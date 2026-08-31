@@ -247,6 +247,7 @@ pub const BootstrapConfig = struct {
     terminal_title: host.TerminalTitle,
     footer_rows: u16,
     startup_min_body_rows: u16 = 0,
+    resume_stream_requested: bool = false,
     default_model: []const u8,
     default_agent_step_limit: usize,
     secret_store: host.SecretStore,
@@ -519,6 +520,7 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         &launch_start_row,
         cfg.startup_min_body_rows,
         state.startup_scrollback,
+        cfg.resume_stream_requested,
     );
     // Enable keyboard/paste protocol modes and disable autowrap for the
     // interactive session. Shutdown restores each mode.
@@ -534,7 +536,19 @@ fn prepareStartupViewport(
     launch_start_row: *u16,
     startup_min_body_rows: u16,
     startup_scrollback: bool,
+    resume_stream_requested: bool,
 ) !u16 {
+    if (resume_stream_requested) {
+        var cursor_buf: [32]u8 = undefined;
+        const cursor = try ui_terminal.moveCursorSequence(
+            &cursor_buf,
+            launch_start_row.*,
+            1,
+        );
+        try writeLifecycleTerminalBytes(shell, metrics, cursor);
+        launch_start_row.* = 1;
+        return 0;
+    }
     if (startup_scrollback and launch_start_row.* > 1) {
         try pushLaunchRowsIntoScrollback(shell, metrics, launch_start_row.* - 1);
         launch_start_row.* = 1;
@@ -1901,7 +1915,14 @@ test "prepare startup viewport uses scrollback setting for launch push only" {
 
     var metrics = Metrics{};
     var enabled_launch_row: u16 = 6;
-    const enabled_reservation = try prepareStartupViewport(&enabled_shell, &metrics, &enabled_launch_row, 11, true);
+    const enabled_reservation = try prepareStartupViewport(
+        &enabled_shell,
+        &metrics,
+        &enabled_launch_row,
+        11,
+        true,
+        false,
+    );
     enabled_shell.stdout_file.close(io_mod.getIo());
 
     var enabled_read = try tmp.dir.openFile(io_mod.getIo(), enabled_path, .{});
@@ -1922,7 +1943,14 @@ test "prepare startup viewport uses scrollback setting for launch push only" {
     defer disabled_shell.deinit(alloc);
 
     var disabled_launch_row: u16 = 6;
-    const disabled_reservation = try prepareStartupViewport(&disabled_shell, &metrics, &disabled_launch_row, 11, false);
+    const disabled_reservation = try prepareStartupViewport(
+        &disabled_shell,
+        &metrics,
+        &disabled_launch_row,
+        11,
+        false,
+        false,
+    );
     disabled_shell.stdout_file.close(io_mod.getIo());
 
     var disabled_read = try tmp.dir.openFile(io_mod.getIo(), disabled_path, .{});
@@ -1933,6 +1961,53 @@ test "prepare startup viewport uses scrollback setting for launch push only" {
     try std.testing.expectEqual(@as(u16, 6), disabled_launch_row);
     try std.testing.expectEqual(@as(u16, 11), disabled_reservation);
     try std.testing.expectEqualStrings("", disabled_bytes);
+}
+
+test "prepare startup viewport positions streamed resume without blank launch rows" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out_path = "resume.out";
+    const out_file = try tmp.dir.createFile(
+        io_mod.getIo(),
+        out_path,
+        .{ .truncate = true },
+    );
+    var shell = TranscriptRuntime{
+        .stdout_file = out_file,
+        .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+    };
+    defer shell.deinit(alloc);
+
+    var metrics = Metrics{};
+    var launch_row: u16 = 24;
+    const reservation = try prepareStartupViewport(
+        &shell,
+        &metrics,
+        &launch_row,
+        11,
+        true,
+        true,
+    );
+    shell.stdout_file.close(io_mod.getIo());
+
+    var read_file = try tmp.dir.openFile(io_mod.getIo(), out_path, .{});
+    defer read_file.close(io_mod.getIo());
+    const bytes = try io_mod.readFileToEnd(alloc, &read_file, 1024);
+    defer alloc.free(bytes);
+
+    try std.testing.expectEqual(@as(u16, 1), launch_row);
+    try std.testing.expectEqual(@as(u16, 0), reservation);
+    try std.testing.expectEqualStrings("\x1b[24;1H", bytes);
 }
 
 test "shutdown cleanup erases from footer frame top after frame commit" {

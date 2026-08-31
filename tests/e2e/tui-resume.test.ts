@@ -6175,6 +6175,7 @@ test.skipIf(!tmuxAvailable())(
     const earlyMarker = "SESSION_PICKER_SCROLLBACK_EARLY";
     const lateMarker = "SESSION_PICKER_SCROLLBACK_LATE";
     const continuationMarker = "SESSION_PICKER_SCROLLBACK_CONTINUATION";
+    const launchMarker = "SESSION_PICKER_SCROLLBACK_LAUNCH";
     const lines = Array.from(
       { length: 80 },
       (_, index) => `SESSION_PICKER_SCROLLBACK_LINE_${String(index).padStart(3, "0")} has enough text to wrap in the terminal viewport.`,
@@ -6218,8 +6219,12 @@ test.skipIf(!tmuxAvailable())(
       ]);
       gateways.push(resumedGateway);
       writeFileSync(stderrPath, "");
+      const resumeCommand = [
+        `for i in {1..24}; do printf "${launchMarker}_%02d\\n" "$i"; done`,
+        `exec ${shellQuote(FX_BIN)} resume ${shellQuote(sessionId)}`,
+      ].join("; ");
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} resume ${sessionId}`,
+        cmd: `/bin/zsh -lc ${shellQuote(resumeCommand)}`,
         cwd: workspaceRoot,
         env: {
           ...gatewayEnv(home, resumedGateway),
@@ -6235,6 +6240,23 @@ test.skipIf(!tmuxAvailable())(
 
       const resumed = await waitForScrollback(active, earlyMarker);
       expect(resumed).toContain(earlyMarker);
+      expect(countOccurrences(resumed, earlyMarker)).toBe(1);
+      expect(countOccurrences(resumed, lateMarker)).toBe(1);
+      expect(resumed).toContain(`${launchMarker}_24`);
+      const resumedRows = resumed.split("\n");
+      const launchRow = resumedRows.findIndex((row) =>
+        row.includes(`${launchMarker}_24`)
+      );
+      const transcriptRow = resumedRows.findIndex((row) =>
+        row.includes("Save a long transcript for resume.")
+      );
+      expect(launchRow).toBeGreaterThanOrEqual(0);
+      expect(transcriptRow).toBeGreaterThan(launchRow);
+      expect(
+        resumedRows
+          .slice(launchRow + 1, transcriptRow)
+          .filter((row) => row.trim().length === 0).length,
+      ).toBeLessThanOrEqual(2);
       expect(countOccurrences(resumed, "direct-resume-scroll.fxtape")).toBe(1);
       const tape = readFileSync(tapePath);
       expect(tape.includes(Buffer.from("\x1b[?1002h"))).toBe(false);

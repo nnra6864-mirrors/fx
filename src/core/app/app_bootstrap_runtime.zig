@@ -188,6 +188,7 @@ pub fn Runtime(comptime App: type) type {
                 .terminal_title = deps.terminal_title,
                 .footer_rows = footer_rows,
                 .startup_min_body_rows = ui_render.welcome_message_reserved_rows,
+                .resume_stream_requested = app.requested_resume != null,
                 .default_model = default_model,
                 .default_agent_step_limit = default_agent_step_limit,
                 .secret_store = if (comptime @hasDecl(App, "secretStore"))
