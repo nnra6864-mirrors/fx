@@ -1266,9 +1266,22 @@ const App = struct {
         );
     }
 
+    pub fn beginCompleteResumeProjection(self: *App) !ResumeProjection {
+        var projection = try ResumeProjection.initComplete(
+            self.alloc,
+            &self.shell,
+            io_mod.milliTimestamp(),
+            self.next_diff_id,
+        );
+        errdefer projection.deinit();
+        try projection.clonePendingDiffs(self.diff_entries.items);
+        return projection;
+    }
+
     pub fn installResumeProjectionRetained(
         self: *App,
         projection: *ResumeProjection,
+        streamed_history_guard_rows: u16,
     ) !void {
         const c_alloc = std.heap.c_allocator;
         try self.diff_entries.ensureUnusedCapacity(
@@ -1280,7 +1293,10 @@ const App = struct {
         }
         projection.pending_diffs.clearRetainingCapacity();
         self.next_diff_id = projection.next_diff_id;
-        try projection.installRetained(&self.shell);
+        try projection.installRetained(
+            &self.shell,
+            streamed_history_guard_rows,
+        );
     }
 
     pub fn historicalToolActivityKind(

@@ -524,7 +524,8 @@ fn syncUpdatesEnabledForValues(override: ?[]const u8, term: ?[]const u8) bool {
 fn historyResetUsesRisForValues(term_program: ?[]const u8, tmux: ?[]const u8) bool {
     return tmux == null and
         term_program != null and
-        std.mem.eql(u8, term_program.?, "Apple_Terminal");
+        (std.mem.eql(u8, term_program.?, "Apple_Terminal") or
+            std.ascii.eqlIgnoreCase(term_program.?, "ghostty"));
 }
 
 fn vminIndex() usize {
@@ -551,10 +552,11 @@ test "sync updates override beats dumb term" {
     try std.testing.expect(!syncUpdatesEnabledForValues(null, "dumb"));
 }
 
-test "direct Apple Terminal uses RIS for terminal history resets" {
+test "direct terminals that need a hard history reset use RIS" {
     try std.testing.expect(historyResetUsesRisForValues("Apple_Terminal", null));
     try std.testing.expect(!historyResetUsesRisForValues("Apple_Terminal", "/tmp/tmux-1/default,1,0"));
-    try std.testing.expect(!historyResetUsesRisForValues("Ghostty", null));
+    try std.testing.expect(historyResetUsesRisForValues("ghostty", null));
+    try std.testing.expect(!historyResetUsesRisForValues("ghostty", "/tmp/tmux-1/default,1,0"));
 }
 
 const TestPty = struct {

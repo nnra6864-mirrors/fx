@@ -4577,6 +4577,8 @@ test.skipIf(!tmuxAvailable())(
       const sessionRoot = join(home, ".fx", "sessions", sessionId);
       const transcriptPath = join(sessionRoot, "transcript.ansi");
       const metadataPath = join(sessionRoot, "transcript.meta");
+      const snapshotPath = join(sessionRoot, "resume.snapshot");
+      expect(existsSync(snapshotPath)).toBe(true);
       rmSync(transcriptPath);
       rmSync(metadataPath);
 
@@ -4605,17 +4607,30 @@ test.skipIf(!tmuxAvailable())(
 
       const exactGateway = startFakeGateway([]);
       gateways.push(exactGateway);
+      const exactTracePath = join(root, "exact-resume-trace.log");
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
         cmd: `${FX_BIN} resume ${sessionId}`,
         cwd: workspace,
-        env: gatewayEnv(home, exactGateway),
+        env: {
+          ...gatewayEnv(home, exactGateway),
+          FX_TRACE_LOG: exactTracePath,
+          FX_TRACE_SCOPES: "session",
+        },
         stderrPath,
       });
       await active.waitForComposer(TIMEOUT);
       const exactScrollback = await waitForScrollback(active, `${marker}_TAIL`);
       expect(countOccurrences(exactScrollback, `${marker}_HEAD`)).toBe(1);
       expect(countOccurrences(exactScrollback, `${marker}_TAIL`)).toBe(1);
+      await waitForCondition(
+        () => existsSync(exactTracePath) &&
+          readFileSync(exactTracePath, "utf8").includes(
+            "event=session_replay source=resume_snapshot",
+          ),
+        "the exact resume snapshot trace",
+        TIMEOUT,
+      );
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       await active.sendText("/quit");
       expect(await active.waitForSessionEnd()).toBe(true);
@@ -5285,11 +5300,16 @@ test.skipIf(!tmuxAvailable())(
 
       const flagGateway = startFakeGateway([fakeGatewayFinalText(flagFollowUp)]);
       gateways.push(flagGateway);
+      const flagTracePath = join(root, "flag-resume-trace.log");
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
         cmd: `${FX_BIN} --resume-last`,
         cwd: workspaceRoot,
-        env: gatewayEnv(home, flagGateway),
+        env: {
+          ...gatewayEnv(home, flagGateway),
+          FX_TRACE_LOG: flagTracePath,
+          FX_TRACE_SCOPES: "session,resize",
+        },
         stderrPath,
         width: 100,
         height: 32,
@@ -5298,6 +5318,16 @@ test.skipIf(!tmuxAvailable())(
       const flagResumed = await waitForScrollback(active, completion);
       expectCompactQuestion(flagResumed);
       await expectQuestionDetail(active);
+      await active.resizeWindow(80, 30);
+      await waitForCondition(
+        () => existsSync(flagTracePath) &&
+          readFileSync(flagTracePath, "utf8").includes(
+            "event=session_transcript_reset outcome=committed",
+          ),
+        "the exact resume transcript reset",
+        TIMEOUT,
+      );
+      await active.waitForComposer(TIMEOUT);
       await active.sendText("Continue the resumed flag session.");
       await active.waitForText(flagFollowUp, TIMEOUT);
       expect(active.isPaneAlive()).toBe(true);
@@ -6176,11 +6206,22 @@ test.skipIf(!tmuxAvailable())(
     const lateMarker = "SESSION_PICKER_SCROLLBACK_LATE";
     const continuationMarker = "SESSION_PICKER_SCROLLBACK_CONTINUATION";
     const launchMarker = "SESSION_PICKER_SCROLLBACK_LAUNCH";
+    const reflowMarker = "WHOLE_RESIZE_TOKEN";
+    const reflowLine =
+      `RESIZE_REFLOW semantic wrapping keeps this marker whole: ${reflowMarker}`;
+    const startupReflowLine =
+      "STARTUP_REFLOW semantic history expands this sentence cleanly at the wider width";
     const lines = Array.from(
       { length: 80 },
       (_, index) => `SESSION_PICKER_SCROLLBACK_LINE_${String(index).padStart(3, "0")} has enough text to wrap in the terminal viewport.`,
     );
     lines.unshift(earlyMarker);
+    lines.splice(
+      1,
+      0,
+      reflowLine,
+      startupReflowLine,
+    );
     lines.push(lateMarker);
     const transcript = lines.join("\n");
     const gateways: Array<ReturnType<typeof startFakeGateway>> = [];
@@ -6228,35 +6269,37 @@ test.skipIf(!tmuxAvailable())(
         cwd: workspaceRoot,
         env: {
           ...gatewayEnv(home, resumedGateway),
+          TMUX: undefined,
+          TMUX_PANE: undefined,
+          TERM_PROGRAM: "ghostty",
+          TERM: "xterm-ghostty",
           FX_RECORD: tapePath,
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "session,resize,frame_commit",
         },
         stderrPath,
-        width: 80,
+        width: 88,
         height: 24,
       });
       await active.waitForComposer(TIMEOUT);
+      await waitForCondition(
+        () => existsSync(tracePath) &&
+          readFileSync(tracePath, "utf8").includes(
+            "event=session_transcript_reset source=semantic_reflow cols=88",
+          ) &&
+          readFileSync(tracePath, "utf8").includes(
+            "event=session_transcript_reset outcome=committed",
+          ),
+        "the startup width reflow",
+        TIMEOUT,
+      );
 
       const resumed = await waitForScrollback(active, earlyMarker);
       expect(resumed).toContain(earlyMarker);
       expect(countOccurrences(resumed, earlyMarker)).toBe(1);
       expect(countOccurrences(resumed, lateMarker)).toBe(1);
-      expect(resumed).toContain(`${launchMarker}_24`);
-      const resumedRows = resumed.split("\n");
-      const launchRow = resumedRows.findIndex((row) =>
-        row.includes(`${launchMarker}_24`)
-      );
-      const transcriptRow = resumedRows.findIndex((row) =>
-        row.includes("Save a long transcript for resume.")
-      );
-      expect(launchRow).toBeGreaterThanOrEqual(0);
-      expect(transcriptRow).toBeGreaterThan(launchRow);
-      expect(
-        resumedRows
-          .slice(launchRow + 1, transcriptRow)
-          .filter((row) => row.trim().length === 0).length,
-      ).toBeLessThanOrEqual(2);
+      expect(resumed).toContain(startupReflowLine);
+      expect(resumed).not.toContain(`${launchMarker}_24`);
       expect(countOccurrences(resumed, "direct-resume-scroll.fxtape")).toBe(1);
       const tape = readFileSync(tapePath);
       expect(tape.includes(Buffer.from("\x1b[?1002h"))).toBe(false);
@@ -6268,6 +6311,12 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("Continue after restoring native scrollback.");
       await active.waitForText(continuationMarker, TIMEOUT);
       await active.waitForComposer(TIMEOUT);
+      const resizeCommitMarker =
+        "event=session_transcript_reset outcome=committed";
+      const priorNarrowCommits = countOccurrences(
+        readFileSync(tracePath, "utf8"),
+        resizeCommitMarker,
+      );
       await active.resizeWindow(72, 20);
       const resized = await active.waitForStableScrollback(
         (scrollback) =>
@@ -6279,10 +6328,40 @@ test.skipIf(!tmuxAvailable())(
       expect(countOccurrences(resized, earlyMarker)).toBe(1);
       expect(countOccurrences(resized, lateMarker)).toBe(1);
       expect(countOccurrences(resized, continuationMarker)).toBe(1);
-      expect(countOccurrences(resized, "Recording:")).toBe(2);
+      expect(countOccurrences(resized, reflowMarker)).toBe(1);
       expect(readFileSync(tracePath, "utf8")).toContain(
-        "event=session_transcript_reset outcome=committed",
+        resizeCommitMarker,
       );
+
+      await waitForCondition(
+        () => countOccurrences(
+          readFileSync(tracePath, "utf8"),
+          resizeCommitMarker,
+        ) > priorNarrowCommits,
+        "the narrow exact resume transcript reset",
+        TIMEOUT,
+      );
+      const priorWideCommits = countOccurrences(
+        readFileSync(tracePath, "utf8"),
+        resizeCommitMarker,
+      );
+      await active.resizeWindow(80, 24);
+      await waitForCondition(
+        () => countOccurrences(
+          readFileSync(tracePath, "utf8"),
+          resizeCommitMarker,
+        ) > priorWideCommits,
+        "the wide exact resume transcript reset",
+        TIMEOUT,
+      );
+      const widened = await active.waitForStableScrollback(
+        (scrollback) =>
+          countOccurrences(scrollback, earlyMarker) === 1 &&
+          countOccurrences(scrollback, lateMarker) === 1 &&
+          countOccurrences(scrollback, continuationMarker) === 1,
+        TIMEOUT,
+      );
+      expect(widened).toContain(reflowLine);
 
       await active.sendText("/quit");
       expect(await active.waitForSessionEnd()).toBe(true);
@@ -6371,7 +6450,10 @@ test.skipIf(!tmuxAvailable())(
       expect(countOccurrences(resized, lateMarker)).toBe(1);
       expect(countOccurrences(resized, "SESSION_PICKER_ACTIVE_STREAM")).toBe(1);
       expect(readFileSync(tracePath, "utf8")).toContain(
-        "event=session_transcript_reset outcome=unavailable reason=record_not_caught_up",
+        "event=session_transcript_reset source=semantic_reflow",
+      );
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "event=session_transcript_reset outcome=committed",
       );
 
       await active.sendKeys("Escape");

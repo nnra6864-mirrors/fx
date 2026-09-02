@@ -4268,8 +4268,11 @@ pub const TranscriptRuntime = struct {
     /// `viewport_top_row`.
     has_painted_transcript: bool = false,
     streamed_session_history_active: bool = false,
+    streamed_session_history_cols: u16 = 0,
+    streamed_session_retention_cap: ?usize = null,
     streamed_reset_requested: bool = false,
     streamed_reset_source_ready: bool = false,
+    streamed_reset_requires_reflow: bool = false,
     footer_viewport: footer_viewport_runtime.FooterViewport = .{},
     extra_input_rows: u16 = 0,
     footer_reserved_base_rows: u16 = 3,
@@ -4340,7 +4343,15 @@ pub const TranscriptRuntime = struct {
     }
 
     pub fn adoptStreamedSessionHistory(self: *TranscriptRuntime) void {
+        self.adoptStreamedSessionHistoryAt(self.layout.cols);
+    }
+
+    pub fn adoptStreamedSessionHistoryAt(
+        self: *TranscriptRuntime,
+        cols: u16,
+    ) void {
         self.streamed_session_history_active = true;
+        self.streamed_session_history_cols = cols;
         const shadow = self.shadow_vt orelse return;
         self.cursor_row = shadow.cursor_row;
         self.cursor_col = shadow.cursor_col;
@@ -4353,6 +4364,45 @@ pub const TranscriptRuntime = struct {
         return self.streamed_session_history_active;
     }
 
+    pub fn streamedSessionHistoryMatchesCurrentWidth(
+        self: *const TranscriptRuntime,
+    ) bool {
+        return self.streamed_session_history_active and
+            self.streamed_session_history_cols == self.layout.cols;
+    }
+
+    pub fn configuredTranscriptRetentionCap(
+        self: *const TranscriptRuntime,
+    ) usize {
+        return self.streamed_session_retention_cap orelse
+            self.max_retained_transcript_bytes;
+    }
+
+    pub fn retainsCompleteStreamedSessionHistory(
+        self: *const TranscriptRuntime,
+    ) bool {
+        return self.streamed_session_history_active and
+            self.streamed_session_retention_cap != null;
+    }
+
+    pub fn retainCompleteStreamedSessionHistory(
+        self: *TranscriptRuntime,
+    ) void {
+        std.debug.assert(self.streamed_session_history_active);
+        if (self.streamed_session_retention_cap == null) {
+            self.streamed_session_retention_cap =
+                self.max_retained_transcript_bytes;
+        }
+        self.max_retained_transcript_bytes = std.math.maxInt(usize);
+    }
+
+    pub fn commitStreamedSessionHistoryReflow(
+        self: *TranscriptRuntime,
+    ) void {
+        std.debug.assert(self.streamed_session_history_active);
+        self.streamed_session_history_cols = self.layout.cols;
+    }
+
     pub fn streamedResetRequested(self: *const TranscriptRuntime) bool {
         return self.streamed_reset_requested;
     }
@@ -4362,15 +4412,37 @@ pub const TranscriptRuntime = struct {
             self.streamed_reset_source_ready;
     }
 
+    pub fn streamedResetRequiresReflow(self: *const TranscriptRuntime) bool {
+        return self.streamed_reset_requested and
+            self.streamed_reset_requires_reflow;
+    }
+
+    pub fn requestStreamedSessionWidthReflow(
+        self: *TranscriptRuntime,
+    ) void {
+        if (!self.streamed_session_history_active or
+            self.streamedSessionHistoryMatchesCurrentWidth())
+        {
+            return;
+        }
+        self.streamed_reset_requested = true;
+        self.streamed_reset_source_ready = true;
+        self.streamed_reset_requires_reflow = true;
+        self.invalidateTranscriptAnchor("streamed_session_startup_width_reflow");
+        self.markTranscriptDirty();
+    }
+
     pub fn finishStreamedResetAttempt(self: *TranscriptRuntime) void {
         self.streamed_reset_requested = false;
         self.streamed_reset_source_ready = false;
+        self.streamed_reset_requires_reflow = false;
         self.terminal_reset_pending = false;
     }
 
     pub fn establishStreamedRetainedAnchor(
         self: *TranscriptRuntime,
         alloc: Allocator,
+        streamed_history_guard_rows: u16,
     ) !void {
         if (!self.streamed_session_history_active) return;
         const shadow = self.shadow_vt orelse return error.ShadowTerminalUnavailable;
@@ -4392,6 +4464,45 @@ pub const TranscriptRuntime = struct {
         );
         defer prepared.deinit(alloc);
 
+        const total_visual_rows = prepared.sourceTotalVisualRows();
+        var visual_offset = visualOffsetForSelection(
+            prepared.sourceVisualRows(),
+            prepared.selection,
+        );
+        const guarded_visual_offset = @min(
+            total_visual_rows,
+            visual_offset +| streamed_history_guard_rows,
+        );
+        debug_trace.logf(
+            "session",
+            "event=streamed_anchor_align cols={d} guard_rows={d} shadow={d},{d} top={d} content_bottom={d} base_offset={d} target_offset={d} total_rows={d} selection={d}..{d} selection_last={d} lines={d}",
+            .{
+                self.layout.cols,
+                streamed_history_guard_rows,
+                shadow.cursor_row,
+                shadow.cursor_col,
+                top,
+                self.layout.content_bottom,
+                visual_offset,
+                guarded_visual_offset,
+                total_visual_rows,
+                prepared.selection.top_row,
+                prepared.selection.bottom_row,
+                prepared.selection.last_visible_row,
+                prepared.selection.line_count,
+            },
+        );
+        if (guarded_visual_offset > visual_offset) {
+            try transcript_painter.reprojectPreparedTranscriptForVisualOffset(
+                alloc,
+                self.layout,
+                &prepared,
+                .{ .top = top, .bottom = self.layout.content_bottom },
+                guarded_visual_offset,
+            );
+            visual_offset = guarded_visual_offset;
+        }
+
         const flow = try alloc.dupe(u8, source.bytes);
         errdefer alloc.free(flow);
         const row_provenance = try alloc.dupe(
@@ -4399,11 +4510,6 @@ pub const TranscriptRuntime = struct {
             prepared.row_provenance.items,
         );
         errdefer if (row_provenance.len > 0) alloc.free(row_provenance);
-        const visual_offset = visualOffsetForSelection(
-            prepared.sourceVisualRows(),
-            prepared.selection,
-        );
-        const total_visual_rows = prepared.sourceTotalVisualRows();
         const footer_rows = @min(
             self.layout.rows,
             self.footer_reserved_base_rows +| 1 +| self.extra_input_rows,
@@ -4910,10 +5016,25 @@ pub const TranscriptRuntime = struct {
         return self.lifecycle_state.finalized_turn_watermark;
     }
 
+    pub fn restoreHistoricalToolTurnWatermark(
+        self: *TranscriptRuntime,
+        watermark: u64,
+    ) void {
+        std.debug.assert(self.lifecycle_state.activeCount() == 0);
+        self.lifecycle_state.finalized_turn_watermark = watermark;
+        self.lifecycle_state.batch_finalized_turn_watermark = null;
+    }
+
     pub fn clearTranscript(self: *TranscriptRuntime, alloc: Allocator) void {
         self.streamed_session_history_active = false;
+        self.streamed_session_history_cols = 0;
+        if (self.streamed_session_retention_cap) |cap| {
+            self.max_retained_transcript_bytes = cap;
+            self.streamed_session_retention_cap = null;
+        }
         self.streamed_reset_requested = false;
         self.streamed_reset_source_ready = false;
+        self.streamed_reset_requires_reflow = false;
         const pending_resume_bytes = self.releasePendingResumeSource(alloc);
         if (pending_resume_bytes > 0) {
             debug_trace.logf(
@@ -6652,11 +6773,19 @@ pub const TranscriptRuntime = struct {
         history_row_delta: ?i32,
     ) !void {
         if (self.streamed_session_history_active) {
+            const requires_reflow =
+                self.streamed_session_history_cols != self.layout.cols;
             const source_ready = if (self.streamed_reset_requested)
                 self.streamed_reset_source_ready
+            else if (requires_reflow and
+                self.retainsCompleteStreamedSessionHistory())
+                true
             else
                 self.presentationRecordReadyForReset();
             self.streamed_reset_requested = true;
+            self.streamed_reset_requires_reflow =
+                self.streamed_reset_requires_reflow or
+                requires_reflow;
             self.reflow_clear_guard_rows = 0;
             self.resize_history_row_delta = null;
             self.pending_resize_observation = null;
@@ -11639,9 +11768,74 @@ test "settled streamed session resize requests one file backed reset without cle
     try std.testing.expectEqual(@as(?i32, null), runtime.resize_history_row_delta);
     try std.testing.expect(!runtime.render_requests.pending_settled_width_reflow);
     try std.testing.expect(runtime.render_requests.hasReason(.transcript));
+    try std.testing.expect(!runtime.streamedResetRequiresReflow());
 
     runtime.finishStreamedResetAttempt();
     try std.testing.expect(!runtime.streamedResetRequested());
+}
+
+test "settled streamed width change requests semantic reflow" {
+    var metrics: Metrics = .{};
+    var runtime = TranscriptRuntime{
+        .layout = invalidationTestLayout(),
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+    };
+    defer runtime.deinit(std.testing.allocator);
+    runtime.adoptStreamedSessionHistory();
+    runtime.resumePresentationRecord(10);
+    runtime.layout.cols = 60;
+
+    try runtime.requestTerminalResetAfterResize(&metrics, null);
+
+    try std.testing.expect(runtime.streamedResetRequested());
+    try std.testing.expect(runtime.streamedResetSourceReady());
+    try std.testing.expect(runtime.streamedResetRequiresReflow());
+    runtime.finishStreamedResetAttempt();
+    try std.testing.expect(!runtime.streamedResetRequiresReflow());
+}
+
+test "streamed session schedules semantic reset when startup width differs" {
+    var runtime = TranscriptRuntime{ .layout = invalidationTestLayout() };
+    defer runtime.deinit(std.testing.allocator);
+    runtime.adoptStreamedSessionHistoryAt(runtime.layout.cols - 1);
+    runtime.retainCompleteStreamedSessionHistory();
+
+    runtime.requestStreamedSessionWidthReflow();
+
+    try std.testing.expect(runtime.streamedResetRequested());
+    try std.testing.expect(runtime.streamedResetSourceReady());
+    try std.testing.expect(runtime.streamedResetRequiresReflow());
+    try std.testing.expect(runtime.render_requests.hasReason(.transcript));
+}
+
+test "streamed session keeps complete semantics and restores its retention cap" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = invalidationTestLayout() };
+    defer runtime.deinit(alloc);
+    const semantic = try alloc.dupe(u8, "semantic source\n");
+    try runtime.entries.append(alloc, .{ .raw_bytes = .{
+        .id = runtime.next_entry_id,
+        .bytes = semantic,
+    } });
+    runtime.next_entry_id += 1;
+    try runtime.transcript.appendSlice(alloc, "cached tail\n");
+    const configured_cap = runtime.max_retained_transcript_bytes;
+    runtime.adoptStreamedSessionHistory();
+    runtime.retainCompleteStreamedSessionHistory();
+
+    var prepared = try runtime.prepareTranscriptSource(alloc, null);
+    defer prepared.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, prepared.bytes, "semantic source") != null);
+    try std.testing.expectEqual(std.math.maxInt(usize), runtime.max_retained_transcript_bytes);
+
+    runtime.layout.cols -= 1;
+    var reflowed = try runtime.prepareTranscriptSource(alloc, null);
+    defer reflowed.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, reflowed.bytes, "semantic source") != null);
+
+    runtime.clearTranscript(alloc);
+    try std.testing.expectEqual(configured_cap, runtime.max_retained_transcript_bytes);
 }
 
 test "armed streamed reset keeps its ready source until the attempt finishes" {

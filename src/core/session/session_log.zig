@@ -13,10 +13,12 @@ const session_projection = @import("session_projection.zig");
 const session_replay = @import("session_replay.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
 const session_transcript = @import("session_transcript.zig");
+const session_resume_snapshot = @import("session_resume_snapshot.zig");
 const session_usage = @import("session_usage.zig");
 const session_usage_sidecar = @import("session_usage_sidecar.zig");
 
 const Allocator = std.mem.Allocator;
+
 const Identifier = session_event.Identifier;
 const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
 const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
@@ -31,6 +33,7 @@ const authority_intent_file = "authority.pending.json";
 const publication_intent_file = "commit.pending.json";
 const manifest_file = "session.json";
 const checkpoint_file = "checkpoint.json";
+const resume_snapshot_file = "resume.snapshot";
 const session_lock_file = "session.lock";
 const commit_lock_file = "commit.lock";
 
@@ -140,6 +143,7 @@ pub const ProjectionStatus = enum {
 };
 
 const ReplaySource = enum {
+    resume_snapshot,
     checkpoint,
     event_log,
 };
@@ -153,6 +157,9 @@ const OpenState = struct {
     projection_status: ProjectionStatus,
     source: ReplaySource,
     tail_bytes: u64,
+    resume_presentation: []u8 = &.{},
+    resume_snapshot_position: ?CommitPosition = null,
+    resume_snapshot_has_presentation: bool = false,
 };
 
 const CheckpointReplay = struct {
@@ -548,6 +555,9 @@ pub const LoadedWritableSession = struct {
     migration_source_bytes: ?u64 = null,
     usage_sidecar_reseal_pending: bool = false,
     transcript_position: ?CommitPosition = null,
+    resume_presentation: []u8 = &.{},
+    resume_snapshot_position: ?CommitPosition = null,
+    resume_snapshot_has_presentation: bool = false,
     /// Runtime-only provenance installed by subagent resume admission. These
     /// fields are never written into the session event log.
     external_prompt_origin: ExternalPromptOrigin = .root,
@@ -565,6 +575,7 @@ pub const LoadedWritableSession = struct {
         if (self.external_root_user_messages.len > 0) {
             alloc.free(self.external_root_user_messages);
         }
+        if (self.resume_presentation.len > 0) alloc.free(self.resume_presentation);
         alloc.free(self.active_id);
         self.state.deinit(alloc);
         self.log.deinit(alloc);
@@ -584,6 +595,55 @@ pub const LoadedWritableSession = struct {
             bytes,
         );
         self.transcript_position = self.position;
+    }
+
+    pub fn publishResumeSnapshot(
+        self: *LoadedWritableSession,
+        alloc: Allocator,
+        presentation: []const u8,
+    ) !void {
+        if (self.state_replacement_pending or
+            self.namespace_confirmation_required or
+            self.degraded_tail != null)
+        {
+            return error.SessionPersistenceDegraded;
+        }
+        const bytes = try session_resume_snapshot.encode(
+            alloc,
+            self.active_id,
+            self.position,
+            self.state,
+            presentation,
+        );
+        defer alloc.free(bytes);
+        try durableReplace(alloc, &self.log.dir, resume_snapshot_file, bytes);
+        self.resume_snapshot_position = self.position;
+        self.resume_snapshot_has_presentation = presentation.len > 0;
+    }
+
+    pub fn resumeSnapshotCurrent(self: *const LoadedWritableSession) bool {
+        const position = self.resume_snapshot_position orelse return false;
+        return positionsEqual(position, self.position);
+    }
+
+    pub fn resumeSnapshotReady(self: *const LoadedWritableSession) bool {
+        return self.resume_snapshot_has_presentation and
+            self.resumeSnapshotCurrent();
+    }
+
+    pub fn invalidateResumeSnapshotPresentation(
+        self: *LoadedWritableSession,
+    ) void {
+        self.resume_snapshot_has_presentation = false;
+    }
+
+    pub fn takeResumePresentation(
+        self: *LoadedWritableSession,
+    ) ?[]u8 {
+        if (!self.resumeSnapshotReady()) return null;
+        const bytes = self.resume_presentation;
+        self.resume_presentation = &.{};
+        return bytes;
     }
 
     pub fn appendTranscript(
@@ -727,6 +787,11 @@ pub const LoadedWritableSession = struct {
             self.state_replacement_pending =
                 self.state_replacement_pending and replacement_was_pending;
         }
+        publishStateOnlyResumeSnapshotIfDueBestEffort(
+            self,
+            alloc,
+            options.checkpoint_interval,
+        );
         return self.position;
     }
 
@@ -784,6 +849,11 @@ pub const LoadedWritableSession = struct {
             return err;
         };
         if (!lifecycle_published) self.state_replacement_pending = true;
+        publishStateOnlyResumeSnapshotIfDueBestEffort(
+            self,
+            alloc,
+            options.checkpoint_interval,
+        );
         return self.position;
     }
 
@@ -895,6 +965,18 @@ pub const LoadedWritableSession = struct {
             error.CheckpointTooLarge => return,
             else => return err,
         };
+        try deleteAndSync(
+            &self.log.dir,
+            resume_snapshot_file,
+            options.test_controls,
+            null,
+        );
+        if (self.resume_presentation.len > 0) {
+            alloc.free(self.resume_presentation);
+        }
+        self.resume_presentation = &.{};
+        self.resume_snapshot_position = null;
+        self.resume_snapshot_has_presentation = false;
         try writeManifestProjection(alloc, self);
         self.projection_status = .current;
     }
@@ -2412,7 +2494,12 @@ fn openWritableSession(
         error.OutOfMemory => return failLoadedWritableSession(error.SessionReplayResourceExhausted),
         else => return err,
     };
-    errdefer open_state.state.deinit(alloc);
+    errdefer {
+        open_state.state.deinit(alloc);
+        if (open_state.resume_presentation.len > 0) {
+            alloc.free(open_state.resume_presentation);
+        }
+    }
     const usage_sidecar_reseal_pending = try restoreUsageSidecar(
         alloc,
         &writable.dir,
@@ -2448,8 +2535,12 @@ fn openWritableSession(
         .checkpoint_sha256 = open_state.checkpoint_sha256,
         .projection_status = open_state.projection_status,
         .usage_sidecar_reseal_pending = usage_sidecar_reseal_pending,
+        .resume_presentation = open_state.resume_presentation,
+        .resume_snapshot_position = open_state.resume_snapshot_position,
+        .resume_snapshot_has_presentation = open_state.resume_snapshot_has_presentation,
     };
     open_state.state = undefined;
+    open_state.resume_presentation = &.{};
     if (result.projection_status == .stale) {
         writeManifestProjection(alloc, &result) catch {
             result.projection_status = .stale;
@@ -2566,6 +2657,36 @@ fn loadOpenState(
     };
     defer if (manifest) |*value| value.manifest.deinit(alloc);
 
+    var exact_snapshot = try loadExactResumeSnapshot(
+        alloc,
+        dir,
+        session_id,
+        position,
+    );
+    defer if (exact_snapshot) |*snapshot| snapshot.deinit(alloc);
+    if (exact_snapshot != null and manifest != null and
+        manifest.?.event_file_matches)
+    {
+        var exact = exact_snapshot.?;
+        exact_snapshot = null;
+        const value = manifest.?.manifest;
+        alloc.free(exact.session_id);
+        exact.session_id = &.{};
+        return .{
+            .state = exact.state,
+            .generation_base_seq = value.generation_base_seq,
+            .generation_base_bytes = value.generation_base_bytes,
+            .checkpoint_seq = value.checkpoint_seq,
+            .checkpoint_sha256 = value.checkpoint_sha256,
+            .projection_status = .current,
+            .source = .resume_snapshot,
+            .tail_bytes = 0,
+            .resume_presentation = exact.presentation,
+            .resume_snapshot_position = exact.position,
+            .resume_snapshot_has_presentation = exact.presentation.len > 0,
+        };
+    }
+
     var checkpoint_failed = false;
     if (manifest) |candidate| {
         const value = candidate.manifest;
@@ -2642,6 +2763,56 @@ fn loadOpenState(
         .source = .event_log,
         .tail_bytes = position.through_event_log_bytes,
     };
+}
+
+fn loadExactResumeSnapshot(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+    position: CommitPosition,
+) !?session_resume_snapshot.Decoded {
+    if (!try entryExists(dir, resume_snapshot_file)) return null;
+    const bytes = readManagedFileAlloc(
+        alloc,
+        dir,
+        resume_snapshot_file,
+        session_resume_snapshot.max_file_bytes,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.CorruptResumeSnapshot,
+    };
+    defer alloc.free(bytes);
+    var snapshot = session_resume_snapshot.decode(alloc, bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.UnsupportedResumeSnapshotSchema => {
+            debug_trace.logf(
+                "session",
+                "event=resume_snapshot_admission outcome=incomplete reason=unsupported_schema",
+                .{},
+            );
+            return null;
+        },
+        else => return error.CorruptResumeSnapshot,
+    };
+    errdefer snapshot.deinit(alloc);
+    if (!std.mem.eql(u8, snapshot.session_id, session_id)) {
+        return error.CorruptResumeSnapshot;
+    }
+    if (!positionsEqual(snapshot.position, position)) {
+        debug_trace.logf(
+            "session",
+            "event=resume_snapshot_admission outcome=incomplete reason=stale",
+            .{},
+        );
+        snapshot.deinit(alloc);
+        return null;
+    }
+    debug_trace.logf(
+        "session",
+        "event=resume_snapshot_admission outcome=exact bytes={d}",
+        .{bytes.len},
+    );
+    return snapshot;
 }
 
 fn loadCurrentManifestForOpen(
@@ -3955,16 +4126,42 @@ fn rollbackPublicationToPrior(
 fn refreshProjections(
     alloc: Allocator,
     loaded: *LoadedWritableSession,
-    options: Options,
+    _: Options,
 ) !void {
-    if (checkpointDue(loaded, options.checkpoint_interval)) {
-        writeCheckpointProjection(alloc, loaded) catch |err| switch (err) {
-            error.CheckpointTooLarge => {},
-            else => return err,
-        };
-    }
     try writeManifestProjection(alloc, loaded);
     loaded.projection_status = .current;
+}
+
+fn publishStateOnlyResumeSnapshotIfDueBestEffort(
+    loaded: *LoadedWritableSession,
+    alloc: Allocator,
+    interval: u64,
+) void {
+    if (!resumeSnapshotDue(loaded, interval)) return;
+    loaded.publishResumeSnapshot(alloc, &.{}) catch |err| {
+        debug_trace.logf(
+            "session",
+            "event=resume_snapshot_publish outcome=degraded stage=state_only err={s}",
+            .{@errorName(err)},
+        );
+    };
+}
+
+fn resumeSnapshotDue(
+    loaded: *const LoadedWritableSession,
+    interval: u64,
+) bool {
+    if (interval == 0) return false;
+    const prior = loaded.resume_snapshot_position orelse {
+        const checkpoint_seq = loaded.checkpoint_seq orelse return true;
+        return loaded.position.through_seq > checkpoint_seq and
+            loaded.position.through_seq - checkpoint_seq >= interval;
+    };
+    if (!std.mem.eql(u8, &prior.log_generation, &loaded.position.log_generation)) {
+        return true;
+    }
+    return loaded.position.through_seq > prior.through_seq and
+        loaded.position.through_seq - prior.through_seq >= interval;
 }
 
 fn checkpointDue(loaded: *LoadedWritableSession, interval: u64) bool {
@@ -4730,6 +4927,85 @@ fn testState(alloc: Allocator, id: []const u8, updated_at_ms: i64) !session_code
         .total_input_tokens = 0,
         .total_output_tokens = 0,
     };
+}
+
+test "resume snapshot reloads exact state and opaque presentation" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-resume-snapshot-exact", 10);
+    defer initial.deinit(alloc);
+
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    try loaded.publishResumeSnapshot(alloc, "retained-presentation");
+    try std.testing.expect(loaded.resumeSnapshotCurrent());
+    loaded.deinit(alloc);
+
+    var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expect(resumed.resumeSnapshotCurrent());
+    try std.testing.expect(resumed.resumeSnapshotReady());
+    const presentation = resumed.takeResumePresentation() orelse
+        return error.MissingResumePresentation;
+    defer alloc.free(presentation);
+    try std.testing.expectEqualStrings("retained-presentation", presentation);
+    try std.testing.expectEqualStrings(initial.id, resumed.state.id);
+}
+
+test "stale resume snapshot falls back to canonical events" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-resume-snapshot-stale", 10);
+    defer initial.deinit(alloc);
+
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    try loaded.publishResumeSnapshot(alloc, "stale-presentation");
+    _ = try loaded.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = true } },
+        20,
+        .retry_expected_tail,
+        .{},
+    );
+    loaded.deinit(alloc);
+
+    var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expect(!resumed.resumeSnapshotCurrent());
+    try std.testing.expect(resumed.takeResumePresentation() == null);
+    try std.testing.expect(resumed.state.preferences.fast_mode);
+}
+
+test "supported resume snapshot corruption fails closed" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-resume-snapshot-corrupt", 10);
+    defer initial.deinit(alloc);
+
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    try loaded.publishResumeSnapshot(alloc, "retained-presentation");
+    const bytes = try readManagedFileAlloc(
+        alloc,
+        &loaded.log.dir,
+        resume_snapshot_file,
+        session_resume_snapshot.max_file_bytes,
+    );
+    defer alloc.free(bytes);
+    bytes[23] ^= 1;
+    try durableReplace(
+        alloc,
+        &loaded.log.dir,
+        resume_snapshot_file,
+        bytes,
+    );
+    loaded.deinit(alloc);
+
+    try std.testing.expectError(
+        error.CorruptResumeSnapshot,
+        temp.root.resumeForWrite(alloc, initial.id, .{}),
+    );
 }
 
 fn stateWithTurn(
@@ -6372,7 +6648,7 @@ test "rollback required failure is excluded from generic degraded retry" {
     );
 }
 
-test "checkpoint scheduling publishes an exact committed checkpoint" {
+test "checkpoint scheduling publishes an exact state-only resume snapshot" {
     const alloc = std.testing.allocator;
     var temp = try TempRoot.init(alloc);
     defer temp.deinit(alloc);
@@ -6397,9 +6673,10 @@ test "checkpoint scheduling publishes an exact committed checkpoint" {
     try std.testing.expect(try temp.root.entryExistsForTest(
         alloc,
         initial.id,
-        "checkpoint.json",
+        resume_snapshot_file,
     ));
-    try loaded.validateCheckpointForTest(alloc);
+    try std.testing.expect(loaded.resumeSnapshotCurrent());
+    try std.testing.expect(!loaded.resumeSnapshotReady());
 }
 
 test "checkpoint clean shutdown publishes when missing" {

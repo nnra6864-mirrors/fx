@@ -50,6 +50,8 @@ const session_permission_state = @import("../permissions/session_permission_stat
 const mcp_access = @import("../mcp/access_policy.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
+const transcript_painter = @import("../../ui/transcript/painter.zig");
+const resume_snapshot = @import("../../ui/transcript/resume_snapshot.zig");
 const ui_input = @import("../../ui/input/runtime.zig");
 const ui_render = @import("../../ui/render.zig");
 const footer_paint_plan = @import("../../ui/footer/paint_plan.zig");
@@ -62,13 +64,20 @@ const resume_stream_autowrap_disable = "\x1b[?7l";
 const resume_stream_read_bytes: usize = 64 * 1024;
 const resume_stream_first_read_bytes: usize = 1024;
 
-pub const ResetTranscriptReader = struct {
-    admission: session_transcript.Admission,
+pub const ResetTranscriptReader = union(enum) {
+    persisted: session_transcript.Admission,
+    memory: struct {
+        alloc: Allocator,
+        bytes: []u8,
+    },
 
     pub fn frameSource(self: *ResetTranscriptReader) !frame_scroll_plan.SequentialDocumentSource {
-        const committed_len = switch (self.admission) {
-            .exact => |reader| reader.committed_len,
-            .missing, .incomplete, .corrupt => return error.TranscriptReaderUnavailable,
+        const committed_len: u64 = switch (self.*) {
+            .persisted => |admission| switch (admission) {
+                .exact => |reader| reader.committed_len,
+                .missing, .incomplete, .corrupt => return error.TranscriptReaderUnavailable,
+            },
+            .memory => |source| @intCast(source.bytes.len),
         };
         return .{
             .ctx = self,
@@ -78,15 +87,37 @@ pub const ResetTranscriptReader = struct {
     }
 
     pub fn deinit(self: *ResetTranscriptReader) void {
-        self.admission.deinit();
+        switch (self.*) {
+            .persisted => |*admission| admission.deinit(),
+            .memory => |source| source.alloc.free(source.bytes),
+        }
         self.* = undefined;
+    }
+
+    fn replacement(
+        self: *const ResetTranscriptReader,
+    ) ?[]const u8 {
+        return switch (self.*) {
+            .persisted => null,
+            .memory => |source| source.bytes,
+        };
     }
 
     fn readAt(ctx: *anyopaque, out: []u8, offset: u64) !usize {
         const self: *ResetTranscriptReader = @ptrCast(@alignCast(ctx));
-        return switch (self.admission) {
-            .exact => |reader| reader.readAt(out, offset),
-            .missing, .incomplete, .corrupt => error.TranscriptReaderUnavailable,
+        return switch (self.*) {
+            .persisted => |admission| switch (admission) {
+                .exact => |reader| reader.readAt(out, offset),
+                .missing, .incomplete, .corrupt => error.TranscriptReaderUnavailable,
+            },
+            .memory => |source| blk: {
+                const start = std.math.cast(usize, offset) orelse
+                    return error.InvalidTranscriptOffset;
+                if (start >= source.bytes.len) break :blk 0;
+                const len = @min(out.len, source.bytes.len - start);
+                @memcpy(out[0..len], source.bytes[start..][0..len]);
+                break :blk len;
+            },
         };
     }
 };
@@ -101,7 +132,7 @@ test "reset transcript reader lends a borrowed sequential frame source" {
     );
     try file.writeStreamingAll(std.testing.io, "history\r\n");
 
-    var reader = ResetTranscriptReader{ .admission = .{ .exact = .{
+    var reader = ResetTranscriptReader{ .persisted = .{ .exact = .{
         .file = file,
         .committed_len = "history\r\n".len,
     } } };
@@ -110,6 +141,21 @@ test "reset transcript reader lends a borrowed sequential frame source" {
     try std.testing.expectEqual(@as(u64, "history\r\n".len), source.committed_len);
     var buffer: [32]u8 = undefined;
     const read = try source.readAt(&buffer, 0);
+    try std.testing.expectEqualStrings("history\r\n", buffer[0..read]);
+}
+
+test "reset transcript reader owns a width-aware in-memory source" {
+    const bytes = try std.testing.allocator.dupe(u8, "reflowed\r\nhistory\r\n");
+    var reader = ResetTranscriptReader{ .memory = .{
+        .alloc = std.testing.allocator,
+        .bytes = bytes,
+    } };
+    defer reader.deinit();
+
+    const source = try reader.frameSource();
+    try std.testing.expectEqual(@as(u64, bytes.len), source.committed_len);
+    var buffer: [32]u8 = undefined;
+    const read = try source.readAt(&buffer, "reflowed\r\n".len);
     try std.testing.expectEqualStrings("history\r\n", buffer[0..read]);
 }
 
@@ -172,7 +218,10 @@ fn streamSessionTranscript(app: anytype, reader: anytype) !u64 {
     }
 }
 
-fn extendResumeStreamGuardForRetainedProjection(app: anytype) !void {
+fn extendResumeStreamGuardForRetainedProjection(
+    app: anytype,
+    live_session_resume: bool,
+) !u16 {
     const desired_rows = (app.shell.layout.rows -|
         app.shell.layout.content_bottom) +|
         footer_paint_plan.idle_footer_gap_reservation_rows +| 1;
@@ -180,6 +229,10 @@ fn extendResumeStreamGuardForRetainedProjection(app: anytype) !void {
     while (emitted_rows < desired_rows) : (emitted_rows += 1) {
         try app.shell.writeResumeStreamBytes(&app.metrics, "\r\n");
     }
+    return if (live_session_resume)
+        footer_paint_plan.idle_footer_gap_reservation_rows
+    else
+        app.shell.layout.rows -| app.shell.layout.content_bottom;
 }
 
 fn streamSessionTranscriptPayload(app: anytype, reader: anytype) !u64 {
@@ -1383,6 +1436,7 @@ pub const Persistence = struct {
     resume_transcript_streamed: bool = false,
     resume_handoff_intent: ResumeHandoffIntent = .none,
     pending_live_session_policy: ?BackgroundSessionPolicy = null,
+    live_session_resume: bool = false,
 
     pub fn deinit(self: *Persistence, alloc: Allocator) void {
         if (self.pending_live_session_policy) |policy| {
@@ -1415,6 +1469,34 @@ pub const Persistence = struct {
 
 pub fn Runtime(comptime App: type) type {
     return struct {
+        fn acquireWidthAwareResetTranscriptReader(
+            app: *App,
+        ) !?ResetTranscriptReader {
+            var source = try app.shell.prepareTranscriptSource(app.alloc, null);
+            defer source.deinit(app.alloc);
+            const prepared = try transcript_painter.prepareTranscriptDocumentAppendBytes(
+                app.alloc,
+                source.bytes,
+                app.shell.layout.cols,
+                0,
+                source.bytes.len,
+                true,
+            );
+            const bytes = if (prepared.len > 0)
+                prepared
+            else
+                try app.alloc.dupe(u8, source.bytes);
+            debug_trace.logf(
+                "session",
+                "event=session_transcript_reset source=semantic_reflow cols={d} entries={d} bytes={d}",
+                .{ app.shell.layout.cols, source.entry_spans.len, bytes.len },
+            );
+            return .{ .memory = .{
+                .alloc = app.alloc,
+                .bytes = bytes,
+            } };
+        }
+
         pub fn acquireResetTranscriptReader(app: *App) !?ResetTranscriptReader {
             if (!app.shell.streamedResetSourceReady()) {
                 debug_trace.logf(
@@ -1423,6 +1505,16 @@ pub fn Runtime(comptime App: type) type {
                     .{},
                 );
                 return null;
+            }
+            if (app.shell.streamedResetRequiresReflow()) {
+                return acquireWidthAwareResetTranscriptReader(app) catch |err| {
+                    debug_trace.logf(
+                        "session",
+                        "event=session_transcript_reset outcome=unavailable reason=semantic_reflow_failed err={s}",
+                        .{@errorName(err)},
+                    );
+                    return null;
+                };
             }
             const expected_committed_len = app.shell.presentationRecordCommittedLen() orelse {
                 debug_trace.logf(
@@ -1445,7 +1537,7 @@ pub fn Runtime(comptime App: type) type {
             var admission = try writable.admitActiveTranscript(app.alloc);
             switch (admission) {
                 .exact => |reader| if (reader.committed_len == expected_committed_len) {
-                    return .{ .admission = admission };
+                    return .{ .persisted = admission };
                 } else {
                     admission.deinit();
                     debug_trace.logf(
@@ -1466,6 +1558,40 @@ pub fn Runtime(comptime App: type) type {
                     return null;
                 },
             }
+        }
+
+        pub fn persistResetTranscriptAfterFrame(
+            app: *App,
+            reader: *const ResetTranscriptReader,
+        ) void {
+            const replacement = reader.replacement() orelse return;
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const loaded = if (app.session_persistence.writable) |*value| value else {
+                app.shell.degradePresentationRecord();
+                return;
+            };
+            loaded.publishTranscript(app.alloc, replacement) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "event=session_transcript_reset persistence=degraded err={s}",
+                    .{@errorName(err)},
+                );
+                app.shell.degradePresentationRecord();
+                return;
+            };
+            loaded.invalidateResumeSnapshotPresentation();
+            if (app.session_persistence.resume_transcript_committed_len != null) {
+                app.session_persistence.resume_transcript_committed_len =
+                    @intCast(replacement.len);
+            }
+            app.shell.commitStreamedSessionHistoryReflow();
+            app.shell.degradePresentationRecord();
+            debug_trace.logf(
+                "session",
+                "event=session_transcript_reset persistence=committed cols={d} bytes={d}",
+                .{ app.shell.layout.cols, replacement.len },
+            );
         }
 
         pub fn stageRequestedSessionTranscript(app: *App) !void {
@@ -1599,7 +1725,7 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.streamedSessionHistoryActive())
                     {
                         var anchor_reconciled = true;
-                        app.shell.establishStreamedRetainedAnchor(app.alloc) catch |err| {
+                        app.shell.establishStreamedRetainedAnchor(app.alloc, 0) catch |err| {
                             anchor_reconciled = false;
                             debug_trace.logf(
                                 "session",
@@ -1896,6 +2022,7 @@ pub fn Runtime(comptime App: type) type {
             log_options: session_log.Options,
         ) !void {
             try prepareLiveSessionTransition(app, .stop_forget, log_options);
+            app.session_persistence.live_session_resume = true;
             try app.shell.requestTerminalReset(&app.metrics);
             try app.commitStartupResumeReplayAnchor();
         }
@@ -2126,7 +2253,13 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             defer display.deinit(app.alloc);
-            hydrateResumedSession(app, loaded.state, display.title, notice) catch |err| {
+            hydrateResumedSession(
+                app,
+                loaded.state,
+                display.title,
+                notice,
+                null,
+            ) catch |err| {
                 traceJsHostRestoreFailure("hydrate", session_id, err);
                 try continueWithFreshJsHostSession(app);
                 return;
@@ -2304,7 +2437,17 @@ pub fn Runtime(comptime App: type) type {
                 app.session_persistence.writable = null;
             }
             const active = &app.session_persistence.writable.?;
-            try hydrateResumedSession(app, active.state, display.title, notice);
+            const resume_presentation = active.takeResumePresentation();
+            defer if (resume_presentation) |bytes| {
+                if (bytes.len > 0) app.alloc.free(bytes);
+            };
+            try hydrateResumedSession(
+                app,
+                active.state,
+                display.title,
+                notice,
+                resume_presentation,
+            );
             enableSessionStores(app);
             refreshSubagentProjectionAfterSessionInstall(app);
         }
@@ -2314,7 +2457,9 @@ pub fn Runtime(comptime App: type) type {
             state: session_codec.DurableSessionState,
             display_title: []const u8,
             notice: ResumeNotice,
+            resume_presentation: ?[]const u8,
         ) !void {
+            defer app.session_persistence.live_session_resume = false;
             if (comptime @hasField(App, "next_image_id")) {
                 app.next_image_id = try nextImageIdForResumedHistory(
                     app.alloc,
@@ -2352,17 +2497,30 @@ pub fn Runtime(comptime App: type) type {
                 const projection_started_ns = io_mod.nanoTimestamp();
                 var projection = try app.beginResumeProjection();
                 defer projection.deinit();
-                var sink = DetachedHistorySink(@TypeOf(projection)){
-                    .app = app,
-                    .projection = &projection,
-                };
-                try replayHistoryToSink(app, &sink, state.history);
-                try writeRecoveryCheckpointToSink(app, &sink, state);
-                const projection_finished_ns = io_mod.nanoTimestamp();
                 const exact_transcript_streamed =
                     app.session_persistence.resume_transcript_streamed;
-                try projection.finalizeForResume(!exact_transcript_streamed);
-                const finalization_finished_ns = io_mod.nanoTimestamp();
+                var projection_finished_ns: i128 = undefined;
+                var finalization_finished_ns: i128 = undefined;
+                if (resume_presentation != null and exact_transcript_streamed) {
+                    var retained = try resume_snapshot.decode(
+                        app.alloc,
+                        resume_presentation.?,
+                    );
+                    defer retained.deinit(app.alloc);
+                    try projection.adoptSnapshot(&retained);
+                    projection_finished_ns = io_mod.nanoTimestamp();
+                    finalization_finished_ns = projection_finished_ns;
+                } else {
+                    var sink = DetachedHistorySink(@TypeOf(projection)){
+                        .app = app,
+                        .projection = &projection,
+                    };
+                    try replayHistoryToSink(app, &sink, state.history);
+                    try writeRecoveryCheckpointToSink(app, &sink, state);
+                    projection_finished_ns = io_mod.nanoTimestamp();
+                    try projection.finalizeForResume(!exact_transcript_streamed);
+                    finalization_finished_ns = io_mod.nanoTimestamp();
+                }
                 var committed_len = app.session_persistence.resume_transcript_committed_len;
                 if (!app.session_persistence.resume_transcript_streamed) {
                     const transcript_bytes = try projection.publicationWireBytes(
@@ -2400,10 +2558,40 @@ pub fn Runtime(comptime App: type) type {
                         };
                     }
                 }
-                const record_cursor = projection.recordCursor();
-                if (projection.retentionChanged()) {
-                    try extendResumeStreamGuardForRetainedProjection(app);
+                if (app.session_persistence.writable) |*loaded| {
+                    if (!loaded.resumeSnapshotReady()) {
+                        const view = projection.snapshotView();
+                        const presentation = resume_snapshot.encode(
+                            app.alloc,
+                            view,
+                        ) catch |err| blk: {
+                            debug_trace.logf(
+                                "session",
+                                "event=resume_snapshot_publish outcome=degraded stage=legacy_encode err={s}",
+                                .{@errorName(err)},
+                            );
+                            break :blk null;
+                        };
+                        if (presentation) |bytes| {
+                            defer app.alloc.free(bytes);
+                            loaded.publishResumeSnapshot(app.alloc, bytes) catch |err| {
+                                debug_trace.logf(
+                                    "session",
+                                    "event=resume_snapshot_publish outcome=degraded stage=legacy_replace err={s}",
+                                    .{@errorName(err)},
+                                );
+                            };
+                        }
+                    }
                 }
+                const record_cursor = projection.recordCursor();
+                const streamed_history_guard_rows = if (projection.retentionChanged())
+                    try extendResumeStreamGuardForRetainedProjection(
+                        app,
+                        app.session_persistence.live_session_resume,
+                    )
+                else
+                    0;
                 if (committed_len) |len| {
                     app.shell.resumePresentationRecordAt(len, record_cursor);
                 } else {
@@ -2416,7 +2604,11 @@ pub fn Runtime(comptime App: type) type {
                     app.shell.footer_reserved_base_rows =
                         footer_paint_plan.composerReservedBaseRows();
                 }
-                try app.installResumeProjectionRetained(&projection);
+                try app.installResumeProjectionRetained(
+                    &projection,
+                    streamed_history_guard_rows,
+                );
+                app.shell.requestStreamedSessionWidthReflow();
                 try app.commitStartupResumeReplayAnchor();
                 try projection.installPostludeRetained(
                     &app.shell,
@@ -2424,6 +2616,12 @@ pub fn Runtime(comptime App: type) type {
                 );
                 var live_sink = LiveHistorySink(App){ .app = app };
                 try writeResumeNotice(app, &live_sink, display_title, notice);
+                if (app.session_persistence.resume_transcript_committed_len) |len| {
+                    committed_len = len;
+                }
+                if (committed_len) |len| {
+                    app.shell.resumePresentationRecord(len);
+                }
                 app.session_persistence.resume_transcript_committed_len = null;
                 app.session_persistence.resume_transcript_streamed = false;
                 const install_finished_ns = io_mod.nanoTimestamp();
@@ -4824,6 +5022,114 @@ pub fn Runtime(comptime App: type) type {
             _ = closeWritableSessionWithResumeHandoff(app, log_options);
         }
 
+        fn publishCanonicalResumeSnapshot(
+            app: *App,
+            loaded: *session_store.LoadedWritableSession,
+        ) void {
+            if (comptime !@hasDecl(App, "beginResumeProjection")) return;
+            if (loaded.resumeSnapshotReady()) return;
+
+            const started_ns = io_mod.nanoTimestamp();
+            const live_complete = app.shell.retainsCompleteStreamedSessionHistory();
+            var projection = (if (live_complete and
+                comptime @hasDecl(App, "beginCompleteResumeProjection"))
+                app.beginCompleteResumeProjection()
+            else
+                app.beginResumeProjection()) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "event=resume_snapshot_publish outcome=degraded stage=close_projection_init err={s}",
+                    .{@errorName(err)},
+                );
+                return;
+            };
+            defer projection.deinit();
+            if (!live_complete) {
+                var sink = DetachedHistorySink(@TypeOf(projection)){
+                    .app = app,
+                    .projection = &projection,
+                };
+                replayHistoryToSink(app, &sink, loaded.state.history) catch |err| {
+                    debug_trace.logf(
+                        "session",
+                        "event=resume_snapshot_publish outcome=degraded stage=close_history_projection err={s}",
+                        .{@errorName(err)},
+                    );
+                    return;
+                };
+                writeRecoveryCheckpointToSink(app, &sink, loaded.state) catch |err| {
+                    debug_trace.logf(
+                        "session",
+                        "event=resume_snapshot_publish outcome=degraded stage=close_recovery_projection err={s}",
+                        .{@errorName(err)},
+                    );
+                    return;
+                };
+            }
+            projection.finalizeForResume(false) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "event=resume_snapshot_publish outcome=degraded stage=close_projection_finalize err={s}",
+                    .{@errorName(err)},
+                );
+                return;
+            };
+            if (live_complete) {
+                const transcript_bytes = projection.publicationWireBytes(
+                    app.shell.layout.cols,
+                ) catch |err| blk: {
+                    debug_trace.logf(
+                        "session",
+                        "event=session_transcript outcome=degraded stage=close_reflow err={s}",
+                        .{@errorName(err)},
+                    );
+                    break :blk null;
+                };
+                if (transcript_bytes) |bytes| {
+                    defer app.alloc.free(bytes);
+                    loaded.publishTranscript(app.alloc, bytes) catch |err| {
+                        debug_trace.logf(
+                            "session",
+                            "event=session_transcript outcome=degraded stage=close_publish err={s}",
+                            .{@errorName(err)},
+                        );
+                    };
+                }
+            }
+            const presentation = resume_snapshot.encode(
+                app.alloc,
+                projection.snapshotView(),
+            ) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "event=resume_snapshot_publish outcome=degraded stage=close_projection_encode err={s}",
+                    .{@errorName(err)},
+                );
+                return;
+            };
+            defer app.alloc.free(presentation);
+            loaded.publishResumeSnapshot(app.alloc, presentation) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "event=resume_snapshot_publish outcome=degraded stage=close_durable_replace err={s}",
+                    .{@errorName(err)},
+                );
+                return;
+            };
+            debug_trace.logf(
+                "session",
+                "event=resume_snapshot_publish outcome=current source={s} bytes={d} elapsed_us={d}",
+                .{
+                    if (live_complete) "live_complete_close" else "canonical_close",
+                    presentation.len,
+                    @divTrunc(
+                        io_mod.nanoTimestamp() - started_ns,
+                        std.time.ns_per_us,
+                    ),
+                },
+            );
+        }
+
         fn closeWritableSessionWithResumeHandoff(
             app: *App,
             log_options: session_log.Options,
@@ -4863,13 +5169,6 @@ pub fn Runtime(comptime App: type) type {
                     );
                 };
             }
-            loaded.writeCheckpointIfDue(app.alloc, true, log_options) catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "final checkpoint failed session={s} err={s}",
-                    .{ loaded.active_id, @errorName(err) },
-                );
-            };
             if (app.shell.presentationRecordCanRestamp() and
                 loaded.transcriptNeedsRestamp())
             {
@@ -4883,6 +5182,7 @@ pub fn Runtime(comptime App: type) type {
                     };
                 }
             }
+            publishCanonicalResumeSnapshot(app, loaded);
             const should_create_handoff = resume_boundary_valid and
                 shouldCreateResumeHandoff(.{
                     .intent = handoff_intent,

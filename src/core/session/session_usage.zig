@@ -339,6 +339,25 @@ pub const Snapshot = struct {
     }
 };
 
+/// Removes fields owned exclusively by the validated usage sidecar from an
+/// owned snapshot before it enters the canonical session materialization.
+pub fn stripSidecarOnlyFields(alloc: Allocator, snapshot: *Snapshot) void {
+    snapshot.reasoning_tokens = null;
+    snapshot.request_count = null;
+    for (snapshot.models) |*model| {
+        model.reasoning_tokens = null;
+        model.request_count = null;
+    }
+    for (snapshot.pending) |*pending| pending.observed_at_ms = null;
+    for (snapshot.publication_backlog) |*fact| fact.deinit(alloc);
+    if (snapshot.publication_backlog.len > 0) {
+        alloc.free(snapshot.publication_backlog);
+    }
+    snapshot.publication_backlog = &.{};
+    if (snapshot.incidents.len > 0) alloc.free(snapshot.incidents);
+    snapshot.incidents = &.{};
+}
+
 /// True when a durable session can still contribute profile usage that is not
 /// proven present in the profile ledger.
 pub fn needsProfileRecovery(snapshot: Snapshot) bool {

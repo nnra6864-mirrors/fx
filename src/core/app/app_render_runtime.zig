@@ -2359,6 +2359,12 @@ pub fn Runtime(comptime App: type) type {
                 },
             );
             if (sequential_reset_armed and result.is_committed()) {
+                if (reset_transcript_reader) |*reader| {
+                    app_session_runtime.Runtime(App).persistResetTranscriptAfterFrame(
+                        app,
+                        reader,
+                    );
+                }
                 presentation_shell.finishStreamedResetAttempt();
                 debug_trace.logf(
                     "session",

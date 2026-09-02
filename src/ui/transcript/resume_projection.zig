@@ -6,6 +6,7 @@ const command_output_content = @import("../../core/tooling/command_output_conten
 const command_output_runtime = @import("command_output_runtime.zig");
 const transcript_painter = @import("painter.zig");
 const presentation_record = @import("presentation_record.zig");
+const resume_snapshot = @import("resume_snapshot.zig");
 const source_preparation = @import("source_preparation.zig");
 const transcript_runtime = @import("runtime.zig");
 const transcript_store = @import("store.zig");
@@ -48,7 +49,7 @@ pub const ResumeProjection = struct {
     ) !ResumeProjection {
         var detached = try transcript_store.cloneDetachedPresentationState(source, alloc);
         errdefer detached.deinit(alloc);
-        const retention_cap = detached.max_retained_transcript_bytes;
+        const retention_cap = source.configuredTranscriptRetentionCap();
         var postlude_entries: std.ArrayList(transcript_runtime.TranscriptEntry) = .empty;
         if (capture_postlude and detached.entries.items.len > 0) {
             postlude_entries = detached.entries;
@@ -82,6 +83,31 @@ pub const ResumeProjection = struct {
             next_diff_id,
             false,
         );
+    }
+
+    pub fn initComplete(
+        alloc: Allocator,
+        source: *TranscriptRuntime,
+        created_at_ms: i64,
+        next_diff_id: u32,
+    ) !ResumeProjection {
+        var detached = try transcript_store.cloneDetachedPresentationState(
+            source,
+            alloc,
+        );
+        errdefer detached.deinit(alloc);
+        const retention_cap = source.configuredTranscriptRetentionCap();
+        detached.max_retained_transcript_bytes = std.math.maxInt(usize);
+        detached.restoreHistoricalToolTurnWatermark(
+            historicalToolTurnWatermark(detached.tool_details.items),
+        );
+        return .{
+            .runtime = detached,
+            .alloc = alloc,
+            .created_at_ms = created_at_ms,
+            .retention_cap = retention_cap,
+            .next_diff_id = next_diff_id,
+        };
     }
 
     pub fn deinit(self: *ResumeProjection) void {
@@ -351,7 +377,7 @@ pub const ResumeProjection = struct {
     }
 
     pub fn finalize(self: *ResumeProjection) !void {
-        return self.finalizeForPresentation(false);
+        return self.finalizeForPresentation(false, false);
     }
 
     pub fn finalizeForResume(
@@ -359,20 +385,24 @@ pub const ResumeProjection = struct {
         postlude_persisted: bool,
     ) !void {
         if (postlude_persisted) try self.appendPostlude();
-        return self.finalize();
+        return self.finalizeForPresentation(false, true);
     }
 
     /// A live projection may end at a valid command-output prefix. Keep that
     /// block open so later output and its terminal event can continue it.
     pub fn finalizeLivePresentation(self: *ResumeProjection) !void {
-        return self.finalizeForPresentation(true);
+        return self.finalizeForPresentation(true, false);
     }
 
     fn finalizeForPresentation(
         self: *ResumeProjection,
         allow_open_command_block: bool,
+        preserve_complete_semantics: bool,
     ) !void {
-        return self.finalizeInner(allow_open_command_block) catch |err| switch (err) {
+        return self.finalizeInner(
+            allow_open_command_block,
+            preserve_complete_semantics,
+        ) catch |err| switch (err) {
             error.WriteFailed => error.OutOfMemory,
             else => err,
         };
@@ -381,6 +411,7 @@ pub const ResumeProjection = struct {
     fn finalizeInner(
         self: *ResumeProjection,
         allow_open_command_block: bool,
+        preserve_complete_semantics: bool,
     ) !void {
         std.debug.assert(!self.finalized);
         std.debug.assert(!self.consumed);
@@ -409,12 +440,15 @@ pub const ResumeProjection = struct {
         );
 
         self.runtime.max_retained_transcript_bytes = self.retention_cap;
-        const retention_changed = try self.runtime.enforceStructuredRetentionAndReport(
-            self.alloc,
-            null,
-        );
+        const retention_changed = if (preserve_complete_semantics)
+            transcript_store.retainedStructuredBytes(&self.runtime) > self.retention_cap
+        else
+            try self.runtime.enforceStructuredRetentionAndReport(
+                self.alloc,
+                null,
+            );
         self.retention_changed = retention_changed;
-        if (!retention_changed) {
+        if (!retention_changed or preserve_complete_semantics) {
             self.runtime.transcript.clearRetainingCapacity();
             self.runtime.replaceable_last_line = false;
             self.runtime.replaceable_start = 0;
@@ -471,9 +505,104 @@ pub const ResumeProjection = struct {
         return self.retention_changed;
     }
 
+    pub fn snapshotView(self: *const ResumeProjection) resume_snapshot.View {
+        std.debug.assert(self.finalized);
+        return .{
+            .entries = self.runtime.entries.items,
+            .tool_details = self.runtime.tool_details.items,
+            .folded_command_blocks = self.runtime.folded_command_blocks.items,
+            .command_output_blocks = self.runtime.command_output_blocks.items,
+            .command_output_display = self.runtime.command_output_display,
+            .transcript = self.runtime.transcript.items,
+            .diffs = self.pending_diffs.items,
+            .record_cursor = self.record_cursor,
+            .next_entry_id = self.runtime.next_entry_id,
+            .next_diff_id = self.next_diff_id,
+            .last_rendered_cols = self.runtime.last_rendered_cols,
+            .transcript_cache_origin_untrimmed = self.runtime.transcript_cache_origin_untrimmed,
+            .replaceable_last_line = self.runtime.replaceable_last_line,
+            .replaceable_row = self.runtime.replaceable_row,
+            .replaceable_start = self.runtime.replaceable_start,
+            .retention_cap = self.retention_cap,
+            .retention_changed = self.retention_changed,
+        };
+    }
+
+    pub fn adoptSnapshot(
+        self: *ResumeProjection,
+        snapshot: *resume_snapshot.Owned,
+    ) !void {
+        std.debug.assert(!self.finalized);
+        std.debug.assert(!self.consumed);
+        std.debug.assert(self.runtime.entries.items.len == 0);
+        std.debug.assert(self.runtime.tool_details.items.len == 0);
+        std.debug.assert(self.runtime.folded_command_blocks.items.len == 0);
+        std.debug.assert(self.runtime.command_output_blocks.items.len == 0);
+        std.debug.assert(self.runtime.transcript.items.len == 0);
+        std.debug.assert(self.pending_diffs.items.len == 0);
+
+        self.runtime.entries = listFromOwnedSlice(
+            transcript_blocks.TranscriptEntry,
+            snapshot.entries,
+        );
+        snapshot.entries = &.{};
+        self.runtime.tool_details = listFromOwnedSlice(
+            transcript_blocks.ToolDetailRecord,
+            snapshot.tool_details,
+        );
+        snapshot.tool_details = &.{};
+        self.runtime.folded_command_blocks = listFromOwnedSlice(
+            command_output_runtime.FoldedCommandBlock,
+            snapshot.folded_command_blocks,
+        );
+        snapshot.folded_command_blocks = &.{};
+        self.runtime.command_output_blocks = listFromOwnedSlice(
+            command_output_runtime.CommandOutputBlock,
+            snapshot.command_output_blocks,
+        );
+        snapshot.command_output_blocks = &.{};
+        self.runtime.command_output_display = snapshot.command_output_display;
+        self.runtime.transcript = listFromOwnedSlice(u8, snapshot.transcript);
+        snapshot.transcript = &.{};
+        const installed_diffs = try cloneDiffEntries(
+            std.heap.c_allocator,
+            snapshot.diffs,
+        );
+        for (snapshot.diffs) |*entry| entry.deinit(self.alloc);
+        if (snapshot.diffs.len > 0) self.alloc.free(snapshot.diffs);
+        snapshot.diffs = &.{};
+        self.pending_diffs = listFromOwnedSlice(diff.DiffEntry, installed_diffs);
+
+        self.record_cursor = snapshot.record_cursor;
+        self.runtime.next_entry_id = snapshot.next_entry_id;
+        self.next_diff_id = snapshot.next_diff_id;
+        self.runtime.last_rendered_cols = snapshot.last_rendered_cols;
+        self.runtime.transcript_cache_origin_untrimmed =
+            snapshot.transcript_cache_origin_untrimmed;
+        self.runtime.replaceable_last_line = snapshot.replaceable_last_line;
+        self.runtime.replaceable_row = snapshot.replaceable_row;
+        self.runtime.replaceable_start = snapshot.replaceable_start;
+        self.retention_cap = snapshot.retention_cap;
+        self.runtime.max_retained_transcript_bytes = snapshot.retention_cap;
+        self.retention_changed = snapshot.retention_changed;
+        self.runtime.recomputeCursorFromTranscript();
+        self.runtime.restoreHistoricalToolTurnWatermark(
+            historicalToolTurnWatermark(self.runtime.tool_details.items),
+        );
+        self.publication_source = try self.runtime.prepareTranscriptSource(
+            self.alloc,
+            null,
+        );
+        self.finalized = true;
+    }
+
     /// Installs structured continuation state after historical bytes were
     /// already written directly to the terminal. No pending source is armed.
-    pub fn installRetained(self: *ResumeProjection, target: *TranscriptRuntime) !void {
+    pub fn installRetained(
+        self: *ResumeProjection,
+        target: *TranscriptRuntime,
+        streamed_history_guard_rows: u16,
+    ) !void {
         std.debug.assert(self.finalized);
         std.debug.assert(!self.consumed);
         std.debug.assert(target.pending_resume_source == null);
@@ -497,12 +626,21 @@ pub const ResumeProjection = struct {
             self.runtime.transcript_cache_origin_untrimmed;
         target.command_output_display = self.runtime.command_output_display;
         target.command_output_render = self.runtime.command_output_render;
+        target.restoreHistoricalToolTurnWatermark(
+            historicalToolTurnWatermark(target.tool_details.items),
+        );
         target.replaceable_last_line = self.runtime.replaceable_last_line;
         target.replaceable_row = self.runtime.replaceable_row;
         target.replaceable_start = self.runtime.replaceable_start;
         if (target.streamedSessionHistoryActive()) {
-            target.adoptStreamedSessionHistory();
-            try target.establishStreamedRetainedAnchor(self.alloc);
+            target.adoptStreamedSessionHistoryAt(
+                self.runtime.last_rendered_cols,
+            );
+            target.retainCompleteStreamedSessionHistory();
+            try target.establishStreamedRetainedAnchor(
+                self.alloc,
+                streamed_history_guard_rows,
+            );
         } else {
             target.recomputeCursorFromTranscript();
         }
@@ -604,6 +742,15 @@ pub const ResumeProjection = struct {
         return pending;
     }
 
+    pub fn clonePendingDiffs(
+        self: *ResumeProjection,
+        source: []const diff.DiffEntry,
+    ) !void {
+        std.debug.assert(self.pending_diffs.items.len == 0);
+        const cloned = try cloneDiffEntries(std.heap.c_allocator, source);
+        self.pending_diffs = listFromOwnedSlice(diff.DiffEntry, cloned);
+    }
+
     fn appendPostlude(self: *ResumeProjection) !void {
         _ = try self.appendPostludeTo(&self.runtime);
     }
@@ -626,6 +773,54 @@ pub const ResumeProjection = struct {
         return true;
     }
 };
+
+fn listFromOwnedSlice(comptime T: type, items: []T) std.ArrayList(T) {
+    return .{ .items = items, .capacity = items.len };
+}
+
+fn historicalToolTurnWatermark(
+    details: []const transcript_blocks.ToolDetailRecord,
+) u64 {
+    var watermark: u64 = 0;
+    for (details) |detail| {
+        if (detail.presentation_group_id) |group| {
+            watermark = @max(watermark, group.turn_id);
+        }
+        if (detail.lifecycle_id) |lifecycle| {
+            watermark = @max(watermark, lifecycle.turn_id);
+        }
+    }
+    return watermark;
+}
+
+fn cloneDiffEntries(
+    alloc: Allocator,
+    source: []const diff.DiffEntry,
+) ![]diff.DiffEntry {
+    const entries = try alloc.alloc(diff.DiffEntry, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (entries[0..initialized]) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+    for (source, entries) |from, *to| {
+        to.* = .{ .id = from.id };
+        if (from.full) |full| {
+            const content = try alloc.dupe(u8, full.content);
+            errdefer alloc.free(content);
+            const call_id = try alloc.dupe(u8, full.lifecycle_id.call_id);
+            to.full = .{
+                .content = content,
+                .lifecycle_id = .{
+                    .turn_id = full.lifecycle_id.turn_id,
+                    .call_id = call_id,
+                },
+            };
+        }
+        initialized += 1;
+    }
+    return entries;
+}
 
 fn setEntryId(entry: *transcript_runtime.TranscriptEntry, id: u32) void {
     switch (entry.*) {
@@ -797,7 +992,7 @@ test "exact resume retains structured startup presentation outside the historica
     try target.enableShadowVt(alloc);
     target.adoptStreamedSessionHistory();
     target.resumePresentationRecordAt(64, projection.recordCursor());
-    try projection.installRetained(&target);
+    try projection.installRetained(&target, 0);
     var metrics: types.Metrics = .{};
     try projection.installPostludeRetained(&target, &metrics);
 
@@ -906,7 +1101,7 @@ test "resume projection can install retained continuation without publication" {
     defer projection.deinit();
     _ = try projection.appendRawClassified("retained marker\n", .unknown_raw);
     try projection.finalize();
-    try projection.installRetained(&target);
+    try projection.installRetained(&target, 0);
 
     try std.testing.expectEqual(@as(usize, 0), target.pendingResumeFlow().len);
     try std.testing.expectEqual(@as(usize, 1), target.entries.items.len);
@@ -919,6 +1114,70 @@ test "resume projection can install retained continuation without publication" {
         return error.MissingStreamedTranscriptAnchor;
     try std.testing.expectEqual(@as(u16, 7), stable.cursor_row);
     try std.testing.expectEqual(@as(u16, 5), stable.cursor_col);
+}
+
+test "binary resume projection installs retained continuation without replay" {
+    const alloc = std.testing.allocator;
+    var source: TranscriptRuntime = .{};
+    source.layout = .{
+        .rows = 24,
+        .cols = 72,
+        .content_bottom = 10,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    };
+    defer source.deinit(alloc);
+
+    var built = try ResumeProjection.initEmpty(alloc, &source, 42, 1);
+    defer built.deinit();
+    for (0..30) |index| {
+        var line_buf: [64]u8 = undefined;
+        const line = try std.fmt.bufPrint(
+            &line_buf,
+            "binary retained marker {d}\n",
+            .{index},
+        );
+        _ = try built.appendRawClassified(line, .unknown_raw);
+    }
+    try built.finalize();
+    const bytes = try resume_snapshot.encode(alloc, built.snapshotView());
+    defer alloc.free(bytes);
+    var decoded = try resume_snapshot.decode(alloc, bytes);
+    defer decoded.deinit(alloc);
+
+    var restored = try ResumeProjection.initEmpty(alloc, &source, 43, 1);
+    defer restored.deinit();
+    try restored.adoptSnapshot(&decoded);
+
+    var target: TranscriptRuntime = .{};
+    target.layout = source.layout;
+    defer target.deinit(alloc);
+    try target.enableShadowVt(alloc);
+    target.adoptStreamedSessionHistory();
+    target.resumePresentationRecordAt(64, restored.recordCursor());
+    try restored.installRetained(&target, 6);
+
+    try std.testing.expectEqual(@as(usize, 30), target.entries.items.len);
+    try std.testing.expect(std.mem.find(
+        u8,
+        target.transcript.items,
+        "binary retained marker 29",
+    ) != null);
+    try std.testing.expectEqual(@as(usize, 0), target.pendingResumeFlow().len);
+    var installed_source = try target.prepareTranscriptSource(alloc, null);
+    defer installed_source.deinit(alloc);
+    const stable = target.stableTranscriptProjectionForFlow(
+        installed_source.bytes,
+    ) orelse return error.MissingStreamedTranscriptAnchor;
+    try std.testing.expectEqual(
+        stable.visual_offset,
+        stable.history_visual_offset,
+    );
+    try std.testing.expect(
+        stable.total_visual_rows - stable.visual_offset <= 4,
+    );
 }
 
 test "resume projection transfers a complete standalone runtime" {

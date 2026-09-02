@@ -560,8 +560,14 @@ async function runStress(config: Config): Promise<Paths> {
     const middleMarker = `RESUME_CHAT_${pad(Math.floor(config.chatBatches * config.chatLinesPerBatch / 2))}`;
     const tailMarker = `RESUME_CHAT_${pad(config.chatBatches * config.chatLinesPerBatch - 1)}`;
     const restoredScrollbackPath = join(paths.root, "restored-scrollback.txt");
-    await session.captureFullScrollbackToFile(restoredScrollbackPath);
     const expectedSessionLines = config.chatBatches * config.chatLinesPerBatch;
+    await waitForExactSessionScrollback(
+      session,
+      restoredScrollbackPath,
+      expectedSessionLines,
+      [headMarker, middleMarker, tailMarker, FINAL_MARKER],
+      TIMEOUT * 20,
+    );
     expect(sessionMarkerCounts(restoredScrollbackPath)).toEqual({
       total: expectedSessionLines,
       unique: expectedSessionLines,
