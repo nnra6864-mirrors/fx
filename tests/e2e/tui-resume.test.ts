@@ -4158,7 +4158,7 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "context-deferred scoped tools remain deferred after resume",
+  "context-withheld scoped tools remain explicitly not run after resume",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-deferred-tools-")));
     const home = join(root, "home");
@@ -4271,8 +4271,9 @@ test.skipIf(!tmuxAvailable())(
 
     function expectDeferredPresentation(scrollback: string): void {
       expect(scrollback).toContain("1 failed");
-      expect(scrollback).toContain("1 deferred");
-      expect(scrollback).toContain(`Context updated ${command}`);
+      expect(scrollback).toContain("1 command not run");
+      expect(scrollback).not.toContain("1 deferred");
+      expect(scrollback).toContain(`Not run — project instructions changed: ${command}`);
       expect(scrollback).not.toContain("Not executed");
       expect(scrollback).not.toContain("├ terminal");
       expect(scrollback).not.toContain("└ terminal");
@@ -4328,16 +4329,17 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("C-o");
       const detail = await active.waitForPane(
         (pane) =>
-          pane.includes(`Context updated ${command}`) &&
+          pane.includes(`Not run — project instructions changed: ${command}`) &&
           pane.includes("ordinary-failure-control"),
         TIMEOUT,
       );
-      expect(countOccurrences(detail, "Context updated")).toBe(1);
+      expect(countOccurrences(detail, "Not run — project instructions changed:")).toBe(1);
       expect(detail).not.toContain("Not executed");
       expect(detail).not.toContain('{"path":"nested/input.txt"}');
       expect(detail).not.toContain(JSON.stringify({ command, cwd: "nested" }));
       expect(detail).toContain(failureCommand);
-      expect(detail).toContain("1 deferred");
+      expect(detail).toContain("1 command not run");
+      expect(detail).not.toContain("1 deferred");
       expect(detail).toContain("1 failed");
       expect(readFileSync(resumeStderrPath, "utf8")).toBe("");
 

@@ -203,8 +203,8 @@ test "automatic text steering resumes the same turn without interrupted history"
     try std.testing.expectEqualStrings("Updated answer", hooks.finish_assistant_text.?);
     const execution = hooks.history_turns.items[0].assistant.execution;
     try std.testing.expectEqual(@as(usize, 2), execution.steering.len);
-    try std.testing.expectEqualStrings("first update", execution.steering[0]);
-    try std.testing.expectEqualStrings("second update", execution.steering[1]);
+    try std.testing.expectEqualStrings("first update", execution.steering[0].text);
+    try std.testing.expectEqualStrings("second update", execution.steering[1].text);
 }
 
 test "streamed presentation preserves raw partial through cancellation" {

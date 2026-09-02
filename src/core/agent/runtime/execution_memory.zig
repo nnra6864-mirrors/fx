@@ -61,23 +61,64 @@ pub fn buildExecutionMemory(alloc: Allocator, within_turn_suffix: []const ChatMe
     );
     errdefer types.freeExecutionMemory(alloc, execution);
 
-    var steering: std.ArrayList([]u8) = .empty;
+    var steering: std.ArrayList(types.PersistedSteering) = .empty;
     errdefer {
-        for (steering.items) |text| alloc.free(text);
+        for (steering.items) |item| {
+            alloc.free(item.text);
+            if (item.assistant_prefix) |prefix| alloc.free(prefix);
+        }
         steering.deinit(alloc);
     }
-    for (within_turn_suffix) |message| {
+    var tool_step_count: usize = 0;
+    var assistant_prefix: ?[]const u8 = null;
+    for (within_turn_suffix, 0..) |message, index| {
+        if (startsPersistedToolStep(within_turn_suffix, index)) {
+            tool_step_count += 1;
+            assistant_prefix = null;
+        } else if (message.role == .assistant) {
+            assistant_prefix = message.content;
+        }
         if (message.role != .user) continue;
         const content = message.content orelse continue;
-        const text = steeringText(content) orelse continue;
+        const text = steeringText(content) orelse {
+            assistant_prefix = null;
+            continue;
+        };
         const copy = try alloc.dupe(u8, text);
-        steering.append(alloc, copy) catch |err| {
+        const prefix_copy = if (assistant_prefix) |prefix|
+            execution_memory_helpers.redactText(alloc, prefix) catch |err| {
+                alloc.free(copy);
+                return err;
+            }
+        else
+            null;
+        steering.append(alloc, .{
+            .text = copy,
+            .assistant_prefix = prefix_copy,
+            .after_tool_step_count = tool_step_count,
+        }) catch |err| {
             alloc.free(copy);
+            if (prefix_copy) |prefix| alloc.free(prefix);
             return err;
         };
+        assistant_prefix = null;
     }
+    std.debug.assert(tool_step_count == execution.tool_steps.len);
     execution.steering = try steering.toOwnedSlice(alloc);
     return execution;
+}
+
+fn startsPersistedToolStep(messages: []const ChatMessage, assistant_index: usize) bool {
+    const assistant = messages[assistant_index];
+    if (assistant.role != .assistant or assistant.tool_calls.len == 0) return false;
+    var result_index = assistant_index + 1;
+    while (result_index < messages.len and messages[result_index].role == .tool) : (result_index += 1) {
+        const result_call_id = messages[result_index].tool_call_id orelse continue;
+        for (assistant.tool_calls) |call| {
+            if (std.mem.eql(u8, call.id, result_call_id)) return true;
+        }
+    }
+    return false;
 }
 
 fn steeringText(content: []const u8) ?[]const u8 {
@@ -1164,8 +1205,46 @@ test "execution memory persists consumed steering without protocol wrappers" {
     defer types.freeExecutionMemory(alloc, execution);
 
     try std.testing.expectEqual(@as(usize, 2), execution.steering.len);
-    try std.testing.expectEqualStrings("focus on rendering", execution.steering[0]);
-    try std.testing.expectEqualStrings("run the focused test", execution.steering[1]);
+    try std.testing.expectEqualStrings("focus on rendering", execution.steering[0].text);
+    try std.testing.expectEqualStrings("run the focused test", execution.steering[1].text);
+    try std.testing.expectEqual(@as(usize, 0), execution.steering[0].after_tool_step_count);
+    try std.testing.expectEqual(@as(usize, 0), execution.steering[1].after_tool_step_count);
+}
+
+test "execution memory records each steering tool boundary" {
+    const alloc = std.testing.allocator;
+    const first_steering = try steeringMessage(alloc, "after first");
+    defer alloc.free(first_steering);
+    const second_steering = try steeringMessage(alloc, "after second");
+    defer alloc.free(second_steering);
+    var first_calls = [_]ToolCall{.{
+        .id = "call_first",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"first\"}",
+    }};
+    var second_calls = [_]ToolCall{.{
+        .id = "call_second",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"second\"}",
+    }};
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &first_calls },
+        .{ .role = .tool, .content = "first result", .tool_call_id = "call_first", .tool_name = "read_file", .tool_result_status = .success },
+        .{ .role = .user, .content = first_steering },
+        .{ .role = .assistant, .tool_calls = &second_calls },
+        .{ .role = .tool, .content = "second result", .tool_call_id = "call_second", .tool_name = "read_file", .tool_result_status = .success },
+        .{ .role = .user, .content = second_steering },
+    };
+
+    const execution = try buildExecutionMemory(alloc, &messages);
+    defer types.freeExecutionMemory(alloc, execution);
+
+    try std.testing.expectEqual(@as(usize, 2), execution.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 2), execution.steering.len);
+    try std.testing.expectEqualStrings("after first", execution.steering[0].text);
+    try std.testing.expectEqual(@as(usize, 1), execution.steering[0].after_tool_step_count);
+    try std.testing.expectEqualStrings("after second", execution.steering[1].text);
+    try std.testing.expectEqual(@as(usize, 2), execution.steering[1].after_tool_step_count);
 }
 
 test "transcript does not mark native web_search as provider resource placeholder" {

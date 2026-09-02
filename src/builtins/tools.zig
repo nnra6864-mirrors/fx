@@ -85,7 +85,7 @@ const shell_interact_properties = [_]model_tool_schema.Property{
     .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"interact"} } },
     .{ .name = "session_id", .json_type = .string, .description = "Owned execution handle returned by shell.run." },
     .{ .name = "chars", .json_type = .string, .bounds = &.{ .max_length = terminal_contracts.max_write_bytes }, .description = "Exact characters to send to tty=true work before observing it. Omit or send an empty string to only observe. Observe application readiness before sending control characters. Use \\n for Enter and JSON escapes such as \\u0003 for control characters." },
-    .{ .name = "yield_time_ms", .json_type = .integer, .bounds = &.{ .minimum = 0, .maximum = managed_execution_contract.max_wait_ceiling_ms }, .description = "Observation window after optional input. Defaults to 5000; use 0 for an immediate snapshot. If the process remains running, interact with the same session_id again; never rerun it." },
+    .{ .name = "yield_time_ms", .json_type = .integer, .bounds = &.{ .minimum = 0, .maximum = managed_execution_contract.max_wait_ceiling_ms }, .description = "Wait before yielding output. Empty observations wait 5000-300000 ms; shorter values are raised to 5000. Non-empty input is capped at 30000 ms and keeps shorter requested waits. Defaults to 5000. If the process remains running, interact with the same session_id again; never rerun it." },
 };
 
 const shell_stop_properties = [_]model_tool_schema.Property{
@@ -938,7 +938,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "7fed627d6a17a6c38bf2bd635c074121c2fb5eae8be33f124bb42abe47dfbe34",
+        "47e84930e1fdc99133e76843f795891b35592d32615cacb76a3dfc81e1b23b7a",
         &actual_hex,
     );
 }
@@ -1071,6 +1071,11 @@ test "shell advertises only run interact and stop" {
         u8,
         schema_json,
         "output_delta is always terminal-safe",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        schema_json,
+        "Empty observations wait 5000-300000 ms",
     ) != null);
     try std.testing.expect(registry.lookup("terminal") == null);
     try std.testing.expect(registry.lookup("shell") != null);

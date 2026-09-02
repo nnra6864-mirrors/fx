@@ -5657,12 +5657,16 @@ test "browser run_command maps host cancellation and deadline without signal or 
     try expectCommandResultNull(timeout_json, "signal");
 }
 
-test "run_command propagates output callback failure" {
+test "run_command preserves result when presentation callback fails" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
     const FailOutput = struct {
-        fn write(_: *anyopaque, _: ?types.ToolLifecycleId, _: command_contract.CommandOutputStream, _: []const u8) error{OutOfMemory}!void {
-            return error.OutOfMemory;
+        calls: usize = 0,
+
+        fn write(raw_ctx: *anyopaque, _: ?types.ToolLifecycleId, _: command_contract.CommandOutputStream, _: []const u8) error{Unexpected}!void {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx));
+            self.calls += 1;
+            return error.Unexpected;
         }
     };
 
@@ -5674,17 +5678,20 @@ test "run_command propagates output callback failure" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
 
+    var presentation = FailOutput{};
     var ctx = rt.context();
-    ctx.output_chunk_ctx = @ptrCast(&rt);
+    ctx.output_chunk_ctx = @ptrCast(&presentation);
     ctx.on_output_chunk = FailOutput.write;
-    try std.testing.expectError(
-        error.OutOfMemory,
-        executeTestRunCommand(ctx, arena_state.allocator(), .{
-            .id = "cmd",
-            .name = "shell",
-            .arguments_json = "{\"action\":\"run\",\"command\":\"printf 'handoff\\\\n'\",\"timeout_ms\":600000}",
-        }),
-    );
+    const result = try executeTestRunCommand(ctx, arena_state.allocator(), .{
+        .id = "cmd",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf 'handoff\\\\nsecond\\\\n'\",\"timeout_ms\":600000}",
+    });
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
+    try std.testing.expectEqual(@as(usize, 1), presentation.calls);
+    try expectContains(result.model_output, "handoff\nsecond");
+    const structured = result.command_result_json orelse return error.TestExpectedEqual;
+    try expectCommandResultInt(structured, "exit_code", 0);
 }
 
 test "run_command returns model output and structured metadata" {

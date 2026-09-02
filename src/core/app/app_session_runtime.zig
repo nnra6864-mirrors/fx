@@ -3767,7 +3767,15 @@ pub fn Runtime(comptime App: type) type {
             sink: anytype,
             execution: types.ExecutionMemory,
         ) !void {
-            for (execution.tool_steps) |step| {
+            var steering_index: usize = 0;
+            for (execution.tool_steps, 0..) |step, step_index| {
+                try writePersistedSteeringAtBoundary(
+                    app,
+                    sink,
+                    execution.steering,
+                    &steering_index,
+                    step_index,
+                );
                 if (step.assistant) |assistant| {
                     if (assistant.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, assistant);
                 }
@@ -3788,7 +3796,35 @@ pub fn Runtime(comptime App: type) type {
                     }
                 }
             }
-            try writePermissionFeedback(sink, execution.steering);
+            while (steering_index < execution.steering.len) : (steering_index += 1) {
+                const steering = execution.steering[steering_index];
+                if (steering.assistant_prefix) |prefix| {
+                    if (prefix.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, prefix);
+                }
+                if (steering.text.len == 0) continue;
+                try sink.appendUserTurn(.{ .text = steering.text }, true);
+            }
+        }
+
+        fn writePersistedSteeringAtBoundary(
+            app: *App,
+            sink: anytype,
+            steering: []const types.PersistedSteering,
+            index: *usize,
+            tool_step_count: usize,
+        ) !void {
+            while (index.* < steering.len and
+                steering[index.*].after_tool_step_count == tool_step_count)
+            {
+                const item = steering[index.*];
+                if (item.assistant_prefix) |prefix| {
+                    if (prefix.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, prefix);
+                }
+                if (item.text.len > 0) {
+                    try sink.appendUserTurn(.{ .text = item.text }, true);
+                }
+                index.* += 1;
+            }
         }
 
         fn writePermissionFeedback(sink: anytype, feedback: []const []const u8) !void {
@@ -6526,6 +6562,7 @@ test "execution replay preserves permission denial reasons" {
                 "run_command",
                 reason,
                 null,
+                null,
             ),
             .user_denied, .auto_denied, .policy_denied, .permission_required => try tool_result_errors.toolPermissionDeniedJson(
                 alloc,
@@ -7181,8 +7218,8 @@ test "execution replay preserves paired deferred tools without command output" {
         app.completed_tool_outcomes.items,
     );
     try std.testing.expectEqual(@as(usize, 3), app.completed_tool_statuses.items.len);
-    try std.testing.expectEqualStrings("● Context updated read_file\n", app.completed_tool_statuses.items[0]);
-    try std.testing.expectEqualStrings("● Context updated run_command\n", app.completed_tool_statuses.items[1]);
+    try std.testing.expectEqualStrings("● Not run — project instructions changed: read_file\n", app.completed_tool_statuses.items[0]);
+    try std.testing.expectEqualStrings("● Not run — project instructions changed: run_command\n", app.completed_tool_statuses.items[1]);
     try std.testing.expectEqualStrings("● Not executed read_file\n", app.completed_tool_statuses.items[2]);
     try std.testing.expectEqual(@as(usize, 3), app.historical_tool_detail_entry_ids.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);

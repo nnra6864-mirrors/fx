@@ -293,9 +293,7 @@ pub fn Bindings(comptime App: type) type {
                 else
                     null,
                 .finalize_turn = agentFinalizeTurn,
-                .take_steering = if (comptime @hasDecl(@TypeOf(app.worker), "takeSteering")) agentTakeSteering else null,
-                .take_immediate_steering = if (comptime @hasDecl(@TypeOf(app.worker), "takeImmediateSteering")) agentTakeImmediateSteering else null,
-                .steering_handoff_required = if (comptime @hasDecl(@TypeOf(app.worker), "steeringHandoffRequired")) agentSteeringHandoffRequired else null,
+                .take_steering_boundary = if (comptime @hasDecl(@TypeOf(app.worker), "takeSteeringBoundary")) agentTakeSteeringBoundary else null,
                 .append_runtime_context = agentAppendRuntimeContext,
                 .append_static_context = agentAppendStaticContext,
                 .validate_tool_call = agentValidateToolCall,
@@ -575,32 +573,37 @@ pub fn Bindings(comptime App: type) type {
             });
         }
 
-        fn agentTakeSteering(ctx: *anyopaque, arena: std.mem.Allocator, turn_id: u64) ![]const []const u8 {
+        fn agentTakeSteeringBoundary(
+            ctx: *anyopaque,
+            arena: std.mem.Allocator,
+            turn_id: u64,
+            kind: worker_runtime.SteeringBoundaryKind,
+        ) !worker_runtime.SteeringBoundaryResult {
             const app: *App = @ptrCast(@alignCast(ctx));
-            const owned = try app.worker.takeSteering(std.heap.c_allocator, turn_id);
-            return copyOwnedSteering(arena, owned);
+            const result = try app.worker.takeSteeringBoundary(
+                std.heap.c_allocator,
+                turn_id,
+                kind,
+            );
+            return switch (result) {
+                .continue_turn => |owned| .{
+                    .continue_turn = try copyOwnedSteering(arena, owned),
+                },
+                .none => .none,
+                .handoff => .handoff,
+                .interrupt => .interrupt,
+            };
         }
 
-        fn agentTakeImmediateSteering(ctx: *anyopaque, arena: std.mem.Allocator, turn_id: u64) ![]const []const u8 {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            const owned = try app.worker.takeImmediateSteering(std.heap.c_allocator, turn_id);
-            return copyOwnedSteering(arena, owned);
-        }
-
-        fn copyOwnedSteering(arena: std.mem.Allocator, owned: [][]u8) ![]const []const u8 {
+        fn copyOwnedSteering(arena: std.mem.Allocator, owned: [][]u8) ![][]u8 {
             if (owned.len == 0) return &.{};
             defer {
                 for (owned) |text| std.heap.c_allocator.free(text);
                 std.heap.c_allocator.free(owned);
             }
-            const result = try arena.alloc([]const u8, owned.len);
+            const result = try arena.alloc([]u8, owned.len);
             for (owned, result) |text, *dest| dest.* = try arena.dupe(u8, text);
             return result;
-        }
-
-        fn agentSteeringHandoffRequired(ctx: *anyopaque, turn_id: u64) bool {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            return app.worker.steeringHandoffRequired(turn_id);
         }
 
         fn agentAppendStaticContext(ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {

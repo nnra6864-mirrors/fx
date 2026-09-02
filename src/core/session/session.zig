@@ -3074,7 +3074,22 @@ fn appendExecutionMemoryMessages(
     messages: *std.ArrayList(message.Message),
     execution: core_types.ExecutionMemory,
 ) !void {
-    for (execution.tool_steps) |step| {
+    var steering_index: usize = 0;
+    for (execution.tool_steps, 0..) |step, step_index| {
+        while (steering_index < execution.steering.len and
+            execution.steering[steering_index].after_tool_step_count == step_index)
+        {
+            const steering = execution.steering[steering_index];
+            if (steering.assistant_prefix) |prefix| {
+                if (prefix.len > 0) {
+                    try messages.append(alloc, message.Message.assistantBorrowed(prefix, &.{}));
+                }
+            }
+            if (steering.text.len > 0) {
+                try messages.append(alloc, message.Message.userText(steering.text));
+            }
+            steering_index += 1;
+        }
         if (step.tool_calls.len == 0) continue;
         try messages.append(alloc, .{
             .role = .assistant,
@@ -3101,9 +3116,15 @@ fn appendExecutionMemoryMessages(
         errdefer alloc.free(text);
         try messages.append(alloc, message.Message.userOwned(text));
     }
-    for (execution.steering) |text| {
-        if (text.len == 0) continue;
-        try messages.append(alloc, message.Message.userText(text));
+    while (steering_index < execution.steering.len) : (steering_index += 1) {
+        const steering = execution.steering[steering_index];
+        if (steering.assistant_prefix) |prefix| {
+            if (prefix.len > 0) {
+                try messages.append(alloc, message.Message.assistantBorrowed(prefix, &.{}));
+            }
+        }
+        if (steering.text.len == 0) continue;
+        try messages.append(alloc, message.Message.userText(steering.text));
     }
 }
 
@@ -3112,7 +3133,22 @@ pub fn appendExecutionMemoryChatMessages(
     messages: *std.ArrayList(core_types.ChatMessage),
     execution: core_types.ExecutionMemory,
 ) !void {
-    for (execution.tool_steps) |step| {
+    var steering_index: usize = 0;
+    for (execution.tool_steps, 0..) |step, step_index| {
+        while (steering_index < execution.steering.len and
+            execution.steering[steering_index].after_tool_step_count == step_index)
+        {
+            const steering = execution.steering[steering_index];
+            if (steering.assistant_prefix) |prefix| {
+                if (prefix.len > 0) {
+                    try messages.append(alloc, .{ .role = .assistant, .content = prefix });
+                }
+            }
+            if (steering.text.len > 0) {
+                try messages.append(alloc, .{ .role = .user, .content = steering.text });
+            }
+            steering_index += 1;
+        }
         if (step.tool_calls.len == 0) continue;
         try messages.append(alloc, .{
             .role = .assistant,
@@ -3144,9 +3180,15 @@ pub fn appendExecutionMemoryChatMessages(
         errdefer alloc.free(text);
         try messages.append(alloc, .{ .role = .user, .content = text });
     }
-    for (execution.steering) |text| {
-        if (text.len == 0) continue;
-        try messages.append(alloc, .{ .role = .user, .content = text });
+    while (steering_index < execution.steering.len) : (steering_index += 1) {
+        const steering = execution.steering[steering_index];
+        if (steering.assistant_prefix) |prefix| {
+            if (prefix.len > 0) {
+                try messages.append(alloc, .{ .role = .assistant, .content = prefix });
+            }
+        }
+        if (steering.text.len == 0) continue;
+        try messages.append(alloc, .{ .role = .user, .content = steering.text });
     }
 }
 
@@ -4186,9 +4228,9 @@ test "history projection keeps system role only for leading summaries" {
 
 test "resume history projects steering before the final assistant" {
     const alloc = std.testing.allocator;
-    var steering = [_][]u8{
-        @constCast("use file B instead"),
-        @constCast("keep the result concise"),
+    var steering = [_]core_types.PersistedSteering{
+        .{ .text = @constCast("use file B instead"), .after_tool_step_count = 0 },
+        .{ .text = @constCast("keep the result concise"), .after_tool_step_count = 0 },
     };
     const history = [_]HistoryTurn{.{ .assistant = .{
         .user = .{ .text = @constCast("modify file A") },
@@ -4222,6 +4264,73 @@ test "resume history projects steering before the final assistant" {
         try std.testing.expectEqualStrings(text, projected.content.?.asText());
         try std.testing.expectEqualStrings(text, chat.content.?);
     }
+}
+
+test "resume history preserves steering between tool episodes" {
+    const alloc = std.testing.allocator;
+    var first_calls = [_]ToolCall{.{
+        .id = "call_first",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"first\"}",
+    }};
+    var first_results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("call_first"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("first result"),
+        .output_bytes = "first result".len,
+        .stored_output_bytes = "first result".len,
+    }};
+    var second_calls = [_]ToolCall{.{
+        .id = "call_second",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"second\"}",
+    }};
+    var second_results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("call_second"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("second result"),
+        .output_bytes = "second result".len,
+        .stored_output_bytes = "second result".len,
+    }};
+    var steps = [_]ToolExecutionStep{
+        .{ .tool_calls = &first_calls, .tool_results = &first_results },
+        .{ .tool_calls = &second_calls, .tool_results = &second_results },
+    };
+    var steering = [_]core_types.PersistedSteering{
+        .{ .text = @constCast("after first"), .after_tool_step_count = 1 },
+        .{ .text = @constCast("after second"), .after_tool_step_count = 2 },
+    };
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("run both") },
+        .assistant = @constCast("finished"),
+        .execution = .{
+            .tool_steps = &steps,
+            .steering = &steering,
+        },
+    } }};
+
+    var messages: std.ArrayList(message.Message) = .empty;
+    defer deinitMessages(alloc, &messages);
+    try appendHistoryMessages(alloc, &messages, &history);
+
+    try std.testing.expectEqual(@as(usize, 8), messages.items.len);
+    const expected_roles = [_]message.Role{
+        .user,
+        .assistant,
+        .tool,
+        .user,
+        .assistant,
+        .tool,
+        .user,
+        .assistant,
+    };
+    for (messages.items, expected_roles) |projected, role| {
+        try std.testing.expectEqual(role, projected.role);
+    }
+    try std.testing.expectEqualStrings("after first", messages.items[3].content.?.asText());
+    try std.testing.expectEqualStrings("after second", messages.items[6].content.?.asText());
 }
 
 test "resume projection replays assistant tool execution memory before final answer" {

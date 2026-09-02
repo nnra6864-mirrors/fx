@@ -140,7 +140,7 @@ fn writeToolCallJson(writer: *std.Io.Writer, tool_call: session.ToolCall) !void 
 }
 
 pub fn writeExecutionMemoryJson(writer: *std.Io.Writer, execution: session.ExecutionMemory) !void {
-    try writer.writeAll("{\"schema_version\":2,\"tool_steps\":[");
+    try writer.writeAll("{\"schema_version\":3,\"tool_steps\":[");
     for (execution.tool_steps, 0..) |step, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.writeAll("{\"assistant\":");
@@ -167,9 +167,17 @@ pub fn writeExecutionMemoryJson(writer: *std.Io.Writer, execution: session.Execu
         try writeFileEvidenceJson(writer, file);
     }
     try writer.writeAll("],\"steering\":[");
-    for (execution.steering, 0..) |text, i| {
+    for (execution.steering, 0..) |steering, i| {
         if (i > 0) try writer.writeByte(',');
-        try std.json.Stringify.value(text, .{}, writer);
+        try writer.writeAll("{\"text\":");
+        try std.json.Stringify.value(steering.text, .{}, writer);
+        try writer.writeAll(",\"assistant_prefix\":");
+        if (steering.assistant_prefix) |prefix| {
+            try std.json.Stringify.value(prefix, .{}, writer);
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.print(",\"after_tool_step_count\":{d}}}", .{steering.after_tool_step_count});
     }
     try writer.writeAll("]}");
 }
@@ -759,7 +767,7 @@ fn parseOptionalExecutionMemory(alloc: Allocator, maybe_value: ?std.json.Value) 
     if (value == .null) return .{};
     const object = try requireObject(value);
     const schema_version: i64 = if (object.get("schema_version")) |version| blk: {
-        if (version != .integer or (version.integer != 1 and version.integer != 2)) {
+        if (version != .integer or version.integer < 1 or version.integer > 3) {
             return error.InvalidSessionFormat;
         }
         break :blk version.integer;
@@ -770,10 +778,67 @@ fn parseOptionalExecutionMemory(alloc: Allocator, maybe_value: ?std.json.Value) 
         schema_version,
     );
     errdefer session.freeExecutionMemory(alloc, .{ .tool_steps = tool_steps });
-    const steering = try parseOptionalStringArray(alloc, object.get("steering"));
-    errdefer types.freePermissionFeedback(alloc, steering);
+    const steering = try parseOptionalSteering(
+        alloc,
+        object.get("steering"),
+        schema_version,
+        tool_steps.len,
+    );
+    errdefer types.freePersistedSteering(alloc, steering);
     const files = try parseFileEvidenceSlice(alloc, object.get("files"));
     return .{ .tool_steps = tool_steps, .files = files, .steering = steering };
+}
+
+fn parseOptionalSteering(
+    alloc: Allocator,
+    maybe_value: ?std.json.Value,
+    schema_version: i64,
+    tool_step_count: usize,
+) ![]types.PersistedSteering {
+    const value = maybe_value orelse return &.{};
+    if (value != .array) return error.InvalidSessionFormat;
+    if (value.array.items.len == 0) return &.{};
+    const steering = try alloc.alloc(types.PersistedSteering, value.array.items.len);
+    errdefer alloc.free(steering);
+    var parsed_count: usize = 0;
+    errdefer for (steering[0..parsed_count]) |item| {
+        alloc.free(item.text);
+        if (item.assistant_prefix) |prefix| alloc.free(prefix);
+    };
+    var prior_tool_step_count: usize = 0;
+    for (value.array.items, 0..) |item, index| {
+        const parsed = if (schema_version <= 2)
+            types.PersistedSteering{
+                .text = try alloc.dupe(u8, if (item == .string) item.string else return error.InvalidSessionFormat),
+                .after_tool_step_count = tool_step_count,
+            }
+        else blk: {
+            const object = try requireObject(item);
+            const after_tool_step_count = try requireUsize(object, "after_tool_step_count");
+            if (after_tool_step_count > tool_step_count or
+                (index > 0 and after_tool_step_count < prior_tool_step_count))
+            {
+                return error.InvalidSessionFormat;
+            }
+            const text = try alloc.dupe(u8, try requireString(object, "text"));
+            const assistant_prefix = optionalStringDup(
+                alloc,
+                object.get("assistant_prefix"),
+            ) catch |err| {
+                alloc.free(text);
+                return err;
+            };
+            break :blk types.PersistedSteering{
+                .text = text,
+                .assistant_prefix = assistant_prefix,
+                .after_tool_step_count = after_tool_step_count,
+            };
+        };
+        steering[index] = parsed;
+        parsed_count += 1;
+        prior_tool_step_count = parsed.after_tool_step_count;
+    }
+    return steering;
 }
 
 fn parseToolExecutionSteps(
@@ -1479,7 +1544,11 @@ test "session JSON round-trips assistant execution memory" {
         .tool_calls = calls[0..],
         .tool_results = results[0..],
     }};
-    var steering = [_][]u8{@constCast("focus on rendering")};
+    var steering = [_]types.PersistedSteering{.{
+        .text = @constCast("focus on rendering"),
+        .assistant_prefix = @constCast("partial assistant"),
+        .after_tool_step_count = 1,
+    }};
     var files = [_]session.FileEvidence{.{
         .path = @constCast("src/main.zig"),
         .tool_call_id = @constCast("call_read"),
@@ -1500,9 +1569,11 @@ test "session JSON round-trips assistant execution memory" {
     try std.testing.expect(std.mem.find(u8, json, "\"execution\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"tool_steps\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"files\"") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"schema_version\":2") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"execution\":{\"schema_version\":3") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"permission_feedback\"") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"steering\":[\"focus on rendering\"]") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"text\":\"focus on rendering\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"assistant_prefix\":\"partial assistant\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"after_tool_step_count\":1") != null);
 
     var loaded = try parseStoredSession(TestStoredSession, alloc, json);
     defer loaded.deinit(alloc);
@@ -1524,7 +1595,28 @@ test "session JSON round-trips assistant execution memory" {
     try std.testing.expectEqual(.read, execution.files[0].action);
     try std.testing.expect(execution.files[0].model_view_covers_full_file);
     try std.testing.expectEqual(@as(usize, 1), execution.steering.len);
-    try std.testing.expectEqualStrings("focus on rendering", execution.steering[0]);
+    try std.testing.expectEqualStrings("focus on rendering", execution.steering[0].text);
+    try std.testing.expectEqualStrings("partial assistant", execution.steering[0].assistant_prefix.?);
+    try std.testing.expectEqual(@as(usize, 1), execution.steering[0].after_tool_step_count);
+}
+
+fn checkV3SteeringAllocationFailures(alloc: Allocator) !void {
+    const json =
+        "[{\"text\":\"first\",\"assistant_prefix\":\"prefix one\",\"after_tool_step_count\":0}," ++
+        "{\"text\":\"second\",\"assistant_prefix\":\"prefix two\",\"after_tool_step_count\":1}]";
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const steering = try parseOptionalSteering(alloc, parsed.value, 3, 1);
+    defer types.freePersistedSteering(alloc, steering);
+    try std.testing.expectEqual(@as(usize, 2), steering.len);
+}
+
+test "session JSON steering cleans up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkV3SteeringAllocationFailures,
+        .{},
+    );
 }
 
 const legacy_execution_memory_fixture =
@@ -1534,7 +1626,8 @@ const legacy_execution_memory_fixture =
     "\"execution\":{\"schema_version\":2,\"tool_steps\":[" ++
     "{\"assistant\":\"checking\",\"tool_calls\":[{\"id\":\"call_write\",\"name\":\"write_file\",\"arguments_json\":\"{}\",\"provider_result\":null}],\"tool_results\":[{\"tool_call_id\":\"call_write\",\"tool_name\":\"write_file\",\"status\":\"success\",\"output\":\"wrote\",\"output_handle\":null,\"preview\":null,\"output_bytes\":5,\"stored_output_bytes\":5,\"truncated\":false,\"provider_native\":false,\"created_at_ms\":1,\"permission_feedback\":[\"read it\"]}]}],\"files\":[" ++
     "{\"path\":\"src/main.zig\",\"new_path\":null,\"tool_call_id\":\"call_read\",\"tool_name\":\"read_file\"," ++
-    "\"action\":\"read\",\"status\":\"success\",\"model_view_covers_full_file\":true,\"stale\":false}]}}]}";
+    "\"action\":\"read\",\"status\":\"success\",\"model_view_covers_full_file\":true,\"stale\":false}]," ++
+    "\"steering\":[\"legacy steer\"]}}]}";
 
 fn checkLegacyExecutionMemoryAllocationFailures(alloc: Allocator) !void {
     var loaded = try parseStoredSession(
@@ -1550,6 +1643,14 @@ fn checkLegacyExecutionMemoryAllocationFailures(alloc: Allocator) !void {
     try std.testing.expectEqual(
         @as(usize, 1),
         loaded.history[0].assistant.execution.files.len,
+    );
+    try std.testing.expectEqualStrings(
+        "legacy steer",
+        loaded.history[0].assistant.execution.steering[0].text,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        loaded.history[0].assistant.execution.steering[0].after_tool_step_count,
     );
     try std.testing.expectEqual(
         @as(usize, 1),

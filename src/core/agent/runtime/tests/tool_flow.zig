@@ -2880,7 +2880,10 @@ test "modern context delta defers effectful call exactly once" {
     try std.testing.expect(hooks.lifecycle_events.items[2] == .terminal);
     const terminal = hooks.lifecycle_events.items[2].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.deferred, terminal.outcome.kind);
-    try std.testing.expectEqualStrings("Context updated write_file", terminal.outcome.summary);
+    try std.testing.expectEqualStrings(
+        "Not run — project instructions changed: write_file",
+        terminal.outcome.summary,
+    );
 }
 
 test "modern context delta does not defer unrelated effectful call" {
@@ -4879,7 +4882,10 @@ test "parallel permission preflight failure terminalizes its started lifecycle" 
     });
     const terminal = hooks.lifecycle_events.items[9].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
-    try std.testing.expect(std.mem.endsWith(u8, terminal.outcome.summary, ": preflight failed"));
+    try std.testing.expectEqualStrings(
+        "Failed read_file: permission preflight failed",
+        terminal.outcome.summary,
+    );
 }
 
 test "web_search denial trace records redacted query without api keys or result bodies" {

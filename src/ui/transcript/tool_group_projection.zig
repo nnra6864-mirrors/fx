@@ -421,7 +421,11 @@ fn formatGroupHeader(
     try appendSegment(&out.writer, summary.failed, "failed");
     try appendSegment(&out.writer, summary.denied, "denied");
     try appendSegment(&out.writer, summary.cancelled, "cancelled");
-    try appendSegment(&out.writer, summary.deferred, "deferred");
+    try appendSegment(
+        &out.writer,
+        summary.deferred,
+        if (summary.deferred == 1) "command not run" else "commands not run",
+    );
 
     const plain = try out.toOwnedSlice();
     defer alloc.free(plain);
@@ -1162,11 +1166,11 @@ test "small minimal tool groups surface canonical action targets" {
     );
 }
 
-test "minimal tool groups preserve denied and deferred action text" {
+test "minimal tool groups preserve denied and not-run action text" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{ .id = 1, .bytes = "⊘ Denied by auto agent zig build\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "↻ Context updated runtime.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "↻ Not run — project instructions changed: runtime.zig\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("terminal"), .activity_kind = .command, .outcome = .denied },
@@ -1177,10 +1181,26 @@ test "minimal tool groups preserve denied and deferred action text" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 2 tool calls · 1 read · 1 command · 1 denied · 1 deferred\n" ++
+        "● 2 tool calls · 1 read · 1 command · 1 denied · 1 command not run\n" ++
             "├ Denied by auto agent zig build\n" ++
-            "└ Context updated runtime.zig",
+            "└ Not run — project instructions changed: runtime.zig",
         projection.entry_actions.items[0].override.bytes,
+    );
+}
+
+test "minimal tool group pluralizes context-withheld commands" {
+    const alloc = std.testing.allocator;
+    const header = try formatGroupHeader(
+        alloc,
+        .{ .total = 3, .deferred = 3 },
+        120,
+        .{},
+    );
+    defer alloc.free(header);
+
+    try std.testing.expectEqualStrings(
+        "● 3 tool calls · 3 commands not run",
+        header,
     );
 }
 

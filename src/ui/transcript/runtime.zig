@@ -2596,7 +2596,7 @@ test "historical tool detail attaches to the exact replayed status entry" {
     try std.testing.expectEqual(@as(i64, 123), detail.created_at_ms);
 }
 
-test "historical deferred tool detail keeps the call without result evidence" {
+test "historical context-withheld tool detail keeps the call without result evidence" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{};
     defer runtime.deinit(alloc);
@@ -2606,7 +2606,7 @@ test "historical deferred tool detail keeps the call without result evidence" {
         alloc,
         &metrics,
         .deferred,
-        "Context updated: Running cat nested/input.txt",
+        "Not run — project instructions changed: Running cat nested/input.txt",
         true,
     );
     try runtime.attachHistoricalToolDetail(

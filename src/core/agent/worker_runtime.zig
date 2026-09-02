@@ -55,14 +55,46 @@ pub const QueueReviewDraft = struct {
     skill_display_spans: []SkillDisplaySpan = &.{},
 };
 
+pub const PromptDelivery = union(enum) {
+    ordinary,
+    active_turn: u64,
+    continuation,
+
+    pub fn activeTurnId(self: PromptDelivery) ?u64 {
+        return switch (self) {
+            .active_turn => |turn_id| turn_id,
+            .ordinary, .continuation => null,
+        };
+    }
+
+    pub fn isSteering(self: PromptDelivery) bool {
+        return switch (self) {
+            .ordinary => false,
+            .active_turn, .continuation => true,
+        };
+    }
+
+    pub fn isContinuation(self: PromptDelivery) bool {
+        return self == .continuation;
+    }
+};
+
+pub const SteeringBoundaryKind = enum {
+    model,
+    cancelled,
+};
+
+pub const SteeringBoundaryResult = union(enum) {
+    none,
+    continue_turn: [][]u8,
+    handoff,
+    interrupt,
+};
+
 pub const QueuedPrompt = struct {
     turn_id: u64 = 0,
-    /// The active turn that may consume this prompt as steering. When that turn
-    /// finishes, the target is cleared in place so admission order is retained.
-    steer_target_turn_id: ?u64 = null,
-    /// Set when steering must start as the next worker turn after the active
-    /// turn settles. The model still receives the prompt as live guidance.
-    steering_continuation: bool = false,
+    /// Runtime-derived delivery state. The worker retains ownership in every state.
+    delivery: PromptDelivery = .ordinary,
     prompt: []u8,
     images: []types.ImageAttachment,
     authorized_image_catalog: []types.ImageAttachment = &.{},
@@ -286,6 +318,19 @@ pub const QueuePreview = struct {
     count: usize = 0,
     steering_count: usize = 0,
     paused: bool = false,
+};
+
+pub const QueuePresentationSnapshot = struct {
+    ordinary_count: usize = 0,
+    steering_messages: [][]u8 = &.{},
+    steering_waits_for_tool: bool = false,
+    paused: bool = false,
+
+    pub fn deinit(self: *QueuePresentationSnapshot, alloc: std.mem.Allocator) void {
+        for (self.steering_messages) |message| alloc.free(message);
+        if (self.steering_messages.len > 0) alloc.free(self.steering_messages);
+        self.* = .{};
+    }
 };
 
 pub const QueueReviewReason = enum {
@@ -684,8 +729,8 @@ pub const WorkerRuntime = struct {
         defer self.worker_mutex.unlock(io_mod.getIo());
 
         const steering_pending = for (self.queued_prompts.items) |prompt| {
-            if (prompt.steer_target_turn_id == self.active_turn_id or
-                prompt.steering_continuation) break true;
+            if (prompt.delivery.activeTurnId() == self.active_turn_id or
+                prompt.delivery.isContinuation()) break true;
         } else false;
         const paused = if (steering_pending)
             false
@@ -967,7 +1012,7 @@ pub const WorkerRuntime = struct {
         queued.agent_settings = self.agent_turn_settings;
         var interrupt_after_admission = false;
         if (steer_if_active and self.worker_processing and self.active_turn_id != 0) {
-            queued.steer_target_turn_id = self.active_turn_id;
+            queued.delivery = .{ .active_turn = self.active_turn_id };
             interrupt_after_admission = self.active_tool_calls.count() == 0;
         }
         try self.enqueuePromptLocked(alloc, queued);
@@ -986,19 +1031,7 @@ pub const WorkerRuntime = struct {
     }
 
     fn isSteeringPrompt(prompt: QueuedPrompt) bool {
-        return prompt.steer_target_turn_id != null or prompt.steering_continuation;
-    }
-
-    pub fn steeringHandoffRequired(self: *WorkerRuntime, turn_id: u64) bool {
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
-        if (!self.worker_processing or self.active_turn_id != turn_id) return false;
-        for (self.queued_prompts.items) |prompt| {
-            if (prompt.steer_target_turn_id == turn_id and !sameTurnSteeringEligible(prompt)) {
-                return true;
-            }
-        }
-        return false;
+        return prompt.delivery.isSteering();
     }
 
     fn enqueuePromptLocked(self: *WorkerRuntime, alloc: std.mem.Allocator, queued: QueuedPrompt) !void {
@@ -1019,46 +1052,53 @@ pub const WorkerRuntime = struct {
         self.worker_cond.broadcast(io_mod.getIo());
     }
 
-    /// Returns allocator-owned steering text for `turn_id`, removing only those
-    /// entries from the shared admission-ordered queue.
-    pub fn takeSteering(self: *WorkerRuntime, alloc: std.mem.Allocator, turn_id: u64) ![][]u8 {
+    /// Classifies and drains steering at one observed agent boundary. Returned
+    /// text is allocator-owned; handoff leaves the queued prompt worker-owned.
+    pub fn takeSteeringBoundary(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        turn_id: u64,
+        kind: SteeringBoundaryKind,
+    ) !SteeringBoundaryResult {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
+        const cancel_requested = self.worker_cancel_requested.load(.seq_cst);
         if (!self.worker_processing or
             self.active_turn_id != turn_id or
             self.queue_admission != null)
         {
-            return &.{};
+            return if (kind == .cancelled and cancel_requested) .interrupt else .none;
         }
 
-        return self.takeSteeringLocked(alloc, turn_id);
-    }
-
-    /// Consumes only text steering that owns the current provider cancellation.
-    /// A successful drain atomically returns the cancel flag to the active turn.
-    pub fn takeImmediateSteering(self: *WorkerRuntime, alloc: std.mem.Allocator, turn_id: u64) ![][]u8 {
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
-        if (!self.worker_processing or
-            self.active_turn_id != turn_id or
-            self.queue_admission != null or
-            self.steering_cancel_turn_id != turn_id or
-            !self.worker_cancel_requested.load(.seq_cst))
-        {
-            return &.{};
+        switch (kind) {
+            .cancelled => {
+                if (!cancel_requested) return .none;
+                if (self.steering_cancel_turn_id != turn_id) return .interrupt;
+                const messages = try self.takeSteeringLocked(alloc, turn_id);
+                if (messages.len == 0) return .interrupt;
+                self.steering_cancel_turn_id = null;
+                self.worker_cancel_requested.store(false, .seq_cst);
+                return .{ .continue_turn = messages };
+            },
+            .model => {
+                if (cancel_requested) return .none;
+                for (self.queued_prompts.items) |prompt| {
+                    if (prompt.delivery.activeTurnId() == turn_id and
+                        !sameTurnSteeringEligible(prompt)) return .handoff;
+                }
+                const messages = try self.takeSteeringLocked(alloc, turn_id);
+                return if (messages.len == 0)
+                    .none
+                else
+                    .{ .continue_turn = messages };
+            },
         }
-
-        const messages = try self.takeSteeringLocked(alloc, turn_id);
-        if (messages.len == 0) return &.{};
-        self.steering_cancel_turn_id = null;
-        self.worker_cancel_requested.store(false, .seq_cst);
-        return messages;
     }
 
     fn takeSteeringLocked(self: *WorkerRuntime, alloc: std.mem.Allocator, turn_id: u64) ![][]u8 {
         var steering_count: usize = 0;
         for (self.queued_prompts.items) |prompt| {
-            if (prompt.steer_target_turn_id != turn_id) continue;
+            if (prompt.delivery.activeTurnId() != turn_id) continue;
             if (!sameTurnSteeringEligible(prompt)) return &.{};
             steering_count += 1;
         }
@@ -1077,7 +1117,7 @@ pub const WorkerRuntime = struct {
             alloc.free(events);
         }
         for (self.queued_prompts.items) |prompt| {
-            if (prompt.steer_target_turn_id != turn_id) continue;
+            if (prompt.delivery.activeTurnId() != turn_id) continue;
             messages[copied] = try alloc.dupe(u8, prompt.prompt);
             copied += 1;
             events[event_count] = .{
@@ -1091,7 +1131,7 @@ pub const WorkerRuntime = struct {
 
         var index: usize = 0;
         while (index < self.queued_prompts.items.len) {
-            if (self.queued_prompts.items[index].steer_target_turn_id != turn_id) {
+            if (self.queued_prompts.items[index].delivery.activeTurnId() != turn_id) {
                 index += 1;
                 continue;
             }
@@ -1449,11 +1489,10 @@ pub const WorkerRuntime = struct {
         self.recovery_continuation_ready = false;
         self.worker_processing = true;
         self.active_turn_id = job.turn_id;
-        if (job.steering_continuation) {
+        if (job.delivery.isContinuation()) {
             for (self.queued_prompts.items) |*prompt| {
-                if (!prompt.steering_continuation or !sameTurnSteeringEligible(prompt.*)) continue;
-                prompt.steer_target_turn_id = job.turn_id;
-                prompt.steering_continuation = false;
+                if (!prompt.delivery.isContinuation() or !sameTurnSteeringEligible(prompt.*)) continue;
+                prompt.delivery = .{ .active_turn = job.turn_id };
             }
         }
         self.active_context_compaction = false;
@@ -1479,9 +1518,8 @@ pub const WorkerRuntime = struct {
         // order in which steering and ordinary prompts were submitted.
         const finished_turn_id = self.active_turn_id;
         for (self.queued_prompts.items) |*prompt| {
-            if (prompt.steer_target_turn_id == finished_turn_id) {
-                prompt.steer_target_turn_id = null;
-                prompt.steering_continuation = true;
+            if (prompt.delivery.activeTurnId() == finished_turn_id) {
+                prompt.delivery = .continuation;
             }
         }
         self.worker_processing = false;
@@ -1658,37 +1696,36 @@ pub const WorkerRuntime = struct {
         };
     }
 
-    /// Returns allocator-owned copies of steering that is visibly waiting on
-    /// the active tool boundary. Immediate steering remains hidden until it is
-    /// committed as a user turn after the model cutoff.
-    pub fn snapshotVisibleSteeringMessages(self: *WorkerRuntime, alloc: std.mem.Allocator) ![][]u8 {
+    /// Returns one coherent, allocator-owned queue presentation snapshot.
+    pub fn snapshotQueuePresentation(self: *WorkerRuntime, alloc: std.mem.Allocator) !QueuePresentationSnapshot {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
 
-        var count: usize = 0;
+        const queued_count = self.queued_prompts.items.len;
+        var steering_count: usize = 0;
         for (self.queued_prompts.items) |prompt| {
-            if (self.pendingSteeringVisibleLocked(prompt)) count += 1;
+            if (isSteeringPrompt(prompt)) steering_count += 1;
         }
-        if (count == 0) return &.{};
+        var snapshot: QueuePresentationSnapshot = .{
+            .ordinary_count = queued_count -| steering_count,
+            .steering_waits_for_tool = steering_count > 0 and self.active_tool_calls.count() > 0,
+            .paused = self.queue_admission != null,
+        };
+        if (steering_count == 0) return snapshot;
 
-        const messages = try alloc.alloc([]u8, count);
+        const messages = try alloc.alloc([]u8, steering_count);
         var copied: usize = 0;
         errdefer {
             for (messages[0..copied]) |message| alloc.free(message);
             alloc.free(messages);
         }
         for (self.queued_prompts.items) |prompt| {
-            if (!self.pendingSteeringVisibleLocked(prompt)) continue;
+            if (!isSteeringPrompt(prompt)) continue;
             messages[copied] = try alloc.dupe(u8, prompt.prompt);
             copied += 1;
         }
-        return messages;
-    }
-
-    fn pendingSteeringVisibleLocked(self: *const WorkerRuntime, prompt: QueuedPrompt) bool {
-        if (!isSteeringPrompt(prompt)) return false;
-        return self.steering_cancel_turn_id == null or
-            prompt.steer_target_turn_id != self.steering_cancel_turn_id;
+        snapshot.steering_messages = messages;
+        return snapshot;
     }
 
     pub fn queuedPromptCount(self: *WorkerRuntime) usize {
@@ -3705,6 +3742,13 @@ fn freeEventList(alloc: std.mem.Allocator, events: *std.ArrayList(WorkerEvent)) 
     events.deinit(alloc);
 }
 
+fn expectContinuedSteering(result: SteeringBoundaryResult) ![]const []const u8 {
+    return switch (result) {
+        .continue_turn => |messages| messages,
+        .none, .handoff, .interrupt => error.TestExpectedContinuedSteering,
+    };
+}
+
 test "interactive prompt admission derives steering from active worker state" {
     const alloc = std.testing.allocator;
     var runtime = WorkerRuntime{};
@@ -3714,7 +3758,9 @@ test "interactive prompt admission derives steering from active worker state" {
 
     try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "steer", "model"));
 
-    const guidance = try runtime.takeSteering(alloc, 41);
+    const guidance = try expectContinuedSteering(
+        try runtime.takeSteeringBoundary(alloc, 41, .cancelled),
+    );
     defer {
         for (guidance) |text| alloc.free(text);
         alloc.free(guidance);
@@ -3732,7 +3778,9 @@ test "active prompt admission drains steering in FIFO order" {
 
     try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "first", "model"));
     try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "second", "model"));
-    const guidance = try runtime.takeSteering(alloc, 41);
+    const guidance = try expectContinuedSteering(
+        try runtime.takeSteeringBoundary(alloc, 41, .cancelled),
+    );
     defer {
         for (guidance) |text| alloc.free(text);
         alloc.free(guidance);
@@ -3761,7 +3809,9 @@ test "immediate steering owns and clears only its cancellation" {
     try std.testing.expect(steering_snapshot.cancel_requested);
     try std.testing.expect(steering_snapshot.cancel_continues_turn);
 
-    const guidance = try runtime.takeImmediateSteering(alloc, 41);
+    const guidance = try expectContinuedSteering(
+        try runtime.takeSteeringBoundary(alloc, 41, .cancelled),
+    );
     defer {
         for (guidance) |text| alloc.free(text);
         alloc.free(guidance);
@@ -3787,8 +3837,8 @@ test "explicit interrupt overrides immediate steering cancellation" {
     try std.testing.expect(interrupt_snapshot.cancel_requested);
     try std.testing.expect(!interrupt_snapshot.cancel_continues_turn);
 
-    const guidance = try runtime.takeImmediateSteering(alloc, 41);
-    try std.testing.expectEqual(@as(usize, 0), guidance.len);
+    const boundary = try runtime.takeSteeringBoundary(alloc, 41, .cancelled);
+    try std.testing.expect(boundary == .interrupt);
     try std.testing.expect(runtime.isCancelRequested());
     try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
 }
@@ -3884,14 +3934,12 @@ test "rich interactive input remains steering and hands off at the tool boundary
     const preview = runtime.queuePreview();
     try std.testing.expectEqual(@as(usize, 1), preview.steering_count);
     try std.testing.expect(!runtime.isCancelRequested());
-    try std.testing.expect(runtime.steeringHandoffRequired(41));
-
-    const guidance = try runtime.takeSteering(alloc, 41);
-    try std.testing.expectEqual(@as(usize, 0), guidance.len);
+    const boundary = try runtime.takeSteeringBoundary(alloc, 41, .model);
+    try std.testing.expect(boundary == .handoff);
     try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
 }
 
-test "immediate steering stays hidden until the cutoff commits its user turn" {
+test "immediate steering is visible while the provider cutoff settles" {
     const alloc = std.testing.allocator;
     var runtime = WorkerRuntime{};
     defer runtime.deinit(alloc);
@@ -3900,18 +3948,13 @@ test "immediate steering stays hidden until the cutoff commits its user turn" {
 
     try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "first", "model"));
     try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "second", "model"));
-    const messages = try runtime.snapshotVisibleSteeringMessages(alloc);
-    defer {
-        for (messages) |message| alloc.free(message);
-        alloc.free(messages);
-    }
+    var snapshot = try runtime.snapshotQueuePresentation(alloc);
+    defer snapshot.deinit(alloc);
 
-    const guidance = try runtime.takeSteering(alloc, 41);
-    defer {
-        for (guidance) |text| alloc.free(text);
-        alloc.free(guidance);
-    }
-    try std.testing.expectEqual(@as(usize, 0), messages.len);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.steering_messages.len);
+    try std.testing.expectEqualStrings("first", snapshot.steering_messages[0]);
+    try std.testing.expectEqualStrings("second", snapshot.steering_messages[1]);
+    try std.testing.expect(!snapshot.steering_waits_for_tool);
 }
 
 test "tool-blocked steering snapshot owns visible messages in admission order" {
@@ -3930,14 +3973,12 @@ test "tool-blocked steering snapshot owns visible messages in admission order" {
     try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "first", "model"));
     try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "second", "model"));
 
-    const messages = try runtime.snapshotVisibleSteeringMessages(alloc);
-    defer {
-        for (messages) |message| alloc.free(message);
-        alloc.free(messages);
-    }
-    try std.testing.expectEqual(@as(usize, 2), messages.len);
-    try std.testing.expectEqualStrings("first", messages[0]);
-    try std.testing.expectEqualStrings("second", messages[1]);
+    var snapshot = try runtime.snapshotQueuePresentation(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.steering_messages.len);
+    try std.testing.expectEqualStrings("first", snapshot.steering_messages[0]);
+    try std.testing.expectEqualStrings("second", snapshot.steering_messages[1]);
+    try std.testing.expect(snapshot.steering_waits_for_tool);
 }
 
 test "manual queue review does not intercept active steering" {
@@ -3950,7 +3991,9 @@ test "manual queue review does not intercept active steering" {
     try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "before", "model"));
     try std.testing.expect(!runtime.beginQueueReview(.manual));
 
-    const guidance = try runtime.takeSteering(alloc, 41);
+    const guidance = try expectContinuedSteering(
+        try runtime.takeSteeringBoundary(alloc, 41, .cancelled),
+    );
     defer {
         for (guidance) |text| alloc.free(text);
         alloc.free(guidance);
@@ -3974,10 +4017,9 @@ test "late steering keeps admission order when demoted on finish" {
     try std.testing.expectEqual(@as(u64, 0), runtime.active_turn_id);
     try std.testing.expectEqual(@as(usize, 2), runtime.queuedPromptCount());
     try std.testing.expectEqualStrings("steer first", runtime.queued_prompts.items[0].prompt);
-    try std.testing.expect(runtime.queued_prompts.items[0].steer_target_turn_id == null);
-    try std.testing.expect(runtime.queued_prompts.items[0].steering_continuation);
+    try std.testing.expect(runtime.queued_prompts.items[0].delivery.isContinuation());
     try std.testing.expectEqualStrings("queue second", runtime.queued_prompts.items[1].prompt);
-    try std.testing.expect(!runtime.queued_prompts.items[1].steering_continuation);
+    try std.testing.expect(!runtime.queued_prompts.items[1].delivery.isContinuation());
 }
 
 test "promoted steering retargets remaining guidance without exposing a queue" {
@@ -3993,10 +4035,12 @@ test "promoted steering retargets remaining guidance without exposing a queue" {
 
     const promoted = (try runtime.tryTakeNextPrompt(alloc)).?;
     defer freeQueuedPrompt(alloc, promoted);
-    try std.testing.expect(promoted.steering_continuation);
+    try std.testing.expect(promoted.delivery.isContinuation());
     try std.testing.expectEqual(@as(usize, 1), runtime.queuePreview().steering_count);
 
-    const guidance = try runtime.takeSteering(alloc, promoted.turn_id);
+    const guidance = try expectContinuedSteering(
+        try runtime.takeSteeringBoundary(alloc, promoted.turn_id, .model),
+    );
     defer {
         for (guidance) |text| alloc.free(text);
         alloc.free(guidance);
@@ -4028,16 +4072,17 @@ test "promoted steering keeps rich trailing guidance for its own turn" {
 
     const promoted = (try runtime.tryTakeNextPrompt(alloc)).?;
     defer freeQueuedPrompt(alloc, promoted);
-    try std.testing.expect(promoted.steering_continuation);
+    try std.testing.expect(promoted.delivery.isContinuation());
     try std.testing.expectEqual(@as(usize, 1), runtime.queuePreview().steering_count);
-    try std.testing.expect(!runtime.steeringHandoffRequired(promoted.turn_id));
+    const boundary = try runtime.takeSteeringBoundary(alloc, promoted.turn_id, .model);
+    try std.testing.expect(boundary == .none);
     try std.testing.expect(!runtime.requestInteractiveCancel());
     try std.testing.expect(runtime.queueReviewReason() == null);
 
     runtime.finishProcessing();
     const trailing = (try runtime.tryTakeNextPrompt(alloc)).?;
     defer freeQueuedPrompt(alloc, trailing);
-    try std.testing.expect(trailing.steering_continuation);
+    try std.testing.expect(trailing.delivery.isContinuation());
     try std.testing.expectEqualStrings("second with image", trailing.prompt);
 }
 
@@ -4054,7 +4099,8 @@ test "clear queued prompts also clears steering" {
 
     try std.testing.expectEqual(@as(usize, 0), runtime.queuePreview().count);
     try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
-    try std.testing.expectEqual(@as(usize, 0), (try runtime.takeSteering(alloc, 9)).len);
+    const boundary = try runtime.takeSteeringBoundary(alloc, 9, .model);
+    try std.testing.expect(boundary == .none);
 }
 
 test "idle interactive admission uses ordinary queue" {
@@ -4064,7 +4110,7 @@ test "idle interactive admission uses ordinary queue" {
 
     try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "next", "model"));
     try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
-    try std.testing.expect(runtime.queued_prompts.items[0].steer_target_turn_id == null);
+    try std.testing.expect(runtime.queued_prompts.items[0].delivery == .ordinary);
 }
 
 test "request shutdown sets stop and cancel flags" {

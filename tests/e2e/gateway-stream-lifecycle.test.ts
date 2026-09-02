@@ -3022,6 +3022,87 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  test("incomplete shell output preserves process status without replaying effects", async () => {
+    const root = createFixtureRoot("shell-incomplete-output");
+    const tracePath = join(root.root, "trace.log");
+    const effectPath = join(root.workspace, "command-effect.txt");
+    const callId = "shell_incomplete_output_1";
+    let observedFailure = "";
+    let step = 0;
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeShellRun(
+            callId,
+            "printf 'effect\\n' >> command-effect.txt; printf 'partial output\\n'",
+            { timeout_ms: 30_000 },
+          );
+        case 1:
+          observedFailure = toolResultOutput(body, callId);
+          return fakeGatewayFinalText("Incomplete output acknowledged without retry.");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Run the mutation exactly once."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_COMMAND_TEST_OUTPUT_INCOMPLETE_AFTER_EXIT: "1",
+          },
+          timeoutMs: 15_000,
+        },
+      );
+      const json = JSON.parse(result.stdout) as {
+        exit_code: number;
+        output: string;
+        tool_calls: Array<{
+          name: string;
+          status: string;
+          command_result?: {
+            exit_code?: number;
+            output_incomplete?: boolean;
+          };
+        }>;
+      };
+
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.output).toContain("acknowledged without retry");
+      expect(gateway.requestCount()).toBe(2);
+      expect(readFileSync(effectPath, "utf8")).toBe("effect\n");
+      expect(JSON.parse(observedFailure)).toMatchObject({
+        state: "completed",
+        exit_code: 0,
+        output_incomplete: true,
+      });
+      expect(observedFailure).toContain("partial output");
+      expect(observedFailure).toContain("do not blindly rerun");
+      expect(observedFailure).not.toContain("Unexpected");
+      expect(json.tool_calls).toHaveLength(1);
+      expect(json.tool_calls[0]).toMatchObject({
+        name: "shell",
+        status: "error",
+        command_result: {
+          exit_code: 0,
+          output_incomplete: true,
+        },
+      });
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "command output drain incomplete reason=injected_after_exit",
+      );
+      expect(result.stderr).not.toContain("Unexpected");
+      expect(result.stderr).not.toContain("error.Unexpected");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("suffixless stored result handle remains readable", async () => {
     const root = createFixtureRoot("suffixless-tool-result-handle");
     const tracePath = join(root.root, "trace.log");

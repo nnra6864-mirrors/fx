@@ -1205,24 +1205,27 @@ fn failureStatusDetail(
     advertised_dynamic_tool_names: []const []const u8,
 ) !?[]const u8 {
     if (result.status_detail) |detail| {
-        if (!std.mem.eql(u8, detail, "preflight failed") or
-            !file_mutation_contract.isToolName(call.name) or
-            !std.mem.startsWith(u8, safe_result, call.name))
+        if (!std.mem.eql(u8, detail, "preflight failed")) return detail;
+
+        if (file_mutation_contract.isToolName(call.name) and
+            std.mem.startsWith(u8, safe_result, call.name))
         {
-            return detail;
+            const failure_prefix = " failed: ";
+            const remainder = safe_result[call.name.len..];
+            if (std.mem.startsWith(u8, remainder, failure_prefix)) {
+                const actionable = remainder[failure_prefix.len..];
+                if (actionable.len > 0 and
+                    std.mem.findScalar(u8, actionable, '\n') == null and
+                    std.mem.findScalar(u8, actionable, '\r') == null)
+                {
+                    return actionable;
+                }
+            }
         }
 
-        const failure_prefix = " failed: ";
-        const remainder = safe_result[call.name.len..];
-        if (!std.mem.startsWith(u8, remainder, failure_prefix)) return detail;
-        const actionable = remainder[failure_prefix.len..];
-        if (actionable.len == 0 or
-            std.mem.findScalar(u8, actionable, '\n') != null or
-            std.mem.findScalar(u8, actionable, '\r') != null)
-        {
-            return detail;
-        }
-        return actionable;
+        if (safe_result.len == 0) return detail;
+        const encoded = try text_utils.encodeTerminalSafe(arena, safe_result, 256);
+        return if (encoded.bytes.len == 0) detail else encoded.bytes;
     }
 
     if (safe_result.len == 0 or
@@ -2135,6 +2138,47 @@ test "file edit preflight failure reports the exact mismatch" {
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
     try std.testing.expectEqualStrings(
         "Failed edit_file: old_string not found in file",
+        terminal.outcome.summary,
+    );
+}
+
+test "permission target preflight failure reports the actionable reason" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    const failure = "Permission target resolution failed for grep_files: FileNotFound";
+
+    try finishExecutedToolStatus(
+        &hooks,
+        arena,
+        5,
+        .{
+            .id = "grep_preflight",
+            .name = "grep_files",
+            .arguments_json = "{\"pattern\":\"upgrade\",\"path\":\"/tmp/missing\"}",
+        },
+        true,
+        null,
+        .{
+            .status = .failure,
+            .model_output = failure,
+            .status_detail = "preflight failed",
+        },
+        failure,
+        .{ .output_bytes = failure.len, .stored_output_bytes = failure.len },
+        null,
+        &.{},
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
+    const terminal = capture.events.items[0].terminal;
+    try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
+    try std.testing.expectEqualStrings(
+        "Failed grep_files: Permission target resolution failed for grep_files: FileNotFound",
         terminal.outcome.summary,
     );
 }

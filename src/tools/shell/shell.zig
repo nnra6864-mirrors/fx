@@ -159,6 +159,16 @@ fn defaultYieldTime(action: Action) u32 {
     };
 }
 
+fn effective_interact_yield_time(has_input: bool, requested_ms: u32) u32 {
+    if (!has_input) {
+        return @min(
+            @max(requested_ms, managed_contract.default_wait_ceiling_ms),
+            managed_contract.max_wait_ceiling_ms,
+        );
+    }
+    return @min(requested_ms, managed_contract.max_yield_time_ms);
+}
+
 fn decodeFailure(
     ctx: tool_dispatch.DispatchContext,
 ) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
@@ -423,6 +433,7 @@ fn callInteract(
     ensureOwnedTtyIndexed(ctx, runtime, session_id) catch |err|
         return runtimeFailure(ctx, err);
     const chars = input.chars orelse "";
+    const yield_time_ms = effective_interact_yield_time(chars.len != 0, input.yield_time_ms);
     if (runtime.isTombstone(session_id)) {
         if (chars.len != 0) return runtimeFailure(ctx, error.ExecutionTerminal);
         if (runtime.retainedTerminalSnapshot(ctx.allocator, session_id) catch |err|
@@ -434,13 +445,13 @@ fn callInteract(
         }
     }
     if (runtime.backendFor(session_id) == .tty) {
-        return callTtyInteract(ctx, input);
+        return callTtyInteract(ctx, input, yield_time_ms);
     }
     if (chars.len != 0) return runtimeFailure(ctx, error.InvalidBackend);
     var prepared = runtime.wait(
         ctx.allocator,
         session_id,
-        input.yield_time_ms,
+        yield_time_ms,
         ctx.cancel_flag,
     ) catch |err| return runtimeFailure(ctx, err);
     defer prepared.deinit(ctx.allocator);
@@ -603,6 +614,7 @@ fn callTtyRun(
 fn callTtyInteract(
     ctx: tool_dispatch.DispatchContext,
     input: Input,
+    yield_time_ms: u32,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const runtime = ctx.managed_executions orelse return unavailable(ctx);
     const session_id = input.session_id orelse return unavailable(ctx);
@@ -684,11 +696,11 @@ fn callTtyInteract(
     const waiter_id = runtime.reserveExternalWait(session_id) catch |err|
         return runtimeFailure(ctx, err);
     defer runtime.releaseExternalWait(session_id, waiter_id);
-    if (state == .running and input.yield_time_ms != 0) {
+    if (state == .running and yield_time_ms != 0) {
         var waited = executeAuthorizedTerminal(ctx, session_id, .{ .wait = .{
             .session_id = session_id,
             .return_when = .exit,
-            .safety_ceiling_ms = input.yield_time_ms,
+            .safety_ceiling_ms = yield_time_ms,
             .authority = null,
         } }) catch |err| return runtimeFailure(ctx, err);
         defer waited.deinit(ctx.allocator);
@@ -701,7 +713,7 @@ fn callTtyInteract(
         };
         state = terminal_managed_observer.snapshotState(result.session, result.outcome);
     }
-    if (accepted_bytes != null and input.yield_time_ms == 0) {
+    if (accepted_bytes != null and yield_time_ms == 0) {
         io_mod.sleep(100 * std.time.ns_per_ms);
     }
     var observed = terminal_managed_observer.observe(
@@ -1151,7 +1163,7 @@ fn finishPrepared(
     handoffPreparedDelivery(ctx, runtime, prepared.reservation_id) catch {
         return .{ .failure = try ctx.allocator.dupe(u8, "shell result commit failed") };
     };
-    return if (action == .command and snapshotFailed(prepared.snapshot.state))
+    return if (action == .command and snapshotFailed(prepared.snapshot))
         .{ .failure = body }
     else
         .{ .success = body };
@@ -1221,6 +1233,7 @@ fn publishSnapshotMetadata(
             .signal = projection.signal,
             .timed_out = timed_out,
             .termination_indeterminate = projection.termination_indeterminate,
+            .output_incomplete = snapshot.output_incomplete,
             .duration_ms = snapshot.duration_ms,
             .stdout_bytes = snapshot.stdout_bytes,
             .stderr_bytes = snapshot.stderr_bytes,
@@ -1406,6 +1419,12 @@ fn formatSnapshotRaw(
             .signal = null,
             .termination_indeterminate = false,
         };
+    const retry_guidance: ?[]const u8 = if (snapshot.output_incomplete)
+        "Command output is incomplete. Inspect external state and available output before retrying; do not blindly rerun a command that may have changed state."
+    else switch (snapshot.state) {
+        .lost => "Execution status is indeterminate. Inspect external state before retrying; do not blindly rerun a command that may have changed state.",
+        .running, .completed, .stopped => null,
+    };
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     try std.json.Stringify.value(.{
@@ -1414,6 +1433,7 @@ fn formatSnapshotRaw(
         .backend = @tagName(snapshot.backend),
         .persistence = @tagName(snapshot.persistence),
         .output_truncated = output_truncated,
+        .output_incomplete = snapshot.output_incomplete,
         .output_terminal_safe = true,
         .full_output_handle = snapshot.output_file,
         .exit_code = projection.exit_code,
@@ -1422,10 +1442,7 @@ fn formatSnapshotRaw(
         .duration_ms = snapshot.duration_ms,
         .accepted_bytes = accepted_bytes,
         .@"error" = snapshot.error_name,
-        .retry_guidance = switch (snapshot.state) {
-            .lost => "Execution status is indeterminate. Inspect external state before retrying; do not blindly rerun a command that may have changed state.",
-            .running, .completed, .stopped => null,
-        },
+        .retry_guidance = retry_guidance,
         .output_delta = output_delta,
     }, .{}, &out.writer);
     return try out.toOwnedSlice();
@@ -1440,8 +1457,9 @@ fn snapshotStateName(state: managed_execution.SnapshotState) []const u8 {
     };
 }
 
-fn snapshotFailed(state: managed_execution.SnapshotState) bool {
-    return switch (state) {
+fn snapshotFailed(snapshot: managed_execution.Snapshot) bool {
+    if (snapshot.output_incomplete) return true;
+    return switch (snapshot.state) {
         .running => false,
         .completed => |status| switch (status) {
             .exit_code => |code| code != 0,
@@ -1740,6 +1758,53 @@ test "shell decoder applies action specific observation defaults" {
     }
 }
 
+test "shell interaction wait bounds empty observations without delaying writes" {
+    const cases = [_]struct {
+        has_input: bool,
+        requested_ms: u32,
+        expected_ms: u32,
+    }{
+        .{ .has_input = false, .requested_ms = 0, .expected_ms = 5_000 },
+        .{ .has_input = false, .requested_ms = 1_000, .expected_ms = 5_000 },
+        .{ .has_input = false, .requested_ms = 5_000, .expected_ms = 5_000 },
+        .{ .has_input = false, .requested_ms = 45_000, .expected_ms = 45_000 },
+        .{ .has_input = false, .requested_ms = 300_000, .expected_ms = 300_000 },
+        .{ .has_input = true, .requested_ms = 0, .expected_ms = 0 },
+        .{ .has_input = true, .requested_ms = 1_000, .expected_ms = 1_000 },
+        .{ .has_input = true, .requested_ms = 30_000, .expected_ms = 30_000 },
+        .{ .has_input = true, .requested_ms = 300_000, .expected_ms = 30_000 },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(
+            case.expected_ms,
+            effective_interact_yield_time(case.has_input, case.requested_ms),
+        );
+    }
+
+    const failure = try validateInteract(
+        .{ .allocator = std.testing.allocator },
+        .{
+            .action = .interact,
+            .session_id = "shell-1",
+            .yield_time_ms = managed_contract.max_wait_ceiling_ms + 1,
+        },
+    ) orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(failure);
+    try std.testing.expect(std.mem.find(u8, failure, "between 0 and 300000") != null);
+
+    const overflow = try decode(
+        .{ .allocator = std.testing.allocator },
+        "{\"action\":\"interact\",\"session_id\":\"shell-1\",\"yield_time_ms\":4294967296}",
+    );
+    switch (overflow) {
+        .input => |input| {
+            defer input.deinit(std.testing.allocator);
+            return error.TestUnexpectedResult;
+        },
+        .failure => |message| std.testing.allocator.free(message),
+    }
+}
+
 test "shell decoder rejects removed handoff and legacy actions" {
     const alloc = std.testing.allocator;
     const ctx = tool_dispatch.DispatchContext{ .allocator = alloc };
@@ -1812,6 +1877,33 @@ test "lost shell snapshot preserves indeterminate execution guidance" {
     defer parsed.deinit();
     const object = parsed.value.object;
     try std.testing.expect(object.get("termination_indeterminate").?.bool);
+    try std.testing.expect(std.mem.find(
+        u8,
+        object.get("retry_guidance").?.string,
+        "do not blindly rerun",
+    ) != null);
+}
+
+test "completed shell snapshot reports incomplete output without losing status" {
+    const alloc = std.testing.allocator;
+    const body = try formatSnapshot(alloc, .{
+        .execution_id = @constCast("shell-incomplete"),
+        .command = @constCast("mutating-command"),
+        .cwd = @constCast("/tmp"),
+        .retained = false,
+        .state = .{ .completed = .{ .exit_code = 0 } },
+        .output_delta = @constCast("partial output"),
+        .output_truncated = false,
+        .output_incomplete = true,
+    }, null);
+    defer alloc.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings("completed", object.get("state").?.string);
+    try std.testing.expectEqual(@as(i64, 0), object.get("exit_code").?.integer);
+    try std.testing.expect(object.get("output_incomplete").?.bool);
     try std.testing.expect(std.mem.find(
         u8,
         object.get("retry_guidance").?.string,
@@ -1935,7 +2027,7 @@ test "running shell snapshot leaves continuation intent to the caller" {
     );
 }
 
-test "registered shell run yields and waits through one managed execution" {
+test "registered shell empty observation waits through one managed execution" {
     if (comptime @import("builtin").os.tag == .wasi) return;
     const alloc = std.testing.allocator;
     var runtime = managed_execution.Runtime.init(alloc);
@@ -1977,7 +2069,7 @@ test "registered shell run yields and waits through one managed execution" {
         .clean,
     );
     const command_ctx = command_admission.CommandContext{
-        .command = "printf ready; sleep 1; printf done",
+        .command = "sleep 2; printf done",
         .resolved_cwd = "/tmp",
         .target_os = @import("builtin").os.tag,
         .environment = environment,
@@ -2009,7 +2101,7 @@ test "registered shell run yields and waits through one managed execution" {
         .{
             .id = "shell-integration",
             .name = "shell",
-            .arguments_json = "{\"action\":\"run\",\"command\":\"printf ready; sleep 1; printf done\",\"cwd\":\"/tmp\",\"profile\":\"clean\",\"yield_time_ms\":0}",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"sleep 2; printf done\",\"cwd\":\"/tmp\",\"profile\":\"clean\",\"yield_time_ms\":0}",
         },
         &start_status_detail,
     );
@@ -2022,7 +2114,7 @@ test "registered shell run yields and waits through one managed execution" {
         return error.TestExpectedEqual;
     const interact_arguments = try std.fmt.allocPrint(
         alloc,
-        "{{\"action\":\"interact\",\"session_id\":\"{s}\",\"yield_time_ms\":2000}}",
+        "{{\"action\":\"interact\",\"session_id\":\"{s}\",\"yield_time_ms\":1000}}",
         .{execution_id.string},
     );
     defer alloc.free(interact_arguments);
@@ -2059,9 +2151,8 @@ test "registered shell run yields and waits through one managed execution" {
     defer waited.deinit(alloc);
     try std.testing.expectEqual(tool_dispatch.DispatchResult.Status.success, waited.status);
     try std.testing.expect(std.mem.find(u8, waited.body, "\"state\":\"completed\"") != null);
-    try std.testing.expect(std.mem.find(u8, waited.body, "ready") != null);
     try std.testing.expect(std.mem.find(u8, waited.body, "done") != null);
-    try std.testing.expectEqual(@as(usize, "readydone".len), streamed_bytes.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, "done".len), streamed_bytes.load(.seq_cst));
     try std.testing.expect(std.mem.find(
         u8,
         command_result_json orelse return error.TestExpectedEqual,

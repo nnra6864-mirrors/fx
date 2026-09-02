@@ -592,7 +592,8 @@ fn pushQueuedPromptBannerRows(
                 var row = try input_presentation.composeSteeringMessageRow(
                     alloc,
                     message,
-                    index + 1 == ctx.steering_messages.len,
+                    ctx.steering_waits_for_tool and
+                        index + 1 == ctx.steering_messages.len,
                     width,
                 );
                 try pushFooterBandRow(
@@ -1616,6 +1617,7 @@ test "clamped steering banner keeps newest messages and escape hint" {
     var ctx = testContext(&input);
     ctx.queued_count = messages.len;
     ctx.steering_messages = &messages;
+    ctx.steering_waits_for_tool = true;
     const planner_input: FooterPlannerInput = .{
         .active_label = null,
         .ctx = ctx,

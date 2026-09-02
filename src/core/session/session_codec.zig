@@ -1121,7 +1121,7 @@ fn writeSnapshotLocator(writer: *std.Io.Writer, value: ?[]const u8) !void {
 }
 
 fn writeExecutionMemory(writer: *std.Io.Writer, execution: session.ExecutionMemory) !void {
-    try writer.writeAll("{\"schema_version\":6,\"tool_steps\":[");
+    try writer.writeAll("{\"schema_version\":7,\"tool_steps\":[");
     for (execution.tool_steps, 0..) |step, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.writeAll("{\"assistant\":");
@@ -1144,9 +1144,13 @@ fn writeExecutionMemory(writer: *std.Io.Writer, execution: session.ExecutionMemo
         try writeFileEvidence(writer, file);
     }
     try writer.writeAll("],\"steering\":[");
-    for (execution.steering, 0..) |text, i| {
+    for (execution.steering, 0..) |steering, i| {
         if (i > 0) try writer.writeByte(',');
-        try writeDurableBytes(writer, text);
+        try writer.writeAll("{\"text\":");
+        try writeDurableBytes(writer, steering.text);
+        try writer.writeAll(",\"assistant_prefix\":");
+        try writeOptionalDurableBytes(writer, steering.assistant_prefix);
+        try writer.print(",\"after_tool_step_count\":{d}}}", .{steering.after_tool_step_count});
     }
     try writer.writeAll("],\"turn_summary\":");
     if (execution.turn_summary) |summary| {
@@ -1504,6 +1508,7 @@ fn parseExecutionMemory(alloc: Allocator, value: std.json.Value) !session.Execut
         1...4 => try exactObject(value, &.{ "schema_version", "tool_steps", "files" }),
         5 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "turn_summary" }),
         6 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
+        7 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
         else => return error.InvalidSessionFormat,
     };
     const tool_steps = try parseToolSteps(
@@ -1514,14 +1519,16 @@ fn parseExecutionMemory(alloc: Allocator, value: std.json.Value) !session.Execut
     errdefer session.freeExecutionMemory(alloc, .{ .tool_steps = tool_steps });
     const files = try parseFiles(alloc, object.get("files") orelse return error.InvalidSessionFormat);
     errdefer types.freeFileEvidenceSlice(alloc, files);
-    const steering: [][]u8 = if (schema_version >= 6)
-        try parseDurableBytesArray(
+    const steering: []types.PersistedSteering = if (schema_version >= 6)
+        try parsePersistedSteering(
             alloc,
             object.get("steering") orelse return error.InvalidSessionFormat,
+            schema_version,
+            tool_steps.len,
         )
     else
         &.{};
-    errdefer types.freePermissionFeedback(alloc, steering);
+    errdefer types.freePersistedSteering(alloc, steering);
     const turn_summary = if (schema_version >= 5)
         try parseOptionalTurnSummary(object.get("turn_summary").?)
     else
@@ -1532,6 +1539,60 @@ fn parseExecutionMemory(alloc: Allocator, value: std.json.Value) !session.Execut
         .steering = steering,
         .turn_summary = turn_summary,
     };
+}
+
+fn parsePersistedSteering(
+    alloc: Allocator,
+    value: std.json.Value,
+    schema_version: u64,
+    tool_step_count: usize,
+) ![]types.PersistedSteering {
+    if (value != .array) return error.InvalidSessionFormat;
+    if (value.array.items.len == 0) return &.{};
+    const steering = try alloc.alloc(types.PersistedSteering, value.array.items.len);
+    errdefer alloc.free(steering);
+    var parsed_count: usize = 0;
+    errdefer for (steering[0..parsed_count]) |item| {
+        alloc.free(item.text);
+        if (item.assistant_prefix) |prefix| alloc.free(prefix);
+    };
+    var prior_tool_step_count: usize = 0;
+    for (value.array.items, 0..) |item, index| {
+        const parsed = if (schema_version == 6)
+            types.PersistedSteering{
+                .text = try parseDurableBytes(alloc, item),
+                .after_tool_step_count = tool_step_count,
+            }
+        else blk: {
+            const object = try exactObject(item, &.{ "text", "assistant_prefix", "after_tool_step_count" });
+            const after_tool_step_count = try requireUsize(object, "after_tool_step_count");
+            if (after_tool_step_count > tool_step_count or
+                (index > 0 and after_tool_step_count < prior_tool_step_count))
+            {
+                return error.InvalidSessionFormat;
+            }
+            const text = try parseDurableBytes(
+                alloc,
+                object.get("text") orelse return error.InvalidSessionFormat,
+            );
+            const assistant_prefix = parseOptionalDurableBytes(
+                alloc,
+                object.get("assistant_prefix") orelse return error.InvalidSessionFormat,
+            ) catch |err| {
+                alloc.free(text);
+                return err;
+            };
+            break :blk types.PersistedSteering{
+                .text = text,
+                .assistant_prefix = assistant_prefix,
+                .after_tool_step_count = after_tool_step_count,
+            };
+        };
+        steering[index] = parsed;
+        parsed_count += 1;
+        prior_tool_step_count = parsed.after_tool_step_count;
+    }
+    return steering;
 }
 
 fn parseOptionalTurnSummary(value: std.json.Value) !?types.TurnSummary {
@@ -1780,7 +1841,7 @@ fn parseToolResult(
         1 => .{ .object = try exactObject(value, v1_keys), .extended = false },
         2 => try exactVariantObject(value, v2_keys, v2_extended_keys),
         3 => .{ .object = try exactObject(value, v3_keys), .extended = true },
-        4, 5, 6 => .{ .object = try exactObject(value, v4_keys), .extended = true },
+        4, 5, 6, 7 => .{ .object = try exactObject(value, v4_keys), .extended = true },
         else => return error.InvalidSessionFormat,
     };
     const object = result_shape.object;
@@ -2948,7 +3009,11 @@ test "execution memory codec preserves feedback and reads v1 results without it"
         .tool_calls = calls[0..],
         .tool_results = results[0..],
     }};
-    var steering = [_][]u8{@constCast("focus on persistence")};
+    var steering = [_]types.PersistedSteering{.{
+        .text = @constCast("focus on persistence"),
+        .assistant_prefix = @constCast("partial assistant"),
+        .after_tool_step_count = 1,
+    }};
     const turn: session.HistoryTurn = .{ .assistant = .{
         .user = .{ .text = @constCast("write a note") },
         .assistant = @constCast("done"),
@@ -2968,8 +3033,10 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     var encoded: std.Io.Writer.Allocating = .init(alloc);
     defer encoded.deinit();
     try writeHistoryTurn(&encoded.writer, turn);
-    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"schema_version\":6") != null);
-    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"steering\":[\"focus on persistence\"]") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"schema_version\":7") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"text\":\"focus on persistence\"") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"assistant_prefix\":\"partial assistant\"") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"after_tool_step_count\":1") != null);
     try std.testing.expect(std.mem.find(u8, encoded.written(), "\"permission_feedback\"") != null);
     try std.testing.expect(std.mem.find(u8, encoded.written(), "\"committed_file_presentation\"") != null);
     try std.testing.expect(std.mem.find(u8, encoded.written(), "\"command_output_replay\"") != null);
@@ -2987,7 +3054,15 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     try std.testing.expectEqual(@as(usize, 1), decoded.assistant.execution.steering.len);
     try std.testing.expectEqualStrings(
         "focus on persistence",
-        decoded.assistant.execution.steering[0],
+        decoded.assistant.execution.steering[0].text,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        decoded.assistant.execution.steering[0].after_tool_step_count,
+    );
+    try std.testing.expectEqualStrings(
+        "partial assistant",
+        decoded.assistant.execution.steering[0].assistant_prefix.?,
     );
     try std.testing.expectEqual(@as(usize, 1), decoded_result.permission_feedback.len);
     try std.testing.expectEqualStrings("read it after writing", decoded_result.permission_feedback[0]);
@@ -3043,6 +3118,43 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     const v5_decoded = try parseHistoryTurn(alloc, v5_parsed.value);
     defer session.freeHistoryTurn(alloc, v5_decoded);
     try std.testing.expectEqual(@as(usize, 0), v5_decoded.assistant.execution.steering.len);
+
+    const v6 =
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"prompt\",\"images\":[]},\"assistant\":\"done\",\"execution\":{\"schema_version\":6,\"tool_steps\":[],\"files\":[],\"steering\":[\"legacy steer\"],\"turn_summary\":null}}";
+    var v6_parsed = try std.json.parseFromSlice(std.json.Value, alloc, v6, .{});
+    defer v6_parsed.deinit();
+    const v6_decoded = try parseHistoryTurn(alloc, v6_parsed.value);
+    defer session.freeHistoryTurn(alloc, v6_decoded);
+    try std.testing.expectEqualStrings("legacy steer", v6_decoded.assistant.execution.steering[0].text);
+    try std.testing.expectEqual(@as(usize, 0), v6_decoded.assistant.execution.steering[0].after_tool_step_count);
+
+    const invalid_v7 =
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"prompt\",\"images\":[]},\"assistant\":\"done\",\"execution\":{\"schema_version\":7,\"tool_steps\":[],\"files\":[],\"steering\":[{\"text\":\"invalid\",\"assistant_prefix\":null,\"after_tool_step_count\":1}],\"turn_summary\":null}}";
+    var invalid_v7_parsed = try std.json.parseFromSlice(std.json.Value, alloc, invalid_v7, .{});
+    defer invalid_v7_parsed.deinit();
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        parseHistoryTurn(alloc, invalid_v7_parsed.value),
+    );
+}
+
+fn checkV7SteeringAllocationFailures(alloc: Allocator) !void {
+    const json =
+        "[{\"text\":\"first\",\"assistant_prefix\":\"prefix one\",\"after_tool_step_count\":0}," ++
+        "{\"text\":\"second\",\"assistant_prefix\":\"prefix two\",\"after_tool_step_count\":1}]";
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const steering = try parsePersistedSteering(alloc, parsed.value, 7, 1);
+    defer types.freePersistedSteering(alloc, steering);
+    try std.testing.expectEqual(@as(usize, 2), steering.len);
+}
+
+test "v7 steering cleans up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkV7SteeringAllocationFailures,
+        .{},
+    );
 }
 
 test "private codec preserves summary-only interrupted turns" {
@@ -3519,8 +3631,10 @@ fn expectHistoryTurnEqual(expected: session.HistoryTurn, actual: session.History
 fn expectExecutionMemoryEqual(expected: session.ExecutionMemory, actual: session.ExecutionMemory) !void {
     try std.testing.expectEqual(expected.turn_summary, actual.turn_summary);
     try std.testing.expectEqual(expected.steering.len, actual.steering.len);
-    for (expected.steering, actual.steering) |text, got_text| {
-        try std.testing.expectEqualSlices(u8, text, got_text);
+    for (expected.steering, actual.steering) |steering, got_steering| {
+        try std.testing.expectEqualSlices(u8, steering.text, got_steering.text);
+        try expectOptionalBytesEqual(steering.assistant_prefix, got_steering.assistant_prefix);
+        try std.testing.expectEqual(steering.after_tool_step_count, got_steering.after_tool_step_count);
     }
     try std.testing.expectEqual(expected.tool_steps.len, actual.tool_steps.len);
     for (expected.tool_steps, actual.tool_steps) |step, got_step| {

@@ -49,10 +49,35 @@ pub const HostSafetyOverride = enum {
     untrusted_action_copy,
 };
 
+pub const InvalidReason = enum {
+    reviewer_unconfigured,
+    override_context_missing,
+    override_failed,
+    transport_unconfigured,
+    invalid_context,
+    construction_timed_out,
+    construction_failed,
+    transport_call_failed,
+    transport_transient,
+    transport_permanent,
+    transport_timed_out,
+    provider_context_missing,
+    provider_failed,
+    completion_text,
+    completion_tool_call_count,
+    completion_tool_name,
+    completion_argument_integrity,
+    arguments_json,
+    arguments_shape,
+    arguments_risk,
+    arguments_decision,
+    arguments_rationale,
+};
+
 pub const ParseOutcome = union(enum) {
     valid: Result,
     evidence_incomplete,
-    invalid,
+    invalid: InvalidReason,
 
     pub fn deinit(self: *ParseOutcome, alloc: std.mem.Allocator) void {
         switch (self.*) {
@@ -401,15 +426,15 @@ pub const Reviewer = struct {
     ) !ParseOutcome {
         if (self.override_fn) |override_fn| {
             return override_fn(
-                self.override_context orelse return .invalid,
+                self.override_context orelse return .{ .invalid = .override_context_missing },
                 alloc,
                 request,
             ) catch |err| switch (err) {
                 error.OutOfMemory, error.Cancelled => return err,
-                else => return .invalid,
+                else => return .{ .invalid = .override_failed },
             };
         }
-        const transport = self.transport orelse return .invalid;
+        const transport = self.transport orelse return .{ .invalid = .transport_unconfigured };
         var fallback_cancel = std.atomic.Value(bool).init(false);
         const cancel_flag = self.cancel_flag orelse &fallback_cancel;
         const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
@@ -445,7 +470,7 @@ pub const Reviewer = struct {
                 "event=auto_review_compose_result result=invalid_context elapsed_ms={d} target_call_id={s}",
                 .{ io_mod.milliTimestamp() - started_ms, review_turn.target_call_id },
             );
-            return .invalid;
+            return .{ .invalid = .invalid_context };
         }
 
         var evidence = serializeEvidence(alloc, request, deadline, cancel_flag) catch |err| {
@@ -497,7 +522,7 @@ pub const Reviewer = struct {
         var message_index: usize = 1;
         const target_call_index = for (review_turn.pending_assistant.tool_calls, 0..) |call, index| {
             if (std.mem.eql(u8, call.id, review_turn.target_call_id)) break index;
-        } else return .invalid;
+        } else return .{ .invalid = .invalid_context };
         var target_pending_assistant = review_turn.pending_assistant;
         target_pending_assistant.tool_calls = review_turn.pending_assistant.tool_calls[target_call_index .. target_call_index + 1];
         // Forward only the exact pending call. Assistant prose and native
@@ -539,11 +564,13 @@ pub const Reviewer = struct {
             cancel_flag,
         ) catch |err| switch (err) {
             error.OutOfMemory, error.Cancelled => return err,
-            else => return .invalid,
+            else => return .{ .invalid = .transport_call_failed },
         };
         switch (transport_outcome) {
             .cancelled => return error.Cancelled,
-            .timed_out, .permanent_failure, .transient_failure => return .invalid,
+            .timed_out => return .{ .invalid = .transport_timed_out },
+            .permanent_failure => return .{ .invalid = .transport_permanent },
+            .transient_failure => return .{ .invalid = .transport_transient },
             .completion => |*owned| {
                 defer owned.deinit(alloc);
                 return try parseCompletion(alloc, owned.completion);
@@ -589,15 +616,15 @@ pub const Classifier = struct {
     ) error{ OutOfMemory, Cancelled }!ParseOutcome {
         if (self.override_fn) |review_fn| {
             return Reviewer.withOverride(
-                self.override_ctx orelse return .invalid,
+                self.override_ctx orelse return .{ .invalid = .override_context_missing },
                 review_fn,
             ).review(alloc, request) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Cancelled => return error.Cancelled,
-                else => return .invalid,
+                else => return .{ .invalid = .override_failed },
             };
         }
-        const provider = self.provider orelse return .invalid;
+        const provider = self.provider orelse return .{ .invalid = .reviewer_unconfigured };
         return provider.review_fn(
             provider.context,
             alloc,
@@ -606,7 +633,7 @@ pub const Classifier = struct {
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Cancelled => return error.Cancelled,
-            else => return .invalid,
+            else => return .{ .invalid = .provider_failed },
         };
     }
 };
@@ -1044,7 +1071,8 @@ fn checkBudget(
 fn constructionFailure(err: anyerror) !ParseOutcome {
     return switch (err) {
         error.OutOfMemory, error.Cancelled => err,
-        else => .invalid,
+        error.TimedOut => .{ .invalid = .construction_timed_out },
+        else => .{ .invalid = .construction_failed },
     };
 }
 
@@ -1231,39 +1259,51 @@ fn buildTestReviewPayload(
 
 fn parseCompletion(alloc: std.mem.Allocator, completion: types.ModelCompletion) !ParseOutcome {
     if (completion.content) |content| {
-        if (std.mem.trim(u8, content, " \t\r\n").len > 0) return .invalid;
+        if (std.mem.trim(u8, content, " \t\r\n").len > 0) {
+            return .{ .invalid = .completion_text };
+        }
     }
-    if (completion.tool_calls.len != 1) return .invalid;
+    if (completion.tool_calls.len != 1) {
+        return .{ .invalid = .completion_tool_call_count };
+    }
 
     const call = completion.tool_calls[0];
-    if (!std.mem.eql(u8, call.name, tool_name)) return .invalid;
-    if (call.argument_integrity != .valid) return .invalid;
+    if (!std.mem.eql(u8, call.name, tool_name)) {
+        return .{ .invalid = .completion_tool_name };
+    }
+    if (call.argument_integrity != .valid) {
+        return .{ .invalid = .completion_argument_integrity };
+    }
     return parseArguments(alloc, call.arguments_json);
 }
 
 fn parseArguments(alloc: std.mem.Allocator, arguments_json: []const u8) !ParseOutcome {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return .invalid,
+        else => return .{ .invalid = .arguments_json },
     };
     defer parsed.deinit();
 
-    if (parsed.value != .object) return .invalid;
+    if (parsed.value != .object) return .{ .invalid = .arguments_shape };
     const object = parsed.value.object;
-    if (object.count() != schema_required.len) return .invalid;
+    if (object.count() != schema_required.len) return .{ .invalid = .arguments_shape };
 
-    const risk_value = object.get("risk") orelse return .invalid;
-    if (risk_value != .string) return .invalid;
-    const risk = std.meta.stringToEnum(Risk, risk_value.string) orelse return .invalid;
+    const risk_value = object.get("risk") orelse return .{ .invalid = .arguments_risk };
+    if (risk_value != .string) return .{ .invalid = .arguments_risk };
+    const risk = std.meta.stringToEnum(Risk, risk_value.string) orelse
+        return .{ .invalid = .arguments_risk };
 
-    const decision_value = object.get("decision") orelse return .invalid;
-    if (decision_value != .string) return .invalid;
-    const decision = std.meta.stringToEnum(Decision, decision_value.string) orelse return .invalid;
+    const decision_value = object.get("decision") orelse
+        return .{ .invalid = .arguments_decision };
+    if (decision_value != .string) return .{ .invalid = .arguments_decision };
+    const decision = std.meta.stringToEnum(Decision, decision_value.string) orelse
+        return .{ .invalid = .arguments_decision };
 
-    const rationale_value = object.get("rationale") orelse return .invalid;
-    if (rationale_value != .string) return .invalid;
+    const rationale_value = object.get("rationale") orelse
+        return .{ .invalid = .arguments_rationale };
+    if (rationale_value != .string) return .{ .invalid = .arguments_rationale };
     if (rationale_value.string.len == 0 or rationale_value.string.len > max_rationale_bytes) {
-        return .invalid;
+        return .{ .invalid = .arguments_rationale };
     }
 
     // Risk is informational for traces and presentation. The host grants only
@@ -1307,7 +1347,7 @@ test "automatic reviewer classifier routes through the registered provider" {
                 std.mem.eql(u8, input.tenant orelse "", "team_1") and
                 std.mem.eql(u8, input.endpoint, "https://example.test/chat") and
                 std.meta.activeTag(request.action) == .tool;
-            return .invalid;
+            return .{ .invalid = .provider_failed };
         }
     };
 
@@ -1422,7 +1462,10 @@ test "review outcome reduces to clear caution or unavailable without effects" {
     } };
     try std.testing.expectEqual(HostDisposition.clear, hostDisposition(clear));
     try std.testing.expectEqual(HostDisposition.caution, hostDisposition(caution));
-    try std.testing.expectEqual(HostDisposition.unavailable, hostDisposition(.invalid));
+    try std.testing.expectEqual(
+        HostDisposition.unavailable,
+        hostDisposition(.{ .invalid = .transport_timed_out }),
+    );
 }
 
 test "action provenance records only exact current-turn tool-result copies" {
@@ -1680,6 +1723,25 @@ test "automatic review rejects malformed extra and legacy decision assessments" 
             std.meta.activeTag(try parseCompletion(std.testing.allocator, completion)),
         );
     }
+}
+
+test "automatic review preserves the exact invalid completion cause" {
+    const unexpected_text = try parseCompletion(std.testing.allocator, .{
+        .content = "review prose must not be accepted",
+    });
+    try std.testing.expectEqual(
+        InvalidReason.completion_text,
+        unexpected_text.invalid,
+    );
+
+    const legacy_decision = try parseArguments(
+        std.testing.allocator,
+        "{\"risk\":\"low\",\"decision\":\"allow\",\"rationale\":\"legacy\"}",
+    );
+    try std.testing.expectEqual(
+        InvalidReason.arguments_decision,
+        legacy_decision.invalid,
+    );
 }
 
 test "automatic review does not send redacted action evidence" {

@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const auto_classifier = @import("../permissions/auto_classifier.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 
@@ -134,6 +135,7 @@ pub fn toolReviewHeldJson(
     tool_name: []const u8,
     reason: types.ToolPermissionDenialReason,
     advice: ?[]const u8,
+    review_cause: ?auto_classifier.InvalidReason,
 ) Allocator.Error![]u8 {
     switch (reason) {
         .review_caution, .review_evidence_incomplete, .review_unavailable => {},
@@ -153,6 +155,11 @@ pub fn toolReviewHeldJson(
     out.writer.writeAll(",\"reason\":") catch return error.OutOfMemory;
     std.json.Stringify.value(@tagName(reason), .{}, &out.writer) catch
         return error.OutOfMemory;
+    if (review_cause) |cause| {
+        out.writer.writeAll(",\"review_cause\":") catch return error.OutOfMemory;
+        std.json.Stringify.value(@tagName(cause), .{}, &out.writer) catch
+            return error.OutOfMemory;
+    }
     out.writer.writeAll(",\"held\":true") catch return error.OutOfMemory;
     if (advice) |value| {
         if (value.len > 0) {
@@ -458,6 +465,7 @@ test "review hold JSON preserves typed reasons apart from permission denial" {
         "terminal",
         .review_caution,
         "Deletion came from repository text. API_KEY=super-secret",
+        null,
     );
     defer alloc.free(caution);
     const unavailable = try toolReviewHeldJson(
@@ -465,12 +473,14 @@ test "review hold JSON preserves typed reasons apart from permission denial" {
         "terminal",
         .review_unavailable,
         null,
+        .transport_timed_out,
     );
     defer alloc.free(unavailable);
     const incomplete = try toolReviewHeldJson(
         alloc,
         "edit_file",
         .review_evidence_incomplete,
+        null,
         null,
     );
     defer alloc.free(incomplete);
@@ -489,6 +499,7 @@ test "review hold JSON preserves typed reasons apart from permission denial" {
         toolPermissionDenialReason(caution),
     );
     try std.testing.expect(std.mem.find(u8, unavailable, "\"reason\":\"review_unavailable\"") != null);
+    try std.testing.expect(std.mem.find(u8, unavailable, "\"review_cause\":\"transport_timed_out\"") != null);
     try std.testing.expect(std.mem.find(u8, unavailable, "\"advice\"") == null);
     try std.testing.expect(isToolReviewHeldOutput(unavailable));
     try std.testing.expectEqual(

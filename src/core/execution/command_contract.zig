@@ -11,6 +11,7 @@ pub const CommandResult = struct {
     signal: ?u32 = null,
     timed_out: bool = false,
     termination_indeterminate: bool = false,
+    output_incomplete: bool = false,
     duration_ms: ?u64 = null,
     stdout_bytes: usize = 0,
     stderr_bytes: usize = 0,
@@ -52,6 +53,7 @@ pub const CommandResultSnapshot = struct {
     stderr_display: []const u8,
     stdout_bytes: usize,
     stderr_bytes: usize,
+    output_incomplete: bool = false,
     duration_ms: ?u64 = null,
 };
 
@@ -83,6 +85,7 @@ pub fn formatCommandResult(
             .exit_code = status.exit_code,
             .signal = status.signal,
             .termination_indeterminate = status.termination_indeterminate,
+            .output_incomplete = snapshot.output_incomplete,
             .duration_ms = snapshot.duration_ms,
             .stdout_bytes = snapshot.stdout_bytes,
             .stderr_bytes = snapshot.stderr_bytes,
@@ -154,6 +157,9 @@ fn writeCommandJson(result: CommandResult, writer: *std.Io.Writer) !void {
     try writeBoolField(writer, "timed_out", result.timed_out);
     if (result.termination_indeterminate) {
         try writeBoolField(writer, "termination_indeterminate", true);
+    }
+    if (result.output_incomplete) {
+        try writeBoolField(writer, "output_incomplete", true);
     }
     try writeOptionalIntField(writer, "duration_ms", result.duration_ms);
     try writeIntField(writer, "stdout_bytes", result.stdout_bytes);
@@ -274,5 +280,31 @@ test "foreground result represents indeterminate termination without implying no
         u8,
         json,
         "\"termination_indeterminate\":true",
+    ) != null);
+}
+
+test "command result preserves observed status when output is incomplete" {
+    const result = try formatCommandResult(std.testing.allocator, .{
+        .command = "printf effect > marker",
+        .cwd = "/tmp",
+        .status = .{ .exit_code = 0 },
+        .stdout_display = "partial output",
+        .stderr_display = "",
+        .stdout_bytes = 14,
+        .stderr_bytes = 0,
+        .output_incomplete = true,
+    });
+    defer std.testing.allocator.free(result.output);
+
+    const command = result.command_result.?;
+    try std.testing.expectEqual(@as(?i64, 0), command.exit_code);
+    try std.testing.expect(command.output_incomplete);
+
+    const json = try command.toJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.find(
+        u8,
+        json,
+        "\"output_incomplete\":true",
     ) != null);
 }

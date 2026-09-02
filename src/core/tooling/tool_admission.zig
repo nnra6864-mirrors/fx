@@ -922,19 +922,26 @@ test "direct git push branch proof accepts only explicit literal operands" {
 
 /// An unavailable or invalid automatic review never executes anything. It is
 /// returned to the primary model as neutral advisory unavailability.
-fn traceReviewerUnavailable(call: ToolCall) void {
+fn traceReviewerUnavailable(
+    call: ToolCall,
+    failure: permission_auto_classifier.InvalidReason,
+) void {
     debug_trace.logf(
         "permission",
-        "event=auto_review_result tool_name={s} decision=unavailable fallback_reason=reviewer_unavailable recovery=agent_replan execution_started=false call_id={s}",
-        .{ call.name, call.id },
+        "event=auto_review_result tool_name={s} decision=unavailable fallback_reason={s} recovery=agent_replan execution_started=false call_id={s}",
+        .{ call.name, @tagName(failure), call.id },
     );
 }
 
-fn reviewerUnavailableOutcome(call: ToolCall) command_admission.PermissionOutcome {
-    traceReviewerUnavailable(call);
+fn reviewerUnavailableOutcome(
+    call: ToolCall,
+    failure: permission_auto_classifier.InvalidReason,
+) command_admission.PermissionOutcome {
+    traceReviewerUnavailable(call, failure);
     return .{
         .decision = .deny,
         .denial_reason = .review_unavailable,
+        .auto_review_failure = failure,
     };
 }
 
@@ -955,9 +962,13 @@ fn nonAllowAutoReviewOutcome(
         review,
     )) {
         .clear => null,
-        .unavailable => .{
-            .decision = .deny,
-            .denial_reason = .review_unavailable,
+        .unavailable => switch (review) {
+            .invalid => |failure| .{
+                .decision = .deny,
+                .denial_reason = .review_unavailable,
+                .auto_review_failure = failure,
+            },
+            .valid, .evidence_incomplete => unreachable,
         },
         .caution => switch (review) {
             .valid => |result| if (result.decision == .caution)
@@ -995,8 +1006,12 @@ fn automaticReviewOutcome(
     is_dynamic_tool: bool,
     file_authorization: ?file_mutation_contract.FileExecutionAuthorization,
 ) !command_admission.PermissionOutcome {
-    if (!input.auto_classifier.enabled()) return reviewerUnavailableOutcome(call);
-    if (input.permission_review_turn == null) return reviewerUnavailableOutcome(call);
+    if (!input.auto_classifier.enabled()) {
+        return reviewerUnavailableOutcome(call, .reviewer_unconfigured);
+    }
+    if (input.permission_review_turn == null) {
+        return reviewerUnavailableOutcome(call, .invalid_context);
+    }
 
     const request = try reviewRequestForCall(
         input,
@@ -1068,10 +1083,10 @@ fn runAutomaticReview(
             "event=auto_review_result tool_name={s} decision=held fallback_reason=review_evidence_incomplete recovery=agent_replan elapsed_ms={d} execution_started=false call_id={s}",
             .{ call.name, io_mod.milliTimestamp() - started_ms, call.id },
         ),
-        .invalid => debug_trace.logf(
+        .invalid => |reason| debug_trace.logf(
             "permission",
-            "event=auto_review_result tool_name={s} decision=unavailable fallback_reason=invalid_or_unavailable recovery=agent_replan elapsed_ms={d} execution_started=false call_id={s}",
-            .{ call.name, io_mod.milliTimestamp() - started_ms, call.id },
+            "event=auto_review_result tool_name={s} decision=unavailable fallback_reason={s} recovery=agent_replan elapsed_ms={d} execution_started=false call_id={s}",
+            .{ call.name, @tagName(reason), io_mod.milliTimestamp() - started_ms, call.id },
         ),
     }
     return review;
@@ -3503,6 +3518,7 @@ const FakeAutoClassifier = struct {
     risk: permission_auto_classifier.Risk = .low,
     rationale: []const u8 = "test automatic review",
     invalid: bool = false,
+    invalid_reason: ?permission_auto_classifier.InvalidReason = null,
     review_model: []const u8 = "",
     review_root_text: []const u8 = "",
     review_target_call_id: []const u8 = "",
@@ -3547,7 +3563,8 @@ const FakeAutoClassifier = struct {
                 self.schema_json = tool.schema_json;
             },
         }
-        if (self.invalid) return .invalid;
+        if (self.invalid_reason) |reason| return .{ .invalid = reason };
+        if (self.invalid) return .{ .invalid = .provider_failed };
         return .{ .valid = .{
             .risk = self.risk,
             .decision = self.decision,
@@ -3876,6 +3893,69 @@ test "automatic non-allow is recoverable regardless tool approval policy" {
     try std.testing.expect(unavailable.auto_review_result == null);
     try std.testing.expectEqual(@as(usize, 3), fake.calls);
     try std.testing.expectEqual(@as(usize, 1), recording.calls);
+}
+
+test "automatic review trace preserves the typed unavailable cause without action text" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.fs.path.join(alloc, &.{ root, "permission.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "permission");
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var fake = FakeAutoClassifier{ .invalid_reason = .transport_timed_out };
+    const calls = [_]ToolCall{.{
+        .id = "typed-unavailable",
+        .name = "shell",
+        .arguments_json = "{\"request\":{\"action\":\"run\",\"command\":\"gh auth token SECRET_SHOULD_NOT_APPEAR\"}}",
+    }};
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.withOverride(
+            @ptrCast(&fake),
+            FakeAutoClassifier.classify,
+        ),
+    );
+    input.permission_review_turn = .{
+        .model = "test/source-model",
+        .pending_assistant = .{ .role = .assistant, .tool_calls = &calls },
+        .target_call_id = calls[0].id,
+        .origin = .root,
+        .trusted_root_context = "Inspect repository status.",
+    };
+
+    const outcome = try requestPermissionOutcome(
+        input,
+        arena_state.allocator(),
+        calls[0],
+        .auto,
+        &.{},
+    );
+    try std.testing.expectEqual(ToolPermissionDecision.deny, outcome.decision);
+    try std.testing.expectEqual(
+        types.ToolPermissionDenialReason.review_unavailable,
+        outcome.denial_reason.?,
+    );
+
+    var trace_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer trace_file.close(io_mod.getIo());
+    const trace = try io_mod.readFileToEnd(alloc, &trace_file, 8192);
+    defer alloc.free(trace);
+    try std.testing.expect(
+        std.mem.find(u8, trace, "fallback_reason=transport_timed_out") != null,
+    );
+    try std.testing.expect(
+        std.mem.find(u8, trace, "SECRET_SHOULD_NOT_APPEAR") == null,
+    );
 }
 
 test "automatic admission holds an exact command copied from untrusted tool output" {

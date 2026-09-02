@@ -210,13 +210,32 @@ fn sendGatewayReview(
     }
     if (stream.completion.finish_reason) |reason| switch (reason) {
         .provider_error => {
+            debug_trace.logf(
+                "permission",
+                "event=auto_review_transport result=transient_failure reason=provider_error",
+                .{},
+            );
             return .transient_failure;
         },
         .content_filter => {
+            debug_trace.logf(
+                "permission",
+                "event=auto_review_transport result=permanent_failure reason=content_filter",
+                .{},
+            );
             return .permanent_failure;
         },
         .stop, .length, .tool_calls, .other => {},
     };
+    debug_trace.logf(
+        "permission",
+        "event=auto_review_transport result=completion finish_reason={s} tool_calls={d} content_bytes={d}",
+        .{
+            if (stream.completion.finish_reason) |reason| @tagName(reason) else "absent",
+            stream.completion.tool_calls.len,
+            if (stream.completion.content) |content| content.len else 0,
+        },
+    );
 
     const owned = try alloc.create(OwnedStream);
     owned.* = .{ .stream = stream };
@@ -257,15 +276,21 @@ fn mapTransportError(
     cancel_flag: *std.atomic.Value(bool),
 ) error{OutOfMemory}!permission_auto_classifier.TransportOutcome {
     if (err == error.OutOfMemory) return error.OutOfMemory;
-    if (err == error.Cancelled or cancel_flag.load(.seq_cst)) return .cancelled;
-    if (err == error.Timeout) return .timed_out;
-    if (gateway_client.isRetryableGatewayError(err)) return .transient_failure;
+    const outcome: permission_auto_classifier.TransportOutcome =
+        if (err == error.Cancelled or cancel_flag.load(.seq_cst))
+            .cancelled
+        else if (err == error.Timeout)
+            .timed_out
+        else if (gateway_client.isRetryableGatewayError(err))
+            .transient_failure
+        else
+            .permanent_failure;
     debug_trace.logf(
         "permission",
-        "event=auto_review_transport result=permanent_failure err={s}",
-        .{@errorName(err)},
+        "event=auto_review_transport result={s} reason=transport_error error={s}",
+        .{ @tagName(std.meta.activeTag(outcome)), @errorName(err) },
     );
-    return .permanent_failure;
+    return outcome;
 }
 
 fn mapHttpStatus(status: std.http.Status) permission_auto_classifier.TransportOutcome {
@@ -590,6 +615,10 @@ test "gateway automatic reviewer distinguishes transient and permanent HTTP fail
         std.meta.Tag(permission_auto_classifier.ParseOutcome).invalid,
         std.meta.activeTag(transient),
     );
+    try std.testing.expectEqual(
+        permission_auto_classifier.InvalidReason.transport_transient,
+        transient.invalid,
+    );
     try std.testing.expectEqual(@as(usize, 1), transient_fake.calls);
 
     var permanent_fake = FakeStream{ .outcomes = &.{ .permanent_http, .valid } };
@@ -598,6 +627,10 @@ test "gateway automatic reviewer distinguishes transient and permanent HTTP fail
     try std.testing.expectEqual(
         std.meta.Tag(permission_auto_classifier.ParseOutcome).invalid,
         std.meta.activeTag(permanent),
+    );
+    try std.testing.expectEqual(
+        permission_auto_classifier.InvalidReason.transport_permanent,
+        permanent.invalid,
     );
     try std.testing.expectEqual(@as(usize, 1), permanent_fake.calls);
 }
@@ -648,6 +681,10 @@ test "gateway automatic reviewer distinguishes timeout permanent failure and can
         std.meta.Tag(permission_auto_classifier.ParseOutcome).invalid,
         std.meta.activeTag(timed_out),
     );
+    try std.testing.expectEqual(
+        permission_auto_classifier.InvalidReason.transport_timed_out,
+        timed_out.invalid,
+    );
     try std.testing.expectEqual(@as(usize, 1), timeout_fake.calls);
 
     var permanent_fake = FakeStream{ .outcomes = &.{ .permanent_error, .valid } };
@@ -656,6 +693,10 @@ test "gateway automatic reviewer distinguishes timeout permanent failure and can
     try std.testing.expectEqual(
         std.meta.Tag(permission_auto_classifier.ParseOutcome).invalid,
         std.meta.activeTag(permanent),
+    );
+    try std.testing.expectEqual(
+        permission_auto_classifier.InvalidReason.transport_permanent,
+        permanent.invalid,
     );
     try std.testing.expectEqual(@as(usize, 1), permanent_fake.calls);
 

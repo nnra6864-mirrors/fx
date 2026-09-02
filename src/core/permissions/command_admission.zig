@@ -107,6 +107,7 @@ pub const PermissionOutcome = struct {
     feedback: ?[]const u8 = null,
     /// Owned by the allocator passed to the permission request.
     auto_review_result: ?auto_classifier.Result = null,
+    auto_review_failure: ?auto_classifier.InvalidReason = null,
 };
 
 pub const PermissionRequirement = enum {

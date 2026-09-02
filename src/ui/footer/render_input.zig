@@ -422,6 +422,7 @@ pub const RenderContext = struct {
     permission_mode: types.PermissionMode = .ask,
     queued_count: usize,
     steering_messages: []const []const u8 = &.{},
+    steering_waits_for_tool: bool = false,
     queued_paused: bool = false,
     queued_cancel_all_available: bool = false,
     queued_prompt_cards: []const QueuedPromptCard = &.{},

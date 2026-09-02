@@ -85,6 +85,30 @@ const TurnFinalizationGuard = runtime_finalization.TurnFinalizationGuard;
 const PromptFinishTrace = runtime_finalization.PromptFinishTrace;
 const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
 
+fn take_steering_boundary(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    turn_id: u64,
+    kind: worker_runtime.SteeringBoundaryKind,
+) !worker_runtime.SteeringBoundaryResult {
+    const take = deps.take_steering_boundary orelse
+        return if (kind == .cancelled) .interrupt else .none;
+    return take(deps.ctx, arena, turn_id, kind);
+}
+
+fn append_steering_guidance(
+    arena: Allocator,
+    within_turn_suffix: *std.ArrayList(ChatMessage),
+    guidance: []const []const u8,
+) !void {
+    for (guidance) |text| {
+        try within_turn_suffix.append(arena, .{
+            .role = .user,
+            .content = try runtime_execution_memory.steeringMessage(arena, text),
+        });
+    }
+}
+
 fn append_pending_steering_after_assistant(
     deps: *const AgentRuntimeDeps,
     arena: Allocator,
@@ -92,20 +116,17 @@ fn append_pending_steering_after_assistant(
     turn_id: u64,
     assistant_text: []const u8,
 ) !bool {
-    const take_steering = deps.take_steering orelse return false;
-    const guidance = try take_steering(deps.ctx, arena, turn_id);
-    if (guidance.len == 0) return false;
+    const boundary = try take_steering_boundary(deps, arena, turn_id, .model);
+    const guidance = switch (boundary) {
+        .continue_turn => |messages| messages,
+        .none, .handoff, .interrupt => return false,
+    };
 
     try within_turn_suffix.append(arena, .{
         .role = .assistant,
         .content = assistant_text,
     });
-    for (guidance) |text| {
-        try within_turn_suffix.append(arena, .{
-            .role = .user,
-            .content = try runtime_execution_memory.steeringMessage(arena, text),
-        });
-    }
+    try append_steering_guidance(arena, within_turn_suffix, guidance);
     return true;
 }
 
@@ -116,9 +137,11 @@ fn append_immediate_steering_after_cancel(
     turn_id: u64,
     assistant_text: []const u8,
 ) !bool {
-    const take_immediate_steering = deps.take_immediate_steering orelse return false;
-    const guidance = try take_immediate_steering(deps.ctx, arena, turn_id);
-    if (guidance.len == 0) return false;
+    const boundary = try take_steering_boundary(deps, arena, turn_id, .cancelled);
+    const guidance = switch (boundary) {
+        .continue_turn => |messages| messages,
+        .none, .handoff, .interrupt => return false,
+    };
 
     if (assistant_text.len > 0) {
         try within_turn_suffix.append(arena, .{
@@ -126,12 +149,7 @@ fn append_immediate_steering_after_cancel(
             .content = try arena.dupe(u8, assistant_text),
         });
     }
-    for (guidance) |text| {
-        try within_turn_suffix.append(arena, .{
-            .role = .user,
-            .content = try runtime_execution_memory.steeringMessage(arena, text),
-        });
-    }
+    try append_steering_guidance(arena, within_turn_suffix, guidance);
     return true;
 }
 
@@ -3944,7 +3962,7 @@ fn processQueuedPromptInner(
         "history_turns={d} gateway_messages_before={d} interrupted_turns={d} history_turn_kinds={s}",
         .{ active_history.len, history_messages_before, interrupted_turns, history_turn_kinds },
     );
-    if (job.steering_continuation) {
+    if (job.delivery.isContinuation()) {
         try session_runtime.appendSteeringActiveContextHistoryChatMessages(
             arena,
             &history_messages,
@@ -3973,7 +3991,7 @@ fn processQueuedPromptInner(
 
     const current_user_message: ChatMessage = .{
         .role = .user,
-        .content = if (job.steering_continuation)
+        .content = if (job.delivery.isContinuation())
             try runtime_execution_memory.steeringMessage(arena, job.prompt)
         else
             job.prompt,
@@ -4722,8 +4740,16 @@ fn processQueuedPromptLoop(
             finish_trace.finish("interrupted");
             return;
         }
-        if (deps.steering_handoff_required) |handoff_required| {
-            if (handoff_required(deps.ctx, turn_id)) {
+        _ = overlay_arena_state.reset(.retain_capacity);
+        const overlay_arena = overlay_arena_state.allocator();
+        const steering_boundary = try take_steering_boundary(
+            deps,
+            overlay_arena,
+            turn_id,
+            .model,
+        );
+        switch (steering_boundary) {
+            .handoff => {
                 try runtime_interruption.persistInterruptedTurnOnce(
                     deps,
                     finalization,
@@ -4739,20 +4765,15 @@ fn processQueuedPromptLoop(
                 );
                 finish_trace.finish("steering_handoff");
                 return;
-            }
+            },
+            .continue_turn => |guidance| try append_steering_guidance(
+                arena,
+                &within_turn_suffix,
+                guidance,
+            ),
+            .none, .interrupt => {},
         }
-        _ = overlay_arena_state.reset(.retain_capacity);
-        const overlay_arena = overlay_arena_state.allocator();
         var ephemeral_overlay: std.ArrayList(ChatMessage) = .empty;
-        if (deps.take_steering) |take_steering| {
-            const guidance = try take_steering(deps.ctx, overlay_arena, turn_id);
-            for (guidance) |text| {
-                try within_turn_suffix.append(arena, .{
-                    .role = .user,
-                    .content = try runtime_execution_memory.steeringMessage(arena, text),
-                });
-            }
-        }
         if (config.explicit_skills_prompt_section.len > 0) {
             try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = config.explicit_skills_prompt_section });
         }
@@ -8711,6 +8732,7 @@ fn processQueuedPromptLoop(
                             result.rationale
                         else
                             null,
+                        permission_outcome.auto_review_failure,
                     ),
                     .user_denied, .auto_denied, .policy_denied, .permission_required => try tool_result_errors.toolPermissionDeniedJson(
                         arena,

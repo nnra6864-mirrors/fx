@@ -205,6 +205,7 @@ function startAuthFixture(
     rejectResourceTemplateAuth?: boolean;
     authorizationServerTrailingSlash?: boolean;
     authorizationResponseIssuer?: string;
+    authorizationResponseTrailingSlash?: boolean;
     omitScopes?: boolean;
     rejectDiscoveryWithoutChallenge?: boolean;
     rejectDiscoveryWithRestAuthorizationDocument?: boolean;
@@ -467,7 +468,8 @@ function startAuthFixture(
         );
         redirect.searchParams.set(
           "iss",
-          options.authorizationResponseIssuer ?? origin,
+          options.authorizationResponseIssuer ??
+            (options.authorizationResponseTrailingSlash ? `${origin}/` : origin),
         );
         return Response.redirect(redirect, 302);
       }
@@ -2564,7 +2566,7 @@ describe("MCP remote authentication lifecycle", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "issuer mismatch stays exact and reports the configuration override",
+    "authorization metadata accepts a trailing-slash discrepancy",
     async () => {
       upstream = startModernMcpHttpFixture("json");
       auth = startAuthFixture(upstream.url, {
@@ -2588,43 +2590,23 @@ describe("MCP remote authentication lifecycle", () => {
       await tui.waitForComposer(15_000);
 
       await tui.sendText("/mcp auth fixture --open");
-      const mismatch = await tui.waitForText(
-        "Add \"oauth\":{\"issuer\":",
-        15_000,
-      );
-      const origin = new URL(auth.url).origin;
-      const compactMismatch = mismatch.replace(/\s+/g, " ");
-      expect(compactMismatch).toContain(`expected issuer "${origin}/"`);
-      expect(compactMismatch).toContain(`metadata returned "${origin}"`);
-      expect(compactMismatch).toContain(`\"issuer\":\"${origin}\"`);
-      expect(auth.authorizationRequests).toBe(0);
-      expect(auth.tokenExchanges).toBe(0);
-
-      const profilePath = join(root.home, ".fx", "mcp.json");
-      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
-      profile.mcp.fixture.oauth.issuer = origin;
-      writeFileSync(profilePath, JSON.stringify(profile));
-      await tui.sendText("/mcp reload");
-      await tui.waitForText(
-        "MCP configuration reloaded, but server 'fixture' is unavailable.",
-        15_000,
-      );
-      await tui.sendText("/mcp auth fixture --open");
       await tui.waitForText("Authenticated MCP server 'fixture'.", 15_000);
       expect(auth.authorizationRequests).toBe(1);
       expect(auth.tokenExchanges).toBe(1);
+      expect(existsSync(join(root.home, ".fx", "mcp-credentials", "credentials.json")))
+        .toBe(true);
     },
-    45_000,
+    30_000,
   );
 
   test.skipIf(!tmuxAvailable())(
     "authorization response issuer mismatch names the response and preserves the trust boundary",
     async () => {
       upstream = startModernMcpHttpFixture("json");
-      const returnedIssuer = "https://authorization-response.example.test";
       auth = startAuthFixture(upstream.url, {
-        authorizationResponseIssuer: returnedIssuer,
+        authorizationResponseTrailingSlash: true,
       });
+      const returnedIssuer = `${new URL(auth.url).origin}/`;
       const root = createRoot(auth);
       gateway = startFakeGateway([], {
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -2646,7 +2628,7 @@ describe("MCP remote authentication lifecycle", () => {
       const mismatch = await tui.waitForText("was rejected", 15_000);
       const compactMismatch = mismatch.replace(/\s+/g, " ");
       expect(compactMismatch).toContain("authorization response returned issuer");
-      expect(compactMismatch).toContain("authorization-response.example.test");
+      expect(compactMismatch).toContain(returnedIssuer);
       expect(compactMismatch).toContain("stopped before token exchange");
       expect(compactMismatch).toContain("Contact the MCP server provider");
       expect(compactMismatch).not.toContain('Add "oauth":{"issuer":');

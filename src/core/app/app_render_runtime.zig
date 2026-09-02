@@ -137,6 +137,7 @@ const RenderReconciliation = union(enum) {
 const QueuedCardProjection = struct {
     cards: []render_input.QueuedPromptCard = &.{},
     steering_messages: [][]u8 = &.{},
+    steering_waits_for_tool: bool = false,
     ordinary_count: usize = 0,
     paused: bool = false,
     row_count: u16 = 0,
@@ -321,20 +322,25 @@ fn previewWithPendingCard(
 fn buildQueuedCardProjection(comptime App: type, app: *App) !QueuedCardProjection {
     var projection: QueuedCardProjection = .{};
     errdefer projection.deinit(app.alloc);
-    const queue_preview = app.worker.queuePreview();
-    const steering_count = if (comptime @hasField(@TypeOf(queue_preview), "steering_count"))
-        queue_preview.steering_count
-    else
-        0;
-    projection.ordinary_count = queue_preview.count -| steering_count;
-    projection.paused = if (comptime @hasField(@TypeOf(queue_preview), "paused"))
-        queue_preview.paused
-    else
-        false;
-    if (comptime @hasDecl(@TypeOf(app.worker), "snapshotVisibleSteeringMessages")) {
-        if (steering_count > 0) {
-            projection.steering_messages = try app.worker.snapshotVisibleSteeringMessages(app.alloc);
-        }
+    if (comptime @hasDecl(@TypeOf(app.worker), "snapshotQueuePresentation")) {
+        var snapshot = try app.worker.snapshotQueuePresentation(app.alloc);
+        defer snapshot.deinit(app.alloc);
+        projection.ordinary_count = snapshot.ordinary_count;
+        projection.paused = snapshot.paused;
+        projection.steering_waits_for_tool = snapshot.steering_waits_for_tool;
+        projection.steering_messages = snapshot.steering_messages;
+        snapshot.steering_messages = &.{};
+    } else {
+        const queue_preview = app.worker.queuePreview();
+        const steering_count = if (comptime @hasField(@TypeOf(queue_preview), "steering_count"))
+            queue_preview.steering_count
+        else
+            0;
+        projection.ordinary_count = queue_preview.count -| steering_count;
+        projection.paused = if (comptime @hasField(@TypeOf(queue_preview), "paused"))
+            queue_preview.paused
+        else
+            false;
     }
     if (comptime !@hasField(App, "queued_prompt_review")) return projection;
     const review_entries = app.queued_prompt_review.entries;
@@ -649,6 +655,7 @@ pub fn Runtime(comptime App: type) type {
                 else
                     queued_cards.ordinary_count + queued_cards.steering_messages.len,
                 .steering_messages = queued_cards.steering_messages,
+                .steering_waits_for_tool = queued_cards.steering_waits_for_tool,
                 .queued_paused = queued_cards.paused,
                 .queued_cancel_all_available = if (comptime @hasField(App, "queued_prompt_review"))
                     app.queued_prompt_review.active() and

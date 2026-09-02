@@ -1528,6 +1528,37 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
   );
 
   test(
+    "search preflight failure shows the target resolution reason",
+    async () => {
+      const root = createIsolatedRoot();
+      const gateway = startFakeGateway([
+        toolCall("grep_preflight_failure", "grep_files", {
+          pattern: "upgrade",
+          path: "missing-map/behavior-index",
+        }),
+        finalText("search failure handled"),
+      ]);
+      const { session, stderrPath } = await launch(root, gateway);
+
+      await session.sendText("Search the generated map once.");
+      const settled = await session.waitForText(
+        "search failure handled",
+        TIMEOUT,
+      );
+      const scrollback = await session.captureFullScrollback();
+
+      expect(scrollback).toContain(
+        "Permission target resolution failed for grep_files: FileNotFound",
+      );
+      expect(scrollback).not.toContain("preflight failed");
+      expect(settled).not.toContain(APPLY_QUESTION);
+      expect(gateway.requests).toHaveLength(2);
+      expectCleanStderr(stderrPath);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "persistent session reevaluates every write and edit turn",
     async () => {
       const root = createIsolatedRoot();

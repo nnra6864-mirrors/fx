@@ -187,7 +187,7 @@ async function waitForFile(path: string): Promise<void> {
 }
 
 test.skipIf(!tmuxAvailable())(
-  "shell captured execution yields one handle and waits without respawn",
+  "shell captured empty observation floors short waits without respawn",
   async () => {
     const fixture = createFixture("fx-shell-captured-");
     let sessionId = "";
@@ -195,7 +195,7 @@ test.skipIf(!tmuxAvailable())(
       fakeGatewayToolCall("shell_run", "shell", {
         request: {
           action: "run",
-          command: "printf CAPTURED_READY; sleep 0.2; printf CAPTURED_DONE",
+          command: "sleep 2; printf CAPTURED_DONE",
           profile: "clean",
           yield_time_ms: 0,
         },
@@ -207,7 +207,7 @@ test.skipIf(!tmuxAvailable())(
           request: {
             action: "interact",
             session_id: sessionId,
-            yield_time_ms: 5_000,
+            yield_time_ms: 1_000,
           },
         });
       },
@@ -232,10 +232,16 @@ test.skipIf(!tmuxAvailable())(
       gateway.requests[1]!.body,
       "shell_run",
     );
+    const interactResult = toolResultEnvelope(
+      gateway.requests[2]!.body,
+      "shell_interact",
+    );
     expect(runResult).not.toContain('\\"next_action\\"');
     expect(runResult).toContain(`\\"session_id\\":\\"${sessionId}\\"`);
+    expect(interactResult).toContain('\\"state\\":\\"completed\\"');
+    expect(interactResult).toContain("CAPTURED_DONE");
     const scrollback = await active.captureFullScrollback();
-    expect(scrollback).toContain("Ran printf CAPTURED_READY");
+    expect(scrollback).toContain("Ran sleep 2; printf CAPTURED_DONE");
     expect(scrollback).toContain(`Observed session ${sessionId}`);
     expect(scrollback).not.toContain("Using terminal");
     expect(scrollback).not.toContain("Used terminal");

@@ -74,6 +74,7 @@ pub const Snapshot = struct {
     persistence: contract.Persistence = .process,
     output_delta: []u8,
     output_truncated: bool,
+    output_incomplete: bool = false,
     duration_ms: ?u64 = null,
     output_file: ?[]u8 = null,
     output_framed_bytes: usize = 0,
@@ -183,6 +184,7 @@ const Entry = struct {
     stdout_bytes: usize = 0,
     stderr_bytes: usize = 0,
     output_truncated: bool = false,
+    output_incomplete: bool = false,
     delivery: contract.DeliveryState = .{},
     active_waiter: ?u64 = null,
     preempted_waiter: ?u64 = null,
@@ -333,6 +335,7 @@ const Entry = struct {
             .replay_capability = replay_capability,
             .published_running = input.published_running,
             .output_truncated = input.output.len > input.max_output_bytes,
+            .output_incomplete = input.output_incomplete,
             .stdout_bytes = raw_output.len,
             .error_name = error_name,
         };
@@ -1144,6 +1147,8 @@ pub const Runtime = struct {
                 .output_delta = output_delta,
                 .output_truncated = entry.output_truncated or
                     if (metadata) |value| value.truncated else false,
+                .output_incomplete = entry.output_incomplete or
+                    if (metadata) |value| value.output_incomplete else false,
                 .duration_ms = if (metadata) |value| value.duration_ms else null,
                 .output_file = output_file,
                 .output_framed_bytes = entry.output_framed_bytes,
@@ -1382,6 +1387,7 @@ fn applyTtyUpdateLocked(entry: *Entry, input: TtyUpdate) !void {
     }
     try entry.appendBoundedOutput(input.output);
     entry.output_truncated = entry.output_truncated or input.output_incomplete;
+    entry.output_incomplete = entry.output_incomplete or input.output_incomplete;
     if (input.error_name) |error_name| {
         entry.error_name = try entry.arena.allocator().dupe(u8, error_name);
     }
