@@ -527,13 +527,9 @@ pub const SessionPicker = struct {
     }
 };
 
-const session_picker_cache_ttl_ns: i128 = 5 * std.time.ns_per_s;
-
 const SessionPickerPageCache = struct {
-    ready: bool = false,
     active_id: ?[]u8 = null,
     limit: usize = 0,
-    loaded_at_ns: i128 = 0,
     page: subagent_resume_admission.ActionableSessionPage = .{},
 
     fn deinit(self: *SessionPickerPageCache) void {
@@ -548,12 +544,18 @@ const SessionPickerPageCache = struct {
         active_id: ?[]const u8,
         limit: usize,
     ) bool {
-        return self.ready and self.limit >= limit and optionalStringEql(self.active_id, active_id);
+        return self.page.publication != null and self.limit >= limit and
+            optionalStringEql(self.active_id, active_id);
     }
 
-    fn isFresh(self: *const SessionPickerPageCache, now_ns: i128) bool {
-        return self.ready and now_ns >= self.loaded_at_ns and
-            now_ns - self.loaded_at_ns <= session_picker_cache_ttl_ns;
+    fn isCurrent(
+        self: *const SessionPickerPageCache,
+        store: session_store.Store,
+    ) bool {
+        return if (self.page.publication) |publication|
+            store.sessionIndexPublicationCurrent(publication)
+        else
+            false;
     }
 
     fn install(
@@ -561,7 +563,6 @@ const SessionPickerPageCache = struct {
         source: *const subagent_resume_admission.ActionableSessionPage,
         active_id: ?[]const u8,
         limit: usize,
-        loaded_at_ns: i128,
     ) !void {
         const alloc = std.heap.c_allocator;
         var owned_active_id = if (active_id) |id| try alloc.dupe(u8, id) else null;
@@ -573,13 +574,12 @@ const SessionPickerPageCache = struct {
             } else null;
         errdefer if (owned_continuation) |*continuation| continuation.deinit(alloc);
         var replacement: SessionPickerPageCache = .{
-            .ready = true,
             .active_id = owned_active_id,
             .limit = limit,
-            .loaded_at_ns = loaded_at_ns,
             .page = .{
                 .has_more = source.has_more,
                 .continuation = owned_continuation,
+                .publication = source.publication,
             },
         };
         owned_active_id = null;
@@ -706,8 +706,22 @@ const SessionPickerLoad = struct {
         request: PageRequest,
         page: ?subagent_resume_admission.ActionableSessionPage = null,
         failure: ?anyerror = null,
+        cancel_requested: std.atomic.Value(bool) = .init(false),
+
+        fn requestStop(self: *Task) void {
+            if (!self.done.load(.acquire) and
+                !self.cancel_requested.swap(true, .acq_rel))
+            {
+                debug_trace.logf(
+                    "core",
+                    "session picker load cancellation requested generation={d}",
+                    .{self.request.generation},
+                );
+            }
+        }
 
         fn deinit(self: *Task) void {
+            self.requestStop();
             if (self.thread) |thread| thread.join();
             if (self.page) |*page| page.deinit(std.heap.c_allocator);
             self.request.deinit();
@@ -723,9 +737,16 @@ const SessionPickerLoad = struct {
     next_generation: u64 = 1,
 
     fn deinit(self: *SessionPickerLoad) void {
+        self.requestStop();
         if (self.task) |task| task.deinit();
         if (self.pending) |*pending| pending.deinit();
         self.* = .{};
+    }
+
+    fn requestStop(self: *SessionPickerLoad) void {
+        if (self.task) |task| task.requestStop();
+        if (self.pending) |*pending| pending.deinit();
+        self.pending = null;
     }
 
     fn allocateGeneration(self: *SessionPickerLoad) u64 {
@@ -763,6 +784,7 @@ const SessionPickerLoad = struct {
         if (self.task) |task| {
             if (task.request.generation == generation) {
                 self.abandoned_generation = generation;
+                task.requestStop();
                 debug_trace.logf(
                     "core",
                     "session picker request abandoned reason=cancelled generation={d}",
@@ -877,18 +899,19 @@ const SessionPickerLoad = struct {
     }
 
     fn threadMain(task: *Task) void {
+        defer task.done.store(true, .release);
         var read_only = session_store.Store.initReadOnlyFromHome(
             std.heap.c_allocator,
             task.home_dir,
             task.workspace_root,
         ) catch |err| {
             task.failure = err;
-            task.done.store(true, .release);
             return;
         };
         defer read_only.deinit(std.heap.c_allocator);
+        read_only.resume_cancel_flag = &task.cancel_requested;
 
-        if (tryListResumableIndexPageForScope(
+        task.page = listResumablePageForScope(
             read_only,
             std.heap.c_allocator,
             task.request.scope,
@@ -897,71 +920,13 @@ const SessionPickerLoad = struct {
             task.request.limit,
         ) catch |err| {
             task.failure = err;
-            task.done.store(true, .release);
-            return;
-        }) |page| {
-            task.page = page;
-            task.done.store(true, .release);
-            return;
-        }
-
-        debug_trace.logf("core", "session picker cache outcome=miss action=backfill", .{});
-        var writable = session_store.Store.initFromHome(
-            std.heap.c_allocator,
-            task.home_dir,
-            task.workspace_root,
-        ) catch |err| {
             debug_trace.logf(
                 "core",
-                "session picker cache backfill outcome=unavailable err={s}",
+                "session picker load stopped err={s}",
                 .{@errorName(err)},
             );
-            task.page = listResumablePageForScope(
-                read_only,
-                std.heap.c_allocator,
-                task.request.scope,
-                task.request.active_id,
-                task.request.continuationValue(),
-                task.request.limit,
-            ) catch |fallback_err| {
-                task.failure = fallback_err;
-                task.done.store(true, .release);
-                return;
-            };
-            task.done.store(true, .release);
             return;
         };
-        defer writable.deinit(std.heap.c_allocator);
-
-        task.page = listResumablePageForScope(
-            writable,
-            std.heap.c_allocator,
-            task.request.scope,
-            task.request.active_id,
-            task.request.continuationValue(),
-            task.request.limit,
-        ) catch |err| {
-            debug_trace.logf(
-                "core",
-                "session picker cache backfill outcome=failed err={s}",
-                .{@errorName(err)},
-            );
-            task.page = listResumablePageForScope(
-                read_only,
-                std.heap.c_allocator,
-                task.request.scope,
-                task.request.active_id,
-                task.request.continuationValue(),
-                task.request.limit,
-            ) catch |fallback_err| {
-                task.failure = fallback_err;
-                task.done.store(true, .release);
-                return;
-            };
-            task.done.store(true, .release);
-            return;
-        };
-        task.done.store(true, .release);
     }
 };
 
@@ -970,27 +935,6 @@ fn resumePageLimitForRows(rows: u16) usize {
     // chrome (4), the menu header (1), the top gap (1), and a trailing
     // "Load more" row (1). Floored so short terminals still page usefully.
     return @max(@as(usize, rows -| 7), session_store.default_resume_page_limit);
-}
-
-fn tryListResumableIndexPageForScope(
-    store: session_store.Store,
-    alloc: Allocator,
-    scope: SessionPickerScope,
-    active_id: ?[]const u8,
-    continuation: ?session_store.ResumableSessionContinuation,
-    limit: usize,
-) !?subagent_resume_admission.ActionableSessionPage {
-    return subagent_resume_admission.tryListActionableIndexPage(
-        store,
-        alloc,
-        switch (scope) {
-            .current_workspace => .current_workspace,
-            .all_workspaces => .all_workspaces,
-        },
-        active_id,
-        continuation,
-        limit,
-    );
 }
 
 fn listResumablePageForScope(
@@ -1194,8 +1138,8 @@ test "persistence in-place initialization preserves empty ownership" {
     try std.testing.expect(!persistence.fast_mode_model_bound);
     try std.testing.expect(!persistence.session_picker.active);
     try std.testing.expect(persistence.session_picker_load.task == null);
-    try std.testing.expect(!persistence.session_picker_current_cache.ready);
-    try std.testing.expect(!persistence.session_picker_all_cache.ready);
+    try std.testing.expect(persistence.session_picker_current_cache.page.publication == null);
+    try std.testing.expect(persistence.session_picker_all_cache.page.publication == null);
     try std.testing.expect(persistence.resume_handoff_intent == .none);
 }
 
@@ -2077,8 +2021,7 @@ pub fn Runtime(comptime App: type) type {
                 session_store.default_resume_page_limit;
             const cache = sessionPickerCacheForScope(&app.session_persistence, scope);
             var cache_visible = false;
-            const now_ns = io_mod.nanoTimestamp();
-            if (cache.matches(active_id, limit)) {
+            if (cache.matches(active_id, limit) and cache.isCurrent(store.*)) {
                 try replaceSessionPickerPage(picker, app.alloc, &cache.page);
                 const continuation: ?subagent_resume_admission.ActionableContinuation =
                     if (cache.page.continuation) |value| .{
@@ -2090,10 +2033,6 @@ pub fn Runtime(comptime App: type) type {
                 picker.has_more = cache.page.has_more;
                 picker.load_state = .ready;
                 cache_visible = true;
-                if (cache.isFresh(now_ns)) {
-                    picker.generation = app.session_persistence.session_picker_load.allocateGeneration();
-                    return;
-                }
             }
 
             const loader = &app.session_persistence.session_picker_load;
@@ -2133,7 +2072,7 @@ pub fn Runtime(comptime App: type) type {
             const loader = &app.session_persistence.session_picker_load;
             for ([_]SessionPickerScope{ .current_workspace, .all_workspaces }) |scope| {
                 const cache = sessionPickerCacheForScope(&app.session_persistence, scope);
-                if (cache.matches(active_id, limit) and cache.isFresh(io_mod.nanoTimestamp())) continue;
+                if (cache.matches(active_id, limit) and cache.isCurrent(store.*)) continue;
                 if (loader.matchingInitialGeneration(scope, active_id, limit) != null) continue;
                 const request = SessionPickerLoad.PageRequest.init(
                     loader.allocateGeneration(),
@@ -2176,7 +2115,10 @@ pub fn Runtime(comptime App: type) type {
             var task_owned = true;
             defer if (task_owned) task.deinit();
 
-            if (task.failure == null and task.page != null and task.request.continuation == null) {
+            if (task.failure == null and task.page != null and
+                task.page.?.publication != null and
+                task.request.continuation == null)
+            {
                 const cache = sessionPickerCacheForScope(
                     &app.session_persistence,
                     task.request.scope,
@@ -2185,7 +2127,6 @@ pub fn Runtime(comptime App: type) type {
                     &task.page.?,
                     task.request.active_id,
                     task.request.limit,
-                    io_mod.nanoTimestamp(),
                 ) catch |err| {
                     debug_trace.logf(
                         "core",
@@ -2198,7 +2139,10 @@ pub fn Runtime(comptime App: type) type {
             const picker = &app.session_persistence.session_picker;
             const current = picker.active and picker.generation == task.request.generation;
             if (!current) {
-                if (task.failure == null and task.page != null and task.request.continuation == null) {
+                if (task.failure == null and task.page != null and
+                    task.page.?.publication != null and
+                    task.request.continuation == null)
+                {
                     debug_trace.logf(
                         "core",
                         "session picker completion cached scope={s} generation={d}",
@@ -3242,6 +3186,10 @@ pub fn Runtime(comptime App: type) type {
         pub fn deinitPersistence(app: *App) void {
             closeWritableSession(app, .{});
             app.session_persistence.deinit(app.alloc);
+        }
+
+        pub fn requestPersistenceShutdown(app: *App) void {
+            app.session_persistence.session_picker_load.requestStop();
         }
 
         fn LiveHistorySink(comptime SinkApp: type) type {
@@ -4521,7 +4469,9 @@ pub fn Runtime(comptime App: type) type {
             app.session_persistence.resume_handoff_intent = .none;
             if (comptime @hasField(@TypeOf(app.session), "usage")) {
                 app.session.usage.cancelReconciliation();
-                app.session.usage.finishProfilePublicationsBeforeShutdown();
+                if (handoff_intent == .none) {
+                    app.session.usage.finishProfilePublicationsBeforeShutdown();
+                }
                 app.session.usage.configureCheckpointSink(null);
             }
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
@@ -4533,16 +4483,23 @@ pub fn Runtime(comptime App: type) type {
                 return null;
             var resume_boundary_valid = false;
             if (handoff_intent != .none) {
-                var settlement_failed = false;
-                settleResumeBoundary(app, loaded, log_options) catch |err| {
-                    settlement_failed = true;
-                    debug_trace.logf(
-                        "session",
-                        "resume handoff boundary invalid session={s} err={s}",
-                        .{ loaded.active_id, @errorName(err) },
-                    );
+                var confirmation_options = log_options;
+                confirmation_options.session_lock_deadline_ms = 0;
+                confirmation_options.commit_lock_deadline_ms = 0;
+                resume_boundary_valid = confirmation: {
+                    loaded.confirmResumeHandoffBoundary(
+                        app.alloc,
+                        confirmation_options,
+                    ) catch |err| {
+                        debug_trace.logf(
+                            "session",
+                            "resume handoff boundary invalid session={s} err={s}",
+                            .{ loaded.active_id, @errorName(err) },
+                        );
+                        break :confirmation false;
+                    };
+                    break :confirmation true;
                 };
-                resume_boundary_valid = !settlement_failed;
             } else {
                 settleDurableState(app, loaded, log_options) catch |err| {
                     debug_trace.logf(
@@ -4551,14 +4508,18 @@ pub fn Runtime(comptime App: type) type {
                         .{ loaded.active_id, @errorName(err) },
                     );
                 };
+                loaded.writeCheckpointIfDue(
+                    app.alloc,
+                    true,
+                    log_options,
+                ) catch |err| {
+                    debug_trace.logf(
+                        "session",
+                        "final checkpoint failed session={s} err={s}",
+                        .{ loaded.active_id, @errorName(err) },
+                    );
+                };
             }
-            loaded.writeCheckpointIfDue(app.alloc, true, log_options) catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "final checkpoint failed session={s} err={s}",
-                    .{ loaded.active_id, @errorName(err) },
-                );
-            };
             const should_create_handoff = resume_boundary_valid and
                 shouldCreateResumeHandoff(.{
                     .intent = handoff_intent,
@@ -6255,7 +6216,7 @@ test "upgrade resume handoff owns a validated pristine session" {
     try std.testing.expectEqualStrings(expected_id, handoff.session_id);
 }
 
-test "resume handoff owns the exact non-pristine session id after final replacement" {
+test "resume handoff suppresses pending canonical replacement" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6274,12 +6235,61 @@ test "resume handoff owns the exact non-pristine session id after final replacem
     const turn = try session_runtime.makeAssistantTurn(alloc, "question", "answer");
     defer session_runtime.freeHistoryTurn(alloc, turn);
     try Runtime(TestApp).appendHistoryTurn(&app, turn);
-    app.session_persistence.writable.?.state_replacement_pending = true;
-    const expected_id = try alloc.dupe(
-        u8,
-        app.session_persistence.writable.?.active_id,
+    app.session_persistence.writable.?.persistence_debt.canonical_replacement = true;
+    Runtime(TestApp).requestResumeHandoff(&app);
+
+    var handoff = Runtime(TestApp).finalizePersistenceWithResumeHandoff(&app);
+    defer if (handoff) |*value| value.deinit(alloc);
+    try std.testing.expect(handoff == null);
+    try std.testing.expect(app.session_persistence.writable == null);
+}
+
+const LatestCachePublicationFailure = struct {
+    fn hit(_: ?*anyopaque, point: session_log.Boundary) !void {
+        if (point == .before_latest_cache_ready) {
+            return error.TestLatestCachePublicationFailure;
+        }
+    }
+};
+
+test "derived index publication debt neither grows the log nor suppresses handoff" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    const loaded = &app.session_persistence.writable.?;
+
+    _ = try loaded.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = true } },
+        io_mod.milliTimestamp(),
+        .retry_expected_tail,
+        .{ .test_controls = .{
+            .boundary_fn = LatestCachePublicationFailure.hit,
+        } },
     );
+    const before_bytes = loaded.position.through_event_log_bytes;
+    const expected_id = try alloc.dupe(u8, loaded.active_id);
     defer alloc.free(expected_id);
+    const session_dir = try session_store.sessionDirPath(
+        alloc,
+        app.session_persistence.store.?.sessions_dir,
+        expected_id,
+    );
+    defer alloc.free(session_dir);
+    const events_path = try std.fs.path.join(alloc, &.{ session_dir, "events.jsonl" });
+    defer alloc.free(events_path);
     Runtime(TestApp).requestResumeHandoff(&app);
 
     var handoff = Runtime(TestApp).finalizePersistenceWithResumeHandoff(&app) orelse
@@ -6287,7 +6297,20 @@ test "resume handoff owns the exact non-pristine session id after final replacem
     defer handoff.deinit(alloc);
 
     try std.testing.expectEqualStrings(expected_id, handoff.session_id);
-    try std.testing.expect(app.session_persistence.writable == null);
+    var read_only = try app.session_persistence.store.?.loadReadOnlyDetail(
+        alloc,
+        expected_id,
+        .{},
+    );
+    defer read_only.deinit(alloc);
+    var event_file = try std.Io.Dir.openFileAbsolute(
+        io_mod.getIo(),
+        events_path,
+        .{},
+    );
+    defer event_file.close(io_mod.getIo());
+    try std.testing.expectEqual(before_bytes, try event_file.length(io_mod.getIo()));
+    try std.testing.expect(read_only.state.preferences.fast_mode);
 }
 
 test "resume handoff preparation repairs an exactly recoverable live commit watermark" {
@@ -9417,8 +9440,12 @@ test "session picker prewarms current and all workspace pages before opening" {
     Runtime(TestApp).primeSessionPicker(&app);
     try waitForSessionPickerPrewarm(&app);
     try std.testing.expect(!app.session_persistence.session_picker.active);
-    try std.testing.expect(app.session_persistence.session_picker_current_cache.ready);
-    try std.testing.expect(app.session_persistence.session_picker_all_cache.ready);
+    try std.testing.expect(
+        app.session_persistence.session_picker_current_cache.page.publication != null,
+    );
+    try std.testing.expect(
+        app.session_persistence.session_picker_all_cache.page.publication != null,
+    );
 
     try Runtime(TestApp).openSessionPicker(&app);
     try std.testing.expectEqual(.ready, app.session_persistence.session_picker.load_state);
@@ -9454,33 +9481,21 @@ test "session picker rejects a load more completion after switching to a fresh c
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
 
-    const current_page: subagent_resume_admission.ActionableSessionPage = .{};
-    var all_page: subagent_resume_admission.ActionableSessionPage = .{ .has_more = true };
-    defer all_page.deinit(alloc);
-    try all_page.summaries.append(alloc, .{
-        .id = try alloc.dupe(u8, "foreign-session"),
-        .created_at_ms = 1,
-        .updated_at_ms = 1,
-        .workspace_root = try alloc.dupe(u8, "/foreign-workspace"),
-        .conversation_language = session_runtime.ConversationLanguage.literal("en"),
-        .history_len = 1,
-    });
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("foreign prompt") },
+        .assistant = @constCast("foreign response"),
+    } }};
+    try writeSessionFixture(
+        alloc,
+        app.session_persistence.store.?,
+        "foreign-session",
+        &history,
+        0,
+    );
+    Runtime(TestApp).primeSessionPicker(&app);
+    try waitForSessionPickerPrewarm(&app);
 
     const active_id = app.session_persistence.writable.?.active_id;
-    const limit = resumePageLimitForRows(app.shell.layout.rows);
-    const loaded_at_ns = io_mod.nanoTimestamp();
-    try app.session_persistence.session_picker_current_cache.install(
-        &current_page,
-        active_id,
-        limit,
-        loaded_at_ns,
-    );
-    try app.session_persistence.session_picker_all_cache.install(
-        &all_page,
-        active_id,
-        limit,
-        loaded_at_ns,
-    );
 
     try Runtime(TestApp).openAllSessionPicker(&app);
     const picker = &app.session_persistence.session_picker;
@@ -9512,11 +9527,13 @@ test "session picker rejects a load more completion after switching to a fresh c
 
     try std.testing.expect(try Runtime(TestApp).toggleSessionPickerScope(&app));
     try std.testing.expectEqual(SessionPickerScope.current_workspace, picker.scope);
-    try std.testing.expectEqual(@as(usize, 0), picker.summaries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), picker.summaries.items.len);
+    try std.testing.expectEqualStrings("foreign-session", picker.summaries.items[0].id);
 
     try Runtime(TestApp).pollSessionPicker(&app);
     try std.testing.expectEqual(SessionPickerScope.current_workspace, picker.scope);
-    try std.testing.expectEqual(@as(usize, 0), picker.summaries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), picker.summaries.items.len);
+    try std.testing.expectEqualStrings("foreign-session", picker.summaries.items[0].id);
 }
 
 test "session picker current mode filters workspace and all mode includes every workspace" {
@@ -9861,7 +9878,7 @@ test "session picker discards a held stale request after cancellation and reopen
     try std.testing.expectEqual(@as(usize, 0), app.notices.items.len);
 }
 
-test "session picker keeps stale cached rows ready when refresh fails" {
+test "session picker does not present an unvalidated cached page" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -9897,7 +9914,6 @@ test "session picker keeps stale cached rows ready when refresh fails" {
         &cached_page,
         active_id,
         limit,
-        io_mod.nanoTimestamp() - session_picker_cache_ttl_ns - 1,
     );
 
     const generation = app.session_persistence.session_picker_load.allocateGeneration();
@@ -9912,16 +9928,15 @@ test "session picker keeps stale cached rows ready when refresh fails" {
 
     try Runtime(TestApp).openSessionPicker(&app);
     const picker = &app.session_persistence.session_picker;
-    try std.testing.expectEqual(.ready, picker.load_state);
-    try std.testing.expectEqualStrings("cached-session", picker.selectedId().?);
+    try std.testing.expectEqual(.loading, picker.load_state);
+    try std.testing.expect(picker.selectedId() == null);
 
     failed.done.store(true, .release);
     try Runtime(TestApp).pollSessionPicker(&app);
 
     try std.testing.expect(picker.active);
-    try std.testing.expectEqual(.ready, picker.load_state);
-    try std.testing.expectEqual(@as(usize, 1), picker.summaries.items.len);
-    try std.testing.expectEqualStrings("cached-session", picker.summaries.items[0].id);
+    try std.testing.expectEqual(.failed, picker.load_state);
+    try std.testing.expectEqual(@as(usize, 0), picker.summaries.items.len);
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
 }
 
@@ -9967,6 +9982,56 @@ fn createHeldSessionPickerTask(
         .request = request,
     };
     return task;
+}
+
+test "session picker shutdown cancels a worker after work begins" {
+    const Worker = struct {
+        fn run(
+            started: *std.atomic.Value(bool),
+            cancelled: *const std.atomic.Value(bool),
+            done: *std.atomic.Value(bool),
+        ) void {
+            started.store(true, .release);
+            while (!cancelled.load(.acquire)) {
+                io_mod.sleep(std.time.ns_per_ms);
+            }
+            done.store(true, .release);
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var store = try session_store.Store.initFromHome(
+        alloc,
+        paths.home,
+        paths.workspace,
+    );
+    defer store.deinit(alloc);
+
+    var load: SessionPickerLoad = .{};
+    const task = try createHeldSessionPickerTask(1, "active-session", store);
+    var started = std.atomic.Value(bool).init(false);
+    task.thread = try std.Thread.spawn(
+        .{},
+        Worker.run,
+        .{ &started, &task.cancel_requested, &task.done },
+    );
+    load.task = task;
+    while (!started.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
+
+    const shutdown_started_ms = io_mod.milliTimestamp();
+    load.requestStop();
+    load.deinit();
+
+    try std.testing.expect(io_mod.milliTimestamp() - shutdown_started_ms < 500);
 }
 
 fn waitForSessionPickerLoad(app: *TestApp) !void {

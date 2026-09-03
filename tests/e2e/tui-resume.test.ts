@@ -4626,6 +4626,458 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "second ctrl+c cancels session discovery after scanning begins",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-session-scan-exit-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const sessionsRoot = join(home, ".fx", "sessions");
+    const stderrPath = join(root, "stderr.log");
+    const tracePath = join(root, "trace.log");
+    mkdirSync(sessionsRoot, { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(stderrPath, "");
+    writeFileSync(tracePath, "");
+    for (let index = 0; index < 4_000; index += 1) {
+      const sessionDir = join(
+        sessionsRoot,
+        `fixture-${index.toString().padStart(5, "0")}`,
+      );
+      mkdirSync(sessionDir);
+      writeFileSync(join(sessionDir, "session.json"), '{"invalid":true}\n');
+    }
+    writeFileSync(join(sessionsRoot, "index.pending"), "pending\n", {
+      mode: 0o600,
+    });
+    const firstFixture = join(sessionsRoot, "fixture-00000", "session.json");
+    const firstBefore = statSync(firstFixture);
+    const pendingBefore = statSync(join(sessionsRoot, "index.pending"));
+    const gateway = startFakeGateway([]);
+    let active: TmuxSession | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: realpathSync(workspace),
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "core,input,session",
+        },
+        stderrPath,
+        width: 100,
+        height: 30,
+        remainOnExit: true,
+        startupWaitMs: 50,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("/resume");
+      await active.waitForText("Loading sessions", TIMEOUT);
+      await waitForCondition(
+        () => readFileSync(tracePath, "utf8").includes(
+          "session discovery mode=read_only_list",
+        ),
+        "session discovery to begin",
+      );
+
+      const pid = active.processPid();
+      active.sendKeysImmediate(["C-c"]);
+      await active.waitForText("press ctrl+c again to exit", TIMEOUT);
+      const exitStarted = performance.now();
+      active.sendKeysImmediate(["C-c"]);
+      const exitDeadline = Date.now() + 5_000;
+      while (!active.paneStatus().dead && Date.now() < exitDeadline) {
+        await Bun.sleep(5);
+      }
+      const exitMs = performance.now() - exitStarted;
+
+      expect(active.paneStatus().dead).toBe(true);
+      expect(exitMs).toBeLessThan(500);
+      expect(() => process.kill(pid, 0)).toThrow();
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain("session picker load cancellation requested");
+      expect(trace).toContain("session picker load stopped err=Cancelled");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      const firstAfter = statSync(firstFixture);
+      const pendingAfter = statSync(join(sessionsRoot, "index.pending"));
+      expect(firstAfter.size).toBe(firstBefore.size);
+      expect(firstAfter.mtimeMs).toBe(firstBefore.mtimeMs);
+      expect(pendingAfter.size).toBe(pendingBefore.size);
+      expect(pendingAfter.mtimeMs).toBe(pendingBefore.mtimeMs);
+    } finally {
+      if (active) await active.kill();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "second ctrl+c cancels a large session index parse",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-session-index-exit-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const sessionsRoot = join(home, ".fx", "sessions");
+    const stderrPath = join(root, "stderr.log");
+    const tracePath = join(root, "trace.log");
+    mkdirSync(sessionsRoot, { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(stderrPath, "");
+    writeFileSync(tracePath, "");
+    const padding = "x".repeat(700);
+    const entries = Array.from({ length: 12_000 }, (_, index) => ({
+      id: `indexed-${index.toString().padStart(5, "0")}`,
+      created_at_ms: 1,
+      updated_at_ms: 12_000 - index,
+      workspace_root: realpathSync(workspace),
+      origin_workspace_root: realpathSync(workspace),
+      conversation_language: "en",
+      history_len: 1,
+      display_metadata_present: true,
+      title: `Indexed ${index}`,
+      preview: padding,
+    }));
+    writeFileSync(
+      join(sessionsRoot, "index.json"),
+      JSON.stringify({
+        schema_version: 3,
+        generation: "11".repeat(16),
+        sessions: entries,
+      }),
+      { mode: 0o600 },
+    );
+    const indexBefore = statSync(join(sessionsRoot, "index.json"));
+    const gateway = startFakeGateway([]);
+    let active: TmuxSession | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: realpathSync(workspace),
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "core,input,session",
+        },
+        stderrPath,
+        width: 100,
+        height: 30,
+        remainOnExit: true,
+        startupWaitMs: 0,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await waitForCondition(
+        () => readFileSync(tracePath, "utf8").includes("session index parse begin"),
+        "session index parsing to begin",
+      );
+
+      active.sendKeysImmediate(["C-c"]);
+      await active.waitForText("press ctrl+c again to exit", TIMEOUT);
+      const exitStarted = performance.now();
+      active.sendKeysImmediate(["C-c"]);
+      const exitDeadline = Date.now() + 5_000;
+      while (!active.paneStatus().dead && Date.now() < exitDeadline) {
+        await Bun.sleep(5);
+      }
+      const exitMs = performance.now() - exitStarted;
+
+      expect(active.paneStatus().dead).toBe(true);
+      expect(exitMs).toBeLessThan(500);
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "session index parse cancelled",
+      );
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      const indexAfter = statSync(join(sessionsRoot, "index.json"));
+      expect(indexAfter.size).toBe(indexBefore.size);
+      expect(indexAfter.mtimeMs).toBe(indexBefore.mtimeMs);
+    } finally {
+      if (active) await active.kill();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "second ctrl+c cancels a legacy managed-child relationship scan",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-legacy-child-scan-exit-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const sessionsRoot = join(home, ".fx", "sessions");
+    const stderrPath = join(root, "stderr.log");
+    const tracePath = join(root, "trace.log");
+    mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+    mkdirSync(workspace);
+    writeFileSync(stderrPath, "");
+    writeFileSync(tracePath, "");
+    const gateway = startFakeGateway([fakeGatewayFinalText("LEGACY_SCAN_SESSION")]);
+    let active: TmuxSession | null = null;
+    try {
+      const seeded = await runFx(
+        ["ask", "--json", "--auto", "Seed the legacy relationship scan."],
+        {
+          cwd: realpathSync(workspace),
+          env: gatewayEnv(home, gateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+      expect(seeded.code).toBe(0);
+      expect(seeded.stderr).toBe("");
+      const sessionId = String(JSON.parse(seeded.stdout).session_id);
+
+      const controlRoot = join(sessionsRoot, sessionId, "subagent");
+      mkdirSync(controlRoot, { recursive: true, mode: 0o700 });
+      chmodSync(controlRoot, 0o700);
+      const pageCount = 4_096;
+      const noSlot = (1n << 64n) - 1n;
+      const u16 = (value: number): Buffer => {
+        const bytes = Buffer.alloc(2);
+        bytes.writeUInt16LE(value);
+        return bytes;
+      };
+      const u32 = (value: number): Buffer => {
+        const bytes = Buffer.alloc(4);
+        bytes.writeUInt32LE(value);
+        return bytes;
+      };
+      const u64 = (value: bigint): Buffer => {
+        const bytes = Buffer.alloc(8);
+        bytes.writeBigUInt64LE(value);
+        return bytes;
+      };
+      const header = Buffer.concat([
+        Buffer.from("FXRELH01"),
+        u32(2),
+        u64(7n),
+        u64(1n),
+        u64(BigInt(pageCount * 64)),
+        u64(noSlot),
+        u64(0n),
+        u64(0n),
+        u64(0n),
+        Buffer.alloc(16),
+        u64(0n),
+        Buffer.from([0]),
+        u64(noSlot),
+        u64(noSlot),
+        u16(0),
+      ]);
+      writeFileSync(join(controlRoot, "relationship-index.bin"), header, {
+        mode: 0o600,
+      });
+      const page = Buffer.alloc(8 + 4 + 8 + 8 + 64 * (1 + 8 + 2));
+      Buffer.from("FXRELP01").copy(page, 0);
+      page.writeUInt32LE(2, 8);
+      page.writeBigUInt64LE(7n, 20);
+      for (let slot = 0; slot < 64; slot += 1) {
+        const offset = 28 + slot * 11;
+        page[offset] = 0;
+        page.writeBigUInt64LE(noSlot, offset + 1);
+        page.writeUInt16LE(0, offset + 9);
+      }
+      for (let pageNumber = 0; pageNumber < pageCount; pageNumber += 1) {
+        page.writeBigUInt64LE(BigInt(pageNumber), 12);
+        writeFileSync(
+          join(
+            controlRoot,
+            `relationship-page-${pageNumber.toString(16).padStart(16, "0")}.bin`,
+          ),
+          page,
+          { mode: 0o600 },
+        );
+      }
+      writeFileSync(join(sessionsRoot, "index.pending"), "pending\n", {
+        mode: 0o600,
+      });
+
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: realpathSync(workspace),
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "core,input,session",
+        },
+        stderrPath,
+        width: 100,
+        height: 30,
+        remainOnExit: true,
+        startupWaitMs: 0,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await waitForCondition(
+        () => readFileSync(tracePath, "utf8").includes(
+          `session managed child legacy scan started session=${sessionId}`,
+        ),
+        "legacy managed-child scan to begin",
+      );
+
+      active.sendKeysImmediate(["C-c"]);
+      await active.waitForText("press ctrl+c again to exit", TIMEOUT);
+      const exitStarted = performance.now();
+      active.sendKeysImmediate(["C-c"]);
+      const exitDeadline = Date.now() + 5_000;
+      while (!active.paneStatus().dead && Date.now() < exitDeadline) {
+        await Bun.sleep(5);
+      }
+      const exitMs = performance.now() - exitStarted;
+      const trace = readFileSync(tracePath, "utf8");
+
+      expect(active.paneStatus().dead).toBe(true);
+      expect(exitMs).toBeLessThan(500);
+      expect(trace).toContain(
+        `session managed child legacy scan cancelled session=${sessionId}`,
+      );
+      expect(trace).toContain("session picker load stopped err=Cancelled");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      if (active) await active.kill();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "contended index publication falls back to current canonical sessions",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-index-contention-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const sessionsRoot = join(home, ".fx", "sessions");
+    const stderrPath = join(root, "stderr.log");
+    const tracePath = join(root, "trace.log");
+    const lockReadyPath = join(root, "lock.ready");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    writeFileSync(stderrPath, "");
+    writeFileSync(tracePath, "");
+    const firstGateway = startFakeGateway([fakeGatewayFinalText("INDEX_BASE")]);
+    const secondMarker = "INDEX_CONTENDED_CURRENT";
+    const secondGateway = startFakeGateway([fakeGatewayFinalText(secondMarker)]);
+    const pickerGateway = startFakeGateway([]);
+    const resumeGateway = startFakeGateway([]);
+    let active: TmuxSession | null = null;
+    let resumed: TmuxSession | null = null;
+    let lockHolder: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      const first = await runFx(
+        ["ask", "--json", "--auto", "Seed the complete session index."],
+        {
+          cwd: realpathSync(workspace),
+          env: gatewayEnv(home, firstGateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+      expect(first.code).toBe(0);
+
+      lockHolder = Bun.spawn([
+        "python3",
+        "-c",
+        [
+          "import fcntl, os, signal, sys",
+          "lock_path, ready_path = sys.argv[1:3]",
+          "lock = open(lock_path, 'a')",
+          "fcntl.flock(lock, fcntl.LOCK_EX)",
+          "open(ready_path, 'w').write(str(os.getpid()))",
+          "signal.pause()",
+        ].join("\n"),
+        join(sessionsRoot, "latest.lock"),
+        lockReadyPath,
+      ], { stdout: "ignore", stderr: "ignore" });
+      await waitForCondition(
+        () => existsSync(lockReadyPath),
+        "latest index lock holder",
+      );
+
+      const second = await runFx(
+        ["ask", "--json", "--auto", "Commit the contended current session."],
+        {
+          cwd: realpathSync(workspace),
+          env: gatewayEnv(home, secondGateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+      expect(second.code).toBe(0);
+      expect(second.stderr).toBe("");
+      const sessionId = String(JSON.parse(second.stdout).session_id);
+      const deferredPath = join(sessionsRoot, "latest", "deferred", sessionId);
+      await waitForCondition(
+        () => existsSync(deferredPath),
+        "deferred publication token",
+      );
+      const deferredBefore = statSync(deferredPath);
+
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: realpathSync(workspace),
+        env: {
+          ...gatewayEnv(home, pickerGateway),
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "core,input,session",
+        },
+        stderrPath,
+        width: 100,
+        height: 30,
+      });
+      await active.waitForComposer(TIMEOUT);
+      const openedAt = performance.now();
+      await active.sendText("/resume");
+      await active.waitForText("Commit the contended current session.", TIMEOUT);
+      const openMs = performance.now() - openedAt;
+      expect(openMs).toBeLessThan(2_000);
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "session discovery mode=read_only_list",
+      );
+      const deferredAfter = statSync(deferredPath);
+      expect(deferredAfter.size).toBe(deferredBefore.size);
+      expect(deferredAfter.mtimeMs).toBe(deferredBefore.mtimeMs);
+      await active.sendKeys("Escape");
+      await waitForSessionPickerClosed(active);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await active.kill();
+      active = null;
+
+      lockHolder.kill("SIGKILL");
+      await lockHolder.exited;
+      lockHolder = null;
+      resumed = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume ${sessionId}`,
+        cwd: realpathSync(workspace),
+        env: gatewayEnv(home, resumeGateway),
+        stderrPath,
+        width: 100,
+        height: 30,
+      });
+      await resumed.waitForComposer(TIMEOUT);
+      expect(stripAnsi(await waitForScrollback(resumed, secondMarker))).toContain(
+        secondMarker,
+      );
+      expect(resumeGateway.requests).toHaveLength(0);
+      await resumed.sendText("/quit");
+      expect(await resumed.waitForSessionEnd(TIMEOUT)).toBe(true);
+    } finally {
+      if (active) await active.kill();
+      if (resumed) await resumed.kill();
+      if (lockHolder) {
+        lockHolder.kill("SIGKILL");
+        await lockHolder.exited;
+      }
+      firstGateway.stop();
+      secondGateway.stop();
+      pickerGateway.stop();
+      resumeGateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
   "closing the startup resume picker starts a writable fresh session",
   async () => {
     const root = realpathSync(

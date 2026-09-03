@@ -147,6 +147,7 @@ pub const SessionMigrationStatus = store_types.SessionMigrationStatus;
 pub const SessionRecoveryResult = store_types.SessionRecoveryResult;
 pub const SessionRecoveryStatus = store_types.SessionRecoveryStatus;
 pub const SessionSummary = store_types.SessionSummary;
+pub const SessionIndexPublication = store_types.SessionIndexPublication;
 pub const HistoryPage = store_types.HistoryPage;
 
 pub const LoadHistoryPageError = error{
@@ -574,6 +575,13 @@ pub const Store = struct {
     // Carried on the value so it propagates through the by-value page chain;
     // the UI sets it from the visible screen height.
     resume_page_limit: usize = default_resume_page_limit,
+    resume_cancel_flag: ?*const std.atomic.Value(bool) = null,
+
+    fn checkResumeCancellation(self: Store) !void {
+        if (self.resume_cancel_flag) |flag| {
+            if (flag.load(.acquire)) return error.Cancelled;
+        }
+    }
 
     /// Narrow, copyable view of this store for the discovery/migration helpers,
     /// so they depend on `StoreContext` instead of the full facade.
@@ -641,6 +649,15 @@ pub const Store = struct {
         options: session_log.Options,
     ) !LoadedWritableSession {
         var root = self.canonical_root;
+        if (!state.subagent_child) {
+            self.ensureSessionIndexForWrite(alloc, options) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "event=session_index_bootstrap_deferred err={s}",
+                    .{@errorName(err)},
+                );
+            };
+        }
         const lifecycle: ?session_log.CommitLifecycle = if (state.subagent_child)
             null
         else
@@ -658,6 +675,59 @@ pub const Store = struct {
         errdefer loaded.deinit(alloc);
         try self.attachWritableChildCapability(alloc, &loaded);
         return loaded;
+    }
+
+    fn ensureSessionIndexForWrite(
+        self: Store,
+        alloc: Allocator,
+        options: session_log.Options,
+    ) !void {
+        var sessions = self.canonical_root.sessions orelse
+            return error.SessionStoreUnavailable;
+        if (!try shouldBootstrapEmptySessionIndex(&sessions)) return;
+
+        var lock = try io_mod.acquireTimedAdvisoryLock(
+            &sessions,
+            latest_sessions_lock_file,
+            options.commit_lock_deadline_ms,
+        );
+        defer lock.release();
+        if (!try shouldBootstrapEmptySessionIndex(&sessions)) return;
+        try writeSessionIndex(alloc, &sessions, &.{});
+    }
+
+    fn shouldBootstrapEmptySessionIndex(
+        sessions: *const io_mod.VerifiedDir,
+    ) !bool {
+        if (try sessionIndexEntryExists(sessions, "index.pending")) return false;
+        if (try sessionIndexEntryExists(
+            sessions,
+            summary_codec.session_index_file,
+        )) return false;
+        if (try summary_codec.deferredCachePresent(sessions)) return false;
+
+        var iter = sessions.dir.iterate();
+        while (try iter.next(io_mod.getIo())) |entry| {
+            if (entry.kind != .directory or
+                std.mem.eql(u8, entry.name, latest_sessions_dir))
+            {
+                continue;
+            }
+            validateSessionId(entry.name) catch continue;
+            return false;
+        }
+        return true;
+    }
+
+    fn sessionIndexEntryExists(
+        sessions: *const io_mod.VerifiedDir,
+        name: []const u8,
+    ) !bool {
+        sessions.dir.access(io_mod.getIo(), name, .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        return true;
     }
 
     fn startRecoveryStagedSession(
@@ -2020,12 +2090,27 @@ pub const Store = struct {
         return summary_codec.deferredCachePresent(sessions) catch true;
     }
 
-    fn loadDeferredReplayScope(self: Store, alloc: Allocator) DeferredReplayScope {
+    pub fn sessionIndexPublicationCurrent(
+        self: Store,
+        publication: SessionIndexPublication,
+    ) bool {
+        const sessions = &(self.canonical_root.sessions orelse return false);
+        return summary_codec.sessionIndexPublicationCurrent(
+            sessions,
+            publication,
+        ) catch false;
+    }
+
+    fn loadDeferredReplayScope(self: Store, alloc: Allocator) !DeferredReplayScope {
         const sessions = &(self.canonical_root.sessions orelse return .{ .tokens = .empty });
-        const tokens = summary_codec.readDeferredCacheTokens(
+        const tokens = summary_codec.readDeferredCacheTokensCancellable(
             alloc,
             sessions,
-        ) catch return .all;
+            self.resume_cancel_flag,
+        ) catch |err| switch (err) {
+            error.OutOfMemory, error.Cancelled => return err,
+            else => return .all,
+        };
         return .{ .tokens = tokens };
     }
 
@@ -2520,9 +2605,6 @@ pub const Store = struct {
         if (try self.tryListResumableIndexPageForScope(alloc, scope, active_id, continuation)) |page| {
             return page;
         }
-        if (self.canonical_root.mode == .writable) {
-            return self.backfillResumablePageForScope(alloc, scope, active_id, continuation);
-        }
         return self.listResumablePageFromDiscoveryForScope(alloc, scope, active_id, continuation);
     }
 
@@ -2561,6 +2643,7 @@ pub const Store = struct {
         active_id: ?[]const u8,
         continuation: ?ResumableSessionContinuation,
     ) !?ResumableSessionPage {
+        try self.checkResumeCancellation();
         const sessions = &(self.canonical_root.sessions orelse return null);
         const workspace_root = switch (scope) {
             .all_workspaces => null,
@@ -2572,98 +2655,12 @@ pub const Store = struct {
             .continuation = continuation,
             .limit = self.resume_page_limit,
             .resumable_only = true,
+            .cancel_flag = self.resume_cancel_flag,
         }) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
+            error.OutOfMemory, error.Cancelled => return err,
             else => return null,
         };
         return try self.hydrateResumablePage(alloc, page);
-    }
-
-    fn backfillResumablePageForScope(
-        self: Store,
-        alloc: Allocator,
-        scope: ResumableSessionScope,
-        active_id: ?[]const u8,
-        continuation: ?ResumableSessionContinuation,
-    ) !ResumableSessionPage {
-        var sessions = self.canonical_root.sessions orelse return error.SessionStoreUnavailable;
-        var summaries = try self.scanSessionSummaries(alloc, .read_only_list);
-        defer freeSummaries(alloc, &summaries);
-        try self.refreshMissingDisplayMetadata(alloc, &summaries);
-        var page = try self.resumablePageFromSummariesForScope(
-            alloc,
-            scope,
-            summaries.items,
-            active_id,
-            continuation,
-        );
-        errdefer page.deinit(alloc);
-
-        var cache_lock = io_mod.acquireTimedAdvisoryLock(
-            &sessions,
-            latest_sessions_lock_file,
-            0,
-        ) catch return page;
-        var cache_lock_held = true;
-        defer if (cache_lock_held) cache_lock.release();
-
-        if (try self.tryListResumableIndexPageForScope(alloc, scope, active_id, continuation)) |indexed| {
-            page.deinit(alloc);
-            return indexed;
-        }
-        var observed = summary_codec.readDeferredCacheTokens(
-            alloc,
-            &sessions,
-        ) catch return page;
-        defer summary_codec.freeDeferredCacheTokens(alloc, &observed);
-        var repair_summaries = try self.scanSessionSummaries(alloc, .read_only_list);
-        defer freeSummaries(alloc, &repair_summaries);
-        try self.refreshMissingDisplayMetadata(alloc, &repair_summaries);
-        try writeSessionIndex(alloc, &sessions, repair_summaries.items);
-        try removeSessionIndexMarker(&sessions);
-        cache_lock.release();
-        cache_lock_held = false;
-        for (observed.items) |token| {
-            var root = self.canonical_root;
-            var boundary = root.captureReadBoundary(
-                alloc,
-                token.session_id,
-                .{ .commit_lock_deadline_ms = 0 },
-            ) catch |err| switch (err) {
-                error.SessionNotFound => {
-                    latest_pointer.clearObservedDeferredToken(
-                        alloc,
-                        &sessions,
-                        token,
-                    ) catch |clear_err| {
-                        debug_trace.logf(
-                            "session",
-                            "event=deferred_cache_orphan_clear_failed err={s}",
-                            .{@errorName(clear_err)},
-                        );
-                    };
-                    continue;
-                },
-                else => continue,
-            };
-            defer boundary.deinit();
-            if (!latest_pointer.commitPositionCovers(
-                boundary.position,
-                token.position,
-            )) continue;
-            latest_pointer.clearObservedDeferredToken(
-                alloc,
-                &sessions,
-                token,
-            ) catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "event=deferred_cache_token_clear_failed err={s}",
-                    .{@errorName(err)},
-                );
-            };
-        }
-        return page;
     }
 
     fn listResumablePageFromDiscoveryForScope(
@@ -2673,6 +2670,7 @@ pub const Store = struct {
         active_id: ?[]const u8,
         continuation: ?ResumableSessionContinuation,
     ) !ResumableSessionPage {
+        try self.checkResumeCancellation();
         var summaries = try self.scanSessionSummaries(alloc, .read_only_list);
         defer freeSummaries(alloc, &summaries);
         return try self.resumablePageFromSummariesForScope(
@@ -2728,6 +2726,7 @@ pub const Store = struct {
         summaries: *std.ArrayList(SessionSummary),
     ) !void {
         for (summaries.items) |*summary| {
+            try self.checkResumeCancellation();
             if (!summaryNeedsDisplayMetadata(summary.*)) continue;
             if (try self.adoptFrozenSidecar(alloc, summary)) continue;
             const source_bytes = self.displayMetadataReplaySourceBytes(summary.id) catch |err| {
@@ -2757,23 +2756,13 @@ pub const Store = struct {
                     continue;
                 },
             };
+            try self.checkResumeCancellation();
             const replacement = detail.summary;
             detail.summary = undefined;
             detail.state.deinit(alloc);
 
             summary.deinit(alloc);
             summary.* = replacement;
-            if (!summary.display_metadata_present) continue;
-            if (self.canonical_root.mode == .writable) {
-                self.writeDisplaySidecarFromSummary(alloc, summary.*) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => debug_trace.logf(
-                        "session",
-                        "event=display_sidecar_write_failed id={s} err={s}",
-                        .{ summary.id, @errorName(err) },
-                    ),
-                };
-            }
         }
     }
 
@@ -2823,26 +2812,6 @@ pub const Store = struct {
         summary.preview = display.preview;
         summary.display_metadata_present = true;
         return true;
-    }
-
-    fn writeDisplaySidecarFromSummary(
-        self: Store,
-        alloc: Allocator,
-        summary: SessionSummary,
-    ) !void {
-        const title = summary.title orelse return;
-        var session_dir = try self.openSessionDir(summary.id);
-        defer session_dir.close();
-        try session_display_metadata.writeSidecar(
-            alloc,
-            &session_dir,
-            .{
-                .present = true,
-                .title = title,
-                .preview = summary.preview,
-                .origin_workspace_root = summary.origin_workspace_root,
-            },
-        );
     }
 
     /// Returns the single newest readable session summary, or
@@ -2915,15 +2884,17 @@ pub const Store = struct {
         mode: DiscoveryMode,
         probe_managed_children: bool,
     ) !SessionSummaryScan {
+        try self.checkResumeCancellation();
         var scan = SessionSummaryScan{};
         errdefer scan.deinit(alloc);
-        var replay_scope = self.loadDeferredReplayScope(alloc);
+        var replay_scope = try self.loadDeferredReplayScope(alloc);
         defer replay_scope.deinit(alloc);
         var metadata: std.ArrayList(DiscoveryCandidateMetadata) = .empty;
         defer metadata.deinit(alloc);
         if (self.canonical_root.sessions == null) return scan;
         var iter = self.canonical_root.sessions.?.dir.iterate();
         while (try iter.next(io_mod.getIo())) |entry| {
+            try self.checkResumeCancellation();
             if (entry.kind != .directory) continue;
             if (std.mem.eql(u8, entry.name, latest_sessions_dir)) {
                 continue;
@@ -2952,6 +2923,7 @@ pub const Store = struct {
                     continue;
                 },
             };
+            try self.checkResumeCancellation();
             session_dir.close();
             if (candidate.storage == .schema_v3 and
                 readOnlyScopeRequiresCanonicalReplay(
@@ -2986,14 +2958,23 @@ pub const Store = struct {
                 detail = undefined;
             }
             if (probe_managed_children) {
-                candidate.summary.has_managed_children =
-                    self.sessionHasManagedChildren(alloc, entry.name) catch |err| switch (err) {
-                        error.OutOfMemory => {
-                            candidate.deinit(alloc);
-                            return error.OutOfMemory;
-                        },
-                        else => false,
-                    };
+                candidate.summary.has_managed_children = self.sessionHasManagedChildren(
+                    alloc,
+                    entry.name,
+                ) catch |err| switch (err) {
+                    error.OutOfMemory, error.Cancelled => {
+                        candidate.deinit(alloc);
+                        return err;
+                    },
+                    else => blk: {
+                        debug_trace.logf(
+                            "session",
+                            "event=managed_child_parent_probe_unavailable id={s} err={s}",
+                            .{ entry.name, @errorName(err) },
+                        );
+                        break :blk false;
+                    },
+                };
             }
             logDiscovery(
                 mode,
@@ -3044,6 +3025,7 @@ pub const Store = struct {
         alloc: Allocator,
         session_id: []const u8,
     ) !bool {
+        try self.checkResumeCancellation();
         var capability = try self.openListedChildCapabilityReadOnly(
             alloc,
             session_id,
@@ -3061,6 +3043,7 @@ pub const Store = struct {
             defer file.deinit();
             const bytes = try file.readToEnd(alloc, 512 * 1024);
             defer alloc.free(bytes);
+            try self.checkResumeCancellation();
             var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
             defer parsed.deinit();
             if (parsed.value != .object) return error.InvalidSubagentState;
@@ -3087,10 +3070,25 @@ pub const Store = struct {
         defer alloc.free(header_bytes);
         const header = try relationship_index_codec.decodeHeader(header_bytes);
         if (header.active_count_known) return header.active_count != 0;
+        debug_trace.logf(
+            "session",
+            "session managed child legacy scan started session={s}",
+            .{session_id},
+        );
 
         var page_number: u64 = 0;
         var offset: u64 = 0;
         while (offset < header.high_watermark) : (page_number += 1) {
+            self.checkResumeCancellation() catch |err| {
+                if (err == error.Cancelled) {
+                    debug_trace.logf(
+                        "session",
+                        "session managed child legacy scan cancelled session={s}",
+                        .{session_id},
+                    );
+                }
+                return err;
+            };
             const page_name = relationship_index_codec.pageFileName(page_number);
             var page_file = try capability.openFileReadOnly(
                 alloc,
@@ -3103,6 +3101,7 @@ pub const Store = struct {
                 relationship_index_codec.max_page_bytes,
             );
             defer alloc.free(page_bytes);
+            try self.checkResumeCancellation();
             const page = try relationship_index_codec.decodePage(
                 page_bytes,
                 page_number,
@@ -3442,7 +3441,7 @@ pub const Store = struct {
     ) !?[]u8 {
         try validateWorkspaceRoot(workspace_root);
         if (self.canonical_root.sessions == null) return null;
-        var replay_scope = self.loadDeferredReplayScope(alloc);
+        var replay_scope = try self.loadDeferredReplayScope(alloc);
         defer replay_scope.deinit(alloc);
 
         var selected: ?WritableCandidate = null;
@@ -6601,7 +6600,7 @@ test "pristine discard retains active recovery and permits cleared recovery" {
     );
 }
 
-test "pristine discard repairs latest and index to the completed predecessor" {
+test "pristine discard keeps the canonical predecessor discoverable" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6643,10 +6642,11 @@ test "pristine discard repairs latest and index to the completed predecessor" {
 
     var rebuilt_page = try ctx.store.listResumablePage(alloc, null, null);
     defer rebuilt_page.deinit(alloc);
-    var rebuilt_index = try readSessionIndex(alloc, &ctx.store.canonical_root.sessions.?);
-    defer freeSummaries(alloc, &rebuilt_index);
-    try std.testing.expectEqual(@as(usize, 1), rebuilt_index.items.len);
-    try std.testing.expectEqualStrings("discard-predecessor", rebuilt_index.items[0].id);
+    try std.testing.expectEqual(@as(usize, 1), rebuilt_page.summaries.items.len);
+    try std.testing.expectEqualStrings(
+        "discard-predecessor",
+        rebuilt_page.summaries.items[0].id,
+    );
 }
 
 test "pristine discard refuses resumed and committed writers" {
@@ -6854,8 +6854,7 @@ test "pristine discard failure after pending retains repairable canonical state"
     try std.testing.expectEqual(@as(usize, 0), warm_page.summaries.items.len);
     var warm_index = try readSessionIndex(alloc, &ctx.store.canonical_root.sessions.?);
     defer freeSummaries(alloc, &warm_index);
-    try std.testing.expectEqual(@as(usize, 1), warm_index.items.len);
-    try std.testing.expectEqualStrings(state.id, warm_index.items[0].id);
+    try std.testing.expectEqual(@as(usize, 0), warm_index.items.len);
     var warm_latest = try readLatestPointer(ctx.store, alloc, ctx.workspace) orelse
         return error.TestExpectedEqual;
     defer warm_latest.deinit(alloc);
@@ -7692,7 +7691,7 @@ test "workspace rebind invalidates the old latest pointer before publishing the 
     try std.testing.expectEqualStrings(state.id, pointer.session_id);
 }
 
-fn expectWorkspaceRebindPublicationFailureRepair(
+fn expectWorkspaceRebindPublicationDebt(
     session_id: []const u8,
     force_compaction: bool,
 ) !void {
@@ -7749,7 +7748,8 @@ fn expectWorkspaceRebindPublicationFailureRepair(
         error.InvalidSessionIndex,
         readLatestPointer(store_b, alloc, workspace_b),
     );
-    try std.testing.expect(rebound.needsFinalStateReplacement(false));
+    try std.testing.expect(!rebound.needsFinalStateReplacement(false));
+    try std.testing.expect(rebound.persistence_debt.derived_publication);
 
     failure.armed = false;
     var current = try rebound.state.dupe(alloc);
@@ -7762,6 +7762,7 @@ fn expectWorkspaceRebindPublicationFailureRepair(
         .{},
     );
     try std.testing.expect(!rebound.needsFinalStateReplacement(false));
+    try std.testing.expect(!rebound.persistence_debt.derived_publication);
 
     const pointer_value = try readLatestPointer(store_b, alloc, workspace_b) orelse
         return error.TestExpectedEqual;
@@ -7770,15 +7771,15 @@ fn expectWorkspaceRebindPublicationFailureRepair(
     try std.testing.expectEqualStrings(state.id, pointer.session_id);
 }
 
-test "workspace rebind publication failure remains pending for shutdown repair" {
-    try expectWorkspaceRebindPublicationFailureRepair(
+test "workspace rebind publication failure records only derived debt" {
+    try expectWorkspaceRebindPublicationDebt(
         "workspace-rebind-publication-failure",
         false,
     );
 }
 
-test "workspace rebind publication failure after compaction remains pending for shutdown repair" {
-    try expectWorkspaceRebindPublicationFailureRepair(
+test "workspace rebind publication failure after compaction records only derived debt" {
+    try expectWorkspaceRebindPublicationDebt(
         "workspace-rebind-compaction-publication-failure",
         true,
     );
@@ -8131,7 +8132,7 @@ test "empty session creation survives latest cache contention" {
     );
     var loaded_open = true;
     defer if (loaded_open) loaded.deinit(alloc);
-    if (!loaded.state_replacement_pending) return error.ExpectedDeferredCreation;
+    if (!loaded.persistence_debt.derived_publication) return error.ExpectedDeferredCreation;
     if (loaded.state.history.len != 0) return error.ExpectedEmptyCreatedSession;
     var readable = try ctx.store.loadReadOnly(alloc, state.id);
     defer readable.deinit(alloc);
@@ -8409,7 +8410,7 @@ test "malformed deferred token scope replays all stale sessions" {
     try std.testing.expectEqual(@as(usize, 1), page.summaries.items[0].history_len);
 }
 
-test "writable picker returns canonical results while deferred repair is busy" {
+test "session listing returns canonical results without consuming deferred publication" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8471,17 +8472,15 @@ test "writable picker returns canonical results while deferred repair is busy" {
     token.close(io_mod.getIo());
 
     latest_lock.release();
-    var repaired = try ctx.store.listResumablePage(alloc, null, null);
-    repaired.deinit(alloc);
-    try std.testing.expectError(
-        error.FileNotFound,
-        deferred.openFile(io_mod.getIo(), "dirty-writable-picker", .{
-            .mode = .read_only,
-            .allow_directory = false,
-            .follow_symlinks = false,
-            .resolve_beneath = true,
-        }),
-    );
+    var listed_again = try ctx.store.listResumablePage(alloc, null, null);
+    listed_again.deinit(alloc);
+    var retained = try deferred.openFile(io_mod.getIo(), "dirty-writable-picker", .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    });
+    retained.close(io_mod.getIo());
 }
 
 test "writable resume last selects canonically while deferred repair is busy" {
@@ -8738,7 +8737,7 @@ test "dirty relationship and managed-child candidates use canonical summaries" {
     );
 }
 
-test "writable repair removes a stable orphan deferred token" {
+test "session listing leaves a stable orphan deferred token unchanged" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8761,11 +8760,12 @@ test "writable repair removes a stable orphan deferred token" {
 
     var page = try ctx.store.listResumablePage(alloc, null, null);
     page.deinit(alloc);
-    try expectDeferredCacheTokenMissing(
+    var retained = (try summary_codec.readDeferredCacheToken(
         alloc,
         &sessions,
         "orphan-deferred-token",
-    );
+    )) orelse return error.TestExpectedEqual;
+    retained.deinit(alloc);
 }
 
 test "pristine discard removes its deferred token" {
@@ -11763,7 +11763,7 @@ test "resumable page hydration adopts the frozen sidecar without rederiving" {
     try std.testing.expectEqualStrings("Frozen custom title", display.title);
 }
 
-test "writable resumable backfill refreshes missing display metadata" {
+test "session listing hydrates missing display metadata without writing" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -11773,7 +11773,8 @@ test "writable resumable backfill refreshes missing display metadata" {
     var state = try testDurableState(alloc, "metadata-backfill", ctx.workspace);
     defer state.deinit(alloc);
     var writable = try ctx.store.startWritableSession(alloc, state);
-    errdefer writable.deinit(alloc);
+    var writable_owned = true;
+    defer if (writable_owned) writable.deinit(alloc);
     var history = try alloc.alloc(session.HistoryTurn, 1);
     history[0] = try session.makeAssistantTurn(
         alloc,
@@ -11801,6 +11802,7 @@ test "writable resumable backfill refreshes missing display metadata" {
         .{},
     );
     writable.deinit(alloc);
+    writable_owned = false;
 
     var session_dir = try ctx.store.openSessionDir("metadata-backfill");
     try session_dir.dir.deleteFile(io_mod.getIo(), session_display_metadata.sidecar_file);
@@ -11821,7 +11823,9 @@ test "writable resumable backfill refreshes missing display metadata" {
         old_index_bytes,
     );
 
-    var page = try ctx.store.listResumablePage(alloc, null, null);
+    var read_only = try Store.initReadOnlyFromHome(alloc, ctx.home, ctx.workspace);
+    defer read_only.deinit(alloc);
+    var page = try read_only.listResumablePage(alloc, null, null);
     defer page.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), page.summaries.items.len);
     try std.testing.expect(page.summaries.items[0].display_metadata_present);
@@ -11833,21 +11837,14 @@ test "writable resumable backfill refreshes missing display metadata" {
     var refreshed_index = try summary_codec.readSessionIndex(alloc, sessions);
     defer freeSummaries(alloc, &refreshed_index);
     try std.testing.expectEqual(@as(usize, 1), refreshed_index.items.len);
-    try std.testing.expect(refreshed_index.items[0].display_metadata_present);
-    try std.testing.expectEqualStrings(
-        "first prompt title has more than eight words",
-        refreshed_index.items[0].title.?,
-    );
+    try std.testing.expect(!refreshed_index.items[0].display_metadata_present);
+    try std.testing.expect(refreshed_index.items[0].title == null);
 
     var refreshed_dir = try ctx.store.openSessionDir("metadata-backfill");
     defer refreshed_dir.close();
     var display = try session_display_metadata.readSidecarOrFallback(alloc, &refreshed_dir);
     defer display.deinit(alloc);
-    try std.testing.expect(display.present);
-    try std.testing.expectEqualStrings(
-        "first prompt title has more than eight words",
-        display.title,
-    );
+    try std.testing.expect(!display.present);
 }
 
 test "workspace resumable index and backfill return the same scoped page" {
@@ -12081,7 +12078,7 @@ test "summary index marker preparation rejects an uncommitted session" {
     );
 }
 
-test "summary index publication failure leaves a repairable cache miss" {
+test "summary index publication failure falls back without read-side repair" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -12119,9 +12116,9 @@ test "summary index publication failure leaves a repairable cache miss" {
     try std.testing.expectEqual(@as(usize, 1), repaired.summaries.items.len);
     try std.testing.expectEqualStrings(state.id, repaired.summaries.items[0].id);
 
-    var warm = (try read_only.tryListResumableIndexPage(alloc, null, null)) orelse return error.TestExpectedEqual;
-    defer warm.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), warm.summaries.items.len);
+    try std.testing.expect(
+        (try read_only.tryListResumableIndexPage(alloc, null, null)) == null,
+    );
 }
 
 test "list breaks updated_at ties by descending id" {

@@ -1078,6 +1078,7 @@ pub const Runtime = struct {
             const entry = candidate orelse continue;
             entry.mutex.lockUncancelable(zio);
             if (!entry.isTerminal()) {
+                entry.force_cancel.store(true, .seq_cst);
                 entry.cancel.store(true, .seq_cst);
                 entry.start_gate.set(zio);
                 live[live_len] = entry;

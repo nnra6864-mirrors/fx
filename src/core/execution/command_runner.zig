@@ -2439,6 +2439,20 @@ fn collectOutput(
             }
         }
 
+        if (source.* == .cancelled and
+            force_kill_sent and
+            leader_status.* != null and
+            !streams_finished)
+        {
+            output_incomplete = true;
+            debug_trace.logf(
+                "core",
+                "command output drain abandoned reason=forced_cancellation wait_ready={s}",
+                .{if (observer.waiter.isReady()) "true" else "false"},
+            );
+            break;
+        }
+
         const now_ms = io_mod.milliTimestamp();
         if (termination_settle_expired(
             signal_started_ms,

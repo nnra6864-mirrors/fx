@@ -844,9 +844,10 @@ const App = struct {
         self.stopStream();
 
         self.worker.requestShutdown();
+        SessionAppRuntime.requestPersistenceShutdown(self);
+        self.file_index.requestStop();
         self.managed_executions.shutdown();
         self.upgrader.stop();
-        self.file_index.requestStop();
 
         self.releaseTerminal();
         if (self.worker_thread) |thread| thread.join();

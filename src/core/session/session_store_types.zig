@@ -82,9 +82,21 @@ pub const ResumableSessionContinuation = struct {
     id: []const u8,
 };
 
+/// Identity of one complete derived session-index publication. New indexes
+/// carry an explicit generation; legacy indexes remain safe through the exact
+/// file identity observed while they were parsed.
+pub const SessionIndexPublication = struct {
+    generation: ?[16]u8 = null,
+    inode: u128,
+    size: u64,
+    mtime_ns: i96,
+    ctime_ns: i96,
+};
+
 pub const ResumableSessionPage = struct {
     summaries: std.ArrayList(SessionSummary) = .empty,
     has_more: bool = false,
+    publication: ?SessionIndexPublication = null,
 
     pub fn deinit(self: *ResumableSessionPage, alloc: Allocator) void {
         for (self.summaries.items) |*summary| summary.deinit(alloc);

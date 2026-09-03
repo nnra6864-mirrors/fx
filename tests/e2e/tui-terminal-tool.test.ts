@@ -68,6 +68,7 @@ async function launch(
   fixture: ReturnType<typeof createFixture>,
   gateway: ReturnType<typeof startFakeGateway>,
   cmd = FX_BIN,
+  remainOnExit = false,
 ) {
   const session = await TmuxSession.create({
     isolated: true,
@@ -84,12 +85,13 @@ async function launch(
       FX_GATEWAY_BASE_URL: gateway.baseUrl,
       FX_GATEWAY_CHAT_URL: gateway.chatUrl,
       FX_TRACE_LOG: fixture.tracePath,
-      FX_TRACE_SCOPES: "shell,terminal,terminal_client,terminal_host,tool,agent",
+      FX_TRACE_SCOPES: "core,shell,terminal,terminal_client,terminal_host,tool,agent",
       FX_TERMINAL_HOST_IDLE_MS: "500",
     },
     width: 120,
     height: 32,
     stderrPath: fixture.stderrPath,
+    remainOnExit,
   });
   sessions.push(session);
   await session.waitForComposer(TIMEOUT);
@@ -185,6 +187,117 @@ async function waitForFile(path: string): Promise<void> {
   }
   throw new Error(`Timed out waiting for ${path}`);
 }
+
+test.skipIf(!tmuxAvailable())(
+  "second ctrl+c exits while an external process retains command output",
+  async () => {
+    const fixture = createFixture("fx-shell-exit-held-output-");
+    const socketPath = join(fixture.root, "output.sock");
+    const brokerReadyPath = join(fixture.root, "broker.ready");
+    const heldFdPath = join(fixture.root, "held-fd.txt");
+    const senderPidPath = join(fixture.root, "sender.pid");
+    const brokerPath = join(fixture.workspace, "broker.py");
+    const senderPath = join(fixture.workspace, "sender.py");
+    writeFileSync(
+      brokerPath,
+      [
+        "import array, os, signal, socket, sys",
+        "socket_path, ready_path, held_path = sys.argv[1:4]",
+        "server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)",
+        "server.bind(socket_path)",
+        "server.listen(1)",
+        "open(ready_path, 'w').write(str(os.getpid()))",
+        "connection, _ = server.accept()",
+        "fds = array.array('i')",
+        "_, ancillary, _, _ = connection.recvmsg(1, socket.CMSG_SPACE(fds.itemsize))",
+        "for level, kind, data in ancillary:",
+        "    if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:",
+        "        fds.frombytes(data[:fds.itemsize])",
+        "if not fds:",
+        "    raise RuntimeError('missing output descriptor')",
+        "open(held_path, 'w').write(str(fds[0]))",
+        "signal.pause()",
+      ].join("\n"),
+    );
+    writeFileSync(
+      senderPath,
+      [
+        "import array, os, socket, sys",
+        "socket_path, pid_path = sys.argv[1:3]",
+        "open(pid_path, 'w').write(str(os.getpid()))",
+        "client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)",
+        "client.connect(socket_path)",
+        "fds = array.array('i', [1])",
+        "client.sendmsg([b'x'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds)])",
+        "client.close()",
+        "print('BROKERED_OUTPUT', flush=True)",
+      ].join("\n"),
+    );
+
+    const broker = Bun.spawn([
+      "python3",
+      brokerPath,
+      socketPath,
+      brokerReadyPath,
+      heldFdPath,
+    ], { stdout: "ignore", stderr: "pipe" });
+    try {
+      await waitForFile(brokerReadyPath);
+      const command = `python3 ${JSON.stringify(senderPath)} ${JSON.stringify(socketPath)} ${JSON.stringify(senderPidPath)}`;
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("shell_exit_held_output", "shell", {
+          request: {
+            action: "run",
+            command,
+            profile: "clean",
+            yield_time_ms: 0,
+          },
+        }),
+        fakeGatewayFinalText("SHELL_EXIT_READY"),
+      ]);
+      gateways.push(gateway);
+      const active = await launch(fixture, gateway, FX_BIN, true);
+      await active.sendText("Finish while another process retains command output.");
+      await active.waitForText("SHELL_EXIT_READY", TIMEOUT);
+      await waitForFile(heldFdPath);
+      await waitForFile(senderPidPath);
+      const senderPid = Number(readFileSync(senderPidPath, "utf8"));
+      expect(Number.isSafeInteger(senderPid) && senderPid > 0).toBe(true);
+      const senderDeadline = Date.now() + 3_000;
+      while (Date.now() < senderDeadline) {
+        try {
+          process.kill(senderPid, 0);
+        } catch {
+          break;
+        }
+        await Bun.sleep(10);
+      }
+      expect(() => process.kill(senderPid, 0)).toThrow();
+
+      active.sendKeysImmediate(["C-c"]);
+      await active.waitForText("press ctrl+c again to exit", TIMEOUT);
+      const exitStarted = performance.now();
+      active.sendKeysImmediate(["C-c"]);
+      const exitDeadline = Date.now() + 5_000;
+      while (!active.paneStatus().dead && Date.now() < exitDeadline) {
+        await Bun.sleep(10);
+      }
+      const exitMs = performance.now() - exitStarted;
+
+      expect(active.paneStatus().dead).toBe(true);
+      expect(exitMs).toBeLessThan(500);
+      expect(broker.exitCode).toBeNull();
+      expect(readFileSync(fixture.tracePath, "utf8")).toContain(
+        "command output drain abandoned reason=forced_cancellation",
+      );
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+    } finally {
+      broker.kill("SIGKILL");
+      await broker.exited;
+    }
+  },
+  TIMEOUT,
+);
 
 test.skipIf(!tmuxAvailable())(
   "shell captured empty observation floors short waits without respawn",

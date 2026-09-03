@@ -539,6 +539,11 @@ pub const CommitLifecycle = struct {
     }
 };
 
+const PersistenceDebt = struct {
+    canonical_replacement: bool = false,
+    derived_publication: bool = false,
+};
+
 pub const LoadedWritableSession = struct {
     pub const ExternalPromptOrigin = enum {
         root,
@@ -549,7 +554,7 @@ pub const LoadedWritableSession = struct {
     state: session_codec.DurableSessionState,
     log: WritableSessionDir,
     freshly_started: bool = false,
-    state_replacement_pending: bool = false,
+    persistence_debt: PersistenceDebt = .{},
     child_capability: ?*session_child_store.SessionChildCapability = null,
     commit_lifecycle: ?CommitLifecycle = null,
     position: CommitPosition,
@@ -638,7 +643,7 @@ pub const LoadedWritableSession = struct {
             => true,
             else => false,
         };
-        const replacement_was_pending = self.state_replacement_pending;
+        const replacement_was_pending = self.persistence_debt.canonical_replacement;
         const next_workspace_root = switch (event) {
             .workspace_rebound => |payload| payload.workspace_root,
             else => self.state.workspace_root,
@@ -663,7 +668,7 @@ pub const LoadedWritableSession = struct {
             else => self.usage_sidecar_reseal_pending,
         };
         defer if (usage_sidecar_bytes) |bytes| alloc.free(bytes);
-        self.state_replacement_pending = true;
+        self.persistence_debt.canonical_replacement = true;
         const cache_deferred = switch (event) {
             .workspace_rebound => blk: {
                 try self.prepareCommitLifecycle(alloc, next_workspace_root, options);
@@ -688,15 +693,11 @@ pub const LoadedWritableSession = struct {
         if (!preserves_pristine_start) self.freshly_started = false;
         const lifecycle_published = !cache_deferred and self.publishCommitLifecycle(alloc);
         maintainCanonicalLogAfterCommit(self, alloc, options) catch |err| {
-            self.state_replacement_pending = true;
+            self.persistence_debt.canonical_replacement = true;
             return err;
         };
-        if (!lifecycle_published) {
-            self.state_replacement_pending = true;
-        } else {
-            self.state_replacement_pending =
-                self.state_replacement_pending and replacement_was_pending;
-        }
+        self.persistence_debt.canonical_replacement = replacement_was_pending;
+        self.persistence_debt.derived_publication = !lifecycle_published;
         return self.position;
     }
 
@@ -719,7 +720,7 @@ pub const LoadedWritableSession = struct {
         else
             null;
         defer if (usage_sidecar_bytes) |bytes| alloc.free(bytes);
-        self.state_replacement_pending = true;
+        self.persistence_debt.canonical_replacement = true;
         const same_workspace = std.mem.eql(
             u8,
             self.state.workspace_root,
@@ -752,10 +753,11 @@ pub const LoadedWritableSession = struct {
         self.freshly_started = false;
         const lifecycle_published = !cache_deferred and self.publishCommitLifecycle(alloc);
         maintainCanonicalLogAfterCommit(self, alloc, options) catch |err| {
-            self.state_replacement_pending = true;
+            self.persistence_debt.canonical_replacement = true;
             return err;
         };
-        if (!lifecycle_published) self.state_replacement_pending = true;
+        self.persistence_debt.canonical_replacement = false;
+        self.persistence_debt.derived_publication = !lifecycle_published;
         return self.position;
     }
 
@@ -885,6 +887,92 @@ pub const LoadedWritableSession = struct {
         );
     }
 
+    /// Confirms the writer's current durable boundary without replaying the
+    /// event log. This is intentionally narrower than recovery validation:
+    /// unresolved canonical work is rejected instead of repaired on exit.
+    pub fn confirmResumeHandoffBoundary(
+        self: *LoadedWritableSession,
+        alloc: Allocator,
+        options: Options,
+    ) !void {
+        if (self.degraded_tail != null or
+            self.namespace_confirmation_required or
+            self.persistence_debt.canonical_replacement)
+        {
+            return error.SessionPersistenceDegraded;
+        }
+
+        options.test_controls.lock(.commit);
+        var commit_lock = acquireLockWithDeadline(
+            &self.log.dir,
+            commit_lock_file,
+            true,
+            options.commit_lock_deadline_ms,
+        ) catch |err| return mapCommitLockError(err);
+        defer commit_lock.release();
+
+        try requireIntentAbsent(alloc, &self.log.dir, authority_intent_file);
+        try requireIntentAbsent(alloc, &self.log.dir, publication_intent_file);
+
+        var authority = try loadAuthority(
+            alloc,
+            &self.log.dir,
+            self.active_id,
+        );
+        defer authority.deinit(alloc);
+        if (!std.mem.eql(u8, &authority.authority_id, &self.authority_id)) {
+            return error.InvalidSessionFormat;
+        }
+
+        var event_log = try openManagedFile(
+            &self.log.dir,
+            events_file,
+            .read_only,
+        );
+        defer event_log.close(io_mod.getIo());
+        const generation = try session_replay.readFirstGeneration(
+            alloc,
+            event_log,
+        );
+        if (!std.mem.eql(u8, &generation, &self.position.log_generation)) {
+            return error.InvalidSessionFormat;
+        }
+        const event_stat = try eventStat(
+            event_log,
+            self.position.through_event_log_bytes,
+        );
+
+        const name = try watermarkName(alloc, generation);
+        defer alloc.free(name);
+        var watermark_file = try openManagedFile(
+            &self.log.dir,
+            name,
+            .read_only,
+        );
+        defer watermark_file.close(io_mod.getIo());
+        const watermark_stat = try watermark_file.stat(io_mod.getIo());
+        if (watermark_stat.kind != .file or watermark_stat.nlink != 1) {
+            return error.InvalidSessionFormat;
+        }
+        const watermark_bytes = try io_mod.readFileToEnd(
+            alloc,
+            &watermark_file,
+            watermark_max_bytes,
+        );
+        defer alloc.free(watermark_bytes);
+        const position = try decodeWatermark(
+            alloc,
+            watermark_bytes,
+            self.active_id,
+            generation,
+        );
+        if (!positionsEqual(position, self.position) or
+            event_stat.mtime_ns > watermark_stat.mtime.nanoseconds)
+        {
+            return error.InvalidSessionFormat;
+        }
+    }
+
     /// Repairs only a corrupt watermark whose writer authority, complete
     /// event log, and in-memory state prove the same exact boundary.
     pub fn repairResumeBoundary(
@@ -951,7 +1039,7 @@ pub const LoadedWritableSession = struct {
         self: *const LoadedWritableSession,
         usage_dirty: bool,
     ) bool {
-        return usage_dirty or self.state_replacement_pending;
+        return usage_dirty or self.persistence_debt.canonical_replacement;
     }
 
     pub fn cleanupOrphans(
@@ -1277,9 +1365,9 @@ pub const Root = struct {
                     };
                     return err;
                 };
-                created.state_replacement_pending = true;
+                created.persistence_debt.derived_publication = true;
             } else if (!created.publishCommitLifecycle(alloc)) {
-                created.state_replacement_pending = true;
+                created.persistence_debt.derived_publication = true;
             }
         }
         return created;
@@ -2382,7 +2470,7 @@ fn createNativeSession(
         .state = state,
         .log = writable.*,
         .freshly_started = true,
-        .state_replacement_pending = false,
+        .persistence_debt = .{},
         .position = position,
         .authority_id = authority_id,
         .generation_base_seq = position.through_seq,
@@ -3309,7 +3397,7 @@ fn publishPreparedTail(
         }
         return err;
     };
-    loaded.state_replacement_pending = switch (prepared.kind) {
+    loaded.persistence_debt.canonical_replacement = switch (prepared.kind) {
         .event => true,
         .state_replacement => false,
     };
@@ -4397,7 +4485,7 @@ fn compactCanonicalLog(
     writeManifestProjection(alloc, loaded) catch {
         loaded.projection_status = .stale;
     };
-    loaded.state_replacement_pending = false;
+    loaded.persistence_debt.canonical_replacement = false;
 }
 
 const CleanupCandidates = struct {
@@ -6456,6 +6544,49 @@ test "rollback required failure is excluded from generic degraded retry" {
     );
 }
 
+test "resume handoff confirmation accepts the current durable metadata" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-handoff-metadata", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+
+    _ = try loaded.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = true } },
+        20,
+        .retry_expected_tail,
+        .{},
+    );
+
+    try loaded.confirmResumeHandoffBoundary(alloc, .{
+        .commit_lock_deadline_ms = 0,
+    });
+}
+
+test "resume handoff confirmation rejects a corrupted watermark" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-handoff-corrupt-watermark", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+
+    const name = try watermarkName(alloc, loaded.position.log_generation);
+    defer alloc.free(name);
+    try durableReplace(alloc, &loaded.log.dir, name, "{}\n");
+
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        loaded.confirmResumeHandoffBoundary(alloc, .{
+            .commit_lock_deadline_ms = 0,
+        }),
+    );
+}
+
 test "checkpoint scheduling publishes an exact committed checkpoint" {
     const alloc = std.testing.allocator;
     var temp = try TempRoot.init(alloc);
@@ -6620,7 +6751,7 @@ test "final replacement policy tracks mutations after the last replacement" {
     );
     try std.testing.expect(!loaded.needsFinalStateReplacement(false));
 
-    loaded.state_replacement_pending = true;
+    loaded.persistence_debt.canonical_replacement = true;
     _ = try loaded.appendEvent(
         alloc,
         .{ .preferences_changed = .{ .fast_mode = false } },
