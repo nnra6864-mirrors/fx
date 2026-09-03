@@ -59,12 +59,6 @@ pub const Broker = struct {
         if (total > max_url_bytes) return error.InvalidHostBrokerUrl;
         return std.fmt.allocPrint(alloc, "{s}{s}", .{ self.base_url, route.path() });
     }
-
-    fn owns_route_url(self: Broker, url: []const u8) bool {
-        if (!std.mem.startsWith(u8, url, self.base_url)) return false;
-        const suffix = url[self.base_url.len..];
-        return std.mem.startsWith(u8, suffix, "/v1/");
-    }
 };
 
 pub const Prepared = struct {
@@ -165,13 +159,6 @@ fn process_config() !Config {
         io_mod.getenv("FX_HOST_BROKER_URL"),
         io_mod.getenv("FX_HOST_BROKER_TOKEN"),
     );
-}
-
-pub fn is_process_route_url(url: []const u8) !bool {
-    return switch (try process_config()) {
-        .disabled => false,
-        .configured => |broker| broker.owns_route_url(url),
-    };
 }
 
 pub fn prepare(
@@ -286,9 +273,6 @@ test "host broker routes are closed and preserve validated query values" {
         defer std.testing.allocator.free(url);
         try std.testing.expectEqualStrings(case.expected, url);
     }
-    try std.testing.expect(config.owns_route_url("https://broker.example/fx/v1/gateway/chat"));
-    try std.testing.expect(!config.owns_route_url("https://broker.example/fx-other/v1/gateway/chat"));
-
     try std.testing.expectError(
         error.InvalidHostBrokerQuery,
         config.route_url(std.testing.allocator, .gateway_credits, "teamId=x&redirect=https://evil.example"),

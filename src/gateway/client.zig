@@ -1418,7 +1418,7 @@ fn streamGatewayCompletionCoreWithOptions(
     const model = request.model;
     const payload = request.payload;
     const trace_ctx = request.trace_ctx;
-    const brokered = try host_broker.is_process_route_url(request.chat_url);
+    const brokered = request.broker_request != null;
     const retry_count = effective_stream_retry_count(
         request.provider_attempt_owner,
         request.retry_count,
