@@ -108,6 +108,8 @@ pub fn classifyCredentialFailure(
 pub const FailureReason = enum {
     credential_refresh_failed,
     http_unauthorized,
+    http_forbidden,
+    host_unavailable,
 };
 
 pub const FailureSnapshot = struct {
@@ -116,10 +118,21 @@ pub const FailureSnapshot = struct {
     http_status: ?std.http.Status = null,
 
     pub fn fromHttp(status: std.http.Status, source: ?credentials.Source) ?FailureSnapshot {
-        if (status != .unauthorized) return null;
+        const resolved_source = source orelse return null;
+        const reason: FailureReason = if (resolved_source == .host_managed)
+            switch (status) {
+                .unauthorized => .http_unauthorized,
+                .forbidden => .http_forbidden,
+                .bad_gateway, .service_unavailable, .gateway_timeout => .host_unavailable,
+                else => return null,
+            }
+        else if (status == .unauthorized)
+            .http_unauthorized
+        else
+            return null;
         return .{
-            .source = source orelse return null,
-            .reason = .http_unauthorized,
+            .source = resolved_source,
+            .reason = reason,
             .http_status = status,
         };
     }
@@ -129,17 +142,41 @@ pub const FailureSnapshot = struct {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
 
-        try out.writer.print("{s} {s}", .{
-            credentials.sourceLabel(self.source),
-            switch (self.reason) {
-                .credential_refresh_failed => "credential refresh failed",
-                .http_unauthorized => "authentication failed",
-            },
-        });
+        if (self.source == .host_managed) {
+            try out.writer.writeAll(switch (self.reason) {
+                .credential_refresh_failed, .http_unauthorized => "Host authentication failed",
+                .http_forbidden => "Host authorization denied",
+                .host_unavailable => "Host authentication service unavailable",
+            });
+        } else {
+            try out.writer.print("{s} {s}", .{
+                credentials.sourceLabel(self.source),
+                switch (self.reason) {
+                    .credential_refresh_failed => "credential refresh failed",
+                    .http_unauthorized => "authentication failed",
+                    .http_forbidden => "authorization denied",
+                    .host_unavailable => "authentication service unavailable",
+                },
+            });
+        }
         if (self.http_status) |status| {
             try out.writer.print(" · HTTP {d}", .{@intFromEnum(status)});
         }
         return try out.toOwnedSlice();
+    }
+
+    pub fn recovery_message(self: FailureSnapshot) []const u8 {
+        return switch (self.source) {
+            .fx_login => "Run /login to repair this source.",
+            .chatgpt_subscription => "Reconnect Codex through /login to repair this source.",
+            .grok_subscription => "Reconnect Grok through /login to repair this source.",
+            .vercel_oidc_token, .ai_gateway_api_key, .stored_key => "Run /provider to repair this source.",
+            .host_managed => switch (self.reason) {
+                .credential_refresh_failed, .http_unauthorized => credentials.host_managed_repair_message,
+                .http_forbidden => credentials.host_managed_access_message,
+                .host_unavailable => credentials.host_managed_unavailable_message,
+            },
+        };
     }
 
     /// Returns owned JSON containing only the shared auth-failure facts.
@@ -2650,6 +2687,53 @@ test "auth failure snapshot keeps refresh failures distinct from HTTP rejection"
 
     try std.testing.expect(FailureSnapshot.fromHttp(.forbidden, .fx_login) == null);
     try std.testing.expect(FailureSnapshot.fromHttp(.unauthorized, null) == null);
+}
+
+test "host-managed auth failure names host repair without local recovery" {
+    const snapshot = FailureSnapshot.fromHttp(.unauthorized, .host_managed).?;
+    const message = try snapshot.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(message);
+
+    try std.testing.expectEqualStrings("Host authentication failed · HTTP 401", message);
+    try std.testing.expect(std.mem.find(u8, message, "/login") == null);
+    try std.testing.expect(std.mem.find(u8, message, "API key") == null);
+}
+
+test "host-managed failures distinguish authentication authorization and availability" {
+    const cases = [_]struct {
+        status: std.http.Status,
+        reason: FailureReason,
+        text: []const u8,
+        recovery: []const u8,
+    }{
+        .{
+            .status = .unauthorized,
+            .reason = .http_unauthorized,
+            .text = "Host authentication failed · HTTP 401",
+            .recovery = "Reconnect this provider in the host application.",
+        },
+        .{
+            .status = .forbidden,
+            .reason = .http_forbidden,
+            .text = "Host authorization denied · HTTP 403",
+            .recovery = "Request access in the host application.",
+        },
+        .{
+            .status = .service_unavailable,
+            .reason = .host_unavailable,
+            .text = "Host authentication service unavailable · HTTP 503",
+            .recovery = "Try again shortly or check the host application.",
+        },
+    };
+
+    for (cases) |case| {
+        const snapshot = FailureSnapshot.fromHttp(case.status, .host_managed).?;
+        try std.testing.expectEqual(case.reason, snapshot.reason);
+        const message = try snapshot.renderText(std.testing.allocator);
+        defer std.testing.allocator.free(message);
+        try std.testing.expectEqualStrings(case.text, message);
+        try std.testing.expectEqualStrings(case.recovery, snapshot.recovery_message());
+    }
 }
 
 test "credential refresh failures preserve repair and retry semantics" {

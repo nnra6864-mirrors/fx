@@ -205,6 +205,66 @@ function fakeGatewayEnv(
   };
 }
 
+function startHostBrokerFixture(
+  gateway: ReturnType<typeof startFakeGateway>,
+  responseFactory?: () => Response,
+) {
+  const token = "acp-host-broker-token";
+  const requests: Array<{ path: string; headers: Headers }> = [];
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const url = new URL(request.url);
+      requests.push({ path: url.pathname, headers: new Headers(request.headers) });
+      const upstreamUrl = switchHostBrokerRoute(url.pathname, gateway);
+      if (
+        upstreamUrl === null ||
+        request.headers.get("authorization") !== `Bearer ${token}` ||
+        request.headers.get("x-fx-host-protocol") !== "1"
+      ) {
+        return Response.json({ error: { message: "invalid host broker request" } }, { status: 401 });
+      }
+      if (responseFactory && url.pathname === "/fx/v1/gateway/chat") return responseFactory();
+
+      const headers = new Headers(request.headers);
+      headers.delete("x-fx-host-protocol");
+      headers.set("authorization", "Bearer host-provider-token");
+      const upstream = await fetch(`${upstreamUrl}${url.search}`, {
+        method: request.method,
+        headers,
+        body: request.body,
+        redirect: "manual",
+      });
+      const responseHeaders = new Headers(upstream.headers);
+      for (const name of ["connection", "content-encoding", "content-length", "transfer-encoding"]) {
+        responseHeaders.delete(name);
+      }
+      return new Response(upstream.body, {
+        status: upstream.status,
+        headers: responseHeaders,
+      });
+    },
+  });
+  return {
+    baseUrl: `http://127.0.0.1:${server.port}/fx`,
+    token,
+    requests,
+    stop() { server.stop(true); },
+  };
+}
+
+function switchHostBrokerRoute(
+  path: string,
+  gateway: ReturnType<typeof startFakeGateway>,
+): string | null {
+  switch (path) {
+    case "/fx/v1/gateway/chat": return gateway.chatUrl;
+    case "/fx/v1/gateway/models": return `${gateway.baseUrl}/coding-agent/v1/models`;
+    default: return null;
+  }
+}
+
 function acpContentText(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) return content.map(acpContentText).join("");
@@ -1053,6 +1113,7 @@ describe("acp: model-independent", () => {
     async () => {
       const root = createIsolatedRoot("fx-acp-host-managed-");
       const gateway = startFakeGateway([finalText("ACP_HOST_MANAGED_OK")]);
+      const broker = startHostBrokerFixture(gateway);
       try {
         client = await AcpClient.create({
           cwd: root.workspace,
@@ -1061,6 +1122,8 @@ describe("acp: model-independent", () => {
             AI_GATEWAY_API_KEY: undefined,
             VERCEL_OIDC_TOKEN: undefined,
             FX_AUTH_MODE: "host-managed",
+            FX_HOST_BROKER_URL: broker.baseUrl,
+            FX_HOST_BROKER_TOKEN: broker.token,
           },
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
@@ -1070,13 +1133,65 @@ describe("acp: model-independent", () => {
 
         expect(result.promptResult.result.stopReason).toBe("end_turn");
         expect(JSON.stringify(result.messages)).toContain("ACP_HOST_MANAGED_OK");
+        expect(broker.requests.filter((request) => request.path === "/fx/v1/gateway/chat")).toHaveLength(1);
+        expect(broker.requests.some((request) => request.path === "/fx/v1/gateway/models")).toBe(true);
+        for (const request of broker.requests) {
+          expect(request.headers.get("authorization")).toBe(`Bearer ${broker.token}`);
+        }
         expect(gateway.requests.length).toBe(1);
-        expect(gateway.requests[0]!.headers.get("authorization")).toBeNull();
+        expect(gateway.requests[0]!.headers.get("authorization")).toBe("Bearer host-provider-token");
         expect(gateway.requests[0]!.headers.get("x-vercel-ai-gateway-team")).toBeNull();
         expect(existsSync(join(root.home, ".fx", "auth.json"))).toBe(false);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
+        broker.stop();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "host-managed ACP failures name host-owned recovery",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-host-managed-failure-");
+      const gateway = startFakeGateway([]);
+      const broker = startHostBrokerFixture(
+        gateway,
+        () => Response.json({ error: { message: "private host detail" } }, { status: 401 }),
+      );
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_AUTH_MODE: "host-managed",
+            FX_HOST_BROKER_URL: broker.baseUrl,
+            FX_HOST_BROKER_TOKEN: broker.token,
+          },
+        });
+        await startCodeSession(client);
+        const result = await runPrompt(client, "Exercise host authentication failure.", TIMEOUT);
+
+        expect(result.promptResult.result.stopReason).toBe("refused");
+        const serialized = JSON.stringify(result.messages);
+        expect(serialized).toContain(
+          "Host authentication failed · HTTP 401. Reconnect this provider in the host application.",
+        );
+        expect(serialized).not.toContain("private host detail");
+        expect(serialized).not.toContain("/login");
+        expect(serialized).not.toContain("API key");
+        expect(broker.requests.filter((request) => request.path === "/fx/v1/gateway/chat")).toHaveLength(1);
+        expect(broker.requests.some((request) => request.path === "/fx/v1/gateway/models")).toBe(true);
+        expect(gateway.requests).toHaveLength(0);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        broker.stop();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }

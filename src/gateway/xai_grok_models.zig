@@ -7,6 +7,7 @@ const io_mod = @import("../core/shared/io.zig");
 const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
+const host_broker = @import("host_broker.zig");
 
 const max_catalog_models: usize = 128;
 const max_model_id_bytes: usize = 256;
@@ -60,21 +61,31 @@ fn fetchCatalogForProvider(
 ) std.mem.Allocator.Error!model_catalog.ProviderResult {
     const request_auth = catalogRequestAuth(input.access) orelse
         return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
+    var models_broker_request = host_broker.prepare(alloc, .grok_models, null) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return .{ .failure = .{ .category = .runtime } };
+    };
+    defer if (models_broker_request) |*prepared| prepared.deinit(alloc);
+    var modalities_broker_request = host_broker.prepare(alloc, .grok_modalities, null) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return .{ .failure = .{ .category = .runtime } };
+    };
+    defer if (modalities_broker_request) |*prepared| prepared.deinit(alloc);
     if (request_auth.account_id) |account_id| {
         if (!grok_session.validAccountId(account_id)) {
             return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
         }
     }
-    const request_url = modelsUrl(alloc) catch |err| {
+    const request_url = if (models_broker_request) |prepared| prepared.url else modelsUrl(alloc) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .runtime } };
     };
-    defer alloc.free(request_url);
-    const modalities_url = modalitiesUrl(alloc) catch |err| {
+    defer if (models_broker_request == null) alloc.free(request_url);
+    const modalities_url = if (modalities_broker_request) |prepared| prepared.url else modalitiesUrl(alloc) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .runtime } };
     };
-    defer alloc.free(modalities_url);
+    defer if (modalities_broker_request == null) alloc.free(modalities_url);
 
     var fallback_cancel = std.atomic.Value(bool).init(false);
     const cancel_flag = input.cancel_flag orelse &fallback_cancel;
@@ -85,9 +96,10 @@ fn fetchCatalogForProvider(
     var response = fetchCatalogResponse(
         alloc,
         request_url,
-        request_auth.credential,
-        request_auth.account_id,
-        request_auth.include_subscription_headers,
+        if (models_broker_request) |prepared| prepared.token else request_auth.credential,
+        if (models_broker_request == null) request_auth.account_id else null,
+        models_broker_request == null and request_auth.include_subscription_headers,
+        models_broker_request != null,
         cancel_flag,
         deadline,
     ) catch |err| {
@@ -101,9 +113,10 @@ fn fetchCatalogForProvider(
     var modalities_response = fetchCatalogResponse(
         alloc,
         modalities_url,
-        request_auth.credential,
+        if (modalities_broker_request) |prepared| prepared.token else request_auth.credential,
         null,
         false,
+        modalities_broker_request != null,
         cancel_flag,
         deadline,
     ) catch |err| {
@@ -165,6 +178,7 @@ const FetchOperation = struct {
     credential: ?[]const u8,
     account_id: ?[]const u8,
     include_subscription_headers: bool,
+    host_broker: bool,
 
     pub fn run(self: *@This()) !FetchResponse {
         var client: std.http.Client = .{ .allocator = self.alloc, .io = io_mod.getIo() };
@@ -182,7 +196,7 @@ const FetchOperation = struct {
         const body_buffer = try self.alloc.alloc(u8, max_catalog_bytes + 1);
         defer secret.zeroAndFree(self.alloc, body_buffer);
         var response_writer = std.Io.Writer.fixed(body_buffer);
-        var extra_headers_buffer: [3]std.http.Header = undefined;
+        var extra_headers_buffer: [4]std.http.Header = undefined;
         var extra_headers_len: usize = 0;
         extra_headers_buffer[extra_headers_len] = .{ .name = "accept", .value = "application/json" };
         extra_headers_len += 1;
@@ -192,6 +206,13 @@ const FetchOperation = struct {
         }
         if (self.account_id) |account_id| {
             extra_headers_buffer[extra_headers_len] = .{ .name = "x-userid", .value = account_id };
+            extra_headers_len += 1;
+        }
+        if (self.host_broker) {
+            extra_headers_buffer[extra_headers_len] = .{
+                .name = host_broker.protocol_header_name,
+                .value = host_broker.protocol_header_value,
+            };
             extra_headers_len += 1;
         }
         const result = client.fetch(.{
@@ -220,6 +241,7 @@ fn fetchCatalogResponse(
     credential: ?[]const u8,
     account_id: ?[]const u8,
     include_subscription_headers: bool,
+    brokered: bool,
     cancel_flag: *std.atomic.Value(bool),
     deadline: std.Io.Clock.Timestamp,
 ) !FetchResponse {
@@ -229,6 +251,7 @@ fn fetchCatalogResponse(
         .credential = credential,
         .account_id = account_id,
         .include_subscription_headers = include_subscription_headers,
+        .host_broker = brokered,
     };
     return gateway_client.runBoundedHttpOperation(
         FetchResponse,
@@ -761,6 +784,7 @@ fn fetchCatalogFixture(body: []const u8) !FetchResponse {
         .credential = "grok-test-token",
         .account_id = "acct_test",
         .include_subscription_headers = true,
+        .host_broker = false,
     };
     const result = operation.run();
     fixture.deinit();

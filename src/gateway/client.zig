@@ -6,6 +6,7 @@ const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
+const host_broker = @import("host_broker.zig");
 
 pub fn isRetryableGatewayError(err: anyerror) bool {
     return err == error.HttpConnectionClosing or
@@ -259,6 +260,18 @@ pub fn fetchGatewayJson(
 }
 
 pub fn fetchGatewayGetResult(alloc: std.mem.Allocator, api_key: ?[]const u8, path: []const u8) !GetResult {
+    const query = if (std.mem.findScalar(u8, path, '?')) |index| path[index + 1 ..] else null;
+    var broker_request = try host_broker.prepare(alloc, .gateway_credits, query);
+    defer if (broker_request) |*prepared| prepared.deinit(alloc);
+    if (broker_request) |prepared| {
+        return fetchGatewayGetAtUrl(
+            alloc,
+            prepared.token,
+            null,
+            prepared.url,
+            e2e_gateway_credits_url_env,
+        );
+    }
     return fetchGatewayGet(alloc, api_key, null, path, e2e_gateway_credits_url_env);
 }
 
@@ -271,12 +284,21 @@ pub fn fetchGatewayGenerationResult(
     cancel_flag: *std.atomic.Value(bool),
 ) !GetResult {
     if (!types.validGatewayGenerationId(generation_id)) return error.InvalidGenerationId;
+    const query = try std.fmt.allocPrint(alloc, "id={s}", .{generation_id});
+    defer alloc.free(query);
+    var broker_request = try host_broker.prepare(alloc, .gateway_generation, query);
+    defer if (broker_request) |*prepared| prepared.deinit(alloc);
+    const direct_url = if (broker_request == null)
+        try std.fmt.allocPrint(alloc, "{s}/v1/generation?id={s}", .{ gateway_origin, generation_id })
+    else
+        null;
+    defer if (direct_url) |value| alloc.free(value);
     var operation = GenerationLookupOperation{
         .alloc = alloc,
-        .api_key = api_key,
-        .gateway_team = gateway_team,
-        .gateway_origin = gateway_origin,
-        .generation_id = generation_id,
+        .api_key = if (broker_request) |prepared| prepared.token else api_key,
+        .gateway_team = if (broker_request == null) gateway_team else null,
+        .url = if (broker_request) |prepared| prepared.url else direct_url.?,
+        .host_broker = broker_request != null,
     };
     return runBoundedHttpOperation(
         GetResult,
@@ -294,23 +316,11 @@ const GenerationLookupOperation = struct {
     alloc: std.mem.Allocator,
     api_key: ?[]const u8,
     gateway_team: ?[]const u8,
-    gateway_origin: []const u8,
-    generation_id: []const u8,
+    url: []const u8,
+    host_broker: bool,
 
     fn run(self: *@This()) !GetResult {
-        const path = try std.fmt.allocPrint(
-            self.alloc,
-            "/v1/generation?id={s}",
-            .{self.generation_id},
-        );
-        defer self.alloc.free(path);
-        const url = try std.fmt.allocPrint(
-            self.alloc,
-            "{s}{s}",
-            .{ self.gateway_origin, path },
-        );
-        defer self.alloc.free(url);
-        const uri = try std.Uri.parse(url);
+        const uri = try std.Uri.parse(self.url);
 
         var client: std.http.Client = .{
             .allocator = self.alloc,
@@ -327,10 +337,11 @@ const GenerationLookupOperation = struct {
             auth_header = try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{api_key});
             headers.authorization = .{ .override = auth_header.? };
         }
-        var extra_headers_buf: [1]std.http.Header = undefined;
+        var extra_headers_buf: [2]std.http.Header = undefined;
         const extra_headers = gatewayModelCatalogExtraHeaders(
             &extra_headers_buf,
             self.gateway_team,
+            self.host_broker,
         );
         var req = try client.request(.GET, uri, .{
             .headers = headers,
@@ -366,7 +377,8 @@ fn fetchGatewayGetAtUrl(alloc: std.mem.Allocator, api_key: ?[]const u8, gateway_
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
 
-    const url = try resolveE2eGatewayUrl(e2e_url_env, default_url);
+    const brokered = try host_broker.is_process_route_url(default_url);
+    const url = if (brokered) default_url else try resolveE2eGatewayUrl(e2e_url_env, default_url);
 
     var auth_header: ?[]u8 = null;
     defer if (auth_header) |value| secret.zeroAndFree(alloc, value);
@@ -377,8 +389,8 @@ fn fetchGatewayGetAtUrl(alloc: std.mem.Allocator, api_key: ?[]const u8, gateway_
         auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{key});
         headers.authorization = .{ .override = auth_header.? };
     }
-    var extra_headers_buf: [1]std.http.Header = undefined;
-    const extra_headers = gatewayModelCatalogExtraHeaders(&extra_headers_buf, gateway_team);
+    var extra_headers_buf: [2]std.http.Header = undefined;
+    const extra_headers = gatewayModelCatalogExtraHeaders(&extra_headers_buf, gateway_team, brokered);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -407,8 +419,9 @@ pub fn fetchGatewayJsonCancellable(
 ) !GatewayJsonResult {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
-    const request_url = try resolveE2eGatewayUrl(e2e_gateway_models_url_env, url);
-    return fetchGatewayJsonAtUrlCancellable(alloc, api_key, gateway_team, request_url, cancel_flag);
+    const brokered = try host_broker.is_process_route_url(url);
+    const request_url = if (brokered) url else try resolveE2eGatewayUrl(e2e_gateway_models_url_env, url);
+    return fetchGatewayJsonAtUrlCancellable(alloc, api_key, gateway_team, request_url, brokered, cancel_flag);
 }
 
 fn fetchGatewayJsonAtUrlCancellable(
@@ -416,6 +429,7 @@ fn fetchGatewayJsonAtUrlCancellable(
     api_key: ?[]const u8,
     gateway_team: ?[]const u8,
     url: []const u8,
+    brokered: bool,
     cancel_flag: *std.atomic.Value(bool),
 ) !GatewayJsonResult {
     var operation = GatewayJsonFetchOperation{
@@ -423,6 +437,7 @@ fn fetchGatewayJsonAtUrlCancellable(
         .api_key = api_key,
         .gateway_team = gateway_team,
         .url = url,
+        .host_broker = brokered,
         .cancel_flag = cancel_flag,
     };
     return runCancellableGatewayJsonFetch(alloc, cancel_flag, &operation);
@@ -433,6 +448,7 @@ const GatewayJsonFetchOperation = struct {
     api_key: ?[]const u8,
     gateway_team: ?[]const u8,
     url: []const u8,
+    host_broker: bool,
     cancel_flag: *std.atomic.Value(bool),
 
     fn run(self: *@This()) !GatewayJsonResult {
@@ -441,6 +457,7 @@ const GatewayJsonFetchOperation = struct {
             self.api_key,
             self.gateway_team,
             self.url,
+            self.host_broker,
             self.cancel_flag,
         );
     }
@@ -512,6 +529,7 @@ fn fetchGatewayJsonAtUrlCore(
     api_key: ?[]const u8,
     gateway_team: ?[]const u8,
     url: []const u8,
+    brokered: bool,
     cancel_flag: *std.atomic.Value(bool),
 ) !GatewayJsonResult {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
@@ -531,8 +549,8 @@ fn fetchGatewayJsonAtUrlCore(
         auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{key});
         headers.authorization = .{ .override = auth_header.? };
     }
-    var extra_headers_buf: [1]std.http.Header = undefined;
-    const extra_headers = gatewayModelCatalogExtraHeaders(&extra_headers_buf, gateway_team);
+    var extra_headers_buf: [2]std.http.Header = undefined;
+    const extra_headers = gatewayModelCatalogExtraHeaders(&extra_headers_buf, gateway_team, brokered);
 
     var req = client.request(.GET, uri, .{
         .headers = headers,
@@ -1386,12 +1404,17 @@ fn streamGatewayCompletionCoreWithOptions(
 ) !StreamResult {
     const model = request.model;
     const payload = request.payload;
-    const retry_count = switch (request.provider_attempt_owner) {
-        .agent => 1,
-        .transport => request.retry_count,
-    };
     const trace_ctx = request.trace_ctx;
-    const request_url = try resolveE2eGatewayUrl(e2e_gateway_chat_url_env, request.chat_url);
+    const brokered = try host_broker.is_process_route_url(request.chat_url);
+    const retry_count = effective_stream_retry_count(
+        request.provider_attempt_owner,
+        request.retry_count,
+        brokered,
+    );
+    const request_url = if (brokered)
+        request.chat_url
+    else
+        try resolveE2eGatewayUrl(e2e_gateway_chat_url_env, request.chat_url);
     const uri = try std.Uri.parse(request_url);
 
     var auth_header: ?[]u8 = null;
@@ -1406,13 +1429,20 @@ fn streamGatewayCompletionCoreWithOptions(
         request_headers.authorization = .{ .override = auth_header.? };
     }
 
-    var extra_headers_buf: [10]std.http.Header = undefined;
-    const extra_headers = gatewayExtraHeaders(
+    var extra_headers_buf: [11]std.http.Header = undefined;
+    var extra_headers = gatewayExtraHeaders(
         &extra_headers_buf,
         model,
         request.team,
         request.session_id,
     );
+    if (brokered) {
+        extra_headers_buf[extra_headers.len] = .{
+            .name = host_broker.protocol_header_name,
+            .value = host_broker.protocol_header_value,
+        };
+        extra_headers = extra_headers_buf[0 .. extra_headers.len + 1];
+    }
 
     if (request.admission) |admission| try admission.admit();
     var attempt: usize = 0;
@@ -1704,6 +1734,18 @@ fn streamGatewayCompletionCoreWithOptions(
     return error.HttpConnectionClosing;
 }
 
+fn effective_stream_retry_count(
+    owner: ProviderAttemptOwner,
+    requested: usize,
+    brokered: bool,
+) usize {
+    if (brokered) return 1;
+    return switch (owner) {
+        .agent => 1,
+        .transport => requested,
+    };
+}
+
 fn gatewayExtraHeaders(
     buf: []std.http.Header,
     model: []const u8,
@@ -1743,14 +1785,21 @@ fn gatewayExtraHeaders(
     return buf[0..len];
 }
 
-fn gatewayModelCatalogExtraHeaders(buf: []std.http.Header, team: ?[]const u8) []const std.http.Header {
-    std.debug.assert(buf.len >= 1);
+fn gatewayModelCatalogExtraHeaders(buf: []std.http.Header, team: ?[]const u8, brokered: bool) []const std.http.Header {
+    std.debug.assert(buf.len >= 2);
     var len: usize = 0;
     if (team) |gateway_team| {
         if (gateway_team.len > 0) {
             buf[len] = .{ .name = vercel_ai_gateway_team_header, .value = gateway_team };
             len += 1;
         }
+    }
+    if (brokered) {
+        buf[len] = .{
+            .name = host_broker.protocol_header_name,
+            .value = host_broker.protocol_header_value,
+        };
+        len += 1;
     }
     return buf[0..len];
 }
@@ -6707,6 +6756,21 @@ test "agent-owned provider attempts return the first retryable response" {
     if (harness.fixture.failure) |err| return err;
 }
 
+test "host broker owns retries after fx sends a request" {
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        effective_stream_retry_count(.transport, 3, true),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        effective_stream_retry_count(.transport, 3, false),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        effective_stream_retry_count(.agent, 3, false),
+    );
+}
+
 test "agent-owned provider attempts return the first TLS setup failure" {
     var harness = try ConnectionSetupHarness.init(.success, false);
     defer harness.deinit();
@@ -7001,7 +7065,7 @@ fn expectCancellableGatewayJsonCancellation(
 
     const started = std.Io.Clock.Timestamp.now(zio, .awake);
     const result = if (use_tls)
-        fetchGatewayJsonAtUrlCancellable(std.testing.allocator, api_key, null, models_url, &cancel_flag)
+        fetchGatewayJsonAtUrlCancellable(std.testing.allocator, api_key, null, models_url, false, &cancel_flag)
     else
         fetchGatewayJsonCancellable(std.testing.allocator, api_key, null, "https://ai-gateway.vercel.sh/v1/models", &cancel_flag);
     const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();

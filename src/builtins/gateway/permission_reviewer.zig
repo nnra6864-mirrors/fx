@@ -1,5 +1,6 @@
 const std = @import("std");
 const gateway_client = @import("../../gateway/client.zig");
+const host_broker = @import("../../gateway/host_broker.zig");
 const permission_auto_classifier = @import("../../core/permissions/auto_classifier.zig");
 const session_usage = @import("../../core/session/session_usage.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
@@ -316,14 +317,16 @@ fn streamGatewayReviewer(
     delivery: *gateway_client.DeliveryCertainty,
     cancel_flag: *std.atomic.Value(bool),
 ) !gateway_client.StreamResult {
+    var broker_request = try host_broker.prepare(alloc, .gateway_chat, null);
+    defer if (broker_request) |*prepared| prepared.deinit(alloc);
     return gateway_client.streamGatewayRequiredToolCompletionBounded(
         alloc,
         .{
-            .api_key = if (api_key.len > 0) api_key else null,
-            .team = team,
+            .api_key = if (broker_request) |prepared| prepared.token else if (api_key.len > 0) api_key else null,
+            .team = if (broker_request == null) team else null,
             .model = model,
             .retry_count = retry_count,
-            .chat_url = chat_url,
+            .chat_url = if (broker_request) |prepared| prepared.url else chat_url,
             .payload = payload,
             .delivery = delivery,
         },

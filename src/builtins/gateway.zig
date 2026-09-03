@@ -12,6 +12,7 @@ const collections = @import("../core/shared/collections.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_error_format = @import("../core/shared/gateway_error_format.zig");
 const gateway_client = @import("../gateway/client.zig");
+const host_broker = @import("../gateway/host_broker.zig");
 const vercel_failure_diagnostics = @import("../gateway/vercel_failure_diagnostics.zig");
 const vercel_protocol = @import("../gateway/vercel_protocol.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -536,14 +537,16 @@ fn streamAgentCompletion(
     const payload = request.prepared_request_body orelse
         try buildAgentRequest(alloc, request.data());
     defer if (request.prepared_request_body == null) alloc.free(payload);
+    var broker_request = try host_broker.prepare(alloc, .gateway_chat, null);
+    defer if (broker_request) |*prepared| prepared.deinit(alloc);
     var events = request.events;
     const stream_request = gateway_client.StreamRequest{
-        .api_key = request.credential.secret(),
-        .team = request.credential.tenant(),
+        .api_key = if (broker_request) |prepared| prepared.token else request.credential.secret(),
+        .team = if (broker_request == null) request.credential.tenant() else null,
         .session_id = request.session_id,
         .model = request.model,
-        .retry_count = request.retry_count,
-        .chat_url = agentChatUrl(),
+        .retry_count = if (credential_source == .host_managed) 1 else request.retry_count,
+        .chat_url = if (broker_request) |prepared| prepared.url else agentChatUrl(),
         .payload = payload,
         .trace_ctx = request.trace_ctx,
         .content_capture_limit = request.content_capture_limit,
@@ -1050,7 +1053,7 @@ pub fn executeGatewayWorker(
         config.api_key orelse "",
         config.team,
         config.model,
-        @max(config.retry_count, 1),
+        if (config.credential_source == .host_managed) 1 else @max(config.retry_count, 1),
         config.chat_url,
         payload,
         provider_tool_name,
@@ -1186,14 +1189,16 @@ fn streamGatewayWorker(
     delivery: *gateway_client.DeliveryCertainty,
     cancel_flag: *std.atomic.Value(bool),
 ) !gateway_client.StreamResult {
+    var broker_request = try host_broker.prepare(alloc, .gateway_chat, null);
+    defer if (broker_request) |*prepared| prepared.deinit(alloc);
     return gateway_client.streamGatewayProviderToolCompletionBounded(
         alloc,
         .{
-            .api_key = if (api_key.len > 0) api_key else null,
-            .team = team,
+            .api_key = if (broker_request) |prepared| prepared.token else if (api_key.len > 0) api_key else null,
+            .team = if (broker_request == null) team else null,
             .model = model,
             .retry_count = request_retry_count,
-            .chat_url = chat_url,
+            .chat_url = if (broker_request) |prepared| prepared.url else chat_url,
             .payload = payload,
             .delivery = delivery,
         },
@@ -1838,6 +1843,7 @@ test "web search drops worker text when no provider result arrives" {
 
 const FakeStream = struct {
     calls: usize = 0,
+    attempt_limit: usize = 0,
     fail_before_send: bool = false,
     fail_after_send: bool = false,
     team: ?[]const u8 = null,
@@ -1856,7 +1862,7 @@ const FakeStream = struct {
         _: []const u8,
         team: ?[]const u8,
         _: []const u8,
-        _: usize,
+        attempt_limit: usize,
         _: []const u8,
         payload: []const u8,
         expected_provider_tool_name: []const u8,
@@ -1866,6 +1872,7 @@ const FakeStream = struct {
     ) anyerror!gateway_client.StreamResult {
         const self: *@This() = @ptrCast(@alignCast(raw_ctx));
         self.calls += 1;
+        self.attempt_limit = attempt_limit;
         if (self.fail_before_send) return error.AccessDenied;
         if (self.fail_after_send) {
             delivery.markPossiblySent();
@@ -1908,6 +1915,27 @@ const FakeStream = struct {
         };
     }
 };
+
+test "host-managed web search leaves inference retries with the host" {
+    const alloc = std.testing.allocator;
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var fake = FakeStream{};
+    var response = try executeGatewayWorker(alloc, .{
+        .api_key = null,
+        .credential_source = .host_managed,
+        .model = "provider/model",
+        .retry_count = 3,
+        .chat_url = default_chat_url,
+        .stream_ctx = @ptrCast(&fake),
+        .stream_fn = FakeStream.execute,
+    }, .{
+        .backend = exa_search_backend_id,
+        .query = "Zig documentation",
+        .cancel_flag = &cancel_flag,
+    }, null, null);
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), fake.attempt_limit);
+}
 
 test "pre-send web search failure stays unbilled" {
     const alloc = std.testing.allocator;
@@ -2418,15 +2446,20 @@ fn fetchModelCatalogResponse(
     const team_path = try modelCatalogTeamPath(alloc, path, access);
     defer if (team_path) |owned| alloc.free(owned);
 
-    const model_catalog_url = try modelCatalogUrl(
-        alloc,
-        team_path orelse path,
-        io_mod.getenv(base_url_env),
-    );
-    defer alloc.free(model_catalog_url);
+    var broker_request = try host_broker.prepare(alloc, .gateway_models, null);
+    defer if (broker_request) |*prepared| prepared.deinit(alloc);
+    const model_catalog_url = if (broker_request) |prepared|
+        prepared.url
+    else
+        try modelCatalogUrl(
+            alloc,
+            team_path orelse path,
+            io_mod.getenv(base_url_env),
+        );
+    defer if (broker_request == null) alloc.free(model_catalog_url);
 
-    const api_key = access.authorizationCredential();
-    const gateway_team = modelCatalogHeaderTeam(access);
+    const api_key = if (broker_request) |prepared| prepared.token else access.authorizationCredential();
+    const gateway_team = if (broker_request == null) modelCatalogHeaderTeam(access) else null;
     return if (cancel_flag) |flag|
         gateway_client.fetchGatewayJsonCancellable(alloc, api_key, gateway_team, model_catalog_url, flag)
     else

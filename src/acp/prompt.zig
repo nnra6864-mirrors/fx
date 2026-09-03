@@ -2338,11 +2338,19 @@ fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u
     else
         null;
     defer if (owned_message) |message| ctx.alloc.free(message);
-    const msg = owned_message orelse if (detail.len > 0)
+    const base_message = owned_message orelse if (detail.len > 0)
         std.fmt.bufPrint(&buf, "HTTP {d}: {s}", .{ @intFromEnum(status), detail }) catch "HTTP error"
     else
         std.fmt.bufPrint(&buf, "HTTP {d}", .{@intFromEnum(status)}) catch "HTTP error";
-    ctx.sendAgentText(ctx.operationalMessageId(), msg) catch {};
+    const host_message: ?[]u8 = if (auth_failure) |failure|
+        if (failure.source == .host_managed)
+            try std.fmt.allocPrint(ctx.alloc, "{s}. {s}", .{ base_message, failure.recovery_message() })
+        else
+            null
+    else
+        null;
+    defer if (host_message) |message| ctx.alloc.free(message);
+    ctx.sendAgentText(ctx.operationalMessageId(), host_message orelse base_message) catch {};
 }
 
 fn formatToolExecutionError(_: *anyopaque, arena: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {

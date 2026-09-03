@@ -7,6 +7,7 @@ const io_mod = @import("../core/shared/io.zig");
 const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
+const host_broker = @import("host_broker.zig");
 
 const max_catalog_models: usize = 128;
 const max_model_id_bytes: usize = 1024;
@@ -61,6 +62,15 @@ fn fetchCatalogForProvider(
 ) std.mem.Allocator.Error!model_catalog.ProviderResult {
     const request_auth = catalogRequestAuth(input.access) orelse
         return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
+    var broker_request = host_broker.prepare(
+        alloc,
+        .codex_models,
+        "client_version=" ++ protocol_client_version,
+    ) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return .{ .failure = .{ .category = .runtime } };
+    };
+    defer if (broker_request) |*prepared| prepared.deinit(alloc);
     var owned_account_id: ?[]u8 = null;
     defer if (owned_account_id) |account| alloc.free(account);
     const account_id = request_auth.account_id orelse if (request_auth.credential) |credential| account: {
@@ -70,19 +80,20 @@ fn fetchCatalogForProvider(
         };
         break :account owned_account_id.?;
     } else null;
-    const request_url = modelsUrl(alloc) catch |err| {
+    const request_url = if (broker_request) |prepared| prepared.url else modelsUrl(alloc) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .runtime } };
     };
-    defer alloc.free(request_url);
+    defer if (broker_request == null) alloc.free(request_url);
 
     var fallback_cancel = std.atomic.Value(bool).init(false);
     const cancel_flag = input.cancel_flag orelse &fallback_cancel;
     var operation = FetchOperation{
         .alloc = alloc,
         .url = request_url,
-        .credential = request_auth.credential,
-        .account_id = account_id,
+        .credential = if (broker_request) |prepared| prepared.token else request_auth.credential,
+        .account_id = if (broker_request == null) account_id else null,
+        .host_broker = broker_request != null,
     };
     var response = gateway_client.runBoundedHttpOperation(
         FetchResponse,
@@ -156,6 +167,7 @@ const FetchOperation = struct {
     url: []const u8,
     credential: ?[]const u8,
     account_id: ?[]const u8,
+    host_broker: bool,
 
     pub fn run(self: *@This()) !FetchResponse {
         var client: std.http.Client = .{ .allocator = self.alloc, .io = io_mod.getIo() };
@@ -173,7 +185,7 @@ const FetchOperation = struct {
         const body_buffer = try self.alloc.alloc(u8, max_catalog_bytes + 1);
         defer secret.zeroAndFree(self.alloc, body_buffer);
         var response_writer = std.Io.Writer.fixed(body_buffer);
-        var extra_headers: [3]std.http.Header = undefined;
+        var extra_headers: [4]std.http.Header = undefined;
         var extra_len: usize = 0;
         if (self.account_id) |account_id| {
             extra_headers[extra_len] = .{ .name = "chatgpt-account-id", .value = account_id };
@@ -183,6 +195,13 @@ const FetchOperation = struct {
         extra_len += 1;
         extra_headers[extra_len] = .{ .name = "accept", .value = "application/json" };
         extra_len += 1;
+        if (self.host_broker) {
+            extra_headers[extra_len] = .{
+                .name = host_broker.protocol_header_name,
+                .value = host_broker.protocol_header_value,
+            };
+            extra_len += 1;
+        }
         const result = client.fetch(.{
             .location = .{ .url = self.url },
             .method = .GET,

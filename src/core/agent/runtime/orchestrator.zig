@@ -5623,6 +5623,11 @@ fn processQueuedPromptLoop(
                     })
                 else
                     model_response_recovery.Decision{ .strategy = .stop };
+                if (job.credential_source == .host_managed and
+                    gateway_delivery.load() == .possibly_sent)
+                {
+                    recovery_decision = .{ .strategy = .stop };
+                }
                 const replay_safe = network_failure != null and streamReplaySafe(&stream_ctx);
                 const reconciliation_tool_violation =
                     recovery_strategy == .reconcile_tool and stream_ctx.saw_tool_start;
@@ -6060,7 +6065,8 @@ fn processQueuedPromptLoop(
             const gateway_wait_finished_ms = io_mod.milliTimestamp();
             summary_accumulator.addThinkingWait(gateway_wait_started_ms, stream_ctx.first_model_output_at_ms orelse gateway_wait_finished_ms);
 
-            if (!assistant_prefill_recovery_used and
+            if (job.credential_source != .host_managed and
+                !assistant_prefill_recovery_used and
                 semantic_attempt + 1 < semantic_limit and
                 streamReplaySafe(&stream_ctx) and
                 isPostVisionAssistantPrefillRejection(
@@ -6090,7 +6096,9 @@ fn processQueuedPromptLoop(
                 continue;
             }
 
-            if (response_failure) |failure| if (isRetryableModelFailure(failure.kind)) {
+            if (response_failure) |failure| if (isRetryableModelFailure(failure.kind) and
+                job.credential_source != .host_managed)
+            {
                 const cause: model_response_recovery.FailureCause = if (failure.kind == .rate_limited)
                     .rate_limited
                 else
@@ -6421,19 +6429,22 @@ fn processQueuedPromptLoop(
                 );
                 attempt_failure_diagnostic = diagnostic;
                 latest_recovery_diagnostic = diagnostic;
-                const decision = model_response_recovery.decide(.{
-                    .cause = cause,
-                    .delivery = .possibly_sent,
-                    .attempts = .{ .consumed = semantic_attempt + 1, .limit = semantic_limit },
-                    .pacing = retry_pacing,
-                    .output = if (partial_assistant.len > 0) .partial else .none,
-                    .tool = effectiveRecoveryToolEvidence(
-                        preserved_tool_evidence,
-                        attempt_completion,
-                        &stream_ctx,
-                    ),
-                    .cancelled = config.cancel_flag.load(.seq_cst),
-                });
+                const decision = if (job.credential_source == .host_managed)
+                    model_response_recovery.Decision{ .strategy = .stop }
+                else
+                    model_response_recovery.decide(.{
+                        .cause = cause,
+                        .delivery = .possibly_sent,
+                        .attempts = .{ .consumed = semantic_attempt + 1, .limit = semantic_limit },
+                        .pacing = retry_pacing,
+                        .output = if (partial_assistant.len > 0) .partial else .none,
+                        .tool = effectiveRecoveryToolEvidence(
+                            preserved_tool_evidence,
+                            attempt_completion,
+                            &stream_ctx,
+                        ),
+                        .cancelled = config.cancel_flag.load(.seq_cst),
+                    });
                 if (attempt_disposition == .provider_failure or
                     attempt_completion.provider_failure_cause == .gateway_stream_timeout)
                 {

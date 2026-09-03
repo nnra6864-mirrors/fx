@@ -3278,11 +3278,23 @@ fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u
     else
         try gateway_error_format.formatHttpErrorMessage(ctx.alloc, status, detail);
     defer ctx.alloc.free(message);
+    const host_recovery = if (auth_failure) |failure|
+        if (failure.source == .host_managed) failure.recovery_message() else null
+    else
+        null;
     try ctx.writeStderr("fx ask: ");
     try ctx.writeStderr(message);
+    if (host_recovery) |recovery| {
+        try ctx.writeStderr(". ");
+        try ctx.writeStderr(recovery);
+    }
     try ctx.writeStderr("\n");
     if (ctx.output_mode.capturesJson()) {
         try ctx.assistant_output.appendSlice(ctx.alloc, message);
+        if (host_recovery) |recovery| {
+            try ctx.assistant_output.appendSlice(ctx.alloc, ". ");
+            try ctx.assistant_output.appendSlice(ctx.alloc, recovery);
+        }
         try ctx.assistant_output.append(ctx.alloc, '\n');
     }
 }
