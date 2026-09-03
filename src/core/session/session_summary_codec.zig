@@ -1496,7 +1496,7 @@ pub fn readSessionIndexForRepair(
 /// Reads the last atomically published index without interpreting pending
 /// update markers. Callers must reconcile deferred tokens before treating the
 /// result as current.
-pub fn readSessionIndexSnapshot(
+fn readSessionIndexSnapshot(
     alloc: Allocator,
     sessions: *const io_mod.VerifiedDir,
 ) !std.ArrayList(SessionSummary) {
@@ -1528,7 +1528,7 @@ pub fn readSessionIndexSnapshotPrefixPage(
     };
 }
 
-pub fn readSessionIndexWorkspaceSnapshot(
+fn readSessionIndexWorkspaceSnapshot(
     alloc: Allocator,
     sessions: *const io_mod.VerifiedDir,
     workspace_root: []const u8,

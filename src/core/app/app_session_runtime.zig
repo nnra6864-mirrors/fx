@@ -6478,6 +6478,76 @@ test "requested resume handoff accepts deferred index publication at a durable b
     try std.testing.expectEqual(@as(usize, 1), reopened.state.history.len);
 }
 
+const HandoffLatestCacheFailure = struct {
+    armed: bool = false,
+
+    fn hit(context: ?*anyopaque, point: session_log.Boundary) !void {
+        const self: *HandoffLatestCacheFailure = @ptrCast(@alignCast(context.?));
+        if (self.armed and point == .before_latest_cache_ready) {
+            return error.TestLatestCacheFailure;
+        }
+    }
+
+    fn controls(self: *HandoffLatestCacheFailure) session_log.TestControls {
+        return .{ .context = self, .boundary_fn = hit };
+    }
+};
+
+test "requested resume handoff accepts post-commit latest cache publication failure" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    var failure = HandoffLatestCacheFailure{};
+    var state = try Runtime(TestApp).freshState(
+        &app,
+        app.session_persistence.workspace_preferences.?,
+    );
+    defer state.deinit(alloc);
+    app.session_persistence.writable = try app.session_persistence.store.?.startWritableSessionWithOptions(
+        alloc,
+        state,
+        .{ .test_controls = failure.controls() },
+    );
+    failure.armed = true;
+    const loaded = &app.session_persistence.writable.?;
+    const expected_id = try alloc.dupe(u8, loaded.active_id);
+    defer alloc.free(expected_id);
+    _ = try loaded.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = true } },
+        io_mod.milliTimestamp(),
+        .retry_expected_tail,
+        .{},
+    );
+    const expected_position = loaded.position;
+    try std.testing.expect(!loaded.state_replacement_pending);
+    try std.testing.expect(loaded.commit_lifecycle_pending);
+    Runtime(TestApp).requestResumeHandoff(&app);
+
+    var handoff = Runtime(TestApp).finalizePersistenceWithResumeHandoff(&app) orelse
+        return error.TestExpectedResumeHandoff;
+    defer handoff.deinit(alloc);
+    try std.testing.expectEqualStrings(expected_id, handoff.session_id);
+
+    var reopened = try app.session_persistence.store.?.resumeForWrite(
+        alloc,
+        expected_id,
+    );
+    defer reopened.deinit(alloc);
+    try std.testing.expectEqualDeep(expected_position, reopened.position);
+}
+
 test "resume handoff preparation repairs an exactly recoverable live commit watermark" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

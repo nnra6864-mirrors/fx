@@ -21,25 +21,48 @@ const ManagedProbeBatch = struct {
     store: session_store.Store,
     summaries: []const session_store.SessionSummary,
     managed: []bool,
+    probe_alloc: Allocator,
     next: std.atomic.Value(usize) = .init(0),
+    out_of_memory: std.atomic.Value(bool) = .init(false),
 
     fn run(self: *ManagedProbeBatch) void {
         while (true) {
             if (cancellationRequested(self.store.discovery_cancel_flag)) return;
+            if (self.out_of_memory.load(.acquire)) return;
             const index = self.next.fetchAdd(1, .monotonic);
             if (index >= self.summaries.len) return;
             if (cancellationRequested(self.store.discovery_cancel_flag)) return;
             self.managed[index] = child_state.isManagedChildSession(
                 self.store,
-                std.heap.c_allocator,
+                self.probe_alloc,
                 self.summaries[index].id,
-            ) catch true;
+            ) catch |err| switch (err) {
+                error.OutOfMemory => {
+                    self.out_of_memory.store(true, .release);
+                    return;
+                },
+                else => true,
+            };
         }
     }
 };
 
 fn probeManagedSessions(
     alloc: Allocator,
+    store: session_store.Store,
+    summaries: []const session_store.SessionSummary,
+) ![]bool {
+    return probeManagedSessionsWithAllocator(
+        alloc,
+        std.heap.c_allocator,
+        store,
+        summaries,
+    );
+}
+
+fn probeManagedSessionsWithAllocator(
+    alloc: Allocator,
+    probe_alloc: Allocator,
     store: session_store.Store,
     summaries: []const session_store.SessionSummary,
 ) ![]bool {
@@ -51,6 +74,7 @@ fn probeManagedSessions(
         .store = store,
         .summaries = summaries,
         .managed = managed,
+        .probe_alloc = probe_alloc,
     };
     if (comptime builtin.single_threaded) {
         batch.run();
@@ -67,6 +91,7 @@ fn probeManagedSessions(
     if (started < worker_count) batch.run();
     for (threads[0..started]) |thread| thread.join();
     if (cancellationRequested(store.discovery_cancel_flag)) return error.Cancelled;
+    if (batch.out_of_memory.load(.acquire)) return error.OutOfMemory;
     return managed;
 }
 
@@ -510,6 +535,61 @@ test "managed session probes stop before claiming cancelled work" {
         error.Cancelled,
         probeManagedSessions(alloc, store, &summaries),
     );
+}
+
+test "managed session probes propagate allocation failure" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var store = try session_store.Store.initFromHome(alloc, home, workspace);
+    defer store.deinit(alloc);
+    var durable = session_codec.DurableSessionState{
+        .id = try alloc.dupe(u8, "allocation-failure-probe"),
+        .origin_workspace_root = try alloc.dupe(u8, workspace),
+        .workspace_root = try alloc.dupe(u8, workspace),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .history = try alloc.alloc(session.HistoryTurn, 0),
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+        .preferences = .{
+            .model = try alloc.dupe(u8, "test"),
+            .effort = .auto,
+            .fast_mode = false,
+        },
+    };
+    defer durable.deinit(alloc);
+    var writable = try store.startWritableSession(alloc, durable);
+    writable.deinit(alloc);
+    const summaries = [_]session_store.SessionSummary{.{
+        .id = @constCast("allocation-failure-probe"),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .history_len = 1,
+    }};
+    var failing = std.testing.FailingAllocator.init(
+        alloc,
+        .{ .fail_index = 0 },
+    );
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        probeManagedSessionsWithAllocator(
+            alloc,
+            failing.allocator(),
+            store,
+            &summaries,
+        ),
+    );
+    try std.testing.expect(failing.has_induced_failure);
 }
 
 test "managed child marker is hidden from external access" {

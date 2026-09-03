@@ -695,11 +695,9 @@ pub const LoadedWritableSession = struct {
             self.state_replacement_pending = true;
             return err;
         };
-        if (cache_deferred) {
+        if (!lifecycle_published) {
             self.state_replacement_pending = replacement_was_pending;
             self.commit_lifecycle_pending = true;
-        } else if (!lifecycle_published) {
-            self.state_replacement_pending = true;
         } else {
             self.state_replacement_pending =
                 self.state_replacement_pending and replacement_was_pending;
@@ -763,13 +761,7 @@ pub const LoadedWritableSession = struct {
             self.state_replacement_pending = true;
             return err;
         };
-        if (cache_deferred) {
-            self.commit_lifecycle_pending = true;
-        } else if (!lifecycle_published) {
-            self.state_replacement_pending = true;
-        } else {
-            self.commit_lifecycle_pending = false;
-        }
+        self.commit_lifecycle_pending = !lifecycle_published;
         return self.position;
     }
 
@@ -1340,7 +1332,7 @@ pub const Root = struct {
                 };
                 created.commit_lifecycle_pending = true;
             } else if (!created.publishCommitLifecycle(alloc)) {
-                created.state_replacement_pending = true;
+                created.commit_lifecycle_pending = true;
             }
         }
         return created;

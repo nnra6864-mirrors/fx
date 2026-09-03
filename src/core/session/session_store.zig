@@ -2947,7 +2947,7 @@ pub const Store = struct {
             alloc,
             source.id,
         ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
+            error.OutOfMemory, error.Cancelled => return err,
             else => {
                 debug_trace.logf(
                     "core",
@@ -3292,9 +3292,9 @@ pub const Store = struct {
             if (probe_managed_children) {
                 candidate.summary.has_managed_children =
                     self.sessionHasManagedChildren(alloc, entry.name) catch |err| switch (err) {
-                        error.OutOfMemory => {
+                        error.OutOfMemory, error.Cancelled => {
                             candidate.deinit(alloc);
-                            return error.OutOfMemory;
+                            return err;
                         },
                         else => false,
                     };
@@ -3344,11 +3344,26 @@ pub const Store = struct {
         return scan;
     }
 
+    fn checkLegacyRelationshipScanCancellation(
+        self: Store,
+        session_id: []const u8,
+    ) !void {
+        self.check_discovery_cancellation() catch |err| {
+            debug_trace.logf(
+                "core",
+                "session managed child legacy scan cancelled session={s}",
+                .{session_id},
+            );
+            return err;
+        };
+    }
+
     fn sessionHasManagedChildren(
         self: Store,
         alloc: Allocator,
         session_id: []const u8,
     ) !bool {
+        try self.check_discovery_cancellation();
         var capability = try self.openListedChildCapabilityReadOnly(
             alloc,
             session_id,
@@ -3364,10 +3379,13 @@ pub const Store = struct {
         };
         if (children_file) |*file| {
             defer file.deinit();
+            try self.check_discovery_cancellation();
             const bytes = try file.readToEnd(alloc, 512 * 1024);
             defer alloc.free(bytes);
+            try self.check_discovery_cancellation();
             var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
             defer parsed.deinit();
+            try self.check_discovery_cancellation();
             if (parsed.value != .object) return error.InvalidSubagentState;
             const children = parsed.value.object.get("children") orelse
                 return error.InvalidSubagentState;
@@ -3385,17 +3403,25 @@ pub const Store = struct {
             else => return err,
         };
         defer header_file.deinit();
+        try self.check_discovery_cancellation();
         const header_bytes = try header_file.readToEnd(
             alloc,
             relationship_index_codec.max_header_bytes,
         );
         defer alloc.free(header_bytes);
+        try self.check_discovery_cancellation();
         const header = try relationship_index_codec.decodeHeader(header_bytes);
         if (header.active_count_known) return header.active_count != 0;
+        debug_trace.logf(
+            "core",
+            "session managed child legacy scan started session={s} slots={d}",
+            .{ session_id, header.high_watermark },
+        );
 
         var page_number: u64 = 0;
         var offset: u64 = 0;
         while (offset < header.high_watermark) : (page_number += 1) {
+            try self.checkLegacyRelationshipScanCancellation(session_id);
             const page_name = relationship_index_codec.pageFileName(page_number);
             var page_file = try capability.openFileReadOnly(
                 alloc,
@@ -3408,11 +3434,13 @@ pub const Store = struct {
                 relationship_index_codec.max_page_bytes,
             );
             defer alloc.free(page_bytes);
+            try self.checkLegacyRelationshipScanCancellation(session_id);
             const page = try relationship_index_codec.decodePage(
                 page_bytes,
                 page_number,
                 header.storage_epoch,
             );
+            try self.checkLegacyRelationshipScanCancellation(session_id);
             const remaining = header.high_watermark - offset;
             const slots_to_read: usize = @intCast(@min(
                 remaining,
@@ -11584,6 +11612,76 @@ test "session scan probes managed children only when requested" {
     defer probing.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), probing.summaries.items.len);
     try std.testing.expect(probing.summaries.items[0].has_managed_children);
+}
+
+test "legacy managed child relationship scan observes cancellation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    var state = try testDurableState(alloc, "legacy-child-scan-cancel", ctx.workspace);
+    defer state.deinit(alloc);
+    var writable = try ctx.store.startWritableSession(alloc, state);
+    {
+        const current_header = try relationship_index_codec.encodeHeader(alloc, .{
+            .storage_epoch = 7,
+            .generation = 1,
+            .high_watermark = relationship_index_codec.page_slots,
+            .active_count = 0,
+        });
+        defer alloc.free(current_header);
+        const version_offset = relationship_index_codec.header_magic.len;
+        const active_count_offset = version_offset + @sizeOf(u32) +
+            @sizeOf(u64) * 3;
+        var legacy_header: std.ArrayList(u8) = .empty;
+        defer legacy_header.deinit(alloc);
+        try legacy_header.appendSlice(alloc, current_header[0..version_offset]);
+        var legacy_version: [@sizeOf(u32)]u8 = undefined;
+        std.mem.writeInt(u32, &legacy_version, 2, .little);
+        try legacy_header.appendSlice(alloc, &legacy_version);
+        try legacy_header.appendSlice(
+            alloc,
+            current_header[version_offset + @sizeOf(u32) .. active_count_offset],
+        );
+        try legacy_header.appendSlice(
+            alloc,
+            current_header[active_count_offset + @sizeOf(u64) ..],
+        );
+        var capability = try writable.childCapability();
+        var header_file = try capability.createExclusiveFile(
+            alloc,
+            .subagent_control,
+            session_child_store.subagent_relationship_index_file,
+        );
+        defer header_file.deinit();
+        try header_file.writeAll(legacy_header.items);
+        try header_file.sync();
+
+        const page_bytes = try relationship_index_codec.encodePage(
+            alloc,
+            relationship_index_codec.PageData.init(0, 7),
+        );
+        defer alloc.free(page_bytes);
+        const page_name = relationship_index_codec.pageFileName(0);
+        var page_file = try capability.createExclusiveFile(
+            alloc,
+            .subagent_control,
+            &page_name,
+        );
+        defer page_file.deinit();
+        try page_file.writeAll(page_bytes);
+        try page_file.sync();
+    }
+    writable.deinit(alloc);
+
+    var cancel = std.atomic.Value(bool).init(true);
+    ctx.store.set_discovery_cancel_flag(&cancel);
+    try std.testing.expectError(
+        error.Cancelled,
+        ctx.store.sessionHasManagedChildren(alloc, state.id),
+    );
 }
 
 test "resumable discovery observes cancellation before index backfill" {

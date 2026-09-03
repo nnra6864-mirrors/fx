@@ -735,6 +735,150 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "second ctrl+c cancels a legacy managed-child relationship scan",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-legacy-child-scan-exit-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const sessionsRoot = join(home, ".fx", "sessions");
+    const stderrPath = join(root, "stderr.log");
+    const tracePath = join(root, "trace.log");
+    mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+    mkdirSync(workspace);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      { mode: 0o600 },
+    );
+    writeFileSync(stderrPath, "");
+    writeFileSync(tracePath, "");
+    const seedGateway = startFakeGateway([fakeGatewayFinalText("LEGACY_SCAN_SESSION")]);
+    let active: TmuxSession | null = null;
+    try {
+      const ask = await runFx(["ask", "--json", "--auto", "Seed the legacy scan fixture."], {
+        cwd: realpathSync(workspace),
+        env: gatewayEnv(home, seedGateway),
+        timeoutMs: TIMEOUT,
+      });
+      expect(ask.code).toBe(0);
+      expect(ask.stderr).toBe("");
+      const sessionId = String(JSON.parse(ask.stdout).session_id);
+
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: realpathSync(workspace),
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "core,input",
+          NO_COLOR: "1",
+        },
+        stderrPath,
+        width: 100,
+        height: 30,
+        remainOnExit: true,
+      });
+      await active.waitForComposer(TIMEOUT);
+
+      const controlRoot = join(sessionsRoot, sessionId, "subagent");
+      mkdirSync(controlRoot, { recursive: true, mode: 0o700 });
+      chmodSync(controlRoot, 0o700);
+      const pageCount = 4_096;
+      const noSlot = (1n << 64n) - 1n;
+      const u16 = (value: number): Buffer => {
+        const bytes = Buffer.alloc(2);
+        bytes.writeUInt16LE(value);
+        return bytes;
+      };
+      const u32 = (value: number): Buffer => {
+        const bytes = Buffer.alloc(4);
+        bytes.writeUInt32LE(value);
+        return bytes;
+      };
+      const u64 = (value: bigint): Buffer => {
+        const bytes = Buffer.alloc(8);
+        bytes.writeBigUInt64LE(value);
+        return bytes;
+      };
+      const header = Buffer.concat([
+        Buffer.from("FXRELH01"),
+        u32(2),
+        u64(7n),
+        u64(1n),
+        u64(BigInt(pageCount * 64)),
+        u64(noSlot),
+        u64(0n),
+        u64(0n),
+        u64(0n),
+        Buffer.alloc(16),
+        u64(0n),
+        Buffer.from([0]),
+        u64(noSlot),
+        u64(noSlot),
+        u16(0),
+      ]);
+      writeFileSync(join(controlRoot, "relationship-index.bin"), header, { mode: 0o600 });
+      const page = Buffer.alloc(8 + 4 + 8 + 8 + 64 * (1 + 8 + 2));
+      Buffer.from("FXRELP01").copy(page, 0);
+      page.writeUInt32LE(2, 8);
+      page.writeBigUInt64LE(7n, 20);
+      for (let slot = 0; slot < 64; slot += 1) {
+        const slotOffset = 28 + slot * 11;
+        page[slotOffset] = 0;
+        page.writeBigUInt64LE(noSlot, slotOffset + 1);
+        page.writeUInt16LE(0, slotOffset + 9);
+      }
+      for (let pageNumber = 0; pageNumber < pageCount; pageNumber += 1) {
+        page.writeBigUInt64LE(BigInt(pageNumber), 12);
+        writeFileSync(
+          join(controlRoot, `relationship-page-${pageNumber.toString(16).padStart(16, "0")}.bin`),
+          page,
+          { mode: 0o600 },
+        );
+      }
+      writeFileSync(join(sessionsRoot, "index.pending"), "", { mode: 0o600 });
+
+      const traceOffset = readFileSync(tracePath, "utf8").length;
+      active.sendLiteralImmediate("/resume");
+      active.sendKeysImmediate(["Enter"]);
+      await waitForTraceAfter(
+        tracePath,
+        traceOffset,
+        `session managed child legacy scan started session=${sessionId}`,
+      );
+
+      active.sendKeysImmediate(["C-c"]);
+      await waitForTraceAfter(
+        tracePath,
+        traceOffset,
+        "ctrl_c_exit_hint_armed",
+      );
+      active.sendKeysImmediate(["C-c"]);
+      const elapsedMs = await waitForPaneExitWithin(active, 5_000);
+      const trace = readFileSync(tracePath, "utf8");
+
+      expect(elapsedMs).toBeLessThan(500);
+      expect(trace).toContain("session picker load cancellation requested");
+      expect(trace).toContain(
+        `session managed child legacy scan cancelled session=${sessionId}`,
+      );
+      expect(trace).toContain("session discovery cancelled");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await active.kill();
+      active = null;
+    } finally {
+      if (active) await active.kill();
+      seedGateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
   "contended deferred updates overlay the index without scanning",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-session-snapshot-")));
