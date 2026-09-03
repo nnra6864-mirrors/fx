@@ -38,6 +38,7 @@ const captured_command = @import("../tooling/captured_command.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const session_log = @import("../session/session_log.zig");
+const session_latest_pointer = @import("../session/session_latest_pointer.zig");
 const session_resume_view = @import("../session/session_resume_view.zig");
 const session_store = @import("../session/session_store.zig");
 const session_summary_codec = @import("../session/session_summary_codec.zig");
@@ -6413,6 +6414,67 @@ test "requested resume handoff leaves pending replacement work off the exit path
         expected_position.through_event_log_bytes,
         reopened.position.through_event_log_bytes,
     );
+    try std.testing.expectEqual(@as(usize, 1), reopened.state.history.len);
+}
+
+test "requested resume handoff accepts deferred index publication at a durable boundary" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+
+    var sessions = app.session_persistence.store.?.canonical_root.sessions orelse
+        return error.TestExpectedEqual;
+    var latest_lock = try io_mod.acquireTimedAdvisoryLock(
+        &sessions,
+        session_latest_pointer.latest_sessions_lock_file,
+        2000,
+    );
+    var latest_lock_held = true;
+    defer if (latest_lock_held) latest_lock.release();
+
+    const turn = try session_runtime.makeAssistantTurn(alloc, "question", "answer");
+    defer session_runtime.freeHistoryTurn(alloc, turn);
+    try Runtime(TestApp).appendHistoryTurn(&app, turn);
+    const loaded = &app.session_persistence.writable.?;
+    try std.testing.expect(!loaded.state_replacement_pending);
+    try std.testing.expect(loaded.commit_lifecycle_pending);
+    var deferred = (try session_summary_codec.readDeferredCacheToken(
+        alloc,
+        &sessions,
+        loaded.active_id,
+    )) orelse return error.TestExpectedEqual;
+    defer deferred.deinit(alloc);
+    try std.testing.expectEqualDeep(loaded.position, deferred.position);
+    const expected_id = try alloc.dupe(u8, loaded.active_id);
+    defer alloc.free(expected_id);
+    const expected_position = loaded.position;
+    Runtime(TestApp).requestResumeHandoff(&app);
+
+    var handoff = Runtime(TestApp).finalizePersistenceWithResumeHandoff(&app) orelse
+        return error.TestExpectedResumeHandoff;
+    defer handoff.deinit(alloc);
+    try std.testing.expectEqualStrings(expected_id, handoff.session_id);
+
+    latest_lock.release();
+    latest_lock_held = false;
+    var reopened = try app.session_persistence.store.?.resumeForWrite(
+        alloc,
+        expected_id,
+    );
+    defer reopened.deinit(alloc);
+    try std.testing.expectEqualDeep(expected_position, reopened.position);
     try std.testing.expectEqual(@as(usize, 1), reopened.state.history.len);
 }
 

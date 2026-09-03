@@ -1473,7 +1473,7 @@ pub fn readSessionIndexForRepair(
     alloc: Allocator,
     sessions: *const io_mod.VerifiedDir,
 ) !std.ArrayList(SessionSummary) {
-    if (try sessionIndexMarkerPresent(sessions)) return error.InvalidSessionIndex;
+    if (try sessionIndexPublicationPending(sessions)) return error.InvalidSessionIndex;
     return readSessionIndexSnapshot(alloc, sessions);
 }
 
@@ -1537,7 +1537,7 @@ pub fn readSessionIndexPage(
     options: SessionIndexPageOptions,
 ) !ResumableSessionPage {
     if (try deferredCachePresent(sessions)) return error.InvalidSessionIndex;
-    if (try sessionIndexMarkerPresent(sessions)) return error.InvalidSessionIndex;
+    if (try sessionIndexPublicationPending(sessions)) return error.InvalidSessionIndex;
     var file = try openVerifiedSessionIndexFile(sessions, session_index_file);
     defer file.close(io_mod.getIo());
     const bytes = io_mod.readFileToEnd(alloc, &file, max_session_index_bytes) catch |err| switch (err) {
@@ -1837,7 +1837,7 @@ fn openVerifiedSessionIndexFile(
     return file;
 }
 
-fn sessionIndexMarkerPresent(sessions: *const io_mod.VerifiedDir) !bool {
+pub fn sessionIndexPublicationPending(sessions: *const io_mod.VerifiedDir) !bool {
     var file = openVerifiedSessionIndexFile(sessions, session_index_marker_file) catch |err| switch (err) {
         error.SessionIndexNotFound => return false,
         else => return err,

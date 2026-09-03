@@ -550,6 +550,9 @@ pub const LoadedWritableSession = struct {
     log: WritableSessionDir,
     freshly_started: bool = false,
     state_replacement_pending: bool = false,
+    /// Derived commit-lifecycle work still needs publication, but does not
+    /// invalidate an otherwise durable canonical session boundary.
+    commit_lifecycle_pending: bool = false,
     child_capability: ?*session_child_store.SessionChildCapability = null,
     commit_lifecycle: ?CommitLifecycle = null,
     position: CommitPosition,
@@ -692,11 +695,15 @@ pub const LoadedWritableSession = struct {
             self.state_replacement_pending = true;
             return err;
         };
-        if (!lifecycle_published) {
+        if (cache_deferred) {
+            self.state_replacement_pending = replacement_was_pending;
+            self.commit_lifecycle_pending = true;
+        } else if (!lifecycle_published) {
             self.state_replacement_pending = true;
         } else {
             self.state_replacement_pending =
                 self.state_replacement_pending and replacement_was_pending;
+            self.commit_lifecycle_pending = false;
         }
         return self.position;
     }
@@ -756,7 +763,13 @@ pub const LoadedWritableSession = struct {
             self.state_replacement_pending = true;
             return err;
         };
-        if (!lifecycle_published) self.state_replacement_pending = true;
+        if (cache_deferred) {
+            self.commit_lifecycle_pending = true;
+        } else if (!lifecycle_published) {
+            self.state_replacement_pending = true;
+        } else {
+            self.commit_lifecycle_pending = false;
+        }
         return self.position;
     }
 
@@ -997,7 +1010,9 @@ pub const LoadedWritableSession = struct {
         self: *const LoadedWritableSession,
         usage_dirty: bool,
     ) bool {
-        return usage_dirty or self.state_replacement_pending;
+        return usage_dirty or
+            self.state_replacement_pending or
+            self.commit_lifecycle_pending;
     }
 
     pub fn cleanupOrphans(
@@ -1323,7 +1338,7 @@ pub const Root = struct {
                     };
                     return err;
                 };
-                created.state_replacement_pending = true;
+                created.commit_lifecycle_pending = true;
             } else if (!created.publishCommitLifecycle(alloc)) {
                 created.state_replacement_pending = true;
             }

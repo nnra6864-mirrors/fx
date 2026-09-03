@@ -2753,6 +2753,7 @@ pub const Store = struct {
     ) !?ResumableSessionPage {
         try self.check_discovery_cancellation();
         const sessions = &(self.canonical_root.sessions orelse return null);
+        if (summary_codec.sessionIndexPublicationPending(sessions) catch return null) return null;
         var observed = summary_codec.readDeferredCacheTokens(
             alloc,
             sessions,
@@ -8416,7 +8417,8 @@ test "empty session creation survives latest cache contention" {
     );
     var loaded_open = true;
     defer if (loaded_open) loaded.deinit(alloc);
-    if (!loaded.state_replacement_pending) return error.ExpectedDeferredCreation;
+    if (!loaded.commit_lifecycle_pending) return error.ExpectedDeferredCreation;
+    if (loaded.state_replacement_pending) return error.ExpectedCanonicalReplacement;
     if (loaded.state.history.len != 0) return error.ExpectedEmptyCreatedSession;
     var readable = try ctx.store.loadReadOnly(alloc, state.id);
     defer readable.deinit(alloc);
@@ -8456,6 +8458,54 @@ test "empty session creation survives latest cache contention" {
     latest_lock_held = false;
     loaded.deinit(alloc);
     loaded_open = false;
+}
+
+test "reconciled resumable index rejects an unjournaled pending publication" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    try writeWritableHistoryFixture(
+        alloc,
+        ctx.store,
+        "pending-index-older",
+        ctx.workspace,
+        10,
+        "older prompt",
+    );
+    try writeWritableHistoryFixture(
+        alloc,
+        ctx.store,
+        "pending-index-newer",
+        ctx.workspace,
+        20,
+        "newer prompt",
+    );
+
+    var sessions = ctx.store.canonical_root.sessions orelse
+        return error.TestExpectedEqual;
+    const stale_snapshot = [_]SessionSummary{
+        testIndexedSessionSummary("pending-index-older", ctx.workspace, 10),
+    };
+    try summary_codec.writeSessionIndex(alloc, &sessions, &stale_snapshot);
+    try summary_codec.writeSessionIndexMarker(alloc, &sessions);
+
+    try std.testing.expect((try ctx.store.tryListReconciledResumableIndexPageForScope(
+        alloc,
+        .all_workspaces,
+        null,
+        null,
+    )) == null);
+
+    var current = try ctx.store.listResumablePage(alloc, null, null);
+    defer current.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), current.summaries.items.len);
+    try std.testing.expectEqualStrings(
+        "pending-index-newer",
+        current.summaries.items[0].id,
+    );
 }
 
 test "read-only session page replays canonical state for a deferred token" {

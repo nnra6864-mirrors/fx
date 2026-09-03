@@ -84,7 +84,7 @@ async function launch(
       FX_GATEWAY_BASE_URL: gateway.baseUrl,
       FX_GATEWAY_CHAT_URL: gateway.chatUrl,
       FX_TRACE_LOG: fixture.tracePath,
-      FX_TRACE_SCOPES: "shell,terminal,terminal_client,terminal_host,tool,agent",
+      FX_TRACE_SCOPES: "core,shell,terminal,terminal_client,terminal_host,tool,agent",
       FX_TERMINAL_HOST_IDLE_MS: "500",
     },
     width: 120,
@@ -342,7 +342,7 @@ test.skipIf(!tmuxAvailable())(
     writeFileSync(
       brokerPath,
       [
-        "import array, os, socket, sys, time",
+        "import array, os, signal, socket, sys",
         "socket_path, ready_path, held_path = sys.argv[1:4]",
         "server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)",
         "server.bind(socket_path)",
@@ -357,7 +357,7 @@ test.skipIf(!tmuxAvailable())(
         "if not fds:",
         "    raise RuntimeError('missing output descriptor')",
         "open(held_path, 'w').write(str(fds[0]))",
-        "time.sleep(30)",
+        "signal.pause()",
       ].join("\n") + "\n",
     );
     writeFileSync(
@@ -403,7 +403,7 @@ test.skipIf(!tmuxAvailable())(
       expect(Number.isSafeInteger(senderPid) && senderPid > 0).toBe(true);
       await waitForPidExit(senderPid, 3_000);
       expect(() => process.kill(senderPid, 0)).toThrow();
-      expect(() => process.kill(broker.pid, 0)).not.toThrow();
+      expect(broker.exitCode).toBeNull();
 
       active.sendKeysImmediate(["C-c"]);
       await Bun.sleep(80);
@@ -411,7 +411,10 @@ test.skipIf(!tmuxAvailable())(
       const elapsedMs = await waitForProcessExit(active, 7_000);
 
       expect(elapsedMs).toBeLessThan(500);
-      expect(() => process.kill(broker.pid, 0)).not.toThrow();
+      expect(broker.exitCode).toBeNull();
+      expect(readFileSync(fixture.tracePath, "utf8")).toContain(
+        "command output drain abandoned reason=runtime_shutdown wait_ready=true",
+      );
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
     } finally {
       broker.kill("SIGKILL");

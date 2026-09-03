@@ -434,6 +434,122 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "deferred index publication preserves the fast exit resume handoff",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-deferred-exit-handoff-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const sessionsRoot = join(home, ".fx", "sessions");
+    const stderrPath = join(root, "stderr.log");
+    const resumedStderrPath = join(root, "resumed-stderr.log");
+    const tracePath = join(root, "trace.log");
+    const lockReadyPath = join(root, "lock.ready");
+    const marker = "DEFERRED_INDEX_EXIT_HANDOFF";
+    mkdirSync(home);
+    mkdirSync(workspace);
+    writeFileSync(stderrPath, "");
+    writeFileSync(resumedStderrPath, "");
+    writeFileSync(tracePath, "");
+    const gateway = startFakeGateway([fakeGatewayFinalText(marker)]);
+    const resumeGateway = startFakeGateway([]);
+    let active: TmuxSession | null = null;
+    let resumed: TmuxSession | null = null;
+    let lockHolder: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: realpathSync(workspace),
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "input,session",
+        },
+        stderrPath,
+        width: 100,
+        height: 30,
+        remainOnExit: true,
+      });
+      await active.waitForComposer(TIMEOUT);
+
+      lockHolder = Bun.spawn([
+        "python3",
+        "-c",
+        [
+          "import fcntl, os, signal, sys",
+          "lock_path, ready_path = sys.argv[1:3]",
+          "lock = open(lock_path, 'a')",
+          "fcntl.flock(lock, fcntl.LOCK_EX)",
+          "open(ready_path, 'w').write(str(os.getpid()))",
+          "signal.pause()",
+        ].join("\n"),
+        join(sessionsRoot, "latest.lock"),
+        lockReadyPath,
+      ], { stdout: "ignore", stderr: "ignore" });
+      await waitForCondition(
+        () => existsSync(lockReadyPath),
+        "latest index lock holder",
+      );
+
+      await active.sendText("Commit this turn while the session index is contended.");
+      await active.waitForText(marker, TIMEOUT);
+      const sessionId = sessionIdFromHome(home);
+      await waitForCondition(
+        () => existsSync(join(sessionsRoot, "latest", "deferred", sessionId)),
+        "deferred session index token",
+      );
+      expect(lockHolder.exitCode).toBeNull();
+
+      active.sendKeysImmediate(["C-c"]);
+      await Bun.sleep(80);
+      active.sendKeysImmediate(["C-c"]);
+      const elapsedMs = await waitForPaneExitWithin(active, 5_000);
+      const scrollback = stripAnsi(await active.captureFullScrollback());
+      const expected = `Continue session with: fx --resume ${sessionId}`;
+
+      expect(elapsedMs).toBeLessThan(500);
+      expect(countOccurrences(scrollback, expected)).toBe(1);
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "event=resume_handoff_confirmation mode=metadata outcome=ready",
+      );
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await active.kill();
+      active = null;
+
+      lockHolder.kill("SIGKILL");
+      await lockHolder.exited;
+      lockHolder = null;
+      resumed = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume ${sessionId}`,
+        cwd: realpathSync(workspace),
+        env: gatewayEnv(home, resumeGateway),
+        stderrPath: resumedStderrPath,
+        width: 100,
+        height: 30,
+      });
+      await resumed.waitForComposer(TIMEOUT);
+      expect(stripAnsi(await waitForScrollback(resumed, marker))).toContain(marker);
+      expect(resumeGateway.requests).toHaveLength(0);
+      expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
+      await resumed.sendText("/quit");
+      expect(await resumed.waitForSessionEnd()).toBe(true);
+      await resumed.kill();
+      resumed = null;
+    } finally {
+      if (active) await active.kill();
+      if (resumed) await resumed.kill();
+      if (lockHolder) {
+        lockHolder.kill("SIGKILL");
+        await lockHolder.exited;
+      }
+      gateway.stop();
+      resumeGateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
   "second ctrl+c cancels an active session discovery scan",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-session-scan-exit-")));
