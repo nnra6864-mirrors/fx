@@ -307,6 +307,7 @@ function installLargeCatalog(
   const indexPath = join(sessionsRoot, "index.json");
   writeFileSync(indexPath, JSON.stringify({ schema_version: 3, sessions: entries }));
   chmodSync(indexPath, 0o600);
+  rmSync(join(sessionsRoot, "index.pending"), { force: true });
   const bytes = statSync(indexPath).size;
   expect(bytes).toBeLessThanOrEqual(16 * 1024 * 1024);
 }
