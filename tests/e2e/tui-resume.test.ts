@@ -269,6 +269,20 @@ async function waitForCondition(
   throw new Error(`Timed out waiting for ${description}.`);
 }
 
+async function waitForTraceAfter(
+  path: string,
+  offset: number,
+  needle: string,
+  timeout = TIMEOUT,
+): Promise<void> {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (readFileSync(path, "utf8").slice(offset).includes(needle)) return;
+    await Bun.sleep(1);
+  }
+  throw new Error(`Timed out waiting for trace event ${needle}.`);
+}
+
 async function waitForPaneExitWithin(
   session: TmuxSession,
   timeout: number,
@@ -681,11 +695,10 @@ test.skipIf(!tmuxAvailable())(
       await Bun.sleep(5_100);
       const traceOffset = readFileSync(tracePath, "utf8").length;
       await active.sendText("/resume");
-      await waitForCondition(
-        () => readFileSync(tracePath, "utf8").slice(traceOffset).includes(
-          "session picker cache overlay stage=deferred begin",
-        ),
-        "deferred session index reconciliation",
+      await waitForTraceAfter(
+        tracePath,
+        traceOffset,
+        "session picker cache overlay stage=deferred begin",
       );
 
       active.sendKeysImmediate(["C-c"]);
