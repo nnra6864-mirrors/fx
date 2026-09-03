@@ -216,13 +216,25 @@ pub fn readDeferredCacheTokens(
     alloc: Allocator,
     sessions: *const io_mod.VerifiedDir,
 ) !std.ArrayList(DeferredCacheToken) {
+    return readDeferredCacheTokensCancellable(alloc, sessions, null);
+}
+
+pub fn readDeferredCacheTokensCancellable(
+    alloc: Allocator,
+    sessions: *const io_mod.VerifiedDir,
+    cancel_flag: ?*const std.atomic.Value(bool),
+) !std.ArrayList(DeferredCacheToken) {
+    try check_cancellation(cancel_flag);
     var tokens: std.ArrayList(DeferredCacheToken) = .empty;
     errdefer freeDeferredCacheTokens(alloc, &tokens);
     var deferred = (try openDeferredCacheDirectory(sessions)) orelse return tokens;
     defer deferred.close();
 
     var iter = deferred.dir.iterate();
-    while (try iter.next(io_mod.getIo())) |entry| {
+    while (true) {
+        try check_cancellation(cancel_flag);
+        const entry = (try iter.next(io_mod.getIo())) orelse break;
+        try check_cancellation(cancel_flag);
         if (tokens.items.len >= max_deferred_cache_token_count) {
             return error.InvalidSessionIndex;
         }
@@ -852,7 +864,9 @@ fn parseSessionIndexWorkspaceSnapshotFast(
     alloc: Allocator,
     json_text: []const u8,
     workspace_root: []const u8,
+    cancel_flag: ?*const std.atomic.Value(bool),
 ) !std.ArrayList(SessionSummary) {
+    try check_cancellation(cancel_flag);
     const prefix = "{\"schema_version\":3,\"sessions\":[";
     if (!std.mem.startsWith(u8, json_text, prefix) or
         !std.mem.endsWith(u8, json_text, "]}"))
@@ -874,12 +888,14 @@ fn parseSessionIndexWorkspaceSnapshotFast(
     var results: std.ArrayList(SessionSummary) = .empty;
     errdefer freeSummaries(alloc, &results);
     var search_from = prefix.len;
-    while (std.mem.indexOfPos(
-        u8,
-        json_text,
-        search_from,
-        workspace_needle,
-    )) |match_start| {
+    while (true) {
+        try check_cancellation(cancel_flag);
+        const match_start = std.mem.indexOfPos(
+            u8,
+            json_text,
+            search_from,
+            workspace_needle,
+        ) orelse break;
         const relative_entry_start = std.mem.lastIndexOfScalar(
             u8,
             json_text[prefix.len..match_start],
@@ -1517,6 +1533,21 @@ pub fn readSessionIndexWorkspaceSnapshot(
     sessions: *const io_mod.VerifiedDir,
     workspace_root: []const u8,
 ) !std.ArrayList(SessionSummary) {
+    return readSessionIndexWorkspaceSnapshotCancellable(
+        alloc,
+        sessions,
+        workspace_root,
+        null,
+    );
+}
+
+pub fn readSessionIndexWorkspaceSnapshotCancellable(
+    alloc: Allocator,
+    sessions: *const io_mod.VerifiedDir,
+    workspace_root: []const u8,
+    cancel_flag: ?*const std.atomic.Value(bool),
+) !std.ArrayList(SessionSummary) {
+    try check_cancellation(cancel_flag);
     var file = try openVerifiedSessionIndexFile(sessions, session_index_file);
     defer file.close(io_mod.getIo());
     const bytes = io_mod.readFileToEnd(
@@ -1528,7 +1559,13 @@ pub fn readSessionIndexWorkspaceSnapshot(
         else => return error.InvalidSessionIndex,
     };
     defer alloc.free(bytes);
-    return parseSessionIndexWorkspaceSnapshotFast(alloc, bytes, workspace_root);
+    try check_cancellation(cancel_flag);
+    return parseSessionIndexWorkspaceSnapshotFast(
+        alloc,
+        bytes,
+        workspace_root,
+        cancel_flag,
+    );
 }
 
 pub fn readSessionIndexPage(
@@ -2504,6 +2541,56 @@ test "deferred cache token reader rejects non-private files" {
     try std.testing.expectError(
         error.InvalidSessionIndex,
         readDeferredCacheTokens(alloc, &sessions),
+    );
+}
+
+test "cancellable deferred token reader stops before enumeration" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(
+        std.testing.io,
+        "sessions",
+        private_dir_permissions,
+    );
+    var sessions_dir = try tmp.dir.openDir(std.testing.io, "sessions", .{
+        .iterate = true,
+    });
+    defer sessions_dir.close(std.testing.io);
+    var sessions = io_mod.VerifiedDir{ .dir = sessions_dir };
+    var cancelled = std.atomic.Value(bool).init(true);
+
+    try std.testing.expectError(
+        error.Cancelled,
+        readDeferredCacheTokensCancellable(alloc, &sessions, &cancelled),
+    );
+}
+
+test "cancellable workspace snapshot stops before parsing" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(
+        std.testing.io,
+        "sessions",
+        private_dir_permissions,
+    );
+    var sessions_dir = try tmp.dir.openDir(std.testing.io, "sessions", .{
+        .iterate = true,
+    });
+    defer sessions_dir.close(std.testing.io);
+    var sessions = io_mod.VerifiedDir{ .dir = sessions_dir };
+    try writeSessionIndex(alloc, &sessions, &.{});
+    var cancelled = std.atomic.Value(bool).init(true);
+
+    try std.testing.expectError(
+        error.Cancelled,
+        readSessionIndexWorkspaceSnapshotCancellable(
+            alloc,
+            &sessions,
+            "/tmp/workspace",
+            &cancelled,
+        ),
     );
 }
 

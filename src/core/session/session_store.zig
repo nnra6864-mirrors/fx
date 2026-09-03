@@ -2682,10 +2682,14 @@ pub const Store = struct {
             page.deinit(alloc);
             return indexed;
         }
-        var observed = summary_codec.readDeferredCacheTokens(
+        var observed = summary_codec.readDeferredCacheTokensCancellable(
             alloc,
             &sessions,
-        ) catch return page;
+            self.discovery_cancel_flag,
+        ) catch |err| switch (err) {
+            error.Cancelled => return err,
+            else => return page,
+        };
         defer summary_codec.freeDeferredCacheTokens(alloc, &observed);
         try self.check_discovery_cancellation();
         var repair_summaries = try self.scanSessionSummaries(alloc, .read_only_list);
@@ -2754,11 +2758,25 @@ pub const Store = struct {
         try self.check_discovery_cancellation();
         const sessions = &(self.canonical_root.sessions orelse return null);
         if (summary_codec.sessionIndexPublicationPending(sessions) catch return null) return null;
-        var observed = summary_codec.readDeferredCacheTokens(
+        debug_trace.logf(
+            "core",
+            "session picker cache overlay stage=deferred begin",
+            .{},
+        );
+        var observed = summary_codec.readDeferredCacheTokensCancellable(
             alloc,
             sessions,
+            self.discovery_cancel_flag,
         ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
+            error.OutOfMemory => return err,
+            error.Cancelled => {
+                debug_trace.logf(
+                    "core",
+                    "session picker cache overlay cancelled stage=deferred",
+                    .{},
+                );
+                return err;
+            },
             else => return null,
         };
         defer summary_codec.freeDeferredCacheTokens(alloc, &observed);
@@ -2829,12 +2847,13 @@ pub const Store = struct {
         active_id: ?[]const u8,
         continuation: ?ResumableSessionContinuation,
     ) !?ResumableSessionPage {
-        var index = summary_codec.readSessionIndexWorkspaceSnapshot(
+        var index = summary_codec.readSessionIndexWorkspaceSnapshotCancellable(
             alloc,
             sessions,
             self.workspace_root,
+            self.discovery_cancel_flag,
         ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
+            error.OutOfMemory, error.Cancelled => return err,
             else => return null,
         };
         defer freeSummaries(alloc, &index);

@@ -618,6 +618,100 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "second ctrl+c cancels deferred session index reconciliation",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-session-overlay-exit-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const sessionsRoot = join(home, ".fx", "sessions");
+    const latestRoot = join(sessionsRoot, "latest");
+    const deferredRoot = join(latestRoot, "deferred");
+    const stderrPath = join(root, "stderr.log");
+    const tracePath = join(root, "trace.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    writeFileSync(stderrPath, "");
+    writeFileSync(tracePath, "");
+    let active: TmuxSession | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: realpathSync(workspace),
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "core,input",
+          NO_COLOR: "1",
+        },
+        stderrPath,
+        width: 100,
+        height: 30,
+        remainOnExit: true,
+      });
+      await active.waitForComposer(TIMEOUT);
+
+      mkdirSync(deferredRoot, { recursive: true, mode: 0o700 });
+      chmodSync(latestRoot, 0o700);
+      chmodSync(deferredRoot, 0o700);
+      writeFileSync(
+        join(sessionsRoot, "index.json"),
+        '{"schema_version":3,"sessions":[]}',
+        { mode: 0o600 },
+      );
+      rmSync(join(sessionsRoot, "index.pending"), { force: true });
+      const padding = " ".repeat(3_000);
+      for (let index = 0; index < 4_096; index += 1) {
+        const sessionId = `deferred-cancel-${index.toString().padStart(4, "0")}`;
+        writeFileSync(join(deferredRoot, sessionId), JSON.stringify({
+          schema_version: 1,
+          session_id: sessionId,
+          workspace_root: workspace,
+          position: {
+            log_generation: "11".repeat(16),
+            through_seq: 1,
+            through_event_id: "22".repeat(16),
+            through_event_log_bytes: 1,
+          },
+        }) + padding, { mode: 0o600 });
+      }
+
+      await Bun.sleep(5_100);
+      const traceOffset = readFileSync(tracePath, "utf8").length;
+      await active.sendText("/resume");
+      await waitForCondition(
+        () => readFileSync(tracePath, "utf8").slice(traceOffset).includes(
+          "session picker cache overlay stage=deferred begin",
+        ),
+        "deferred session index reconciliation",
+      );
+
+      active.sendKeysImmediate(["C-c"]);
+      await Bun.sleep(80);
+      active.sendKeysImmediate(["C-c"]);
+      const elapsedMs = await waitForPaneExitWithin(active, 5_000);
+      const trace = readFileSync(tracePath, "utf8");
+
+      expect(elapsedMs).toBeLessThan(500);
+      expect(trace).toContain("session picker load cancellation requested");
+      expect(trace).toContain(
+        "session picker cache overlay cancelled stage=deferred",
+      );
+      expect(trace).toContain("session discovery cancelled");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await active.kill();
+      active = null;
+    } finally {
+      if (active) await active.kill();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
   "contended deferred updates overlay the index without scanning",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-session-snapshot-")));

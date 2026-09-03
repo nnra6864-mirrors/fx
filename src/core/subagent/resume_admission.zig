@@ -25,8 +25,10 @@ const ManagedProbeBatch = struct {
 
     fn run(self: *ManagedProbeBatch) void {
         while (true) {
+            if (cancellationRequested(self.store.discovery_cancel_flag)) return;
             const index = self.next.fetchAdd(1, .monotonic);
             if (index >= self.summaries.len) return;
+            if (cancellationRequested(self.store.discovery_cancel_flag)) return;
             self.managed[index] = child_state.isManagedChildSession(
                 self.store,
                 std.heap.c_allocator,
@@ -41,6 +43,7 @@ fn probeManagedSessions(
     store: session_store.Store,
     summaries: []const session_store.SessionSummary,
 ) ![]bool {
+    if (cancellationRequested(store.discovery_cancel_flag)) return error.Cancelled;
     const managed = try alloc.alloc(bool, summaries.len);
     errdefer alloc.free(managed);
     @memset(managed, true);
@@ -51,6 +54,7 @@ fn probeManagedSessions(
     };
     if (comptime builtin.single_threaded) {
         batch.run();
+        if (cancellationRequested(store.discovery_cancel_flag)) return error.Cancelled;
         return managed;
     }
 
@@ -62,7 +66,13 @@ fn probeManagedSessions(
     }
     if (started < worker_count) batch.run();
     for (threads[0..started]) |thread| thread.join();
+    if (cancellationRequested(store.discovery_cancel_flag)) return error.Cancelled;
     return managed;
+}
+
+fn cancellationRequested(cancel_flag: ?*const std.atomic.Value(bool)) bool {
+    const flag = cancel_flag orelse return false;
+    return flag.load(.seq_cst);
 }
 
 pub const ActionableContinuation = struct {
@@ -472,6 +482,34 @@ fn ensureLoadedExternalPromptAllowed(
     loaded: *const session_store.LoadedWritableSession,
 ) !void {
     if (loaded.state.subagent_child) return error.OneOffSessionNotResumable;
+}
+
+test "managed session probes stop before claiming cancelled work" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var store = try session_store.Store.initFromHome(alloc, home, workspace);
+    defer store.deinit(alloc);
+    var cancelled = std.atomic.Value(bool).init(true);
+    store.set_discovery_cancel_flag(&cancelled);
+    const summaries = [_]session_store.SessionSummary{.{
+        .id = @constCast("cancelled-probe"),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .history_len = 1,
+    }};
+
+    try std.testing.expectError(
+        error.Cancelled,
+        probeManagedSessions(alloc, store, &summaries),
+    );
 }
 
 test "managed child marker is hidden from external access" {
