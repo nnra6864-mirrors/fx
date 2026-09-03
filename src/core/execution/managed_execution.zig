@@ -196,6 +196,7 @@ const Entry = struct {
     error_name: ?[]const u8 = null,
     cancel: std.atomic.Value(bool) = .init(false),
     force_cancel: std.atomic.Value(bool) = .init(false),
+    shutdown: std.atomic.Value(bool) = .init(false),
     start_gate: std.Io.Event = .unset,
     thread: ?std.Thread = null,
     published_running: bool = false,
@@ -431,6 +432,7 @@ const Entry = struct {
             .max_command_output_bytes = self.max_output_bytes,
             .cancel_flag = &self.cancel,
             .force_cancel_flag = &self.force_cancel,
+            .shutdown_flag = &self.shutdown,
             .output_chunk_lifecycle_id = self.output_chunk_lifecycle_id,
             .output_chunk_ctx = self.output_chunk_ctx,
             .on_output_chunk = self.on_output_chunk,
@@ -1078,6 +1080,8 @@ pub const Runtime = struct {
             const entry = candidate orelse continue;
             entry.mutex.lockUncancelable(zio);
             if (!entry.isTerminal()) {
+                entry.shutdown.store(true, .seq_cst);
+                entry.force_cancel.store(true, .seq_cst);
                 entry.cancel.store(true, .seq_cst);
                 entry.start_gate.set(zio);
                 live[live_len] = entry;

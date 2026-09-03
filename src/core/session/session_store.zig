@@ -574,6 +574,21 @@ pub const Store = struct {
     // Carried on the value so it propagates through the by-value page chain;
     // the UI sets it from the visible screen height.
     resume_page_limit: usize = default_resume_page_limit,
+    discovery_cancel_flag: ?*const std.atomic.Value(bool) = null,
+
+    /// Binds a borrowed cancellation flag to this store copy. The caller must
+    /// keep the flag alive until every operation using the copy has returned.
+    pub fn set_discovery_cancel_flag(
+        self: *Store,
+        cancel_flag: *const std.atomic.Value(bool),
+    ) void {
+        self.discovery_cancel_flag = cancel_flag;
+    }
+
+    fn check_discovery_cancellation(self: Store) !void {
+        const cancel_flag = self.discovery_cancel_flag orelse return;
+        if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+    }
 
     /// Narrow, copyable view of this store for the discovery/migration helpers,
     /// so they depend on `StoreContext` instead of the full facade.
@@ -2482,6 +2497,20 @@ pub const Store = struct {
         );
     }
 
+    pub fn tryListReconciledResumableIndexPage(
+        self: Store,
+        alloc: Allocator,
+        active_id: ?[]const u8,
+        continuation: ?ResumableSessionContinuation,
+    ) !?ResumableSessionPage {
+        return self.tryListReconciledResumableIndexPageForScope(
+            alloc,
+            .all_workspaces,
+            active_id,
+            continuation,
+        );
+    }
+
     pub fn listResumableWorkspacePage(
         self: Store,
         alloc: Allocator,
@@ -2510,6 +2539,20 @@ pub const Store = struct {
         );
     }
 
+    pub fn tryListReconciledResumableWorkspaceIndexPage(
+        self: Store,
+        alloc: Allocator,
+        active_id: ?[]const u8,
+        continuation: ?ResumableSessionContinuation,
+    ) !?ResumableSessionPage {
+        return self.tryListReconciledResumableIndexPageForScope(
+            alloc,
+            .current_workspace,
+            active_id,
+            continuation,
+        );
+    }
+
     fn listResumablePageForScope(
         self: Store,
         alloc: Allocator,
@@ -2517,6 +2560,7 @@ pub const Store = struct {
         active_id: ?[]const u8,
         continuation: ?ResumableSessionContinuation,
     ) !ResumableSessionPage {
+        try self.check_discovery_cancellation();
         if (try self.tryListResumableIndexPageForScope(alloc, scope, active_id, continuation)) |page| {
             return page;
         }
@@ -2572,11 +2616,34 @@ pub const Store = struct {
             .continuation = continuation,
             .limit = self.resume_page_limit,
             .resumable_only = true,
+            .cancel_flag = self.discovery_cancel_flag,
         }) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
+            error.OutOfMemory, error.Cancelled => return err,
             else => return null,
         };
         return try self.hydrateResumablePage(alloc, page);
+    }
+
+    fn tryListReconciledResumableIndexPageForScope(
+        self: Store,
+        alloc: Allocator,
+        scope: ResumableSessionScope,
+        active_id: ?[]const u8,
+        continuation: ?ResumableSessionContinuation,
+    ) !?ResumableSessionPage {
+        if (self.canonical_root.mode != .writable) return null;
+        if (try self.tryListResumableIndexPageForScope(
+            alloc,
+            scope,
+            active_id,
+            continuation,
+        )) |page| return page;
+        return self.tryListResumableOverlayPageForScope(
+            alloc,
+            scope,
+            active_id,
+            continuation,
+        );
     }
 
     fn backfillResumablePageForScope(
@@ -2586,10 +2653,13 @@ pub const Store = struct {
         active_id: ?[]const u8,
         continuation: ?ResumableSessionContinuation,
     ) !ResumableSessionPage {
+        try self.check_discovery_cancellation();
         var sessions = self.canonical_root.sessions orelse return error.SessionStoreUnavailable;
         var summaries = try self.scanSessionSummaries(alloc, .read_only_list);
         defer freeSummaries(alloc, &summaries);
+        try self.check_discovery_cancellation();
         try self.refreshMissingDisplayMetadata(alloc, &summaries);
+        try self.check_discovery_cancellation();
         var page = try self.resumablePageFromSummariesForScope(
             alloc,
             scope,
@@ -2606,6 +2676,7 @@ pub const Store = struct {
         ) catch return page;
         var cache_lock_held = true;
         defer if (cache_lock_held) cache_lock.release();
+        try self.check_discovery_cancellation();
 
         if (try self.tryListResumableIndexPageForScope(alloc, scope, active_id, continuation)) |indexed| {
             page.deinit(alloc);
@@ -2616,14 +2687,18 @@ pub const Store = struct {
             &sessions,
         ) catch return page;
         defer summary_codec.freeDeferredCacheTokens(alloc, &observed);
+        try self.check_discovery_cancellation();
         var repair_summaries = try self.scanSessionSummaries(alloc, .read_only_list);
         defer freeSummaries(alloc, &repair_summaries);
+        try self.check_discovery_cancellation();
         try self.refreshMissingDisplayMetadata(alloc, &repair_summaries);
+        try self.check_discovery_cancellation();
         try writeSessionIndex(alloc, &sessions, repair_summaries.items);
         try removeSessionIndexMarker(&sessions);
         cache_lock.release();
         cache_lock_held = false;
         for (observed.items) |token| {
+            try self.check_discovery_cancellation();
             var root = self.canonical_root;
             var boundary = root.captureReadBoundary(
                 alloc,
@@ -2664,6 +2739,212 @@ pub const Store = struct {
             };
         }
         return page;
+    }
+
+    /// Serves a current in-memory view without the global index lock by
+    /// overlaying the bounded deferred journal on the last atomic snapshot.
+    /// This keeps readers responsive while another fx process publishes.
+    fn tryListResumableOverlayPageForScope(
+        self: Store,
+        alloc: Allocator,
+        scope: ResumableSessionScope,
+        active_id: ?[]const u8,
+        continuation: ?ResumableSessionContinuation,
+    ) !?ResumableSessionPage {
+        try self.check_discovery_cancellation();
+        const sessions = &(self.canonical_root.sessions orelse return null);
+        var observed = summary_codec.readDeferredCacheTokens(
+            alloc,
+            sessions,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        defer summary_codec.freeDeferredCacheTokens(alloc, &observed);
+        return switch (scope) {
+            .all_workspaces => self.tryListResumableGlobalOverlayPage(
+                alloc,
+                sessions,
+                observed.items,
+                active_id,
+                continuation,
+            ),
+            .current_workspace => self.tryListResumableWorkspaceOverlayPage(
+                alloc,
+                sessions,
+                observed.items,
+                active_id,
+                continuation,
+            ),
+        };
+    }
+
+    fn tryListResumableGlobalOverlayPage(
+        self: Store,
+        alloc: Allocator,
+        sessions: *const io_mod.VerifiedDir,
+        tokens: []const summary_codec.DeferredCacheToken,
+        active_id: ?[]const u8,
+        continuation: ?ResumableSessionContinuation,
+    ) !?ResumableSessionPage {
+        var snapshot = summary_codec.readSessionIndexSnapshotPrefixPage(alloc, sessions, .{
+            .active_id = active_id,
+            .continuation = continuation,
+            .limit = self.resume_page_limit +| tokens.len,
+            .resumable_only = true,
+            .cancel_flag = self.discovery_cancel_flag,
+        }) catch |err| switch (err) {
+            error.OutOfMemory, error.Cancelled => return err,
+            else => return null,
+        };
+        defer snapshot.deinit(alloc);
+        if (!try self.applyDeferredResumableIndexRows(
+            alloc,
+            &snapshot.summaries,
+            tokens,
+            active_id,
+        )) return null;
+        var page = try self.resumablePageFromSummariesForScope(
+            alloc,
+            .all_workspaces,
+            snapshot.summaries.items,
+            active_id,
+            continuation,
+        );
+        page.has_more = page.has_more or snapshot.has_more;
+        debug_trace.logf(
+            "core",
+            "session picker cache overlay outcome=ready scope=all_workspaces deferred={d}",
+            .{tokens.len},
+        );
+        return try self.hydrateResumablePage(alloc, page);
+    }
+
+    fn tryListResumableWorkspaceOverlayPage(
+        self: Store,
+        alloc: Allocator,
+        sessions: *const io_mod.VerifiedDir,
+        tokens: []const summary_codec.DeferredCacheToken,
+        active_id: ?[]const u8,
+        continuation: ?ResumableSessionContinuation,
+    ) !?ResumableSessionPage {
+        var index = summary_codec.readSessionIndexWorkspaceSnapshot(
+            alloc,
+            sessions,
+            self.workspace_root,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        defer freeSummaries(alloc, &index);
+        if (!try self.applyDeferredResumableIndexRows(
+            alloc,
+            &index,
+            tokens,
+            active_id,
+        )) return null;
+        const page = try self.resumablePageFromSummariesForScope(
+            alloc,
+            .current_workspace,
+            index.items,
+            active_id,
+            continuation,
+        );
+        debug_trace.logf(
+            "core",
+            "session picker cache overlay outcome=ready scope=current_workspace deferred={d}",
+            .{tokens.len},
+        );
+        return try self.hydrateResumablePage(alloc, page);
+    }
+
+    fn applyDeferredResumableIndexRows(
+        self: Store,
+        alloc: Allocator,
+        index: *std.ArrayList(SessionSummary),
+        tokens: []const summary_codec.DeferredCacheToken,
+        active_id: ?[]const u8,
+    ) !bool {
+        for (tokens) |token| {
+            try self.check_discovery_cancellation();
+            if (active_id) |id| {
+                if (std.mem.eql(u8, id, token.session_id)) continue;
+            }
+
+            var session_dir = self.openSessionDir(token.session_id) catch |err| switch (err) {
+                else => {
+                    debug_trace.logf(
+                        "core",
+                        "session picker cache overlay outcome=deferred stage=open err={s}",
+                        .{@errorName(err)},
+                    );
+                    return false;
+                },
+            };
+            defer session_dir.close();
+            var candidate = classifyReadOnlyCandidate(
+                alloc,
+                &session_dir,
+                token.session_id,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    debug_trace.logf(
+                        "core",
+                        "session picker cache overlay outcome=deferred stage=projection err={s}",
+                        .{@errorName(err)},
+                    );
+                    return false;
+                },
+            };
+            defer candidate.deinit(alloc);
+            if (candidate.projection_state == .stale) {
+                debug_trace.logf(
+                    "core",
+                    "session picker cache overlay projection=stale id={s}",
+                    .{token.session_id},
+                );
+            }
+            if (!try self.replaceDeferredResumableIndexRow(
+                alloc,
+                index,
+                candidate.summary,
+            )) return false;
+        }
+        return true;
+    }
+
+    fn replaceDeferredResumableIndexRow(
+        self: Store,
+        alloc: Allocator,
+        index: *std.ArrayList(SessionSummary),
+        source: SessionSummary,
+    ) !bool {
+        var replacement = try summary_codec.cloneSessionSummary(alloc, source);
+        var replacement_owned = true;
+        defer if (replacement_owned) replacement.deinit(alloc);
+        replacement.has_managed_children = self.sessionHasManagedChildren(
+            alloc,
+            source.id,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                debug_trace.logf(
+                    "core",
+                    "session picker cache overlay outcome=deferred stage=children err={s}",
+                    .{@errorName(err)},
+                );
+                return false;
+            },
+        };
+        try summary_codec.preserveIndexedDisplayMetadata(
+            alloc,
+            index.items,
+            &replacement,
+        );
+        try summary_codec.replaceIndexedSummary(alloc, index, &replacement);
+        replacement_owned = false;
+        return true;
     }
 
     fn listResumablePageFromDiscoveryForScope(
@@ -2728,6 +3009,7 @@ pub const Store = struct {
         summaries: *std.ArrayList(SessionSummary),
     ) !void {
         for (summaries.items) |*summary| {
+            try self.check_discovery_cancellation();
             if (!summaryNeedsDisplayMetadata(summary.*)) continue;
             if (try self.adoptFrozenSidecar(alloc, summary)) continue;
             const source_bytes = self.displayMetadataReplaySourceBytes(summary.id) catch |err| {
@@ -2915,6 +3197,7 @@ pub const Store = struct {
         mode: DiscoveryMode,
         probe_managed_children: bool,
     ) !SessionSummaryScan {
+        try self.check_discovery_cancellation();
         var scan = SessionSummaryScan{};
         errdefer scan.deinit(alloc);
         var replay_scope = self.loadDeferredReplayScope(alloc);
@@ -2924,6 +3207,7 @@ pub const Store = struct {
         if (self.canonical_root.sessions == null) return scan;
         var iter = self.canonical_root.sessions.?.dir.iterate();
         while (try iter.next(io_mod.getIo())) |entry| {
+            try self.check_discovery_cancellation();
             if (entry.kind != .directory) continue;
             if (std.mem.eql(u8, entry.name, latest_sessions_dir)) {
                 continue;
@@ -3018,6 +3302,7 @@ pub const Store = struct {
             };
             candidate.summary = undefined;
         }
+        try self.check_discovery_cancellation();
         sortSummariesNewestFirst(scan.summaries.items);
         if (mode == .global_read_only_last and scan.summaries.items.len > 0) {
             for (metadata.items) |candidate| {
@@ -11230,6 +11515,25 @@ test "session scan probes managed children only when requested" {
     defer probing.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), probing.summaries.items.len);
     try std.testing.expect(probing.summaries.items[0].has_managed_children);
+}
+
+test "resumable discovery observes cancellation before index backfill" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    var sessions = ctx.store.canonical_root.sessions orelse
+        return error.TestExpectedEqual;
+    try summary_codec.writeSessionIndexMarker(alloc, &sessions);
+    var cancel = std.atomic.Value(bool).init(true);
+    ctx.store.set_discovery_cancel_flag(&cancel);
+
+    try std.testing.expectError(
+        error.Cancelled,
+        ctx.store.listResumablePage(alloc, null, null),
+    );
 }
 
 test "session discovery accepts the usage recovery name" {

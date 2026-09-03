@@ -848,6 +848,57 @@ fn parseSessionIndexForWorkspaceFast(
     return results;
 }
 
+fn parseSessionIndexWorkspaceSnapshotFast(
+    alloc: Allocator,
+    json_text: []const u8,
+    workspace_root: []const u8,
+) !std.ArrayList(SessionSummary) {
+    const prefix = "{\"schema_version\":3,\"sessions\":[";
+    if (!std.mem.startsWith(u8, json_text, prefix) or
+        !std.mem.endsWith(u8, json_text, "]}"))
+    {
+        return error.InvalidSessionIndex;
+    }
+
+    var needle_writer: std.Io.Writer.Allocating = .init(alloc);
+    defer needle_writer.deinit();
+    try needle_writer.writer.writeAll(",\"workspace_root\":");
+    try std.json.Stringify.value(
+        workspace_root,
+        .{},
+        &needle_writer.writer,
+    );
+    const workspace_needle = try needle_writer.toOwnedSlice();
+    defer alloc.free(workspace_needle);
+
+    var results: std.ArrayList(SessionSummary) = .empty;
+    errdefer freeSummaries(alloc, &results);
+    var search_from = prefix.len;
+    while (std.mem.indexOfPos(
+        u8,
+        json_text,
+        search_from,
+        workspace_needle,
+    )) |match_start| {
+        const relative_entry_start = std.mem.lastIndexOfScalar(
+            u8,
+            json_text[prefix.len..match_start],
+            '{',
+        ) orelse return error.InvalidSessionIndex;
+        const entry_start = prefix.len + relative_entry_start;
+        const entry_end = findIndexedSummaryEnd(json_text, entry_start) orelse
+            return error.InvalidSessionIndex;
+        try appendWorkspaceSummaryFromSlice(
+            alloc,
+            &results,
+            json_text[entry_start..entry_end],
+            workspace_root,
+        );
+        search_from = entry_end;
+    }
+    return results;
+}
+
 fn findIndexedSummaryEnd(
     json_text: []const u8,
     entry_start: usize,
@@ -946,6 +997,7 @@ pub const SessionIndexPageOptions = struct {
     continuation: ?ResumableSessionContinuation = null,
     limit: usize,
     resumable_only: bool,
+    cancel_flag: ?*const std.atomic.Value(bool) = null,
 };
 
 const IndexedSummaryView = struct {
@@ -1065,6 +1117,99 @@ fn parseSessionIndexPage(
     return page;
 }
 
+/// Reads a bounded prefix from the canonical writer format. The session index
+/// is derived state; selected rows are still validated against canonical
+/// session storage before resume.
+fn parseSessionIndexSnapshotPrefixPage(
+    alloc: Allocator,
+    json_text: []const u8,
+    options: SessionIndexPageOptions,
+) !ResumableSessionPage {
+    const prefix = "{\"schema_version\":3,\"sessions\":[";
+    if (options.workspace_root != null or
+        !std.mem.startsWith(u8, json_text, prefix) or
+        !std.mem.endsWith(u8, json_text, "]}"))
+    {
+        return error.InvalidSessionIndex;
+    }
+
+    var page: ResumableSessionPage = .{};
+    errdefer page.deinit(alloc);
+    var previous_updated_at_ms: ?i64 = null;
+    var previous_id: [255]u8 = undefined;
+    var previous_id_len: usize = 0;
+    var cursor = prefix.len;
+    const end = json_text.len - 2;
+    while (cursor < end) {
+        try check_cancellation(options.cancel_flag);
+        if (json_text[cursor] != '{') return error.InvalidSessionIndex;
+        const entry_end = findIndexedSummaryEnd(json_text, cursor) orelse
+            return error.InvalidSessionIndex;
+        var parsed = std.json.parseFromSlice(
+            std.json.Value,
+            alloc,
+            json_text[cursor..entry_end],
+            .{},
+        ) catch return error.InvalidSessionIndex;
+        defer parsed.deinit();
+        var summary = try parseIndexedSummary(alloc, parsed.value);
+        var summary_owned = true;
+        defer if (summary_owned) summary.deinit(alloc);
+
+        if (previous_updated_at_ms) |updated_at_ms| {
+            if (summary.updated_at_ms > updated_at_ms or
+                (summary.updated_at_ms == updated_at_ms and
+                    std.mem.order(u8, summary.id, previous_id[0..previous_id_len]) == .gt))
+            {
+                return error.InvalidSessionIndex;
+            }
+        }
+        previous_updated_at_ms = summary.updated_at_ms;
+        previous_id_len = summary.id.len;
+        @memcpy(previous_id[0..previous_id_len], summary.id);
+
+        if (sessionSummaryMatchesPage(summary, options)) {
+            if (page.summaries.items.len == options.limit) {
+                page.has_more = true;
+                return page;
+            }
+            try page.summaries.append(alloc, summary);
+            summary_owned = false;
+        }
+
+        cursor = entry_end;
+        if (cursor == end) break;
+        if (json_text[cursor] != ',') return error.InvalidSessionIndex;
+        cursor += 1;
+    }
+    if (cursor != end) return error.InvalidSessionIndex;
+    return page;
+}
+
+fn sessionSummaryMatchesPage(
+    summary: SessionSummary,
+    options: SessionIndexPageOptions,
+) bool {
+    if (options.resumable_only and
+        summary.history_len == 0 and
+        !summary.has_managed_children)
+    {
+        return false;
+    }
+    if (options.active_id) |active_id| {
+        if (std.mem.eql(u8, summary.id, active_id)) return false;
+    }
+    if (options.continuation) |continuation| {
+        if (summary.updated_at_ms > continuation.updated_at_ms) return false;
+        if (summary.updated_at_ms == continuation.updated_at_ms and
+            std.mem.order(u8, summary.id, continuation.id) != .lt)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 fn parseSessionIndexPageRows(
     alloc: Allocator,
     scanner: *std.json.Scanner,
@@ -1074,6 +1219,7 @@ fn parseSessionIndexPageRows(
 ) !void {
     try expectJsonToken(try scanner.next(), .array_begin);
     while (true) {
+        try check_cancellation(options.cancel_flag);
         const token = try scanner.next();
         switch (token) {
             .array_end => return,
@@ -1104,6 +1250,11 @@ fn parseSessionIndexPageRows(
             else => return error.InvalidSessionIndex,
         }
     }
+}
+
+fn check_cancellation(cancel_flag: ?*const std.atomic.Value(bool)) !void {
+    const flag = cancel_flag orelse return;
+    if (flag.load(.seq_cst)) return error.Cancelled;
 }
 
 fn readIndexedSummaryView(
@@ -1323,6 +1474,16 @@ pub fn readSessionIndexForRepair(
     sessions: *const io_mod.VerifiedDir,
 ) !std.ArrayList(SessionSummary) {
     if (try sessionIndexMarkerPresent(sessions)) return error.InvalidSessionIndex;
+    return readSessionIndexSnapshot(alloc, sessions);
+}
+
+/// Reads the last atomically published index without interpreting pending
+/// update markers. Callers must reconcile deferred tokens before treating the
+/// result as current.
+pub fn readSessionIndexSnapshot(
+    alloc: Allocator,
+    sessions: *const io_mod.VerifiedDir,
+) !std.ArrayList(SessionSummary) {
     var file = try openVerifiedSessionIndexFile(sessions, session_index_file);
     defer file.close(io_mod.getIo());
     const bytes = io_mod.readFileToEnd(alloc, &file, max_session_index_bytes) catch |err| switch (err) {
@@ -1331,6 +1492,43 @@ pub fn readSessionIndexForRepair(
     };
     defer alloc.free(bytes);
     return parseSessionIndex(alloc, bytes);
+}
+
+pub fn readSessionIndexSnapshotPrefixPage(
+    alloc: Allocator,
+    sessions: *const io_mod.VerifiedDir,
+    options: SessionIndexPageOptions,
+) !ResumableSessionPage {
+    var file = try openVerifiedSessionIndexFile(sessions, session_index_file);
+    defer file.close(io_mod.getIo());
+    const bytes = io_mod.readFileToEnd(alloc, &file, max_session_index_bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidSessionIndex,
+    };
+    defer alloc.free(bytes);
+    return parseSessionIndexSnapshotPrefixPage(alloc, bytes, options) catch |err| switch (err) {
+        error.OutOfMemory, error.Cancelled => return err,
+        else => return error.InvalidSessionIndex,
+    };
+}
+
+pub fn readSessionIndexWorkspaceSnapshot(
+    alloc: Allocator,
+    sessions: *const io_mod.VerifiedDir,
+    workspace_root: []const u8,
+) !std.ArrayList(SessionSummary) {
+    var file = try openVerifiedSessionIndexFile(sessions, session_index_file);
+    defer file.close(io_mod.getIo());
+    const bytes = io_mod.readFileToEnd(
+        alloc,
+        &file,
+        max_session_index_bytes,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidSessionIndex,
+    };
+    defer alloc.free(bytes);
+    return parseSessionIndexWorkspaceSnapshotFast(alloc, bytes, workspace_root);
 }
 
 pub fn readSessionIndexPage(
@@ -1348,7 +1546,7 @@ pub fn readSessionIndexPage(
     };
     defer alloc.free(bytes);
     return parseSessionIndexPage(alloc, bytes, options) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
+        error.OutOfMemory, error.Cancelled => return err,
         else => return error.InvalidSessionIndex,
     };
 }
@@ -1362,18 +1560,7 @@ pub fn readSessionIndexWorkspaceCandidates(
     workspace_root: []const u8,
 ) !std.ArrayList(SessionSummary) {
     if (try deferredCachePresent(sessions)) return error.InvalidSessionIndex;
-    var file = try openVerifiedSessionIndexFile(sessions, session_index_file);
-    defer file.close(io_mod.getIo());
-    const bytes = io_mod.readFileToEnd(
-        alloc,
-        &file,
-        max_session_index_bytes,
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidSessionIndex,
-    };
-    defer alloc.free(bytes);
-    return parseSessionIndexForWorkspace(alloc, bytes, workspace_root);
+    return readSessionIndexWorkspaceSnapshot(alloc, sessions, workspace_root);
 }
 
 /// Streams a fixed window of the frozen ordinary-session candidate snapshot.

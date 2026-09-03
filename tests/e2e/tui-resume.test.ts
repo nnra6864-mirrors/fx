@@ -269,6 +269,18 @@ async function waitForCondition(
   throw new Error(`Timed out waiting for ${description}.`);
 }
 
+async function waitForPaneExitWithin(
+  session: TmuxSession,
+  timeout: number,
+): Promise<number> {
+  const started = performance.now();
+  while (performance.now() - started < timeout) {
+    if (!session.isPaneAlive()) return performance.now() - started;
+    await Bun.sleep(10);
+  }
+  throw new Error(`Timed out waiting for fx to exit after ${timeout}ms`);
+}
+
 async function waitForPersistedSessionMarker(
   home: string,
   marker: string,
@@ -344,6 +356,288 @@ async function waitForSessionPickerClosed(session: TmuxSession): Promise<string>
 function stripAnsi(text: string): string {
   return text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
 }
+
+test.skipIf(!tmuxAvailable())(
+  "resumed session double ctrl+c exits through bounded handoff confirmation",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-resumed-fast-exit-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    const tracePath = join(root, "trace.log");
+    const marker = "RESUMED_FAST_EXIT_DURABLE_MARKER";
+    mkdirSync(home);
+    mkdirSync(workspace);
+    writeFileSync(stderrPath, "");
+    writeFileSync(tracePath, "");
+    const seedGateway = startFakeGateway([fakeGatewayFinalText(marker)]);
+    const resumeGateway = startFakeGateway([]);
+    let active: TmuxSession | null = null;
+    try {
+      const seed = await runFx(
+        ["ask", "--json", "--auto", "Seed the resumed fast-exit fixture."],
+        {
+          cwd: realpathSync(workspace),
+          env: gatewayEnv(home, seedGateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+      expect(seed.code).toBe(0);
+      expect(seed.stderr).toBe("");
+      const sessionId = String(JSON.parse(seed.stdout).session_id);
+
+      active = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume ${sessionId}`,
+        cwd: realpathSync(workspace),
+        env: {
+          ...gatewayEnv(home, resumeGateway),
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "input,session",
+        },
+        stderrPath,
+        width: 100,
+        height: 30,
+        remainOnExit: true,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.waitForText(marker, TIMEOUT);
+
+      active.sendKeysImmediate(["C-c"]);
+      await Bun.sleep(80);
+      active.sendKeysImmediate(["C-c"]);
+      const elapsedMs = await waitForPaneExitWithin(active, 5_000);
+
+      expect(elapsedMs).toBeLessThan(500);
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "event=resume_handoff_confirmation mode=metadata outcome=ready",
+      );
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await active.kill();
+      active = null;
+
+      const persisted = await runFx(["session", "--id", sessionId, "--json"], {
+        cwd: realpathSync(workspace),
+        env: { HOME: home },
+        timeoutMs: TIMEOUT,
+      });
+      expect(persisted.code).toBe(0);
+      expect(persisted.stderr).toBe("");
+      expect(persisted.stdout).toContain(marker);
+    } finally {
+      if (active) await active.kill();
+      seedGateway.stop();
+      resumeGateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "second ctrl+c cancels an active session discovery scan",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-session-scan-exit-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const sessionsRoot = join(home, ".fx", "sessions");
+    const stderrPath = join(root, "stderr.log");
+    const tracePath = join(root, "trace.log");
+    mkdirSync(sessionsRoot, { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(stderrPath, "");
+    writeFileSync(tracePath, "");
+    for (let index = 0; index < 4_000; index += 1) {
+      const sessionDir = join(sessionsRoot, `fixture-${index.toString().padStart(5, "0")}`);
+      mkdirSync(sessionDir);
+      writeFileSync(join(sessionDir, "session.json"), '{"invalid":true}\n');
+    }
+    writeFileSync(join(sessionsRoot, "index.pending"), "");
+
+    let active: TmuxSession | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: realpathSync(workspace),
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "core,input",
+          NO_COLOR: "1",
+        },
+        stderrPath,
+        width: 100,
+        height: 30,
+        remainOnExit: true,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("/resume");
+      await waitForCondition(
+        () => readFileSync(tracePath, "utf8").includes(
+          "session picker cache outcome=miss action=backfill",
+        ),
+        "explicit session discovery",
+      );
+
+      active.sendKeysImmediate(["C-c"]);
+      await Bun.sleep(80);
+      active.sendKeysImmediate(["C-c"]);
+      const elapsedMs = await waitForPaneExitWithin(active, 5_000);
+
+      expect(elapsedMs).toBeLessThan(500);
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain("session picker load cancellation requested");
+      expect(trace).toContain("session discovery cancelled");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await active.kill();
+      active = null;
+    } finally {
+      if (active) await active.kill();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "contended deferred updates overlay the index without scanning",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-session-snapshot-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const sessionsRoot = join(home, ".fx", "sessions");
+    const latestRoot = join(sessionsRoot, "latest");
+    const deferredRoot = join(latestRoot, "deferred");
+    const stderrPath = join(root, "stderr.log");
+    const tracePath = join(root, "trace.log");
+    const lockReadyPath = join(root, "lock.ready");
+    mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+    mkdirSync(workspace);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+    );
+    writeFileSync(stderrPath, "");
+    writeFileSync(tracePath, "");
+    chmodSync(join(home, ".fx"), 0o700);
+    const seedGateway = startFakeGateway([fakeGatewayFinalText("SNAPSHOT_INDEX_SESSION")]);
+    let active: TmuxSession | null = null;
+    let lockHolder: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      const ask = await runFx(["ask", "--json", "--auto", "Seed the index reconciliation fixture."], {
+        cwd: realpathSync(workspace),
+        env: gatewayEnv(home, seedGateway),
+        timeoutMs: TIMEOUT,
+      });
+      expect(ask.code).toBe(0);
+      expect(ask.stderr).toBe("");
+      const seededId = String(JSON.parse(ask.stdout).session_id);
+
+      mkdirSync(deferredRoot, { recursive: true, mode: 0o700 });
+      chmodSync(latestRoot, 0o700);
+      chmodSync(deferredRoot, 0o700);
+      const summaries = Array.from({ length: 4_000 }, (_, index) => ({
+        id: index === 0 ? seededId : `snapshot-${index.toString().padStart(5, "0")}`,
+        created_at_ms: 1,
+        updated_at_ms: 4_000 - index,
+        workspace_root: workspace,
+        conversation_language: "en",
+        history_len: 1,
+        display_metadata_present: true,
+        title: `Snapshot session ${index.toString().padStart(5, "0")}`,
+        preview: `Snapshot session ${index.toString().padStart(5, "0")}`,
+      }));
+      const indexPath = join(sessionsRoot, "index.json");
+      writeFileSync(
+        indexPath,
+        JSON.stringify({ schema_version: 3, sessions: summaries }),
+        { mode: 0o600 },
+      );
+      rmSync(join(sessionsRoot, "index.pending"), { force: true });
+      const deferredPath = join(deferredRoot, seededId);
+      writeFileSync(deferredPath, JSON.stringify({
+        schema_version: 1,
+        session_id: seededId,
+        workspace_root: workspace,
+        position: {
+          log_generation: "11".repeat(16),
+          through_seq: 1,
+          through_event_id: "22".repeat(16),
+          through_event_log_bytes: 1,
+        },
+      }), { mode: 0o600 });
+      lockHolder = Bun.spawn([
+        "python3",
+        "-c",
+        [
+          "import fcntl, os, sys, time",
+          "lock_path, ready_path = sys.argv[1:3]",
+          "lock = open(lock_path, 'a')",
+          "fcntl.flock(lock, fcntl.LOCK_EX)",
+          "open(ready_path, 'w').write(str(os.getpid()))",
+          "time.sleep(30)",
+        ].join("\n"),
+        join(sessionsRoot, "latest.lock"),
+        lockReadyPath,
+      ], { stdout: "ignore", stderr: "ignore" });
+      await waitForCondition(
+        () => existsSync(lockReadyPath),
+        "latest index lock holder",
+      );
+
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: realpathSync(workspace),
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "core,session,input",
+          NO_COLOR: "1",
+        },
+        stderrPath,
+        width: 100,
+        height: 30,
+        remainOnExit: true,
+      });
+      await active.waitForComposer(TIMEOUT);
+      const started = performance.now();
+      await active.sendText("/resume");
+      await active.waitForPane((pane) =>
+        pane.includes("Snapshot session 00000") && !pane.includes("Loading sessions"),
+      TIMEOUT);
+      const paintMs = performance.now() - started;
+
+      expect(paintMs).toBeLessThan(500);
+      const traceBeforeExit = readFileSync(tracePath, "utf8");
+      expect(traceBeforeExit).toMatch(
+        /session picker cache overlay outcome=ready scope=\w+ deferred=[1-9]/,
+      );
+      expect(traceBeforeExit).not.toContain("session discovery mode=read_only_list");
+
+      active.sendKeysImmediate(["C-c"]);
+      await Bun.sleep(80);
+      active.sendKeysImmediate(["C-c"]);
+      expect(await waitForPaneExitWithin(active, 5_000)).toBeLessThan(500);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await active.kill();
+      active = null;
+    } finally {
+      if (active) await active.kill();
+      if (lockHolder) {
+        lockHolder.kill("SIGKILL");
+        await lockHolder.exited;
+      }
+      seedGateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT,
+);
 
 type SessionPickerEntry = {
   row: number;
@@ -4493,7 +4787,9 @@ test.skipIf(!tmuxAvailable())(
       const sessionId = sessionIdFromHome(home);
       expect(sessionId).toMatch(/^[A-Za-z0-9_-]{12}$/);
 
-      await active.sendText("/quit");
+      active.sendKeysImmediate(["C-c"]);
+      await Bun.sleep(80);
+      active.sendKeysImmediate(["C-c"]);
       await waitForCondition(
         () => active?.paneStatus().dead === true,
         "the graceful exit pane to stop",

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const child_state = @import("child_state.zig");
 const io_mod = @import("../shared/io.zig");
 const session = @import("../session/session.zig");
@@ -8,6 +9,61 @@ const session_summary_codec = @import("../session/session_summary_codec.zig");
 
 const Allocator = std.mem.Allocator;
 const max_page_limit: usize = 100;
+const max_managed_probe_workers: usize = 8;
+
+const ActionablePageSource = enum {
+    discovery,
+    index,
+    reconciled_index,
+};
+
+const ManagedProbeBatch = struct {
+    store: session_store.Store,
+    summaries: []const session_store.SessionSummary,
+    managed: []bool,
+    next: std.atomic.Value(usize) = .init(0),
+
+    fn run(self: *ManagedProbeBatch) void {
+        while (true) {
+            const index = self.next.fetchAdd(1, .monotonic);
+            if (index >= self.summaries.len) return;
+            self.managed[index] = child_state.isManagedChildSession(
+                self.store,
+                std.heap.c_allocator,
+                self.summaries[index].id,
+            ) catch true;
+        }
+    }
+};
+
+fn probeManagedSessions(
+    alloc: Allocator,
+    store: session_store.Store,
+    summaries: []const session_store.SessionSummary,
+) ![]bool {
+    const managed = try alloc.alloc(bool, summaries.len);
+    errdefer alloc.free(managed);
+    @memset(managed, true);
+    var batch = ManagedProbeBatch{
+        .store = store,
+        .summaries = summaries,
+        .managed = managed,
+    };
+    if (comptime builtin.single_threaded) {
+        batch.run();
+        return managed;
+    }
+
+    var threads: [max_managed_probe_workers]std.Thread = undefined;
+    var started: usize = 0;
+    const worker_count = @min(summaries.len, max_managed_probe_workers);
+    while (started < worker_count) : (started += 1) {
+        threads[started] = std.Thread.spawn(.{}, ManagedProbeBatch.run, .{&batch}) catch break;
+    }
+    if (started < worker_count) batch.run();
+    for (threads[0..started]) |thread| thread.join();
+    return managed;
+}
 
 pub const ActionableContinuation = struct {
     updated_at_ms: i64,
@@ -148,7 +204,7 @@ pub fn listActionablePage(
         active_id,
         continuation,
         limit,
-        false,
+        .discovery,
     )).?;
 }
 
@@ -167,7 +223,26 @@ pub fn tryListActionableIndexPage(
         active_id,
         continuation,
         limit,
-        true,
+        .index,
+    );
+}
+
+pub fn tryListActionableReconciledIndexPage(
+    store: session_store.Store,
+    alloc: Allocator,
+    scope: session_store.SessionListScope,
+    active_id: ?[]const u8,
+    continuation: ?session_store.ResumableSessionContinuation,
+    limit: usize,
+) !?ActionableSessionPage {
+    return listActionablePageInternal(
+        store,
+        alloc,
+        scope,
+        active_id,
+        continuation,
+        limit,
+        .reconciled_index,
     );
 }
 
@@ -178,7 +253,7 @@ fn listActionablePageInternal(
     active_id: ?[]const u8,
     continuation: ?session_store.ResumableSessionContinuation,
     limit: usize,
-    index_only: bool,
+    source: ActionablePageSource,
 ) !?ActionableSessionPage {
     if (limit == 0 or limit > max_page_limit) return error.InvalidSessionListLimit;
 
@@ -193,33 +268,27 @@ fn listActionablePageInternal(
     var scanned: usize = 0;
     while (result.summaries.items.len < limit and scanned < max_page_limit) {
         var scoped = store;
-        scoped.resume_page_limit = @min(
-            limit - result.summaries.items.len,
-            max_page_limit - scanned,
-        );
+        scoped.resume_page_limit = switch (source) {
+            .discovery => @min(
+                limit - result.summaries.items.len,
+                max_page_limit - scanned,
+            ),
+            .index, .reconciled_index => max_page_limit - scanned,
+        };
         const next = if (position) |value| value.view() else null;
-        const maybe_page = if (index_only) switch (scope) {
-            .current_workspace => try scoped.tryListResumableWorkspaceIndexPage(
-                alloc,
-                active_id,
-                next,
-            ),
-            .all_workspaces => try scoped.tryListResumableIndexPage(
-                alloc,
-                active_id,
-                next,
-            ),
-        } else switch (scope) {
-            .current_workspace => try scoped.listResumableWorkspacePage(
-                alloc,
-                active_id,
-                next,
-            ),
-            .all_workspaces => try scoped.listResumablePage(
-                alloc,
-                active_id,
-                next,
-            ),
+        const maybe_page = switch (source) {
+            .index => switch (scope) {
+                .current_workspace => try scoped.tryListResumableWorkspaceIndexPage(alloc, active_id, next),
+                .all_workspaces => try scoped.tryListResumableIndexPage(alloc, active_id, next),
+            },
+            .reconciled_index => switch (scope) {
+                .current_workspace => try scoped.tryListReconciledResumableWorkspaceIndexPage(alloc, active_id, next),
+                .all_workspaces => try scoped.tryListReconciledResumableIndexPage(alloc, active_id, next),
+            },
+            .discovery => switch (scope) {
+                .current_workspace => try scoped.listResumableWorkspacePage(alloc, active_id, next),
+                .all_workspaces => try scoped.listResumablePage(alloc, active_id, next),
+            },
         };
         var page = maybe_page orelse {
             result.deinit(alloc);
@@ -229,22 +298,39 @@ fn listActionablePageInternal(
         result.has_more = page.has_more;
         if (page.summaries.items.len == 0) break;
 
-        for (page.summaries.items) |summary| {
+        const managed = switch (source) {
+            .discovery => null,
+            .index, .reconciled_index => try probeManagedSessions(
+                alloc,
+                store,
+                page.summaries.items,
+            ),
+        };
+        defer if (managed) |values| alloc.free(values);
+
+        for (page.summaries.items, 0..) |summary, page_index| {
+            if (result.summaries.items.len == limit) {
+                result.has_more = true;
+                break;
+            }
             scanned += 1;
             if (position) |*value| value.deinit(alloc);
             position = .{
                 .updated_at_ms = summary.updated_at_ms,
                 .id = try alloc.dupe(u8, summary.id),
             };
-            const managed = child_state.isManagedChildSession(
-                store,
-                alloc,
-                summary.id,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => true,
-            };
-            if (managed) continue;
+            const is_managed = if (managed) |values|
+                values[page_index]
+            else
+                child_state.isManagedChildSession(
+                    store,
+                    alloc,
+                    summary.id,
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => true,
+                };
+            if (is_managed) continue;
             var cloned = try session_summary_codec.cloneSessionSummary(alloc, summary);
             result.summaries.append(alloc, cloned) catch |err| {
                 cloned.deinit(alloc);

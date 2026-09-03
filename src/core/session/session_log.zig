@@ -558,6 +558,7 @@ pub const LoadedWritableSession = struct {
     generation_base_bytes: u64,
     checkpoint_seq: ?u64 = null,
     checkpoint_sha256: ?session_projection.Digest = null,
+    checkpoint_rejected_position: ?CommitPosition = null,
     projection_status: ProjectionStatus = .current,
     namespace_confirmation_required: bool = false,
     degraded_tail: ?FailedTail = null,
@@ -858,6 +859,7 @@ pub const LoadedWritableSession = struct {
         options: Options,
     ) !void {
         try confirmWritableNamespace(self, alloc, options);
+        if (checkpointRejectedAtCurrentPosition(self)) return;
         if (!checkpointDue(self, options.checkpoint_interval) and
             !(ensure_present and !self.hasCurrentCheckpoint()))
         {
@@ -883,6 +885,50 @@ pub const LoadedWritableSession = struct {
             self.active_id,
             self.position,
         );
+    }
+
+    /// Confirms a clean handoff from bounded metadata reads. Recovery callers
+    /// that need content validation must use validateResumeBoundary instead.
+    pub fn confirmResumeHandoffBoundary(
+        self: *LoadedWritableSession,
+        alloc: Allocator,
+    ) !void {
+        if (self.namespace_confirmation_required) {
+            return error.SessionCommitBoundaryUnavailable;
+        }
+        if (self.degraded_tail != null or self.state_replacement_pending) {
+            return error.SessionPersistenceDegraded;
+        }
+
+        var event_log = try openManagedFile(
+            &self.log.dir,
+            events_file,
+            .read_only,
+        );
+        defer event_log.close(io_mod.getIo());
+        const generation = try session_replay.readFirstGeneration(alloc, event_log);
+        if (!std.mem.eql(u8, &generation, &self.position.log_generation)) {
+            return error.InvalidSessionFormat;
+        }
+        const current = try loadWatermarkPosition(
+            alloc,
+            &self.log.dir,
+            self.active_id,
+            generation,
+        );
+        if (!positionsEqual(current, self.position)) {
+            return error.InvalidSessionFormat;
+        }
+        var manifest = try loadCurrentManifestForOpen(
+            alloc,
+            &self.log.dir,
+            self.active_id,
+            self.authority_id,
+            event_log,
+            self.position,
+        );
+        defer manifest.manifest.deinit(alloc);
+        if (!manifest.event_file_matches) return error.InvalidSessionFormat;
     }
 
     /// Repairs only a corrupt watermark whose writer authority, complete
@@ -3050,20 +3096,6 @@ fn validateLivePosition(
     session_id: []const u8,
     expected: CommitPosition,
 ) !session_projection.EventBoundary {
-    var log = try openManagedFile(dir, events_file, .read_only);
-    defer log.close(io_mod.getIo());
-    const generation = try session_replay.readFirstGeneration(alloc, log);
-    if (!std.mem.eql(u8, &generation, &expected.log_generation)) {
-        return error.InvalidSessionFormat;
-    }
-    const actual = try loadAndValidateWatermark(
-        alloc,
-        dir,
-        session_id,
-        generation,
-        log,
-    );
-    if (!positionsEqual(actual, expected)) return error.InvalidSessionFormat;
     return validateCommitPosition(alloc, dir, session_id, expected);
 }
 
@@ -3104,12 +3136,11 @@ fn validateCommitPosition(
     if (!std.mem.eql(u8, &generation, &position.log_generation)) {
         return error.InvalidSessionFormat;
     }
-    const watermark = try loadAndValidateWatermark(
+    const watermark = try loadWatermarkPosition(
         alloc,
         dir,
         session_id,
         generation,
-        log,
     );
     if (!positionsEqual(position, watermark)) return error.InvalidSessionFormat;
     return session_replay.scanCommitPosition(alloc, log, position);
@@ -4019,9 +4050,14 @@ fn refreshProjections(
 }
 
 fn checkpointDue(loaded: *LoadedWritableSession, interval: u64) bool {
-    return interval > 0 and
+    return !checkpointRejectedAtCurrentPosition(loaded) and interval > 0 and
         (loaded.checkpoint_seq == null or
             loaded.position.through_seq - loaded.checkpoint_seq.? >= interval);
+}
+
+fn checkpointRejectedAtCurrentPosition(loaded: *const LoadedWritableSession) bool {
+    const rejected = loaded.checkpoint_rejected_position orelse return false;
+    return positionsEqual(rejected, loaded.position);
 }
 
 fn writeCheckpointProjection(
@@ -4036,8 +4072,14 @@ fn writeCheckpointProjection(
         .through_event_log_bytes = loaded.position.through_event_log_bytes,
         .state = loaded.state,
     };
-    const bytes = try session_projection.encodeCheckpoint(alloc, checkpoint);
+    const bytes = session_projection.encodeCheckpoint(alloc, checkpoint) catch |err| {
+        if (err == error.CheckpointTooLarge) {
+            loaded.checkpoint_rejected_position = loaded.position;
+        }
+        return err;
+    };
     defer alloc.free(bytes);
+    loaded.checkpoint_rejected_position = null;
     try durableReplace(alloc, &loaded.log.dir, checkpoint_file, bytes);
     loaded.checkpoint_seq = loaded.position.through_seq;
     loaded.checkpoint_sha256 = session_projection.sha256(bytes);
@@ -6555,6 +6597,91 @@ test "checkpoint clean shutdown preserves a valid bounded tail" {
         opened.tail_bytes,
     );
     try std.testing.expect(opened.state.preferences.fast_mode);
+}
+
+test "oversized checkpoint rejection is cached for the current position" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-oversized-checkpoint", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    const response = try alloc.alloc(u8, session_projection.checkpoint_max_bytes);
+    defer alloc.free(response);
+    @memset(response, 'x');
+    const oversized = try stateWithPrompt(
+        alloc,
+        loaded.state,
+        20,
+        "large response",
+        response,
+    );
+    loaded.state.deinit(alloc);
+    loaded.state = oversized;
+
+    try std.testing.expectError(
+        error.CheckpointTooLarge,
+        writeCheckpointProjection(alloc, &loaded),
+    );
+    try std.testing.expect(!checkpointDue(&loaded, 1));
+    loaded.position.through_seq += 1;
+    try std.testing.expect(checkpointDue(&loaded, 1));
+}
+
+test "resume handoff confirmation accepts current durable metadata" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-fast-handoff-confirmation", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+
+    try loaded.confirmResumeHandoffBoundary(alloc);
+}
+
+test "resume handoff confirmation rejects a corrupted watermark" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-fast-handoff-watermark", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    const name = try watermarkName(alloc, loaded.position.log_generation);
+    defer alloc.free(name);
+    try durableReplace(alloc, &loaded.log.dir, name, "{bad");
+
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        loaded.confirmResumeHandoffBoundary(alloc),
+    );
+}
+
+test "resume handoff confirmation rejects changed event file metadata" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-fast-handoff-event-stat", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    var event_log = try openManagedFile(
+        &loaded.log.dir,
+        events_file,
+        .read_write,
+    );
+    var first: [1]u8 = undefined;
+    _ = try event_log.readPositionalAll(io_mod.getIo(), &first, 0);
+    try event_log.writePositionalAll(io_mod.getIo(), &first, 0);
+    try event_log.sync(io_mod.getIo());
+    event_log.close(io_mod.getIo());
+
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        loaded.confirmResumeHandoffBoundary(alloc),
+    );
 }
 
 test "final replacement policy tracks mutations after the last replacement" {

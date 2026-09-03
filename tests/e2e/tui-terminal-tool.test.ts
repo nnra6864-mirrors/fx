@@ -186,6 +186,31 @@ async function waitForFile(path: string): Promise<void> {
   throw new Error(`Timed out waiting for ${path}`);
 }
 
+async function waitForProcessExit(
+  session: TmuxSession,
+  timeoutMs: number,
+): Promise<number> {
+  const startedAt = performance.now();
+  while (performance.now() - startedAt < timeoutMs) {
+    if (!session.isAlive()) return performance.now() - startedAt;
+    await Bun.sleep(10);
+  }
+  throw new Error(`Timed out waiting for fx to exit after ${timeoutMs}ms`);
+}
+
+async function waitForPidExit(pid: number, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return;
+    }
+    await Bun.sleep(10);
+  }
+  throw new Error(`Timed out waiting for process ${pid} to exit`);
+}
+
 test.skipIf(!tmuxAvailable())(
   "shell captured empty observation floors short waits without respawn",
   async () => {
@@ -300,6 +325,98 @@ test.skipIf(!tmuxAvailable())(
       "shell_cross_turn_stop",
     )).toContain('\\"state\\":\\"stopped\\"');
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "second ctrl+c exits promptly when an external process retains command output",
+  async () => {
+    const fixture = createFixture("fx-shell-exit-held-output-");
+    const brokerPath = join(fixture.workspace, "fd-broker.py");
+    const senderPath = join(fixture.workspace, "fd-sender.py");
+    const socketPath = join(fixture.workspace, "broker.sock");
+    const readyPath = join(fixture.workspace, "broker.ready");
+    const heldPath = join(fixture.workspace, "broker.held");
+    const senderPidPath = join(fixture.workspace, "sender.pid");
+    writeFileSync(
+      brokerPath,
+      [
+        "import array, os, socket, sys, time",
+        "socket_path, ready_path, held_path = sys.argv[1:4]",
+        "server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)",
+        "server.bind(socket_path)",
+        "server.listen(1)",
+        "open(ready_path, 'w').write(str(os.getpid()))",
+        "connection, _ = server.accept()",
+        "fds = array.array('i')",
+        "_, ancillary, _, _ = connection.recvmsg(1, socket.CMSG_SPACE(fds.itemsize))",
+        "for level, kind, data in ancillary:",
+        "    if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:",
+        "        fds.frombytes(data[:fds.itemsize])",
+        "if not fds:",
+        "    raise RuntimeError('missing output descriptor')",
+        "open(held_path, 'w').write(str(fds[0]))",
+        "time.sleep(30)",
+      ].join("\n") + "\n",
+    );
+    writeFileSync(
+      senderPath,
+      [
+        "import array, os, socket, sys",
+        "socket_path, pid_path = sys.argv[1:3]",
+        "open(pid_path, 'w').write(str(os.getpid()))",
+        "client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)",
+        "client.connect(socket_path)",
+        "fds = array.array('i', [1])",
+        "client.sendmsg([b'x'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds)])",
+        "client.close()",
+        "print('BROKERED_OUTPUT', flush=True)",
+      ].join("\n") + "\n",
+    );
+
+    const broker = Bun.spawn(
+      ["python3", brokerPath, socketPath, readyPath, heldPath],
+      { stdout: "ignore", stderr: "ignore" },
+    );
+    try {
+      await waitForFile(readyPath);
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("shell_exit_held_output", "shell", {
+          request: {
+            action: "run",
+            command: `python3 ${JSON.stringify(senderPath)} ${JSON.stringify(socketPath)} ${JSON.stringify(senderPidPath)}`,
+            profile: "clean",
+            yield_time_ms: 0,
+          },
+        }),
+        fakeGatewayFinalText("SHELL_EXIT_READY"),
+      ]);
+      gateways.push(gateway);
+      const active = await launch(fixture, gateway);
+      await active.sendText("Finish the turn while the external process retains command output.");
+      await active.waitForText("SHELL_EXIT_READY", TIMEOUT);
+      await waitForFile(senderPidPath);
+      await waitForFile(heldPath);
+
+      const senderPid = Number(readFileSync(senderPidPath, "utf8"));
+      expect(Number.isSafeInteger(senderPid) && senderPid > 0).toBe(true);
+      await waitForPidExit(senderPid, 3_000);
+      expect(() => process.kill(senderPid, 0)).toThrow();
+      expect(() => process.kill(broker.pid, 0)).not.toThrow();
+
+      active.sendKeysImmediate(["C-c"]);
+      await Bun.sleep(80);
+      active.sendKeysImmediate(["C-c"]);
+      const elapsedMs = await waitForProcessExit(active, 7_000);
+
+      expect(elapsedMs).toBeLessThan(500);
+      expect(() => process.kill(broker.pid, 0)).not.toThrow();
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+    } finally {
+      broker.kill("SIGKILL");
+      await broker.exited;
+    }
   },
   TIMEOUT,
 );

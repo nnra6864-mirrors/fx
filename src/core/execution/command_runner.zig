@@ -25,6 +25,7 @@ pub const Config = struct {
     max_command_output_bytes: usize,
     cancel_flag: ?*std.atomic.Value(bool) = null,
     force_cancel_flag: ?*std.atomic.Value(bool) = null,
+    shutdown_flag: ?*std.atomic.Value(bool) = null,
     output_chunk_lifecycle_id: ?types.ToolLifecycleId = null,
     output_chunk_ctx: ?*anyopaque = null,
     on_output_chunk: ?CommandOutputCallback = null,
@@ -2437,6 +2438,23 @@ fn collectOutput(
                     }
                 }
             }
+        }
+
+        if (cancelRequested(cfg.shutdown_flag) and
+            force_kill_sent and
+            observer.waiter.isReady())
+        {
+            debug_trace.logf(
+                "core",
+                "command output drain abandoned reason=runtime_shutdown wait_ready=true",
+                .{},
+            );
+            recordOutputDrainFailure(
+                &output_incomplete,
+                "runtime_shutdown",
+                error.Cancelled,
+            );
+            break;
         }
 
         const now_ms = io_mod.milliTimestamp();
