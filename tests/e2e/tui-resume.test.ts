@@ -611,6 +611,7 @@ test.skipIf(!tmuxAvailable())(
         "explicit session discovery",
       );
 
+      const traceOffset = readFileSync(tracePath, "utf8").length;
       active.sendKeysImmediate(["C-c"]);
       await waitForTraceAfter(
         tracePath,
@@ -707,7 +708,11 @@ test.skipIf(!tmuxAvailable())(
       );
 
       active.sendKeysImmediate(["C-c"]);
-      await Bun.sleep(80);
+      await waitForTraceAfter(
+        tracePath,
+        traceOffset,
+        "ctrl_c_exit_hint_armed",
+      );
       active.sendKeysImmediate(["C-c"]);
       const elapsedMs = await waitForPaneExitWithin(active, 5_000);
       const trace = readFileSync(tracePath, "utf8");
