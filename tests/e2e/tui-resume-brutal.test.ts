@@ -14,7 +14,7 @@ import {
 } from "node:fs";
 import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN } from "../evals/eval-helpers";
+import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -238,8 +238,20 @@ async function seedRealSession(paths: Paths, config: Config): Promise<IndexedSum
     gateway.stop();
   }
 
-  const indexPath = join(paths.home, ".fx", "sessions", "index.json");
-  const parsed = JSON.parse(readFileSync(indexPath, "utf8")) as {
+  const listed = await runFx(["sessions", "--all", "--json", "--limit", "1"], {
+    cwd: realpathSync(paths.workspace),
+    env: {
+      HOME: paths.home,
+      AI_GATEWAY_API_KEY: undefined,
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_AUTO_UPGRADE: "0",
+      FX_DISABLE_KEYCHAIN: "1",
+    },
+    timeoutMs: TIMEOUT,
+  });
+  expect(listed.code).toBe(0);
+  expect(listed.stderr).toBe("");
+  const parsed = JSON.parse(listed.stdout) as {
     sessions: IndexedSummary[];
   };
   expect(parsed.sessions).toHaveLength(1);
