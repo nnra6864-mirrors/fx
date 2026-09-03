@@ -99,7 +99,7 @@ fn fetchCatalogForProvider(
         if (models_broker_request) |prepared| prepared.token else request_auth.credential,
         if (models_broker_request == null) request_auth.account_id else null,
         models_broker_request == null and request_auth.include_subscription_headers,
-        models_broker_request != null,
+        if (models_broker_request) |*prepared| prepared else null,
         cancel_flag,
         deadline,
     ) catch |err| {
@@ -116,7 +116,7 @@ fn fetchCatalogForProvider(
         if (modalities_broker_request) |prepared| prepared.token else request_auth.credential,
         null,
         false,
-        modalities_broker_request != null,
+        if (modalities_broker_request) |*prepared| prepared else null,
         cancel_flag,
         deadline,
     ) catch |err| {
@@ -157,6 +157,7 @@ fn catalogRequestAuth(access: credentials.CatalogAccess) ?CatalogRequestAuth {
 }
 
 fn catalogFetchFailure(err: anyerror) model_catalog.Failure {
+    if (err == error.UpstreamCancellationUnconfirmed) return .{ .category = .transport, .upstream_cancel_unconfirmed = true };
     if (err == error.Cancelled) return .{ .category = .cancellation };
     if (err == error.GrokModelCatalogTooLarge) return .{ .category = .malformed_response };
     return .{ .category = .transport, .retryable = true };
@@ -178,7 +179,7 @@ const FetchOperation = struct {
     credential: ?[]const u8,
     account_id: ?[]const u8,
     include_subscription_headers: bool,
-    host_broker: bool,
+    broker_request: ?*const host_broker.Prepared,
 
     pub fn run(self: *@This()) !FetchResponse {
         var client: std.http.Client = .{ .allocator = self.alloc, .io = io_mod.getIo() };
@@ -196,7 +197,7 @@ const FetchOperation = struct {
         const body_buffer = try self.alloc.alloc(u8, max_catalog_bytes + 1);
         defer secret.zeroAndFree(self.alloc, body_buffer);
         var response_writer = std.Io.Writer.fixed(body_buffer);
-        var extra_headers_buffer: [4]std.http.Header = undefined;
+        var extra_headers_buffer: [5]std.http.Header = undefined;
         var extra_headers_len: usize = 0;
         extra_headers_buffer[extra_headers_len] = .{ .name = "accept", .value = "application/json" };
         extra_headers_len += 1;
@@ -208,11 +209,13 @@ const FetchOperation = struct {
             extra_headers_buffer[extra_headers_len] = .{ .name = "x-userid", .value = account_id };
             extra_headers_len += 1;
         }
-        if (self.host_broker) {
+        if (self.broker_request) |prepared| {
             extra_headers_buffer[extra_headers_len] = .{
                 .name = host_broker.protocol_header_name,
                 .value = host_broker.protocol_header_value,
             };
+            extra_headers_len += 1;
+            extra_headers_buffer[extra_headers_len] = .{ .name = host_broker.request_id_header_name, .value = &prepared.request_id };
             extra_headers_len += 1;
         }
         const result = client.fetch(.{
@@ -241,7 +244,7 @@ fn fetchCatalogResponse(
     credential: ?[]const u8,
     account_id: ?[]const u8,
     include_subscription_headers: bool,
-    brokered: bool,
+    broker_request: ?*const host_broker.Prepared,
     cancel_flag: *std.atomic.Value(bool),
     deadline: std.Io.Clock.Timestamp,
 ) !FetchResponse {
@@ -251,7 +254,7 @@ fn fetchCatalogResponse(
         .credential = credential,
         .account_id = account_id,
         .include_subscription_headers = include_subscription_headers,
-        .host_broker = brokered,
+        .broker_request = broker_request,
     };
     return gateway_client.runBoundedHttpOperation(
         FetchResponse,
@@ -259,7 +262,10 @@ fn fetchCatalogResponse(
         cancel_flag,
         deadline,
         &operation,
-    );
+    ) catch |err| {
+        if (broker_request) |prepared| if (!prepared.cancel(alloc)) return error.UpstreamCancellationUnconfirmed;
+        return err;
+    };
 }
 
 fn modelsUrl(alloc: std.mem.Allocator) ![]u8 {
@@ -784,7 +790,7 @@ fn fetchCatalogFixture(body: []const u8) !FetchResponse {
         .credential = "grok-test-token",
         .account_id = "acct_test",
         .include_subscription_headers = true,
-        .host_broker = false,
+        .broker_request = null,
     };
     const result = operation.run();
     fixture.deinit();

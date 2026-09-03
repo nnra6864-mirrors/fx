@@ -1,4 +1,7 @@
 const std = @import("std");
+
+pub const upstream_cancellation_unconfirmed_message = "Host could not confirm upstream cancellation. Work may continue until the host deadline.";
+const agent_stream_provider = @import("../agent/stream_provider.zig");
 const api_key_validator = @import("api_key_validator.zig");
 const auth_transition = @import("auth_transition.zig");
 const credentials = @import("credentials.zig");
@@ -9,11 +12,13 @@ const host_target = @import("../hosts/target.zig");
 const login_flow = @import("login_flow.zig");
 const oauth = @import("oauth.zig");
 const model_provider = @import("../config/model_provider.zig");
+const model_catalog = @import("../gateway/model_catalog.zig");
 const provider_catalog = @import("provider_catalog.zig");
 const provider_picker_catalog = @import("provider_picker_catalog.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const gateway_error_format = @import("../shared/gateway_error_format.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
@@ -117,6 +122,17 @@ pub const FailureSnapshot = struct {
     reason: FailureReason,
     http_status: ?std.http.Status = null,
 
+    pub fn from_provider(failure: agent_stream_provider.Failure, source: ?credentials.Source) ?FailureSnapshot {
+        if (failure.http_status) |status| return fromHttp(status, source);
+        const selected_source = source orelse return null;
+        const reason: FailureReason = switch (failure.kind) {
+            .unauthorized => .http_unauthorized,
+            .forbidden => if (selected_source == .host_managed) .http_forbidden else return null,
+            else => return null,
+        };
+        return .{ .source = selected_source, .reason = reason };
+    }
+
     pub fn fromHttp(status: std.http.Status, source: ?credentials.Source) ?FailureSnapshot {
         const resolved_source = source orelse return null;
         const reason: FailureReason = if (resolved_source == .host_managed)
@@ -179,6 +195,12 @@ pub const FailureSnapshot = struct {
         };
     }
 
+    pub fn render_with_recovery(self: FailureSnapshot, alloc: Allocator) ![]u8 {
+        const message = try self.renderText(alloc);
+        defer alloc.free(message);
+        return std.fmt.allocPrint(alloc, "{s}. {s}", .{ message, self.recovery_message() });
+    }
+
     /// Returns owned JSON containing only the shared auth-failure facts.
     pub fn renderJson(self: FailureSnapshot, alloc: Allocator) ![]u8 {
         var out: std.Io.Writer.Allocating = .init(alloc);
@@ -199,6 +221,31 @@ pub const FailureSnapshot = struct {
         try writer.writeByte('}');
     }
 };
+
+/// Returns owned host recovery text, or null when the failure is not host authentication.
+pub fn host_http_failure_text(alloc: Allocator, status: ?std.http.Status, source: ?credentials.Source) !?[]u8 {
+    if (source != .host_managed) return null;
+    const snapshot = FailureSnapshot.fromHttp(status orelse return null, source) orelse return null;
+    return try snapshot.render_with_recovery(alloc);
+}
+
+pub fn host_catalog_failure_text(alloc: Allocator, failure: model_catalog.Failure, source: ?credentials.Source) !?[]u8 {
+    if (source != .host_managed) return null;
+    if (failure.upstream_cancel_unconfirmed) {
+        return try alloc.dupe(u8, upstream_cancellation_unconfirmed_message);
+    }
+    if (try host_http_failure_text(alloc, failure.http_status, source)) |message| return message;
+    const status = failure.http_status orelse return null;
+    return try gateway_error_format.formatHttpErrorMessage(alloc, status, @tagName(failure.category));
+}
+
+pub fn provider_failure_text(alloc: Allocator, metadata: agent_stream_provider.FailureMetadata) Allocator.Error![]u8 {
+    const failure: agent_stream_provider.Failure = .{ .kind = metadata.kind, .http_status = metadata.http_status };
+    if (FailureSnapshot.from_provider(failure, metadata.credential_source)) |snapshot| {
+        return snapshot.render_with_recovery(alloc) catch return error.OutOfMemory;
+    }
+    return gateway_error_format.format_provider_failure(alloc, failure) catch return error.OutOfMemory;
+}
 
 /// Returns one complete owned credential after a provider-specific refresh.
 /// The caller owns every field and must call `Credential.deinit`.

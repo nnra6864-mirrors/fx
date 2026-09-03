@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
 import { runFx } from "../evals/eval-helpers";
-import { fakeGatewayFinalText, fakeGatewayPermissionDecision, fakeGatewaySse, fakeShellRun, TmuxSession } from "./tmux-helpers";
+import { fakeGatewayFinalText, fakeGatewayPermissionDecision, fakeGatewaySse, fakeGatewayToolCall, fakeShellRun, TmuxSession } from "./tmux-helpers";
 
 const TIMEOUT = 30_000;
 
@@ -34,12 +34,24 @@ describe("host-managed authentication", () => {
   let upstreamBaseUrl = "";
   let codexUnauthorizedResponses = 0;
   let brokerFailureStatus: number | null = null;
+  let rejectDiscoveryStatus: number | null = null;
   let gatewayPermissionScenario = false;
   let gatewayPermissionReviews = 0;
-  let holdBrokerGatewayChat = false;
+  let reviewFailureStatus: number | null = null;
+  let heldBrokerRoute: string | null = null;
   let brokerGatewayHoldStarted = 0;
   let brokerGatewayCancellationCount = 0;
   let brokerTruncatedText: string | null = null;
+  let visionScenario: "empty" | "partial" | null = null;
+  let visionRequested = false;
+  let visionBodies: string[] = [];
+  let visionFailureStatus: number | null = null;
+  let compactionFailureStatus: number | null = null;
+  let compactionRequests = 0;
+  const heldRequests = new Map<string, { controller: AbortController; settled: Promise<void> }>();
+  let cancelRequestCount = 0;
+  let rejectCancellation = false;
+  let stallCancellation = false;
 
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "fx-host-managed-auth-"));
@@ -58,12 +70,29 @@ describe("host-managed authentication", () => {
           search: new URL(request.url).search,
           headers,
         });
+        if (path === "/gateway/held") {
+          const encoder = new TextEncoder();
+          let timer: ReturnType<typeof setInterval>;
+          request.signal.addEventListener("abort", () => { brokerGatewayCancellationCount += 1; }, { once: true });
+          return new Response(new ReadableStream({
+            start(controller) {
+              controller.enqueue(encoder.encode(": upstream-active\n\n"));
+              timer = setInterval(() => controller.enqueue(encoder.encode(": upstream-active\n\n")), 50);
+            },
+            cancel() { clearInterval(timer); },
+          }), { headers: { "content-type": "text/event-stream" } });
+        }
         if (path === "/gateway/models") {
           if (headers.get("authorization") !== `Bearer ${GATEWAY_TOKEN}`) {
             return Response.json({ error: { message: "missing gateway authentication" } }, { status: 401 });
           }
           return Response.json({
-            data: [{ id: "test/gateway-model", type: "language", tags: ["tool-use"] }],
+            data: [
+              { id: "test/gateway-model", type: "language", tags: ["tool-use"] },
+              { id: "zai/glm-5.2-fast", type: "language", tags: ["tool-use"], context_window: 65536, max_tokens: 2048 },
+              { id: "google/gemini-2.5-flash", type: "language", tags: ["tool-use", "vision", "file-input"] },
+              { id: "openai/gpt-5.6-luna", type: "language", tags: ["tool-use"], context_window: 65536, max_tokens: 2048 },
+            ],
           });
         }
         if (path === "/gateway/responses") {
@@ -71,15 +100,36 @@ describe("host-managed authentication", () => {
             return Response.json({ error: { message: "missing gateway authentication" } }, { status: 401 });
           }
           const body = await request.text();
+          if (compactionFailureStatus !== null && body.includes("Summarize only conversation goals")) {
+            compactionRequests += 1;
+            return Response.json({ error: { message: "host compaction rejected" } }, { status: compactionFailureStatus });
+          }
+          if (visionScenario !== null) {
+            if (headers.get("ai-language-model-id") === "google/gemini-2.5-flash") {
+              visionBodies.push(body);
+              if (visionFailureStatus !== null) return Response.json({ error: { message: "host vision rejected" } }, { status: visionFailureStatus });
+              return new Response(visionScenario === "empty" ? "" :
+                'data: {"type":"text-delta","id":"vision","delta":"{\\\"images\\\":["}\n\n', {
+                  headers: { "content-type": "text/event-stream" },
+                });
+            }
+            if (!visionRequested) {
+              visionRequested = true;
+              return fakeGatewayToolCall("broker_vision", "vision", { image_ids: [1], focus: "Inspect the image." });
+            }
+            return fakeGatewayFinalText("VISION_FINISHED_WITHOUT_REPLAY");
+          }
           if (body.includes("permission_decision")) {
             gatewayPermissionReviews += 1;
+            if (reviewFailureStatus !== null) return Response.json({ error: { message: "host review rejected" } }, { status: reviewFailureStatus });
             return fakeGatewayPermissionDecision("clear");
           }
           if (gatewayPermissionScenario) {
             gatewayPermissionScenario = false;
             return fakeShellRun(
               "broker_permission_shell",
-              "printf BROKER_PERMISSION_TOOL_OK > broker-permission.txt",
+              reviewFailureStatus === null ? "printf BROKER_PERMISSION_TOOL_OK > broker-permission.txt" :
+                "printf SHOULD_NOT_RUN > broker-denied-permission.txt",
             );
           }
           if (body.includes("broker permission route")) {
@@ -230,6 +280,20 @@ describe("host-managed authentication", () => {
         ) {
           return Response.json({ error: { message: "invalid broker capability" } }, { status: 401 });
         }
+        if (path === "/fx/v1/cancel") {
+          cancelRequestCount += 1;
+          if (stallCancellation) {
+            return await new Promise<Response>((resolve) => {
+              request.signal.addEventListener("abort", () => resolve(new Response(null, { status: 499 })), { once: true });
+            });
+          }
+          if (rejectCancellation) return new Response(null, { status: 503 });
+          const input = await request.json() as { request_id: string };
+          const held = heldRequests.get(input.request_id);
+          held?.controller.abort();
+          await held?.settled;
+          return new Response(null, { status: 204 });
+        }
 
         const routes: Record<string, string> = {
           "/fx/v1/gateway/models": "/gateway/models",
@@ -244,6 +308,9 @@ describe("host-managed authentication", () => {
         };
         const upstreamPath = routes[path];
         if (!upstreamPath) return new Response("unknown broker route", { status: 404 });
+        if (rejectDiscoveryStatus !== null && !path.endsWith("/chat") && !path.endsWith("/responses")) {
+          return Response.json({ error: { message: "host discovery rejected" } }, { status: rejectDiscoveryStatus });
+        }
         if (brokerTruncatedText !== null && path === "/fx/v1/gateway/chat") {
           const text = brokerTruncatedText;
           brokerTruncatedText = null;
@@ -258,20 +325,32 @@ describe("host-managed authentication", () => {
             { status: brokerFailureStatus },
           );
         }
-        if (holdBrokerGatewayChat && path === "/fx/v1/gateway/chat") {
-          holdBrokerGatewayChat = false;
-          brokerGatewayHoldStarted += 1;
-          return await new Promise<Response>((resolve) => {
-            const timer = setTimeout(
-              () => resolve(Response.json({ error: { message: "held broker request timed out" } }, { status: 504 })),
-              TIMEOUT,
-            );
-            request.signal.addEventListener("abort", () => {
-              clearTimeout(timer);
-              brokerGatewayCancellationCount += 1;
-              resolve(Response.json({ error: { message: "client cancelled" } }, { status: 499 }));
-            }, { once: true });
+        if (heldBrokerRoute === path) {
+          heldBrokerRoute = null;
+          const id = headers.get("x-fx-request-id") ?? "missing-id";
+          const controller = new AbortController();
+          const upstream = await fetch(`${upstreamBaseUrl}/gateway/held`, { signal: controller.signal });
+          let output: ReadableStreamDefaultController<Uint8Array>;
+          let disconnected = false;
+          const responseBody = new ReadableStream<Uint8Array>({
+            start(value) { output = value; },
+            cancel() { disconnected = true; },
           });
+          const settled = (async () => {
+            try {
+              for await (const chunk of upstream.body!) {
+                if (!disconnected) output.enqueue(chunk);
+              }
+            } catch (error) {
+              if (!controller.signal.aborted) throw error;
+            } finally {
+              if (!disconnected) output.close();
+              heldRequests.delete(id);
+            }
+          })();
+          heldRequests.set(id, { controller, settled });
+          brokerGatewayHoldStarted += 1;
+          return new Response(responseBody, { headers: { "content-type": "text/event-stream" } });
         }
 
         const upstreamHeaders = new Headers(headers);
@@ -309,6 +388,7 @@ describe("host-managed authentication", () => {
   });
 
   afterAll(() => {
+    for (const held of heldRequests.values()) held.controller.abort();
     brokerServer.stop(true);
     upstreamServer.stop(true);
     rmSync(root, { recursive: true, force: true });
@@ -416,6 +496,7 @@ describe("host-managed authentication", () => {
     for (const request of brokerRequests) {
       expect(request.headers.get("authorization"), request.path).toBe(`Bearer ${BROKER_TOKEN}`);
       expect(request.headers.get("x-fx-host-protocol"), request.path).toBe("1");
+      expect(request.headers.get("x-fx-request-id"), request.path).toMatch(/^[a-f0-9]{32}$/);
       expect(request.headers.get("x-vercel-ai-gateway-team"), request.path).toBeNull();
       expect(request.headers.get("chatgpt-account-id"), request.path).toBeNull();
       expect(request.headers.get("x-xai-token-auth"), request.path).toBeNull();
@@ -561,12 +642,205 @@ describe("host-managed authentication", () => {
     }
   }, TIMEOUT);
 
+  test("preserves the observed broker HTTP status instead of reconstructing an outage", async () => {
+    const childEnv = env();
+    expect((await runFx(["provider", "codex"], { cwd: workspace, env: childEnv })).code).toBe(0);
+    try {
+      for (const status of [402, 404, 422]) {
+        brokerFailureStatus = status;
+        const asked = await runFx(["ask", "--json", "--no-save", "Reply once."], { cwd: workspace, env: childEnv });
+        expect(asked.code).toBe(1);
+        expect(asked.stderr).toContain(`HTTP ${status}`);
+        expect(asked.stderr).not.toContain("HTTP 502");
+        expect(asked.stderr).not.toContain("Try again shortly");
+      }
+    } finally { brokerFailureStatus = null; }
+  }, TIMEOUT);
+
+  test("discovery activation and credits preserve host recovery", async () => {
+    const childEnv = env();
+    expect((await runFx(["provider", "gateway"], { cwd: workspace, env: childEnv })).code).toBe(0);
+    try {
+      for (const [status, recovery] of [
+        [401, "Reconnect this provider in the host application."],
+        [403, "Request access in the host application."],
+        [503, "Try again shortly or check the host application."],
+      ] as const) {
+        rejectDiscoveryStatus = status;
+        for (const args of [["models", "--json"], ["credits", "--json"], ["provider", "codex"]]) {
+          const result = await runFx(args, { cwd: workspace, env: childEnv });
+          expect(result.code).toBe(1);
+          expect(result.stdout + result.stderr).toContain(`HTTP ${status}`);
+          expect(result.stdout + result.stderr).toContain(recovery);
+          expect(result.stdout + result.stderr).not.toContain("Run /login");
+        }
+      }
+    } finally { rejectDiscoveryStatus = null; }
+  }, TIMEOUT);
+
+  test("Vision does not replay an incompletely delivered host-managed response", async () => {
+    const childEnv = { ...env(), FX_MODEL: "zai/glm-5.2-fast" };
+    expect((await runFx(["provider", "gateway"], { cwd: workspace, env: childEnv })).code).toBe(0);
+    try {
+      for (const scenario of ["empty", "partial"] as const) {
+        visionScenario = scenario;
+        visionRequested = false;
+        visionBodies = [];
+        const asked = await runFx(["ask", "--json", "--auto", "--no-save", "--image",
+          join(import.meta.dirname, "fixtures", "placeholder-logo.png"), "Inspect the attached image."], {
+          cwd: workspace, env: childEnv, timeoutMs: TIMEOUT,
+        });
+        expect(asked.code, asked.stderr).toBe(0);
+        expect(asked.stdout).toContain("VISION_FINISHED_WITHOUT_REPLAY");
+        expect(visionBodies).toHaveLength(1);
+      }
+    } finally { visionScenario = null; }
+  }, TIMEOUT);
+
+  test("secondary Vision and permission failures reach the parent with host recovery", async () => {
+    const childEnv = { ...env(), FX_MODEL: "zai/glm-5.2-fast" };
+    expect((await runFx(["provider", "gateway"], { cwd: workspace, env: childEnv })).code).toBe(0);
+    try {
+      for (const status of [401, 403, 503]) {
+        visionScenario = "empty";
+        visionFailureStatus = status;
+        visionRequested = false;
+        visionBodies = [];
+        const vision = await runFx(["ask", "--json", "--auto", "--no-save", "--image",
+          join(import.meta.dirname, "fixtures", "placeholder-logo.png"), "Inspect the image."], {
+          cwd: workspace, env: childEnv, timeoutMs: TIMEOUT,
+        });
+        expect(vision.code).toBe(1);
+        expect(vision.stderr).toContain(`HTTP ${status}`);
+        expect(vision.stderr.match(/HTTP /g)).toHaveLength(1);
+        expect(vision.stderr).not.toContain("/login");
+        expect(vision.stderr).not.toContain("switch model");
+        expect(visionBodies).toHaveLength(1);
+        visionScenario = null;
+        visionFailureStatus = null;
+
+        reviewFailureStatus = status;
+        gatewayPermissionScenario = true;
+        const reviewsBefore = gatewayPermissionReviews;
+        const review = await runFx(["ask", "--json", "--auto", "--no-save", "Exercise broker permission route."], {
+          cwd: workspace, env: childEnv, timeoutMs: TIMEOUT,
+        });
+        expect(review.code).toBe(1);
+        expect(review.stderr).toContain(`HTTP ${status}`);
+        expect(review.stderr).not.toContain("/login");
+        expect(gatewayPermissionReviews - reviewsBefore).toBe(1);
+        expect(existsSync(join(workspace, "broker-denied-permission.txt"))).toBe(false);
+        reviewFailureStatus = null;
+      }
+    } finally {
+      visionScenario = null;
+      visionFailureStatus = null;
+      reviewFailureStatus = null;
+      gatewayPermissionScenario = false;
+    }
+  }, TIMEOUT);
+
+  test("manual compaction preserves host rejection and leaves the session usable", async () => {
+    const childEnv = { ...env(), FX_MODEL: "zai/glm-5.2-fast" };
+    await runFx(["provider", "gateway"], { cwd: workspace, env: childEnv });
+    for (const status of [401, 403, 503]) {
+      const session = await TmuxSession.create({ cwd: workspace, env: childEnv, isolated: true });
+      try {
+        await session.waitForComposer(TIMEOUT);
+        for (const prompt of ["Remember the first context fact.", "Remember the second context fact.", "Remember the third context fact."]) {
+          await session.sendText(prompt);
+          await session.waitForText("GATEWAY_HOST_MANAGED_OK", TIMEOUT);
+          await session.waitForComposer(TIMEOUT);
+        }
+        compactionFailureStatus = status;
+        const before = compactionRequests;
+        await session.sendText("/compact");
+        const pane = await session.waitForText(`HTTP ${status}`, TIMEOUT);
+        expect(compactionRequests - before).toBe(1);
+        expect(pane).toContain("Host");
+        expect(pane).not.toContain("Run /login");
+        compactionFailureStatus = null;
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText("Continue after the compaction rejection.");
+        await session.waitForText("GATEWAY_HOST_MANAGED_OK", TIMEOUT);
+      } finally {
+        compactionFailureStatus = null;
+        await session.kill();
+      }
+    }
+  }, TIMEOUT * 4);
+
+
+  test("host catalog preserves non-auth HTTP statuses in CLI consumers", async () => {
+    const childEnv = env();
+    try {
+      for (const status of [402, 404, 422, 429, 500]) {
+        rejectDiscoveryStatus = status;
+        for (const args of [["models", "--json"], ["provider", "codex"]]) {
+          const result = await runFx(args, { cwd: workspace, env: childEnv });
+          expect(result.code).toBe(1);
+          expect(result.stdout + result.stderr).toContain(`HTTP ${status}`);
+          expect(result.stdout + result.stderr).not.toContain("HTTP 502");
+        }
+      }
+    } finally { rejectDiscoveryStatus = null; }
+  }, TIMEOUT);
+
+  test("interrupted catalog and credit GETs preserve unconfirmed scoped cleanup", async () => {
+    const childEnv = env();
+    await runFx(["provider", "gateway"], { cwd: workspace, env: childEnv });
+    const requested = new Set<string>();
+    const cancelled: string[] = [];
+    const droppingBroker = createServer((request, response) => {
+      if (request.url === "/fx/v1/cancel") {
+        let body = "";
+        request.on("data", (chunk) => { body += chunk; });
+        request.on("end", () => {
+          cancelled.push(JSON.parse(body).request_id);
+          response.writeHead(503);
+          response.end();
+        });
+        return;
+      }
+      requested.add(String(request.headers["x-fx-request-id"]));
+      request.resume();
+      setTimeout(() => request.socket.destroy(), 5);
+    });
+    await new Promise<void>((resolve) => droppingBroker.listen(0, "127.0.0.1", resolve));
+    const address = droppingBroker.address();
+    if (!address || typeof address === "string") throw new Error("broker address missing");
+    try {
+      for (const command of ["models", "credits"]) {
+        const result = await runFx([command, "--json"], { cwd: workspace, env: {
+          ...childEnv, FX_HOST_BROKER_URL: `http://127.0.0.1:${address.port}/fx`,
+        } });
+        expect(result.code).toBe(1);
+        expect(result.stdout + result.stderr).toContain("Host could not confirm upstream cancellation");
+      }
+      expect(requested.size).toBe(2);
+      expect(cancelled).toHaveLength(2);
+      for (const id of cancelled) expect(requested.has(id)).toBe(true);
+    } finally {
+      droppingBroker.closeAllConnections();
+      await new Promise<void>((resolve) => droppingBroker.close(() => resolve()));
+    }
+  }, TIMEOUT);
+
+
   test("does not replay a host-managed request after the broker drops a delivered body", async () => {
     let delivered = 0;
+    let cancelled = 0;
     const droppingBroker = createServer((request, response) => {
       if (request.url === "/fx/v1/gateway/models") {
         response.writeHead(200, { "content-type": "application/json" });
         response.end(JSON.stringify({ data: [{ id: "test/gateway-model", type: "language", tags: ["tool-use"] }] }));
+        return;
+      }
+      if (request.url === "/fx/v1/cancel") {
+        cancelled += 1;
+        request.resume();
+        response.writeHead(204);
+        response.end();
         return;
       }
       request.resume();
@@ -589,6 +863,7 @@ describe("host-managed authentication", () => {
       });
       expect(asked.code).toBe(1);
       expect(delivered).toBe(1);
+      expect(cancelled).toBe(1);
       expect(asked.stderr).not.toContain("retrying request");
     } finally {
       droppingBroker.closeAllConnections();
@@ -662,9 +937,14 @@ describe("host-managed authentication", () => {
     }
   }, TIMEOUT * 2);
 
-  test("interactive cancellation reaches the host broker and leaves the session usable", async () => {
+  for (const [provider, route, marker] of [
+    ["gateway", "/fx/v1/gateway/chat", "GATEWAY_HOST_MANAGED_OK"],
+    ["codex", "/fx/v1/codex/responses", "CODEX_HOST_MANAGED_OK"],
+    ["grok", "/fx/v1/grok/responses", "GROK_HOST_MANAGED_OK"],
+  ] as const) {
+  test(`${provider} interactive cancellation reaches active upstream even when the proxy retains disconnected work`, async () => {
     const childEnv = env();
-    const selected = await runFx(["provider", "gateway"], {
+    const selected = await runFx(["provider", provider], {
       cwd: workspace,
       env: childEnv,
       timeoutMs: TIMEOUT,
@@ -682,7 +962,8 @@ describe("host-managed authentication", () => {
       await session.waitForComposer(TIMEOUT);
       const startedBefore = brokerGatewayHoldStarted;
       const cancelledBefore = brokerGatewayCancellationCount;
-      holdBrokerGatewayChat = true;
+      const cancelRequestsBefore = cancelRequestCount;
+      heldBrokerRoute = route;
       await session.sendText("Wait for the host broker.");
       const requestDeadline = Date.now() + TIMEOUT;
       while (brokerGatewayHoldStarted === startedBefore && Date.now() < requestDeadline) {
@@ -695,14 +976,52 @@ describe("host-managed authentication", () => {
         await Bun.sleep(25);
       }
       expect(brokerGatewayCancellationCount - cancelledBefore).toBe(1);
+      expect(cancelRequestCount - cancelRequestsBefore).toBe(1);
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Reply after cancellation.");
-      const pane = await session.waitForText("GATEWAY_HOST_MANAGED_OK", TIMEOUT);
-      expect(pane).toContain("GATEWAY_HOST_MANAGED_OK");
+      const pane = await session.waitForText(marker, TIMEOUT);
+      expect(pane).toContain(marker);
     } finally {
-      holdBrokerGatewayChat = false;
+      heldBrokerRoute = null;
       await session.kill();
     }
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   }, TIMEOUT * 2);
+  }
+
+  for (const unavailable of ["rejected", "unresponsive"] as const) {
+  test(`${unavailable} upstream cancellation is visible and leaves the session usable`, async () => {
+    const childEnv = env();
+    await runFx(["provider", "gateway"], { cwd: workspace, env: childEnv });
+    const session = await TmuxSession.create({ cwd: workspace, env: childEnv, isolated: true });
+    try {
+      await session.waitForComposer(TIMEOUT);
+      const startedBefore = brokerGatewayHoldStarted;
+      const cancelledBefore = brokerGatewayCancellationCount;
+      heldBrokerRoute = "/fx/v1/gateway/chat";
+      rejectCancellation = true;
+      stallCancellation = unavailable === "unresponsive";
+      await session.sendText("Hold until cancelled.");
+      const deadline = Date.now() + TIMEOUT;
+      while (brokerGatewayHoldStarted === startedBefore && Date.now() < deadline) await Bun.sleep(25);
+      expect(brokerGatewayHoldStarted - startedBefore).toBe(1);
+      const cancelStartedAt = Date.now();
+      await session.sendKeys("Escape");
+      await session.waitForText("Host could not confirm upstream cancellation", 5_000);
+      expect(Date.now() - cancelStartedAt).toBeLessThan(3_500);
+      expect(brokerGatewayCancellationCount).toBe(cancelledBefore);
+      rejectCancellation = false;
+      stallCancellation = false;
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Reply after unconfirmed cancellation.");
+      await session.waitForText("GATEWAY_HOST_MANAGED_OK", TIMEOUT);
+    } finally {
+      rejectCancellation = false;
+      stallCancellation = false;
+      heldBrokerRoute = null;
+      for (const held of heldRequests.values()) held.controller.abort();
+      await session.kill();
+    }
+  }, TIMEOUT * 2);
+  }
 });

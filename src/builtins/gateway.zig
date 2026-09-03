@@ -6,6 +6,7 @@ pub const permission_reviewer = @import("gateway/permission_reviewer.zig");
 const api_key_validator_contract = @import("../core/auth/api_key_validator.zig");
 const agent_stream_provider_contract = @import("../core/agent/stream_provider.zig");
 const credentials = @import("../core/auth/credentials.zig");
+const auth_runtime = @import("../core/auth/auth_runtime.zig");
 const oauth_transport = @import("../core/auth/oauth_transport.zig");
 const secret = @import("../core/auth/secret.zig");
 const collections = @import("../core/shared/collections.zig");
@@ -539,8 +540,14 @@ fn streamAgentCompletion(
     defer if (request.prepared_request_body == null) alloc.free(payload);
     var broker_request = try host_broker.prepare(alloc, .gateway_chat, null);
     defer if (broker_request) |*prepared| prepared.deinit(alloc);
+    errdefer if (broker_request) |*prepared| {
+        if (request.delivery.load() == .possibly_sent and !prepared.cancel(alloc)) {
+            request.delivery.upstream_cancel_unconfirmed.store(true, .seq_cst);
+        }
+    };
     var events = request.events;
     const stream_request = gateway_client.StreamRequest{
+        .broker_request = if (broker_request) |*prepared| prepared else null,
         .api_key = if (broker_request) |prepared| prepared.token else request.credential.secret(),
         .team = if (broker_request == null) request.credential.tenant() else null,
         .session_id = request.session_id,
@@ -590,6 +597,7 @@ fn streamAgentCompletion(
         vercel_failure_diagnostics.collect(alloc, payload, result.err_body);
     if (result.status != .ok) return .{ .failed = .{
         .kind = failureKind(result.status),
+        .http_status = result.status,
         .detail = result.err_body,
         .diagnostics = .{
             .schema = diagnostics.schema,
@@ -687,8 +695,7 @@ fn fetchCredits(
     }
     return fetchCreditsWithFetch(
         alloc,
-        input.credential,
-        input.tenant,
+        input,
         gateway_client.fetchGatewayGetResult,
     );
 }
@@ -700,13 +707,12 @@ fn fetchCredits(
 /// team here, so the query value is added for logins only.
 fn fetchCreditsWithFetch(
     alloc: Allocator,
-    api_key: ?[]const u8,
-    gateway_team: ?[]const u8,
+    input: gateway_provider.CreditsLookupInput,
     fetch_fn: FetchGatewayGetResultFn,
 ) output_contracts.CreditsSnapshot {
     var team_path: ?[]u8 = null;
     defer if (team_path) |path| alloc.free(path);
-    if (gateway_team) |team| {
+    if (input.tenant) |team| {
         if (shared_types.validGatewayTeam(team)) {
             team_path = std.fmt.allocPrint(alloc, "{s}?teamId={s}", .{ credits_path, team }) catch {
                 return creditsErrorSnapshot(alloc, "failed to fetch credits from gateway");
@@ -716,12 +722,19 @@ fn fetchCreditsWithFetch(
         }
     }
 
-    var result = fetch_fn(alloc, api_key, team_path orelse credits_path) catch {
+    var result = fetch_fn(alloc, input.credential, team_path orelse credits_path) catch |err| {
+        if (input.credential_source == .host_managed and err == error.UpstreamCancellationUnconfirmed) {
+            return creditsErrorSnapshot(alloc, auth_runtime.upstream_cancellation_unconfirmed_message);
+        }
         return creditsErrorSnapshot(alloc, "failed to fetch credits from gateway");
     };
     defer result.deinit(alloc);
 
     if (result.status != .ok) {
+        const host_message = auth_runtime.host_http_failure_text(alloc, result.status, input.credential_source) catch {
+            return creditsErrorSnapshot(alloc, "failed to format host failure");
+        };
+        if (host_message) |message| return .{ .err_message = message };
         const message = gateway_error_format.formatHttpErrorMessage(alloc, result.status, result.body) catch {
             return creditsErrorSnapshot(alloc, "failed to fetch credits from gateway");
         };
@@ -1053,7 +1066,7 @@ pub fn executeGatewayWorker(
         config.api_key orelse "",
         config.team,
         config.model,
-        if (config.credential_source == .host_managed) 1 else @max(config.retry_count, 1),
+        @max(config.retry_count, 1),
         config.chat_url,
         payload,
         provider_tool_name,
@@ -1189,16 +1202,14 @@ fn streamGatewayWorker(
     delivery: *gateway_client.DeliveryCertainty,
     cancel_flag: *std.atomic.Value(bool),
 ) !gateway_client.StreamResult {
-    var broker_request = try host_broker.prepare(alloc, .gateway_chat, null);
-    defer if (broker_request) |*prepared| prepared.deinit(alloc);
     return gateway_client.streamGatewayProviderToolCompletionBounded(
         alloc,
         .{
-            .api_key = if (broker_request) |prepared| prepared.token else if (api_key.len > 0) api_key else null,
-            .team = if (broker_request == null) team else null,
+            .api_key = if (api_key.len > 0) api_key else null,
+            .team = team,
             .model = model,
             .retry_count = request_retry_count,
-            .chat_url = if (broker_request) |prepared| prepared.url else chat_url,
+            .chat_url = chat_url,
             .payload = payload,
             .delivery = delivery,
         },
@@ -1843,7 +1854,6 @@ test "web search drops worker text when no provider result arrives" {
 
 const FakeStream = struct {
     calls: usize = 0,
-    attempt_limit: usize = 0,
     fail_before_send: bool = false,
     fail_after_send: bool = false,
     team: ?[]const u8 = null,
@@ -1862,7 +1872,7 @@ const FakeStream = struct {
         _: []const u8,
         team: ?[]const u8,
         _: []const u8,
-        attempt_limit: usize,
+        _: usize,
         _: []const u8,
         payload: []const u8,
         expected_provider_tool_name: []const u8,
@@ -1872,7 +1882,6 @@ const FakeStream = struct {
     ) anyerror!gateway_client.StreamResult {
         const self: *@This() = @ptrCast(@alignCast(raw_ctx));
         self.calls += 1;
-        self.attempt_limit = attempt_limit;
         if (self.fail_before_send) return error.AccessDenied;
         if (self.fail_after_send) {
             delivery.markPossiblySent();
@@ -1915,27 +1924,6 @@ const FakeStream = struct {
         };
     }
 };
-
-test "host-managed web search leaves inference retries with the host" {
-    const alloc = std.testing.allocator;
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    var fake = FakeStream{};
-    var response = try executeGatewayWorker(alloc, .{
-        .api_key = null,
-        .credential_source = .host_managed,
-        .model = "provider/model",
-        .retry_count = 3,
-        .chat_url = default_chat_url,
-        .stream_ctx = @ptrCast(&fake),
-        .stream_fn = FakeStream.execute,
-    }, .{
-        .backend = exa_search_backend_id,
-        .query = "Zig documentation",
-        .cancel_flag = &cancel_flag,
-    }, null, null);
-    defer response.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), fake.attempt_limit);
-}
 
 test "pre-send web search failure stays unbilled" {
     const alloc = std.testing.allocator;
@@ -2088,8 +2076,7 @@ test "built-in credits provider names the team query only when valid" {
         captured_credits_path_len = 0;
         var snapshot = fetchCreditsWithFetch(
             std.testing.allocator,
-            null,
-            case.team,
+            .{ .credential = null, .tenant = case.team },
             stubCaptureCreditsPath,
         );
         defer snapshot.deinit(std.testing.allocator);
@@ -2103,8 +2090,7 @@ test "built-in credits provider names the team query only when valid" {
 test "built-in credits provider maps fetch failure" {
     var snapshot = fetchCreditsWithFetch(
         std.testing.allocator,
-        null,
-        null,
+        .{ .credential = null, .tenant = null },
         stubFetchCreditsError,
     );
     defer snapshot.deinit(std.testing.allocator);
@@ -2121,8 +2107,7 @@ test "built-in credits provider maps fetch failure" {
 test "built-in credits provider maps Gateway HTTP denial" {
     var snapshot = fetchCreditsWithFetch(
         std.testing.allocator,
-        null,
-        null,
+        .{ .credential = null, .tenant = null },
         stubFetchForbiddenCredits,
     );
     defer snapshot.deinit(std.testing.allocator);
@@ -2139,8 +2124,7 @@ test "built-in credits provider maps Gateway HTTP denial" {
 test "built-in credits provider rejects malformed JSON" {
     var snapshot = fetchCreditsWithFetch(
         std.testing.allocator,
-        null,
-        null,
+        .{ .credential = null, .tenant = null },
         stubFetchInvalidCreditsJson,
     );
     defer snapshot.deinit(std.testing.allocator);
@@ -2169,8 +2153,7 @@ test "built-in credits provider rejects non-object JSON" {
 test "built-in credits provider returns owned string fields" {
     var snapshot = fetchCreditsWithFetch(
         std.testing.allocator,
-        null,
-        null,
+        .{ .credential = null, .tenant = null },
         stubFetchCreditsObject,
     );
     defer snapshot.deinit(std.testing.allocator);
@@ -2460,10 +2443,11 @@ fn fetchModelCatalogResponse(
 
     const api_key = if (broker_request) |prepared| prepared.token else access.authorizationCredential();
     const gateway_team = if (broker_request == null) modelCatalogHeaderTeam(access) else null;
+    const prepared_request = if (broker_request) |*prepared| prepared else null;
     return if (cancel_flag) |flag|
-        gateway_client.fetchGatewayJsonCancellable(alloc, api_key, gateway_team, model_catalog_url, flag)
+        gateway_client.fetchGatewayJsonCancellable(alloc, api_key, gateway_team, model_catalog_url, prepared_request, flag)
     else
-        gateway_client.fetchGatewayJson(alloc, api_key, gateway_team, model_catalog_url);
+        gateway_client.fetchGatewayJson(alloc, api_key, gateway_team, model_catalog_url, prepared_request);
 }
 
 fn modelCatalogTeamPath(
@@ -2483,6 +2467,7 @@ fn modelCatalogHeaderTeam(access: credentials.CatalogAccess) ?[]const u8 {
 }
 
 fn catalogRequestFailure(err: anyerror) model_catalog.Failure {
+    if (err == error.UpstreamCancellationUnconfirmed) return .{ .category = .transport, .upstream_cancel_unconfirmed = true };
     if (err == error.OutOfMemory) return .{ .category = .resource_exhausted };
     if (err == error.Cancelled) return .{ .category = .cancellation };
     if (isInvalidGatewayResponse(err)) return .{ .category = .malformed_response };

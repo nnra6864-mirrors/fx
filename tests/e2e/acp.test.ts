@@ -211,36 +211,65 @@ function startHostBrokerFixture(
 ) {
   const token = "acp-host-broker-token";
   const requests: Array<{ path: string; headers: Headers }> = [];
+  const active = new Map<string, { controller: AbortController; settled: Promise<void> }>();
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
     async fetch(request) {
       const url = new URL(request.url);
       requests.push({ path: url.pathname, headers: new Headers(request.headers) });
-      const upstreamUrl = switchHostBrokerRoute(url.pathname, gateway);
       if (
-        upstreamUrl === null ||
         request.headers.get("authorization") !== `Bearer ${token}` ||
         request.headers.get("x-fx-host-protocol") !== "1"
       ) {
         return Response.json({ error: { message: "invalid host broker request" } }, { status: 401 });
       }
+      if (url.pathname === "/fx/v1/cancel") {
+        const { request_id } = await request.json() as { request_id: string };
+        const owned = active.get(request_id);
+        owned?.controller.abort();
+        await owned?.settled;
+        return new Response(null, { status: 204 });
+      }
+      const upstreamUrl = switchHostBrokerRoute(url.pathname, gateway);
+      if (upstreamUrl === null) return new Response(null, { status: 404 });
       if (responseFactory && url.pathname === "/fx/v1/gateway/chat") return responseFactory();
 
       const headers = new Headers(request.headers);
       headers.delete("x-fx-host-protocol");
+      headers.delete("x-fx-request-id");
       headers.set("authorization", "Bearer host-provider-token");
+      const controller = new AbortController();
       const upstream = await fetch(`${upstreamUrl}${url.search}`, {
         method: request.method,
         headers,
         body: request.body,
         redirect: "manual",
+        signal: controller.signal,
       });
       const responseHeaders = new Headers(upstream.headers);
       for (const name of ["connection", "content-encoding", "content-length", "transfer-encoding"]) {
         responseHeaders.delete(name);
       }
-      return new Response(upstream.body, {
+      const id = request.headers.get("x-fx-request-id")!;
+      let output: ReadableStreamDefaultController<Uint8Array>;
+      let disconnected = false;
+      const body = new ReadableStream<Uint8Array>({
+        start(value) { output = value; },
+        cancel() { disconnected = true; },
+      });
+      const settled = (async () => {
+        try {
+          for await (const chunk of upstream.body!) if (!disconnected) output.enqueue(chunk);
+        } catch (error) {
+          if (!controller.signal.aborted) throw error;
+        } finally {
+          if (!disconnected) output.close();
+          active.delete(id);
+        }
+      })();
+      active.set(id, { controller, settled });
+      return new Response(body, {
         status: upstream.status,
         headers: responseHeaders,
       });
@@ -250,7 +279,11 @@ function startHostBrokerFixture(
     baseUrl: `http://127.0.0.1:${server.port}/fx`,
     token,
     requests,
-    stop() { server.stop(true); },
+    get activeCount() { return active.size; },
+    stop() {
+      for (const owned of active.values()) owned.controller.abort();
+      server.stop(true);
+    },
   };
 }
 
@@ -1198,6 +1231,46 @@ describe("acp: model-independent", () => {
     },
     TIMEOUT,
   );
+
+  test("host-managed ACP cancellation stops retained upstream work and preserves the session", async () => {
+    const root = createIsolatedRoot("fx-acp-broker-cancel-");
+    let upstreamCancelled = false;
+    let timer: ReturnType<typeof setInterval>;
+    const held = new Response(new ReadableStream({
+      start(controller) {
+        const chunk = new TextEncoder().encode(": active\n\n");
+        controller.enqueue(chunk);
+        timer = setInterval(() => controller.enqueue(chunk), 50);
+      },
+      cancel() { clearInterval(timer); upstreamCancelled = true; },
+    }), { headers: { "content-type": "text/event-stream" } });
+    const gateway = startFakeGateway([held, finalText("ACP_AFTER_SCOPED_CANCEL")]);
+    const broker = startHostBrokerFixture(gateway);
+    try {
+      client = await AcpClient.create({ cwd: root.workspace, env: {
+        ...fakeGatewayEnv(root, gateway), AI_GATEWAY_API_KEY: undefined, VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTH_MODE: "host-managed", FX_HOST_BROKER_URL: broker.baseUrl, FX_HOST_BROKER_TOKEN: broker.token,
+      } });
+      await startCodeSession(client);
+      sendPrompt(client, 96, "Wait for upstream.");
+      await waitForCondition("active broker upstream", () => gateway.requests.length === 1 && broker.activeCount === 1);
+      client.send({ jsonrpc: "2.0", id: 97, method: "session/cancel", params: {} });
+      const stopped = await readResponse(client, 96);
+      expect(stopped.result.stopReason).toBe("cancelled");
+      await waitForCondition("scoped upstream cancellation", () => upstreamCancelled, 5_000);
+      expect(broker.requests.filter((request) => request.path === "/fx/v1/cancel")).toHaveLength(1);
+      const next = await runPrompt(client, "Reply after cancellation.");
+      expect(next.promptResult.result.stopReason).toBe("end_turn");
+      expect(JSON.stringify(next.messages)).toContain("ACP_AFTER_SCOPED_CANCEL");
+      expect(client.stderr).toBe("");
+    } finally {
+      clearInterval(timer!);
+      await client?.close();
+      broker.stop();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
 
   test(
     "active ACP session uses typed MCP Resources Prompts and Completion state",

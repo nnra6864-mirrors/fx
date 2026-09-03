@@ -1,4 +1,5 @@
 const std = @import("std");
+const agent_stream_provider = @import("../stream_provider.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const types = @import("../../shared/types.zig");
@@ -736,7 +737,7 @@ const NoticeCapture = struct {
             .push_diff_block = pushDiff,
             .push_system_notice = systemNotice,
             .push_command_output_complete = commandOutputComplete,
-            .push_http_error = httpError,
+            .push_provider_failure = httpError,
             .format_tool_execution_error = formatError,
         };
     }
@@ -788,7 +789,7 @@ const NoticeCapture = struct {
     }
 
     fn commandOutputComplete(_: *anyopaque, _: ?types.ToolLifecycleId) !void {}
-    fn httpError(_: *anyopaque, _: std.http.Status, _: []const u8, _: ?types.CredentialSource) !void {}
+    fn httpError(_: *anyopaque, _: agent_stream_provider.Failure, _: ?types.CredentialSource) !void {}
 
     fn formatError(_: *anyopaque, arena: Allocator, _: []const u8, err: anyerror) ![]const u8 {
         return std.fmt.allocPrint(arena, "{s}", .{@errorName(err)});
@@ -852,7 +853,7 @@ const StreamCapture = struct {
             .push_diff_block = noopPushDiff,
             .push_system_notice = noopSystemNotice,
             .push_command_output_complete = noopCommandOutputComplete,
-            .push_http_error = noopHttpError,
+            .push_provider_failure = noopHttpError,
             .format_tool_execution_error = noopFormatError,
         };
     }
@@ -890,7 +891,7 @@ const StreamCapture = struct {
     fn noopPushDiff(_: *anyopaque, _: DiffEntryPayload) !void {}
     fn noopSystemNotice(_: *anyopaque, _: []const u8) !void {}
     fn noopCommandOutputComplete(_: *anyopaque, _: ?types.ToolLifecycleId) !void {}
-    fn noopHttpError(_: *anyopaque, _: std.http.Status, _: []const u8, _: ?types.CredentialSource) !void {}
+    fn noopHttpError(_: *anyopaque, _: agent_stream_provider.Failure, _: ?types.CredentialSource) !void {}
     fn noopFormatError(_: *anyopaque, arena: Allocator, _: []const u8, err: anyerror) ![]const u8 {
         return std.fmt.allocPrint(arena, "{s}", .{@errorName(err)});
     }

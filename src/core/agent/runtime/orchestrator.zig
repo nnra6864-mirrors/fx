@@ -18,6 +18,7 @@ const io_mod = @import("../../shared/io.zig");
 const host_target = @import("../../hosts/target.zig");
 const secret = @import("../../auth/secret.zig");
 const auth_transition = @import("../../auth/auth_transition.zig");
+const auth_runtime = @import("../../auth/auth_runtime.zig");
 const credentials = @import("../../auth/credentials.zig");
 const credential_authority = @import("../../auth/credential_authority.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
@@ -2587,6 +2588,9 @@ fn finishPendingParallelCancelled(
     for (calls, results, status_started, status_terminalized) |call, result, started, terminalized| {
         if (terminalized) continue;
         if (result) |execution| {
+            if (execution.upstream_cancel_unconfirmed) {
+                try deps.push_unconfirmed_cancellation();
+            }
             var prepared = try runtime_execution_memory.prepareToolModelOutput(
                 arena,
                 config,
@@ -3234,21 +3238,6 @@ fn isRetryableModelFailure(kind: agent_stream_provider.FailureKind) bool {
     return switch (kind) {
         .rate_limited, .server_error, .bad_gateway, .unavailable, .gateway_timeout => true,
         else => false,
-    };
-}
-
-fn failureHttpStatus(kind: agent_stream_provider.FailureKind) std.http.Status {
-    return switch (kind) {
-        .invalid_request => .bad_request,
-        .unauthorized => .unauthorized,
-        .forbidden => .forbidden,
-        .request_too_large => .payload_too_large,
-        .rate_limited => .too_many_requests,
-        .server_error => .internal_server_error,
-        .bad_gateway => .bad_gateway,
-        .unavailable => .service_unavailable,
-        .gateway_timeout => .gateway_timeout,
-        .provider_error => .bad_gateway,
     };
 }
 
@@ -4225,12 +4214,22 @@ fn permissionDeniedModelOutput(
     reason: types.ToolPermissionDenialReason,
     outcome: command_admission.PermissionOutcome,
 ) ![]u8 {
+    const provider_advice = if (outcome.provider_failure) |failure|
+        try auth_runtime.provider_failure_text(alloc, failure)
+    else
+        null;
+    defer if (provider_advice) |text| alloc.free(text);
     return switch (reason) {
         .review_caution, .review_evidence_incomplete, .review_unavailable => tool_result_errors.toolReviewHeldJson(
             alloc,
             tool_name,
             reason,
-            if (outcome.auto_review_result) |result| result.rationale else null,
+            provider_advice orelse if (outcome.upstream_cancel_unconfirmed)
+                auth_runtime.upstream_cancellation_unconfirmed_message
+            else if (outcome.auto_review_result) |result|
+                result.rationale
+            else
+                null,
             outcome.auto_review_failure,
         ),
         .user_denied, .auto_denied, .policy_denied, .permission_required => tool_result_errors.toolPermissionDeniedJson(
@@ -4605,7 +4604,7 @@ pub fn compactContextTransaction(
             .body = "Compacting context…",
         });
     }
-    var compacted = try runtime_context_compaction.compact(
+    const outcome = try runtime_context_compaction.compact(
         alloc,
         request.source_messages,
         .{
@@ -4633,6 +4632,24 @@ pub fn compactContextTransaction(
             .trace_ctx = request.trace_ctx,
         },
     );
+    var compacted = switch (outcome) {
+        .completed => |completed| completed,
+        .provider_failure => |failure| {
+            try deps.push_provider_failure(deps.ctx, .{
+                .kind = failure.kind,
+                .http_status = failure.http_status,
+            }, failure.credential_source);
+            return error.ContextCompactionUnavailable;
+        },
+        .upstream_cancellation_unconfirmed => |cause| {
+            try deps.push_unconfirmed_cancellation();
+            return switch (cause) {
+                .cancelled => error.Cancelled,
+                .timed_out => error.Timeout,
+                .transport_failure => error.ContextCompactionUnavailable,
+            };
+        },
+    };
     errdefer compacted.deinit(alloc);
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     try commitContextCompaction(deps, .{
@@ -5539,6 +5556,9 @@ fn processQueuedPromptLoop(
                 deps.usage,
                 deps.usage_allocator,
             ) catch |err| {
+                if (gateway_delivery.upstream_cancel_unconfirmed.load(.seq_cst)) {
+                    try deps.push_unconfirmed_cancellation();
+                }
                 parent_turn_delivery.observeGatewayDelivery(
                     deps,
                     overlay_arena,
@@ -6070,7 +6090,7 @@ fn processQueuedPromptLoop(
                 semantic_attempt + 1 < semantic_limit and
                 streamReplaySafe(&stream_ctx) and
                 isPostVisionAssistantPrefillRejection(
-                    if (response_failure) |failure| failureHttpStatus(failure.kind) else .ok,
+                    if (response_failure) |failure| failure.http_status orelse .ok else .ok,
                     if (response_failure) |failure| failure.detail orelse "" else "",
                     request_messages,
                 ))
@@ -6103,11 +6123,10 @@ fn processQueuedPromptLoop(
                     .rate_limited
                 else
                     .provider_unavailable;
-                const diagnostic = try httpFailureDiagnostic(
-                    arena,
-                    failureHttpStatus(failure.kind),
-                    failure.detail orelse "",
-                );
+                const diagnostic = if (failure.http_status) |status|
+                    try httpFailureDiagnostic(arena, status, failure.detail orelse "")
+                else
+                    try prepareExternalFailureDiagnostic(arena, failure.detail orelse "", @tagName(failure.kind));
                 latest_recovery_diagnostic = diagnostic;
                 const route_changed = disableFastRouteAfterFailure(
                     &route_fast_mode,
@@ -6741,14 +6760,13 @@ fn processQueuedPromptLoop(
         if (streamFailure(stream_result)) |failure| {
             const detail = if (failure.detail) |body| std.mem.trim(u8, body, " \r\n\t") else "";
             const clipped = detail[0..@min(detail.len, http_error_detail_max_bytes)];
-            const http_detail = try runtime_gateway_step.gatewayHttpErrorDetail(
-                arena,
-                failureHttpStatus(failure.kind),
-                clipped,
-                job.model,
-                request_capabilities,
-            );
-            try deps.push_http_error(deps.ctx, failureHttpStatus(failure.kind), http_detail, job.credential_source);
+            var reported = failure;
+            reported.detail = if (failure.http_status) |status|
+                try runtime_gateway_step.gatewayHttpErrorDetail(arena, status, clipped, job.model, request_capabilities)
+            else
+                clipped;
+            reported.ownership = .borrowed;
+            try deps.push_provider_failure(deps.ctx, reported, job.credential_source);
             if (stop_state.retained_candidate != null) {
                 stop_state.terminal_materializing = true;
                 const assistant_text = try hooks.prompt.joinVisibleSegments(
@@ -9269,6 +9287,10 @@ fn processQueuedPromptLoop(
                 execution.result_commit.?.cancel();
             };
 
+            if (execution.upstream_cancel_unconfirmed) {
+                try deps.push_unconfirmed_cancellation();
+            }
+
             if (execution.cancelled and config.cancel_flag.load(.seq_cst)) {
                 runtime_telemetry.traceCancelObserved(step_ctx, true);
                 if (execution.result_commit) |commit| {
@@ -9424,6 +9446,12 @@ fn processQueuedPromptLoop(
             }
 
             runtime_parallel_execution.reportInnerToolUsage(deps, tool_call.name, execution);
+            if (execution.provider_failure) |failure| {
+                try deps.push_provider_failure(deps.ctx, .{
+                    .kind = failure.kind,
+                    .http_status = failure.http_status,
+                }, failure.credential_source);
+            }
             if (execution.diff_entry) |payload| {
                 try deps.push_diff_block(deps.ctx, payload);
             }
@@ -9529,7 +9557,7 @@ fn processQueuedPromptLoop(
                     &within_turn_suffix,
                 );
                 var pushed_interactive_notice = false;
-                if (execution.interactive_notice) |notice| {
+                if (if (execution.provider_failure == null) execution.interactive_notice else null) |notice| {
                     if (deps.push_interactive_notice) |push_notice| {
                         try push_notice(deps.ctx, notice);
                         pushed_interactive_notice = true;
@@ -9597,7 +9625,7 @@ fn processQueuedPromptLoop(
             if (execution.system_notice) |notice| {
                 try within_turn_suffix.append(arena, .{ .role = .system, .content = notice });
             }
-            if (execution.interactive_notice) |notice| {
+            if (if (execution.provider_failure == null) execution.interactive_notice else null) |notice| {
                 if (deps.push_interactive_notice) |push_notice| {
                     try push_notice(deps.ctx, notice);
                 } else {

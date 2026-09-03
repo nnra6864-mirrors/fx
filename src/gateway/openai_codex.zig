@@ -266,6 +266,11 @@ pub fn streamPrepared(
     defer auth_headers.deinit(alloc);
     var broker_request = try host_broker.prepare(alloc, .codex_responses, null);
     defer if (broker_request) |*prepared| prepared.deinit(alloc);
+    errdefer if (broker_request) |*prepared| {
+        if (request.delivery.load() == .possibly_sent and !prepared.cancel(alloc)) {
+            request.delivery.upstream_cancel_unconfirmed.store(true, .seq_cst);
+        }
+    };
     var broker_authorization: ?[]u8 = null;
     defer if (broker_authorization) |value| secret.zeroAndFree(alloc, value);
     if (broker_request) |prepared| {
@@ -281,7 +286,7 @@ pub fn streamPrepared(
     } else endpoint;
     const uri = try std.Uri.parse(request_endpoint);
 
-    var extra_headers_buf: [8]std.http.Header = undefined;
+    var extra_headers_buf: [9]std.http.Header = undefined;
     var extra_count: usize = 0;
     if (auth_headers.account_id) |account_id| {
         extra_headers_buf[extra_count] = .{ .name = "chatgpt-account-id", .value = account_id };
@@ -299,11 +304,13 @@ pub fn streamPrepared(
         extra_headers_buf[extra_count] = .{ .name = "x-client-request-id", .value = session_id };
         extra_count += 1;
     };
-    if (broker_request != null) {
+    if (broker_request) |*prepared| {
         extra_headers_buf[extra_count] = .{
             .name = host_broker.protocol_header_name,
             .value = host_broker.protocol_header_value,
         };
+        extra_count += 1;
+        extra_headers_buf[extra_count] = .{ .name = host_broker.request_id_header_name, .value = &prepared.request_id };
         extra_count += 1;
     }
 
@@ -363,6 +370,7 @@ pub fn streamPrepared(
         };
         return .{ .failed = .{
             .kind = failureKind(response.head.status),
+            .http_status = response.head.status,
             .detail = body,
             .ownership = .owned,
         } };

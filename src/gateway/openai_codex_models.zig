@@ -93,7 +93,7 @@ fn fetchCatalogForProvider(
         .url = request_url,
         .credential = if (broker_request) |prepared| prepared.token else request_auth.credential,
         .account_id = if (broker_request == null) account_id else null,
-        .host_broker = broker_request != null,
+        .broker_request = if (broker_request) |*prepared| prepared else null,
     };
     var response = gateway_client.runBoundedHttpOperation(
         FetchResponse,
@@ -105,10 +105,12 @@ fn fetchCatalogForProvider(
         }),
         &operation,
     ) catch |err| {
+        const cancellation_unconfirmed = if (broker_request) |*prepared| !prepared.cancel(alloc) else false;
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{
             .category = if (err == error.Cancelled) .cancellation else .transport,
             .retryable = err != error.Cancelled,
+            .upstream_cancel_unconfirmed = cancellation_unconfirmed,
         } };
     };
     defer response.deinit(alloc);
@@ -167,7 +169,7 @@ const FetchOperation = struct {
     url: []const u8,
     credential: ?[]const u8,
     account_id: ?[]const u8,
-    host_broker: bool,
+    broker_request: ?*const host_broker.Prepared,
 
     pub fn run(self: *@This()) !FetchResponse {
         var client: std.http.Client = .{ .allocator = self.alloc, .io = io_mod.getIo() };
@@ -185,7 +187,7 @@ const FetchOperation = struct {
         const body_buffer = try self.alloc.alloc(u8, max_catalog_bytes + 1);
         defer secret.zeroAndFree(self.alloc, body_buffer);
         var response_writer = std.Io.Writer.fixed(body_buffer);
-        var extra_headers: [4]std.http.Header = undefined;
+        var extra_headers: [5]std.http.Header = undefined;
         var extra_len: usize = 0;
         if (self.account_id) |account_id| {
             extra_headers[extra_len] = .{ .name = "chatgpt-account-id", .value = account_id };
@@ -195,11 +197,13 @@ const FetchOperation = struct {
         extra_len += 1;
         extra_headers[extra_len] = .{ .name = "accept", .value = "application/json" };
         extra_len += 1;
-        if (self.host_broker) {
+        if (self.broker_request) |prepared| {
             extra_headers[extra_len] = .{
                 .name = host_broker.protocol_header_name,
                 .value = host_broker.protocol_header_value,
             };
+            extra_len += 1;
+            extra_headers[extra_len] = .{ .name = host_broker.request_id_header_name, .value = &prepared.request_id };
             extra_len += 1;
         }
         const result = client.fetch(.{

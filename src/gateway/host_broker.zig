@@ -1,12 +1,14 @@
 const std = @import("std");
 const credentials = @import("../core/auth/credentials.zig");
 const io_mod = @import("../core/shared/io.zig");
+const secret = @import("../core/auth/secret.zig");
 
 const max_url_bytes: usize = 2048;
 const max_token_bytes: usize = 4096;
 
 pub const protocol_header_name = "x-fx-host-protocol";
 pub const protocol_header_value = "1";
+pub const request_id_header_name = "x-fx-request-id";
 
 pub const Route = enum {
     gateway_chat,
@@ -68,10 +70,67 @@ pub const Broker = struct {
 pub const Prepared = struct {
     url: []u8,
     token: []const u8,
+    base_url: []const u8,
+    request_id: [32]u8,
 
     pub fn deinit(self: *Prepared, alloc: std.mem.Allocator) void {
         alloc.free(self.url);
         self.* = undefined;
+    }
+
+    /// Acknowledgement means the host settled this request, not that a provider
+    /// refunded it. Cleanup is independent of the cancelled inference task.
+    pub fn cancel(self: *const Prepared, alloc: std.mem.Allocator) bool {
+        const io = io_mod.getIo();
+        const previous = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(previous);
+        const Event = union(enum) { response: bool, timeout: void };
+        var buffer: [2]Event = undefined;
+        var select: std.Io.Select(Event) = .init(io, &buffer);
+        defer select.cancelDiscard();
+        select.concurrent(.timeout, cancel_deadline, .{}) catch return false;
+        select.concurrent(.response, cancel_http, .{ self, alloc }) catch return false;
+        const event = select.await() catch return false;
+        return switch (event) {
+            .response => |confirmed| confirmed,
+            .timeout => false,
+        };
+    }
+
+    fn cancel_deadline() void {
+        io_mod.getIo().sleep(.fromMilliseconds(1000), .awake) catch {};
+    }
+
+    fn cancel_http(self: *const Prepared, alloc: std.mem.Allocator) bool {
+        const url = std.fmt.allocPrint(alloc, "{s}/v1/cancel", .{self.base_url}) catch return false;
+        defer alloc.free(url);
+        const authorization = std.fmt.allocPrint(alloc, "Bearer {s}", .{self.token}) catch return false;
+        defer secret.zeroAndFree(alloc, authorization);
+        var payload_buffer: [64]u8 = undefined;
+        var payload_writer = std.Io.Writer.fixed(&payload_buffer);
+        std.json.Stringify.value(.{ .request_id = @as([]const u8, &self.request_id) }, .{}, &payload_writer) catch return false;
+        const payload = payload_writer.buffered();
+        var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
+        defer client.deinit();
+        var request = client.request(.POST, std.Uri.parse(url) catch return false, .{
+            .headers = .{
+                .authorization = .{ .override = authorization },
+                .content_type = .{ .override = "application/json" },
+                .accept_encoding = .omit,
+            },
+            .extra_headers = &.{.{ .name = protocol_header_name, .value = protocol_header_value }},
+            .keep_alive = false,
+            .redirect_behavior = .unhandled,
+        }) catch return false;
+        defer request.deinit();
+        request.transfer_encoding = .{ .content_length = payload.len };
+        var send_buffer: [128]u8 = undefined;
+        var body = request.sendBodyUnflushed(&send_buffer) catch return false;
+        body.writer.writeAll(payload) catch return false;
+        body.end() catch return false;
+        if (request.connection) |connection| connection.flush() catch return false;
+        const response = request.receiveHead(&.{}) catch return false;
+        return response.head.status == .no_content;
     }
 };
 
@@ -120,13 +179,17 @@ pub fn prepare(
     route: Route,
     query: ?[]const u8,
 ) !?Prepared {
-    const config = try process_config();
-    return switch (config) {
-        .disabled => null,
-        .configured => |broker| .{
-            .url = try broker.route_url(alloc, route, query),
-            .token = broker.token,
-        },
+    const broker = switch (try process_config()) {
+        .disabled => return null,
+        .configured => |configured| configured,
+    };
+    var random_bytes: [16]u8 = undefined;
+    io_mod.getIo().random(&random_bytes);
+    return .{
+        .url = try broker.route_url(alloc, route, query),
+        .token = broker.token,
+        .base_url = broker.base_url,
+        .request_id = std.fmt.bytesToHex(random_bytes, .lower),
     };
 }
 

@@ -1006,10 +1006,12 @@ pub fn Runtime(comptime App: type) type {
                 .catalog => |catalog| catalog,
                 .failure => |failure| {
                     debug_trace.logf("provider", "catalog rejected provider={t} category={t}", .{ target, failure.category });
+                    const host_message = try auth_runtime.host_catalog_failure_text(app.alloc, failure, access.credentialSource());
+                    defer if (host_message) |message| app.alloc.free(message);
                     try app.writeDomainNotice(.{
                         .topic = "provider",
                         .tone = .@"error",
-                        .body = providerFailureMessage(
+                        .body = host_message orelse providerFailureMessage(
                             intent,
                             "The target provider catalog could not be validated. The current provider is unchanged.",
                             "Subscription sign-in completed, but its model catalog could not be validated. The current provider is unchanged.",
