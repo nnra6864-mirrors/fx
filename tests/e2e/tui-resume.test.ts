@@ -694,7 +694,8 @@ test.skipIf(!tmuxAvailable())(
 
       await Bun.sleep(5_100);
       const traceOffset = readFileSync(tracePath, "utf8").length;
-      await active.sendText("/resume");
+      active.sendLiteralImmediate("/resume");
+      active.sendKeysImmediate(["Enter"]);
       await waitForTraceAfter(
         tracePath,
         traceOffset,
