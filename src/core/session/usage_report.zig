@@ -1,6 +1,7 @@
 const std = @import("std");
 const types = @import("../shared/types.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
+const read_cancellation = @import("../shared/read_cancellation.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -512,7 +513,9 @@ pub fn buildRollingSnapshot(
     coverage_started_at_ms: ?i64,
     facts: []const GenerationFact,
     incidents: []const Incident,
-) BuildError!Snapshot {
+    cancel_flag: read_cancellation.CancelFlag,
+) (BuildError || error{Cancelled})!Snapshot {
+    try read_cancellation.check(cancel_flag);
     const duration_ms = scope.durationMs() orelse return error.InvalidSnapshotTime;
     if (snapshot_time_ms < 0) return error.InvalidSnapshotTime;
     const window_start_ms = std.math.sub(i64, snapshot_time_ms, duration_ms) catch
@@ -527,6 +530,7 @@ pub fn buildRollingSnapshot(
 
     var completeness: Completeness = .complete;
     for (incidents) |incident| {
+        try read_cancellation.check(cancel_flag);
         if (incident.occurred_at_ms < window_start_ms or
             incident.occurred_at_ms >= snapshot_time_ms)
         {
@@ -567,6 +571,7 @@ pub fn buildRollingSnapshot(
     var totals: MutableTotals = .{};
 
     for (facts) |fact| {
+        try read_cancellation.check(cancel_flag);
         try validateFact(fact);
         if (fact.created_at_ms < window_start_ms or fact.created_at_ms >= snapshot_time_ms) {
             continue;
@@ -709,14 +714,7 @@ test "rolling snapshots use closed-open boundaries and stable usage-first orderi
             100,
         ),
     };
-    var snapshot = try buildRollingSnapshot(
-        alloc,
-        .days_30,
-        now,
-        0,
-        &facts,
-        &.{},
-    );
+    var snapshot = try buildRollingSnapshot(alloc, .days_30, now, 0, &facts, &.{}, null);
     defer snapshot.deinit(alloc);
 
     try std.testing.expectEqual(Coverage.full, snapshot.coverage);
@@ -742,38 +740,17 @@ test "rolling snapshots dedupe exact facts and fail closed on conflicts and inci
     var conflict = original;
     conflict.output_tokens = 3;
 
-    var exact = try buildRollingSnapshot(
-        alloc,
-        .hours_24,
-        now,
-        0,
-        &.{ original, duplicate },
-        &.{},
-    );
+    var exact = try buildRollingSnapshot(alloc, .hours_24, now, 0, &.{ original, duplicate }, &.{}, null);
     defer exact.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 6), exact.totals.?.total_tokens);
     try std.testing.expectEqual(@as(u64, 1), exact.totals.?.request_count.?);
 
-    var conflicted = try buildRollingSnapshot(
-        alloc,
-        .hours_24,
-        now,
-        0,
-        &.{ original, conflict },
-        &.{},
-    );
+    var conflicted = try buildRollingSnapshot(alloc, .hours_24, now, 0, &.{ original, conflict }, &.{}, null);
     defer conflicted.deinit(alloc);
     try std.testing.expectEqual(Completeness.incomplete, conflicted.completeness);
     try std.testing.expectEqual(@as(u64, 6), conflicted.totals.?.total_tokens);
 
-    var pending = try buildRollingSnapshot(
-        alloc,
-        .hours_24,
-        now,
-        0,
-        &.{original},
-        &.{.{ .occurred_at_ms = now - 1, .completeness = .pending }},
-    );
+    var pending = try buildRollingSnapshot(alloc, .hours_24, now, 0, &.{original}, &.{.{ .occurred_at_ms = now - 1, .completeness = .pending }}, null);
     defer pending.deinit(alloc);
     try std.testing.expectEqual(Completeness.pending, pending.completeness);
     try std.testing.expectEqual(@as(u64, 6), pending.totals.?.total_tokens);
@@ -782,27 +759,13 @@ test "rolling snapshots dedupe exact facts and fail closed on conflicts and inci
 test "rolling snapshots distinguish tracking start from measured zero" {
     const alloc = std.testing.allocator;
     const now = std.time.ms_per_day * 40;
-    var unstarted = try buildRollingSnapshot(
-        alloc,
-        .days_7,
-        now,
-        null,
-        &.{},
-        &.{},
-    );
+    var unstarted = try buildRollingSnapshot(alloc, .days_7, now, null, &.{}, &.{}, null);
     defer unstarted.deinit(alloc);
     try std.testing.expectEqual(Coverage.not_started, unstarted.coverage);
     try std.testing.expectEqual(Completeness.complete, unstarted.completeness);
     try std.testing.expect(unstarted.totals == null);
 
-    var concurrently_started = try buildRollingSnapshot(
-        alloc,
-        .days_7,
-        now,
-        now + 1,
-        &.{},
-        &.{},
-    );
+    var concurrently_started = try buildRollingSnapshot(alloc, .days_7, now, now + 1, &.{}, &.{}, null);
     defer concurrently_started.deinit(alloc);
     try std.testing.expectEqual(
         Coverage.not_started,
@@ -811,27 +774,13 @@ test "rolling snapshots distinguish tracking start from measured zero" {
     try std.testing.expect(concurrently_started.coverage_started_at_ms == null);
     try std.testing.expect(concurrently_started.totals == null);
 
-    var unknown = try buildRollingSnapshot(
-        alloc,
-        .days_7,
-        now,
-        null,
-        &.{},
-        &.{.{ .occurred_at_ms = now - 1, .completeness = .incomplete }},
-    );
+    var unknown = try buildRollingSnapshot(alloc, .days_7, now, null, &.{}, &.{.{ .occurred_at_ms = now - 1, .completeness = .incomplete }}, null);
     defer unknown.deinit(alloc);
     try std.testing.expectEqual(Coverage.not_started, unknown.coverage);
     try std.testing.expectEqual(Completeness.incomplete, unknown.completeness);
     try std.testing.expect(unknown.totals == null);
 
-    var measured = try buildRollingSnapshot(
-        alloc,
-        .days_7,
-        now,
-        now - std.time.ms_per_day,
-        &.{},
-        &.{},
-    );
+    var measured = try buildRollingSnapshot(alloc, .days_7, now, now - std.time.ms_per_day, &.{}, &.{}, null);
     defer measured.deinit(alloc);
     try std.testing.expectEqual(Coverage.partial, measured.coverage);
     try std.testing.expectEqual(@as(u64, 0), measured.totals.?.total_tokens);

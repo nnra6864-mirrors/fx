@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const darwin_process_spawn = @import("darwin_process_spawn.zig");
+const read_cancellation = @import("read_cancellation.zig");
 
 pub const RawEnviron = [*:null]const ?[*:0]const u8;
 
@@ -530,6 +531,7 @@ fn defaultSyncDir(_: ?*anyopaque, dir: std.Io.Dir) anyerror!void {
 
 pub const DurableOps = struct {
     ctx: ?*anyopaque = null,
+    cancel_flag: ?*const std.atomic.Value(bool) = null,
     sync_file: *const fn (?*anyopaque, std.Io.File) anyerror!void = defaultSyncFile,
     sync_dir: *const fn (?*anyopaque, std.Io.Dir) anyerror!void = defaultSyncDir,
 };
@@ -543,7 +545,9 @@ fn defaultLockNow(_: ?*anyopaque) i64 {
 }
 
 fn defaultLockSleep(_: ?*anyopaque, millis: u64) void {
-    sleep(millis * std.time.ns_per_ms);
+    getIo().sleep(.fromMilliseconds(@intCast(millis)), .awake) catch {
+        getIo().recancel();
+    };
 }
 
 pub const LockOps = struct {
@@ -605,7 +609,6 @@ fn openOrCreateVerifiedPrivateChild(parent: std.Io.Dir, name: []const u8) !Verif
     try validateRelativeLeaf(name);
     const zio = getIo();
 
-    var created = false;
     var dir = parent.openDir(zio, name, .{
         .iterate = true,
         .follow_symlinks = false,
@@ -615,7 +618,6 @@ fn openOrCreateVerifiedPrivateChild(parent: std.Io.Dir, name: []const u8) !Verif
                 error.PathAlreadyExists => {},
                 else => return create_err,
             };
-            created = true;
             break :blk try parent.openDir(zio, name, .{
                 .iterate = true,
                 .follow_symlinks = false,
@@ -628,7 +630,8 @@ fn openOrCreateVerifiedPrivateChild(parent: std.Io.Dir, name: []const u8) !Verif
 
     dir.setPermissions(zio, private_dir_permissions) catch return error.PrivateStatePermissionsUnsupported;
     try verifyPrivateDirectory(dir);
-    if (created) try syncVerifiedDir(parent);
+    // Another opener can observe a new name before its creator syncs it.
+    try syncVerifiedDir(parent);
     return .{ .dir = dir };
 }
 
@@ -638,6 +641,43 @@ pub fn openOrCreateVerifiedPrivateDir(parent: *VerifiedDir, name: []const u8) !V
 
 pub fn openOrCreateVerifiedPrivateDirFromDir(parent: std.Io.Dir, name: []const u8) !VerifiedDir {
     return openOrCreateVerifiedPrivateChild(parent, name);
+}
+
+test "existing private directory cannot acknowledge an unsynced parent" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "existing", .fromMode(0o755));
+    const Probe = struct {
+        var parent: ?std.Io.Dir = null;
+        var original: std.Io = undefined;
+
+        fn chmod(raw: ?*anyopaque, child: std.Io.Dir, permissions: std.Io.File.Permissions) std.Io.Dir.SetPermissionsError!void {
+            try original.vtable.dirSetPermissions(raw, child, permissions);
+            // Closing only this test-owned descriptor makes the real parent
+            // fsync fail after the child has already opened successfully.
+            if (parent) |directory| {
+                parent = null;
+                directory.close(original);
+            }
+        }
+    };
+    Probe.original = std.testing.io;
+    Probe.parent = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true });
+    defer if (Probe.parent) |directory| directory.close(std.testing.io);
+    const parent = Probe.parent.?;
+    var vtable = std.testing.io.vtable.*;
+    vtable.dirSetPermissions = Probe.chmod;
+    const previous = real_io;
+    real_io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    defer real_io = previous;
+    const result = openOrCreateVerifiedPrivateChild(parent, "existing");
+    if (result) |value| {
+        var directory = value;
+        directory.close();
+    } else |_| {}
+    try std.testing.expect(Probe.parent == null);
+    try std.testing.expectError(error.DirectorySyncFailed, result);
 }
 
 fn validateReplaceTarget(dir: std.Io.Dir, name: []const u8) !void {
@@ -656,13 +696,65 @@ fn cleanupVerifiedTemp(dir: std.Io.Dir, name: []const u8) void {
     dir.deleteFile(getIo(), name) catch {};
 }
 
+test "durable replacement cancellation after temporary sync preserves its destination" {
+    const Pause = struct {
+        entered: std.Io.Event = .unset,
+        released: std.Io.Event = .unset,
+        cancelled: std.atomic.Value(bool) = .init(false),
+
+        fn sync(raw: ?*anyopaque, file: std.Io.File) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try file.sync(getIo());
+            self.entered.set(getIo());
+            self.released.waitUncancelable(getIo());
+        }
+        fn cancel(self: *@This()) void {
+            self.entered.waitUncancelable(getIo());
+            self.cancelled.store(true, .release);
+            self.released.set(getIo());
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var parent = VerifiedDir{ .dir = try tmp.dir.openDir(getIo(), ".", .{ .iterate = true, .follow_symlinks = false }) };
+    defer parent.close();
+    var directory = try openOrCreateVerifiedPrivateDir(&parent, "owned");
+    defer directory.close();
+    try durableReplaceVerified(alloc, &directory, "value", "prior");
+    const before = try directory.dir.statFile(getIo(), "value", .{});
+    var pause = Pause{};
+    const thread = try std.Thread.spawn(.{}, Pause.cancel, .{&pause});
+    var failure: ?anyerror = null;
+    durableReplaceVerifiedWithOps(alloc, &directory, "value", "x" ** (128 * 1024), .{ .ctx = &pause, .sync_file = Pause.sync, .cancel_flag = &pause.cancelled }) catch |err| {
+        failure = err;
+    };
+    pause.entered.set(getIo());
+    thread.join();
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), failure);
+    const after = try directory.dir.statFile(getIo(), "value", .{});
+    try std.testing.expectEqual(before.inode, after.inode);
+    try std.testing.expectEqual(before.size, after.size);
+    try std.testing.expectEqual(before.mtime, after.mtime);
+    var iterator = directory.dir.iterate();
+    var count: usize = 0;
+    while (try iterator.next(getIo())) |entry| {
+        count += 1;
+        try std.testing.expectEqualStrings("value", entry.name);
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
 pub fn durableReplaceVerified(
     alloc: std.mem.Allocator,
     dir: *VerifiedDir,
     name: []const u8,
     bytes: []const u8,
 ) !void {
-    return durableReplaceVerifiedWithOps(alloc, dir, name, bytes, .{});
+    return durableReplaceVerifiedWithOps(alloc, dir, name, bytes, .{}) catch |err| switch (err) {
+        error.Cancelled => unreachable,
+        inline else => |failure| return failure,
+    };
 }
 
 pub fn durableReplaceVerifiedWithOps(
@@ -672,6 +764,7 @@ pub fn durableReplaceVerifiedWithOps(
     bytes: []const u8,
     ops: DurableOps,
 ) !void {
+    try read_cancellation.check(ops.cancel_flag);
     e2eFailIfDurableMutationAttempted();
     try validateRelativeLeaf(name);
     validateReplaceTarget(dir.dir, name) catch |err| switch (err) {
@@ -703,8 +796,12 @@ pub fn durableReplaceVerifiedWithOps(
         error.DurablePathUnsafe, error.PrivateStatePermissionsUnsupported => return err,
         else => return error.DurableReplacePreRenameFailed,
     };
-    file.writeStreamingAll(getIo(), bytes) catch return error.DurableReplacePreRenameFailed;
+    read_cancellation.writeFileBytes(getIo(), file, 0, bytes, ops.cancel_flag) catch |err| switch (err) {
+        error.Cancelled => return err,
+        else => return error.DurableReplacePreRenameFailed,
+    };
     ops.sync_file(ops.ctx, file) catch return error.DurableReplacePreRenameFailed;
+    try read_cancellation.check(ops.cancel_flag);
     dir.dir.rename(temp_name, dir.dir, name, getIo()) catch return error.DurableReplacePreRenameFailed;
     temp_exists = false;
 
@@ -824,6 +921,7 @@ fn acquireTimedAdvisoryLockControlled(
     const started = ops.now_ms(ops.ctx);
     const deadline: i64 = started + @as(i64, @intCast(deadline_ms));
     while (true) {
+        try getIo().checkCancel();
         if (cancel_flag) |flag| {
             if (flag.load(.acquire)) return error.Cancelled;
         }

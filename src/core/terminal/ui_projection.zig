@@ -90,6 +90,7 @@ pub const Store = struct {
             .resize => |value| try self.upsert(alloc, value.session, null),
             .signal => |value| try self.upsert(alloc, value.session, null),
             .close => |value| try self.upsert(alloc, value.session, null),
+            .close_owner => {},
         }
     }
 

@@ -1,7 +1,6 @@
 const std = @import("std");
 const contracts = @import("contracts.zig");
 
-pub const queue_capacity: usize = 16;
 pub const outcome_capacity: usize = 32;
 
 pub const IdleFacts = struct {
@@ -14,22 +13,6 @@ pub fn idleEligible(facts: IdleFacts) bool {
     return facts.connected_clients == 0 and
         facts.pending_requests == 0 and
         facts.live_work == 0;
-}
-
-pub const QueueAdmission = enum {
-    admit,
-    full,
-    stopping,
-};
-
-pub fn classifyQueueAdmission(
-    queued: usize,
-    capacity: usize,
-    stopping: bool,
-) QueueAdmission {
-    if (stopping) return .stopping;
-    if (queued >= capacity) return .full;
-    return .admit;
 }
 
 pub const ConnectionEvidence = enum {
@@ -146,21 +129,6 @@ test "idle eligibility accounts for every host owner" {
     try std.testing.expect(!idleEligible(.{ .connected_clients = 1 }));
     try std.testing.expect(!idleEligible(.{ .pending_requests = 1 }));
     try std.testing.expect(!idleEligible(.{ .live_work = 1 }));
-}
-
-test "queue admission is bounded and rejects shutdown" {
-    try std.testing.expectEqual(
-        QueueAdmission.admit,
-        classifyQueueAdmission(queue_capacity - 1, queue_capacity, false),
-    );
-    try std.testing.expectEqual(
-        QueueAdmission.full,
-        classifyQueueAdmission(queue_capacity, queue_capacity, false),
-    );
-    try std.testing.expectEqual(
-        QueueAdmission.stopping,
-        classifyQueueAdmission(0, queue_capacity, true),
-    );
 }
 
 test "reconciliation requires both lock and liveness proof before cleanup" {

@@ -103,7 +103,7 @@ pub fn decode(alloc: Allocator, bytes: []const u8) Error!Decoded {
         alloc.free(history);
     }
     for (history_value.array.items, 0..) |turn_value, index| {
-        history[index] = session_codec.parseHistoryTurn(alloc, turn_value) catch |err| switch (err) {
+        history[index] = session_codec.parseHistoryTurn(alloc, turn_value, null) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.InvalidCheckpoint,
         };

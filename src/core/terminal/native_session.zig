@@ -21,6 +21,7 @@ const self_exe = @import("../shared/self_exe.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
 const workspace_pathing = @import("../workspace/pathing.zig");
+const read_cancellation = @import("../shared/read_cancellation.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -670,7 +671,7 @@ const UnsupportedRegistry = struct {
     pub fn executeAuthorized(
         self: *UnsupportedRegistry,
         request: contracts.ActionRequest,
-        _: *const std.atomic.Value(bool),
+        _: *std.atomic.Value(bool),
     ) Allocator.Error!contracts.OwnedResult {
         return contracts.OwnedResult.init(
             self.alloc,
@@ -689,6 +690,29 @@ const UnsupportedRegistry = struct {
 };
 
 const SupportedRegistry = struct {
+    const StartReservation = struct {
+        owner_id: []const u8,
+        source: ?contracts.ProcessOwner,
+        cancelled: *std.atomic.Value(bool),
+    };
+    const Slot = union(enum) {
+        empty,
+        starting: *StartReservation,
+        resident: struct { session: *Session, references: usize },
+    };
+    const ExitFence = struct {
+        const Outcome = enum { open, closing, succeeded, failed };
+        owner_id: [255]u8,
+        owner_len: u8,
+        source: contracts.ProcessOwner,
+        outcome: Outcome = .open,
+
+        fn matches(self: ExitFence, id: []const u8, source: contracts.ProcessOwner) bool {
+            return std.mem.eql(u8, self.owner_id[0..self.owner_len], id) and
+                self.source.pid == source.pid and std.mem.eql(u8, self.source.token(), source.token());
+        }
+    };
+
     alloc: Allocator,
     tracker: WorkTracker,
     profile: *terminal_store.ProfileStore,
@@ -696,8 +720,10 @@ const SupportedRegistry = struct {
     durable_root: []const u8,
     transport_root: []const u8,
     mutex: std.Io.Mutex = .init,
-    sessions: [max_sessions]?*Session = @splat(null),
-    references: [max_sessions]usize = @splat(0),
+
+    slots: [max_sessions]Slot = @splat(.empty),
+    exit_fences: [max_sessions]?ExitFence = @splat(null),
+    stop_requested: ?*std.atomic.Value(bool) = null,
     recycle_cursor: usize = 0,
     recovery: ?terminal_store.RecoveredList = null,
 
@@ -777,7 +803,8 @@ const SupportedRegistry = struct {
             session.deinitRecoveryAttempt();
             self.alloc.destroy(session);
         };
-        try self.profile.register_resident(&session.durable);
+        try session.durable.ensureSessionExitProof();
+        try self.profile.register_resident(&session.durable, null);
         const slot = self.reserve(session) orelse return error.CapacityExceeded;
         std.debug.assert(slot.evicted == null);
         var reserved = true;
@@ -823,22 +850,19 @@ const SupportedRegistry = struct {
     /// while other threads are reading.
     pub fn shutdownSessionsOnly(self: *SupportedRegistry) void {
         const zio = io_mod.getIo();
-        // Take a reference on every live session before releasing the lock.
-        // A bare pointer copy would not stop a client that still holds the
-        // registry from recycling a reference-free slot and destroying the
-        // session this loop is about to signal, which is the use-after-free
-        // this drain exists to prevent. Recycling skips a referenced slot.
         var pinned: [max_sessions]?*Session = @splat(null);
         self.mutex.lockUncancelable(zio);
-        for (&self.sessions, 0..) |*entry, index| {
-            const session = entry.* orelse continue;
-            self.references[index] += 1;
-            pinned[index] = session;
-        }
+        for (&self.slots, 0..) |*entry, index| switch (entry.*) {
+            .empty => {},
+            .starting => |starting| starting.cancelled.store(true, .release),
+            .resident => |*resident| {
+                resident.references += 1;
+                pinned[index] = resident.session;
+            },
+        };
         self.mutex.unlock(zio);
-
-        for (&pinned, 0..) |maybe_session, index| {
-            const session = maybe_session orelse continue;
+        for (pinned, 0..) |entry, index| {
+            const session = entry orelse continue;
             session.shutdown();
             self.releaseReference(index, session);
         }
@@ -847,35 +871,36 @@ const SupportedRegistry = struct {
     pub fn deinit(self: *SupportedRegistry) void {
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);
-        var sessions = self.sessions;
-        self.sessions = @splat(null);
+        const slots = self.slots;
+        self.slots = @splat(.empty);
         self.mutex.unlock(zio);
-
-        for (&sessions) |*entry| {
-            const session = entry.* orelse continue;
-            session.shutdown();
-        }
-        for (&sessions) |*entry| {
-            const session = entry.* orelse continue;
-            session.deinit();
-            self.alloc.destroy(session);
-        }
+        for (slots) |entry| switch (entry) {
+            .empty => {},
+            .starting => unreachable,
+            .resident => |resident| resident.session.shutdown(),
+        };
+        for (slots) |entry| switch (entry) {
+            .empty => {},
+            .starting => unreachable,
+            .resident => |resident| {
+                resident.session.deinit();
+                self.alloc.destroy(resident.session);
+            },
+        };
         if (self.recovery) |*recovered| recovered.deinit();
         self.* = undefined;
     }
 
     fn deinitRecoveryAttempt(self: *SupportedRegistry) void {
-        const zio = io_mod.getIo();
-        self.mutex.lockUncancelable(zio);
-        var sessions = self.sessions;
-        self.sessions = @splat(null);
-        self.mutex.unlock(zio);
-
-        for (&sessions) |*entry| {
-            const session = entry.* orelse continue;
-            session.deinitRecoveredRegistryAttempt();
-            self.alloc.destroy(session);
-        }
+        for (&self.slots) |*entry| switch (entry.*) {
+            .empty => {},
+            .starting => unreachable,
+            .resident => |resident| {
+                resident.session.deinitRecoveredRegistryAttempt();
+                self.alloc.destroy(resident.session);
+                entry.* = .empty;
+            },
+        };
         if (self.recovery) |*recovered| recovered.deinit();
         self.* = undefined;
     }
@@ -883,12 +908,12 @@ const SupportedRegistry = struct {
     pub fn executeAuthorized(
         self: *SupportedRegistry,
         request: contracts.ActionRequest,
-        cancelled: *const std.atomic.Value(bool),
+        cancelled: *std.atomic.Value(bool),
     ) Allocator.Error!contracts.OwnedResult {
         return switch (request) {
             .start => |value| self.start(value, cancelled),
             .read => |value| self.read(value),
-            .screen => |value| self.screen(value),
+            .screen => |value| self.screen(value, cancelled),
             .write => |value| self.write(value, cancelled),
             .wait => |value| self.wait(value, cancelled),
             .inspect => |value| self.inspect(value),
@@ -906,6 +931,7 @@ const SupportedRegistry = struct {
                 .{value},
             ),
             .close => |value| self.close(value),
+            .close_owner => |value| self.closeOwner(value),
         };
     }
 
@@ -914,21 +940,7 @@ const SupportedRegistry = struct {
         session_id: []const u8,
         claim: contracts.AuthorityClaim,
     ) !void {
-        if (self.find(session_id)) |reference| {
-            defer self.releaseReference(reference.index, reference.session);
-            try reference.session.durable.cancel_claim(
-                claim,
-                io_mod.milliTimestamp(),
-            );
-            return;
-        }
-
-        if (io_mod.getenv("FX_TERMINAL_TEST_FAIL_CANCELLATION_OPEN") != null) {
-            return error.InjectedCancellationOpenFailure;
-        }
-        const durable = try self.profile.open_terminal(session_id);
-        defer self.profile.release_terminal(durable);
-        try durable.cancel_claim(claim, io_mod.milliTimestamp());
+        try self.profile.cancelClaim(session_id, claim, io_mod.milliTimestamp());
     }
 
     fn read(
@@ -997,10 +1009,11 @@ const SupportedRegistry = struct {
     fn screen(
         self: *SupportedRegistry,
         request: contracts.SessionRequest,
+        cancelled: *const std.atomic.Value(bool),
     ) Allocator.Error!contracts.OwnedResult {
         if (self.find(request.session_id)) |reference| {
             defer self.releaseReference(reference.index, reference.session);
-            return screenAction(reference.session, request) catch |err|
+            return screenAction(reference.session, request, cancelled) catch |err|
                 self.actionError(.screen, request.session_id, err);
         }
         const durable = self.profile.open_terminal(request.session_id) catch |err| {
@@ -1012,7 +1025,7 @@ const SupportedRegistry = struct {
             request.authority.?,
             .screen,
         ) catch |err| return self.actionError(.screen, request.session_id, err);
-        return screenDurable(self.alloc, durable, authorization) catch |err|
+        return screenDurable(self.alloc, durable, authorization, cancelled) catch |err|
             self.actionError(.screen, request.session_id, err);
     }
 
@@ -1049,10 +1062,126 @@ const SupportedRegistry = struct {
         ) catch return error.OutOfMemory;
     }
 
+    fn closeOwner(self: *SupportedRegistry, request: contracts.CloseOwnerRequest) Allocator.Error!contracts.OwnedResult {
+        const deadline = io_mod.milliTimestamp() + 300;
+        self.profile.authorizeSessionExit(request.authority) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return self.failure(.close_owner, .authority_denied, request.authority.session_id);
+        };
+        const source = request.process_owner orelse return self.failure(.close_owner, .authority_denied, request.authority.session_id);
+        const owner_id = request.authority.session_id;
+        var pinned: [max_sessions]?*Session = @splat(null);
+        var closed: u16 = 0;
+        self.mutex.lockUncancelable(io_mod.getIo());
+        if (self.sourceFencedLocked(owner_id, source)) {
+            self.mutex.unlock(io_mod.getIo());
+            return self.waitOwnerExit(owner_id, source, deadline);
+        }
+        self.fenceSourceLocked(owner_id, source) catch {
+            self.mutex.unlock(io_mod.getIo());
+            return self.failure(.close_owner, .capacity_exceeded, owner_id);
+        };
+        for (&self.slots, 0..) |*entry, index| switch (entry.*) {
+            .empty => {},
+            .starting => |starting| {
+                if (std.mem.eql(u8, starting.owner_id, owner_id)) starting.cancelled.store(true, .release);
+            },
+            .resident => |*resident| {
+                const session = resident.session;
+                if (!std.mem.eql(u8, session.durable.record.owner_session_id, owner_id)) continue;
+                resident.references += 1;
+                pinned[index] = session;
+                if (!session.backend_detaching.load(.acquire)) closed += 1;
+            },
+        };
+        self.mutex.unlock(io_mod.getIo());
+        var outcome: ExitFence.Outcome = .failed;
+        defer self.finishOwnerExit(owner_id, source, outcome);
+        defer for (pinned, 0..) |entry, index| if (entry) |session| self.releaseReference(index, session);
+
+        for (pinned) |entry| if (entry) |session| session.backend_detaching.store(true, .release);
+        var complete = true;
+        for (pinned) |entry| {
+            const session = entry orelse continue;
+            const delivered = session.signalForOwnerExit() catch |err| failed: {
+                debug_trace.logf("terminal_host", "owner exit tree signal failed id={s} err={s}", .{ session.id, @errorName(err) });
+                break :failed false;
+            };
+            if (delivered) |success| complete = complete and success;
+            session.shutdown();
+        }
+        while (!self.ownerExitSettled(owner_id, &pinned)) {
+            if (io_mod.milliTimestamp() >= deadline) return self.failure(.close_owner, .session_lost, owner_id);
+            io_mod.sleep(wait_poll_ns);
+        }
+        for (pinned) |entry| {
+            const session = entry orelse continue;
+            session.finalizeBackend();
+            if (session.tmux_backend) |*backend| {
+                backend.cleanupChecked(self.profile.process_provider, deadline) catch |err| {
+                    debug_trace.logf("terminal_host", "owner exit tmux cleanup failed id={s} err={s}", .{ session.id, @errorName(err) });
+                    complete = false;
+                };
+            }
+        }
+        if (!complete) return self.failure(.close_owner, .session_lost, owner_id);
+        outcome = .succeeded;
+        return contracts.OwnedResult.init(self.alloc, .{ .success = .{ .close_owner = .{ .closed_sessions = closed } } }) catch return error.OutOfMemory;
+    }
+
+    fn waitOwnerExit(self: *SupportedRegistry, owner_id: []const u8, source: contracts.ProcessOwner, deadline: i64) Allocator.Error!contracts.OwnedResult {
+        while (true) {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            const outcome: ExitFence.Outcome = for (self.exit_fences) |entry| {
+                const fence = entry orelse continue;
+                if (fence.matches(owner_id, source)) break fence.outcome;
+            } else .failed;
+            self.mutex.unlock(io_mod.getIo());
+            switch (outcome) {
+                .succeeded => return contracts.OwnedResult.init(self.alloc, .{ .success = .{ .close_owner = .{ .closed_sessions = 0 } } }) catch return error.OutOfMemory,
+                .open, .failed => return self.failure(.close_owner, .session_lost, owner_id),
+                .closing => if (io_mod.milliTimestamp() >= deadline) return self.failure(.close_owner, .session_lost, owner_id),
+            }
+            io_mod.sleep(wait_poll_ns);
+        }
+    }
+
+    fn finishOwnerExit(self: *SupportedRegistry, owner_id: []const u8, source: contracts.ProcessOwner, outcome: ExitFence.Outcome) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (&self.exit_fences) |*entry| {
+            const fence = if (entry.*) |*value| value else continue;
+            if (fence.matches(owner_id, source)) {
+                fence.outcome = outcome;
+                return;
+            }
+        }
+    }
+
+    fn ownerExitSettled(self: *SupportedRegistry, owner_id: []const u8, pinned: *const [max_sessions]?*Session) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.slots, 0..) |entry, index| switch (entry) {
+            .empty => {},
+            .starting => |starting| {
+                if (std.mem.eql(u8, starting.owner_id, owner_id) and starting.cancelled.load(.acquire)) return false;
+            },
+            .resident => |resident| {
+                if (pinned[index] != resident.session) continue;
+                if (resident.session.launch_phase.load(.acquire) == .launching) return false;
+                resident.session.mutex.lockUncancelable(io_mod.getIo());
+                const live = resident.session.live_counted;
+                resident.session.mutex.unlock(io_mod.getIo());
+                if (live) return false;
+            },
+        };
+        return true;
+    }
+
     fn start(
         self: *SupportedRegistry,
         request: contracts.StartRequest,
-        cancelled: *const std.atomic.Value(bool),
+        cancelled: *std.atomic.Value(bool),
     ) Allocator.Error!contracts.OwnedResult {
         if (!isSupported()) {
             return self.failure(.start, .unsupported_host, null);
@@ -1060,12 +1189,29 @@ const SupportedRegistry = struct {
         const persistence = request.persistence orelse
             return self.failure(.start, .authority_denied, null);
 
+        if (cancelled.load(.acquire)) return self.failure(.start, .cancelled, null);
+        var starting = StartReservation{
+            .owner_id = persistence.grant.principal.durable_session_id,
+            .source = request.process_owner,
+            .cancelled = cancelled,
+        };
+        const slot = self.reserveSlot(.{ .starting = &starting }) orelse
+            return self.failure(.start, if (cancelled.load(.acquire)) .cancelled else .capacity_exceeded, null);
+        var reservation_owned = true;
+        defer if (reservation_owned) self.abandonStart(slot.index, &starting);
+        if (slot.evicted) |evicted| {
+            evicted.deinit();
+            self.alloc.destroy(evicted);
+        }
+        if (cancelled.load(.acquire)) return self.failure(.start, .cancelled, null);
+
         const session_id = try session_layout.generateTerminalSessionId(self.alloc);
         var session_id_owned = true;
         defer if (session_id_owned) self.alloc.free(session_id);
         const session = try self.alloc.create(Session);
         var session_owned = true;
         defer if (session_owned) self.alloc.destroy(session);
+        if (cancelled.load(.acquire)) return self.failure(.start, .cancelled, null);
         session.* = Session.init(
             self.alloc,
             self.tracker,
@@ -1074,6 +1220,7 @@ const SupportedRegistry = struct {
             session_id,
             request,
             persistence,
+            cancelled,
         ) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             debug_trace.logf(
@@ -1084,6 +1231,7 @@ const SupportedRegistry = struct {
             return self.failure(
                 .start,
                 switch (err) {
+                    error.Cancelled => .cancelled,
                     error.CapacityExceeded => .capacity_exceeded,
                     error.MissingLoginShell => .shell_unavailable,
                     error.RelativeShellPath,
@@ -1095,48 +1243,37 @@ const SupportedRegistry = struct {
             );
         };
         session_id_owned = false;
-        self.profile.register_resident(&session.durable) catch {
+        self.profile.register_resident(&session.durable, cancelled) catch |err| {
             session.deinitUnlaunched();
+            if (err == error.Cancelled) return self.failure(.start, .cancelled, null);
             return error.OutOfMemory;
         };
 
-        const slot = self.reserve(session) orelse {
-            session.deinitUnlaunched();
-            return self.failure(.start, .capacity_exceeded, null);
-        };
-        defer self.releaseReference(slot.index, session);
-        if (slot.evicted) |evicted| {
-            evicted.deinit();
-            self.alloc.destroy(evicted);
-        }
+        const launch_allowed = self.publishStart(slot.index, &starting, session);
+        reservation_owned = false;
         session_owned = false;
+        if (!launch_allowed) {
+            self.retireFailedStart(slot.index, session, error.Cancelled);
+            return self.failure(.start, .cancelled, null);
+        }
 
         session.markLive();
         session.launch(
             request,
             self.durable_root,
             self.transport_root,
+            cancelled,
         ) catch |err| {
             debug_trace.logf(
                 "terminal_host",
                 "session launch failed id={s} err={s}",
                 .{ session.id, @errorName(err) },
             );
-            self.removeOwned(slot.index, session);
-            if (!session.child_released) {
-                session.durable.rollback_unreleased_start() catch |rollback_err| {
-                    debug_trace.logf(
-                        "terminal_host",
-                        "unreleased start rollback failed id={s} err={s}",
-                        .{ session.id, @errorName(rollback_err) },
-                    );
-                };
-            }
-            session.deinit();
-            self.alloc.destroy(session);
+            self.retireFailedStart(slot.index, session, err);
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return self.failure(.start, launchFailureCode(err), null);
         };
+        defer self.releaseReference(slot.index, session);
 
         const condition = request.return_when orelse .started;
         const ceiling = request.wait_ceiling_ms orelse 5_000;
@@ -1149,7 +1286,31 @@ const SupportedRegistry = struct {
         return session.startResult(outcome, .{
             .actor = persistence.grant.actor,
             .controls = persistence.grant.controls,
-        });
+        }) catch |err| switch (err) {
+            error.Cancelled => self.failure(.start, .cancelled, session.id),
+            error.OutOfMemory => error.OutOfMemory,
+        };
+    }
+
+    fn retireFailedStart(self: *SupportedRegistry, index: usize, session: *Session, cause: anyerror) void {
+        if (cause == error.Cancelled or session.backend_detaching.load(.acquire)) {
+            session.shutdown();
+            session.finalizeBackend();
+            session.mutex.lockUncancelable(io_mod.getIo());
+            if (session.lifecycle == .starting or session.lifecycle == .running) session.lifecycle = .lost;
+            session.mutex.unlock(io_mod.getIo());
+            session.markNotLive();
+            self.releaseReference(index, session);
+            return;
+        }
+        self.removeOwned(index, session);
+        if (session.launch_phase.load(.acquire) != .released) {
+            session.durable.rollback_unreleased_start() catch |err| {
+                debug_trace.logf("terminal_host", "unreleased start rollback failed id={s} err={s}", .{ session.id, @errorName(err) });
+            };
+        }
+        session.deinit();
+        self.alloc.destroy(session);
     }
 
     fn write(
@@ -1367,45 +1528,127 @@ const SupportedRegistry = struct {
         session: *Session,
     };
 
-    fn reserve(
-        self: *SupportedRegistry,
-        session: *Session,
-    ) ?Reservation {
+    fn reserve(self: *SupportedRegistry, session: *Session) ?Reservation {
+        return self.reserveSlot(.{ .resident = .{ .session = session, .references = 1 } });
+    }
+
+    fn reserveSlot(self: *SupportedRegistry, value: Slot) ?Reservation {
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);
         defer self.mutex.unlock(zio);
-        for (&self.sessions, 0..) |*entry, index| {
-            if (entry.* != null) continue;
-            entry.* = session;
-            self.references[index] = 1;
+        if (self.stop_requested) |flag| if (flag.load(.acquire)) {
+            if (value == .starting) value.starting.cancelled.store(true, .release);
+            return null;
+        };
+        if (value == .starting and self.sourceFencedLocked(value.starting.owner_id, value.starting.source)) {
+            value.starting.cancelled.store(true, .release);
+            return null;
+        }
+        if (value == .starting) {
+            if (value.starting.source) |source| {
+                _ = self.retainSourceLocked(value.starting.owner_id, source) catch return null;
+            }
+        }
+        for (&self.slots, 0..) |*entry, index| {
+            if (entry.* != .empty) continue;
+            entry.* = value;
             return .{ .index = index, .evicted = null };
         }
         for (0..max_sessions) |offset| {
             const index = (self.recycle_cursor + offset) % max_sessions;
-            if (self.references[index] != 0) continue;
-            const candidate = self.sessions[index].?;
+            const entry = &self.slots[index];
+            if (entry.* != .resident or entry.resident.references != 0) continue;
+            const candidate = entry.resident.session;
             if (!candidate.isRecyclable()) continue;
-            self.sessions[index] = session;
-            self.references[index] = 1;
+            if (!self.profile.tryUnregisterResident(&candidate.durable)) continue;
+            entry.* = value;
             self.recycle_cursor = (index + 1) % max_sessions;
             return .{ .index = index, .evicted = candidate };
         }
         return null;
     }
 
-    fn removeOwned(
-        self: *SupportedRegistry,
-        index: usize,
-        session: *Session,
-    ) void {
+    fn publishStart(self: *SupportedRegistry, index: usize, starting: *StartReservation, session: *Session) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        std.debug.assert(self.slots[index] == .starting and self.slots[index].starting == starting);
+        const allowed = !starting.cancelled.load(.acquire) and !self.sourceFencedLocked(starting.owner_id, starting.source) and
+            (self.stop_requested == null or !self.stop_requested.?.load(.acquire));
+        session.launch_phase.store(if (allowed) .launching else .failed, .release);
+        self.slots[index] = .{ .resident = .{ .session = session, .references = 1 } };
+        return allowed;
+    }
+
+    fn abandonStart(self: *SupportedRegistry, index: usize, starting: *StartReservation) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        std.debug.assert(self.slots[index] == .starting and self.slots[index].starting == starting);
+        self.slots[index] = .empty;
+    }
+
+    fn sourceFencedLocked(self: *const SupportedRegistry, owner_id: []const u8, source: ?contracts.ProcessOwner) bool {
+        const sender = source orelse return false;
+        for (self.exit_fences) |entry| {
+            const fence = entry orelse continue;
+            if (fence.matches(owner_id, sender)) return fence.outcome != .open;
+        }
+        return false;
+    }
+
+    /// The accept owner supplies all active sources, including the incoming
+    /// connection. Process death alone does not retire buffered requests.
+    pub fn pruneExitFences(self: *SupportedRegistry, active_sources: []const contracts.ProcessOwner) void {
+        for (0..max_sessions) |index| {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            const entry = self.exit_fences[index];
+            self.mutex.unlock(io_mod.getIo());
+            const fence = entry orelse continue;
+            if (fence.outcome == .closing) continue;
+            const active = for (active_sources) |source| {
+                if (source.pid == fence.source.pid and std.mem.eql(u8, source.token(), fence.source.token())) break true;
+            } else false;
+            if (active) continue;
+            const token = process_identity.ProcessInstanceToken.parse(fence.source.token()) catch continue;
+            var pid_buffer: [32]u8 = undefined;
+            const pid = std.fmt.bufPrint(&pid_buffer, "{d}", .{fence.source.pid}) catch continue;
+            switch (self.profile.process_provider.matchToken(self.alloc, pid, token)) {
+                .matched, .unavailable => continue,
+                .missing, .mismatched => {},
+            }
+            self.mutex.lockUncancelable(io_mod.getIo());
+            if (self.exit_fences[index]) |current| {
+                if (current.outcome != .closing and current.matches(fence.owner_id[0..fence.owner_len], fence.source)) self.exit_fences[index] = null;
+            }
+            self.mutex.unlock(io_mod.getIo());
+        }
+    }
+
+    fn fenceSourceLocked(self: *SupportedRegistry, owner_id: []const u8, source: contracts.ProcessOwner) error{CapacityExceeded}!void {
+        const fence = try self.retainSourceLocked(owner_id, source);
+        if (fence.outcome == .open) fence.outcome = .closing;
+    }
+
+    fn retainSourceLocked(self: *SupportedRegistry, owner_id: []const u8, source: contracts.ProcessOwner) error{CapacityExceeded}!*ExitFence {
+        for (&self.exit_fences) |*entry| {
+            const fence = if (entry.*) |*value| value else continue;
+            if (fence.matches(owner_id, source)) return fence;
+        }
+        const entry = for (&self.exit_fences) |*value| {
+            if (value.* == null) break value;
+        } else return error.CapacityExceeded;
+        var fence = ExitFence{ .owner_id = undefined, .owner_len = @intCast(owner_id.len), .source = source };
+        @memcpy(fence.owner_id[0..owner_id.len], owner_id);
+        entry.* = fence;
+        return &entry.*.?;
+    }
+
+    fn removeOwned(self: *SupportedRegistry, index: usize, session: *Session) void {
         const zio = io_mod.getIo();
         while (true) {
             self.mutex.lockUncancelable(zio);
-            if (self.sessions[index] == session and
-                self.references[index] == 1)
-            {
-                self.sessions[index] = null;
-                self.references[index] = 0;
+            const entry = &self.slots[index];
+            if (entry.* == .resident and entry.resident.session == session and entry.resident.references == 1) {
+                entry.* = .empty;
                 self.mutex.unlock(zio);
                 return;
             }
@@ -1414,34 +1657,40 @@ const SupportedRegistry = struct {
         }
     }
 
-    fn find(
-        self: *SupportedRegistry,
-        session_id: []const u8,
-    ) ?SessionReference {
-        const zio = io_mod.getIo();
-        self.mutex.lockUncancelable(zio);
-        defer self.mutex.unlock(zio);
-        for (self.sessions, 0..) |entry, index| {
-            const session = entry orelse continue;
-            if (std.mem.eql(u8, session.id, session_id)) {
-                self.references[index] += 1;
-                return .{ .index = index, .session = session };
-            }
+    fn find(self: *SupportedRegistry, session_id: []const u8) ?SessionReference {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (&self.slots, 0..) |*entry, index| {
+            if (entry.* != .resident) continue;
+            const resident = &entry.resident;
+            if (!std.mem.eql(u8, resident.session.id, session_id)) continue;
+            resident.references += 1;
+            return .{ .index = index, .session = resident.session };
         }
         return null;
     }
 
-    fn releaseReference(
-        self: *SupportedRegistry,
-        index: usize,
-        session: *Session,
-    ) void {
-        const zio = io_mod.getIo();
-        self.mutex.lockUncancelable(zio);
-        defer self.mutex.unlock(zio);
-        if (self.sessions[index] != session) return;
-        std.debug.assert(self.references[index] > 0);
-        self.references[index] -= 1;
+    fn releaseReference(self: *SupportedRegistry, index: usize, session: *Session) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        const entry = &self.slots[index];
+        if (entry.* != .resident or entry.resident.session != session) return;
+        std.debug.assert(entry.resident.references > 0);
+        entry.resident.references -= 1;
+    }
+
+    pub fn retireIfIdle(self: *SupportedRegistry, context: ?*anyopaque, eligible: *const fn (?*anyopaque) bool) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (!eligible(context)) return false;
+        for (self.slots) |entry| switch (entry) {
+            .empty => {},
+            .starting => return false,
+            .resident => |resident| if (resident.references != 0 or !resident.session.isRecyclable()) return false,
+        };
+        const stopping = self.stop_requested orelse return false;
+        stopping.store(true, .release);
+        return true;
     }
 
     fn failure(
@@ -1487,6 +1736,7 @@ fn finalizeRecoveredCloseBackend(
                     null
             else
                 null,
+            null,
         ),
     }
 }
@@ -1572,6 +1822,8 @@ fn shouldPauseRecoveredTmuxProcess(
 }
 
 const Session = struct {
+    const LaunchPhase = enum(u8) { prepared, launching, released, failed };
+
     alloc: Allocator,
     tracker: WorkTracker,
     id: []u8,
@@ -1596,6 +1848,7 @@ const Session = struct {
     tmux_capture: ?std.Io.net.Stream = null,
     tmux_lifecycle_index: usize = 0,
     launcher: ?std.process.Child = null,
+    launcher_token: ?process_identity.ProcessInstanceToken = null,
     control_file: ?std.Io.File = null,
     liveness_file: ?std.Io.File = null,
     output_thread: ?std.Thread = null,
@@ -1619,7 +1872,7 @@ const Session = struct {
     screen_available: bool = true,
     durable: terminal_store.DurableSession,
     workspace_root: []u8,
-    child_released: bool = false,
+    launch_phase: std.atomic.Value(LaunchPhase) = .init(.prepared),
 
     fn init(
         alloc: Allocator,
@@ -1629,7 +1882,9 @@ const Session = struct {
         id: []u8,
         request: contracts.StartRequest,
         persistence: contracts.StartPersistence,
+        cancel_flag: read_cancellation.CancelFlag,
     ) !Session {
+        try read_cancellation.check(cancel_flag);
         var login_shell_buffer: [4096]u8 = undefined;
         const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
         const invocation = try shell_resolver.resolve(configured, request.shell);
@@ -1674,6 +1929,7 @@ const Session = struct {
             .dimensions = dimensions,
             .persistence = persistence,
             .now_ms = now_ms,
+            .cancel_flag = cancel_flag,
         });
         return .{
             .alloc = alloc,
@@ -1783,11 +2039,19 @@ const Session = struct {
         request: contracts.StartRequest,
         durable_root: []const u8,
         transport_root: []const u8,
+        cancelled: *const std.atomic.Value(bool),
     ) !void {
+        self.launch_phase.store(.launching, .release);
+        errdefer if (self.launch_phase.load(.acquire) != .released) self.launch_phase.store(.failed, .release);
+        try self.checkLaunchCancellation(cancelled);
         try switch (request.backend) {
-            .native => self.launchNative(request),
-            .tmux => self.launchTmux(request, durable_root, transport_root),
+            .native => self.launchNative(request, cancelled),
+            .tmux => self.launchTmux(request, durable_root, transport_root, cancelled),
         };
+    }
+
+    fn checkLaunchCancellation(self: *Session, cancelled: *const std.atomic.Value(bool)) error{Cancelled}!void {
+        if (cancelled.load(.acquire) or self.backend_detaching.load(.acquire)) return error.Cancelled;
     }
 
     fn startTimeoutWatcher(self: *Session) !void {
@@ -1827,7 +2091,8 @@ const Session = struct {
             return;
         }
         self.mutex.unlock(zio);
-        self.durable.mark_timed_out(io_mod.milliTimestamp()) catch |err| {
+        self.durable.mark_timed_out(io_mod.milliTimestamp(), &self.backend_detaching) catch |err| {
+            if (err == error.Cancelled) return;
             debug_trace.logf(
                 "terminal_host",
                 "terminal timeout persistence failed id={s} err={s}",
@@ -1842,6 +2107,7 @@ const Session = struct {
         request: contracts.StartRequest,
         durable_root: []const u8,
         transport_root: []const u8,
+        cancelled: *const std.atomic.Value(bool),
     ) !void {
         var invocation = try shell_resolver.resolve(
             null,
@@ -1876,6 +2142,7 @@ const Session = struct {
         defer self.alloc.free(source_command);
         if (request.command != null) invocation.setCommand(source_command);
 
+        try self.checkLaunchCancellation(cancelled);
         var backend = try tmux_session.Backend.start(
             self.alloc,
             self.durable.profile.process_provider,
@@ -1933,7 +2200,7 @@ const Session = struct {
         self.backend_started = true;
         self.control_thread = std.Thread.spawn(.{}, tmuxControlMain, .{self}) catch |err| {
             self.backend_started = false;
-            self.tmux_backend.?.stopCapture();
+            self.tmux_backend.?.stopCapture(&self.backend_detaching);
             self.tmux_capture.?.close(io_mod.getIo());
             self.tmux_capture = null;
             self.output_thread.?.join();
@@ -1944,11 +2211,12 @@ const Session = struct {
             return err;
         };
         maybeDelayForTest("FX_TERMINAL_TEST_TMUX_PREPARED_RELEASE_DELAY_MS");
+        try self.checkLaunchCancellation(cancelled);
         self.tmux_backend.?.release() catch |err| {
             self.tmux_backend.?.killSession();
             return err;
         };
-        self.child_released = true;
+        self.launch_phase.store(.released, .release);
     }
 
     fn recoverTmux(
@@ -2048,12 +2316,13 @@ const Session = struct {
             return err;
         };
         if (tmuxRecoveryFailure(self.id, "screen-reanchor")) return error.InjectedFailure;
-        self.child_released = true;
+        self.launch_phase.store(.released, .release);
 
         if (terminal_present) {
             try self.applyRecoveredTmuxFrames(frames);
             try recovered.cleanupChecked(
                 self.durable.profile.process_provider,
+                null,
             );
             recovered.deinit();
             self.tmux_backend = null;
@@ -2085,7 +2354,7 @@ const Session = struct {
                 debug_trace.logf("terminal_host", "tmux recovery stage=release-prepared id={s} err={s}", .{ self.id, @errorName(err) });
                 return err;
             };
-            self.child_released = true;
+            self.launch_phase.store(.released, .release);
             if (tmuxRecoveryFailure(self.id, "release")) return error.InjectedFailure;
         }
         if (tmuxRecoveryFailure(self.id, "control-thread")) return error.InjectedFailure;
@@ -2167,7 +2436,7 @@ const Session = struct {
         }
     }
 
-    fn launchNative(self: *Session, request: contracts.StartRequest) !void {
+    fn launchNative(self: *Session, request: contracts.StartRequest, cancelled: *const std.atomic.Value(bool)) !void {
         var invocation = try shell_resolver.resolve(
             null,
             pinnedShell(request.shell, self.shell),
@@ -2231,6 +2500,7 @@ const Session = struct {
             .handle = pty.slave,
             .flags = .{ .nonblocking = false },
         };
+        try self.checkLaunchCancellation(cancelled);
         var child = try std.process.spawn(io_mod.getIo(), .{
             .argv = &helper_argv,
             .stdin = .pipe,
@@ -2239,6 +2509,9 @@ const Session = struct {
         });
         var child_owned = true;
         errdefer if (child_owned) child.kill(io_mod.getIo());
+        var launcher_pid_buffer: [32]u8 = undefined;
+        const launcher_pid = try std.fmt.bufPrint(&launcher_pid_buffer, "{d}", .{child.id orelse return error.ChildIdentityMissing});
+        const launcher_token = try self.durable.profile.process_provider.captureToken(self.alloc, launcher_pid);
         closeFd(pty.slave);
         slave_open = false;
 
@@ -2277,15 +2550,20 @@ const Session = struct {
         child.stderr = null;
         var control_open = true;
         errdefer if (control_open) control.close(io_mod.getIo());
-        const prepared = readControlFile(control) catch
-            return error.LauncherNotPrepared;
+        const prepared = readControlFile(control, &self.backend_detaching) catch |err| switch (err) {
+            error.Cancelled => return error.Cancelled,
+            else => return error.LauncherNotPrepared,
+        };
         if (prepared.kind != .prepared) return error.LauncherNotPrepared;
 
+        self.mutex.lockUncancelable(io_mod.getIo());
         self.master_fd = pty.master;
         master_open = false;
         self.launcher = child;
+        self.launcher_token = launcher_token;
         child_owned = false;
         self.control_file = control;
+        self.mutex.unlock(io_mod.getIo());
         control_open = false;
         self.output_active.store(true, .release);
         self.output_thread = std.Thread.spawn(.{}, outputMain, .{self}) catch |err| {
@@ -2304,13 +2582,17 @@ const Session = struct {
         if (request.command == null) {
             try writeAllFd(self.master_fd.?, source_command, true);
         }
+        self.write_mutex.lockUncancelable(io_mod.getIo());
+        defer self.write_mutex.unlock(io_mod.getIo());
+        try self.checkLaunchCancellation(cancelled);
         self.liveness_file = input;
         input_open = false;
         try input.writeStreamingAll(io_mod.getIo(), &.{1});
-        self.child_released = true;
+        self.launch_phase.store(.released, .release);
     }
 
     fn deinit(self: *Session) void {
+        const already_detaching = self.backend_detaching.load(.acquire);
         self.shutdown();
         self.stopTimeoutWatcher();
         if (self.backend_started) {
@@ -2326,7 +2608,8 @@ const Session = struct {
             }
         }
         if (self.tmux_backend) |*backend| {
-            if (!self.close_committed) backend.killSession();
+            if (!self.close_committed and !already_detaching) backend.killSession();
+            if (!self.close_committed and already_detaching) debug_trace.logf("terminal_host", "session destruction leaves prior forced namespace outcome unchanged id={s}", .{self.id});
             backend.deinit();
             self.tmux_backend = null;
         }
@@ -2351,7 +2634,7 @@ const Session = struct {
             return;
         }
         self.backend_detaching.store(true, .release);
-        if (self.tmux_backend) |*backend| backend.stopCapture();
+        if (self.tmux_backend) |*backend| backend.stopCapture(&self.backend_detaching);
         if (self.tmux_capture) |stream| {
             stream.close(io_mod.getIo());
             self.tmux_capture = null;
@@ -2376,6 +2659,7 @@ const Session = struct {
         const backend = if (self.tmux_backend) |*value| value else return;
         backend.cleanupChecked(
             self.durable.profile.process_provider,
+            null,
         ) catch |err| {
             backend.deinitRetainingOwnedNamespace();
             self.tmux_backend = null;
@@ -2386,7 +2670,7 @@ const Session = struct {
     }
 
     fn stopTmuxRecoveryHandles(self: *Session) void {
-        if (self.tmux_backend) |*backend| backend.stopCapture();
+        if (self.tmux_backend) |*backend| backend.stopCapture(&self.backend_detaching);
         if (self.tmux_capture) |stream| {
             stream.close(io_mod.getIo());
             self.tmux_capture = null;
@@ -2399,6 +2683,7 @@ const Session = struct {
     }
 
     fn shutdown(self: *Session) void {
+        self.backend_detaching.store(true, .release);
         self.timeout_done.set(io_mod.getIo());
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);
@@ -2420,7 +2705,7 @@ const Session = struct {
             self.control_thread = null;
         }
         self.backend_started = false;
-        self.durable.release_completed_handles();
+        self.durable.release_completed_handles(&self.backend_detaching);
     }
 
     fn markLive(self: *Session) void {
@@ -2455,11 +2740,14 @@ const Session = struct {
             @as(u64, @intCast(std.math.maxInt(i64))),
         ));
         while (true) {
-            if (cancelled.load(.acquire)) return .cancelled;
+            if (cancelled.load(.acquire) or self.backend_detaching.load(.acquire)) return .cancelled;
             const now = io_mod.milliTimestamp();
             const zio = io_mod.getIo();
-            self.mutex.lockUncancelable(zio);
-            const outcome = self.matchConditionLocked(condition, now);
+            read_cancellation.lock(zio, &self.mutex, &self.backend_detaching) catch return .cancelled;
+            const outcome = self.matchConditionLocked(condition, now) catch {
+                self.mutex.unlock(zio);
+                return .cancelled;
+            };
             const lost = self.lifecycle == .lost;
             self.mutex.unlock(zio);
             if (outcome) |value| return value;
@@ -2489,7 +2777,7 @@ const Session = struct {
         self: *Session,
         condition: contracts.ReturnCondition,
         now_ms: i64,
-    ) ?contracts.ReturnOutcome {
+    ) error{Cancelled}!?contracts.ReturnOutcome {
         if (self.term) |term| return outcomeFromTerm(term);
         return switch (condition) {
             .started => if (self.lifecycle == .running) .started else null,
@@ -2515,10 +2803,15 @@ const Session = struct {
                     else
                         null;
                 }
-                break :blk if (self.durable.contains(
+                const output = try self.durable.outputState(&self.backend_detaching);
+                break :blk if (self.durable.containsCancellable(
                     pattern,
-                    self.durable.available_cursor(),
-                ) catch false)
+                    output.available_cursor,
+                    &self.backend_detaching,
+                ) catch |err| switch (err) {
+                    error.Cancelled => return error.Cancelled,
+                    else => false,
+                })
                     .condition_met
                 else
                     null;
@@ -2530,14 +2823,16 @@ const Session = struct {
         self: *Session,
         outcome: contracts.ReturnOutcome,
         authorization: terminal_store.Authorization,
-    ) Allocator.Error!contracts.OwnedResult {
+    ) (Allocator.Error || error{Cancelled})!contracts.OwnedResult {
         const zio = io_mod.getIo();
-        self.mutex.lockUncancelable(zio);
+        try read_cancellation.lock(zio, &self.mutex, &self.backend_detaching);
         defer self.mutex.unlock(zio);
+        const facts = try self.durable.factsCancellable(&self.backend_detaching);
+        try read_cancellation.check(&self.backend_detaching);
         return contracts.OwnedResult.init(
             self.alloc,
             .{ .success = .{ .start = .{
-                .session = self.factsLocked(authorization),
+                .session = projectedFacts(facts, authorization),
                 .outcome = outcome,
             } } },
         ) catch return error.OutOfMemory;
@@ -2564,7 +2859,12 @@ const Session = struct {
         self: *const Session,
         authorization: terminal_store.Authorization,
     ) contracts.SessionFacts {
-        return projectedFacts(self.durable.facts(), authorization);
+        var facts = self.durable.facts();
+        if (self.backend_detaching.load(.acquire) and (self.term != null or self.backend_done.isSet())) {
+            facts.lifecycle = self.lifecycle;
+            facts.attention = .{};
+        }
+        return projectedFacts(facts, authorization);
     }
 
     fn signalProcess(self: *Session, signal: contracts.Signal) bool {
@@ -2601,6 +2901,24 @@ const Session = struct {
         signal: contracts.Signal,
     ) !?bool {
         const target = self.signalTarget() orelse return null;
+        return try self.signalVerifiedTerminalTree(target, signal);
+    }
+
+    fn signalForOwnerExit(self: *Session) !?bool {
+        const target = captured: {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            defer self.mutex.unlock(io_mod.getIo());
+            if (self.child_pid) |pid| if (self.child_token) |token| break :captured SignalTarget{ .pid = pid, .token = token };
+            const launcher = self.launcher orelse return null;
+            break :captured SignalTarget{
+                .pid = launcher.id orelse return null,
+                .token = self.launcher_token orelse return false,
+            };
+        };
+        return try self.signalVerifiedTerminalTree(target, .kill);
+    }
+
+    fn signalVerifiedTerminalTree(self: *Session, target: SignalTarget, signal: contracts.Signal) !bool {
         if (!self.matchesSignalTarget(target)) return false;
         if (failSignalStageForTest("refresh")) {
             return error.ProcessIdentityUnavailable;
@@ -2676,13 +2994,26 @@ const Session = struct {
 
     fn appendOutput(self: *Session, bytes: []const u8) void {
         const zio = io_mod.getIo();
-        self.write_mutex.lockUncancelable(zio);
+        read_cancellation.lock(zio, &self.write_mutex, &self.backend_detaching) catch {
+            debug_trace.logf("terminal_host", "output append abandoned id={s} reason=owner_shutdown", .{self.id});
+            return;
+        };
         defer self.write_mutex.unlock(zio);
         var feed_result: ?terminal_engine.FeedResult = null;
+        defer if (feed_result) |*result| result.deinit(self.alloc);
         var checkpoint_cursor: ?contracts.RawCursor = null;
-        self.mutex.lockUncancelable(zio);
+        read_cancellation.lock(zio, &self.mutex, &self.backend_detaching) catch {
+            debug_trace.logf("terminal_host", "output append abandoned id={s} reason=owner_shutdown", .{self.id});
+            return;
+        };
         const now_ms = io_mod.milliTimestamp();
-        self.durable.append(bytes, now_ms) catch |err| {
+        const appended = self.durable.appendOutput(bytes, now_ms, &self.backend_detaching) catch |err| {
+            if (err == error.Cancelled) {
+                self.screen_available = false;
+                debug_trace.logf("terminal_host", "output append abandoned id={s} reason=owner_shutdown", .{self.id});
+                self.mutex.unlock(zio);
+                return;
+            }
             const cursor = self.durable.record.output_cursor;
             debug_trace.logf(
                 "terminal_host",
@@ -2701,17 +3032,21 @@ const Session = struct {
         };
         if (self.screen_available) {
             const feed_mode: terminal_engine.FeedMode = if (self.durable.record.backend == .tmux) .tmux_live else .native_live;
-            feed_result = self.engine.feedMode(bytes, feed_mode) catch |err| blk: {
+            feed_result = self.engine.feedModeCancellable(bytes, feed_mode, &self.backend_detaching) catch |err| blk: {
                 self.screen_available = false;
                 debug_trace.logf(
                     "terminal_host",
                     "screen feed unavailable id={s} err={s}",
                     .{ self.id, @errorName(err) },
                 );
+                if (err == error.Cancelled) {
+                    self.mutex.unlock(zio);
+                    return;
+                }
                 break :blk null;
             };
             if (feed_result != null) {
-                checkpoint_cursor = self.durable.checkpoint_due_cursor();
+                checkpoint_cursor = appended.checkpoint_cursor;
             }
         }
         self.last_output_ms = now_ms;
@@ -2720,18 +3055,25 @@ const Session = struct {
                 self.command_start_cursor != null;
             if (eligible) {
                 const anchor = self.command_start_cursor orelse
-                    self.durable.available_cursor();
-                self.startup_match_seen = self.durable.contains(
+                    appended.available_cursor;
+                self.startup_match_seen = self.durable.containsCancellable(
                     self.startup_match.?,
                     anchor,
-                ) catch false;
+                    &self.backend_detaching,
+                ) catch |err| failed: {
+                    if (err == error.Cancelled) {
+                        debug_trace.logf("terminal_host", "startup match scan abandoned id={s} reason=owner_shutdown", .{self.id});
+                        self.mutex.unlock(zio);
+                        return;
+                    }
+                    break :failed false;
+                };
             }
         }
         const master_fd = if (self.input_quiesced) null else self.master_fd;
         self.mutex.unlock(zio);
 
         if (feed_result) |*result| {
-            defer result.deinit(self.alloc);
             if (self.durable.record.backend == .tmux) {
                 std.debug.assert(result.replies.items.len == 0);
             } else {
@@ -2750,10 +3092,10 @@ const Session = struct {
         }
 
         if (checkpoint_cursor) |cursor| {
-            self.mutex.lockUncancelable(zio);
+            read_cancellation.lock(zio, &self.mutex, &self.backend_detaching) catch return;
             defer self.mutex.unlock(zio);
             if (!self.screen_available) return;
-            self.checkpointLocked(cursor, now_ms) catch |err| {
+            self.checkpointLockedCancellable(cursor, now_ms, &self.backend_detaching) catch |err| {
                 debug_trace.logf(
                     "terminal_host",
                     "screen checkpoint failed id={s} err={s}",
@@ -2780,24 +3122,37 @@ const Session = struct {
         applied_cursor: contracts.RawCursor,
         now_ms: i64,
     ) !void {
+        return self.checkpointLockedCancellable(applied_cursor, now_ms, null) catch |err| switch (err) {
+            error.Cancelled => unreachable,
+            inline else => |other| return other,
+        };
+    }
+
+    fn checkpointLockedCancellable(self: *Session, applied_cursor: contracts.RawCursor, now_ms: i64, cancel_flag: read_cancellation.CancelFlag) !void {
+        const output = try self.durable.outputState(cancel_flag);
         if (contracts.compare_raw_cursors(
             applied_cursor,
-            self.durable.output_cursor(),
+            output.output_cursor,
         ) != .eq) return error.InvalidCheckpoint;
-        const payload = try self.engine.checkpointPayload(self.alloc);
+        const payload = try self.engine.checkpointPayloadCancellable(self.alloc, cancel_flag);
         defer self.alloc.free(payload);
+        try read_cancellation.check(cancel_flag);
         const payload_len = std.math.cast(u32, payload.len) orelse
             return error.CheckpointTooLarge;
         const envelope = contracts.CheckpointEnvelope{
             .engine_schema_revision = terminal_engine.checkpoint_schema_revision,
             .applied_cursor = applied_cursor,
             .payload_len = payload_len,
-            .checksum = contracts.checkpoint_checksum(payload),
+            .checksum = try read_cancellation.sha256(payload, cancel_flag),
         };
-        try self.durable.store_checkpoint(envelope, payload, now_ms);
+        try self.durable.storeCheckpoint(envelope, payload, now_ms, cancel_flag);
     }
 
     fn handleControl(self: *Session, frame: ControlFrame) void {
+        if (self.backend_detaching.load(.acquire)) switch (frame.kind) {
+            .prepared, .shell_ready, .command_started => return,
+            .command_exited, .command_signal, .startup_failed, .invalid_term => {},
+        };
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);
         const closing = self.close_committed;
@@ -2814,6 +3169,7 @@ const Session = struct {
                     if (self.tmux_backend == null and
                         !self.establishStartupBoundary())
                     {
+                        if (self.backend_detaching.load(.acquire)) return;
                         debug_trace.logf(
                             "terminal_host",
                             "terminal shell boundary unavailable id={s}",
@@ -2855,6 +3211,7 @@ const Session = struct {
                     return;
                 }
                 if (!self.establishStartupBoundary()) {
+                    if (self.backend_detaching.load(.acquire)) return;
                     debug_trace.logf(
                         "terminal_host",
                         "terminal command boundary unavailable id={s}",
@@ -2865,6 +3222,7 @@ const Session = struct {
                 }
                 self.publishStarted(frame.value);
                 if (!self.releaseCommandEvaluation()) {
+                    if (self.backend_detaching.load(.acquire)) return;
                     debug_trace.logf(
                         "terminal_host",
                         "tmux recovered command release unavailable id={s}",
@@ -2945,7 +3303,7 @@ const Session = struct {
             return;
         }
         const zio = io_mod.getIo();
-        self.mutex.lockUncancelable(zio);
+        read_cancellation.lock(zio, &self.mutex, &self.backend_detaching) catch return;
         if (self.lifecycle != .starting or
             (self.child_pid != null and !self.recovered_start_identity))
         {
@@ -2960,7 +3318,12 @@ const Session = struct {
                 pid_text,
                 token.?,
                 io_mod.milliTimestamp(),
+                &self.backend_detaching,
             ) catch |err| {
+                if (err == error.Cancelled) {
+                    self.mutex.unlock(zio);
+                    return;
+                }
                 debug_trace.logf(
                     "terminal_host",
                     "starting record update failed id={s} err={s}",
@@ -2999,14 +3362,29 @@ const Session = struct {
     fn setTerm(self: *Session, term: std.process.Child.Term) void {
         const zio = io_mod.getIo();
         self.timeout_done.set(zio);
-        self.write_mutex.lockUncancelable(zio);
-        self.mutex.lockUncancelable(zio);
+        if (self.backend_detaching.load(.acquire)) return self.setDetachedTerm(term);
+        read_cancellation.lock(zio, &self.write_mutex, &self.backend_detaching) catch return self.setDetachedTerm(term);
+        read_cancellation.lock(zio, &self.mutex, &self.backend_detaching) catch {
+            self.write_mutex.unlock(zio);
+            return self.setDetachedTerm(term);
+        };
         const final_checkpoint = self.lifecycle == .running and self.screen_available;
         if (final_checkpoint) {
-            self.checkpointLocked(
-                self.durable.output_cursor(),
+            const output = self.durable.outputState(&self.backend_detaching) catch {
+                self.mutex.unlock(zio);
+                self.write_mutex.unlock(zio);
+                return self.setDetachedTerm(term);
+            };
+            self.checkpointLockedCancellable(
+                output.output_cursor,
                 io_mod.milliTimestamp(),
+                &self.backend_detaching,
             ) catch |err| {
+                if (err == error.Cancelled) {
+                    self.mutex.unlock(zio);
+                    self.write_mutex.unlock(zio);
+                    return self.setDetachedTerm(term);
+                }
                 debug_trace.logf(
                     "terminal_host",
                     "final screen checkpoint failed id={s} err={s}",
@@ -3016,7 +3394,7 @@ const Session = struct {
         }
         self.mutex.unlock(zio);
         self.write_mutex.unlock(zio);
-        self.mutex.lockUncancelable(zio);
+        read_cancellation.lock(zio, &self.mutex, &self.backend_detaching) catch return self.setDetachedTerm(term);
         if (self.close_committed) {
             self.term = term;
             self.lifecycle = .closed;
@@ -3049,10 +3427,15 @@ const Session = struct {
             },
         };
         const now_ms = io_mod.milliTimestamp();
-        self.durable.persist_termination(
+        self.durable.persistTermination(
             persisted,
             now_ms,
+            &self.backend_detaching,
         ) catch |err| {
+            if (err == error.Cancelled) {
+                self.mutex.unlock(zio);
+                return self.setDetachedTerm(term);
+            }
             debug_trace.logf(
                 "terminal_host",
                 "termination persistence failed id={s} err={s}",
@@ -3073,6 +3456,19 @@ const Session = struct {
         self.mutex.unlock(zio);
     }
 
+    fn setDetachedTerm(self: *Session, term: std.process.Child.Term) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        self.term = term;
+        self.lifecycle = if (self.close_committed) .closed else switch (self.lifecycle) {
+            .starting => .lost,
+            .running => if (outcomeFromTerm(term) != null) .exited else .lost,
+            else => self.lifecycle,
+        };
+        self.input_quiesced = true;
+        self.mutex.unlock(io_mod.getIo());
+        debug_trace.logf("terminal_host", "final terminal publication skipped id={s} reason=owner_shutdown", .{self.id});
+    }
+
     fn failClosed(
         self: *Session,
         code: contracts.StructuredErrorCode,
@@ -3084,7 +3480,7 @@ const Session = struct {
             self.start_failure = code;
         }
         self.mutex.unlock(zio);
-        self.closeLiveness();
+        if (!self.backend_detaching.load(.acquire)) self.closeLiveness();
     }
 
     fn closeLiveness(self: *Session) void {
@@ -3112,7 +3508,7 @@ const Session = struct {
             if (self.start_failure == null) self.start_failure = .session_lost;
         }
         self.mutex.unlock(zio);
-        self.closeLiveness();
+        if (!self.backend_detaching.load(.acquire)) self.closeLiveness();
     }
 
     fn persistLostLocked(self: *Session, now_ms: i64) void {
@@ -3121,7 +3517,11 @@ const Session = struct {
             if (self.start_failure == null) self.start_failure = .session_lost;
             return;
         }
-        self.durable.persist_lost(now_ms) catch |err| {
+        self.durable.persistLost(now_ms, &self.backend_detaching) catch |err| {
+            if (err == error.Cancelled) {
+                debug_trace.logf("terminal_host", "terminal loss publication skipped id={s} reason=owner_shutdown", .{self.id});
+                return;
+            }
             debug_trace.logf(
                 "terminal_host",
                 "lost record update failed id={s} err={s}",
@@ -3148,25 +3548,26 @@ const Session = struct {
             maybeDelayForTest("FX_TERMINAL_TEST_COMMAND_BOUNDARY_DELAY_MS");
         }
         const zio = io_mod.getIo();
-        self.mutex.lockUncancelable(zio);
+        read_cancellation.lock(zio, &self.mutex, &self.backend_detaching) catch return;
+        defer self.mutex.unlock(zio);
         if (self.command != null) {
-            self.command_start_cursor = self.durable.output_cursor();
+            const output = self.durable.outputState(&self.backend_detaching) catch return;
+            self.command_start_cursor = output.output_cursor;
             self.startup_match_seen = false;
         }
         self.last_output_ms = io_mod.milliTimestamp();
-        self.mutex.unlock(zio);
     }
 
     fn releaseCommandEvaluation(self: *Session) bool {
         const zio = io_mod.getIo();
-        self.write_mutex.lockUncancelable(zio);
+        read_cancellation.lock(zio, &self.write_mutex, &self.backend_detaching) catch return false;
         defer self.write_mutex.unlock(zio);
-        self.mutex.lockUncancelable(zio);
+        read_cancellation.lock(zio, &self.mutex, &self.backend_detaching) catch return false;
         const file = self.liveness_file;
         const tmux = if (self.tmux_backend) |*backend| backend else null;
         const running = self.lifecycle == .running;
         self.mutex.unlock(zio);
-        if (!running) return false;
+        if (!running or self.backend_detaching.load(.acquire)) return false;
         if (tmux) |backend| {
             backend.releaseCommand() catch return false;
             return true;
@@ -3196,6 +3597,7 @@ fn pinnedShell(
 fn screenAction(
     session: *Session,
     request: contracts.SessionRequest,
+    cancelled: *const std.atomic.Value(bool),
 ) !contracts.OwnedResult {
     const authorization = try session.durable.authorize(
         request.authority.?,
@@ -3212,7 +3614,7 @@ fn screenAction(
         recovered = try reconstructEngine(session.alloc, &session.durable);
         break :blk &recovered.?;
     };
-    var snapshot = try grid.renderSnapshot(session.alloc);
+    var snapshot = try grid.renderSnapshotCancellable(session.alloc, cancelled);
     defer snapshot.deinit(session.alloc);
     return contracts.OwnedResult.init(
         session.alloc,
@@ -3227,10 +3629,11 @@ fn screenDurable(
     alloc: Allocator,
     durable: *terminal_store.DurableSession,
     authorization: terminal_store.Authorization,
+    cancelled: *const std.atomic.Value(bool),
 ) !contracts.OwnedResult {
     var grid = try reconstructEngine(alloc, durable);
     defer grid.deinit();
-    var snapshot = try grid.renderSnapshot(alloc);
+    var snapshot = try grid.renderSnapshotCancellable(alloc, cancelled);
     defer snapshot.deinit(alloc);
     const facts = projectedFacts(durable.facts(), authorization);
     return contracts.OwnedResult.init(
@@ -3496,7 +3899,7 @@ fn readAction(
     const zio = io_mod.getIo();
     session.mutex.lockUncancelable(zio);
     defer session.mutex.unlock(zio);
-    defer session.durable.release_completed_handles();
+    defer session.durable.release_completed_handles(&session.backend_detaching);
     var page = try session.durable.read(
         session.alloc,
         request.cursor,
@@ -3635,13 +4038,14 @@ fn resizeAction(
     request: contracts.ResizeRequest,
 ) !contracts.OwnedResult {
     const zio = io_mod.getIo();
-    session.write_mutex.lockUncancelable(zio);
+    try read_cancellation.lock(zio, &session.write_mutex, &session.backend_detaching);
     defer session.write_mutex.unlock(zio);
-    const authorization = try session.durable.authorize(
+    const authorization = try session.durable.authorizeCancellable(
         request.authority.?,
         .resize,
+        &session.backend_detaching,
     );
-    session.mutex.lockUncancelable(zio);
+    try read_cancellation.lock(zio, &session.mutex, &session.backend_detaching);
     const fd = session.master_fd;
     const tmux_ready = session.tmux_backend != null;
     const valid = session.lifecycle == .starting or session.lifecycle == .running;
@@ -3655,32 +4059,34 @@ fn resizeAction(
     }
     const previous_dimensions = session.dimensions;
     const now_ms = io_mod.milliTimestamp();
-    session.durable.check_resize_capacity(request.dimensions) catch |err| {
+    session.durable.checkResizeCapacityCancellable(request.dimensions, &session.backend_detaching) catch |err| {
         session.mutex.unlock(zio);
         return err;
     };
-    const previous_payload = session.engine.checkpointPayload(session.alloc) catch |err| {
+    const previous_payload = session.engine.checkpointPayloadCancellable(session.alloc, &session.backend_detaching) catch |err| {
         session.mutex.unlock(zio);
         return err;
     };
     defer session.alloc.free(previous_payload);
-    var resized_engine = terminal_engine.Grid.restoreCheckpoint(
+    var resized_engine = terminal_engine.Grid.restoreCheckpointCancellable(
         session.alloc,
         previous_payload,
+        &session.backend_detaching,
     ) catch |err| {
         session.mutex.unlock(zio);
         return err;
     };
     var resized_engine_owned = true;
     defer if (resized_engine_owned) resized_engine.deinit();
-    resized_engine.resize(
+    resized_engine.resizeCancellable(
         request.dimensions.columns,
         request.dimensions.rows,
+        &session.backend_detaching,
     ) catch |err| {
         session.mutex.unlock(zio);
         return err;
     };
-    session.durable.resize(request.dimensions, now_ms) catch |err| {
+    session.durable.resizeCancellable(request.dimensions, now_ms, &session.backend_detaching) catch |err| {
         session.mutex.unlock(zio);
         return err;
     };
@@ -3689,8 +4095,10 @@ fn resizeAction(
     resized_engine_owned = false;
     session.dimensions = request.dimensions;
     session.mutex.unlock(zio);
+    try read_cancellation.check(&session.backend_detaching);
     if (session.tmux_backend) |*backend| {
-        backend.resize(request.dimensions) catch |err| {
+        backend.resize(request.dimensions, &session.backend_detaching) catch |err| {
+            try read_cancellation.check(&session.backend_detaching);
             rollbackTmuxResize(
                 session,
                 previous_dimensions,
@@ -3700,6 +4108,7 @@ fn resizeAction(
         };
     } else {
         resizeFd(fd.?, request.dimensions) catch |err| {
+            try read_cancellation.check(&session.backend_detaching);
             rollbackDurableResize(
                 session,
                 fd.?,
@@ -3709,6 +4118,7 @@ fn resizeAction(
             return err;
         };
         if (!session.signalNative(std.c.SIG.WINCH)) {
+            try read_cancellation.check(&session.backend_detaching);
             rollbackDurableResize(
                 session,
                 fd.?,
@@ -3719,6 +4129,7 @@ fn resizeAction(
         }
     }
     if (session.tmux_backend != null and tmuxResizeCheckpointFailure()) {
+        try read_cancellation.check(&session.backend_detaching);
         rollbackTmuxResize(
             session,
             previous_dimensions,
@@ -3726,9 +4137,14 @@ fn resizeAction(
         );
         return error.InjectedFailure;
     }
-    session.mutex.lockUncancelable(zio);
-    session.checkpointLocked(session.durable.output_cursor(), now_ms) catch |err| {
+    try read_cancellation.lock(zio, &session.mutex, &session.backend_detaching);
+    const output = session.durable.outputState(&session.backend_detaching) catch |err| {
         session.mutex.unlock(zio);
+        return err;
+    };
+    session.checkpointLockedCancellable(output.output_cursor, now_ms, &session.backend_detaching) catch |err| {
+        session.mutex.unlock(zio);
+        if (err == error.Cancelled) return err;
         if (session.tmux_backend != null) {
             rollbackTmuxResize(
                 session,
@@ -3746,12 +4162,13 @@ fn resizeAction(
         return err;
     };
     session.mutex.unlock(zio);
-    session.mutex.lockUncancelable(zio);
+    try read_cancellation.lock(zio, &session.mutex, &session.backend_detaching);
     defer session.mutex.unlock(zio);
+    const facts = try session.durable.factsCancellable(&session.backend_detaching);
     return contracts.OwnedResult.init(
         session.alloc,
         .{ .success = .{ .resize = .{
-            .session = session.factsLocked(authorization),
+            .session = projectedFacts(facts, authorization),
             .dimensions = request.dimensions,
         } } },
     ) catch return error.OutOfMemory;
@@ -3783,9 +4200,10 @@ fn rollbackDurableResize(
     dimensions: contracts.Dimensions,
     checkpoint_payload: []const u8,
 ) void {
+    read_cancellation.check(&session.backend_detaching) catch return;
     resizeFd(fd, dimensions) catch |err| {
         const zio = io_mod.getIo();
-        session.mutex.lockUncancelable(zio);
+        read_cancellation.lock(zio, &session.mutex, &session.backend_detaching) catch return;
         session.screen_available = false;
         session.mutex.unlock(zio);
         debug_trace.logf(
@@ -3797,7 +4215,7 @@ fn rollbackDurableResize(
     };
     if (!session.signalNative(std.c.SIG.WINCH)) {
         const zio = io_mod.getIo();
-        session.mutex.lockUncancelable(zio);
+        read_cancellation.lock(zio, &session.mutex, &session.backend_detaching) catch return;
         session.screen_available = false;
         session.mutex.unlock(zio);
         debug_trace.logf(
@@ -3815,10 +4233,11 @@ fn rollbackTmuxResize(
     dimensions: contracts.Dimensions,
     checkpoint_payload: []const u8,
 ) void {
+    read_cancellation.check(&session.backend_detaching) catch return;
     const backend = if (session.tmux_backend) |*value| value else return;
-    backend.resize(dimensions) catch |err| {
+    backend.resize(dimensions, &session.backend_detaching) catch |err| {
         const zio = io_mod.getIo();
-        session.mutex.lockUncancelable(zio);
+        read_cancellation.lock(zio, &session.mutex, &session.backend_detaching) catch return;
         session.screen_available = false;
         session.mutex.unlock(zio);
         debug_trace.logf(
@@ -3836,12 +4255,16 @@ fn restoreDurableResize(
     dimensions: contracts.Dimensions,
     checkpoint_payload: []const u8,
 ) void {
-    var restored = terminal_engine.Grid.restoreCheckpoint(
+    var restored = terminal_engine.Grid.restoreCheckpointCancellable(
         session.alloc,
         checkpoint_payload,
+        &session.backend_detaching,
     ) catch |err| {
         const zio = io_mod.getIo();
-        session.mutex.lockUncancelable(zio);
+        read_cancellation.lock(zio, &session.mutex, &session.backend_detaching) catch {
+            debug_trace.logf("terminal_host", "resize rollback abandoned id={s} reason=owner_shutdown", .{session.id});
+            return;
+        };
         session.screen_available = false;
         session.mutex.unlock(zio);
         debug_trace.logf(
@@ -3854,9 +4277,9 @@ fn restoreDurableResize(
     var restored_owned = true;
     defer if (restored_owned) restored.deinit();
     const zio = io_mod.getIo();
-    session.mutex.lockUncancelable(zio);
+    read_cancellation.lock(zio, &session.mutex, &session.backend_detaching) catch return;
     defer session.mutex.unlock(zio);
-    session.durable.resize(dimensions, io_mod.milliTimestamp()) catch |err| {
+    session.durable.resizeCancellable(dimensions, io_mod.milliTimestamp(), &session.backend_detaching) catch |err| {
         session.screen_available = false;
         debug_trace.logf(
             "terminal_host",
@@ -3870,9 +4293,11 @@ fn restoreDurableResize(
     restored_owned = false;
     session.dimensions = dimensions;
     session.screen_available = true;
-    session.checkpointLocked(
-        session.durable.output_cursor(),
+    const output = session.durable.outputState(&session.backend_detaching) catch return;
+    session.checkpointLockedCancellable(
+        output.output_cursor,
         io_mod.milliTimestamp(),
+        &session.backend_detaching,
     ) catch |err| debug_trace.logf(
         "terminal_host",
         "screen resize rollback checkpoint failed id={s} err={s}",
@@ -4045,7 +4470,7 @@ fn closeAction(
     session.mutex.unlock(zio);
     session.finalizeBackend();
     if (session.tmux_backend) |*backend| {
-        try backend.cleanupChecked(session.durable.profile.process_provider);
+        try backend.cleanupChecked(session.durable.profile.process_provider, null);
     }
     try session.durable.finish_close(io_mod.milliTimestamp());
     if (force_signal_attempted and forceCloseSignalIncomplete(force_tree_complete)) {
@@ -4123,6 +4548,33 @@ test "PTY output drains use a nonblocking master" {
     const flags: usize = @intCast(result);
     const nonblocking = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
     try std.testing.expect(flags & nonblocking != 0);
+}
+
+test "terminal protocol replies return when the real PTY input buffer is full" {
+    if (comptime !isSupported()) return;
+    const pty = try openPty();
+    defer closeFd(pty.master);
+    defer closeFd(pty.slave);
+    var termios = try std.posix.tcgetattr(pty.slave);
+    termios.lflag.ICANON = false;
+    termios.lflag.ECHO = false;
+    try std.posix.tcsetattr(pty.slave, .NOW, termios);
+    const fill = "x" ** 8192;
+    var full = false;
+    var written: usize = 0;
+    while (!full and written < 16 * 1024 * 1024) {
+        written += (std.Io.File{ .handle = pty.master, .flags = .{ .nonblocking = true } }).writeStreaming(io_mod.getIo(), "", &.{fill}, 1) catch |err| switch (err) {
+            error.WouldBlock => blk: {
+                full = true;
+                break :blk 0;
+            },
+            else => return err,
+        };
+    }
+    try std.testing.expect(full);
+    const started = io_mod.nanoTimestamp();
+    try std.testing.expectError(error.WouldBlock, writeAllFd(pty.master, "\x1b[1;1R", true));
+    try std.testing.expect(io_mod.nanoTimestamp() - started < 500 * std.time.ns_per_ms);
 }
 
 fn resizeFd(fd: std.posix.fd_t, dimensions: contracts.Dimensions) !void {
@@ -4246,9 +4698,12 @@ fn writeControlFd(fd: std.posix.fd_t, kind: ControlKind, value: u32) !void {
     try writeAllFd(fd, &bytes, false);
 }
 
-fn readControlFile(file: std.Io.File) !ControlFrame {
+fn readControlFile(file: std.Io.File, cancel_flag: read_cancellation.CancelFlag) !ControlFrame {
     var bytes: [control_frame_len]u8 = undefined;
-    try readExactFd(file.handle, &bytes);
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        offset += try readAvailableFd(file.handle, bytes[offset..], control_poll_ms, cancel_flag);
+    }
     return .{
         .kind = switch (bytes[0]) {
             1 => .prepared,
@@ -4343,7 +4798,7 @@ fn tmuxControlMain(session: *Session) void {
                 .prepared, .shell_ready, .command_started => false,
             };
             if (terminal_seen) {
-                backend.stopCapture();
+                backend.stopCapture(&session.backend_detaching);
                 if (session.tmux_capture) |stream| {
                     stream.close(io_mod.getIo());
                     session.tmux_capture = null;
@@ -4361,7 +4816,7 @@ fn tmuxControlMain(session: *Session) void {
         if (!terminal_seen) io_mod.sleep(wait_poll_ns);
     }
 
-    if (session.tmux_backend) |*backend| backend.stopCapture();
+    if (session.tmux_backend) |*backend| backend.stopCapture(&session.backend_detaching);
     session.output_done.waitUncancelable(io_mod.getIo());
     if (session.output_thread) |thread| {
         thread.join();
@@ -4388,7 +4843,7 @@ fn controlMain(session: *Session) void {
     }
     const control = session.control_file orelse return;
     while (true) {
-        const frame = readControlFile(control) catch {
+        const frame = readControlFile(control, null) catch {
             const zio = io_mod.getIo();
             session.mutex.lockUncancelable(zio);
             const reported = session.term != null or
@@ -4419,7 +4874,12 @@ fn controlMain(session: *Session) void {
         const reported = session.term != null or session.lifecycle == .lost;
         session.mutex.unlock(zio);
         if (!reported and term != null) {
-            switch (term.?) {
+            if (session.backend_detaching.load(.acquire)) {
+                session.mutex.lockUncancelable(zio);
+                session.lifecycle = .lost;
+                session.mutex.unlock(zio);
+                debug_trace.logf("terminal_host", "terminal loss publication skipped id={s} reason=owner_shutdown", .{session.id});
+            } else switch (term.?) {
                 .exited => |code| if (code != 0) session.markLost(),
                 .signal, .stopped, .unknown => session.markLost(),
             }
@@ -4457,7 +4917,14 @@ fn readOutputChunk(
     buffer: []u8,
     timeout_ms: i32,
 ) !bool {
-    const total = try readAvailableFd(fd, buffer, timeout_ms);
+    const total = readAvailableFd(fd, buffer, timeout_ms, &session.backend_detaching) catch |err| {
+        if (err == error.Cancelled) debug_trace.logf(
+            "terminal_host",
+            "output collection abandoned id={s} reason=backend_shutdown",
+            .{session.id},
+        );
+        return err;
+    };
     if (total == 0) return false;
     session.appendOutput(buffer[0..total]);
     return true;
@@ -4467,10 +4934,12 @@ fn readAvailableFd(
     fd: std.posix.fd_t,
     buffer: []u8,
     timeout_ms: i32,
+    cancelled: ?*const std.atomic.Value(bool),
 ) !usize {
     var total: usize = 0;
     var poll_timeout = timeout_ms;
     while (total < buffer.len) {
+        if (cancelled) |flag| if (flag.load(.acquire)) return error.Cancelled;
         var poll_fds = [_]std.posix.pollfd{.{
             .fd = fd,
             .events = std.posix.POLL.IN,
@@ -4523,12 +4992,146 @@ test "terminal output drain reads final bytes after peer close" {
     closeFd(handles[1]);
 
     var buffer: [128]u8 = undefined;
-    const count = try readAvailableFd(handles[0], &buffer, 1000);
+    const count = try readAvailableFd(handles[0], &buffer, 1000, null);
     try std.testing.expectEqualStrings(sentinel, buffer[0..count]);
     try std.testing.expectError(
         error.EndOfStream,
-        readAvailableFd(handles[0], &buffer, 0),
+        readAvailableFd(handles[0], &buffer, 0, null),
     );
+}
+
+fn testCaptureOutput(mode: enum { idle, active, complete }) !void {
+    const alloc = std.testing.allocator;
+    const zio = io_mod.getIo();
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    var session = try Session.init(alloc, .{ .context = null, .update_fn = ignoreWorkUpdate }, &fixture.profile, "test-host", try alloc.dupe(u8, "terminal-capture-shutdown"), .{
+        .cwd = fixture.home,
+        .shell = .{ .executable = .{ .path = if (builtin.os.tag == .macos) "/bin/zsh" else "/bin/bash" } },
+    }, testPersistence(fixture.home), null);
+    defer session.deinitUnlaunched();
+    var handles: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &handles) != 0) return error.SocketPairFailed;
+    session.tmux_capture = .{ .socket = .{ .handle = handles[0], .address = .{ .ip4 = .unspecified(0) } } };
+    defer session.tmux_capture.?.close(zio);
+    var writer_owned = true;
+    defer if (writer_owned) closeFd(handles[1]);
+    var producer = try std.process.spawn(zio, .{
+        .argv = &.{ "/bin/sh", "-c", switch (mode) {
+            .idle => "printf 'CAPTURE_STARTED\\n'; exec sleep 30",
+            .active => "printf 'CAPTURE_STARTED\\n'; while :; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; done",
+            .complete => "printf 'CAPTURE_STARTED\\n'; i=0; while [ \"$i\" -lt 8192 ]; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; i=$((i+1)); done; printf 'CAPTURE_FINISHED\\n'",
+        } },
+        .stdin = .ignore,
+        .stdout = .{ .file = .{ .handle = handles[1], .flags = .{ .nonblocking = false } } },
+        .stderr = .ignore,
+    });
+    defer if (producer.id != null) producer.kill(zio);
+    const producer_pid = producer.id.?;
+    closeFd(handles[1]);
+    writer_owned = false;
+    session.output_active.store(true, .release);
+    const thread = try std.Thread.spawn(.{}, outputMain, .{&session});
+    var joined = false;
+    defer {
+        if (producer.id != null) producer.kill(zio);
+        if (!joined) thread.join();
+    }
+    var observed = false;
+    const deadline = io_mod.milliTimestamp() + 5000;
+    while (!observed and io_mod.milliTimestamp() < deadline) {
+        session.mutex.lockUncancelable(zio);
+        observed = session.durable.containsCancellable("CAPTURE_STARTED", session.durable.available_cursor(), null) catch false;
+        session.mutex.unlock(zio);
+        if (!observed) io_mod.sleep(wait_poll_ns);
+    }
+    try std.testing.expect(observed);
+    if (mode == .complete) {
+        try session.output_done.waitTimeout(zio, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } });
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try producer.wait(zio));
+        var page = try session.durable.read(alloc, session.durable.available_cursor(), 1024 * 1024);
+        defer page.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, "CAPTURE_STARTED\n".len + 32 * 8192 + "CAPTURE_FINISHED\n".len), page.output.len);
+        try std.testing.expect(std.mem.startsWith(u8, page.output, "CAPTURE_STARTED\n"));
+        try std.testing.expect(std.mem.endsWith(u8, page.output, "CAPTURE_FINISHED\n"));
+        return;
+    }
+    const started = io_mod.nanoTimestamp();
+    session.shutdown();
+    const stopped_while_retained = if (session.output_done.waitTimeout(zio, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(500) } })) |_| true else |_| false;
+    const external_survived = std.c.kill(producer_pid, @enumFromInt(0)) == 0;
+    if (!stopped_while_retained) producer.kill(zio);
+    thread.join();
+    joined = true;
+    const elapsed = io_mod.nanoTimestamp() - started;
+    if (producer.id != null) producer.kill(zio);
+    try std.testing.expect(stopped_while_retained);
+    try std.testing.expect(elapsed < 500 * std.time.ns_per_ms);
+    try std.testing.expect(external_survived);
+}
+
+test "capture shutdown stops after reading from an externally retained idle socket" {
+    if (comptime !isSupported() or builtin.single_threaded) return error.SkipZigTest;
+    try testCaptureOutput(.idle);
+}
+
+test "launch control cancellation interrupts a partially received frame" {
+    if (comptime !isSupported() or builtin.single_threaded) return error.SkipZigTest;
+    const Reader = struct {
+        file: std.Io.File,
+        cancelled: std.atomic.Value(bool) = .init(false),
+        done: std.Io.Event = .unset,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            _ = readControlFile(self.file, &self.cancelled) catch |err| {
+                self.failure = err;
+                self.done.set(io_mod.getIo());
+                return;
+            };
+            self.done.set(io_mod.getIo());
+        }
+    };
+    var handles: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &handles) != 0) return error.SocketPairFailed;
+    defer closeFd(handles[0]);
+    var writer_open = true;
+    defer if (writer_open) closeFd(handles[1]);
+    try writeAllFd(handles[1], &.{@intFromEnum(ControlKind.prepared)}, false);
+    var reader = Reader{ .file = .{ .handle = handles[0], .flags = .{ .nonblocking = false } } };
+    const thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+    var joined = false;
+    defer if (!joined) {
+        closeFd(handles[1]);
+        writer_open = false;
+        thread.join();
+    };
+    const read_deadline = io_mod.milliTimestamp() + 5000;
+    while (true) {
+        var unread: c_int = 0;
+        const read_pending: c_int = if (builtin.os.tag == .macos) 0x4004667f else std.c.T.FIONREAD;
+        if (std.c.ioctl(handles[0], read_pending, &unread) != 0) return error.SocketInspectionFailed;
+        if (unread == 0) break;
+        if (io_mod.milliTimestamp() >= read_deadline) return error.TestReadDidNotBegin;
+        io_mod.sleep(wait_poll_ns);
+    }
+    reader.cancelled.store(true, .release);
+    const stopped = if (reader.done.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(200) } })) |_| true else |_| false;
+    closeFd(handles[1]);
+    writer_open = false;
+    thread.join();
+    joined = true;
+    try std.testing.expect(stopped);
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), reader.failure);
+}
+
+test "capture shutdown stops after reading from an active external socket producer" {
+    if (comptime !isSupported() or builtin.single_threaded) return error.SkipZigTest;
+    try testCaptureOutput(.active);
+}
+
+test "capture natural completion drains every byte before publishing output done" {
+    if (comptime !isSupported() or builtin.single_threaded) return error.SkipZigTest;
+    try testCaptureOutput(.complete);
 }
 
 fn maybeDelayForTest(name: []const u8) void {
@@ -4574,6 +5177,8 @@ fn returnOutcomeIsTerminal(outcome: contracts.ReturnOutcome) bool {
 
 fn launchFailureCode(err: anyerror) contracts.StructuredErrorCode {
     return switch (err) {
+        error.Cancelled => .cancelled,
+        error.ProcessIdentityUnavailable => .process_identity_unavailable,
         error.MissingLoginShell => .shell_unavailable,
         error.PtyUnavailable,
         error.ResizeFailed,
@@ -4838,6 +5443,7 @@ fn checkSessionInitAllocationFailures(alloc: Allocator) !void {
             .return_when = .{ .match = "ready" },
         },
         testPersistence("/workspace"),
+        null,
     );
     id_owned = false;
     defer session.deinitUnlaunched();
@@ -4849,6 +5455,1080 @@ test "session initialization owns durable resources" {
         checkSessionInitAllocationFailures,
         .{},
     );
+}
+
+const NativeStartAllocationGate = struct {
+    armed: bool = false,
+    fail_after_release: bool = false,
+    entered: std.Io.Event = .unset,
+    release: std.Io.Event = .unset,
+    blocked: std.atomic.Value(bool) = .init(false),
+
+    fn allocator(self: *@This()) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = free } };
+    }
+    fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, address: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const result = std.testing.allocator.rawAlloc(len, alignment, address) orelse return null;
+        if (self.armed and !self.blocked.swap(true, .acq_rel)) {
+            self.entered.set(io_mod.getIo());
+            self.release.waitUncancelable(io_mod.getIo());
+            if (self.fail_after_release) {
+                std.testing.allocator.rawFree(result[0..len], alignment, address);
+                return null;
+            }
+        }
+        return result;
+    }
+    fn free(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, address: usize) void {
+        std.testing.allocator.rawFree(bytes, alignment, address);
+    }
+};
+
+test "owner exit authenticates before fencing and preserves other saved sessions" {
+    if (comptime !isSupported()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    fixture.profile.process_provider = @import("../../tools/shell/process_provider.zig").provider;
+    var original_source = try std.process.spawn(io_mod.getIo(), .{ .argv = &.{ "/bin/sleep", "30" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+    defer if (original_source.id != null) original_source.kill(io_mod.getIo());
+    const request: contracts.StartRequest = .{ .cwd = fixture.home, .shell = .{ .executable = .{ .path = if (builtin.os.tag == .macos) "/bin/zsh" else "/bin/bash" } } };
+    var session = try Session.init(alloc, .{ .context = null, .update_fn = ignoreWorkUpdate }, &fixture.profile, "test-host", try alloc.dupe(u8, "terminal-owner-exit"), request, testPersistence(fixture.home), null);
+    defer session.deinit();
+    const owner_path = try std.fs.path.join(alloc, &.{ fixture.home, ".fx", "sessions", "terminal-test-owner" });
+    defer alloc.free(owner_path);
+    var owner_dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), owner_path, .{ .iterate = true });
+    defer owner_dir.close(io_mod.getIo());
+    var owner = try @import("../session/session_child_store.zig").SessionChildCapability.init(alloc, owner_dir, owner_path, .writable);
+    defer owner.deinit();
+    const proof = try terminal_store.prepareSessionExitProof(alloc, &owner);
+    var registry = SupportedRegistry{ .alloc = alloc, .tracker = .{ .context = null, .update_fn = ignoreWorkUpdate }, .profile = &fixture.profile, .host_identity = "test-host", .durable_root = fixture.home, .transport_root = fixture.home };
+    registry.slots[0] = .{ .resident = .{ .session = &session, .references = 0 } };
+    var cancelled: std.atomic.Value(bool) = .init(false);
+    var foreign_cancelled: std.atomic.Value(bool) = .init(false);
+    var pending = SupportedRegistry.StartReservation{ .owner_id = "terminal-test-owner", .source = null, .cancelled = &cancelled };
+    var foreign = SupportedRegistry.StartReservation{ .owner_id = "another-saved-session", .source = null, .cancelled = &foreign_cancelled };
+    const pending_slot = registry.reserveSlot(.{ .starting = &pending }).?;
+    var pending_owned = true;
+    defer if (pending_owned) registry.abandonStart(pending_slot.index, &pending);
+    const foreign_slot = registry.reserveSlot(.{ .starting = &foreign }).?;
+    defer registry.abandonStart(foreign_slot.index, &foreign);
+    var pid_buffer: [32]u8 = undefined;
+    const pid = try std.fmt.bufPrint(&pid_buffer, "{d}", .{original_source.id.?});
+    const token = try fixture.profile.process_provider.captureToken(alloc, pid);
+    const source = try contracts.ProcessOwner.init(@intCast(original_source.id.?), token.view());
+    var exit_request = contracts.CloseOwnerRequest{ .authority = .{ .session_id = "terminal-test-owner", .proof = proof }, .process_owner = source };
+    exit_request.authority.proof.bytes[0] ^= 1;
+    var rejected = try registry.executeAuthorized(.{ .close_owner = exit_request }, &cancelled);
+    defer rejected.deinit(alloc);
+    try std.testing.expectEqual(contracts.StructuredErrorCode.authority_denied, rejected.view().failure.code);
+    try std.testing.expect(!cancelled.load(.acquire));
+    try std.testing.expect(!session.backend_detaching.load(.acquire));
+    exit_request.authority.proof = proof;
+    registry.abandonStart(pending_slot.index, &pending);
+    pending_owned = false;
+    var closed = try registry.executeAuthorized(.{ .close_owner = exit_request }, &cancelled);
+    defer closed.deinit(alloc);
+    try std.testing.expect(closed.view() == .success);
+    try std.testing.expect(session.backend_detaching.load(.acquire));
+    try std.testing.expect(!foreign_cancelled.load(.acquire));
+    try std.testing.expect(registry.sourceFencedLocked("terminal-test-owner", source));
+    original_source.kill(io_mod.getIo());
+    var later = try Session.init(alloc, .{ .context = null, .update_fn = ignoreWorkUpdate }, &fixture.profile, "test-host", try alloc.dupe(u8, "terminal-later-owner-exit"), request, testPersistence(fixture.home), null);
+    defer later.deinit();
+    registry.slots[0] = .{ .resident = .{ .session = &later, .references = 0 } };
+    var duplicate = try registry.executeAuthorized(.{ .close_owner = exit_request }, &cancelled);
+    defer duplicate.deinit(alloc);
+    try std.testing.expect(duplicate.view() == .success);
+    try std.testing.expectEqual(@as(u16, 0), duplicate.view().success.close_owner.closed_sessions);
+    try std.testing.expect(!later.backend_detaching.load(.acquire));
+    var late = SupportedRegistry.StartReservation{ .owner_id = "terminal-test-owner", .source = source, .cancelled = &cancelled };
+    try std.testing.expect(registry.reserveSlot(.{ .starting = &late }) == null);
+    try std.testing.expect(cancelled.load(.acquire));
+    const next_pid = try std.fmt.bufPrint(&pid_buffer, "{d}", .{std.c.getpid()});
+    const next_token = try fixture.profile.process_provider.captureToken(alloc, next_pid);
+    const next_source = try contracts.ProcessOwner.init(@intCast(std.c.getpid()), next_token.view());
+    cancelled.store(false, .release);
+    late.source = next_source;
+    const next_slot = registry.reserveSlot(.{ .starting = &late }) orelse return error.TestNextSourceRejected;
+    registry.abandonStart(next_slot.index, &late);
+    registry.finishOwnerExit("terminal-test-owner", source, .failed);
+    var repeated_failure = try registry.executeAuthorized(.{ .close_owner = exit_request }, &cancelled);
+    defer repeated_failure.deinit(alloc);
+    try std.testing.expectEqual(contracts.StructuredErrorCode.session_lost, repeated_failure.view().failure.code);
+    try std.testing.expect(!later.backend_detaching.load(.acquire));
+}
+
+test "claimed cancellation reports a busy profile without losing the lease" {
+    if (comptime !isSupported() or builtin.single_threaded) return error.SkipZigTest;
+    const Cancel = struct {
+        registry: *SupportedRegistry,
+        id: []const u8,
+        claim: contracts.AuthorityClaim,
+        started: std.Io.Event = .unset,
+        done: std.Io.Event = .unset,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.started.set(io_mod.getIo());
+            self.registry.cancelAuthorized(self.id, self.claim) catch |err| {
+                self.failure = err;
+            };
+            self.done.set(io_mod.getIo());
+        }
+    };
+    const alloc = std.testing.allocator;
+    const zio = io_mod.getIo();
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const persistence = testPersistence(fixture.home);
+    const claim: contracts.AuthorityClaim = .{ .principal = persistence.grant.principal, .actor = persistence.grant.actor, .generation = persistence.grant.generation, .proof = persistence.proof };
+    var session = try Session.init(alloc, .{ .context = null, .update_fn = ignoreWorkUpdate }, &fixture.profile, "host", try alloc.dupe(u8, "cancel-busy-profile"), .{ .cwd = fixture.home, .shell = .{ .executable = .{ .path = if (builtin.os.tag == .macos) "/bin/zsh" else "/bin/bash" } } }, persistence, null);
+    defer session.deinitUnlaunched();
+    try fixture.profile.register_resident(&session.durable, null);
+    _ = try session.durable.acquire_write_lease(claim, io_mod.milliTimestamp());
+    var registry = SupportedRegistry{ .alloc = alloc, .tracker = .{ .context = null, .update_fn = ignoreWorkUpdate }, .profile = &fixture.profile, .host_identity = "host", .durable_root = fixture.home, .transport_root = fixture.home };
+    registry.slots[0] = .{ .resident = .{ .session = &session, .references = 0 } };
+    fixture.profile.mutex.lockUncancelable(zio);
+    var held = true;
+    defer if (held) fixture.profile.mutex.unlock(zio);
+    var cancel = Cancel{ .registry = &registry, .id = session.id, .claim = claim };
+    const thread = try std.Thread.spawn(.{}, Cancel.run, .{&cancel});
+    var joined = false;
+    defer if (!joined) {
+        fixture.profile.mutex.unlock(zio);
+        held = false;
+        thread.join();
+    };
+    try cancel.started.waitTimeout(zio, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(5000) } });
+    const finished = if (cancel.done.waitTimeout(zio, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(200) } })) |_| true else |_| false;
+    fixture.profile.mutex.unlock(zio);
+    held = false;
+    thread.join();
+    joined = true;
+    try std.testing.expect(finished);
+    try std.testing.expectEqual(@as(?anyerror, error.LockBusy), cancel.failure);
+    try std.testing.expectEqual(contracts.WriteLease.agent, session.durable.record.attention.write_lease);
+    try std.testing.expectEqual(@as(usize, 0), registry.slots[0].resident.references);
+    try registry.cancelAuthorized(session.id, claim);
+    try std.testing.expectEqual(contracts.WriteLease.none, session.durable.record.attention.write_lease);
+    _ = try session.durable.acquire_write_lease(claim, io_mod.milliTimestamp());
+    var wrong_proof = claim;
+    wrong_proof.proof.bytes[0] ^= 1;
+    try std.testing.expectError(error.InvalidHolderProof, registry.cancelAuthorized(session.id, wrong_proof));
+    var wrong_owner = claim;
+    wrong_owner.principal.durable_session_id = "another-saved-session";
+    try std.testing.expectError(error.PrincipalMismatch, registry.cancelAuthorized(session.id, wrong_owner));
+    try std.testing.expectEqual(contracts.WriteLease.agent, session.durable.record.attention.write_lease);
+}
+
+test "reopened cancellation resolves its exact owner without scanning the profile" {
+    if (comptime !isSupported()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const persistence = testPersistence(fixture.home);
+    const claim: contracts.AuthorityClaim = .{ .principal = persistence.grant.principal, .actor = persistence.grant.actor, .generation = persistence.grant.generation, .proof = persistence.proof };
+    const id = "cancel-exact-owner";
+    var session = try Session.init(alloc, .{ .context = null, .update_fn = ignoreWorkUpdate }, &fixture.profile, "host", try alloc.dupe(u8, id), .{ .cwd = fixture.home, .shell = .{ .executable = .{ .path = if (builtin.os.tag == .macos) "/bin/zsh" else "/bin/bash" } } }, persistence, null);
+    var session_owned = true;
+    defer if (session_owned) session.deinitUnlaunched();
+    _ = try session.durable.acquire_write_lease(claim, io_mod.milliTimestamp());
+    session.deinitUnlaunched();
+    session_owned = false;
+    for (0..128) |index| {
+        var name_buffer: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "unrelated-owner-{d}", .{index});
+        try fixture.profile.sessions_dir.dir.createDir(io_mod.getIo(), name, .fromMode(0o700));
+    }
+    var budget = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 128 });
+    fixture.profile.alloc = budget.allocator();
+    var profile_restored = false;
+    defer if (!profile_restored) {
+        fixture.profile.alloc = alloc;
+    };
+    var registry = SupportedRegistry{ .alloc = alloc, .tracker = .{ .context = null, .update_fn = ignoreWorkUpdate }, .profile = &fixture.profile, .host_identity = "host", .durable_root = fixture.home, .transport_root = fixture.home };
+    const result = registry.cancelAuthorized(id, claim);
+    fixture.profile.alloc = alloc;
+    profile_restored = true;
+    try result;
+    try std.testing.expectEqual(@as(usize, 0), fixture.profile.residents.items.len);
+    const reopened = try fixture.profile.open_terminal(id);
+    defer fixture.profile.release_terminal(reopened);
+    try std.testing.expectEqual(contracts.WriteLease.none, reopened.record.attention.write_lease);
+}
+
+test "owner exit cancels a reserved start before durable initialization" {
+    if (comptime !isSupported() or builtin.single_threaded) return error.SkipZigTest;
+    const Start = struct {
+        registry: *SupportedRegistry,
+        request: contracts.StartRequest,
+        cancelled: std.atomic.Value(bool) = .init(false),
+        result: ?contracts.OwnedResult = null,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.result = self.registry.executeAuthorized(.{ .start = self.request }, &self.cancelled) catch |err| failed: {
+                self.failure = err;
+                break :failed null;
+            };
+        }
+    };
+    const Close = struct {
+        registry: *SupportedRegistry,
+        request: contracts.CloseOwnerRequest,
+        result: ?contracts.OwnedResult = null,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var cancelled: std.atomic.Value(bool) = .init(false);
+            self.result = self.registry.executeAuthorized(.{ .close_owner = self.request }, &cancelled) catch |err| failed: {
+                self.failure = err;
+                break :failed null;
+            };
+        }
+    };
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    fixture.profile.process_provider = @import("../../tools/shell/process_provider.zig").provider;
+    const owner_path = try std.fs.path.join(alloc, &.{ fixture.home, ".fx", "sessions", "terminal-test-owner" });
+    defer alloc.free(owner_path);
+    var dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), owner_path, .{ .iterate = true });
+    defer dir.close(io_mod.getIo());
+    var owner = try @import("../session/session_child_store.zig").SessionChildCapability.init(alloc, dir, owner_path, .writable);
+    defer owner.deinit();
+    const proof = try terminal_store.prepareSessionExitProof(alloc, &owner);
+    var pid_buffer: [32]u8 = undefined;
+    const pid = try std.fmt.bufPrint(&pid_buffer, "{d}", .{std.c.getpid()});
+    const token = try fixture.profile.process_provider.captureToken(alloc, pid);
+    const source = try contracts.ProcessOwner.init(@intCast(std.c.getpid()), token.view());
+    var gate: NativeStartAllocationGate = .{ .armed = true };
+    var registry = SupportedRegistry{ .alloc = gate.allocator(), .tracker = .{ .context = null, .update_fn = ignoreWorkUpdate }, .profile = &fixture.profile, .host_identity = "test-host", .durable_root = fixture.home, .transport_root = fixture.home };
+    defer registry.deinit();
+    var start = Start{ .registry = &registry, .request = .{ .cwd = fixture.home, .command = "read -r ignored", .shell = .{ .executable = .{ .path = if (builtin.os.tag == .macos) "/bin/zsh" else "/bin/bash", .clean_start = true } }, .persistence = testPersistence(fixture.home), .process_owner = source } };
+    const start_thread = try std.Thread.spawn(.{}, Start.run, .{&start});
+    defer if (start.result) |*result| result.deinit(registry.alloc);
+    var start_joined = false;
+    defer if (!start_joined) {
+        start.cancelled.store(true, .release);
+        gate.release.set(io_mod.getIo());
+        start_thread.join();
+    };
+    try gate.entered.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(5000) } });
+    var close = Close{ .registry = &registry, .request = .{ .authority = .{ .session_id = "terminal-test-owner", .proof = proof }, .process_owner = source } };
+    const close_thread = try std.Thread.spawn(.{}, Close.run, .{&close});
+    defer if (close.result) |*result| result.deinit(registry.alloc);
+    var close_joined = false;
+    defer if (!close_joined) close_thread.join();
+    const deadline = io_mod.milliTimestamp() + 200;
+    while (!start.cancelled.load(.acquire) and io_mod.milliTimestamp() < deadline) io_mod.sleep(std.time.ns_per_ms);
+    const owner_cancelled_start = start.cancelled.load(.acquire);
+    gate.release.set(io_mod.getIo());
+    start_thread.join();
+    start_joined = true;
+    close_thread.join();
+    close_joined = true;
+    try std.testing.expect(owner_cancelled_start);
+    try std.testing.expectEqual(@as(?anyerror, null), start.failure);
+    try std.testing.expectEqual(contracts.StructuredErrorCode.cancelled, start.result.?.view().failure.code);
+    try std.testing.expectEqual(@as(?anyerror, null), close.failure);
+    try std.testing.expect(close.result.?.view() == .success);
+    for (registry.slots) |slot| try std.testing.expect(slot == .empty);
+    if (owner.iterate(alloc, .terminal_state)) |value| {
+        var names = value;
+        defer names.deinit();
+        try std.testing.expectEqual(@as(usize, 0), names.names.len);
+    } else |err| try std.testing.expectEqual(error.FileNotFound, err);
+}
+
+test "owner exit fences are bounded idempotent and cleared only after process death" {
+    if (comptime !isSupported()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    fixture.profile.process_provider = @import("../../tools/shell/process_provider.zig").provider;
+    var child = try std.process.spawn(io_mod.getIo(), .{ .argv = &.{ "/bin/sleep", "30" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+    defer if (child.id != null) child.kill(io_mod.getIo());
+    var pid_buffer: [32]u8 = undefined;
+    const pid = try std.fmt.bufPrint(&pid_buffer, "{d}", .{child.id.?});
+    const token = try fixture.profile.process_provider.captureToken(alloc, pid);
+    const source = try contracts.ProcessOwner.init(@intCast(child.id.?), token.view());
+    var registry = SupportedRegistry{ .alloc = alloc, .tracker = .{ .context = null, .update_fn = ignoreWorkUpdate }, .profile = &fixture.profile, .host_identity = "test-host", .durable_root = fixture.home, .transport_root = fixture.home };
+    try registry.fenceSourceLocked("owner", source);
+    try registry.fenceSourceLocked("owner", source);
+    try std.testing.expect(registry.exit_fences[0] != null and registry.exit_fences[1] == null);
+    registry.pruneExitFences(&.{});
+    try std.testing.expect(registry.sourceFencedLocked("owner", source));
+    const actual_provider = fixture.profile.process_provider;
+    fixture.profile.process_provider = process_provider_mod.unavailable_provider;
+    registry.pruneExitFences(&.{});
+    try std.testing.expect(registry.sourceFencedLocked("owner", source));
+    fixture.profile.process_provider = actual_provider;
+    child.kill(io_mod.getIo());
+    registry.pruneExitFences(&.{});
+    try std.testing.expect(registry.sourceFencedLocked("owner", source));
+    registry.finishOwnerExit("owner", source, .succeeded);
+    registry.pruneExitFences(&.{});
+    try std.testing.expect(!registry.sourceFencedLocked("owner", source));
+    for (0..max_sessions) |index| {
+        var owner_buffer: [32]u8 = undefined;
+        const owner_id = try std.fmt.bufPrint(&owner_buffer, "owner-{d}", .{index});
+        try registry.fenceSourceLocked(owner_id, source);
+    }
+    try std.testing.expectError(error.CapacityExceeded, registry.fenceSourceLocked("one-too-many", source));
+    var cancelled: std.atomic.Value(bool) = .init(false);
+    var pending = SupportedRegistry.StartReservation{ .owner_id = "one-too-many", .source = source, .cancelled = &cancelled };
+    try std.testing.expect(registry.reserveSlot(.{ .starting = &pending }) == null);
+    try std.testing.expect(!cancelled.load(.acquire));
+}
+
+test "idle retirement excludes pending starts and fences later admissions" {
+    if (comptime !isSupported()) return error.SkipZigTest;
+    const Idle = struct {
+        fn yes(_: ?*anyopaque) bool {
+            return true;
+        }
+        fn no(_: ?*anyopaque) bool {
+            return false;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    var stopping: std.atomic.Value(bool) = .init(false);
+    var cancelled: std.atomic.Value(bool) = .init(false);
+    var registry = SupportedRegistry{ .alloc = alloc, .tracker = .{ .context = null, .update_fn = ignoreWorkUpdate }, .profile = &fixture.profile, .host_identity = "test-host", .durable_root = fixture.home, .transport_root = fixture.home, .stop_requested = &stopping };
+    var pending = SupportedRegistry.StartReservation{ .owner_id = "owner", .source = null, .cancelled = &cancelled };
+    const reservation = registry.reserveSlot(.{ .starting = &pending }).?;
+    try std.testing.expect(!registry.retireIfIdle(null, Idle.yes));
+    try std.testing.expect(!stopping.load(.acquire));
+    registry.abandonStart(reservation.index, &pending);
+    try std.testing.expect(!registry.retireIfIdle(null, Idle.no));
+    try std.testing.expect(registry.retireIfIdle(null, Idle.yes));
+    try std.testing.expect(stopping.load(.acquire));
+    try std.testing.expect(registry.reserveSlot(.{ .starting = &pending }) == null);
+    try std.testing.expect(cancelled.load(.acquire));
+}
+
+test "owner shutdown after native launch begins prevents releasing a child" {
+    if (comptime !isSupported() or builtin.single_threaded) return error.SkipZigTest;
+    const Launch = struct {
+        session: *Session,
+        request: contracts.StartRequest,
+        home: []const u8,
+        failure: ?anyerror = null,
+        cancelled: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.session.launch(self.request, self.home, self.home, &self.cancelled) catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var fixture = try TestDurableFixture.init(std.testing.allocator);
+    defer fixture.deinit();
+    fixture.profile.process_provider = @import("../../tools/shell/process_provider.zig").provider;
+    var gate: NativeStartAllocationGate = .{};
+    const alloc = gate.allocator();
+    const request: contracts.StartRequest = .{
+        .cwd = fixture.home,
+        .command = "read -r ignored",
+        .shell = .{ .executable = .{ .path = if (builtin.os.tag == .macos) "/bin/zsh" else "/bin/bash", .clean_start = true } },
+    };
+    var session = try Session.init(alloc, .{ .context = null, .update_fn = ignoreWorkUpdate }, &fixture.profile, "test-host", try alloc.dupe(u8, "terminal-cancelled-launch"), request, testPersistence(fixture.home), null);
+    defer session.deinit();
+    session.markLive();
+    gate.armed = true;
+    var launch = Launch{ .session = &session, .request = request, .home = fixture.home };
+    const thread = try std.Thread.spawn(.{}, Launch.run, .{&launch});
+    var joined = false;
+    defer if (!joined) {
+        session.shutdown();
+        gate.release.set(io_mod.getIo());
+        thread.join();
+    };
+    try gate.entered.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(5000) } });
+    session.shutdown();
+    gate.release.set(io_mod.getIo());
+    thread.join();
+    joined = true;
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), launch.failure);
+    try std.testing.expect(session.launch_phase.load(.acquire) != .released);
+    try std.testing.expect(session.launcher == null);
+}
+
+fn testRegisteredShutdownStart(allocation_failure: bool) !void {
+    if (comptime !isSupported() or builtin.single_threaded) return error.SkipZigTest;
+    const Launch = struct {
+        registry: *SupportedRegistry,
+        session: *Session,
+        request: contracts.StartRequest,
+        home: []const u8,
+        cancelled: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+        done: std.Io.Event = .unset,
+        fn run(self: *@This()) void {
+            defer self.done.set(io_mod.getIo());
+            self.session.launch(self.request, self.home, self.home, &self.cancelled) catch |err| {
+                self.failure = err;
+                self.registry.retireFailedStart(0, self.session, err);
+            };
+        }
+    };
+    const alloc = std.testing.allocator;
+    const zio = io_mod.getIo();
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    var gate: NativeStartAllocationGate = .{ .fail_after_release = allocation_failure };
+    const request: contracts.StartRequest = .{ .cwd = fixture.home, .command = "read -r hold", .shell = .{ .executable = .{ .path = if (builtin.os.tag == .macos) "/bin/zsh" else "/bin/bash", .clean_start = true } } };
+    const session = try alloc.create(Session);
+    session.* = try Session.init(gate.allocator(), .{ .context = null, .update_fn = ignoreWorkUpdate }, &fixture.profile, "host", try alloc.dupe(u8, "cancelled-registered-start"), request, testPersistence(fixture.home), null);
+    var registry = SupportedRegistry{ .alloc = alloc, .tracker = .{ .context = null, .update_fn = ignoreWorkUpdate }, .profile = &fixture.profile, .host_identity = "host", .durable_root = fixture.home, .transport_root = fixture.home };
+    registry.slots[0] = .{ .resident = .{ .session = session, .references = 1 } };
+    defer registry.deinit();
+    try fixture.profile.register_resident(&session.durable, null);
+    session.markLive();
+    const original_boundary = session.durable.record.updated_at_ms;
+    gate.armed = true;
+    var launch = Launch{ .registry = &registry, .session = session, .request = request, .home = fixture.home };
+    const thread = try std.Thread.spawn(.{}, Launch.run, .{&launch});
+    var joined = false;
+    defer if (!joined) {
+        launch.cancelled.store(true, .release);
+        gate.release.set(zio);
+        thread.join();
+    };
+    try gate.entered.waitTimeout(zio, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(5000) } });
+    fixture.profile.mutex.lockUncancelable(zio);
+    if (allocation_failure) session.backend_detaching.store(true, .release) else launch.cancelled.store(true, .release);
+    gate.release.set(zio);
+    const completed_while_held = if (launch.done.waitTimeout(zio, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(200) } })) |_| true else |_| false;
+    fixture.profile.mutex.unlock(zio);
+    thread.join();
+    joined = true;
+    try std.testing.expect(completed_while_held);
+    try std.testing.expectEqual(@as(?anyerror, if (allocation_failure) error.OutOfMemory else error.Cancelled), launch.failure);
+    try std.testing.expect(registry.slots[0] == .resident);
+    try std.testing.expectEqual(session, registry.slots[0].resident.session);
+    try std.testing.expectEqual(@as(usize, 0), registry.slots[0].resident.references);
+    try std.testing.expect(session.durable.registered);
+    try std.testing.expectEqual(&session.durable, fixture.profile.residents.items[0]);
+    try std.testing.expectEqual(original_boundary, session.durable.record.updated_at_ms);
+    try std.testing.expectEqual(contracts.Lifecycle.starting, session.durable.record.lifecycle);
+    try std.testing.expect(!session.live_counted and session.isRecyclable());
+}
+
+test "registered cancelled start retires without waiting on the profile writer" {
+    try testRegisteredShutdownStart(false);
+}
+
+test "shutdown retires a registered launch allocation failure without blocking" {
+    try testRegisteredShutdownStart(true);
+}
+
+test "start cancellation before registration does not wait on profile ownership" {
+    if (comptime !isSupported() or builtin.single_threaded) return error.SkipZigTest;
+    const Init = struct {
+        alloc: Allocator,
+        fixture: *TestDurableFixture,
+        id: []u8,
+        cancelled: std.atomic.Value(bool) = .init(false),
+        result: ?Session = null,
+        failure: ?anyerror = null,
+        done: std.Io.Event = .unset,
+        fn run(self: *@This()) void {
+            defer self.done.set(io_mod.getIo());
+            self.result = Session.init(self.alloc, .{ .context = null, .update_fn = ignoreWorkUpdate }, &self.fixture.profile, "host", self.id, .{ .cwd = self.fixture.home, .shell = .{ .executable = .{ .path = if (builtin.os.tag == .macos) "/bin/zsh" else "/bin/bash" } } }, testPersistence(self.fixture.home), &self.cancelled) catch |err| failed: {
+                self.failure = err;
+                break :failed null;
+            };
+        }
+    };
+    const alloc = std.testing.allocator;
+    const zio = io_mod.getIo();
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    var gate: NativeStartAllocationGate = .{ .armed = true };
+    var init = Init{ .alloc = gate.allocator(), .fixture = &fixture, .id = try alloc.dupe(u8, "cancel-before-registration") };
+    defer if (init.result) |*session| session.deinitUnlaunched() else alloc.free(init.id);
+    fixture.profile.mutex.lockUncancelable(zio);
+    var held = true;
+    defer if (held) fixture.profile.mutex.unlock(zio);
+    const worker = try std.Thread.spawn(.{}, Init.run, .{&init});
+    var joined = false;
+    defer if (!joined) {
+        fixture.profile.mutex.unlock(zio);
+        held = false;
+        init.cancelled.store(true, .release);
+        gate.release.set(zio);
+        worker.join();
+    };
+    try gate.entered.waitTimeout(zio, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(5000) } });
+    init.cancelled.store(true, .release);
+    gate.release.set(zio);
+    const finished = if (init.done.waitTimeout(zio, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(200) } })) |_| true else |_| false;
+    fixture.profile.mutex.unlock(zio);
+    held = false;
+    worker.join();
+    joined = true;
+    try std.testing.expect(finished);
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), init.failure);
+    try std.testing.expect(init.result == null);
+    try std.testing.expectEqual(@as(usize, 0), fixture.profile.residents.items.len);
+    try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.access(zio, ".fx/sessions/terminal-test-owner/terminal", .{}));
+}
+
+const StartupMetadataOperation = enum { publication, boundary, matching, result };
+
+fn testStartupMetadataCancellation(operation: StartupMetadataOperation) !void {
+    if (comptime !isSupported() or builtin.single_threaded) return error.SkipZigTest;
+    const Operation = struct {
+        session: *Session,
+        operation: StartupMetadataOperation,
+        cancelled: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+        done: std.Io.Event = .unset,
+        fn run(self: *@This()) void {
+            defer self.done.set(io_mod.getIo());
+            self.execute() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn execute(self: *@This()) !void {
+            switch (self.operation) {
+                .publication => self.session.publishStarted(@intCast(std.c.getpid())),
+                .boundary => self.session.commitStartupBoundary(),
+                .matching => {
+                    _ = try self.session.waitFor(.{ .match = "missing-pattern" }, 5000, &self.cancelled);
+                },
+                .result => {
+                    var result = try self.session.startResult(.started, .{ .actor = .agent, .controls = .full() });
+                    result.deinit(self.session.alloc);
+                },
+            }
+        }
+    };
+    const alloc = std.testing.allocator;
+    const zio = io_mod.getIo();
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    fixture.profile.process_provider = @import("../../tools/shell/process_provider.zig").provider;
+    var session = try Session.init(alloc, .{ .context = null, .update_fn = ignoreWorkUpdate }, &fixture.profile, "host", try alloc.dupe(u8, "startup-metadata-cancel"), .{ .cwd = fixture.home, .command = "printf ready", .shell = .{ .executable = .{ .path = if (builtin.os.tag == .macos) "/bin/zsh" else "/bin/bash" } } }, testPersistence(fixture.home), null);
+    defer session.deinitUnlaunched();
+    if (operation != .publication) session.lifecycle = .running;
+    fixture.profile.mutex.lockUncancelable(zio);
+    var held = true;
+    defer if (held) fixture.profile.mutex.unlock(zio);
+    var task = Operation{ .session = &session, .operation = operation };
+    const thread = try std.Thread.spawn(.{}, Operation.run, .{&task});
+    var joined = false;
+    defer if (!joined) {
+        fixture.profile.mutex.unlock(zio);
+        held = false;
+        task.cancelled.store(true, .release);
+        thread.join();
+    };
+    const deadline = io_mod.milliTimestamp() + 5000;
+    while (session.mutex.tryLock()) {
+        session.mutex.unlock(zio);
+        if (io_mod.milliTimestamp() >= deadline) return error.TestMetadataOperationDidNotBegin;
+        io_mod.sleep(wait_poll_ns);
+    }
+    session.backend_detaching.store(true, .release);
+    const finished = if (task.done.waitTimeout(zio, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(200) } })) |_| true else |_| false;
+    task.cancelled.store(true, .release);
+    fixture.profile.mutex.unlock(zio);
+    held = false;
+    thread.join();
+    joined = true;
+    try std.testing.expect(finished);
+    try std.testing.expectEqual(contracts.Lifecycle.starting, session.durable.record.lifecycle);
+    if (operation == .publication) try std.testing.expectEqual(contracts.Lifecycle.starting, session.lifecycle);
+}
+
+test "started publication cancels after waiting for profile metadata" {
+    try testStartupMetadataCancellation(.publication);
+}
+test "command boundary cancels after waiting for profile metadata" {
+    try testStartupMetadataCancellation(.boundary);
+}
+test "startup matching cancels after waiting for profile metadata" {
+    try testStartupMetadataCancellation(.matching);
+}
+test "startup result cancels after waiting for profile metadata" {
+    try testStartupMetadataCancellation(.result);
+}
+
+test "owner shutdown joins an expired timer without waiting on profile metadata" {
+    if (comptime !isSupported() or builtin.single_threaded) return error.SkipZigTest;
+    const Timer = struct {
+        session: *Session,
+        done: std.Io.Event = .unset,
+        fn run(self: *@This()) void {
+            self.session.timeoutMain();
+            self.done.set(io_mod.getIo());
+        }
+    };
+    const alloc = std.testing.allocator;
+    const zio = io_mod.getIo();
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    fixture.profile.process_provider = @import("../../tools/shell/process_provider.zig").provider;
+    var child = try std.process.spawn(zio, .{ .argv = &.{ "/bin/sleep", "30" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore, .pgid = 0 });
+    defer if (child.id != null) child.kill(zio);
+    var pid_buffer: [32]u8 = undefined;
+    const pid = try std.fmt.bufPrint(&pid_buffer, "{d}", .{child.id.?});
+    const token = try fixture.profile.process_provider.captureToken(alloc, pid);
+    var session = try Session.init(alloc, .{ .context = null, .update_fn = ignoreWorkUpdate }, &fixture.profile, "host", try alloc.dupe(u8, "cancelled-expired-timer"), .{ .cwd = fixture.home, .timeout_ms = 1, .shell = .{ .executable = .{ .path = if (builtin.os.tag == .macos) "/bin/zsh" else "/bin/bash" } } }, testPersistence(fixture.home), null);
+    defer session.deinit();
+    try session.durable.mark_started(pid, token, io_mod.milliTimestamp(), null);
+    session.child_pid = child.id.?;
+    session.child_token = token;
+    session.lifecycle = .running;
+    session.timeout_at_ms = session.durable.record.timeout_at_ms;
+    fixture.profile.mutex.lockUncancelable(zio);
+    var profile_held = true;
+    defer if (profile_held) fixture.profile.mutex.unlock(zio);
+    session.mutex.lockUncancelable(zio);
+    var session_held = true;
+    defer if (session_held) session.mutex.unlock(zio);
+    var timer = Timer{ .session = &session };
+    session.timeout_thread = try std.Thread.spawn(.{}, Timer.run, .{&timer});
+    const deadline = io_mod.milliTimestamp() + 5000;
+    while (session.mutex.state.load(.acquire) != .contended) {
+        if (io_mod.milliTimestamp() >= deadline) return error.TestTimerDidNotBegin;
+        io_mod.sleep(wait_poll_ns);
+    }
+    session.backend_detaching.store(true, .release);
+    session.mutex.unlock(zio);
+    session_held = false;
+    const finished = if (timer.done.waitTimeout(zio, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(200) } })) |_| true else |_| false;
+    fixture.profile.mutex.unlock(zio);
+    profile_held = false;
+    session.stopTimeoutWatcher();
+    try std.testing.expect(finished);
+    try std.testing.expect(!session.durable.record.timed_out);
+    try std.testing.expect(session.timeout_thread == null);
+}
+
+const TmuxDeinitTest = struct {
+    fn command(socket: []const u8, args: []const []const u8) ![]u8 {
+        const alloc = std.testing.allocator;
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(alloc);
+        try argv.appendSlice(alloc, &.{ "tmux", "-S", socket, "-f", "/dev/null" });
+        try argv.appendSlice(alloc, args);
+        const result = try @import("../execution/process_owner.zig").run(alloc, .{ .argv = argv.items, .stdout_limit = 4096, .timeout_ms = 2000 });
+        defer alloc.free(result.stderr);
+        if (result.term != .exited or result.term.exited != 0) {
+            alloc.free(result.stdout);
+            return error.TmuxFixtureCommandFailed;
+        }
+        return result.stdout;
+    }
+    fn discard(socket: []const u8, args: []const []const u8) !void {
+        std.testing.allocator.free(try command(socket, args));
+    }
+    fn pendingClient(socket: []const u8) !?std.posix.pid_t {
+        const alloc = std.testing.allocator;
+        const result = try @import("../execution/process_owner.zig").run(alloc, .{ .argv = &.{ "/bin/ps", "-axo", "pid=,command=" }, .stdout_limit = 1024 * 1024, .timeout_ms = 2000 });
+        defer alloc.free(result.stdout);
+        defer alloc.free(result.stderr);
+        var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.find(u8, line, socket) == null or std.mem.find(u8, line, "pipe-pane") == null) continue;
+            var words = std.mem.tokenizeAny(u8, line, " \t");
+            return try std.fmt.parseInt(std.posix.pid_t, words.next() orelse continue, 10);
+        }
+        return null;
+    }
+};
+
+test "session destruction preserves prior forced tmux cleanup failure without another RPC" {
+    if (comptime !isSupported() or builtin.single_threaded) return error.SkipZigTest;
+    const Dispose = struct {
+        session: *Session,
+        done: std.Io.Event = .unset,
+        fn run(self: *@This()) void {
+            self.session.deinit();
+            self.done.set(io_mod.getIo());
+        }
+    };
+    const alloc = std.testing.allocator;
+    const zio = io_mod.getIo();
+    const provider = @import("../../tools/shell/process_provider.zig").provider;
+    for ([_]bool{ true, false }) |prior_force| {
+        var fixture = try TestDurableFixture.init(alloc);
+        defer fixture.deinit();
+        fixture.profile.process_provider = provider;
+        var persistence = testPersistence(fixture.home);
+        persistence.grant.principal.backend = .tmux;
+        const request = contracts.StartRequest{ .cwd = fixture.home, .backend = .tmux };
+        var session = try Session.init(alloc, .{ .context = null, .update_fn = ignoreWorkUpdate }, &fixture.profile, "test-host", try alloc.dupe(u8, "terminal-tmux-deinit"), request, persistence, null);
+        var session_owned = true;
+        defer if (session_owned) session.deinit();
+        const transport_root = try std.fmt.allocPrint(alloc, "/tmp/fx-deinit-{s}", .{session.durable.record.backend_identity});
+        defer alloc.free(transport_root);
+        try std.Io.Dir.createDirAbsolute(zio, transport_root, .fromMode(0o700));
+        defer std.Io.Dir.deleteDirAbsolute(zio, transport_root) catch {};
+        var paths = try tmux_session.Paths.init(alloc, fixture.home, transport_root, session.durable.record.backend_identity);
+        defer paths.deinit(alloc);
+        var server_pid: ?std.posix.pid_t = null;
+        defer {
+            if (server_pid) |pid| std.posix.kill(pid, .CONT) catch {};
+            TmuxDeinitTest.discard(paths.socket, &.{ "kill-session", "-t", paths.session_name }) catch {};
+            TmuxDeinitTest.discard(paths.socket, &.{ "kill-session", "-t", "other-owner" }) catch {};
+            std.Io.Dir.deleteFileAbsolute(zio, paths.socket) catch {};
+        }
+        TmuxDeinitTest.discard(paths.socket, &.{ "new-session", "-d", "-s", paths.session_name, "-n", "terminal", "exec sleep 30" }) catch |err| switch (err) {
+            error.FileNotFound => return error.SkipZigTest,
+            else => return err,
+        };
+        try TmuxDeinitTest.discard(paths.socket, &.{ "set-option", "-g", "@fx_terminal_namespace", "1" });
+        try TmuxDeinitTest.discard(paths.socket, &.{ "set-option", "-t", paths.session_name, "@fx_terminal_namespace", session.durable.record.backend_identity });
+        try TmuxDeinitTest.discard(paths.socket, &.{ "set-option", "-w", "-t", paths.session_name, "remain-on-exit", "on" });
+        try TmuxDeinitTest.discard(paths.socket, &.{ "new-session", "-d", "-s", "other-owner", "exec sleep 30" });
+        const identities = try TmuxDeinitTest.command(paths.socket, &.{ "display-message", "-p", "-t", paths.target, "#{pane_id}|#{pane_pid}|#{pid}" });
+        defer alloc.free(identities);
+        var fields = std.mem.splitScalar(u8, std.mem.trim(u8, identities, "\r\n"), '|');
+        const pane_id = fields.next() orelse return error.InvalidFixture;
+        const pane_pid = fields.next() orelse return error.InvalidFixture;
+        server_pid = try std.fmt.parseInt(std.posix.pid_t, fields.next() orelse return error.InvalidFixture, 10);
+        const token = try provider.captureToken(alloc, pane_pid);
+        var output: std.Io.Writer.Allocating = .init(alloc);
+        defer output.deinit();
+        try std.json.Stringify.value(.{ .schema_version = @as(u16, 1), .backend_identity = session.durable.record.backend_identity, .session_name = paths.session_name, .pane_id = pane_id, .pane_pid = pane_pid, .pane_process_token = token.view() }, .{}, &output.writer);
+        var manifest_file = try std.Io.Dir.createFileAbsolute(zio, paths.manifest, .{ .permissions = .fromMode(0o600) });
+        try manifest_file.writeStreamingAll(zio, output.written());
+        manifest_file.close(zio);
+        session.tmux_backend = try tmux_session.Backend.recover(alloc, provider, fixture.home, transport_root, session.durable.record.backend_identity, "");
+        try session.durable.mark_started(pane_pid, token, io_mod.milliTimestamp(), null);
+        session.child_pid = try std.fmt.parseInt(std.posix.pid_t, pane_pid, 10);
+        session.child_token = token;
+        session.lifecycle = .running;
+        if (prior_force) {
+            try provider.signalProcess(alloc, pane_pid, token);
+            const death_deadline = io_mod.milliTimestamp() + 2000;
+            while (provider.matchToken(alloc, pane_pid, token) == .matched and io_mod.milliTimestamp() < death_deadline) io_mod.sleep(wait_poll_ns);
+            try std.testing.expect(provider.matchToken(alloc, pane_pid, token) != .matched);
+            session.backend_detaching.store(true, .release);
+            try std.posix.kill(server_pid.?, .STOP);
+            try std.testing.expectError(error.Timeout, session.tmux_backend.?.cleanupChecked(provider, io_mod.milliTimestamp() + 100));
+        }
+        const before = try std.Io.Dir.cwd().statFile(zio, paths.manifest, .{});
+        var dispose = Dispose{ .session = &session };
+        const started = io_mod.nanoTimestamp();
+        const thread = try std.Thread.spawn(.{}, Dispose.run, .{&dispose});
+        session_owned = false;
+        var client_pid: ?std.posix.pid_t = null;
+        if (prior_force) {
+            const observation_deadline = io_mod.milliTimestamp() + 200;
+            while (!dispose.done.isSet() and client_pid == null and io_mod.milliTimestamp() < observation_deadline) client_pid = try TmuxDeinitTest.pendingClient(paths.socket);
+        }
+        const completed = if (dispose.done.waitTimeout(zio, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(300) } })) |_| true else |_| false;
+        const elapsed = io_mod.nanoTimestamp() - started;
+        if (!completed) if (client_pid) |pid| {
+            std.posix.kill(pid, .KILL) catch {};
+        };
+        if (prior_force) try std.posix.kill(server_pid.?, .CONT);
+        thread.join();
+        if (!completed) try std.testing.expect(client_pid != null);
+        try std.testing.expect(completed);
+        try std.testing.expect(elapsed < 500 * std.time.ns_per_ms);
+        if (prior_force) {
+            try std.testing.expect(client_pid == null);
+            const after = try std.Io.Dir.cwd().statFile(zio, paths.manifest, .{});
+            try std.testing.expectEqual(before.inode, after.inode);
+            try std.testing.expectEqual(before.mtime, after.mtime);
+        } else try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(zio, paths.manifest, .{}));
+        try TmuxDeinitTest.discard(paths.socket, &.{ "has-session", "-t", "other-owner" });
+    }
+}
+
+test "detached terminal completion preserves unknown status without publishing it" {
+    if (comptime !isSupported()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const request = contracts.StartRequest{ .cwd = fixture.home };
+    var session = try Session.init(alloc, .{ .context = null, .update_fn = ignoreWorkUpdate }, &fixture.profile, "test-host", try alloc.dupe(u8, "terminal-detached-term"), request, testPersistence(fixture.home), null);
+    defer session.deinit();
+    session.backend_detaching.store(true, .release);
+    const before = try session.durable.state.?.stat(.terminal_state, "record-terminal-detached-term.json");
+    for ([_]std.process.Child.Term{ .{ .exited = 0 }, .{ .signal = .KILL }, .{ .unknown = 1 }, .{ .stopped = .STOP } }) |term| {
+        session.lifecycle = .running;
+        session.setTerm(term);
+        try std.testing.expectEqual(if (outcomeFromTerm(term) != null) contracts.Lifecycle.exited else contracts.Lifecycle.lost, session.lifecycle);
+        try std.testing.expectEqual(before, try session.durable.state.?.stat(.terminal_state, "record-terminal-detached-term.json"));
+    }
+}
+
+test "native shutdown joins busy output without waiting on the profile writer" {
+    if (comptime !isSupported() or builtin.single_threaded) return error.SkipZigTest;
+    const Stop = struct {
+        session: *Session,
+        done: std.Io.Event = .unset,
+        elapsed_ns: i128 = 0,
+        fn run(self: *@This()) void {
+            const started = io_mod.nanoTimestamp();
+            self.session.shutdown();
+            self.session.finalizeBackend();
+            self.elapsed_ns = io_mod.nanoTimestamp() - started;
+            self.done.set(io_mod.getIo());
+        }
+    };
+    const alloc = std.testing.allocator;
+    const zio = io_mod.getIo();
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    fixture.profile.process_provider = @import("../../tools/shell/process_provider.zig").provider;
+    const request: contracts.StartRequest = .{
+        .cwd = fixture.home,
+        .command = "printf 'BUSY_EXIT_READY\\n'; read -r next; printf 'BUSY_EXIT_BLOCKED\\n'; read -r hold",
+        .shell = .{ .executable = .{ .path = if (builtin.os.tag == .macos) "/bin/zsh" else "/bin/bash", .clean_start = true } },
+    };
+    var session = try Session.init(alloc, .{ .context = null, .update_fn = ignoreWorkUpdate }, &fixture.profile, "test-host", try alloc.dupe(u8, "terminal-busy-output-exit"), request, testPersistence(fixture.home), null);
+    defer session.deinit();
+    session.markLive();
+    var cancelled: std.atomic.Value(bool) = .init(false);
+    try session.launchNative(request, &cancelled);
+    try std.testing.expectEqual(contracts.ReturnOutcome.condition_met, try session.waitFor(.{ .match = "BUSY_EXIT_READY" }, 5000, &cancelled));
+    const shell_pid = session.child_pid.?;
+    const launcher_pid = session.launcher.?.id.?;
+    const prior = session.durable.output_cursor();
+    const record_name = try std.fmt.allocPrint(alloc, "record-{s}.json", .{session.id});
+    defer alloc.free(record_name);
+    const before_record = try session.durable.state.?.stat(.terminal_state, record_name);
+    fixture.profile.mutex.lockUncancelable(zio);
+    var held = true;
+    defer if (held) fixture.profile.mutex.unlock(zio);
+    try writeAllFd(session.master_fd.?, "\n", true);
+    var append_began = false;
+    const deadline = io_mod.milliTimestamp() + 5000;
+    while (!append_began and io_mod.milliTimestamp() < deadline) {
+        if (session.mutex.tryLock()) {
+            session.mutex.unlock(zio);
+            io_mod.sleep(wait_poll_ns);
+        } else {
+            // Startup is complete and the control thread awaits termination;
+            // only the real output worker now takes this mutex.
+            append_began = true;
+        }
+    }
+    try std.testing.expect(append_began);
+    var stop: Stop = .{ .session = &session };
+    const thread = try std.Thread.spawn(.{}, Stop.run, .{&stop});
+    const finished_while_held = if (stop.done.waitTimeout(zio, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(500) } })) |_| true else |_| false;
+    const shell_missing_before_release = std.c.errno(std.c.kill(shell_pid, @enumFromInt(0))) == .SRCH;
+    fixture.profile.mutex.unlock(zio);
+    held = false;
+    thread.join();
+    try std.testing.expect(finished_while_held);
+    try std.testing.expect(stop.elapsed_ns < 500 * std.time.ns_per_ms);
+    try std.testing.expect(shell_missing_before_release);
+    try std.testing.expect(session.output_done.isSet() and session.backend_done.isSet());
+    try std.testing.expect(session.output_thread == null and session.control_thread == null);
+    try std.testing.expect(session.launcher == null and !session.backend_started);
+    try std.testing.expectEqual(std.posix.E.SRCH, std.c.errno(std.c.kill(launcher_pid, @enumFromInt(0))));
+    try std.testing.expectEqual(prior, session.durable.output_cursor());
+    try session.durable.record.validate();
+    const after_record = try session.durable.state.?.stat(.terminal_state, record_name);
+    try std.testing.expectEqual(before_record, after_record);
+    try std.testing.expect(session.lifecycle == .exited or session.lifecycle == .lost);
+    const facts = session.factsLocked(.{ .actor = .agent, .controls = .{} });
+    try std.testing.expect(facts.lifecycle == .exited or facts.lifecycle == .lost);
+    var recovered_profile = try terminal_store.ProfileStore.init(alloc, fixture.home, fixture.profile.process_provider);
+    defer recovered_profile.deinit();
+    var recovered = try recovered_profile.recover("next-host", io_mod.milliTimestamp());
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(usize, 1), recovered.sessions.items.len);
+    const saved = &recovered.sessions.items[0];
+    try std.testing.expectEqual(contracts.Lifecycle.lost, saved.record.lifecycle);
+    try std.testing.expectEqual(prior, saved.record.output_cursor);
+    try saved.record.validate();
+}
+
+test "owner exit stops profile descendants before the shell identity is published" {
+    if (comptime !isSupported() or builtin.single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const zio = io_mod.getIo();
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    fixture.profile.process_provider = @import("../../tools/shell/process_provider.zig").provider;
+    const shell_path = try std.fs.path.join(alloc, &.{ fixture.home, "bash" });
+    defer alloc.free(shell_path);
+    const profile_path = try std.fs.path.join(alloc, &.{ fixture.home, "profile" });
+    defer alloc.free(profile_path);
+    const script_path = try std.fs.path.join(alloc, &.{ fixture.home, "escaped.py" });
+    defer alloc.free(script_path);
+    const identity_path = try std.fs.path.join(alloc, &.{ fixture.home, "escaped.pid" });
+    defer alloc.free(identity_path);
+    const command_path = try std.fs.path.join(alloc, &.{ fixture.home, "command-ran" });
+    defer alloc.free(command_path);
+    const wrapper = try std.fmt.allocPrint(alloc, "#!/bin/bash\nwhile [ \"$#\" -gt 0 ] && [ \"$1\" != \"-c\" ]; do shift; done\nexec /bin/bash --noprofile --rcfile '{s}' -i \"$@\"\n", .{profile_path});
+    defer alloc.free(wrapper);
+    var shell_file = try std.Io.Dir.createFileAbsolute(zio, shell_path, .{ .permissions = .fromMode(0o700) });
+    try shell_file.writeStreamingAll(zio, wrapper);
+    shell_file.close(zio);
+    const profile_text = try std.fmt.allocPrint(alloc, "python3 '{s}' &\nwhile :; do sleep 0.05; done\n", .{script_path});
+    defer alloc.free(profile_text);
+    var profile_file = try std.Io.Dir.createFileAbsolute(zio, profile_path, .{});
+    try profile_file.writeStreamingAll(zio, profile_text);
+    profile_file.close(zio);
+    const python = try std.fmt.allocPrint(alloc, "import os,time\nif os.fork() == 0:\n os.setsid()\n with open({f},'w') as f: f.write(str(os.getpid())+' '+str(os.getpgrp())+' '+str(os.getsid(0)))\n while True: time.sleep(1)\nos.wait()\n", .{std.json.fmt(identity_path, .{})});
+    defer alloc.free(python);
+    var script = try std.Io.Dir.createFileAbsolute(zio, script_path, .{});
+    try script.writeStreamingAll(zio, python);
+    script.close(zio);
+    const command = try std.fmt.allocPrint(alloc, "printf forbidden > '{s}'", .{command_path});
+    defer alloc.free(command);
+    const request: contracts.StartRequest = .{ .cwd = fixture.home, .command = command, .shell = .{ .executable = .{ .path = shell_path, .clean_start = true } } };
+    var session = try Session.init(alloc, .{ .context = null, .update_fn = ignoreWorkUpdate }, &fixture.profile, "test-host", try alloc.dupe(u8, "terminal-profile-exit"), request, testPersistence(fixture.home), null);
+    defer session.deinit();
+    var observed = try process_tree.Tracker.init(alloc);
+    defer {
+        if (session.launcher) |child| if (child.id) |pid| observed.refresh(pid) catch {};
+        _ = observed.signalAll(.KILL);
+        observed.deinit();
+    }
+    var cancelled: std.atomic.Value(bool) = .init(false);
+    session.markLive();
+    try session.launchNative(request, &cancelled);
+    const launcher_pid = session.launcher.?.id.?;
+    const deadline = io_mod.milliTimestamp() + 5000;
+    var identity: ?[]u8 = null;
+    defer if (identity) |bytes| alloc.free(bytes);
+    while (identity == null and io_mod.milliTimestamp() < deadline) {
+        identity = std.Io.Dir.cwd().readFileAlloc(zio, identity_path, alloc, .limited(128)) catch null;
+        if (identity) |contents| if (contents.len == 0) {
+            alloc.free(contents);
+            identity = null;
+        };
+        if (identity == null) io_mod.sleep(wait_poll_ns);
+    }
+    const bytes = identity orelse return error.TestProfileDidNotStart;
+    var fields = std.mem.tokenizeScalar(u8, bytes, ' ');
+    const escaped_pid = try std.fmt.parseInt(std.posix.pid_t, fields.next().?, 10);
+    try std.testing.expectEqual(escaped_pid, try std.fmt.parseInt(std.posix.pid_t, fields.next().?, 10));
+    try std.testing.expectEqual(escaped_pid, try std.fmt.parseInt(std.posix.pid_t, fields.next().?, 10));
+    try observed.refresh(launcher_pid);
+    try std.testing.expect(observed.anyAlive());
+    try std.testing.expect(session.signalTarget() == null);
+    try std.testing.expect(session.child_pid == null);
+    try std.testing.expect(session.launcher_token != null);
+    const owner_path = try std.fs.path.join(alloc, &.{ fixture.home, ".fx", "sessions", "terminal-test-owner" });
+    defer alloc.free(owner_path);
+    var owner_dir = try std.Io.Dir.openDirAbsolute(zio, owner_path, .{ .iterate = true });
+    defer owner_dir.close(zio);
+    var owner = try @import("../session/session_child_store.zig").SessionChildCapability.init(alloc, owner_dir, owner_path, .writable);
+    defer owner.deinit();
+    const proof = (try terminal_store.loadSessionExitProof(alloc, &owner)).?;
+    var pid_buffer: [32]u8 = undefined;
+    const pid = try std.fmt.bufPrint(&pid_buffer, "{d}", .{std.c.getpid()});
+    const token = try fixture.profile.process_provider.captureToken(alloc, pid);
+    const source = try contracts.ProcessOwner.init(@intCast(std.c.getpid()), token.view());
+    var registry = SupportedRegistry{ .alloc = alloc, .tracker = .{ .context = null, .update_fn = ignoreWorkUpdate }, .profile = &fixture.profile, .host_identity = "test-host", .durable_root = fixture.home, .transport_root = fixture.home };
+    registry.slots[0] = .{ .resident = .{ .session = &session, .references = 0 } };
+    const started = io_mod.nanoTimestamp();
+    var result = try registry.executeAuthorized(.{ .close_owner = .{ .authority = .{ .session_id = "terminal-test-owner", .proof = proof }, .process_owner = source } }, &cancelled);
+    defer result.deinit(alloc);
+    try std.testing.expect(result.view() == .success);
+    while (observed.anyAlive() and io_mod.nanoTimestamp() - started < 500 * std.time.ns_per_ms) io_mod.sleep(wait_poll_ns);
+    try std.testing.expect(!observed.anyAlive());
+    try std.testing.expect(io_mod.nanoTimestamp() - started < 500 * std.time.ns_per_ms);
+    try std.testing.expect(session.launcher == null);
+    try std.testing.expect(session.backend_done.isSet());
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(zio, command_path, .{}));
+}
+
+test "native force close joins while another process retains the PTY slave" {
+    if (comptime !isSupported() or builtin.single_threaded) return error.SkipZigTest;
+    const Close = struct {
+        session: *Session,
+        claim: contracts.AuthorityClaim,
+        done: std.Io.Event = .unset,
+        result: ?contracts.OwnedResult = null,
+        failure: ?anyerror = null,
+        elapsed_ns: i128 = 0,
+
+        fn run(self: *@This()) void {
+            const started = io_mod.nanoTimestamp();
+            self.result = closeAction(self.session, .{
+                .session_id = self.session.id,
+                .policy = .force,
+                .authority = self.claim,
+            }) catch |err| failed: {
+                self.failure = err;
+                break :failed null;
+            };
+            self.elapsed_ns = io_mod.nanoTimestamp() - started;
+            self.done.set(io_mod.getIo());
+        }
+    };
+    const alloc = std.testing.allocator;
+    const zio = io_mod.getIo();
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    fixture.profile.process_provider = @import("../../tools/shell/process_provider.zig").provider;
+    const persistence = testPersistence(fixture.home);
+    const request: contracts.StartRequest = .{
+        .cwd = fixture.home,
+        .command = "printf 'OUTPUT_DRAIN_STARTED\\n'; read -r ignored",
+        .shell = .{ .executable = .{
+            .path = if (builtin.os.tag == .macos) "/bin/zsh" else "/bin/bash",
+            .clean_start = true,
+        } },
+    };
+    var session = try Session.init(alloc, .{ .context = null, .update_fn = ignoreWorkUpdate }, &fixture.profile, "test-host", try alloc.dupe(u8, "terminal-retained-output"), request, persistence, null);
+    defer session.deinit();
+    session.markLive();
+    var cancel: std.atomic.Value(bool) = .init(false);
+    try session.launchNative(request, &cancel);
+    try std.testing.expectEqual(contracts.ReturnOutcome.condition_met, try session.waitFor(.{ .match = "OUTPUT_DRAIN_STARTED" }, 5000, &cancel));
+    const shell_pid = session.child_pid.?;
+    const launcher_pid = session.launcher.?.id.?;
+
+    const slave_name = ptsname(session.master_fd.?) orelse return error.PtyUnavailable;
+    const slave = try std.posix.openatZ(std.posix.AT.FDCWD, slave_name, .{ .ACCMODE = .RDWR, .NOCTTY = true, .CLOEXEC = true }, 0);
+    var slave_owned = true;
+    defer if (slave_owned) closeFd(slave);
+    var external = try std.process.spawn(zio, .{
+        .argv = &.{ "/bin/sleep", "30" },
+        .stdin = .ignore,
+        .stdout = .{ .file = .{ .handle = slave, .flags = .{ .nonblocking = false } } },
+        .stderr = .ignore,
+    });
+    defer if (external.id != null) external.kill(zio);
+    closeFd(slave);
+    slave_owned = false;
+    const external_pid = external.id.?;
+    var close: Close = .{ .session = &session, .claim = .{
+        .principal = persistence.grant.principal,
+        .actor = persistence.grant.actor,
+        .generation = persistence.grant.generation,
+        .proof = persistence.proof,
+    } };
+    const thread = try std.Thread.spawn(.{}, Close.run, .{&close});
+    const completed_while_retained = if (close.done.waitTimeout(zio, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(500) } })) |_| true else |_| false;
+    const external_survived = std.c.kill(external_pid, @enumFromInt(0)) == 0;
+    // Release only the test-owned external process so a failing drain cannot
+    // strand the fixture while reporting the regression.
+    external.kill(zio);
+    thread.join();
+    defer if (close.result) |*result| result.deinit(alloc);
+    try std.testing.expect(completed_while_retained);
+    try std.testing.expect(close.elapsed_ns < 500 * std.time.ns_per_ms);
+    try std.testing.expect(external_survived);
+    try std.testing.expectEqual(@as(?anyerror, null), close.failure);
+    try std.testing.expect(close.result.? == .success);
+    try std.testing.expect(session.backend_done.isSet());
+    try std.testing.expect(session.output_done.isSet());
+    try std.testing.expect(!session.backend_started);
+    try std.testing.expect(session.control_thread == null and session.output_thread == null);
+    try std.testing.expect(session.launcher == null);
+    try std.testing.expectEqual(std.posix.E.SRCH, std.c.errno(std.c.kill(shell_pid, @enumFromInt(0))));
+    try std.testing.expectEqual(std.posix.E.SRCH, std.c.errno(std.c.kill(launcher_pid, @enumFromInt(0))));
 }
 
 test "recovered session owns the saved workspace scope" {
@@ -4897,6 +6577,7 @@ test "terminal state does not release live work before backend cleanup" {
             .shell = .{ .executable = .{ .path = "/bin/zsh" } },
         },
         testPersistence("/workspace"),
+        null,
     );
     defer session.deinitUnlaunched();
 
@@ -4931,6 +6612,7 @@ test "durable journal preserves startup matches" {
             .return_when = .{ .match = "ready" },
         },
         testPersistence("/workspace"),
+        null,
     );
     defer session.deinitUnlaunched();
 
@@ -4943,7 +6625,7 @@ test "durable journal preserves startup matches" {
     try std.testing.expect(session.startup_match_seen);
     try std.testing.expectEqual(
         contracts.ReturnOutcome.condition_met,
-        session.matchConditionLocked(.{ .match = "ready" }, io_mod.milliTimestamp()).?,
+        (try session.matchConditionLocked(.{ .match = "ready" }, io_mod.milliTimestamp())).?,
     );
 }
 
@@ -4965,15 +6647,16 @@ test "command start match ignores profile output before its cursor" {
             .return_when = .{ .match = "boundary-match" },
         },
         testPersistence("/workspace"),
+        null,
     );
     defer session.deinitUnlaunched();
 
     session.appendOutput("profile boundary-match\n");
     try std.testing.expect(!session.startup_match_seen);
-    try std.testing.expect(session.matchConditionLocked(
+    try std.testing.expect((try session.matchConditionLocked(
         .{ .match = "boundary-match" },
         io_mod.milliTimestamp(),
-    ) == null);
+    )) == null);
 
     session.command_start_cursor = session.durable.record.output_cursor;
     session.last_output_ms = io_mod.milliTimestamp();
@@ -4982,10 +6665,10 @@ test "command start match ignores profile output before its cursor" {
     try std.testing.expect(session.startup_match_seen);
     try std.testing.expectEqual(
         contracts.ReturnOutcome.condition_met,
-        session.matchConditionLocked(
+        (try session.matchConditionLocked(
             .{ .match = "boundary-match" },
             io_mod.milliTimestamp(),
-        ).?,
+        )).?,
     );
 }
 
@@ -5005,6 +6688,7 @@ test "split partial bytes remain opaque and ordered" {
             .shell = .{ .executable = .{ .path = "/bin/zsh" } },
         },
         testPersistence("/workspace"),
+        null,
     );
     defer session.deinitUnlaunched();
 
@@ -5045,13 +6729,14 @@ test "checkpoint plus contiguous observational replay equals live screen" {
             .dimensions = .{ .rows = 4, .columns = 12 },
         },
         testPersistence("/workspace"),
+        null,
     );
     defer session.deinitUnlaunched();
 
     session.appendOutput("hello\x1b[2;");
     const checkpoint_cursor = session.durable.record.output_cursor;
     try session.checkpointLocked(checkpoint_cursor, io_mod.milliTimestamp());
-    try session.durable.append("3H\xe7\x95\x8c\x1b[6n", io_mod.milliTimestamp());
+    _ = try session.durable.appendOutput("3H\xe7\x95\x8c\x1b[6n", io_mod.milliTimestamp(), null);
     var live_result = try session.engine.feedMode(
         "3H\xe7\x95\x8c\x1b[6n",
         .native_live,
@@ -5114,6 +6799,7 @@ test "many small output chunks checkpoint only at store boundaries" {
             .shell = .{ .executable = .{ .path = "/bin/zsh" } },
         },
         testPersistence("/workspace"),
+        null,
     );
     defer session.deinitUnlaunched();
     var sink = try std.Io.Dir.openFileAbsolute(
@@ -5151,6 +6837,154 @@ test "many small output chunks checkpoint only at store boundaries" {
     );
 }
 
+test "historical screen remains readable after backend detachment" {
+    if (comptime !isSupported()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    fixture.profile.process_provider = @import("../../tools/shell/process_provider.zig").provider;
+    const persistence = testPersistence(fixture.home);
+    const id = try alloc.dupe(u8, "terminal-detached-screen");
+    var session = Session.init(alloc, .{ .context = null, .update_fn = ignoreWorkUpdate }, &fixture.profile, "test-host", id, .{ .cwd = fixture.home }, persistence, null) catch |err| {
+        alloc.free(id);
+        return err;
+    };
+    defer session.deinitUnlaunched();
+    _ = try session.durable.appendOutput("SAVED_SCREEN", 2, null);
+    try session.engine.feed("SAVED_SCREEN");
+    session.backend_detaching.store(true, .release);
+    const before = try session.durable.state.?.stat(.terminal_state, "record-terminal-detached-screen.json");
+    var cancelled = std.atomic.Value(bool).init(false);
+    var result = try screenAction(&session, .{ .session_id = session.id, .authority = .{ .principal = persistence.grant.principal, .actor = .agent, .generation = persistence.grant.generation, .proof = persistence.proof } }, &cancelled);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("S", result.view().success.screen.snapshot.cells[0].text);
+    try std.testing.expectEqualStrings("N", result.view().success.screen.snapshot.cells[11].text);
+    try std.testing.expectEqual(before, try session.durable.state.?.stat(.terminal_state, "record-terminal-detached-screen.json"));
+}
+
+test "resize rollback stops after waiting on the profile writer begins" {
+    if (comptime !isSupported() or builtin.single_threaded) return error.SkipZigTest;
+    const Rollback = struct {
+        session: *Session,
+        payload: []const u8,
+        done: std.Io.Event = .unset,
+        fn run(self: *@This()) void {
+            restoreDurableResize(self.session, self.session.dimensions, self.payload);
+            self.done.set(io_mod.getIo());
+        }
+    };
+    const alloc = std.testing.allocator;
+    const zio = io_mod.getIo();
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const request: contracts.StartRequest = .{ .cwd = fixture.home };
+    var session = try Session.init(alloc, .{ .context = null, .update_fn = ignoreWorkUpdate }, &fixture.profile, "test-host", try alloc.dupe(u8, "terminal-rollback-cancel"), request, testPersistence(fixture.home), null);
+    defer session.deinit();
+    try session.engine.feed("saved resize content");
+    const payload = try session.engine.checkpointPayload(alloc);
+    defer alloc.free(payload);
+    const before = try session.durable.state.?.stat(.terminal_state, "record-terminal-rollback-cancel.json");
+    fixture.profile.mutex.lockUncancelable(zio);
+    var held = true;
+    defer if (held) fixture.profile.mutex.unlock(zio);
+    var rollback = Rollback{ .session = &session, .payload = payload };
+    const thread = try std.Thread.spawn(.{}, Rollback.run, .{&rollback});
+    var waiting = false;
+    const deadline = io_mod.milliTimestamp() + 5000;
+    while (!waiting and io_mod.milliTimestamp() < deadline) {
+        if (session.mutex.tryLock()) {
+            session.mutex.unlock(zio);
+            io_mod.sleep(wait_poll_ns);
+        } else waiting = true;
+    }
+    const started = io_mod.nanoTimestamp();
+    session.backend_detaching.store(true, .release);
+    const stopped_while_held = if (rollback.done.waitTimeout(zio, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(500) } })) |_| true else |_| false;
+    const elapsed = io_mod.nanoTimestamp() - started;
+    fixture.profile.mutex.unlock(zio);
+    held = false;
+    thread.join();
+    try std.testing.expect(waiting);
+    try std.testing.expect(stopped_while_held);
+    try std.testing.expect(elapsed < 500 * std.time.ns_per_ms);
+    try std.testing.expectEqual(before, try session.durable.state.?.stat(.terminal_state, "record-terminal-rollback-cancel.json"));
+    const after = try session.engine.checkpointPayload(alloc);
+    defer alloc.free(after);
+    try std.testing.expectEqualSlices(u8, payload, after);
+}
+
+test "owner shutdown cancels resize already waiting on the profile writer" {
+    if (comptime !isSupported() or builtin.single_threaded) return error.SkipZigTest;
+    const Resize = struct {
+        session: *Session,
+        request: contracts.ResizeRequest,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            var result = resizeAction(self.session, self.request) catch |err| {
+                self.failure = err;
+                return;
+            };
+            result.deinit(self.session.alloc);
+        }
+    };
+    const Stop = struct {
+        session: *Session,
+        done: std.Io.Event = .unset,
+        elapsed_ns: i128 = 0,
+        fn run(self: *@This()) void {
+            const started = io_mod.nanoTimestamp();
+            self.session.shutdown();
+            self.session.finalizeBackend();
+            self.elapsed_ns = io_mod.nanoTimestamp() - started;
+            self.done.set(io_mod.getIo());
+        }
+    };
+    const alloc = std.testing.allocator;
+    const zio = io_mod.getIo();
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    fixture.profile.process_provider = @import("../../tools/shell/process_provider.zig").provider;
+    const persistence = testPersistence(fixture.home);
+    const request: contracts.StartRequest = .{ .cwd = fixture.home, .command = "printf 'RESIZE_READY\\n'; sleep 30", .shell = .{ .executable = .{ .path = if (builtin.os.tag == .macos) "/bin/zsh" else "/bin/bash", .clean_start = true } } };
+    var session = try Session.init(alloc, .{ .context = null, .update_fn = ignoreWorkUpdate }, &fixture.profile, "test-host", try alloc.dupe(u8, "terminal-resize-cancel"), request, persistence, null);
+    defer session.deinit();
+    session.markLive();
+    var cancelled: std.atomic.Value(bool) = .init(false);
+    try session.launchNative(request, &cancelled);
+    try std.testing.expectEqual(contracts.ReturnOutcome.condition_met, try session.waitFor(.{ .match = "RESIZE_READY" }, 5000, &cancelled));
+    session.write_mutex.lockUncancelable(zio);
+    session.write_mutex.unlock(zio);
+    const before = try session.durable.state.?.stat(.terminal_state, "record-terminal-resize-cancel.json");
+    const dimensions = session.dimensions;
+    fixture.profile.mutex.lockUncancelable(zio);
+    var held = true;
+    defer if (held) fixture.profile.mutex.unlock(zio);
+    var resize = Resize{ .session = &session, .request = .{ .session_id = session.id, .dimensions = .{ .columns = 40, .rows = 12 }, .authority = .{ .principal = persistence.grant.principal, .actor = persistence.grant.actor, .generation = persistence.grant.generation, .proof = persistence.proof } } };
+    const resize_thread = try std.Thread.spawn(.{}, Resize.run, .{&resize});
+    var resize_began = false;
+    const deadline = io_mod.milliTimestamp() + 5000;
+    while (!resize_began and io_mod.milliTimestamp() < deadline) {
+        if (session.write_mutex.tryLock()) {
+            session.write_mutex.unlock(zio);
+            io_mod.sleep(wait_poll_ns);
+        } else resize_began = true;
+    }
+    var stop = Stop{ .session = &session };
+    const stop_thread = try std.Thread.spawn(.{}, Stop.run, .{&stop});
+    const stopped_while_held = if (stop.done.waitTimeout(zio, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(500) } })) |_| true else |_| false;
+    fixture.profile.mutex.unlock(zio);
+    held = false;
+    resize_thread.join();
+    stop_thread.join();
+    try std.testing.expect(resize_began);
+    try std.testing.expect(stopped_while_held);
+    try std.testing.expect(stop.elapsed_ns < 500 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), resize.failure);
+    try std.testing.expectEqual(dimensions, session.dimensions);
+    try std.testing.expectEqual(before, try session.durable.state.?.stat(.terminal_state, "record-terminal-resize-cancel.json"));
+    try std.testing.expect(session.output_done.isSet() and session.backend_done.isSet());
+}
+
 test "resize recovery never reflows raw output at final dimensions" {
     const alloc = std.testing.allocator;
     var fixture = try TestDurableFixture.init(alloc);
@@ -5168,11 +7002,12 @@ test "resize recovery never reflows raw output at final dimensions" {
             .dimensions = .{ .rows = 2, .columns = 4 },
         },
         testPersistence("/workspace"),
+        null,
     );
     var session_owned = true;
     defer if (session_owned) session.deinitUnlaunched();
 
-    try session.durable.append("abcdef", 2);
+    _ = try session.durable.appendOutput("abcdef", 2, null);
     var feed = try session.engine.feedMode("abcdef", .native_live);
     feed.deinit(alloc);
     var row: std.ArrayList(u8) = .empty;
@@ -5212,12 +7047,12 @@ test "resize recovery never reflows raw output at final dimensions" {
     try session.engine.rowTextTrimmed(1, &row);
     try std.testing.expectEqualStrings("abcd", row.items);
 
-    try session.durable.store_checkpoint(.{
+    try session.durable.storeCheckpoint(.{
         .engine_schema_revision = terminal_engine.checkpoint_schema_revision + 1,
         .applied_cursor = session.durable.output_cursor(),
         .payload_len = @intCast(live_payload.len),
         .checksum = contracts.checkpoint_checksum(live_payload),
-    }, live_payload, 5);
+    }, live_payload, 5, null);
     try std.testing.expect(!session.durable.record.raw_replay_exact);
     try std.testing.expectError(
         error.ScreenUnsupported,
@@ -5258,6 +7093,7 @@ test "native protocol replies are independent of either durable write lease" {
             .shell = .{ .executable = .{ .path = "/bin/zsh" } },
         },
         testPersistence("/workspace"),
+        null,
     );
     defer session.deinitUnlaunched();
 
@@ -5290,6 +7126,7 @@ test "missing corrupt and unsupported checkpoints fall back only with full raw c
             .dimensions = .{ .rows = 3, .columns = 10 },
         },
         testPersistence("/workspace"),
+        null,
     );
     defer session.deinitUnlaunched();
     session.appendOutput("fallback");
@@ -5365,6 +7202,7 @@ test "checkpoint load allocation failure preserves durable recovery facts" {
             .shell = .{ .executable = .{ .path = "/bin/zsh" } },
         },
         testPersistence("/workspace"),
+        null,
     );
     defer session.deinitUnlaunched();
 
@@ -5419,6 +7257,7 @@ test "journal engine feed allocation failure preserves durable recovery facts" {
             .shell = .{ .executable = .{ .path = "/bin/zsh" } },
         },
         testPersistence("/workspace"),
+        null,
     );
     defer session.deinitUnlaunched();
 
@@ -5427,9 +7266,10 @@ test "journal engine feed allocation failure preserves durable recovery facts" {
         session.durable.output_cursor(),
         io_mod.milliTimestamp(),
     );
-    try session.durable.append(
+    _ = try session.durable.appendOutput(
         "\x1b]8;;https://example.com\x1b\\X\x1b]8;;\x1b\\",
         io_mod.milliTimestamp(),
+        null,
     );
     const recovery = session.durable.record.screen_recovery;
     const generation = session.durable.record.checkpoint_generation;
@@ -5480,19 +7320,20 @@ test "malformed raw fallback durably replaces an invalid checkpoint with corrupt
             .shell = .{ .executable = .{ .path = "/bin/zsh" } },
         },
         testPersistence("/workspace"),
+        null,
     );
     var session_owned = true;
     defer if (session_owned) session.deinitUnlaunched();
 
     const malformed = "\x1b[1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1H";
-    try session.durable.append(malformed, io_mod.milliTimestamp());
+    _ = try session.durable.appendOutput(malformed, io_mod.milliTimestamp(), null);
     const invalid_payload = "invalid-engine-checkpoint";
-    try session.durable.store_checkpoint(.{
+    try session.durable.storeCheckpoint(.{
         .engine_schema_revision = terminal_engine.checkpoint_schema_revision,
         .applied_cursor = session.durable.output_cursor(),
         .payload_len = invalid_payload.len,
         .checksum = contracts.checkpoint_checksum(invalid_payload),
-    }, invalid_payload, io_mod.milliTimestamp());
+    }, invalid_payload, io_mod.milliTimestamp(), null);
 
     try std.testing.expectError(
         error.ScreenCorrupt,
@@ -5544,6 +7385,7 @@ test "shutdownSessionsOnly signals live sessions and leaves them allocated" {
             .shell = .{ .executable = .{ .path = "/bin/zsh" } },
         },
         testPersistence("/workspace"),
+        null,
     );
     defer session.deinitUnlaunched();
 
@@ -5564,24 +7406,24 @@ test "shutdownSessionsOnly signals live sessions and leaves them allocated" {
         .durable_root = "/workspace",
         .transport_root = "/workspace",
     };
-    registry.sessions[0] = &session;
+    registry.slots[0] = .{ .resident = .{ .session = &session, .references = 0 } };
 
     // A slot with no outstanding reference is exactly the slot a client may
     // recycle, so this is the case the pin has to cover.
-    try std.testing.expectEqual(@as(usize, 0), registry.references[0]);
+    try std.testing.expectEqual(@as(usize, 0), registry.slots[0].resident.references);
 
     registry.shutdownSessionsOnly();
 
     // Every reference taken to pin the session for shutdown is given back, so
     // the drain cannot wedge a later removeOwned that waits for the count.
-    try std.testing.expectEqual(@as(usize, 0), registry.references[0]);
+    try std.testing.expectEqual(@as(usize, 0), registry.slots[0].resident.references);
 
     // The liveness handle is released, so the session was actually shut down.
     try std.testing.expect(session.liveness_file == null);
     // And the session is still allocated: the registry slot still points at it
     // and the object is readable, which is what makes this safe to call while
     // client threads still hold session pointers.
-    try std.testing.expect(registry.sessions[0] == &session);
+    try std.testing.expect(registry.slots[0].resident.session == &session);
     try std.testing.expectEqual(contracts.Lifecycle.running, session.lifecycle);
 }
 
@@ -5610,7 +7452,7 @@ test "durable release and exit wait survive resident session removal" {
     });
     var durable_owned = true;
     defer if (durable_owned) durable.deinit();
-    try durable.persist_termination(.{ .exited = 17 }, 2);
+    try durable.persistTermination(.{ .exited = 17 }, 2, null);
     _ = try durable.acquire_write_lease(authority, 3);
     durable.deinit();
     durable_owned = false;
@@ -5686,9 +7528,11 @@ test "a referenced slot is never recycled out from under its holder" {
             .shell = .{ .executable = .{ .path = "/bin/zsh" } },
         },
         testPersistence("/workspace"),
+        null,
     );
     defer resident.deinitUnlaunched();
     resident.lifecycle = .exited;
+    try fixture.profile.register_resident(&resident.durable, null);
     try std.testing.expect(resident.isRecyclable());
 
     const incoming_id = try alloc.dupe(u8, "terminal-recycle-incoming");
@@ -5703,6 +7547,7 @@ test "a referenced slot is never recycled out from under its holder" {
             .shell = .{ .executable = .{ .path = "/bin/zsh" } },
         },
         testPersistence("/workspace"),
+        null,
     );
     defer incoming.deinitUnlaunched();
 
@@ -5713,8 +7558,7 @@ test "a referenced slot is never recycled out from under its holder" {
         .host_identity = "test-host",
         .durable_root = "/workspace",
         .transport_root = "/workspace",
-        .sessions = @splat(&resident),
-        .references = @splat(1),
+        .slots = @splat(.{ .resident = .{ .session = &resident, .references = 1 } }),
     };
 
     // Every slot holds a recyclable session, so only the reference keeps them.
@@ -5723,8 +7567,18 @@ test "a referenced slot is never recycled out from under its holder" {
 
     // Drop the references and the same slots become recyclable again, so the
     // check above is about the reference and not about some other refusal.
-    registry.references = @splat(0);
+    for (&registry.slots) |*slot| slot.resident.references = 0;
+    fixture.profile.mutex.lockUncancelable(io_mod.getIo());
+    var profile_held = true;
+    defer if (profile_held) fixture.profile.mutex.unlock(io_mod.getIo());
+    try std.testing.expect(registry.reserve(&incoming) == null);
+    try std.testing.expect(resident.durable.registered);
+    try std.testing.expectEqual(&resident.durable, fixture.profile.residents.items[0]);
+    fixture.profile.mutex.unlock(io_mod.getIo());
+    profile_held = false;
     const reservation = registry.reserve(&incoming) orelse
         return error.TestExpectedRecycle;
     try std.testing.expectEqual(@as(?*Session, &resident), reservation.evicted);
+    try std.testing.expect(!resident.durable.registered);
+    try std.testing.expectEqual(@as(usize, 0), fixture.profile.residents.items.len);
 }

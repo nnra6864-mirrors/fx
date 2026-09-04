@@ -2133,7 +2133,17 @@ pub fn renderEntriesToBytes(
     cols: u16,
     styles: Styles,
 ) ![]u8 {
-    return (try renderEntries(alloc, entries, cols, styles, .{})).bytes;
+    return renderEntriesToBytesInterruptible(alloc, entries, cols, styles, null);
+}
+
+pub fn renderEntriesToBytesInterruptible(
+    alloc: Allocator,
+    entries: []const TranscriptEntry,
+    cols: u16,
+    styles: Styles,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) ![]u8 {
+    return (try renderEntriesInterruptible(alloc, entries, cols, styles, .{}, checkpoint)).bytes;
 }
 
 pub fn renderEntriesWithOverridesToBytes(

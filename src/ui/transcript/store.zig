@@ -17,6 +17,7 @@
 //   writeTranscriptClassified
 
 const std = @import("std");
+const build_checkpoint = @import("../render_engine/build_checkpoint.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const types = @import("../../core/shared/types.zig");
@@ -156,31 +157,53 @@ pub fn rebuildTranscriptFromRendered(self: anytype, alloc: Allocator, bytes: []c
 }
 
 pub fn retainedStructuredBytes(self: anytype) usize {
+    return retainedStructuredBytesInterruptible(self, null) catch unreachable;
+}
+
+fn retainedStructuredBytesInterruptible(self: anytype, checkpoint: ?*build_checkpoint.BuildCheckpoint) !usize {
     var total: usize = 0;
-    for (self.entries.items) |entry| total += entryRetainedBytes(entry);
-    for (self.folded_command_blocks.items) |block| total += command_output_runtime.foldedBlockRetainedBytes(block);
-    for (self.command_output_blocks.items) |block| total += command_output_runtime.commandOutputBlockRetainedBytes(block);
+    for (self.entries.items) |entry| {
+        try build_checkpoint.tick(checkpoint);
+        total += try entryRetainedBytesInterruptible(entry, checkpoint);
+    }
+    for (self.folded_command_blocks.items) |block| {
+        try build_checkpoint.tick(checkpoint);
+        for (block.lines.items) |line| {
+            try build_checkpoint.tick(checkpoint);
+            total += line.text.len;
+        }
+    }
+    for (self.command_output_blocks.items) |block| {
+        try build_checkpoint.tick(checkpoint);
+        total += try command_output_runtime.commandOutputBlockRetainedBytesInterruptible(block, checkpoint);
+    }
     return total;
 }
 
 fn entryRetainedBytes(entry: TranscriptEntry) usize {
+    return entryRetainedBytesInterruptible(entry, null) catch unreachable;
+}
+
+fn entryRetainedBytesInterruptible(entry: TranscriptEntry, checkpoint: ?*build_checkpoint.BuildCheckpoint) !usize {
     return switch (entry) {
         .raw_bytes => |e| e.bytes.len,
         .semantic_notice => |e| e.topic.len + e.body.len,
         .user_turn => |e| blk: {
             var total = e.turn.text.len;
             for (e.turn.images) |img| {
+                try build_checkpoint.tick(checkpoint);
                 total += img.path.len;
                 total += img.media_type.len;
             }
             for (e.skill_tokens) |token| {
+                try build_checkpoint.tick(checkpoint);
                 total += token.name.len;
                 total += token.path.len;
             }
             break :blk total;
         },
         .assistant_turn => |e| e.segments.text.items.len,
-        .assistant_table => |e| tableRetainedBytes(e.table),
+        .assistant_table => |e| try tableRetainedBytes(e.table, checkpoint),
         .assistant_code_block => |e| e.block.language.len + e.block.code.len,
         .assistant_thematic_rule => 0,
     };
@@ -225,10 +248,14 @@ fn freeSkillTokenSpans(alloc: Allocator, skill_tokens: []SkillTokenSpan) void {
     if (skill_tokens.len > 0) alloc.free(skill_tokens);
 }
 
-fn tableRetainedBytes(table: assistant_presentation.TablePayload) usize {
+fn tableRetainedBytes(table: assistant_presentation.TablePayload, checkpoint: ?*build_checkpoint.BuildCheckpoint) !usize {
     var total: usize = table.alignments.len * @sizeOf(assistant_presentation.TableColumnAlign);
     for (table.rows) |row| {
-        for (row.cells) |cell| total += cell.len;
+        try build_checkpoint.tick(checkpoint);
+        for (row.cells) |cell| {
+            try build_checkpoint.tick(checkpoint);
+            total += cell.len;
+        }
     }
     return total;
 }
@@ -242,8 +269,9 @@ pub fn replaceableEntryId(self: anytype) ?u32 {
     };
 }
 
-fn protectedPreviousUserTurnId(self: anytype, protected_id: u32) ?u32 {
+fn protectedPreviousUserTurnId(self: anytype, protected_id: u32, checkpoint: ?*build_checkpoint.BuildCheckpoint) !?u32 {
     for (self.entries.items, 0..) |entry, index| {
+        try build_checkpoint.tick(checkpoint);
         if (entry.id() != protected_id) continue;
         if (entry != .assistant_turn or index == 0) return null;
         const previous = self.entries.items[index - 1];
@@ -253,13 +281,21 @@ fn protectedPreviousUserTurnId(self: anytype, protected_id: u32) ?u32 {
 }
 
 fn isProtectedEntry(self: anytype, entry_id: u32, protected_id: ?u32) bool {
-    if (isLifecyclePinned(self, entry_id)) return true;
+    return isProtectedEntryInterruptible(self, entry_id, protected_id, null) catch unreachable;
+}
+
+fn isProtectedEntryInterruptible(self: anytype, entry_id: u32, protected_id: ?u32, checkpoint: ?*build_checkpoint.BuildCheckpoint) !bool {
+    if (try isLifecyclePinnedInterruptible(self, entry_id, checkpoint)) return true;
     for (self.command_output_blocks.items) |block| {
-        if (command_output_runtime.isPrunedRangeAnchor(block, entry_id)) return true;
+        try build_checkpoint.tick(checkpoint);
+        for (block.pruned_ranges.items) |range| {
+            try build_checkpoint.tick(checkpoint);
+            if (range.anchor_entry_id == entry_id) return true;
+        }
     }
     if (protected_id) |id| {
         if (entry_id == id) return true;
-        if (protectedPreviousUserTurnId(self, id)) |user_id| {
+        if (try protectedPreviousUserTurnId(self, id, checkpoint)) |user_id| {
             if (entry_id == user_id) return true;
         }
     }
@@ -270,7 +306,12 @@ fn isProtectedEntry(self: anytype, entry_id: u32, protected_id: ?u32) bool {
 }
 
 pub fn isLifecyclePinned(self: anytype, entry_id: u32) bool {
+    return isLifecyclePinnedInterruptible(self, entry_id, null) catch unreachable;
+}
+
+fn isLifecyclePinnedInterruptible(self: anytype, entry_id: u32, checkpoint: ?*build_checkpoint.BuildCheckpoint) !bool {
     for (self.entries.items) |entry| {
+        try build_checkpoint.tick(checkpoint);
         if (entry != .raw_bytes or entry.raw_bytes.id != entry_id) continue;
         return entry.raw_bytes.lifecycle_pinned;
     }
@@ -295,9 +336,10 @@ pub fn lifecyclePinCount(self: anytype) usize {
 
 pub const EntryIdSet = std.AutoHashMapUnmanaged(u32, void);
 
-fn rebuildEntryIdSet(self: anytype, alloc: Allocator, entry_ids: *EntryIdSet) !void {
+fn rebuildEntryIdSet(self: anytype, alloc: Allocator, entry_ids: *EntryIdSet, checkpoint: ?*build_checkpoint.BuildCheckpoint) !void {
     entry_ids.clearRetainingCapacity();
     for (self.entries.items) |entry| {
+        try build_checkpoint.tick(checkpoint);
         try entry_ids.put(alloc, entry.id(), {});
     }
 }
@@ -306,9 +348,16 @@ fn compactEntriesToRetainedSet(
     self: anytype,
     alloc: Allocator,
     retained_entry_ids: *const EntryIdSet,
-) void {
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !void {
     var write_index: usize = 0;
     for (self.entries.items, 0..) |entry, read_index| {
+        build_checkpoint.tick(checkpoint) catch |err| {
+            const remaining = self.entries.items[read_index..];
+            std.mem.copyForwards(TranscriptEntry, self.entries.items[write_index..][0..remaining.len], remaining);
+            self.entries.items.len = write_index + remaining.len;
+            return err;
+        };
         if (!retained_entry_ids.contains(entry.id())) {
             var removed = entry;
             removed.deinit(alloc);
@@ -322,27 +371,66 @@ fn compactEntriesToRetainedSet(
     self.entries.items.len = write_index;
 }
 
+test "retention cancellation preserves ownership after a removed entry" {
+    const alloc = std.testing.allocator;
+    var state = struct { entries: std.ArrayList(TranscriptEntry) = .empty }{};
+    defer {
+        for (state.entries.items) |*entry| entry.deinit(alloc);
+        state.entries.deinit(alloc);
+    }
+    for (1..5) |id| {
+        try state.entries.append(alloc, .{ .raw_bytes = .{
+            .id = @intCast(id),
+            .created_at_ms = 1,
+            .bytes = try alloc.dupe(u8, "retained"),
+        } });
+    }
+    var retained: EntryIdSet = .empty;
+    defer retained.deinit(alloc);
+    try retained.put(alloc, 2, {});
+    var reached = false;
+    const Cancel = struct {
+        fn requested(raw: *anyopaque) bool {
+            const flag: *bool = @ptrCast(@alignCast(raw));
+            flag.* = true;
+            return true;
+        }
+    };
+    var checkpoint = build_checkpoint.BuildCheckpoint.init(&reached, Cancel.requested);
+    checkpoint.remaining = 2;
+    try std.testing.expectError(error.InputPending, compactEntriesToRetainedSet(&state, alloc, &retained, &checkpoint));
+    try std.testing.expect(reached);
+    try std.testing.expectEqual(@as(usize, 3), state.entries.items.len);
+    for (state.entries.items, 2..) |entry, id| {
+        try std.testing.expectEqual(@as(u32, @intCast(id)), entry.id());
+        try std.testing.expectEqualStrings("retained", entry.raw_bytes.bytes);
+    }
+}
+
 fn buildProtectedEntryIdSet(
     self: anytype,
     alloc: Allocator,
     protected_id: ?u32,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) !EntryIdSet {
     var protected_entry_ids: EntryIdSet = .empty;
     errdefer protected_entry_ids.deinit(alloc);
 
     for (self.entries.items) |entry| {
+        try build_checkpoint.tick(checkpoint);
         if (entry == .raw_bytes and entry.raw_bytes.lifecycle_pinned) {
             try protected_entry_ids.put(alloc, entry.raw_bytes.id, {});
         }
     }
     for (self.command_output_blocks.items) |block| {
         for (block.pruned_ranges.items) |range| {
+            try build_checkpoint.tick(checkpoint);
             try protected_entry_ids.put(alloc, range.anchor_entry_id, {});
         }
     }
     if (protected_id) |id| {
         try protected_entry_ids.put(alloc, id, {});
-        if (protectedPreviousUserTurnId(self, id)) |user_id| {
+        if (try protectedPreviousUserTurnId(self, id, checkpoint)) |user_id| {
             try protected_entry_ids.put(alloc, user_id, {});
         }
     }
@@ -356,10 +444,12 @@ fn pruneOrphanedFoldedCommandBlocks(
     self: anytype,
     alloc: Allocator,
     entry_ids: *const EntryIdSet,
-) bool {
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !bool {
     var changed = false;
     var i: usize = 0;
     while (i < self.folded_command_blocks.items.len) {
+        try build_checkpoint.tick(checkpoint);
         const summary_id = self.folded_command_blocks.items[i].summary_entry_id;
         if (summary_id) |id| {
             if (!entry_ids.contains(id)) {
@@ -376,19 +466,23 @@ fn pruneOrphanedFoldedCommandBlocks(
 fn firstExistingCommandOutputSourceEntryId(
     entry_ids: *const EntryIdSet,
     block: command_output_runtime.CommandOutputBlock,
-) ?u32 {
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !?u32 {
     for (block.pruned_ranges.items) |range| {
+        try build_checkpoint.tick(checkpoint);
         if (entry_ids.contains(range.anchor_entry_id)) return range.anchor_entry_id;
     }
     for (block.source_entry_ids.items) |entry_id| {
+        try build_checkpoint.tick(checkpoint);
         if (entry_ids.contains(entry_id)) return entry_id;
     }
     return null;
 }
 
-fn retargetCommandOutputDetails(self: anytype, old_entry_id: u32, new_entry_id: u32) void {
+fn retargetCommandOutputDetails(self: anytype, old_entry_id: u32, new_entry_id: u32, checkpoint: ?*build_checkpoint.BuildCheckpoint) !void {
     if (comptime !@hasField(@TypeOf(self.*), "tool_details")) return;
     for (self.tool_details.items) |*detail| {
+        try build_checkpoint.tick(checkpoint);
         if (detail.command_output_entry_id == old_entry_id) {
             detail.command_output_entry_id = new_entry_id;
         }
@@ -398,11 +492,13 @@ fn retargetCommandOutputDetails(self: anytype, old_entry_id: u32, new_entry_id: 
 fn commandOutputBlockHasDetail(
     self: anytype,
     block: command_output_runtime.CommandOutputBlock,
-) bool {
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !bool {
     if (comptime !@hasField(@TypeOf(self.*), "tool_details")) return false;
     for (self.tool_details.items) |detail| {
+        try build_checkpoint.tick(checkpoint);
         if (detail.command_output_entry_id) |entry_id| {
-            if (command_output_runtime.commandBlockOwnsEntry(block, entry_id)) {
+            if (try command_output_runtime.commandBlockOwnsEntryInterruptible(block, entry_id, checkpoint)) {
                 return true;
             }
         }
@@ -420,9 +516,11 @@ fn removePrunedRangeAnchorEntries(
     alloc: Allocator,
     block: command_output_runtime.CommandOutputBlock,
     entry_ids: *EntryIdSet,
-) void {
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !void {
     var entry_index: usize = 0;
     while (entry_index < self.entries.items.len) {
+        try build_checkpoint.tick(checkpoint);
         const entry_id = self.entries.items[entry_index].id();
         if (!command_output_runtime.isPrunedRangeAnchor(block, entry_id)) {
             entry_index += 1;
@@ -438,10 +536,12 @@ fn pruneOrphanedCommandOutputBlocks(
     self: anytype,
     alloc: Allocator,
     entry_ids: *EntryIdSet,
-) bool {
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !bool {
     var changed = false;
     var i: usize = 0;
     while (i < self.command_output_blocks.items.len) {
+        try build_checkpoint.tick(checkpoint);
         if (self.command_output_blocks.items[i].live_entry_ids.items.len != 0) {
             i += 1;
             continue;
@@ -455,13 +555,14 @@ fn pruneOrphanedCommandOutputBlocks(
 
         if (self.command_output_blocks.items[i].lines.items.len == 0 and
             self.command_output_blocks.items[i].pruned_ranges.items.len > 0 and
-            !commandOutputBlockHasDetail(self, self.command_output_blocks.items[i]))
+            !try commandOutputBlockHasDetail(self, self.command_output_blocks.items[i], checkpoint))
         {
-            removePrunedRangeAnchorEntries(
+            try removePrunedRangeAnchorEntries(
                 self,
                 alloc,
                 self.command_output_blocks.items[i],
                 entry_ids,
+                checkpoint,
             );
             command_output_runtime.removeCommandOutputBlock(self, alloc, i);
             changed = true;
@@ -471,9 +572,9 @@ fn pruneOrphanedCommandOutputBlocks(
         const entry_id = self.command_output_blocks.items[i].entry_id;
         if (entry_id) |id| {
             if (!entry_ids.contains(id)) {
-                if (firstExistingCommandOutputSourceEntryId(entry_ids, self.command_output_blocks.items[i])) |replacement| {
+                if (try firstExistingCommandOutputSourceEntryId(entry_ids, self.command_output_blocks.items[i], checkpoint)) |replacement| {
                     self.command_output_blocks.items[i].entry_id = replacement;
-                    retargetCommandOutputDetails(self, id, replacement);
+                    try retargetCommandOutputDetails(self, id, replacement, checkpoint);
                     changed = true;
                     i += 1;
                     continue;
@@ -483,7 +584,7 @@ fn pruneOrphanedCommandOutputBlocks(
                 continue;
             }
         } else {
-            if (firstExistingCommandOutputSourceEntryId(entry_ids, self.command_output_blocks.items[i])) |replacement| {
+            if (try firstExistingCommandOutputSourceEntryId(entry_ids, self.command_output_blocks.items[i], checkpoint)) |replacement| {
                 self.command_output_blocks.items[i].entry_id = replacement;
                 changed = true;
                 i += 1;
@@ -498,27 +599,30 @@ fn pruneOrphanedCommandOutputBlocks(
     return changed;
 }
 
-fn coalesceCommandOutputPrunedRanges(self: anytype, alloc: Allocator) bool {
+fn coalesceCommandOutputPrunedRanges(self: anytype, alloc: Allocator, checkpoint: ?*build_checkpoint.BuildCheckpoint) !bool {
     var changed = false;
     for (0..self.command_output_blocks.items.len) |block_index| {
-        if (command_output_runtime.coalesceCommandOutputPrunedRanges(
+        try build_checkpoint.tick(checkpoint);
+        if (try command_output_runtime.coalesceCommandOutputPrunedRangesInterruptible(
             self,
             alloc,
             block_index,
+            checkpoint,
         )) changed = true;
     }
     return changed;
 }
 
-fn trimFoldedCommandLinesToBudget(self: anytype, alloc: Allocator, cap: usize) bool {
+fn trimFoldedCommandLinesToBudget(self: anytype, alloc: Allocator, cap: usize, checkpoint: ?*build_checkpoint.BuildCheckpoint) !bool {
     var changed = false;
-    var total = retainedStructuredBytes(self);
+    var total = try retainedStructuredBytesInterruptible(self, checkpoint);
     if (total <= cap) return false;
 
     var block_index: usize = 0;
     while (block_index < self.folded_command_blocks.items.len and total > cap) : (block_index += 1) {
         var block = &self.folded_command_blocks.items[block_index];
         while (block.lines.items.len > 0 and total > cap) {
+            try build_checkpoint.tick(checkpoint);
             const line = block.lines.orderedRemove(0);
             const line_len = line.text.len;
             alloc.free(line.text);
@@ -536,26 +640,30 @@ fn trimCommandOutputLinesToBudget(
     alloc: Allocator,
     cap: usize,
     only_count_only_blocks: bool,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) !bool {
     var changed = false;
-    var total = retainedStructuredBytes(self);
+    var total = try retainedStructuredBytesInterruptible(self, checkpoint);
     if (total <= cap) return false;
 
     var block_index: usize = 0;
     while (block_index < self.command_output_blocks.items.len and total > cap) : (block_index += 1) {
+        try build_checkpoint.tick(checkpoint);
         var block = &self.command_output_blocks.items[block_index];
         if (only_count_only_blocks and block.total_lines <= block.lines.items.len) continue;
         while (block.lines.items.len > 0 and total > cap) {
+            try build_checkpoint.tick(checkpoint);
             const line_index = block.lines.items.len - 1;
             const line_len = block.lines.items[line_index].text.len;
-            if (!try command_output_runtime.trimRetainedCommandOutputLine(
+            if (!try command_output_runtime.trimRetainedCommandOutputLineInterruptible(
                 self,
                 alloc,
                 block_index,
                 line_index,
+                checkpoint,
             )) break;
             block = &self.command_output_blocks.items[block_index];
-            total = retainedStructuredBytes(self);
+            total = try retainedStructuredBytesInterruptible(self, checkpoint);
             changed = true;
             debug_trace.logf("transcript_retention", "pruned command output line bytes={d} retained={d} cap={d}", .{ line_len, total, cap });
         }
@@ -572,11 +680,12 @@ const CommandOutputLineLocation = struct {
 
 const CommandOutputBlockIndex = std.AutoHashMapUnmanaged(u32, usize);
 
-fn buildCommandOutputBlockIndex(self: anytype, alloc: Allocator) !CommandOutputBlockIndex {
+fn buildCommandOutputBlockIndex(self: anytype, alloc: Allocator, checkpoint: ?*build_checkpoint.BuildCheckpoint) !CommandOutputBlockIndex {
     var index: CommandOutputBlockIndex = .empty;
     errdefer index.deinit(alloc);
     for (self.command_output_blocks.items, 0..) |block, block_index| {
         for (block.lines.items) |line| {
+            try build_checkpoint.tick(checkpoint);
             if (line.entry_id) |entry_id| {
                 try index.put(alloc, entry_id, block_index);
             }
@@ -589,10 +698,12 @@ fn commandOutputLineLocation(
     self: anytype,
     block_index: *const CommandOutputBlockIndex,
     entry_id: u32,
-) ?CommandOutputLineLocation {
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !?CommandOutputLineLocation {
     const index = block_index.get(entry_id) orelse return null;
     const block = self.command_output_blocks.items[index];
     for (block.lines.items, 0..) |line, line_index| {
+        try build_checkpoint.tick(checkpoint);
         if (line.entry_id != entry_id) continue;
         var open = false;
         for (block.open_line_indices) |open_line_index| {
@@ -610,17 +721,18 @@ fn commandOutputLineLocation(
     return null;
 }
 
-fn trimProtectedEntriesToBudget(self: anytype, alloc: Allocator, cap: usize, protected_id: ?u32) !bool {
+fn trimProtectedEntriesToBudget(self: anytype, alloc: Allocator, cap: usize, protected_id: ?u32, checkpoint: ?*build_checkpoint.BuildCheckpoint) !bool {
     var changed = false;
-    var total = retainedStructuredBytes(self);
+    var total = try retainedStructuredBytesInterruptible(self, checkpoint);
     while (total > cap) {
         const excess = total - cap;
         var trimmed = false;
 
         for (self.entries.items) |*entry| {
+            try build_checkpoint.tick(checkpoint);
             const entry_id = entry.id();
-            if (!isProtectedEntry(self, entry_id, protected_id)) continue;
-            if (isLifecyclePinned(self, entry_id)) continue;
+            if (!try isProtectedEntryInterruptible(self, entry_id, protected_id, checkpoint)) continue;
+            if (try isLifecyclePinnedInterruptible(self, entry_id, checkpoint)) continue;
 
             const before = entryRetainedBytes(entry.*);
             if (before == 0) continue;
@@ -666,22 +778,29 @@ fn trimEntryRetainedBytes(alloc: Allocator, entry: *TranscriptEntry, target: usi
 }
 
 pub fn refreshFoldedCommandSummaryIndices(self: anytype, alloc: Allocator) !void {
+    return refreshFoldedCommandSummaryIndicesInterruptible(self, alloc, null);
+}
+
+fn refreshFoldedCommandSummaryIndicesInterruptible(self: anytype, alloc: Allocator, checkpoint: ?*build_checkpoint.BuildCheckpoint) !void {
     const cols: u16 = if (self.layout.cols > 0) self.layout.cols else 80;
     const summary_entry_ids = try alloc.alloc(?u32, self.folded_command_blocks.items.len);
     defer alloc.free(summary_entry_ids);
     for (self.folded_command_blocks.items, summary_entry_ids) |block, *entry_id| {
+        try build_checkpoint.tick(checkpoint);
         entry_id.* = block.summary_entry_id;
     }
 
-    var prepared = try transcript_blocks.renderEntriesForPreparation(
+    var prepared = try transcript_blocks.renderEntriesForPreparationInterruptible(
         alloc,
         self.entries.items,
         cols,
         self.command_output_render.styles,
         .{ .folded_summary_entry_ids = summary_entry_ids },
+        checkpoint,
     );
     defer prepared.deinit(alloc);
     for (self.folded_command_blocks.items, prepared.folded_summary_indices) |*block, index| {
+        try build_checkpoint.tick(checkpoint);
         block.summary_transcript_index = index;
     }
 }
@@ -718,13 +837,15 @@ fn rebuildTranscriptCacheFromEntriesMode(
     alloc: Allocator,
     label: []const u8,
     mode: TranscriptSourceRewriteMode,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) !void {
     const cols: u16 = if (self.layout.cols > 0) self.layout.cols else 80;
-    const fresh = try transcript_blocks.renderEntriesToBytes(
+    const fresh = try transcript_blocks.renderEntriesToBytesInterruptible(
         alloc,
         self.entries.items,
         cols,
         self.command_output_render.styles,
+        checkpoint,
     );
     defer alloc.free(fresh);
     try rebuildTranscriptFromRendered(self, alloc, fresh, label);
@@ -733,7 +854,7 @@ fn rebuildTranscriptCacheFromEntriesMode(
 }
 
 pub fn rebuildTranscriptCacheFromEntries(self: anytype, alloc: Allocator, label: []const u8) !void {
-    return rebuildTranscriptCacheFromEntriesMode(self, alloc, label, .strict);
+    return rebuildTranscriptCacheFromEntriesMode(self, alloc, label, .strict, null);
 }
 
 pub fn rebuildTranscriptCacheAfterStructuredRewrite(
@@ -746,6 +867,7 @@ pub fn rebuildTranscriptCacheAfterStructuredRewrite(
         alloc,
         label,
         .preserve_same_epoch,
+        null,
     );
 }
 
@@ -758,39 +880,50 @@ pub fn enforceStructuredRetentionAndReport(
     alloc: Allocator,
     protected_id: ?u32,
 ) !bool {
+    return enforceStructuredRetentionAndReportInterruptible(self, alloc, protected_id, null);
+}
+
+pub fn enforceStructuredRetentionAndReportInterruptible(
+    self: anytype,
+    alloc: Allocator,
+    protected_id: ?u32,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !bool {
+    try build_checkpoint.poll(checkpoint);
     const cap = self.max_retained_transcript_bytes;
     var entry_ids: EntryIdSet = .empty;
     defer entry_ids.deinit(alloc);
-    try rebuildEntryIdSet(self, alloc, &entry_ids);
+    try rebuildEntryIdSet(self, alloc, &entry_ids, checkpoint);
 
-    var changed = pruneOrphanedFoldedCommandBlocks(self, alloc, &entry_ids);
-    if (pruneOrphanedCommandOutputBlocks(self, alloc, &entry_ids)) changed = true;
-    if (coalesceCommandOutputPrunedRanges(self, alloc)) {
+    var changed = try pruneOrphanedFoldedCommandBlocks(self, alloc, &entry_ids, checkpoint);
+    if (try pruneOrphanedCommandOutputBlocks(self, alloc, &entry_ids, checkpoint)) changed = true;
+    if (try coalesceCommandOutputPrunedRanges(self, alloc, checkpoint)) {
         changed = true;
-        try rebuildEntryIdSet(self, alloc, &entry_ids);
+        try rebuildEntryIdSet(self, alloc, &entry_ids, checkpoint);
     }
-    var total = retainedStructuredBytes(self);
+    var total = try retainedStructuredBytesInterruptible(self, checkpoint);
 
     if (total > cap) {
-        if (try trimCommandOutputLinesToBudget(self, alloc, cap, true)) {
+        if (try trimCommandOutputLinesToBudget(self, alloc, cap, true, checkpoint)) {
             changed = true;
-            total = retainedStructuredBytes(self);
+            total = try retainedStructuredBytesInterruptible(self, checkpoint);
         }
     }
 
-    var protected_entry_ids = try buildProtectedEntryIdSet(self, alloc, protected_id);
+    var protected_entry_ids = try buildProtectedEntryIdSet(self, alloc, protected_id, checkpoint);
     defer protected_entry_ids.deinit(alloc);
     try protected_entry_ids.ensureTotalCapacity(alloc, @intCast(self.entries.items.len));
-    var command_output_block_index = try buildCommandOutputBlockIndex(self, alloc);
+    var command_output_block_index = try buildCommandOutputBlockIndex(self, alloc, checkpoint);
     defer command_output_block_index.deinit(alloc);
     var prune_scan_index: usize = 0;
 
     while (total > cap) {
         var prune_index: ?usize = null;
         for (self.entries.items[prune_scan_index..], prune_scan_index..) |entry, i| {
+            try build_checkpoint.tick(checkpoint);
             if (!entry_ids.contains(entry.id())) continue;
             if (!protected_entry_ids.contains(entry.id())) {
-                if (commandOutputLineLocation(self, &command_output_block_index, entry.id())) |location| {
+                if (try commandOutputLineLocation(self, &command_output_block_index, entry.id(), checkpoint)) |location| {
                     if (location.open) continue;
                 }
                 prune_index = i;
@@ -801,18 +934,19 @@ pub fn enforceStructuredRetentionAndReport(
         const index = prune_index orelse break;
         prune_scan_index = index;
         const entry_id = self.entries.items[index].id();
-        if (commandOutputLineLocation(self, &command_output_block_index, entry_id)) |location| {
+        if (try commandOutputLineLocation(self, &command_output_block_index, entry_id, checkpoint)) |location| {
             const block_bytes_before = command_output_runtime.commandOutputBlockRetainedBytes(
                 self.command_output_blocks.items[location.block_index],
             );
             const entry_bytes_before = entryRetainedBytes(self.entries.items[index]);
             const line_bytes = self.command_output_blocks.items[location.block_index]
                 .lines.items[location.line_index].text.len;
-            if (try command_output_runtime.trimRetainedCommandOutputLine(
+            if (try command_output_runtime.trimRetainedCommandOutputLineInterruptible(
                 self,
                 alloc,
                 location.block_index,
                 location.line_index,
+                checkpoint,
             )) {
                 changed = true;
                 debug_trace.logf(
@@ -840,7 +974,7 @@ pub fn enforceStructuredRetentionAndReport(
             }
         }
 
-        const entry_bytes = entryRetainedBytes(self.entries.items[index]);
+        const entry_bytes = try entryRetainedBytesInterruptible(self.entries.items[index], checkpoint);
         _ = entry_ids.remove(entry_id);
         changed = true;
         debug_trace.logf("transcript_retention", "pruned entry id={d} bytes={d} retained_before={d} cap={d}", .{ entry_id, entry_bytes, total, cap });
@@ -848,36 +982,36 @@ pub fn enforceStructuredRetentionAndReport(
     }
 
     if (changed) {
-        compactEntriesToRetainedSet(self, alloc, &entry_ids);
-        if (coalesceCommandOutputPrunedRanges(self, alloc)) {
-            try rebuildEntryIdSet(self, alloc, &entry_ids);
+        try compactEntriesToRetainedSet(self, alloc, &entry_ids, checkpoint);
+        if (try coalesceCommandOutputPrunedRanges(self, alloc, checkpoint)) {
+            try rebuildEntryIdSet(self, alloc, &entry_ids, checkpoint);
         }
-        _ = pruneOrphanedFoldedCommandBlocks(self, alloc, &entry_ids);
-        _ = pruneOrphanedCommandOutputBlocks(self, alloc, &entry_ids);
-        total = retainedStructuredBytes(self);
+        _ = try pruneOrphanedFoldedCommandBlocks(self, alloc, &entry_ids, checkpoint);
+        _ = try pruneOrphanedCommandOutputBlocks(self, alloc, &entry_ids, checkpoint);
+        total = try retainedStructuredBytesInterruptible(self, checkpoint);
     }
 
     if (total > cap) {
-        if (trimFoldedCommandLinesToBudget(self, alloc, cap)) {
+        if (try trimFoldedCommandLinesToBudget(self, alloc, cap, checkpoint)) {
             changed = true;
-            total = retainedStructuredBytes(self);
+            total = try retainedStructuredBytesInterruptible(self, checkpoint);
         }
     }
 
     if (total > cap) {
-        if (try trimCommandOutputLinesToBudget(self, alloc, cap, false)) {
+        if (try trimCommandOutputLinesToBudget(self, alloc, cap, false, checkpoint)) {
             changed = true;
-            total = retainedStructuredBytes(self);
+            total = try retainedStructuredBytesInterruptible(self, checkpoint);
         }
     }
 
     if (changed) {
-        _ = try command_output_runtime.syncCommandOutputBlockEntries(self, alloc);
-        total = retainedStructuredBytes(self);
+        _ = try command_output_runtime.syncCommandOutputBlockEntriesInterruptible(self, alloc, checkpoint);
+        total = try retainedStructuredBytesInterruptible(self, checkpoint);
     }
 
     if (total > cap) {
-        if (try trimProtectedEntriesToBudget(self, alloc, cap, protected_id)) {
+        if (try trimProtectedEntriesToBudget(self, alloc, cap, protected_id, checkpoint)) {
             changed = true;
         }
     }
@@ -892,13 +1026,38 @@ pub fn enforceStructuredRetentionAndReport(
 
     if (!changed) return false;
     if (comptime @hasDecl(@TypeOf(self.*), "pruneToolDetailsForRetainedEntries")) {
-        try rebuildEntryIdSet(self, alloc, &entry_ids);
-        self.pruneToolDetailsForRetainedEntries(alloc, &entry_ids);
+        try rebuildEntryIdSet(self, alloc, &entry_ids, checkpoint);
+        try pruneToolDetailsForRetainedEntries(self, alloc, &entry_ids, checkpoint);
     }
-    try self.refreshFoldedCommandSummaryIndices(alloc);
-    try rebuildTranscriptCacheAfterStructuredRewrite(self, alloc, "structured retention");
+    try refreshFoldedCommandSummaryIndicesInterruptible(self, alloc, checkpoint);
+    try rebuildTranscriptCacheFromEntriesMode(self, alloc, "structured retention", .preserve_same_epoch, checkpoint);
     requestTranscriptPaint(self);
     return true;
+}
+
+pub fn pruneToolDetailsForRetainedEntries(
+    self: anytype,
+    alloc: Allocator,
+    retained_entry_ids: *const EntryIdSet,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !void {
+    var write_index: usize = 0;
+    for (self.tool_details.items, 0..) |detail, read_index| {
+        build_checkpoint.tick(checkpoint) catch |err| {
+            const remaining = self.tool_details.items[read_index..];
+            std.mem.copyForwards(ToolDetailRecord, self.tool_details.items[write_index..][0..remaining.len], remaining);
+            self.tool_details.items.len = write_index + remaining.len;
+            return err;
+        };
+        if (!retained_entry_ids.contains(detail.entry_id)) {
+            var removed = detail;
+            removed.deinit(alloc);
+            continue;
+        }
+        if (write_index != read_index) self.tool_details.items[write_index] = detail;
+        write_index += 1;
+    }
+    self.tool_details.items.len = write_index;
 }
 
 pub fn clearTranscript(self: anytype, alloc: Allocator) void {
@@ -2405,27 +2564,6 @@ pub fn appendRawTranscriptEntryClassified(
     rollback_entry = false;
     try enforceStructuredRetention(self, alloc, entry_id);
     return entry_id;
-}
-
-pub fn releaseStartupResumeViewEntry(
-    self: anytype,
-    alloc: Allocator,
-    entry_id: u32,
-) !bool {
-    try self.assertCanMutateTranscript();
-    const entry_index = rawEntryIndex(self, entry_id) orelse return false;
-
-    var removed = self.entries.orderedRemove(entry_index);
-    errdefer {
-        self.entries.insertAssumeCapacity(entry_index, removed);
-    }
-
-    try rebuildTranscriptCacheFromEntries(self, alloc, "startup resume view release");
-    self.recomputeCursorFromTranscript();
-    requestTranscriptPaint(self);
-
-    removed.deinit(alloc);
-    return true;
 }
 
 pub fn updateRawBytesEntry(

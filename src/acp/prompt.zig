@@ -1397,10 +1397,7 @@ fn refreshGatewayCredential(
     );
 }
 
-fn persistUsageCheckpoint(
-    raw_ctx: *anyopaque,
-    snapshot: session_usage.Snapshot,
-) !void {
+fn persistUsageCheckpoint(raw_ctx: *anyopaque, snapshot: session_usage.Snapshot, _: ?*const std.atomic.Value(bool)) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const active = if (ctx.state.active_session) |*session|
         session
@@ -3027,6 +3024,7 @@ test "ACP usage checkpoints honor the active session write boundary" {
             persistUsageCheckpoint(
                 @ptrCast(self.ctx),
                 self.snapshot,
+                null,
             ) catch |err| {
                 self.failure = err;
             };
@@ -3056,7 +3054,7 @@ test "ACP usage checkpoints honor the active session write boundary" {
 test "ACP usage checkpoints maintain the profile recovery marker" {
     const alloc = std.testing.allocator;
     const PublicationSink = struct {
-        fn publish(_: *anyopaque, _: session_usage.usage_report.ProfileEvent) !void {}
+        fn publish(_: *anyopaque, _: session_usage.usage_report.ProfileEvent, _: ?*const std.atomic.Value(bool)) !void {}
     };
 
     var tmp = std.testing.tmpDir(.{});
@@ -3138,7 +3136,7 @@ test "ACP usage checkpoints maintain the profile recovery marker" {
         .session_id = writable.active_id,
     };
 
-    try persistUsageCheckpoint(@ptrCast(&ctx), pending);
+    try persistUsageCheckpoint(@ptrCast(&ctx), pending, null);
     var marked = try store.listUsageRecoverySessions(alloc);
     defer {
         for (marked.items) |*entry| entry.deinit(alloc);
@@ -3174,7 +3172,7 @@ test "ACP usage checkpoints maintain the profile recovery marker" {
     });
     var settled = try usage.snapshot(alloc);
     defer settled.deinit(alloc);
-    try persistUsageCheckpoint(@ptrCast(&ctx), settled);
+    try persistUsageCheckpoint(@ptrCast(&ctx), settled, null);
 
     var cleared = try store.listUsageRecoverySessions(alloc);
     defer {

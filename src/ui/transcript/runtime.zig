@@ -49,18 +49,6 @@ pub const RawEntryClass = transcript_blocks.RawEntryClass;
 pub const TranscriptEntry = transcript_blocks.TranscriptEntry;
 pub const TranscriptPreparationSource = source_preparation.TranscriptPreparationSource;
 
-pub const VisibleTranscriptSnapshot = struct {
-    text: []u8,
-    terminal_rows: u16,
-    terminal_cols: u16,
-    complete: bool,
-
-    pub fn deinit(self: *VisibleTranscriptSnapshot, alloc: Allocator) void {
-        alloc.free(self.text);
-        self.* = undefined;
-    }
-};
-
 pub const ResizeObservationPhase = enum {
     live,
     settle_pending,
@@ -1707,44 +1695,6 @@ test "cached compact transcript preserves pending resume flow" {
     defer source.deinit(alloc);
 
     try std.testing.expect(std.mem.find(u8, source.bytes, "full resume history") != null);
-}
-
-test "startup resume view release preserves later structured notices" {
-    const alloc = std.testing.allocator;
-    var runtime = TranscriptRuntime{
-        .layout = .{
-            .rows = 24,
-            .cols = 80,
-            .content_bottom = 20,
-            .divider_top_row = 21,
-            .input_row = 22,
-            .divider_bottom_row = 23,
-            .hint_row = 24,
-        },
-        .owned_top_row = 1,
-    };
-    defer runtime.deinit(alloc);
-
-    const resume_entry_id = try runtime.appendRawTranscriptEntryClassified(
-        alloc,
-        "cached resume view\n",
-        .unknown_raw,
-    );
-    _ = try runtime.appendSemanticNotice(alloc, .{
-        .topic = "recording",
-        .tone = .warning,
-        .body = "terminal capture is active",
-    });
-    try std.testing.expect(std.mem.find(u8, runtime.transcript.items, "cached resume view") != null);
-    try std.testing.expect(std.mem.find(u8, runtime.transcript.items, "terminal capture is active") != null);
-
-    try std.testing.expect(try runtime.releaseStartupResumeViewEntry(alloc, resume_entry_id));
-
-    try std.testing.expectEqual(@as(usize, 1), runtime.entries.items.len);
-    try std.testing.expect(runtime.entries.items[0] == .semantic_notice);
-    try std.testing.expect(std.mem.find(u8, runtime.transcript.items, "cached resume view") == null);
-    try std.testing.expect(std.mem.find(u8, runtime.transcript.items, "terminal capture is active") != null);
-    try std.testing.expect(!try runtime.releaseStartupResumeViewEntry(alloc, resume_entry_id));
 }
 
 const PendingBuildProbe = struct {
@@ -4683,88 +4633,6 @@ pub const TranscriptRuntime = struct {
         return transcript_store.clearTranscript(self, alloc);
     }
 
-    pub fn snapshotVisibleTranscriptText(
-        self: *const TranscriptRuntime,
-        alloc: Allocator,
-        max_bytes: usize,
-    ) !?VisibleTranscriptSnapshot {
-        const grid = self.shadow_vt orelse return null;
-        if (!self.has_painted_transcript or
-            self.last_visible_transcript_top_row == 0 or
-            self.last_visible_transcript_last_row < self.last_visible_transcript_top_row)
-        {
-            return null;
-        }
-        const footer_gap_rows = if (!self.committed_frame_layout.footer_area.isEmpty() and
-            self.committed_frame_layout.footer_area.top > self.last_visible_transcript_last_row)
-            self.committed_frame_layout.footer_area.top - self.last_visible_transcript_last_row - 1
-        else
-            0;
-        if (footer_gap_rows >= max_bytes) return null;
-        const text_byte_limit = max_bytes - footer_gap_rows;
-        var out: std.ArrayList(u8) = .empty;
-        errdefer out.deinit(alloc);
-        var start_row = self.last_visible_transcript_top_row;
-        const leading_welcome_visible = if (self.entries.items.len > 0 and
-            self.entries.items[0] == .raw_bytes and
-            self.entries.items[0].raw_bytes.class == .welcome and
-            self.last_viewport_selection != null)
-            self.last_viewport_selection.?.start_line == 0 or
-                (self.last_viewport_selection.?.split_active and
-                    self.last_viewport_selection.?.split_prefix_lines > 0)
-        else
-            false;
-        if (leading_welcome_visible) {
-            var saw_welcome_text = false;
-            while (start_row <= self.last_visible_transcript_last_row) : (start_row += 1) {
-                var line: std.ArrayList(u8) = .empty;
-                defer line.deinit(grid.alloc);
-                try grid.rowTextTrimmed(start_row, &line);
-                if (line.items.len > 0) {
-                    saw_welcome_text = true;
-                } else if (saw_welcome_text) {
-                    start_row += 1;
-                    break;
-                }
-            }
-            if (!saw_welcome_text or start_row > self.last_visible_transcript_last_row) return null;
-        }
-        var selected_start: ?u16 = null;
-        var selected_bytes: usize = 0;
-        var row = self.last_visible_transcript_last_row;
-        while (true) {
-            var line: std.Io.Writer.Allocating = .init(grid.alloc);
-            defer line.deinit();
-            try grid.rowStyledTextTrimmed(row, &line.writer);
-            if (line.written().len >= text_byte_limit - selected_bytes) break;
-            selected_bytes += line.written().len + 1;
-            selected_start = row;
-            if (row == start_row) break;
-            row -= 1;
-        }
-        row = selected_start orelse return null;
-        var has_content = false;
-        while (row <= self.last_visible_transcript_last_row) : (row += 1) {
-            var line: std.Io.Writer.Allocating = .init(grid.alloc);
-            defer line.deinit();
-            try grid.rowStyledTextTrimmed(row, &line.writer);
-            has_content = has_content or line.written().len > 0;
-            try out.appendSlice(alloc, line.written());
-            try out.append(alloc, '\n');
-        }
-        if (!has_content) {
-            out.deinit(alloc);
-            return null;
-        }
-        try out.appendNTimes(alloc, '\n', footer_gap_rows);
-        return .{
-            .text = try out.toOwnedSlice(alloc),
-            .terminal_rows = grid.rows,
-            .terminal_cols = grid.cols,
-            .complete = selected_start.? == start_row,
-        };
-    }
-
     pub fn resetVisualEpoch(self: *TranscriptRuntime, alloc: Allocator, welcome: []const u8) !void {
         return transcript_store.resetVisualEpoch(self, alloc, welcome);
     }
@@ -5967,19 +5835,7 @@ pub const TranscriptRuntime = struct {
         alloc: Allocator,
         retained_entry_ids: *const transcript_store.EntryIdSet,
     ) void {
-        var write_index: usize = 0;
-        for (self.tool_details.items, 0..) |detail, read_index| {
-            if (!retained_entry_ids.contains(detail.entry_id)) {
-                var removed = detail;
-                removed.deinit(alloc);
-                continue;
-            }
-            if (write_index != read_index) {
-                self.tool_details.items[write_index] = detail;
-            }
-            write_index += 1;
-        }
-        self.tool_details.items.len = write_index;
+        transcript_store.pruneToolDetailsForRetainedEntries(self, alloc, retained_entry_ids, null) catch unreachable;
     }
 
     pub fn clearFullTranscriptDetails(self: *TranscriptRuntime, alloc: Allocator) void {
@@ -6107,14 +5963,6 @@ pub const TranscriptRuntime = struct {
         class: RawEntryClass,
     ) !u32 {
         return transcript_store.appendRawTranscriptEntryClassified(self, alloc, text, class);
-    }
-
-    pub fn releaseStartupResumeViewEntry(
-        self: *TranscriptRuntime,
-        alloc: Allocator,
-        entry_id: u32,
-    ) !bool {
-        return transcript_store.releaseStartupResumeViewEntry(self, alloc, entry_id);
     }
 
     pub fn appendTurnSummaryEntry(self: *TranscriptRuntime, alloc: Allocator, summary: types.TurnSummary) !u32 {
@@ -11100,161 +10948,6 @@ fn resolveTranscriptRecoveryCommit(
         .document_append_committed = transition.recovery_tracks_semantic_progress and
             materialized.visual_offset > accepted_visual_offset,
     };
-}
-
-test "resume view snapshot captures visible transcript styling" {
-    const alloc = std.testing.allocator;
-    var runtime: TranscriptRuntime = .{};
-    defer runtime.deinit(alloc);
-    runtime.layout = .{
-        .rows = 6,
-        .cols = 12,
-        .content_bottom = 3,
-        .divider_top_row = 4,
-        .input_row = 5,
-        .divider_bottom_row = 5,
-        .hint_row = 6,
-    };
-    try runtime.enableShadowVt(alloc);
-    try runtime.shadow_vt.?.feed(
-        "\x1b[1;1Hnot cached\x1b[2;1H" ++
-            "\x1b]8;;https://example.com\x1b\\" ++
-            "\x1b[1;3;38;2;1;2;3m\x1b[48;5;245mvisible one\x1b[0m" ++
-            "\x1b]8;;\x1b\\\x1b[3;1H\x1b[31mvisible two\x1b[0m" ++
-            "\x1b[4;1Hfooter",
-    );
-    runtime.has_painted_transcript = true;
-    runtime.last_visible_transcript_top_row = 2;
-    runtime.last_visible_transcript_last_row = 3;
-
-    var snapshot = (try runtime.snapshotVisibleTranscriptText(alloc, 128)).?;
-    defer snapshot.deinit(alloc);
-    try std.testing.expect(snapshot.complete);
-    try std.testing.expectEqual(@as(u16, 6), snapshot.terminal_rows);
-    try std.testing.expectEqual(@as(u16, 12), snapshot.terminal_cols);
-    try std.testing.expectEqualStrings(
-        "\x1b[0m\x1b[1m\x1b[3m\x1b[38;2;1;2;3m" ++
-            "\x1b[48;5;245mvisible one\x1b[0m\n" ++
-            "\x1b[0m\x1b[31mvisible two\x1b[0m\n",
-        snapshot.text,
-    );
-}
-
-test "resume view snapshot preserves the committed footer gap" {
-    const alloc = std.testing.allocator;
-    var runtime: TranscriptRuntime = .{};
-    defer runtime.deinit(alloc);
-    runtime.layout.rows = 6;
-    runtime.layout.cols = 12;
-    runtime.committed_frame_layout.footer_area = .{ .top = 4, .bottom = 6 };
-    try runtime.enableShadowVt(alloc);
-    try runtime.shadow_vt.?.feed("\x1b[1;1Hvisible");
-    runtime.has_painted_transcript = true;
-    runtime.last_visible_transcript_top_row = 1;
-    runtime.last_visible_transcript_last_row = 1;
-
-    var snapshot = (try runtime.snapshotVisibleTranscriptText(alloc, 128)).?;
-    defer snapshot.deinit(alloc);
-    try std.testing.expect(snapshot.complete);
-    try std.testing.expectEqualStrings("visible\n\n\n", snapshot.text);
-}
-
-test "resume view snapshot omits a visible leading welcome entry" {
-    const alloc = std.testing.allocator;
-    var runtime: TranscriptRuntime = .{};
-    defer runtime.deinit(alloc);
-    runtime.layout = .{
-        .rows = 6,
-        .cols = 40,
-        .content_bottom = 4,
-        .divider_top_row = 5,
-        .input_row = 6,
-        .divider_bottom_row = 6,
-        .hint_row = 6,
-    };
-    var metrics: Metrics = .{};
-    try runtime.writeTranscriptClassified(
-        alloc,
-        &metrics,
-        "fx · Run /help for commands\n\n",
-        true,
-        .welcome,
-    );
-    try runtime.enableShadowVt(alloc);
-    try runtime.shadow_vt.?.feed(
-        "\x1b[1;1Hfx · Run /help for commands" ++
-            "\x1b[3;1Hvisible one\x1b[4;1Hvisible two",
-    );
-    runtime.has_painted_transcript = true;
-    runtime.last_visible_transcript_top_row = 1;
-    runtime.last_visible_transcript_last_row = 4;
-    runtime.last_viewport_selection = .{
-        .top_row = 1,
-        .bottom_row = 4,
-        .start_line = 0,
-        .partial_skip_rows = 0,
-        .line_count = 4,
-    };
-
-    var snapshot = (try runtime.snapshotVisibleTranscriptText(alloc, 128)).?;
-    defer snapshot.deinit(alloc);
-    try std.testing.expect(snapshot.complete);
-    try std.testing.expectEqualStrings("visible one\nvisible two\n", snapshot.text);
-}
-
-test "resume view snapshot keeps one complete UTF-8 row at the byte limit" {
-    const alloc = std.testing.allocator;
-    var runtime: TranscriptRuntime = .{};
-    defer runtime.deinit(alloc);
-    runtime.layout.rows = 6;
-    runtime.layout.cols = 12;
-    try runtime.enableShadowVt(alloc);
-    try runtime.shadow_vt.?.feed("\x1b[1;1Hééé");
-    runtime.has_painted_transcript = true;
-    runtime.last_visible_transcript_top_row = 1;
-    runtime.last_visible_transcript_last_row = 1;
-
-    var snapshot = (try runtime.snapshotVisibleTranscriptText(alloc, 7)).?;
-    defer snapshot.deinit(alloc);
-    try std.testing.expect(snapshot.complete);
-    try std.testing.expectEqualStrings("ééé\n", snapshot.text);
-    try std.testing.expect(std.unicode.utf8ValidateSlice(snapshot.text));
-}
-
-test "resume view snapshot drops oldest rows and retains the newest tail" {
-    const alloc = std.testing.allocator;
-    var runtime: TranscriptRuntime = .{};
-    defer runtime.deinit(alloc);
-    runtime.layout.rows = 6;
-    runtime.layout.cols = 12;
-    try runtime.enableShadowVt(alloc);
-    try runtime.shadow_vt.?.feed(
-        "\x1b[1;1Holdest\x1b[2;1Høø\x1b[3;1HTAIL",
-    );
-    runtime.has_painted_transcript = true;
-    runtime.last_visible_transcript_top_row = 1;
-    runtime.last_visible_transcript_last_row = 3;
-
-    var snapshot = (try runtime.snapshotVisibleTranscriptText(alloc, 10)).?;
-    defer snapshot.deinit(alloc);
-    try std.testing.expect(!snapshot.complete);
-    try std.testing.expectEqualStrings("øø\nTAIL\n", snapshot.text);
-}
-
-test "resume view snapshot returns no text for empty visible rows" {
-    const alloc = std.testing.allocator;
-    var runtime: TranscriptRuntime = .{};
-    defer runtime.deinit(alloc);
-    runtime.layout.rows = 6;
-    runtime.layout.cols = 12;
-    try runtime.enableShadowVt(alloc);
-    runtime.has_painted_transcript = true;
-    runtime.last_visible_transcript_top_row = 1;
-    runtime.last_visible_transcript_last_row = 2;
-
-    try std.testing.expect(
-        try runtime.snapshotVisibleTranscriptText(alloc, 128) == null,
-    );
 }
 
 fn acceptedTranscriptRows(

@@ -5,6 +5,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const generation_fact_codec = @import("generation_fact_codec.zig");
 const generation_usage = @import("generation_usage_provider.zig");
 const io_mod = @import("../shared/io.zig");
+const read_cancellation = @import("../shared/read_cancellation.zig");
 const types = @import("../shared/types.zig");
 const stream_provider = @import("../agent/stream_provider.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -56,7 +57,7 @@ pub const DeliveryOutcome = enum {
 pub const UsageCheckpointSink = struct {
     context: *anyopaque,
     allocator: Allocator,
-    persist: *const fn (context: *anyopaque, snapshot: Snapshot) anyerror!void,
+    persist: *const fn (context: *anyopaque, snapshot: Snapshot, cancel_flag: read_cancellation.CancelFlag) anyerror!void,
 };
 
 /// Host-owned local-profile publication sink. The callback receives a borrowed
@@ -67,6 +68,7 @@ pub const ProfilePublicationSink = struct {
     publish: *const fn (
         context: *anyopaque,
         event: usage_report.ProfileEvent,
+        cancel_flag: read_cancellation.CancelFlag,
     ) anyerror!void,
 };
 
@@ -214,7 +216,7 @@ pub const InvocationObservation = struct {
                     "usage generation queued sequence={d} id={s}",
                     .{ self.sequence, reference.generation_id },
                 );
-                ledger.flushProfilePublications();
+                ledger.flushProfilePublications(null);
             },
             .unavailable => unreachable,
         }
@@ -499,13 +501,13 @@ pub const Usage = struct {
         self.publication_mutex.lockUncancelable(io_mod.getIo());
         self.publication_sink = sink;
         self.publication_mutex.unlock(io_mod.getIo());
-        if (sink != null) self.flushProfilePublications();
+        if (sink != null) self.flushProfilePublications(null);
     }
 
     pub fn persistCheckpoint(self: *Usage) bool {
         self.checkpoint_mutex.lockUncancelable(io_mod.getIo());
         defer self.checkpoint_mutex.unlock(io_mod.getIo());
-        return self.persistCheckpointBestEffortLocked();
+        return self.persistCheckpointBestEffortLocked(null);
     }
 
     fn reserveInvocationDurably(self: *Usage) !u64 {
@@ -527,9 +529,9 @@ pub const Usage = struct {
     ) !void {
         self.checkpoint_mutex.lockUncancelable(io_mod.getIo());
         self.finishInvocation(sequence, duration_ms, outcome);
-        _ = self.persistCheckpointBestEffortLocked();
+        _ = self.persistCheckpointBestEffortLocked(null);
         self.checkpoint_mutex.unlock(io_mod.getIo());
-        self.flushProfilePublications();
+        self.flushProfilePublications(null);
     }
 
     fn finishObservedInvocationDurably(
@@ -553,17 +555,17 @@ pub const Usage = struct {
             team,
         ) catch |err| {
             self.markBillingIncomplete();
-            _ = self.persistCheckpointBestEffortLocked();
+            _ = self.persistCheckpointBestEffortLocked(null);
             debug_trace.logf(
                 "session",
                 "usage generation checkpointed incomplete reason={s}",
                 .{@errorName(err)},
             );
             self.checkpoint_mutex.unlock(io_mod.getIo());
-            self.flushProfilePublications();
+            self.flushProfilePublications(null);
             return false;
         };
-        _ = self.persistCheckpointBestEffortLocked();
+        _ = self.persistCheckpointBestEffortLocked(null);
         self.checkpoint_mutex.unlock(io_mod.getIo());
         return accepted;
     }
@@ -585,17 +587,17 @@ pub const Usage = struct {
             reference,
         ) catch |err| {
             self.markBillingIncomplete();
-            _ = self.persistCheckpointBestEffortLocked();
+            _ = self.persistCheckpointBestEffortLocked(null);
             debug_trace.logf(
                 "session",
                 "usage generation checkpointed incomplete reason={s}",
                 .{@errorName(err)},
             );
             self.checkpoint_mutex.unlock(io_mod.getIo());
-            self.flushProfilePublications();
+            self.flushProfilePublications(null);
             return false;
         };
-        _ = self.persistCheckpointBestEffortLocked();
+        _ = self.persistCheckpointBestEffortLocked(null);
         self.checkpoint_mutex.unlock(io_mod.getIo());
         return accepted;
     }
@@ -673,7 +675,7 @@ pub const Usage = struct {
             durable_bridge,
         ) catch |err| {
             self.markBillingIncomplete();
-            _ = self.persistCheckpointBestEffortLocked();
+            _ = self.persistCheckpointBestEffortLocked(null);
             self.checkpoint_mutex.unlock(io_mod.getIo());
             debug_trace.logf(
                 "session",
@@ -683,16 +685,16 @@ pub const Usage = struct {
             return false;
         };
         if (!accepted) {
-            _ = self.persistCheckpointBestEffortLocked();
+            _ = self.persistCheckpointBestEffortLocked(null);
             self.checkpoint_mutex.unlock(io_mod.getIo());
             return false;
         }
-        if (durable_bridge and !self.persistCheckpointBestEffortLocked()) {
+        if (durable_bridge and !self.persistCheckpointBestEffortLocked(null)) {
             self.checkpoint_mutex.unlock(io_mod.getIo());
             return false;
         }
         self.checkpoint_mutex.unlock(io_mod.getIo());
-        if (durable_bridge) self.flushProfilePublications();
+        if (durable_bridge) self.flushProfilePublications(null);
         return true;
     }
 
@@ -736,11 +738,12 @@ pub const Usage = struct {
         const sink = self.checkpoint_sink orelse return;
         var persisted = try self.snapshotCurrent(sink.allocator);
         defer persisted.deinit(sink.allocator);
-        try sink.persist(sink.context, persisted);
+        try sink.persist(sink.context, persisted, null);
         self.markClean(persisted);
     }
 
-    fn persistCheckpointBestEffortLocked(self: *Usage) bool {
+    fn persistCheckpointBestEffortLocked(self: *Usage, cancel_flag: read_cancellation.CancelFlag) bool {
+        read_cancellation.check(cancel_flag) catch return false;
         const sink = self.checkpoint_sink orelse return true;
         var persisted = self.snapshotCurrent(sink.allocator) catch |err| {
             self.markBillingIncomplete();
@@ -752,7 +755,8 @@ pub const Usage = struct {
             return false;
         };
         defer persisted.deinit(sink.allocator);
-        sink.persist(sink.context, persisted) catch |err| {
+        sink.persist(sink.context, persisted, cancel_flag) catch |err| {
+            if (err == error.Cancelled) return false;
             self.markBillingIncomplete();
             debug_trace.logf(
                 "session",
@@ -1027,24 +1031,33 @@ pub const Usage = struct {
     }
 
     pub fn applyGeneration(self: *Usage, alloc: Allocator, record: GenerationRecord) !void {
+        return self.applyGenerationCancellable(alloc, record, null);
+    }
+
+    fn applyGenerationCancellable(self: *Usage, alloc: Allocator, record: GenerationRecord, cancel_flag: read_cancellation.CancelFlag) !void {
+        try read_cancellation.check(cancel_flag);
         try validateGenerationRecord(record);
         const fact = generationFactBorrowed(record);
 
-        self.checkpoint_mutex.lockUncancelable(io_mod.getIo());
-        const publication = self.publishFact(fact);
+        try read_cancellation.lock(io_mod.getIo(), &self.checkpoint_mutex, cancel_flag);
+        const publication = self.publishFact(fact, cancel_flag) catch |err| {
+            self.checkpoint_mutex.unlock(io_mod.getIo());
+            return err;
+        };
         if (publication != .durable and self.checkpoint_sink != null) {
             self.stagePublicationBacklog(alloc, fact) catch |err| {
                 self.checkpoint_mutex.unlock(io_mod.getIo());
-                self.flushProfilePublications();
+                self.flushProfilePublications(cancel_flag);
                 return err;
             };
-            if (!self.persistCheckpointBestEffortLocked()) {
+            if (!self.persistCheckpointBestEffortLocked(cancel_flag)) {
                 self.checkpoint_mutex.unlock(io_mod.getIo());
-                self.flushProfilePublications();
+                try read_cancellation.check(cancel_flag);
+                self.flushProfilePublications(cancel_flag);
                 return error.ProfilePublicationRecoveryUnavailable;
             }
             self.checkpoint_mutex.unlock(io_mod.getIo());
-            self.flushProfilePublications();
+            self.flushProfilePublications(cancel_flag);
             // The rollback-readable event omits the richer publication fact,
             // so the pending generation remains the canonical recovery bridge
             // even when the sidecar preserves the full backlog.
@@ -1053,7 +1066,7 @@ pub const Usage = struct {
         if (publication == .failed) {
             self.stagePublicationBacklog(alloc, fact) catch |err| {
                 self.checkpoint_mutex.unlock(io_mod.getIo());
-                self.flushProfilePublications();
+                self.flushProfilePublications(cancel_flag);
                 return err;
             };
         }
@@ -1066,13 +1079,14 @@ pub const Usage = struct {
         ) catch |err| {
             self.mutex.unlock(io_mod.getIo());
             self.checkpoint_mutex.unlock(io_mod.getIo());
-            self.flushProfilePublications();
+            self.flushProfilePublications(cancel_flag);
             return err;
         };
         self.mutex.unlock(io_mod.getIo());
-        _ = self.persistCheckpointBestEffortLocked();
+        _ = self.persistCheckpointBestEffortLocked(cancel_flag);
         self.checkpoint_mutex.unlock(io_mod.getIo());
-        if (publication == .failed) self.flushProfilePublications();
+        try read_cancellation.check(cancel_flag);
+        if (publication == .failed) self.flushProfilePublications(cancel_flag);
     }
 
     fn applyGenerationUnlocked(
@@ -1188,11 +1202,13 @@ pub const Usage = struct {
     fn publishFact(
         self: *Usage,
         fact: usage_report.GenerationFact,
-    ) PublicationResult {
-        self.publication_mutex.lockUncancelable(io_mod.getIo());
+        cancel_flag: read_cancellation.CancelFlag,
+    ) !PublicationResult {
+        try read_cancellation.lock(io_mod.getIo(), &self.publication_mutex, cancel_flag);
         defer self.publication_mutex.unlock(io_mod.getIo());
         const sink = self.publication_sink orelse return .not_configured;
-        sink.publish(sink.context, .{ .generation = fact }) catch |err| {
+        sink.publish(sink.context, .{ .generation = fact }, cancel_flag) catch |err| {
+            if (err == error.Cancelled) return err;
             debug_trace.logf(
                 "session",
                 "usage profile publication failed id={s} reason={s}",
@@ -1301,8 +1317,8 @@ pub const Usage = struct {
         };
     }
 
-    fn flushProfilePublications(self: *Usage) void {
-        self.publication_mutex.lockUncancelable(io_mod.getIo());
+    fn flushProfilePublications(self: *Usage, cancel_flag: read_cancellation.CancelFlag) void {
+        read_cancellation.lock(io_mod.getIo(), &self.publication_mutex, cancel_flag) catch return;
         const sink = self.publication_sink orelse {
             self.publication_mutex.unlock(io_mod.getIo());
             return;
@@ -1320,7 +1336,11 @@ pub const Usage = struct {
         defer batch.deinit(sink.allocator);
 
         for (batch.pending) |marker| {
-            sink.publish(sink.context, .{ .pending = marker }) catch |err| {
+            sink.publish(sink.context, .{ .pending = marker }, cancel_flag) catch |err| {
+                if (err == error.Cancelled) {
+                    self.publication_mutex.unlock(io_mod.getIo());
+                    return;
+                }
                 debug_trace.logf(
                     "session",
                     "usage profile pending publication failed id={s} reason={s}",
@@ -1330,7 +1350,11 @@ pub const Usage = struct {
         }
         var published_any = false;
         for (batch.incidents) |incident| {
-            sink.publish(sink.context, .{ .incident = incident }) catch |err| {
+            sink.publish(sink.context, .{ .incident = incident }, cancel_flag) catch |err| {
+                if (err == error.Cancelled) {
+                    self.publication_mutex.unlock(io_mod.getIo());
+                    return;
+                }
                 debug_trace.logf(
                     "session",
                     "usage profile incident publication failed reason={s}",
@@ -1345,7 +1369,11 @@ pub const Usage = struct {
         }
 
         for (batch.facts) |fact| {
-            sink.publish(sink.context, .{ .generation = fact }) catch |err| {
+            sink.publish(sink.context, .{ .generation = fact }, cancel_flag) catch |err| {
+                if (err == error.Cancelled) {
+                    self.publication_mutex.unlock(io_mod.getIo());
+                    return;
+                }
                 debug_trace.logf(
                     "session",
                     "usage profile backlog retry failed id={s} reason={s}",
@@ -1375,8 +1403,8 @@ pub const Usage = struct {
         self.publication_mutex.unlock(io_mod.getIo());
 
         if (batch.checkpoint_changed or published_any) {
-            self.checkpoint_mutex.lockUncancelable(io_mod.getIo());
-            _ = self.persistCheckpointBestEffortLocked();
+            read_cancellation.lock(io_mod.getIo(), &self.checkpoint_mutex, cancel_flag) catch return;
+            _ = self.persistCheckpointBestEffortLocked(cancel_flag);
             self.checkpoint_mutex.unlock(io_mod.getIo());
         }
     }
@@ -1724,7 +1752,7 @@ pub const Usage = struct {
         copied = undefined;
         self.dirty = false;
         self.mutex.unlock(io_mod.getIo());
-        self.flushProfilePublications();
+        self.flushProfilePublications(null);
     }
 
     pub fn isDirty(self: *Usage) bool {
@@ -1987,6 +2015,36 @@ pub const Usage = struct {
         self.stopReconciliation();
     }
 
+    /// Requests cancellation without joining a running worker. Call again
+    /// until true before transferring this session's usage data.
+    pub fn pollStopForRestore(self: *Usage) bool {
+        self.reconciliation_cancel.store(true, .seq_cst);
+        if (!self.reconciliation_done.load(.seq_cst)) return false;
+        if (!self.reconciliation_mutex.tryLock()) return false;
+        defer self.reconciliation_mutex.unlock(io_mod.getIo());
+        if (!self.reconciliation_done.load(.seq_cst)) return false;
+        const thread = self.reconciliation_thread;
+        self.reconciliation_thread = null;
+        if (thread) |handle| handle.join();
+        return true;
+    }
+
+    /// Swaps prepared data into a quiescent live owner without allocating.
+    /// Live host bindings stay at this address; `prepared` owns the old data.
+    pub fn installPrepared(self: *Usage, prepared: *Usage) void {
+        std.debug.assert(self.reconciliation_thread == null);
+        std.debug.assert(prepared.reconciliation_thread == null);
+        const checkpoint_sink = self.checkpoint_sink;
+        const publication_sink = self.publication_sink;
+        const providers = self.generation_usage_providers;
+        std.mem.swap(Usage, self, prepared);
+        self.checkpoint_sink = checkpoint_sink;
+        self.publication_sink = publication_sink;
+        self.generation_usage_providers = providers;
+        prepared.checkpoint_sink = null;
+        prepared.publication_sink = null;
+    }
+
     /// Gives the current worker a bounded drain, then cancels it so one-shot
     /// hosts can persist prompt results without turning exit into an API wait.
     pub fn finishReconciliationBeforeShutdown(self: *Usage) void {
@@ -2001,7 +2059,7 @@ pub const Usage = struct {
     }
 
     pub fn finishProfilePublicationsBeforeShutdown(self: *Usage) void {
-        self.flushProfilePublications();
+        self.flushProfilePublications(null);
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         if (self.publication_backlog.items.len > 0) {
@@ -2051,7 +2109,8 @@ pub const Usage = struct {
         self.dirty = true;
     }
 
-    fn rejectPendingGeneration(self: *Usage, alloc: Allocator, id: []const u8) void {
+    fn rejectPendingGeneration(self: *Usage, alloc: Allocator, id: []const u8, cancel_flag: read_cancellation.CancelFlag) void {
+        read_cancellation.check(cancel_flag) catch return;
         self.mutex.lockUncancelable(io_mod.getIo());
         const pending_index = for (self.pending.items, 0..) |pending, index| {
             if (std.mem.eql(u8, pending.id, id)) break index;
@@ -2067,7 +2126,7 @@ pub const Usage = struct {
         self.billing = .incomplete;
         self.dirty = true;
         self.mutex.unlock(io_mod.getIo());
-        self.flushProfilePublications();
+        self.flushProfilePublications(cancel_flag);
     }
 
     pub fn markCodeIncomplete(self: *Usage) void {
@@ -2229,6 +2288,93 @@ pub const Usage = struct {
         self.publication_backlog = .empty;
     }
 };
+
+test "prepared usage adoption moves owned data without allocation" {
+    const alloc = std.testing.allocator;
+    var live = Usage.initFresh();
+    defer live.deinit(alloc);
+    var prepared = Usage.initFresh();
+    defer prepared.deinit(alloc);
+    try prepared.models.append(alloc, .{
+        .model = try alloc.dupe(u8, "restored/model"),
+        .first_sequence = 1,
+        .input_tokens = 17,
+        .reasoning_tokens = 0,
+        .request_count = 0,
+    });
+    prepared.next_sequence = 2;
+    prepared.settled_through_sequence = 1;
+    prepared.input_tokens = 17;
+    const storage = prepared.models.items.ptr;
+    live.installPrepared(&prepared);
+    try std.testing.expect(live.models.items.ptr == storage);
+    try std.testing.expectEqual(@as(u64, 17), live.input_tokens);
+    try std.testing.expectEqualStrings("restored/model", live.models.items[0].model);
+    try std.testing.expectEqual(@as(usize, 0), prepared.models.items.len);
+}
+
+test "usage restore cancellation does not join a running reconciliation" {
+    var usage = Usage.initFresh();
+    defer usage.deinit(std.testing.allocator);
+    const Worker = struct {
+        usage: *Usage,
+        release: std.Io.Event = .unset,
+        returned: std.Io.Event = .unset,
+        stopped: bool = true,
+
+        fn reconcile(self: *@This()) void {
+            self.release.waitUncancelable(std.testing.io);
+            self.usage.reconciliation_done.store(true, .seq_cst);
+        }
+        fn poll(self: *@This()) void {
+            self.stopped = self.usage.pollStopForRestore();
+            self.returned.set(std.testing.io);
+        }
+    };
+    var worker = Worker{ .usage = &usage };
+    usage.reconciliation_done.store(false, .seq_cst);
+    usage.reconciliation_thread = try std.Thread.spawn(.{}, Worker.reconcile, .{&worker});
+    const poller = std.Thread.spawn(.{}, Worker.poll, .{&worker}) catch |err| {
+        worker.release.set(std.testing.io);
+        return err;
+    };
+    const returned = if (worker.returned.waitTimeout(std.testing.io, .{
+        .duration = .{ .raw = .{ .nanoseconds = 500 * std.time.ns_per_ms }, .clock = .awake },
+    })) |_| true else |_| false;
+    worker.release.set(std.testing.io);
+    poller.join();
+    try std.testing.expect(returned);
+    try std.testing.expect(!worker.stopped);
+    try std.testing.expect(usage.reconciliation_cancel.load(.seq_cst));
+}
+
+test "usage restore stop does not wait for a held reconciliation mutex" {
+    var usage = Usage.initFresh();
+    defer usage.deinit(std.testing.allocator);
+    const Poller = struct {
+        usage: *Usage,
+        returned: std.Io.Event = .unset,
+        stopped: bool = true,
+
+        fn run(self: *@This()) void {
+            self.stopped = self.usage.pollStopForRestore();
+            self.returned.set(std.testing.io);
+        }
+    };
+    var poller = Poller{ .usage = &usage };
+    usage.reconciliation_mutex.lockUncancelable(std.testing.io);
+    const thread = std.Thread.spawn(.{}, Poller.run, .{&poller}) catch |err| {
+        usage.reconciliation_mutex.unlock(std.testing.io);
+        return err;
+    };
+    const returned = if (poller.returned.waitTimeout(std.testing.io, .{
+        .duration = .{ .raw = .{ .nanoseconds = 500 * std.time.ns_per_ms }, .clock = .awake },
+    })) |_| true else |_| false;
+    usage.reconciliation_mutex.unlock(std.testing.io);
+    thread.join();
+    try std.testing.expect(returned);
+    try std.testing.expect(!poller.stopped);
+}
 
 const ReconciliationAuthority = struct {
     provider: model_provider.ProviderId,
@@ -3153,10 +3299,11 @@ fn reconcilePendingBlocking(
                         "usage generation lookup rejected attempt={d}",
                         .{attempt + 1},
                     );
-                    usage.rejectPendingGeneration(alloc, pending.id);
+                    usage.rejectPendingGeneration(alloc, pending.id, cancel_flag);
                 },
                 .found => |record| {
-                    usage.applyGeneration(alloc, record) catch |err| {
+                    usage.applyGenerationCancellable(alloc, record, cancel_flag) catch |err| {
+                        if (err == error.Cancelled) return;
                         debug_trace.logf(
                             "session",
                             "usage generation apply failed reason={s}",
@@ -3661,7 +3808,7 @@ test "durable incident publication retires profile recovery" {
         calls: usize = 0,
         recovery_pending: bool = true,
 
-        fn persist(raw: *anyopaque, snapshot: Snapshot) !void {
+        fn persist(raw: *anyopaque, snapshot: Snapshot, _: ?*const std.atomic.Value(bool)) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
             self.recovery_pending = needsProfileRecovery(snapshot);
@@ -3671,10 +3818,7 @@ test "durable incident publication retires profile recovery" {
         fail: bool = true,
         incidents: usize = 0,
 
-        fn publish(
-            raw: *anyopaque,
-            event: usage_report.ProfileEvent,
-        ) !void {
+        fn publish(raw: *anyopaque, event: usage_report.ProfileEvent, _: ?*const std.atomic.Value(bool)) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             switch (event) {
                 .incident => {},
@@ -3730,10 +3874,7 @@ test "profile publication failure preserves session totals and retries backlog" 
         fail: bool = true,
         calls: usize = 0,
 
-        fn publish(
-            raw: *anyopaque,
-            _: usage_report.ProfileEvent,
-        ) !void {
+        fn publish(raw: *anyopaque, _: usage_report.ProfileEvent, _: ?*const std.atomic.Value(bool)) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
             if (self.fail) return error.InjectedPublicationFailure;
@@ -3794,16 +3935,13 @@ test "profile publication failure preserves session totals and retries backlog" 
 test "restored publication backlog settles the pending generation exactly" {
     const alloc = std.testing.allocator;
     const Checkpoint = struct {
-        fn persist(_: *anyopaque, _: Snapshot) !void {}
+        fn persist(_: *anyopaque, _: Snapshot, _: ?*const std.atomic.Value(bool)) !void {}
     };
     const PublicationProbe = struct {
         fail_generation: bool = true,
         successful_generations: usize = 0,
 
-        fn publish(
-            raw: *anyopaque,
-            event: usage_report.ProfileEvent,
-        ) !void {
+        fn publish(raw: *anyopaque, event: usage_report.ProfileEvent, _: ?*const std.atomic.Value(bool)) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             switch (event) {
                 .generation => {
@@ -3889,10 +4027,7 @@ test "no-checkpoint usage drains a transient publication failure" {
         successful_generations: usize = 0,
         published_search_calls: u64 = 0,
 
-        fn publish(
-            raw: *anyopaque,
-            event: usage_report.ProfileEvent,
-        ) !void {
+        fn publish(raw: *anyopaque, event: usage_report.ProfileEvent, _: ?*const std.atomic.Value(bool)) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             switch (event) {
                 .generation => |fact| {
@@ -3954,7 +4089,7 @@ test "missing profile publication sink keeps the durable pending bridge" {
     const Checkpoint = struct {
         calls: usize = 0,
 
-        fn persist(raw: *anyopaque, _: Snapshot) !void {
+        fn persist(raw: *anyopaque, _: Snapshot, _: ?*const std.atomic.Value(bool)) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
         }
@@ -4352,7 +4487,7 @@ test "active invocation does not render partial usage as complete" {
 test "active invocation dominates separate pending and publication state" {
     const alloc = std.testing.allocator;
     const Checkpoint = struct {
-        fn persist(_: *anyopaque, _: Snapshot) !void {}
+        fn persist(_: *anyopaque, _: Snapshot, _: ?*const std.atomic.Value(bool)) !void {}
     };
     var checkpoint_context: u8 = 0;
     var usage = Usage.initFresh();
@@ -4507,7 +4642,7 @@ test "rejected observed generation settles without publishing its identity or bi
         generations: usize = 0,
         incidents: usize = 0,
 
-        fn publish(raw: *anyopaque, event: usage_report.ProfileEvent) !void {
+        fn publish(raw: *anyopaque, event: usage_report.ProfileEvent, _: ?*const std.atomic.Value(bool)) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             switch (event) {
                 .pending => |marker| {
@@ -4772,6 +4907,66 @@ test "usage restore and reset retain the injected generation provider" {
     );
 }
 
+test "reconciliation cancellation reaches the real profile publication lock" {
+    const Worker = struct {
+        usage: *Usage,
+        entered: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        cancel: std.atomic.Value(bool) = .init(false),
+
+        fn tryLock(raw: ?*anyopaque, file: std.Io.File) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const acquired = try file.tryLock(std.testing.io, .exclusive);
+            if (!acquired) self.entered.store(true, .release);
+            return acquired;
+        }
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            reconcilePendingBlocking(self.usage, std.testing.allocator, "credential", &self.cancel, .{ .provider = .gateway, .credential_identity = null }, self.usage.generation_usage_providers, 1);
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |rejected| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(home);
+        var profile = @import("profile_usage_runtime.zig").Runtime{};
+        defer profile.deinit(alloc);
+        _ = try profile.initialize(alloc, home);
+        const publisher = profile.publisherSink(alloc);
+        try publisher.publish(publisher.context, .{ .incident = .{ .occurred_at_ms = 1, .completeness = .incomplete } }, null);
+        var provider = TestGenerationUsageProvider{ .outcome = if (rejected) .reject else .found };
+        var usage = Usage.initFreshWithProvider(provider.provider());
+        defer usage.deinit(alloc);
+        const sequence = try usage.reserveInvocation();
+        try usage.finishObservedInvocation(alloc, sequence, 5, .observed_generation, "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV", "https://provider.example", null);
+        usage.configurePublicationSink(publisher);
+        var directory = profile.store.?.durable_home.?;
+        const before = try directory.dir.statFile(std.testing.io, "usage.jsonl", .{});
+        var held = try io_mod.acquireTimedAdvisoryLock(&directory, "usage.lock", 0);
+        defer held.release();
+        var worker = Worker{ .usage = &usage };
+        profile.store.?.lock_ops = .{ .ctx = &worker, .try_lock = Worker.tryLock };
+        const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+        while (!worker.entered.load(.acquire) and !worker.done.load(.acquire)) std.Thread.yield() catch {};
+        const started = io_mod.nanoTimestamp();
+        worker.cancel.store(true, .release);
+        thread.join();
+        try std.testing.expect(worker.entered.load(.acquire));
+        try std.testing.expect(io_mod.nanoTimestamp() - started < 500 * std.time.ns_per_ms);
+        var snapshot = try usage.snapshot(alloc);
+        defer snapshot.deinit(alloc);
+        try std.testing.expectEqual(if (rejected) Availability.incomplete else Availability.pending, snapshot.billing);
+        try std.testing.expectEqual(@as(usize, if (rejected) 0 else 1), snapshot.pending.len);
+        try std.testing.expectEqual(@as(usize, 0), snapshot.publication_backlog.len);
+        const after = try directory.dir.statFile(std.testing.io, "usage.jsonl", .{});
+        try std.testing.expectEqual(before.size, after.size);
+        try std.testing.expectEqual(before.mtime, after.mtime);
+        try std.testing.expectEqual(before.ctime, after.ctime);
+    }
+}
+
 test "reconciliation settles usage through the injected provider" {
     const alloc = std.testing.allocator;
     var fake = TestGenerationUsageProvider{ .outcome = .found };
@@ -4846,12 +5041,12 @@ test "terminal Gateway billing settles the durable observation immediately" {
 test "duplicate Gateway terminal callback does not republish inline billing" {
     const alloc = std.testing.allocator;
     const CheckpointProbe = struct {
-        fn persist(_: *anyopaque, _: Snapshot) !void {}
+        fn persist(_: *anyopaque, _: Snapshot, _: ?*const std.atomic.Value(bool)) !void {}
     };
     const PublicationProbe = struct {
         generations: usize = 0,
 
-        fn publish(raw: *anyopaque, event: usage_report.ProfileEvent) !void {
+        fn publish(raw: *anyopaque, event: usage_report.ProfileEvent, _: ?*const std.atomic.Value(bool)) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             switch (event) {
                 .generation => self.generations += 1,
@@ -5249,7 +5444,7 @@ test "populated usage snapshot keeps the rollback-readable durable shape" {
     }
 
     const Publisher = struct {
-        fn publish(_: *anyopaque, _: usage_report.ProfileEvent) !void {}
+        fn publish(_: *anyopaque, _: usage_report.ProfileEvent, _: ?*const std.atomic.Value(bool)) !void {}
     };
     var publisher_context: u8 = 0;
     var resumed = Usage.initFresh();
@@ -5282,7 +5477,7 @@ test "populated usage snapshot keeps the rollback-readable durable shape" {
 test "rich usage snapshot preserves optional metrics and recovery state" {
     const alloc = std.testing.allocator;
     const Publisher = struct {
-        fn fail(_: *anyopaque, _: usage_report.ProfileEvent) !void {
+        fn fail(_: *anyopaque, _: usage_report.ProfileEvent, _: ?*const std.atomic.Value(bool)) !void {
             return error.InjectedPublicationFailure;
         }
     };
@@ -5580,7 +5775,7 @@ test "checkpoint snapshot does not join a completed reconciliation worker" {
     const Capture = struct {
         calls: usize = 0,
 
-        fn persist(raw: *anyopaque, _: Snapshot) !void {
+        fn persist(raw: *anyopaque, _: Snapshot, _: ?*const std.atomic.Value(bool)) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
         }
@@ -5629,7 +5824,7 @@ test "gateway observation checkpoints active and terminal usage states" {
         api_duration_complete: [2]bool = undefined,
         pending_count: [2]usize = undefined,
 
-        fn persist(raw: *anyopaque, snapshot: Snapshot) !void {
+        fn persist(raw: *anyopaque, snapshot: Snapshot, _: ?*const std.atomic.Value(bool)) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const index = self.calls;
             self.billing[index] = snapshot.billing;
@@ -5670,7 +5865,7 @@ test "gateway observation does not proceed when active checkpoint fails" {
     const Reject = struct {
         calls: usize = 0,
 
-        fn persist(raw: *anyopaque, _: Snapshot) !void {
+        fn persist(raw: *anyopaque, _: Snapshot, _: ?*const std.atomic.Value(bool)) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
             return error.CheckpointRejected;
@@ -5703,7 +5898,7 @@ test "terminal checkpoint failure preserves request progress as incomplete" {
     const Reject = struct {
         calls: usize = 0,
 
-        fn persist(raw: *anyopaque, _: Snapshot) !void {
+        fn persist(raw: *anyopaque, _: Snapshot, _: ?*const std.atomic.Value(bool)) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
             if (self.calls == 2) return error.CheckpointRejected;

@@ -630,7 +630,7 @@ fn parseRecord(alloc: Allocator, line: []const u8) !ParsedRecord {
     try validateWorkspaceRoot(workspace.string);
     const owned_workspace = try alloc.dupe(u8, workspace.string);
     errdefer alloc.free(owned_workspace);
-    const owned_text = session_codec.parseDurableBytes(alloc, text) catch
+    const owned_text = session_codec.parseDurableBytes(alloc, text, null) catch
         return error.InvalidPromptHistoryRecord;
     return .{
         .timestamp_ms = timestamp.integer,

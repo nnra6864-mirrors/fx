@@ -902,15 +902,16 @@ pub fn Bindings(comptime App: type) type {
             checkpoint: session_codec.RecoveryCheckpoint,
         ) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            try app_session_runtime.Runtime(App).setRecoveryCheckpoint(app, checkpoint);
+            const shutdown_flag = if (comptime @hasField(App, "managed_executions"))
+                &app.managed_executions.shutting_down
+            else
+                null;
+            try app_session_runtime.Runtime(App).setRecoveryCheckpoint(app, checkpoint, shutdown_flag);
         }
 
-        fn agentPersistUsageCheckpoint(
-            ctx: *anyopaque,
-            snapshot: session_usage.Snapshot,
-        ) !void {
+        fn agentPersistUsageCheckpoint(ctx: *anyopaque, snapshot: session_usage.Snapshot, cancel_flag: ?*const std.atomic.Value(bool)) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            try app_session_runtime.Runtime(App).persistUsageCheckpoint(app, snapshot);
+            try app_session_runtime.Runtime(App).persistUsageCheckpoint(app, snapshot, cancel_flag);
         }
 
         fn agentPropagateGrant(ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) !void {

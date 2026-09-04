@@ -6,6 +6,7 @@ const session_event = @import("session_event.zig");
 const session_json = @import("session_json.zig");
 const session_log = @import("session_log.zig");
 const session_projection = @import("session_projection.zig");
+const session_read = @import("../shared/read_cancellation.zig");
 const Allocator = std.mem.Allocator;
 
 const paths = @import("session_store_paths.zig");
@@ -129,6 +130,7 @@ fn isPreparedCreationOrphan(
         alloc,
         &file,
         stat.size,
+        null,
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidSessionFormat,
@@ -376,14 +378,20 @@ fn legacyFingerprintMatches(
     alloc: Allocator,
     bytes: []const u8,
     expected: LegacyFingerprint,
+    cancel_flag: session_read.CancelFlag,
 ) !bool {
+    try session_read.check(cancel_flag);
     if (bytes.len != expected.primary_bytes) return false;
     const schema = session_json.parseLegacySchemaVersion(
         alloc,
         bytes,
-    ) catch return false;
+        cancel_flag,
+    ) catch |err| switch (err) {
+        error.Cancelled => return err,
+        else => return false,
+    };
     if (schema != expected.schema) return false;
-    const digest = session_projection.sha256(bytes);
+    const digest = try session_read.sha256(bytes, cancel_flag);
     return std.mem.eql(u8, &digest, &expected.primary_sha256);
 }
 
@@ -402,20 +410,22 @@ fn legacyPrimaryBytes(
     session_dir: *io_mod.VerifiedDir,
     name: []const u8,
     expected: LegacyFingerprint,
+    cancel_flag: session_read.CancelFlag,
 ) !?[]u8 {
     const max_bytes = std.math.cast(
         usize,
         std.math.add(u64, expected.primary_bytes, 1) catch
             return error.LegacySessionMigrationResourceExhausted,
     ) orelse return error.LegacySessionMigrationResourceExhausted;
-    const bytes = try readOptionalSessionFile(
+    const bytes = try readOptionalSessionFileCancellable(
         alloc,
         session_dir,
         name,
         max_bytes,
+        cancel_flag,
     ) orelse return null;
     errdefer alloc.free(bytes);
-    if (!try legacyFingerprintMatches(alloc, bytes, expected)) {
+    if (!try legacyFingerprintMatches(alloc, bytes, expected, cancel_flag)) {
         alloc.free(bytes);
         return null;
     }
@@ -440,13 +450,16 @@ pub fn restoreLegacyAuthority(
     alloc: Allocator,
     writable: *session_log.WritableSessionDir,
     transition: AuthorityTransition,
+    cancel_flag: session_read.CancelFlag,
 ) !void {
+    try session_read.check(cancel_flag);
     const prior = transition.prior orelse return error.InvalidSessionFormat;
     const current = try legacyPrimaryBytes(
         alloc,
         &writable.dir,
         "session.json",
         prior,
+        cancel_flag,
     );
     if (current) |bytes| {
         alloc.free(bytes);
@@ -456,15 +469,21 @@ pub fn restoreLegacyAuthority(
             &writable.dir,
             "session.legacy.json",
             prior,
+            cancel_flag,
         ) orelse return error.LegacySessionMigrationIndeterminate;
         defer alloc.free(stable);
-        io_mod.durableReplaceVerified(
+        io_mod.durableReplaceVerifiedWithOps(
             alloc,
             &writable.dir,
             "session.json",
             stable,
-        ) catch return error.LegacySessionMigrationIndeterminate;
+            .{ .cancel_flag = cancel_flag },
+        ) catch |err| switch (err) {
+            error.Cancelled => return err,
+            else => return error.LegacySessionMigrationIndeterminate,
+        };
     }
+    try session_read.check(cancel_flag);
     removeSessionEntryIfPresent(&writable.dir, "authority.json") catch
         return error.LegacySessionMigrationIndeterminate;
     io_mod.syncVerifiedDir(writable.dir.dir) catch
@@ -474,11 +493,13 @@ pub fn restoreLegacyAuthority(
         &writable.dir,
         "session.json",
         prior,
+        cancel_flag,
     ) orelse return error.LegacySessionMigrationIndeterminate;
     alloc.free(confirmed);
     if (try entryExistsRelative(&writable.dir, "authority.json")) {
         return error.LegacySessionMigrationIndeterminate;
     }
+    try session_read.check(cancel_flag);
     deleteSessionEntry(&writable.dir, "authority.pending.json") catch
         return error.SessionAuthorityIntentCleanupPending;
 }
@@ -492,13 +513,27 @@ pub fn readOptionalSessionFile(
     name: []const u8,
     max_bytes: usize,
 ) !?[]u8 {
+    return readOptionalSessionFileCancellable(alloc, session_dir, name, max_bytes, null) catch |err| switch (err) {
+        error.Cancelled => unreachable,
+        inline else => |failure| return failure,
+    };
+}
+
+pub fn readOptionalSessionFileCancellable(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    name: []const u8,
+    max_bytes: usize,
+    cancel_flag: session_read.CancelFlag,
+) !?[]u8 {
+    try session_read.check(cancel_flag);
     var file = openSessionFile(session_dir, name, .read_only) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
     defer file.close(io_mod.getIo());
-    return io_mod.readFileToEnd(alloc, &file, max_bytes) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
+    return readSessionBytes(alloc, &file, max_bytes, cancel_flag) catch |err| switch (err) {
+        error.OutOfMemory, error.Cancelled => return err,
         else => return error.InvalidSessionFormat,
     };
 }
@@ -746,10 +781,22 @@ pub fn readExactLegacyFile(
     alloc: Allocator,
     file: *std.Io.File,
     size: u64,
+    cancel_flag: session_read.CancelFlag,
 ) ![]u8 {
     const limit = std.math.add(u64, size, 1) catch return error.OutOfMemory;
     const max_bytes = std.math.cast(usize, limit) orelse return error.OutOfMemory;
-    return io_mod.readFileToEnd(alloc, file, max_bytes);
+    return readSessionBytes(alloc, file, max_bytes, cancel_flag);
+}
+
+fn readSessionBytes(alloc: Allocator, file: *std.Io.File, max_bytes: usize, cancel_flag: session_read.CancelFlag) ![]u8 {
+    var buffer: [session_read.work_bytes]u8 = undefined;
+    var file_reader = file.readerStreaming(io_mod.getIo(), &buffer);
+    var checked_buffer: [session_read.work_bytes]u8 = undefined;
+    var checked = session_read.Reader.init(&file_reader.interface, &checked_buffer, cancel_flag);
+    return checked.interface.allocRemaining(alloc, .limited(max_bytes)) catch |err| {
+        try session_read.check(cancel_flag);
+        return err;
+    };
 }
 
 /// Normalizes a canonical-replay `OutOfMemory` into

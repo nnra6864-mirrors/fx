@@ -7,12 +7,15 @@ const CancellationTarget = enum {
     none,
     agent_turn,
     context_compaction,
+    session_restore,
 };
 
 fn cancellationTarget(
     stream_active: bool,
     compaction_status: worker_runtime.ContextCompactionStatus,
+    session_restore_active: bool,
 ) CancellationTarget {
+    if (session_restore_active) return .session_restore;
     if (stream_active) return .agent_turn;
     return switch (compaction_status) {
         .idle => .none,
@@ -23,23 +26,23 @@ fn cancellationTarget(
 test "cancellation target distinguishes agent turns and manual compaction" {
     try std.testing.expectEqual(
         CancellationTarget.none,
-        cancellationTarget(false, .idle),
+        cancellationTarget(false, .idle, false),
     );
     try std.testing.expectEqual(
         CancellationTarget.agent_turn,
-        cancellationTarget(true, .idle),
+        cancellationTarget(true, .idle, false),
     );
     try std.testing.expectEqual(
         CancellationTarget.context_compaction,
-        cancellationTarget(false, .queued),
+        cancellationTarget(false, .queued, false),
     );
     try std.testing.expectEqual(
         CancellationTarget.context_compaction,
-        cancellationTarget(false, .running),
+        cancellationTarget(false, .running, false),
     );
     try std.testing.expectEqual(
         CancellationTarget.agent_turn,
-        cancellationTarget(true, .running),
+        cancellationTarget(true, .running, false),
     );
 }
 
@@ -50,6 +53,13 @@ pub fn InterruptRuntime(comptime App: type) type {
         }
 
         pub fn cancelActiveOperation(app: *App) !void {
+            if (activeCancellationTarget(app) == .session_restore) {
+                if (comptime @hasDecl(App, "cancelSessionRestore")) {
+                    _ = app.cancelSessionRestore();
+                }
+                app.shell.render_requests.request(.footer);
+                return;
+            }
             if (activeCancellationTarget(app) == .context_compaction) {
                 if (comptime !@hasDecl(
                     @TypeOf(app.worker),
@@ -156,7 +166,11 @@ pub fn InterruptRuntime(comptime App: type) type {
                 app.worker.contextCompactionStatus()
             else
                 worker_runtime.ContextCompactionStatus.idle;
-            return cancellationTarget(app.stream.active, status);
+            const restoring = if (comptime @hasDecl(App, "sessionRestoreActive"))
+                app.sessionRestoreActive()
+            else
+                false;
+            return cancellationTarget(app.stream.active, status, restoring);
         }
     };
 }

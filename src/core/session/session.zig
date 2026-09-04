@@ -3,6 +3,7 @@ const kernel_agent = @import("../agent/runtime/agent.zig");
 const core_types = @import("../shared/types.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const read_cancellation = @import("../shared/read_cancellation.zig");
 const message = @import("../shared/message.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const language_script = @import("../shared/language_script.zig");
@@ -379,17 +380,30 @@ const LegacyImagePlaceholderIterator = struct {
         length: usize,
     };
 
-    fn next(self: *@This()) ?Slot {
-        const relative_start = std.mem.indexOf(u8, self.text[self.offset..], prefix) orelse
+    fn find(text: []const u8, needle: []const u8, cancel_flag: read_cancellation.CancelFlag) error{Cancelled}!?usize {
+        var offset: usize = 0;
+        while (offset < text.len) {
+            try read_cancellation.check(cancel_flag);
+            const length = @min(read_cancellation.work_bytes, text.len - offset);
+            const end = offset + length + @min(needle.len - 1, text.len - offset - length);
+            if (std.mem.indexOf(u8, text[offset..end], needle)) |relative| return offset + relative;
+            offset += length;
+        }
+        return null;
+    }
+
+    fn next(self: *@This(), cancel_flag: read_cancellation.CancelFlag) error{Cancelled}!?Slot {
+        try read_cancellation.check(cancel_flag);
+        const relative_start = try find(self.text[self.offset..], prefix, cancel_flag) orelse
             return null;
         const start = self.offset + relative_start;
-        if (image_attachments.matchImagePlaceholder(self.text, start)) |match| {
+        if (try image_attachments.matchImagePlaceholderCancellable(self.text, start, cancel_flag)) |match| {
             self.offset = start + match.length;
             return .{ .id = match.id, .start = start, .length = match.length };
         }
 
         const body_start = start + prefix.len;
-        self.offset = if (std.mem.indexOfScalar(u8, self.text[body_start..], ']')) |relative_end|
+        self.offset = if (try find(self.text[body_start..], "]", cancel_flag)) |relative_end|
             body_start + relative_end + 1
         else
             body_start;
@@ -409,13 +423,14 @@ const LegacyTurnTextRepair = struct {
     text: []u8,
 };
 
-fn history_placeholder_id_count(history: []const HistoryTurn, id: usize) usize {
+fn history_placeholder_id_count(history: []const HistoryTurn, id: usize, cancel_flag: read_cancellation.CancelFlag) error{Cancelled}!usize {
     var count: usize = 0;
     for (history) |turn| {
+        try read_cancellation.check(cancel_flag);
         var placeholders = LegacyImagePlaceholderIterator{
             .text = user_text_for_history_turn(turn),
         };
-        while (placeholders.next()) |placeholder| {
+        while (try placeholders.next(cancel_flag)) |placeholder| {
             if (placeholder.id != null and placeholder.id.? == id) count += 1;
         }
     }
@@ -425,17 +440,19 @@ fn history_placeholder_id_count(history: []const HistoryTurn, id: usize) usize {
 fn legacy_placeholder_claim(
     history: []const HistoryTurn,
     placeholder: ?LegacyImagePlaceholderIterator.Slot,
-) ?usize {
+    cancel_flag: read_cancellation.CancelFlag,
+) error{Cancelled}!?usize {
     const slot = placeholder orelse return null;
     const placeholder_id = slot.id orelse return null;
     if (placeholder_id == 0) return null;
-    if (history_placeholder_id_count(history, placeholder_id) != 1) return null;
-    if (history_contains_image_id(history, placeholder_id)) return null;
+    if (try history_placeholder_id_count(history, placeholder_id, cancel_flag) != 1) return null;
+    if (try history_contains_image_id(history, placeholder_id, cancel_flag)) return null;
     return placeholder_id;
 }
 
-fn legacy_repairs_contain_id(repairs: []const LegacyImageRepair, id: usize) bool {
+fn legacy_repairs_contain_id(repairs: []const LegacyImageRepair, id: usize, cancel_flag: read_cancellation.CancelFlag) error{Cancelled}!bool {
     for (repairs) |repair| {
+        try read_cancellation.check(cancel_flag);
         if (repair.assigned_id == id) return true;
     }
     return false;
@@ -444,16 +461,19 @@ fn legacy_repairs_contain_id(repairs: []const LegacyImageRepair, id: usize) bool
 fn assign_legacy_image_ids(
     history: []const HistoryTurn,
     repairs: []LegacyImageRepair,
-) error{ImageIdOverflow}!void {
+    cancel_flag: read_cancellation.CancelFlag,
+) error{ ImageIdOverflow, Cancelled }!void {
     for (repairs) |*repair| {
-        repair.assigned_id = legacy_placeholder_claim(history, repair.placeholder) orelse 0;
+        try read_cancellation.check(cancel_flag);
+        repair.assigned_id = try legacy_placeholder_claim(history, repair.placeholder, cancel_flag) orelse 0;
     }
 
     var candidate: usize = 1;
     for (repairs) |*repair| {
+        try read_cancellation.check(cancel_flag);
         if (repair.assigned_id != 0) continue;
-        while (history_contains_image_id(history, candidate) or
-            legacy_repairs_contain_id(repairs, candidate))
+        while (try history_contains_image_id(history, candidate, cancel_flag) or
+            try legacy_repairs_contain_id(repairs, candidate, cancel_flag))
         {
             candidate = std.math.add(usize, candidate, 1) catch
                 return error.ImageIdOverflow;
@@ -467,10 +487,12 @@ fn rebuilt_legacy_turn_text(
     history: []const HistoryTurn,
     turn_index: usize,
     repairs: []const LegacyImageRepair,
-) Allocator.Error!?[]u8 {
+    cancel_flag: read_cancellation.CancelFlag,
+) (Allocator.Error || error{Cancelled})!?[]u8 {
     const text = user_text_for_history_turn(history[turn_index]);
     var needs_rebuild = false;
     for (repairs) |repair| {
+        try read_cancellation.check(cancel_flag);
         if (repair.turn_index != turn_index) continue;
         const placeholder = repair.placeholder orelse continue;
         const legacy_id = placeholder.id orelse continue;
@@ -482,6 +504,7 @@ fn rebuilt_legacy_turn_text(
     errdefer rebuilt.deinit();
     var cursor: usize = 0;
     for (repairs) |repair| {
+        try read_cancellation.check(cancel_flag);
         if (repair.turn_index != turn_index) continue;
         const placeholder = repair.placeholder orelse continue;
         const legacy_id = placeholder.id orelse continue;
@@ -489,12 +512,22 @@ fn rebuilt_legacy_turn_text(
 
         std.debug.assert(placeholder.start >= cursor);
         std.debug.assert(placeholder.start + placeholder.length <= text.len);
-        rebuilt.writer.writeAll(text[cursor..placeholder.start]) catch return error.OutOfMemory;
+        try appendLegacyText(&rebuilt, text[cursor..placeholder.start], cancel_flag);
         image_attachments.writeImagePlaceholder(&rebuilt.writer, repair.assigned_id) catch return error.OutOfMemory;
         cursor = placeholder.start + placeholder.length;
     }
-    rebuilt.writer.writeAll(text[cursor..]) catch return error.OutOfMemory;
+    try appendLegacyText(&rebuilt, text[cursor..], cancel_flag);
     return rebuilt.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+fn appendLegacyText(out: *std.Io.Writer.Allocating, text: []const u8, cancel_flag: read_cancellation.CancelFlag) (Allocator.Error || error{Cancelled})!void {
+    var offset: usize = 0;
+    while (offset < text.len) {
+        try read_cancellation.check(cancel_flag);
+        const end = offset + @min(read_cancellation.work_bytes, text.len - offset);
+        out.writer.writeAll(text[offset..end]) catch return error.OutOfMemory;
+        offset = end;
+    }
 }
 
 fn mutable_user_for_history_turn(turn: *HistoryTurn) ?*UserTurn {
@@ -505,21 +538,17 @@ fn mutable_user_for_history_turn(turn: *HistoryTurn) ?*UserTurn {
     };
 }
 
-/// Repairs image IDs omitted by the legacy session deep-copy path. This is
-/// only for allocator-owned history loaded from durable storage. Rebuilt text
-/// remains owned by its history turn. Returns whether any attachment changed.
-pub fn repair_legacy_zero_image_ids(
-    alloc: Allocator,
-    history: []HistoryTurn,
-) (Allocator.Error || error{ImageIdOverflow})!bool {
+fn repairLegacyZeroImageIds(alloc: Allocator, history: []HistoryTurn, cancel_flag: read_cancellation.CancelFlag) (Allocator.Error || error{ ImageIdOverflow, Cancelled })!bool {
+    try read_cancellation.check(cancel_flag);
     var repairs: std.ArrayList(LegacyImageRepair) = .empty;
     defer repairs.deinit(alloc);
     for (history, 0..) |*turn, turn_index| {
+        try read_cancellation.check(cancel_flag);
         var placeholders = LegacyImagePlaceholderIterator{
             .text = user_text_for_history_turn(turn.*),
         };
         for (mutable_images_for_history_turn(turn), 0..) |attachment, image_index| {
-            const placeholder = placeholders.next();
+            const placeholder = try placeholders.next(cancel_flag);
             if (attachment.id != 0) continue;
             try repairs.append(alloc, .{
                 .turn_index = turn_index,
@@ -530,17 +559,19 @@ pub fn repair_legacy_zero_image_ids(
     }
     if (repairs.items.len == 0) return false;
 
-    try assign_legacy_image_ids(history, repairs.items);
+    try assign_legacy_image_ids(history, repairs.items, cancel_flag);
 
     var text_repairs: std.ArrayList(LegacyTurnTextRepair) = .empty;
     defer text_repairs.deinit(alloc);
     errdefer for (text_repairs.items) |repair| alloc.free(repair.text);
     for (history, 0..) |_, turn_index| {
+        try read_cancellation.check(cancel_flag);
         const rebuilt = try rebuilt_legacy_turn_text(
             alloc,
             history,
             turn_index,
             repairs.items,
+            cancel_flag,
         ) orelse continue;
         text_repairs.append(alloc, .{ .turn_index = turn_index, .text = rebuilt }) catch |err| {
             alloc.free(rebuilt);
@@ -548,11 +579,15 @@ pub fn repair_legacy_zero_image_ids(
         };
     }
 
+    try read_cancellation.check(cancel_flag);
     for (repairs.items) |repair| {
+        try read_cancellation.check(cancel_flag);
         mutable_images_for_history_turn(&history[repair.turn_index])[repair.image_index].id =
             repair.assigned_id;
     }
-    for (text_repairs.items) |repair| {
+    while (text_repairs.items.len > 0) {
+        try read_cancellation.check(cancel_flag);
+        const repair = text_repairs.pop().?;
         const user = mutable_user_for_history_turn(&history[repair.turn_index]).?;
         alloc.free(user.text);
         user.text = repair.text;
@@ -560,48 +595,44 @@ pub fn repair_legacy_zero_image_ids(
     return true;
 }
 
-pub fn repair_legacy_image_snapshots(
-    alloc: Allocator,
-    history: []HistoryTurn,
-    snapshot_dir: []const u8,
-) Allocator.Error!bool {
-    const snapshot_dir_existed = snapshot_directory_exists(snapshot_dir);
-    const candidate = try alloc.alloc(HistoryTurn, history.len);
-    var copied: usize = 0;
-    errdefer {
-        for (candidate[0..copied]) |turn| freeHistoryTurn(alloc, turn);
-        alloc.free(candidate);
+pub fn needsLegacyImageRepair(history: []const HistoryTurn, cancel_flag: read_cancellation.CancelFlag) error{Cancelled}!bool {
+    try read_cancellation.check(cancel_flag);
+    for (history) |turn| {
+        try read_cancellation.check(cancel_flag);
+        for (images_for_history_turn(turn)) |image| {
+            try read_cancellation.check(cancel_flag);
+            if (image.id == 0 or image.snapshot_path == null or image.snapshot_sha256 == null) return true;
+        }
     }
-    while (copied < history.len) : (copied += 1) {
-        candidate[copied] = try dupeHistoryTurn(alloc, history[copied]);
-    }
-
-    const changed = repair_legacy_image_snapshots_in_place(
-        alloc,
-        candidate,
-        snapshot_dir,
-    ) catch |err| {
-        cleanup_candidate_snapshot_files(candidate, history);
-        if (!snapshot_dir_existed) remove_empty_snapshot_directory(snapshot_dir);
-        return err;
-    };
-    if (!changed) {
-        freeHistoryTurnSlice(alloc, candidate);
-        return false;
-    }
-
-    for (history, candidate) |*current, *replacement| {
-        std.mem.swap(HistoryTurn, current, replacement);
-    }
-    freeHistoryTurnSlice(alloc, candidate);
-    return true;
+    return false;
 }
 
-pub fn repair_legacy_images_transactionally(
-    alloc: Allocator,
+pub const PreparedLegacyImageRepair = struct {
     history: []HistoryTurn,
+    /// Path strings borrow the repaired history; the array itself is owned.
+    created_snapshot_paths: [][]const u8,
+
+    pub fn discardSnapshots(self: *const @This()) void {
+        for (self.created_snapshot_paths) |path| image_attachments.discardCreatedSnapshot(path);
+    }
+
+    /// Releases memory only. Uncertain canonical commits must retain snapshots.
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.created_snapshot_paths);
+        freeHistoryTurnSlice(alloc, self.history);
+        self.* = undefined;
+    }
+};
+
+/// Returns one owned repaired history and actual creation receipts, or null
+/// without allocating or touching the filesystem when no repair is needed.
+pub fn prepareLegacyImageRepair(
+    alloc: Allocator,
+    history: []const HistoryTurn,
     snapshot_dir: []const u8,
-) (Allocator.Error || error{ImageIdOverflow})!bool {
+    cancel_flag: read_cancellation.CancelFlag,
+) (Allocator.Error || error{ ImageIdOverflow, Cancelled })!?PreparedLegacyImageRepair {
+    if (!try needsLegacyImageRepair(history, cancel_flag)) return null;
     const candidate = try alloc.alloc(HistoryTurn, history.len);
     var copied: usize = 0;
     errdefer {
@@ -609,31 +640,35 @@ pub fn repair_legacy_images_transactionally(
         alloc.free(candidate);
     }
     while (copied < history.len) : (copied += 1) {
-        candidate[copied] = try dupeHistoryTurn(alloc, history[copied]);
+        candidate[copied] = try core_types.dupeHistoryTurnCancellable(alloc, history[copied], cancel_flag);
     }
-
-    const ids_changed = try repair_legacy_zero_image_ids(alloc, candidate);
-    const snapshots_changed = try repair_legacy_image_snapshots(
+    const remove_empty_dir = snapshot_directory_missing(snapshot_dir);
+    var created_snapshot_paths: std.ArrayList([]const u8) = .empty;
+    defer created_snapshot_paths.deinit(alloc);
+    errdefer {
+        for (created_snapshot_paths.items) |path| image_attachments.discardCreatedSnapshot(path);
+        if (remove_empty_dir) remove_empty_snapshot_directory(snapshot_dir);
+    }
+    const ids_changed = try repairLegacyZeroImageIds(alloc, candidate, cancel_flag);
+    const snapshots_changed = try repair_legacy_image_snapshots_in_place(
         alloc,
         candidate,
         snapshot_dir,
+        cancel_flag,
+        &created_snapshot_paths,
     );
+    try read_cancellation.check(cancel_flag);
     if (!ids_changed and !snapshots_changed) {
         freeHistoryTurnSlice(alloc, candidate);
-        return false;
+        return null;
     }
-
-    for (history, candidate) |*current, *replacement| {
-        std.mem.swap(HistoryTurn, current, replacement);
-    }
-    freeHistoryTurnSlice(alloc, candidate);
-    return true;
+    return .{ .history = candidate, .created_snapshot_paths = try created_snapshot_paths.toOwnedSlice(alloc) };
 }
 
-fn snapshot_directory_exists(path: []const u8) bool {
-    var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), path, .{}) catch return false;
+fn snapshot_directory_missing(path: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), path, .{}) catch |err| return err == error.FileNotFound;
     dir.close(io_mod.getIo());
-    return true;
+    return false;
 }
 
 fn remove_empty_snapshot_directory(path: []const u8) void {
@@ -651,18 +686,23 @@ fn repair_legacy_image_snapshots_in_place(
     alloc: Allocator,
     history: []HistoryTurn,
     snapshot_dir: []const u8,
-) Allocator.Error!bool {
+    cancel_flag: read_cancellation.CancelFlag,
+    created_snapshot_paths: *std.ArrayList([]const u8),
+) (Allocator.Error || error{Cancelled})!bool {
     var changed = false;
     for (history) |*turn| {
+        try read_cancellation.check(cancel_flag);
         const images_ptr = mutable_images_slice_for_history_turn(turn) orelse continue;
         if (images_ptr.*.len == 0) continue;
 
         var drop_indexes: std.ArrayList(usize) = .empty;
         defer drop_indexes.deinit(alloc);
         for (images_ptr.*, 0..) |*image, image_index| {
+            try read_cancellation.check(cancel_flag);
             if (image.snapshot_path != null and image.snapshot_sha256 != null) continue;
-            image_attachments.captureImageSnapshot(alloc, image, snapshot_dir) catch |err| switch (err) {
+            const outcome = image_attachments.captureImageSnapshotTracked(alloc, image, snapshot_dir, .{ .cancel_flag = cancel_flag }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
+                error.Cancelled => return error.Cancelled,
                 else => {
                     debug_trace.logf(
                         "session",
@@ -672,6 +712,10 @@ fn repair_legacy_image_snapshots_in_place(
                     try drop_indexes.append(alloc, image_index);
                     continue;
                 },
+            };
+            if (outcome == .created) created_snapshot_paths.append(alloc, image.snapshot_path.?) catch |err| {
+                image_attachments.discardCreatedSnapshot(image.snapshot_path.?);
+                return err;
             };
             changed = true;
         }
@@ -700,18 +744,6 @@ fn repair_legacy_image_snapshots_in_place(
         changed = true;
     }
     return changed;
-}
-
-fn cleanup_candidate_snapshot_files(
-    candidate: []const HistoryTurn,
-    original: []const HistoryTurn,
-) void {
-    for (candidate, original) |candidate_turn, original_turn| {
-        image_attachments.deleteUnreferencedImageSnapshots(
-            images_for_history_turn(candidate_turn),
-            images_for_history_turn(original_turn),
-        );
-    }
 }
 
 fn make_owned_legacy_image_turn(
@@ -749,6 +781,68 @@ fn writeSessionTestImage(
     return io_mod.dirRealpathAlloc(alloc, tmp.dir, name);
 }
 
+test "legacy image repair does not allocate for unchanged history" {
+    var images = [_]ImageAttachment{.{ .id = 7, .path = @constCast("/source.png"), .media_type = @constCast("image/png"), .snapshot_path = @constCast("/snapshots/image.bin"), .snapshot_sha256 = @constCast("a" ** 64) }};
+    var history = [_]HistoryTurn{.{ .assistant = .{ .user = .{ .text = @constCast("saved"), .images = &images }, .assistant = @constCast("answer") } }};
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expect(try prepareLegacyImageRepair(failing.allocator(), &history, "/unused", null) == null);
+    try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "legacy image repair cancellation after nested copy leaves original state unchanged" {
+    const Pause = struct {
+        entered: std.Io.Event = .unset,
+        released: std.Io.Event = .unset,
+        cancel_flag: std.atomic.Value(bool) = .init(false),
+        observed: bool = false,
+        fn allocator(self: *@This()) Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = free } };
+        }
+        fn allocate(raw: *anyopaque, size: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const bytes = std.testing.allocator.rawAlloc(size, alignment, ra);
+            if (size == 128 * 1024 and !self.observed) {
+                self.observed = true;
+                self.entered.set(io_mod.getIo());
+                self.released.waitUncancelable(io_mod.getIo());
+            }
+            return bytes;
+        }
+        fn free(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            std.testing.allocator.rawFree(bytes, alignment, ra);
+        }
+        fn cancel(self: *@This()) void {
+            self.entered.waitUncancelable(io_mod.getIo());
+            self.cancel_flag.store(true, .release);
+            self.released.set(io_mod.getIo());
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try writeSessionTestImage(alloc, &tmp, "original.png", "\x89PNG\r\n\x1a\noriginal");
+    defer alloc.free(path);
+    const snapshot_dir = try sessionTestSnapshotDir(alloc, &tmp);
+    defer alloc.free(snapshot_dir);
+    var history = [_]HistoryTurn{try make_owned_legacy_image_turn(alloc, "saved [Image #1]", "x" ** (128 * 1024), path)};
+    defer freeHistoryTurn(alloc, history[0]);
+    var pause = Pause{};
+    const thread = try std.Thread.spawn(.{}, Pause.cancel, .{&pause});
+    var failure: ?anyerror = null;
+    var prepared = prepareLegacyImageRepair(pause.allocator(), &history, snapshot_dir, &pause.cancel_flag) catch |err| failed: {
+        failure = err;
+        break :failed null;
+    };
+    defer if (prepared) |*owned| owned.deinit(alloc);
+    pause.entered.set(io_mod.getIo());
+    thread.join();
+    try std.testing.expect(pause.observed);
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), failure);
+    try std.testing.expectEqual(@as(usize, 0), history[0].assistant.user.images[0].id);
+    try std.testing.expect(history[0].assistant.user.images[0].snapshot_path == null);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.openDirAbsolute(io_mod.getIo(), snapshot_dir, .{}));
+}
+
 test "legacy image snapshot repair captures available path once" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -767,21 +861,193 @@ test "legacy image snapshot repair captures available path once" {
     defer freeHistoryTurn(alloc, history[0]);
     turn_owned = false;
 
-    try std.testing.expect(try repair_legacy_image_snapshots(alloc, &history, snapshot_dir));
-    try std.testing.expect(history[0].assistant.user.images[0].snapshot_path != null);
-    try std.testing.expect(history[0].assistant.user.images[0].snapshot_sha256 != null);
+    var prepared = (try prepareLegacyImageRepair(alloc, &history, snapshot_dir, null)).?;
+    defer prepared.deinit(alloc);
+    try std.testing.expect(prepared.history[0].assistant.user.images[0].snapshot_path != null);
+    try std.testing.expect(prepared.history[0].assistant.user.images[0].snapshot_sha256 != null);
     const replaced_path = try writeSessionTestImage(alloc, &tmp, "legacy.png", image_b);
     defer alloc.free(replaced_path);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try image_attachments.writeImageFilePartJson(alloc, &out.writer, history[0].assistant.user.images[0]);
+    try image_attachments.writeImageFilePartJson(alloc, &out.writer, prepared.history[0].assistant.user.images[0]);
     var expected_buf: [128]u8 = undefined;
     const expected = std.base64.standard.Encoder.encode(&expected_buf, image_a);
     var unexpected_buf: [128]u8 = undefined;
     const unexpected = std.base64.standard.Encoder.encode(&unexpected_buf, image_b);
     try std.testing.expect(std.mem.find(u8, out.written(), expected) != null);
     try std.testing.expect(std.mem.find(u8, out.written(), unexpected) == null);
+}
+
+test "prepared legacy image repair owns only newly created snapshots" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try writeSessionTestImage(alloc, &tmp, "shared.png", "\x89PNG\r\n\x1a\nshared");
+    defer alloc.free(path);
+    const snapshot_dir = try sessionTestSnapshotDir(alloc, &tmp);
+    defer alloc.free(snapshot_dir);
+    var existing = try core_types.dupeImageAttachment(alloc, .{
+        .id = 1,
+        .path = @constCast(path),
+        .media_type = @constCast("image/png"),
+    });
+    defer core_types.freeImageAttachment(alloc, existing);
+    try image_attachments.captureImageSnapshot(alloc, &existing, snapshot_dir);
+    var original = try std.Io.Dir.openFileAbsolute(std.testing.io, existing.snapshot_path.?, .{});
+    defer original.close(std.testing.io);
+    const original_stat = try original.stat(std.testing.io);
+
+    var history = [_]HistoryTurn{
+        try make_owned_legacy_image_turn(alloc, "one [Image #1]", "one", path),
+        try make_owned_legacy_image_turn(alloc, "two [Image #2]", "two", path),
+    };
+    defer for (history) |turn| freeHistoryTurn(alloc, turn);
+    history[0].assistant.user.images[0].id = 1;
+    history[1].assistant.user.images[0].id = 2;
+    var prepared = (try prepareLegacyImageRepair(alloc, &history, snapshot_dir, null)).?;
+    defer prepared.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), prepared.created_snapshot_paths.len);
+    const created = prepared.history[1].assistant.user.images[0].snapshot_path.?;
+    try std.testing.expectEqualStrings(created, prepared.created_snapshot_paths[0]);
+    prepared.discardSnapshots();
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.openFileAbsolute(std.testing.io, created, .{}));
+    var preserved = try std.Io.Dir.openFileAbsolute(std.testing.io, existing.snapshot_path.?, .{});
+    defer preserved.close(std.testing.io);
+    try std.testing.expectEqual(original_stat.inode, (try preserved.stat(std.testing.io)).inode);
+    for (history) |turn| try std.testing.expect(turn.assistant.user.images[0].snapshot_path == null);
+}
+
+test "legacy image cancellation after snapshot publication preserves original files" {
+    const Pause = struct {
+        snapshot_dir: []const u8,
+        entered: std.Io.Event = .unset,
+        released: std.Io.Event = .unset,
+        cancel_flag: std.atomic.Value(bool) = .init(false),
+        observed: bool = false,
+        cancelled_ns: i128 = 0,
+        fn allocator(self: *@This()) Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = free } };
+        }
+        fn allocate(raw: *anyopaque, size: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const bytes = std.testing.allocator.rawAlloc(size, alignment, ra);
+            if (size == 64 and !self.observed and !snapshot_directory_missing(self.snapshot_dir)) {
+                self.observed = true;
+                self.entered.set(io_mod.getIo());
+                self.released.waitUncancelable(io_mod.getIo());
+            }
+            return bytes;
+        }
+        fn free(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            std.testing.allocator.rawFree(bytes, alignment, ra);
+        }
+        fn cancel(self: *@This()) void {
+            self.entered.waitUncancelable(io_mod.getIo());
+            self.cancelled_ns = io_mod.nanoTimestamp();
+            self.cancel_flag.store(true, .release);
+            self.released.set(io_mod.getIo());
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |reuse_existing| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try writeSessionTestImage(alloc, &tmp, "cancel-after-capture.png", "\x89PNG\r\n\x1a\nsaved");
+        defer alloc.free(path);
+        const snapshot_dir = try sessionTestSnapshotDir(alloc, &tmp);
+        defer alloc.free(snapshot_dir);
+        var existing = try core_types.dupeImageAttachment(alloc, .{
+            .id = 1,
+            .path = @constCast(path),
+            .media_type = @constCast("image/png"),
+        });
+        defer core_types.freeImageAttachment(alloc, existing);
+        var original_stat: ?std.Io.File.Stat = null;
+        if (reuse_existing) {
+            try image_attachments.captureImageSnapshot(alloc, &existing, snapshot_dir);
+            var file = try std.Io.Dir.openFileAbsolute(std.testing.io, existing.snapshot_path.?, .{});
+            defer file.close(std.testing.io);
+            original_stat = try file.stat(std.testing.io);
+        }
+        var history = [_]HistoryTurn{try make_owned_legacy_image_turn(alloc, "saved [Image #1]", "answer", path)};
+        defer freeHistoryTurn(alloc, history[0]);
+        history[0].assistant.user.images[0].id = 1;
+        var pause = Pause{ .snapshot_dir = snapshot_dir };
+        const thread = try std.Thread.spawn(.{}, Pause.cancel, .{&pause});
+        var failure: ?anyerror = null;
+        var prepared = prepareLegacyImageRepair(pause.allocator(), &history, snapshot_dir, &pause.cancel_flag) catch |err| failed: {
+            failure = err;
+            break :failed null;
+        };
+        defer if (prepared) |*owned| owned.deinit(alloc);
+        const finished_ns = io_mod.nanoTimestamp();
+        pause.entered.set(io_mod.getIo());
+        thread.join();
+        try std.testing.expect(pause.observed);
+        try std.testing.expectEqual(@as(?anyerror, error.Cancelled), failure);
+        try std.testing.expect(finished_ns - pause.cancelled_ns < 500 * std.time.ns_per_ms);
+        try std.testing.expect(history[0].assistant.user.images[0].snapshot_path == null);
+        if (reuse_existing) {
+            var file = try std.Io.Dir.openFileAbsolute(std.testing.io, existing.snapshot_path.?, .{});
+            defer file.close(std.testing.io);
+            try std.testing.expectEqual(original_stat.?.inode, (try file.stat(std.testing.io)).inode);
+        } else {
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.openDirAbsolute(std.testing.io, snapshot_dir, .{}));
+        }
+    }
+}
+
+test "legacy image ID repair observes cancellation after candidate collection begins" {
+    const Pause = struct {
+        entered: std.Io.Event = .unset,
+        released: std.Io.Event = .unset,
+        cancel_flag: std.atomic.Value(bool) = .init(false),
+        observed: bool = false,
+        elapsed_ns: i128 = 0,
+        fn allocator(self: *@This()) Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = free } };
+        }
+        fn allocate(raw: *anyopaque, size: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const bytes = std.testing.allocator.rawAlloc(size, alignment, ra);
+            if (!self.observed) {
+                self.observed = true;
+                self.entered.set(io_mod.getIo());
+                self.released.waitUncancelable(io_mod.getIo());
+            }
+            return bytes;
+        }
+        fn free(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            std.testing.allocator.rawFree(bytes, alignment, ra);
+        }
+        fn cancel(self: *@This()) void {
+            self.entered.waitUncancelable(io_mod.getIo());
+            self.elapsed_ns = io_mod.nanoTimestamp();
+            self.cancel_flag.store(true, .release);
+            self.released.set(io_mod.getIo());
+        }
+    };
+    const alloc = std.testing.allocator;
+    var history = [_]HistoryTurn{
+        try make_owned_legacy_image_turn(alloc, "first [Image #1]", "a", "/unused-a.png"),
+        try make_owned_legacy_image_turn(alloc, "second [Image #1]", "b", "/unused-b.png"),
+    };
+    defer for (history) |turn| freeHistoryTurn(alloc, turn);
+    var pause = Pause{};
+    const thread = try std.Thread.spawn(.{}, Pause.cancel, .{&pause});
+    var failure: ?anyerror = null;
+    _ = repairLegacyZeroImageIds(pause.allocator(), &history, &pause.cancel_flag) catch |err| failed: {
+        failure = err;
+        break :failed false;
+    };
+    const finished_ns = io_mod.nanoTimestamp();
+    pause.entered.set(io_mod.getIo());
+    thread.join();
+    try std.testing.expect(pause.observed);
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), failure);
+    try std.testing.expect(finished_ns - pause.elapsed_ns < 500 * std.time.ns_per_ms);
+    for (history) |turn| try std.testing.expectEqual(@as(usize, 0), turn.assistant.user.images[0].id);
 }
 
 test "legacy image snapshot repair drops unavailable path-only images" {
@@ -802,8 +1068,9 @@ test "legacy image snapshot repair drops unavailable path-only images" {
     defer freeHistoryTurn(alloc, history[0]);
     turn_owned = false;
 
-    try std.testing.expect(try repair_legacy_image_snapshots(alloc, &history, snapshot_dir));
-    try std.testing.expectEqual(@as(usize, 0), history[0].assistant.user.images.len);
+    var prepared = (try prepareLegacyImageRepair(alloc, &history, snapshot_dir, null)).?;
+    defer prepared.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), prepared.history[0].assistant.user.images.len);
 }
 
 test "legacy image snapshot repair propagates OOM without changing memory or disk" {
@@ -832,16 +1099,18 @@ test "legacy image snapshot repair propagates OOM without changing memory or dis
             path,
         );
         var history = [_]HistoryTurn{turn};
+        defer freeHistoryTurn(alloc, history[0]);
         var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
 
-        if (repair_legacy_images_transactionally(
+        if (prepareLegacyImageRepair(
             failing.allocator(),
             &history,
             snapshot_dir,
-        )) |changed| {
-            try std.testing.expect(changed);
+            null,
+        )) |prepared| {
+            var owned = prepared.?;
+            defer owned.deinit(alloc);
             try std.testing.expect(!failing.has_induced_failure);
-            freeHistoryTurn(failing.allocator(), history[0]);
             reached_success = true;
             break;
         } else |err| {
@@ -858,7 +1127,6 @@ test "legacy image snapshot repair propagates OOM without changing memory or dis
                 error.FileNotFound,
                 std.Io.Dir.openDirAbsolute(std.testing.io, snapshot_dir, .{ .iterate = true }),
             );
-            freeHistoryTurn(alloc, history[0]);
         }
     }
     try std.testing.expect(reached_success);
@@ -890,7 +1158,7 @@ test "legacy image repair rewrites repeated per-turn ordinals to stable session 
     first_owned = false;
     second_owned = false;
 
-    try std.testing.expect(try repair_legacy_zero_image_ids(alloc, &history));
+    try std.testing.expect(try repairLegacyZeroImageIds(alloc, &history, null));
 
     try std.testing.expectEqual(@as(usize, 1), history[0].assistant.user.images[0].id);
     try std.testing.expectEqualStrings(
@@ -999,7 +1267,7 @@ test "legacy image repair rewrites three repeated ordinals across persisted turn
     background_text_owned = false;
     interrupted_text_owned = false;
 
-    try std.testing.expect(try repair_legacy_zero_image_ids(alloc, &history));
+    try std.testing.expect(try repairLegacyZeroImageIds(alloc, &history, null));
 
     try std.testing.expectEqual(@as(usize, 1), assistant_images[0].id);
     try std.testing.expectEqual(@as(usize, 2), background_images[0].id);
@@ -1066,7 +1334,7 @@ test "legacy image repair leaves history unchanged when text reconstruction runs
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 2 });
     try std.testing.expectError(
         error.OutOfMemory,
-        repair_legacy_zero_image_ids(failing.allocator(), &history),
+        repairLegacyZeroImageIds(failing.allocator(), &history, null),
     );
 
     try std.testing.expectEqual(@as(usize, 0), first_images[0].id);
@@ -1115,7 +1383,7 @@ test "legacy image repair preserves canonical placeholder identity by attachment
         } },
     };
 
-    _ = try repair_legacy_zero_image_ids(std.testing.allocator, &history);
+    _ = try repairLegacyZeroImageIds(std.testing.allocator, &history, null);
 
     try std.testing.expectEqual(@as(usize, 5), first_images[0].id);
     try std.testing.expectEqual(@as(usize, 9), mixed_images[0].id);
@@ -1147,7 +1415,7 @@ test "legacy image repair reserves a later low placeholder before an earlier fal
         } },
     };
 
-    _ = try repair_legacy_zero_image_ids(std.testing.allocator, &history);
+    _ = try repairLegacyZeroImageIds(std.testing.allocator, &history, null);
 
     try std.testing.expectEqual(@as(usize, 2), fallback_images[0].id);
     try std.testing.expectEqual(@as(usize, 1), reserved_images[0].id);
@@ -1175,7 +1443,7 @@ test "legacy image repair preserves a low reservation before a later fallback" {
         } },
     };
 
-    _ = try repair_legacy_zero_image_ids(std.testing.allocator, &history);
+    _ = try repairLegacyZeroImageIds(std.testing.allocator, &history, null);
 
     try std.testing.expectEqual(@as(usize, 1), reserved_images[0].id);
     try std.testing.expectEqual(@as(usize, 2), fallback_images[0].id);
@@ -1248,7 +1516,7 @@ test "legacy image repair reserves low ids before interleaved fallbacks across t
         } },
     };
 
-    _ = try repair_legacy_zero_image_ids(std.testing.allocator, &history);
+    _ = try repairLegacyZeroImageIds(std.testing.allocator, &history, null);
 
     try std.testing.expectEqual(@as(usize, 3), missing_images[0].id);
     try std.testing.expectEqual(@as(usize, 1), reserved_one_images[0].id);
@@ -1284,7 +1552,7 @@ test "legacy image repair gives existing positive ids priority over placeholder 
     };
     defer alloc.free(history[1].assistant.user.text);
 
-    _ = try repair_legacy_zero_image_ids(alloc, &history);
+    _ = try repairLegacyZeroImageIds(alloc, &history, null);
 
     try std.testing.expectEqual(@as(usize, 1), positive_images[0].id);
     try std.testing.expectEqual(@as(usize, 2), conflicting_images[0].id);
@@ -1372,7 +1640,7 @@ test "legacy image repair falls back for missing malformed zero duplicate and co
     zero_text_owned = false;
     duplicate_text_owned = false;
 
-    _ = try repair_legacy_zero_image_ids(alloc, &history);
+    _ = try repairLegacyZeroImageIds(alloc, &history, null);
 
     try std.testing.expectEqual(@as(usize, 3), positive_images[0].id);
     try std.testing.expectEqual(@as(usize, 1), conflicting_images[0].id);
@@ -1415,7 +1683,7 @@ test "legacy image repair binds transcript and Vision authorization to reserved 
         } },
     };
 
-    _ = try repair_legacy_zero_image_ids(std.testing.allocator, &history);
+    _ = try repairLegacyZeroImageIds(std.testing.allocator, &history, null);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     const expanded = try image_attachments.expandPlaceholdersWithBadges(
@@ -1440,9 +1708,11 @@ test "legacy image repair binds transcript and Vision authorization to reserved 
     try std.testing.expectEqualStrings("/tmp/fallback.png", authorized[1].path);
 }
 
-fn history_contains_image_id(history: []const HistoryTurn, id: usize) bool {
+fn history_contains_image_id(history: []const HistoryTurn, id: usize, cancel_flag: read_cancellation.CancelFlag) error{Cancelled}!bool {
     for (history) |turn| {
+        try read_cancellation.check(cancel_flag);
         for (images_for_history_turn(turn)) |attachment| {
+            try read_cancellation.check(cancel_flag);
             if (attachment.id == id) return true;
         }
     }
@@ -1463,17 +1733,22 @@ pub fn repairPersistedToolArguments(
     calls: []ToolCall,
     results: []PersistedToolResult,
     source: PersistedToolArgumentsSource,
+    cancel_flag: read_cancellation.CancelFlag,
 ) !void {
     for (calls) |call| {
+        try read_cancellation.check(cancel_flag);
         if (call.argument_integrity == .malformed_json) {
-            _ = try persistedResultForMalformedCall(calls, results, call);
+            _ = try persistedResultForMalformedCall(calls, results, call, cancel_flag);
         }
     }
 
     for (calls) |*call| {
+        try read_cancellation.check(cancel_flag);
         if (call.argument_integrity != .malformed_json) continue;
-        const result = try persistedResultForMalformedCall(calls, results, call.*);
+        const result = try persistedResultForMalformedCall(calls, results, call.*, cancel_flag);
         const failure_output = try tool_result_errors.malformedToolArgumentsJson(alloc, call.name);
+        errdefer alloc.free(failure_output);
+        try read_cancellation.check(cancel_flag);
 
         alloc.free(result.output);
         if (result.output_handle) |handle| alloc.free(handle);
@@ -1504,15 +1779,18 @@ fn persistedResultForMalformedCall(
     calls: []ToolCall,
     results: []PersistedToolResult,
     call: ToolCall,
+    cancel_flag: read_cancellation.CancelFlag,
 ) !*PersistedToolResult {
     var matching_calls: usize = 0;
     for (calls) |candidate| {
+        try read_cancellation.check(cancel_flag);
         if (std.mem.eql(u8, candidate.id, call.id)) matching_calls += 1;
     }
     if (matching_calls != 1) return error.InvalidSessionFormat;
 
     var matched_result: ?*PersistedToolResult = null;
     for (results) |*result| {
+        try read_cancellation.check(cancel_flag);
         if (!std.mem.eql(u8, result.tool_call_id, call.id)) continue;
         if (matched_result != null) return error.InvalidSessionFormat;
         matched_result = result;
@@ -1542,6 +1820,145 @@ pub const WebFetchArtifactState = union(enum) {
     store: web_fetch_artifacts.Store,
     unavailable: anyerror,
 };
+
+/// Owned conversation data prepared without touching a live session runtime.
+pub const RestoredConversation = struct {
+    history: std.ArrayList(HistoryTurn) = .empty,
+    permission_state: session_permission_state.State = .{},
+    language: ConversationLanguage,
+    context_history_start: usize,
+
+    pub fn prepare(
+        alloc: Allocator,
+        language: ConversationLanguage,
+        history: []const HistoryTurn,
+        context_history_start: usize,
+        permission_state: session_permission_state.State,
+        cancel_flag: ?*const std.atomic.Value(bool),
+    ) !RestoredConversation {
+        if (context_history_start > history.len) return error.InvalidContextHistoryStart;
+        var restored = RestoredConversation{
+            .language = language,
+            .context_history_start = context_history_start,
+        };
+        errdefer restored.deinit(alloc);
+        for (history) |turn| {
+            try read_cancellation.check(cancel_flag);
+            try restored.history.ensureUnusedCapacity(alloc, 1);
+            restored.history.appendAssumeCapacity(try core_types.dupeHistoryTurnCancellable(alloc, turn, cancel_flag));
+        }
+        try read_cancellation.check(cancel_flag);
+        restored.permission_state = try session_permission_state.dupe(alloc, permission_state);
+        try read_cancellation.check(cancel_flag);
+        return restored;
+    }
+
+    pub fn deinit(self: *RestoredConversation, alloc: Allocator) void {
+        for (self.history.items) |turn| freeHistoryTurn(alloc, turn);
+        self.history.deinit(alloc);
+        self.permission_state.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+test "prepared restoration consumes agent freshness for empty and populated history" {
+    const alloc = std.testing.allocator;
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("saved question"), .images = &.{} },
+        .assistant = @constCast("saved answer"),
+    } }};
+    for (0..2) |count| {
+        var runtime = SessionRuntime{ .max_history_turns = 20 };
+        defer runtime.deinit(alloc);
+        var restored = try RestoredConversation.prepare(alloc, .default(), history[0..count], 0, .{}, null);
+        defer restored.deinit(alloc);
+        try std.testing.expect(runtime.agent.fresh);
+        runtime.installRestoredConversation(&restored);
+        try std.testing.expect(!runtime.agent.fresh);
+        try std.testing.expectEqual(count, runtime.agent.history.items.len);
+    }
+}
+
+test "restored conversation cancels after nested output allocation begins" {
+    const Canceller = struct {
+        trigger_len: ?usize = 65537,
+        started: std.atomic.Value(bool) = .init(false),
+        cancelled: std.atomic.Value(bool) = .init(false),
+        finished: std.atomic.Value(bool) = .init(false),
+
+        fn allocator(self: *@This()) Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = free } };
+        }
+        fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const bytes = std.testing.allocator.rawAlloc(len, alignment, ra);
+            if ((self.trigger_len == null or self.trigger_len == len) and !self.started.load(.acquire)) {
+                self.started.store(true, .release);
+                while (!self.cancelled.load(.acquire)) std.Thread.yield() catch {};
+            }
+            return bytes;
+        }
+        fn free(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            std.testing.allocator.rawFree(bytes, alignment, ra);
+        }
+        fn run(self: *@This()) void {
+            while (!self.started.load(.acquire) and !self.finished.load(.acquire)) std.Thread.yield() catch {};
+            if (self.started.load(.acquire)) self.cancelled.store(true, .release);
+        }
+
+        fn copy(alloc: Allocator, history: []const HistoryTurn) !void {
+            var cancelled = std.atomic.Value(bool).init(false);
+            var restored = try RestoredConversation.prepare(alloc, .default(), history, 0, .{}, &cancelled);
+            defer restored.deinit(alloc);
+            const expected = history[0].assistant.execution.tool_steps[0].tool_results[0].output;
+            const actual = restored.history.items[0].assistant.execution.tool_steps[0].tool_results[0].output;
+            try std.testing.expectEqualStrings(expected, actual);
+            try std.testing.expect(expected.ptr != actual.ptr);
+        }
+    };
+    var output = [_]u8{'x'} ** 65537;
+    var results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("call"),
+        .tool_name = @constCast("command"),
+        .status = .success,
+        .output = &output,
+        .output_bytes = output.len,
+        .stored_output_bytes = output.len,
+    }};
+    var steps = [_]ToolExecutionStep{.{ .tool_results = &results }};
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("saved question"), .images = &.{} },
+        .assistant = @constCast("saved answer"),
+        .execution = .{ .tool_steps = &steps },
+    } }};
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Canceller.copy, .{history[0..]});
+    var control = Canceller{};
+    const thread = try std.Thread.spawn(.{}, Canceller.run, .{&control});
+    defer {
+        control.finished.store(true, .release);
+        thread.join();
+    }
+    if (RestoredConversation.prepare(control.allocator(), .default(), &history, 0, .{}, &control.cancelled)) |value| {
+        var owned = value;
+        owned.deinit(control.allocator());
+        return error.TestExpectedCancellation;
+    } else |err| {
+        try std.testing.expectEqual(error.Cancelled, err);
+    }
+    try std.testing.expect(control.started.load(.acquire));
+
+    var calls = [_]ToolCall{.{ .id = @constCast("call"), .name = @constCast("command"), .arguments_json = @constCast("{}"), .argument_integrity = .malformed_json }};
+    var repair_result = [_]PersistedToolResult{.{ .tool_call_id = @constCast("call"), .tool_name = @constCast("command"), .status = .success, .output = try std.testing.allocator.dupe(u8, "prior output"), .output_bytes = 12, .stored_output_bytes = 12 }};
+    defer std.testing.allocator.free(repair_result[0].output);
+    var repair = Canceller{ .trigger_len = null };
+    const repair_thread = try std.Thread.spawn(.{}, Canceller.run, .{&repair});
+    defer {
+        repair.finished.store(true, .release);
+        repair_thread.join();
+    }
+    try std.testing.expectError(error.Cancelled, repairPersistedToolArguments(repair.allocator(), &calls, &repair_result, .schema_v3, &repair.cancelled));
+    try std.testing.expectEqualStrings("prior output", repair_result[0].output);
+}
 
 pub const SessionRuntime = struct {
     agent: kernel_agent.Agent = .{},
@@ -1673,33 +2090,57 @@ pub const SessionRuntime = struct {
         context_history_start: usize,
         permission_state: session_permission_state.State,
     ) !void {
-        if (context_history_start > history.len) {
-            return error.InvalidContextHistoryStart;
-        }
-        var permission_copy = try session_permission_state.dupe(
-            alloc,
-            permission_state,
-        );
-        errdefer permission_copy.deinit(alloc);
-        try self.restoreWithContextHistoryStart(
+        var restored = try RestoredConversation.prepare(
             alloc,
             language,
             history,
             context_history_start,
+            permission_state,
+            null,
         );
+        defer restored.deinit(alloc);
+        self.clearWebFetchArtifacts();
+        self.usage.resetLegacy(alloc);
+        self.installRestoredConversation(&restored);
+    }
+
+    /// Installs prepared data by ownership transfer. `restored` takes the old
+    /// conversation so its caller can retire that storage away from input.
+    pub fn installRestoredConversation(self: *SessionRuntime, restored: *RestoredConversation) void {
+        std.mem.swap(@TypeOf(self.agent.history), &self.agent.history, &restored.history);
+        self.agent.fresh = false;
         self.permission_state_lock.lockUncancelable(io_mod.getIo());
-        defer self.permission_state_lock.unlock(io_mod.getIo());
-        self.permission_state.deinit(alloc);
-        self.permission_state = permission_copy;
+        std.mem.swap(session_permission_state.State, &self.permission_state, &restored.permission_state);
+        self.permission_state_lock.unlock(io_mod.getIo());
+        self.setConversationLanguage(restored.language);
+        self.context_history_start = restored.context_history_start;
+        self.unversioned_history_len = self.agent.history.items.len;
+        if (self.context_history_start < self.agent.history.items.len and
+            isCurrentCompactionCheckpoint(self.agent.history.items[self.context_history_start]))
+        {
+            self.unversioned_history_len = 0;
+        }
+        self.clearContextNotices();
     }
 
     pub fn snapshotPermissionState(
         self: *SessionRuntime,
         alloc: Allocator,
     ) !session_permission_state.State {
-        self.permission_state_lock.lockUncancelable(io_mod.getIo());
+        return self.snapshotPermissionStateCancellable(alloc, null);
+    }
+
+    pub fn snapshotPermissionStateCancellable(
+        self: *SessionRuntime,
+        alloc: Allocator,
+        cancel_flag: read_cancellation.CancelFlag,
+    ) !session_permission_state.State {
+        try read_cancellation.lock(io_mod.getIo(), &self.permission_state_lock, cancel_flag);
         defer self.permission_state_lock.unlock(io_mod.getIo());
-        return session_permission_state.dupe(alloc, self.permission_state);
+        var copy = try session_permission_state.dupe(alloc, self.permission_state);
+        errdefer copy.deinit(alloc);
+        try read_cancellation.check(cancel_flag);
+        return copy;
     }
 
     pub fn applyPermissionEvent(
@@ -1836,8 +2277,12 @@ pub const SessionRuntime = struct {
         };
     }
 
-    pub fn snapshotHistory(self: *const SessionRuntime, alloc: Allocator) ![]HistoryTurn {
+    pub fn snapshotHistory(self: *const SessionRuntime, alloc: Allocator) Allocator.Error![]HistoryTurn {
         return self.agent.snapshotHistory(alloc);
+    }
+
+    pub fn snapshotHistoryCancellable(self: *const SessionRuntime, alloc: Allocator, cancel_flag: read_cancellation.CancelFlag) ![]HistoryTurn {
+        return self.agent.snapshotHistoryCancellable(alloc, cancel_flag);
     }
 
     pub fn snapshotImageCatalog(
@@ -1859,6 +2304,16 @@ pub const SessionRuntime = struct {
 
     pub fn appendHistoryEntry(self: *SessionRuntime, alloc: Allocator, turn: HistoryTurn) !void {
         try self.agent.appendHistoryEntry(alloc, turn);
+        self.didAppendHistoryEntry(turn);
+    }
+
+    /// Consumes the turn on success. On error it remains owned by the caller.
+    pub fn appendOwnedHistoryEntry(self: *SessionRuntime, alloc: Allocator, turn: HistoryTurn) !void {
+        try self.agent.appendOwnedHistoryEntry(alloc, turn);
+        self.didAppendHistoryEntry(turn);
+    }
+
+    fn didAppendHistoryEntry(self: *SessionRuntime, turn: HistoryTurn) void {
         if (turn == .compacted_summary) {
             self.context_history_start = self.agent.history.items.len - 1;
             if (isCurrentCompactionCheckpoint(turn)) {
@@ -2006,111 +2461,11 @@ pub fn freeHistoryTurnSlice(alloc: Allocator, turns: []HistoryTurn) void {
     if (turns.len > 0) alloc.free(turns);
 }
 /// Deep-copies an image attachment slice; caller owns the returned slice and frees with freeImageAttachmentSlice.
-pub fn dupeImageAttachmentSlice(alloc: Allocator, attachments: []const ImageAttachment) ![]ImageAttachment {
-    if (attachments.len == 0) return &.{};
-    const copy = try alloc.alloc(ImageAttachment, attachments.len);
-    errdefer alloc.free(copy);
-    var copied: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < copied) : (i += 1) {
-            core_types.freeImageAttachment(alloc, copy[i]);
-        }
-    }
-    for (attachments, 0..) |attachment, i| {
-        copy[i] = try dupeImageAttachment(alloc, attachment);
-        copied += 1;
-    }
-    return copy;
-}
-fn dupeImageAttachment(alloc: Allocator, src: ImageAttachment) !ImageAttachment {
-    const path = try alloc.dupe(u8, src.path);
-    errdefer alloc.free(path);
-    const media_type = try alloc.dupe(u8, src.media_type);
-    errdefer alloc.free(media_type);
-    const snapshot_path = if (src.snapshot_path) |value|
-        try alloc.dupe(u8, value)
-    else
-        null;
-    errdefer if (snapshot_path) |value| alloc.free(value);
-    const snapshot_sha256 = if (src.snapshot_sha256) |value|
-        try alloc.dupe(u8, value)
-    else
-        null;
-    return .{
-        .id = src.id,
-        .path = path,
-        .media_type = media_type,
-        .snapshot_path = snapshot_path,
-        .snapshot_sha256 = snapshot_sha256,
-    };
-}
+pub const dupeImageAttachmentSlice = core_types.dupeImageAttachmentSlice;
+const dupeImageAttachment = core_types.dupeImageAttachment;
+
 /// Deep-copies one history turn; caller owns the returned turn and frees with freeHistoryTurn.
-pub fn dupeHistoryTurn(alloc: Allocator, turn: HistoryTurn) !HistoryTurn {
-    switch (turn) {
-        .compacted_summary => |entry| {
-            const summary = try alloc.dupe(u8, entry.summary);
-            errdefer alloc.free(summary);
-            const root_user_messages = try core_types.dupeCompletedToolNames(
-                alloc,
-                entry.root_user_messages,
-            );
-            errdefer core_types.freeCompletedToolNames(alloc, root_user_messages);
-            const permission_feedback = try core_types.dupePermissionFeedback(
-                alloc,
-                entry.permission_feedback,
-            );
-            return .{ .compacted_summary = .{
-                .summary = summary,
-                .removed_turn_count = entry.removed_turn_count,
-                .compaction_count = entry.compaction_count,
-                .root_user_messages = root_user_messages,
-                .root_user_messages_complete = entry.root_user_messages_complete,
-                .permission_feedback = permission_feedback,
-                .permission_feedback_complete = entry.permission_feedback_complete,
-            } };
-        },
-        .assistant => |entry| {
-            const user = try dupeUserTurn(alloc, entry.user);
-            errdefer freeUserTurn(alloc, user);
-            const assistant_copy = try alloc.dupe(u8, entry.assistant);
-            errdefer alloc.free(assistant_copy);
-            const execution = try core_types.dupeExecutionMemory(alloc, entry.execution);
-            return .{ .assistant = .{
-                .user = user,
-                .assistant = assistant_copy,
-                .execution = execution,
-            } };
-        },
-        .interrupted => |entry| {
-            const user = try dupeUserTurn(alloc, entry.user);
-            errdefer freeUserTurn(alloc, user);
-            const assistant = if (entry.assistant) |text| try alloc.dupe(u8, text) else null;
-            errdefer if (assistant) |text| alloc.free(text);
-            const tool_call = if (entry.tool_call) |call| try core_types.dupeToolCall(alloc, call) else null;
-            errdefer if (tool_call) |call| core_types.freeToolCall(alloc, call);
-            const completed_tool_names = try core_types.dupeCompletedToolNames(alloc, entry.completed_tool_names);
-            errdefer core_types.freeCompletedToolNames(alloc, completed_tool_names);
-            const cancelled_command = if (entry.cancelled_command) |presentation|
-                try core_types.dupeCancelledCommandPresentation(alloc, presentation)
-            else
-                null;
-            errdefer if (cancelled_command) |presentation| {
-                core_types.freeCancelledCommandPresentation(alloc, presentation);
-            };
-            const execution = try core_types.dupeExecutionMemory(alloc, entry.execution);
-            return .{ .interrupted = .{
-                .user = user,
-                .assistant = assistant,
-                .tool_call = tool_call,
-                .completed_tool_names = completed_tool_names,
-                .execution = execution,
-                .cancelled_command = cancelled_command,
-                .terminal_reason = entry.terminal_reason,
-            } };
-        },
-    }
-}
+pub const dupeHistoryTurn = core_types.dupeHistoryTurn;
 pub fn appendAssistantTurnWithExecution(
     alloc: Allocator,
     current: []HistoryTurn,
@@ -2184,7 +2539,7 @@ test "unavailable profile usage keeps reconciled generation pending in host runt
     const Checkpoint = struct {
         calls: usize = 0,
 
-        fn persist(raw: *anyopaque, _: session_usage.Snapshot) !void {
+        fn persist(raw: *anyopaque, _: session_usage.Snapshot, _: ?*const std.atomic.Value(bool)) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
         }
@@ -2240,7 +2595,7 @@ test "readable profile usage does not attach publishers or flush recovery" {
     const Checkpoint = struct {
         calls: usize = 0,
 
-        fn persist(raw: *anyopaque, _: session_usage.Snapshot) !void {
+        fn persist(raw: *anyopaque, _: session_usage.Snapshot, _: ?*const std.atomic.Value(bool)) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
         }

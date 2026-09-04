@@ -1,4 +1,14 @@
 const std = @import("std");
+
+pub fn classifyResumeFailure(err: anyerror) ResumeFailure {
+    return switch (err) {
+        error.SessionBusy => .open_elsewhere,
+        error.SessionAuthorityBoundaryUnavailable,
+        error.SessionCommitBoundaryUnavailable,
+        => .being_updated,
+        else => .unavailable,
+    };
+}
 const session_display_metadata = @import("session_display_metadata.zig");
 const session_store = @import("session_store.zig");
 const text_utils = @import("../shared/text_utils.zig");

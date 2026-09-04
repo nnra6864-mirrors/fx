@@ -557,7 +557,7 @@ test "terminal checkpoint failure releases automatic reviewer stream" {
     const Checkpoint = struct {
         calls: usize = 0,
 
-        fn persist(raw_ctx: *anyopaque, _: session_usage.Snapshot) !void {
+        fn persist(raw_ctx: *anyopaque, _: session_usage.Snapshot, _: ?*const std.atomic.Value(bool)) !void {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx));
             self.calls += 1;
             if (self.calls == 2) return error.CheckpointRejected;

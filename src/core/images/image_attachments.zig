@@ -7,6 +7,7 @@ const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
 const pathing = @import("../workspace/pathing.zig");
+const read_cancellation = @import("../shared/read_cancellation.zig");
 
 pub const max_image_bytes: usize = 20 * 1024 * 1024;
 const max_encoded_image_bytes: usize = 5 * 1024 * 1024;
@@ -218,7 +219,7 @@ pub fn cleanupSnapshotDir(path: []const u8) void {
 }
 
 pub const CaptureBudget = struct {
-    cancel_flag: ?*std.atomic.Value(bool) = null,
+    cancel_flag: ?*const std.atomic.Value(bool) = null,
     deadline: ?std.Io.Clock.Timestamp = null,
     test_hook: if (builtin.is_test) ?TestBudgetHook else void = if (builtin.is_test) null else {},
 
@@ -308,6 +309,19 @@ pub fn captureImageSnapshotWithBudget(
     snapshot_dir: []const u8,
     budget: CaptureBudget,
 ) !void {
+    _ = try captureImageSnapshotTracked(alloc, attachment, snapshot_dir, budget);
+}
+
+pub const CaptureOutcome = enum { created, reused };
+
+/// Captures into the immutable snapshot namespace without replacing an existing
+/// file. Only a created outcome grants the caller rollback deletion ownership.
+pub fn captureImageSnapshotTracked(
+    alloc: std.mem.Allocator,
+    attachment: *types.ImageAttachment,
+    snapshot_dir: []const u8,
+    budget: CaptureBudget,
+) !CaptureOutcome {
     if (attachment.id == 0) return error.InvalidImageId;
     try budget.check();
 
@@ -459,7 +473,7 @@ pub fn captureBoundImageAttachment(
         };
     };
     errdefer discardImageAttachment(alloc, attachment);
-    try captureImageSnapshotFromOpenFileWithBudget(
+    _ = try captureImageSnapshotFromOpenFileWithBudget(
         alloc,
         &attachment,
         snapshot_dir,
@@ -541,7 +555,7 @@ fn captureImageSnapshotFromOpenFileWithBudget(
     budget: CaptureBudget,
     source: *std.Io.File,
     source_stat: std.Io.File.Stat,
-) !void {
+) !CaptureOutcome {
     if (source_stat.kind != .file) return error.NotRegularFile;
     if (source_stat.size > max_image_bytes) return error.ImageTooLarge;
 
@@ -639,23 +653,37 @@ fn captureImageSnapshotFromOpenFileWithBudget(
     const final_path = try std.fs.path.join(alloc, &.{ snapshot_dir, final_name });
     errdefer alloc.free(final_path);
     try budget.check();
-    try snapshot_dir_handle.rename(
-        selected_temp_name,
-        snapshot_dir_handle,
-        final_name,
-        io_mod.getIo(),
-    );
-    if (std.mem.eql(u8, selected_temp_name, source_temp_name)) {
-        cleanup_source_temp = false;
-    } else {
-        cleanup_candidate_temp = false;
+    const outcome: CaptureOutcome = outcome: {
+        snapshot_dir_handle.renamePreserve(
+            selected_temp_name,
+            snapshot_dir_handle,
+            final_name,
+            io_mod.getIo(),
+        ) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                const existing = try inspectImageCandidate(snapshot_dir_handle, final_name, budget);
+                if (existing.size_bytes != metadata.size_bytes or
+                    !std.mem.eql(u8, &existing.digest_hex, &metadata.digest_hex) or
+                    !std.mem.eql(u8, existing.media_type, metadata.media_type)) return error.ImagePreparationFailed;
+                break :outcome .reused;
+            },
+            else => return err,
+        };
+        break :outcome .created;
+    };
+    if (outcome == .created) {
+        if (std.mem.eql(u8, selected_temp_name, source_temp_name)) {
+            cleanup_source_temp = false;
+        } else {
+            cleanup_candidate_temp = false;
+        }
     }
-    var cleanup_final = true;
+    var cleanup_final = outcome == .created;
     errdefer if (cleanup_final) {
         deleteSnapshotFile(snapshot_dir_handle, final_name, "capture_final");
     };
 
-    try syncSnapshotDirectory(snapshot_dir_handle);
+    if (outcome == .created) try syncSnapshotDirectory(snapshot_dir_handle);
     try budget.check();
     const digest_hex = try alloc.dupe(u8, &metadata.digest_hex);
     errdefer alloc.free(digest_hex);
@@ -674,6 +702,7 @@ fn captureImageSnapshotFromOpenFileWithBudget(
         alloc.free(old);
     }
     if (old_snapshot_sha256) |old| alloc.free(old);
+    return outcome;
 }
 
 fn streamSourceToFile(
@@ -962,6 +991,11 @@ fn deleteSnapshotPath(path: []const u8, reason: []const u8) void {
     deleteSnapshotFile(parent, name, reason);
 }
 
+/// Deletes a snapshot whose creation receipt belongs to the caller.
+pub fn discardCreatedSnapshot(path: []const u8) void {
+    deleteSnapshotPath(path, "rollback_created_snapshot");
+}
+
 pub const VerifiedSnapshot = struct {
     bytes: []u8,
     media_type: []const u8,
@@ -1131,6 +1165,30 @@ pub fn cloneVerifiedImageAttachment(
     );
 }
 
+/// Rebinds owned staged metadata without deleting source snapshots. A null
+/// destination keeps each existing owner directory. The caller retires old
+/// files only after admission, and discards new files if admission fails.
+pub fn prepareSubmittedImageAttachments(
+    alloc: std.mem.Allocator,
+    attachments: []types.ImageAttachment,
+    snapshot_dir: ?[]const u8,
+) !void {
+    for (attachments) |*attachment| {
+        const source = attachment.snapshot_path orelse continue;
+        if (attachment.id == 0) return error.InvalidImageId;
+        const digest = attachment.snapshot_sha256 orelse return error.MissingImageSnapshot;
+        if (digest.len != snapshot_digest_hex_len) return error.InvalidImageSnapshotDigest;
+        var name_buffer: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "image-{d}-{s}.bin", .{ attachment.id, digest[0..16] });
+        const source_dir = std.fs.path.dirname(source) orelse return error.ImageSnapshotPathUnsafe;
+        const destination = snapshot_dir orelse source_dir;
+        if (std.mem.eql(u8, source_dir, destination) and std.mem.eql(u8, std.fs.path.basename(source), name)) continue;
+        const replacement = try copyVerifiedImageAttachmentToDir(alloc, attachment.*, attachment.id, destination);
+        types.freeImageAttachment(alloc, attachment.*);
+        attachment.* = replacement;
+    }
+}
+
 pub fn copyVerifiedImageAttachmentToDir(
     alloc: std.mem.Allocator,
     attachment: types.ImageAttachment,
@@ -1143,8 +1201,6 @@ pub fn copyVerifiedImageAttachmentToDir(
     var verified = try loadVerifiedSnapshot(alloc, attachment, .{});
     defer verified.deinit(alloc);
 
-    const path = try alloc.dupe(u8, attachment.path);
-    errdefer alloc.free(path);
     const media_type = try alloc.dupe(u8, verified.media_type);
     errdefer alloc.free(media_type);
     const digest = try alloc.dupe(u8, source_digest);
@@ -1158,6 +1214,11 @@ pub fn copyVerifiedImageAttachmentToDir(
     defer alloc.free(final_name);
     const final_path = try std.fs.path.join(alloc, &.{ snapshot_dir, final_name });
     errdefer alloc.free(final_path);
+    const path = try alloc.dupe(u8, if (std.mem.eql(u8, attachment.path, attachment.snapshot_path.?))
+        final_path
+    else
+        attachment.path);
+    errdefer alloc.free(path);
 
     const temp_name = try std.fmt.allocPrint(
         alloc,
@@ -1349,6 +1410,11 @@ pub fn formatImagePlaceholder(buf: []u8, id: usize) error{NoSpaceLeft}![]const u
 }
 
 pub fn matchImagePlaceholder(text: []const u8, start: usize) ?ImagePlaceholderMatch {
+    return matchImagePlaceholderCancellable(text, start, null) catch unreachable;
+}
+
+pub fn matchImagePlaceholderCancellable(text: []const u8, start: usize, cancel_flag: read_cancellation.CancelFlag) error{Cancelled}!?ImagePlaceholderMatch {
+    try read_cancellation.check(cancel_flag);
     if (start > text.len or text.len - start < image_placeholder_prefix.len) return null;
     if (!std.mem.eql(u8, text[start .. start + image_placeholder_prefix.len], image_placeholder_prefix)) return null;
 
@@ -1356,6 +1422,7 @@ pub fn matchImagePlaceholder(text: []const u8, start: usize) ?ImagePlaceholderMa
     var id: usize = 0;
     var digits: usize = 0;
     while (i < text.len and text[i] >= '0' and text[i] <= '9') : (i += 1) {
+        if (digits % read_cancellation.work_bytes == 0) try read_cancellation.check(cancel_flag);
         id = std.math.mul(usize, id, 10) catch return null;
         id = std.math.add(usize, id, text[i] - '0') catch return null;
         digits += 1;
@@ -3555,6 +3622,44 @@ test "capture derives media type from captured bytes" {
     );
 
     try std.testing.expectEqualStrings("image/png", attachment.media_type);
+}
+
+test "capture rollback preserves an existing immutable snapshot" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "existing.png", .data = "\x89PNG\r\n\x1a\nexisting" });
+    const image_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "existing.png");
+    defer alloc.free(image_path);
+    const existing = try testCapturedAttachment(alloc, &tmp, image_path, 1, "image/png");
+    defer types.freeImageAttachment(alloc, existing);
+    const snapshot_dir = std.fs.path.dirname(existing.snapshot_path.?).?;
+    var snapshot = try std.Io.Dir.openFileAbsolute(std.testing.io, existing.snapshot_path.?, .{});
+    defer snapshot.close(std.testing.io);
+    const original_stat = try snapshot.stat(std.testing.io);
+    var succeeded = false;
+    for (0..16) |fail_index| {
+        var candidate = try types.dupeImageAttachment(alloc, .{
+            .id = 1,
+            .path = @constCast(image_path),
+            .media_type = @constCast("image/png"),
+        });
+        defer types.freeImageAttachment(alloc, candidate);
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
+        captureImageSnapshot(failing.allocator(), &candidate, snapshot_dir) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            var preserved = try std.Io.Dir.openFileAbsolute(std.testing.io, existing.snapshot_path.?, .{});
+            defer preserved.close(std.testing.io);
+            try std.testing.expectEqual(original_stat.inode, (try preserved.stat(std.testing.io)).inode);
+            continue;
+        };
+        succeeded = true;
+        var preserved = try std.Io.Dir.openFileAbsolute(std.testing.io, existing.snapshot_path.?, .{});
+        defer preserved.close(std.testing.io);
+        try std.testing.expectEqual(original_stat.inode, (try preserved.stat(std.testing.io)).inode);
+        break;
+    }
+    try std.testing.expect(succeeded);
 }
 
 test "capture removes final snapshot when digest allocation fails after rename" {

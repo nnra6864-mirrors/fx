@@ -2376,10 +2376,6 @@ describe("effect-aware command permissions", () => {
       await activeSession.kill();
       activeSession = null;
 
-      rmSync(
-        join(root.home, ".fx", "sessions", sessionId, "resume-view.bin"),
-        { force: true },
-      );
       activeSession = await TmuxSession.create({
         cmd: `${FX_BIN} resume ${sessionId}`,
         cwd: root.workspace,

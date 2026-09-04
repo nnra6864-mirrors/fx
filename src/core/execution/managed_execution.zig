@@ -197,6 +197,7 @@ const Entry = struct {
     cancel: std.atomic.Value(bool) = .init(false),
     force_cancel: std.atomic.Value(bool) = .init(false),
     start_gate: std.Io.Event = .unset,
+    join_mutex: std.Io.Mutex = .init,
     thread: ?std.Thread = null,
     published_running: bool = false,
     tombstone_sequence: std.atomic.Value(u32) = .init(0),
@@ -497,7 +498,7 @@ pub const Runtime = struct {
     next_reservation_id: u64 = 1,
     next_generated_id: u64 = 1,
     next_tombstone_sequence: std.atomic.Value(u32) = .init(1),
-    shutting_down: bool = false,
+    shutting_down: std.atomic.Value(bool) = .init(false),
     replay_store: command_replay_store.EphemeralStore,
     pending_admissions: usize = 0,
 
@@ -612,7 +613,7 @@ pub const Runtime = struct {
     ) !PreparedSnapshot {
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);
-        if (self.shutting_down) {
+        if (self.shutting_down.load(.acquire)) {
             self.mutex.unlock(zio);
             return error.RuntimeStopping;
         }
@@ -657,7 +658,7 @@ pub const Runtime = struct {
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);
         defer self.mutex.unlock(zio);
-        if (self.shutting_down) return error.RuntimeStopping;
+        if (self.shutting_down.load(.acquire)) return error.RuntimeStopping;
         if (contract.decideAdmission(
             self.liveCountLocked() + self.pending_admissions,
         ) == .capacity_exhausted) {
@@ -913,7 +914,7 @@ pub const Runtime = struct {
             const next = contract.transition(entry.state, entry.barrier, .stop_requested);
             entry.state = next.state;
             entry.barrier = next.barrier;
-            entry.force_cancel.store(force, .seq_cst);
+            if (force) entry.force_cancel.store(true, .seq_cst);
             entry.cancel.store(true, .seq_cst);
             if (entry.active_waiter) |waiter_id| {
                 entry.preempted_waiter = waiter_id;
@@ -1064,30 +1065,40 @@ pub const Runtime = struct {
         return self.cancelEntryDelivery(entry, reservation_id);
     }
 
+    pub fn requestShutdown(self: *Runtime) void {
+        self.shutting_down.store(true, .release);
+        if (!self.mutex.tryLock()) return;
+        defer self.mutex.unlock(io_mod.getIo());
+        self.requestShutdownLocked();
+    }
+
+    fn requestShutdownLocked(self: *Runtime) void {
+        for (self.entries) |candidate| {
+            const entry = candidate orelse continue;
+            entry.force_cancel.store(true, .seq_cst);
+            entry.cancel.store(true, .seq_cst);
+            entry.start_gate.set(io_mod.getIo());
+        }
+    }
+
     pub fn shutdown(self: *Runtime) void {
+        self.requestShutdown();
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);
-        if (self.shutting_down) {
-            self.mutex.unlock(zio);
-            return;
-        }
-        self.shutting_down = true;
-        var live: [contract.max_live_entries]*Entry = undefined;
+        self.requestShutdownLocked();
+        var live: [max_entries]*Entry = undefined;
         var live_len: usize = 0;
         for (self.entries) |candidate| {
             const entry = candidate orelse continue;
-            entry.mutex.lockUncancelable(zio);
-            if (!entry.isTerminal()) {
-                entry.force_cancel.store(true, .seq_cst);
-                entry.cancel.store(true, .seq_cst);
-                entry.start_gate.set(zio);
-                live[live_len] = entry;
-                live_len += 1;
-            }
-            entry.mutex.unlock(zio);
+            entry.active_operations += 1;
+            live[live_len] = entry;
+            live_len += 1;
         }
         self.mutex.unlock(zio);
-        for (live[0..live_len]) |entry| self.joinEntry(entry);
+        for (live[0..live_len]) |entry| {
+            self.joinEntry(entry);
+            self.releaseEntry(entry);
+        }
     }
 
     const AdmissionResult = struct {
@@ -1099,7 +1110,7 @@ pub const Runtime = struct {
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);
         defer self.mutex.unlock(zio);
-        if (self.shutting_down) return error.RuntimeStopping;
+        if (self.shutting_down.load(.acquire)) return error.RuntimeStopping;
         if (self.findEntryLocked(input.execution_id)) |existing| {
             if (!existing.matchesCapturedInput(input)) {
                 return error.ExecutionIdentityConflict;
@@ -1333,6 +1344,9 @@ pub const Runtime = struct {
     }
 
     fn joinEntry(_: *Runtime, entry: *Entry) void {
+        const zio = io_mod.getIo();
+        entry.join_mutex.lockUncancelable(zio);
+        defer entry.join_mutex.unlock(zio);
         if (entry.thread) |thread| {
             thread.join();
             entry.thread = null;
@@ -1700,6 +1714,48 @@ test "captured stop returns lost when its worker cannot settle" {
     try std.testing.expect(settled_before_release);
     try std.testing.expect(stop_lost.load(.seq_cst));
     try std.testing.expect(!stop_failed.load(.seq_cst));
+}
+
+test "cooperative stop cannot downgrade an authoritative shutdown request" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    const Gate = struct {
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+
+        fn onChunk(raw: *anyopaque, _: ?types.ToolLifecycleId, _: command_contract.CommandOutputStream, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.entered.set(io_mod.getIo());
+            self.release.waitUncancelable(io_mod.getIo());
+        }
+    };
+    var gate: Gate = .{};
+    defer gate.release.set(io_mod.getIo());
+    var input = StartCapturedInput{
+        .execution_id = "shutdown-stop-race",
+        .command = "printf 'READY\\n'; sleep 30",
+        .cwd = "/tmp",
+        .environment = .{ .clean = "/bin/bash" },
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = null,
+        .command_artifact_dir = null,
+        .yield_time_ms = 0,
+        .output_chunk_ctx = &gate,
+        .on_output_chunk = Gate.onChunk,
+    };
+    input.authority = testAuthority(input);
+    var started = try runtime.startCaptured(alloc, input);
+    defer started.deinit(alloc);
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+    try gate.entered.waitTimeout(io_mod.getIo(), .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    runtime.requestShutdown();
+    var stopped = try runtime.stop_with_ceiling(alloc, input.execution_id, false, 1);
+    defer stopped.deinit(alloc);
+    const entry = runtime.acquireEntry(input.execution_id).?;
+    defer runtime.releaseEntry(entry);
+    try std.testing.expect(entry.force_cancel.load(.acquire));
 }
 
 test "generated captured execution identities do not depend on provider call ids" {

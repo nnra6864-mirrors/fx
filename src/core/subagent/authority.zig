@@ -32,6 +32,7 @@ pub fn admitChildPermission(
 }
 
 pub const Error = error{
+    Cancelled,
     OutOfMemory,
     ChildNotAttached,
     InvalidControlRecord,
@@ -195,12 +196,14 @@ pub const Resolver = struct {
     root_id: []const u8 = "",
     host: HostResolver,
     child_store_options: session_child_store.Options = .{},
+    cancel_flag: ?*const std.atomic.Value(bool) = null,
 
     pub fn resolve(
         self: *Resolver,
         alloc: Allocator,
         child_id: []const u8,
     ) Error!Snapshot {
+        if (self.cancel_flag) |flag| if (flag.load(.acquire)) return error.Cancelled;
         domain.validateId(child_id) catch return error.ChildNotAttached;
         domain.validateId(self.root_id) catch return error.ChildNotAttached;
         var store = child_state.Store{
@@ -208,7 +211,8 @@ pub const Resolver = struct {
             .parent_id = self.root_id,
             .options = self.child_store_options,
         };
-        var lock = store.acquireLock(alloc) catch |err| return switch (err) {
+        var lock = store.acquireLock(alloc, self.cancel_flag) catch |err| return switch (err) {
+            error.Cancelled => error.Cancelled,
             error.OutOfMemory => error.OutOfMemory,
             else => error.StoreUnavailable,
         };
@@ -223,6 +227,7 @@ pub const Resolver = struct {
             active.permission_mode
         else
             return error.ChildNotAttached;
+        if (self.cancel_flag) |flag| if (flag.load(.acquire)) return error.Cancelled;
         var host = try self.host.resolve(alloc, self.root_id);
         defer host.deinit(alloc);
 

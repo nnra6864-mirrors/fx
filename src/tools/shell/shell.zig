@@ -557,6 +557,10 @@ fn callTtyRun(
         .lifetime = .session,
     }) catch |err| return runtimeFailure(ctx, err);
     defer persistence.deinit();
+    var start_persistence = persistence.view();
+    start_persistence.exit_proof = terminal_store.prepareSessionExitProof(ctx.allocator, owner) catch |err|
+        return runtimeFailure(ctx, err);
+    defer std.crypto.secureZero(u8, @volatileCast(&start_persistence.exit_proof.?.bytes));
     const request = terminal_contracts.ActionRequest{ .start = .{
         .cwd = cwd,
         .command = command,
@@ -565,7 +569,7 @@ fn callTtyRun(
         .return_when = if (input.yield_time_ms == 0) .started else .exit,
         .wait_ceiling_ms = @max(@as(u64, 1), input.yield_time_ms),
         .timeout_ms = input.timeout_ms,
-        .persistence = persistence.view(),
+        .persistence = start_persistence,
     } };
     var executed = executeTerminal(ctx, request) catch |err|
         return runtimeFailure(ctx, err);
@@ -607,7 +611,6 @@ fn callTtyRun(
     capacity_reserved = false;
     session_owned = false;
     defer prepared.deinit(ctx.allocator);
-    _ = owner;
     return finishPrepared(ctx, runtime, &prepared, .command);
 }
 
@@ -907,7 +910,7 @@ fn executeAuthorizedTerminal(
             owned.authority = authority.view();
             break :blk owned;
         } },
-        .start, .inspect, .list, .resize => return error.InvalidTerminalRequest,
+        .start, .inspect, .list, .resize, .close_owner => return error.InvalidTerminalRequest,
     };
     return executeTerminal(ctx, authorized);
 }

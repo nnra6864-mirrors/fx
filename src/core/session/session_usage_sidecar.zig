@@ -557,17 +557,17 @@ test "missing and corrupt usage sidecars retain canonical usage with one fixed g
 
 test "torn exact settlement republishes stale backlog without reapplying totals" {
     const Checkpoint = struct {
-        fn persist(_: *anyopaque, _: session_usage.Snapshot) !void {}
+        fn persist(_: *anyopaque, _: session_usage.Snapshot, _: ?*const std.atomic.Value(bool)) !void {}
     };
     const RejectPublication = struct {
-        fn publish(_: *anyopaque, event: session_usage.usage_report.ProfileEvent) !void {
+        fn publish(_: *anyopaque, event: session_usage.usage_report.ProfileEvent, _: ?*const std.atomic.Value(bool)) !void {
             if (event == .generation) return error.InjectedPublicationFailure;
         }
     };
     const PublicationProbe = struct {
         generations: usize = 0,
 
-        fn publish(raw: *anyopaque, event: session_usage.usage_report.ProfileEvent) !void {
+        fn publish(raw: *anyopaque, event: session_usage.usage_report.ProfileEvent, _: ?*const std.atomic.Value(bool)) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (event == .generation) self.generations += 1;
         }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const session_layout = @import("../session/session_layout.zig");
 const types = @import("../shared/types.zig");
+const read_cancellation = @import("../shared/read_cancellation.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -28,12 +29,14 @@ pub const protocol_capability_screen_checkpoints: u64 = 1 << 1;
 pub const protocol_capability_tmux_recovery: u64 = 1 << 2;
 pub const protocol_capability_path_outside_workspace_error: u64 = 1 << 3;
 pub const protocol_capability_complete_process_tree_signals: u64 = 1 << 4;
+pub const protocol_capability_owner_exit: u64 = 1 << 5;
 pub const known_protocol_capabilities: u64 =
     protocol_capability_authority_generations |
     protocol_capability_screen_checkpoints |
     protocol_capability_tmux_recovery |
     protocol_capability_path_outside_workspace_error |
-    protocol_capability_complete_process_tree_signals;
+    protocol_capability_complete_process_tree_signals |
+    protocol_capability_owner_exit;
 
 pub const Action = enum {
     start,
@@ -46,6 +49,7 @@ pub const Action = enum {
     resize,
     signal,
     close,
+    close_owner,
 };
 
 pub const Lifecycle = enum {
@@ -311,12 +315,43 @@ pub const StartRequest = struct {
     timeout_ms: ?u64 = null,
     dimensions: ?Dimensions = null,
     persistence: ?StartPersistence = null,
+    process_owner: ?ProcessOwner = null,
+
+    pub fn jsonStringify(self: StartRequest, writer: anytype) !void {
+        try writer.write(.{
+            .cwd = self.cwd,
+            .command = self.command,
+            .shell = self.shell,
+            .backend = self.backend,
+            .return_when = self.return_when,
+            .wait_ceiling_ms = self.wait_ceiling_ms,
+            .timeout_ms = self.timeout_ms,
+            .dimensions = self.dimensions,
+            .persistence = self.persistence,
+        });
+    }
 };
 
 pub const StartPersistence = struct {
     grant: AuthorityGrant,
     proof: HolderProof,
     direct_human_model_read_only: bool = false,
+    exit_proof: ?HolderProof = null,
+
+    pub fn jsonStringify(self: StartPersistence, writer: anytype) !void {
+        try writer.beginObject();
+        try writer.objectField("grant");
+        try writer.write(self.grant);
+        try writer.objectField("proof");
+        try writer.write(self.proof);
+        try writer.objectField("direct_human_model_read_only");
+        try writer.write(self.direct_human_model_read_only);
+        if (self.exit_proof) |proof| {
+            try writer.objectField("exit_proof");
+            try writer.write(proof);
+        }
+        try writer.endObject();
+    }
 
     pub fn validate(self: StartPersistence, request: StartRequest) error{
         InvalidPrincipal,
@@ -328,6 +363,7 @@ pub const StartPersistence = struct {
     }!void {
         try self.grant.validate();
         try self.proof.validate();
+        if (self.exit_proof) |proof| try proof.validate();
         if (!std.mem.eql(u8, self.grant.principal.cwd, request.cwd) or
             self.grant.principal.backend != request.backend)
         {
@@ -414,6 +450,26 @@ pub const CloseRequest = struct {
     authority: ?AuthorityClaim = null,
 };
 
+pub const SessionExitAuthority = struct {
+    session_id: []const u8,
+    proof: HolderProof,
+
+    pub fn validate(self: SessionExitAuthority) error{ InvalidSessionId, InvalidHolderProof }!void {
+        try validate_session_id(self.session_id);
+        try self.proof.validate();
+    }
+};
+
+/// Internal lifecycle request. Process ownership is stamped by the host.
+pub const CloseOwnerRequest = struct {
+    authority: SessionExitAuthority,
+    process_owner: ?ProcessOwner = null,
+
+    pub fn jsonStringify(self: CloseOwnerRequest, writer: anytype) !void {
+        try writer.write(.{ .authority = self.authority });
+    }
+};
+
 pub const RequestValidationError = error{
     InvalidCommand,
     InvalidCwd,
@@ -447,6 +503,7 @@ pub const ActionRequest = union(enum) {
     resize: ResizeRequest,
     signal: SignalRequest,
     close: CloseRequest,
+    close_owner: CloseOwnerRequest,
 
     pub fn action(self: ActionRequest) Action {
         return switch (self) {
@@ -460,6 +517,7 @@ pub const ActionRequest = union(enum) {
             .resize => .resize,
             .signal => .signal,
             .close => .close,
+            .close_owner => .close_owner,
         };
     }
 
@@ -498,6 +556,7 @@ pub const ActionRequest = union(enum) {
                 if (request.persistence) |persistence| {
                     try persistence.validate(request);
                 }
+                if (request.process_owner) |owner| owner.validate() catch return error.InvalidAuthorityClaim;
             },
             .read => |request| {
                 try validate_session_id(request.session_id);
@@ -545,6 +604,10 @@ pub const ActionRequest = union(enum) {
                 try validate_session_id(request.session_id);
                 try validate_optional_authority_claim(request.authority);
             },
+            .close_owner => |request| {
+                try request.authority.validate();
+                if (request.process_owner) |owner| owner.validate() catch return error.InvalidAuthorityClaim;
+            },
         }
     }
 };
@@ -554,6 +617,9 @@ pub fn required_capabilities(request: ActionRequest) u64 {
     switch (request) {
         .start => |start| {
             required |= protocol_capability_complete_process_tree_signals;
+            if (start.persistence) |persistence| {
+                if (persistence.exit_proof != null) required |= protocol_capability_owner_exit;
+            }
             if (start.backend == .tmux) {
                 required |= protocol_capability_tmux_recovery;
             }
@@ -566,6 +632,7 @@ pub fn required_capabilities(request: ActionRequest) u64 {
                 required |= protocol_capability_complete_process_tree_signals;
             }
         },
+        .close_owner => required |= protocol_capability_owner_exit | protocol_capability_complete_process_tree_signals,
         .read,
         .screen,
         .write,
@@ -687,6 +754,13 @@ fn clone_action_request(alloc: Allocator, request: ActionRequest) Allocator.Erro
                 .authority = parts.authority,
             } };
         },
+        .close_owner => |value| .{ .close_owner = .{
+            .authority = .{
+                .session_id = try alloc.dupe(u8, value.authority.session_id),
+                .proof = value.authority.proof,
+            },
+            .process_owner = value.process_owner,
+        } },
     };
 }
 
@@ -737,6 +811,7 @@ fn clone_start_request(alloc: Allocator, request: StartRequest) Allocator.Error!
             .grant = try clone_authority_grant(alloc, value.grant),
             .proof = value.proof,
             .direct_human_model_read_only = value.direct_human_model_read_only,
+            .exit_proof = value.exit_proof,
         }
     else
         null;
@@ -750,6 +825,7 @@ fn clone_start_request(alloc: Allocator, request: StartRequest) Allocator.Error!
         .timeout_ms = request.timeout_ms,
         .dimensions = request.dimensions,
         .persistence = persistence,
+        .process_owner = request.process_owner,
     };
 }
 
@@ -977,7 +1053,7 @@ fn deinit_list_filters(alloc: Allocator, filters: ListFilters) void {
 
 fn deinit_action_request(alloc: Allocator, request: *ActionRequest) void {
     switch (request.*) {
-        .start => |value| {
+        .start => |*value| {
             alloc.free(value.cwd);
             if (value.command) |command| alloc.free(command);
             deinit_shell_spec(alloc, value.shell);
@@ -986,6 +1062,9 @@ fn deinit_action_request(alloc: Allocator, request: *ActionRequest) void {
             }
             if (value.persistence) |persistence| {
                 deinit_authority_grant(alloc, persistence.grant);
+            }
+            if (value.persistence) |*persistence| {
+                if (persistence.exit_proof) |*proof| std.crypto.secureZero(u8, @volatileCast(&proof.bytes));
             }
         },
         .read => |value| {
@@ -1022,6 +1101,10 @@ fn deinit_action_request(alloc: Allocator, request: *ActionRequest) void {
         .close => |value| {
             alloc.free(value.session_id);
             deinit_optional_authority_claim(alloc, value.authority);
+        },
+        .close_owner => |*value| {
+            alloc.free(value.authority.session_id);
+            std.crypto.secureZero(u8, @volatileCast(&value.authority.proof.bytes));
         },
     }
 }
@@ -1350,11 +1433,20 @@ pub const CheckpointEnvelope = struct {
         CheckpointTooLarge,
         CheckpointChecksumMismatch,
     }!void {
+        return self.validateCancellable(payload, null) catch |err| switch (err) {
+            error.Cancelled => unreachable,
+            error.InvalidCheckpoint => error.InvalidCheckpoint,
+            error.CheckpointTooLarge => error.CheckpointTooLarge,
+            error.CheckpointChecksumMismatch => error.CheckpointChecksumMismatch,
+        };
+    }
+
+    pub fn validateCancellable(self: CheckpointEnvelope, payload: []const u8, cancel_flag: read_cancellation.CancelFlag) error{ InvalidCheckpoint, CheckpointTooLarge, CheckpointChecksumMismatch, Cancelled }!void {
         try self.validate_header();
         const payload_len = std.math.cast(u32, payload.len) orelse
             return error.CheckpointTooLarge;
         if (payload_len != self.payload_len) return error.InvalidCheckpoint;
-        const actual = checkpoint_checksum(payload);
+        const actual = try read_cancellation.sha256(payload, cancel_flag);
         if (!std.mem.eql(u8, &self.checksum, &actual)) {
             return error.CheckpointChecksumMismatch;
         }
@@ -1546,7 +1638,7 @@ pub const AllowedControls = packed struct {
 
     pub fn allows(self: AllowedControls, action: Action) bool {
         return switch (action) {
-            .start => false,
+            .start, .close_owner => false,
             .read => self.read,
             .screen => self.screen,
             .write => self.write,
@@ -2182,6 +2274,10 @@ pub const CloseResult = struct {
     policy: ClosePolicy,
 };
 
+pub const CloseOwnerResult = struct {
+    closed_sessions: u16,
+};
+
 pub const ResultValidationError = error{
     InvalidResult,
     InvalidSessionId,
@@ -2210,6 +2306,7 @@ pub const ActionResult = union(enum) {
     resize: ResizeResult,
     signal: SignalResult,
     close: CloseResult,
+    close_owner: CloseOwnerResult,
 
     pub fn action(self: ActionResult) Action {
         return switch (self) {
@@ -2223,6 +2320,7 @@ pub const ActionResult = union(enum) {
             .resize => .resize,
             .signal => .signal,
             .close => .close,
+            .close_owner => .close_owner,
         };
     }
 
@@ -2286,6 +2384,7 @@ pub const ActionResult = union(enum) {
             },
             .signal => |value| try value.session.validate(),
             .close => |value| try value.session.validate(),
+            .close_owner => {},
         }
     }
 };
@@ -2325,6 +2424,7 @@ pub const OwnedSuccessResult = union(enum) {
     resize: ResizeResult,
     signal: SignalResult,
     close: CloseResult,
+    close_owner: CloseOwnerResult,
 
     fn view(self: *const OwnedSuccessResult) ActionResult {
         return switch (self.*) {
@@ -2341,6 +2441,7 @@ pub const OwnedSuccessResult = union(enum) {
             .resize => |value| .{ .resize = value },
             .signal => |value| .{ .signal = value },
             .close => |value| .{ .close = value },
+            .close_owner => |value| .{ .close_owner = value },
         };
     }
 };
@@ -2444,6 +2545,7 @@ fn clone_success_result(
             .session = try clone_session_facts(alloc, value.session),
             .policy = value.policy,
         } },
+        .close_owner => |value| .{ .close_owner = value },
     };
 }
 
@@ -2528,6 +2630,7 @@ fn deinit_success_result(alloc: Allocator, result: *OwnedSuccessResult) void {
         .resize => |value| deinit_session_facts(alloc, value.session),
         .signal => |value| deinit_session_facts(alloc, value.session),
         .close => |value| deinit_session_facts(alloc, value.session),
+        .close_owner => {},
     }
     result.* = undefined;
 }
@@ -2579,6 +2682,7 @@ test "action requests own every accepted action input" {
             .session_id = "terminal-1",
             .policy = .graceful,
         } },
+        .{ .close_owner = .{ .authority = .{ .session_id = "session-1", .proof = test_proof() } } },
     };
 
     for (requests, std.meta.tags(Action)) |request, action| {
@@ -3195,6 +3299,7 @@ test "results own every action-specific success and structured failure" {
             .session = test_session_facts(),
             .policy = .graceful,
         } },
+        .{ .close_owner = .{ .closed_sessions = 2 } },
     };
 
     for (successes, std.meta.tags(Action)) |success, action| {
@@ -3348,6 +3453,93 @@ fn test_principal() Principal {
 
 fn test_proof() HolderProof {
     return .{ .bytes = [_]u8{1} ** 32 };
+}
+
+test "owner exit validates saved session identity and nonzero proof without model controls" {
+    const authority = SessionExitAuthority{ .session_id = "session-1", .proof = test_proof() };
+    try authority.validate();
+    for ([_][]const u8{ "", "../other", "session/other" }) |id| {
+        try std.testing.expectError(error.InvalidSessionId, (SessionExitAuthority{ .session_id = id, .proof = authority.proof }).validate());
+    }
+    try std.testing.expectError(error.InvalidHolderProof, (SessionExitAuthority{ .session_id = authority.session_id, .proof = .{ .bytes = @splat(0) } }).validate());
+    try std.testing.expect(!(AllowedControls.full()).allows(.close_owner));
+    try std.testing.expectEqual(@as(u8, 9), @intFromEnum(Action.close));
+    try std.testing.expectEqual(@as(u8, 10), @intFromEnum(Action.close_owner));
+}
+
+test "owner exit capability is required only by opted in starts and owner close" {
+    var request: ActionRequest = .{ .start = .{ .cwd = "/workspace/src", .persistence = .{
+        .grant = .{ .principal = test_principal(), .actor = .agent, .controls = .full(), .generation = .{ .value = 1 } },
+        .proof = test_proof(),
+    } } };
+    const legacy = required_capabilities(request);
+    try std.testing.expectEqual(@as(u64, 0), legacy & protocol_capability_owner_exit);
+    request.start.persistence.?.exit_proof = test_proof();
+    try std.testing.expectEqual(legacy | protocol_capability_owner_exit, required_capabilities(request));
+    try request.validate();
+    request.start.persistence.?.exit_proof = .{ .bytes = @splat(0) };
+    try std.testing.expectError(error.InvalidHolderProof, request.validate());
+    const close: ActionRequest = .{ .close_owner = .{ .authority = .{ .session_id = "session-1", .proof = test_proof() } } };
+    try std.testing.expectEqual(protocol_capability_authority_generations | protocol_capability_owner_exit | protocol_capability_complete_process_tree_signals, required_capabilities(close));
+    const negotiation = try negotiate_protocol(.{
+        .range = local_protocol_range,
+        .capabilities = known_protocol_capabilities,
+        .required_capabilities = required_capabilities(close),
+    }, .{ .range = local_protocol_range, .capabilities = known_protocol_capabilities & ~protocol_capability_owner_exit });
+    try std.testing.expectEqual(protocol_capability_owner_exit, negotiation.incompatible.missing_capabilities);
+}
+
+test "owner exit request copies retain proof and authenticated owner through allocation failures" {
+    const Probe = struct {
+        fn run(alloc: Allocator) !void {
+            const owner = try ProcessOwner.init(42, "verified-instance");
+            const id = "session-1";
+            var close = try OwnedActionRequest.init(alloc, .{ .close_owner = .{
+                .authority = .{ .session_id = id, .proof = test_proof() },
+                .process_owner = owner,
+            } });
+            defer close.deinit(alloc);
+            try std.testing.expect(close.value.close_owner.authority.session_id.ptr != id.ptr);
+            try std.testing.expectEqual(test_proof(), close.value.close_owner.authority.proof);
+            try std.testing.expectEqual(owner, close.value.close_owner.process_owner.?);
+            var start = try OwnedActionRequest.init(alloc, .{ .start = .{
+                .cwd = "/workspace/src",
+                .process_owner = owner,
+                .persistence = .{
+                    .grant = .{ .principal = test_principal(), .actor = .agent, .controls = .full(), .generation = .{ .value = 1 } },
+                    .proof = test_proof(),
+                    .exit_proof = .{ .bytes = @splat(7) },
+                },
+            } });
+            defer start.deinit(alloc);
+            try std.testing.expectEqual(HolderProof{ .bytes = @splat(7) }, start.value.start.persistence.?.exit_proof.?);
+            try std.testing.expectEqual(owner, start.value.start.process_owner.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+test "legacy starts omit exit proof and every start omits host process ownership on the wire" {
+    var request: StartRequest = .{
+        .cwd = "/workspace/src",
+        .process_owner = try ProcessOwner.init(42, "verified-instance"),
+        .persistence = .{
+            .grant = .{ .principal = test_principal(), .actor = .agent, .controls = .full(), .generation = .{ .value = 1 } },
+            .proof = test_proof(),
+        },
+    };
+    for ([_]?HolderProof{ null, test_proof() }) |proof| {
+        request.persistence.?.exit_proof = proof;
+        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+        try std.json.Stringify.value(request, .{}, &output.writer);
+        try std.testing.expect(std.mem.find(u8, output.written(), "process_owner") == null);
+        try std.testing.expectEqual(proof != null, std.mem.find(u8, output.written(), "exit_proof") != null);
+        var parsed = try std.json.parseFromSlice(StartRequest, std.testing.allocator, output.written(), .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.process_owner == null);
+        try std.testing.expectEqual(proof, parsed.value.persistence.?.exit_proof);
+    }
 }
 
 test "authority wire encoding excludes host-authenticated process ownership" {

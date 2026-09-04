@@ -2,12 +2,12 @@ const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const helpers = @import("upgrade_helpers.zig");
 const update_target = @import("update_target.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 
 const check_interval_ms: u64 = 30 * 60 * 1000;
 const initial_delay_ms: u64 = 10_000;
-const sleep_increment_ms: u64 = 50;
 
 pub const State = enum(u8) {
     idle = 0,
@@ -49,7 +49,7 @@ pub const AutoUpgrade = struct {
     state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(State.idle)),
     should_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     render_dirty: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    thread: ?std.Thread = null,
+    thread: ?std.Io.Future(void) = null,
 
     version_mutex: std.Io.Mutex = .init,
     latest_version_buf: [64]u8 = undefined,
@@ -75,13 +75,13 @@ pub const AutoUpgrade = struct {
         current: update_target.CurrentBuild,
     ) void {
         self.setPreviousRevision(current.revision);
-        self.thread = std.Thread.spawn(.{}, runLoop, .{ self, alloc, current }) catch return;
+        self.thread = std.Io.concurrent(io_mod.getIo(), runLoop, .{ self, alloc, current }) catch return;
     }
 
     pub fn stop(self: *AutoUpgrade) void {
         self.should_stop.store(true, .release);
-        if (self.thread) |t| {
-            t.join();
+        if (self.thread) |*t| {
+            t.cancel(io_mod.getIo());
             self.thread = null;
         }
     }
@@ -179,7 +179,7 @@ pub const AutoUpgrade = struct {
         alloc: Allocator,
         current: update_target.CurrentBuild,
     ) void {
-        self.sleepInterruptible(initial_delay_ms);
+        io_mod.getIo().sleep(.fromMilliseconds(initial_delay_ms), .awake) catch return;
 
         while (!self.should_stop.load(.acquire)) {
             if (self.getState() == .ready) return;
@@ -190,7 +190,8 @@ pub const AutoUpgrade = struct {
             if (post_state == .ready) return;
 
             if (post_state != .failed) self.setState(.waiting);
-            self.sleepInterruptible(check_interval_ms);
+            if (self.should_stop.load(.acquire)) return;
+            io_mod.getIo().sleep(.fromMilliseconds(check_interval_ms), .awake) catch return;
         }
     }
 
@@ -242,7 +243,7 @@ pub const AutoUpgrade = struct {
         const rand_hex = std.fmt.bytesToHex(rand_buf, .lower);
         const tmp_dir = std.fmt.allocPrint(alloc, "{s}/fx-auto-upgrade-{s}", .{ tmp_base, rand_hex }) catch return error.AllocFailed;
         defer alloc.free(tmp_dir);
-        defer std.Io.Dir.cwd().deleteTree(io_mod.getIo(), tmp_dir) catch {};
+        defer self.cleanupTemporary(tmp_dir);
 
         std.Io.Dir.createDirAbsolute(io_mod.getIo(), tmp_dir, .default_dir) catch return error.ExtractionFailed;
 
@@ -275,13 +276,12 @@ pub const AutoUpgrade = struct {
         io_mod.copyFileAtomic(alloc, extracted_bin, self_exe) catch return error.InstallFailed;
     }
 
-    fn sleepInterruptible(self: *AutoUpgrade, total_ms: u64) void {
-        var remaining = total_ms;
-        while (remaining > 0 and !self.should_stop.load(.acquire)) {
-            const chunk = @min(remaining, sleep_increment_ms);
-            io_mod.sleep(chunk * @as(u64, std.time.ns_per_ms));
-            remaining -|= chunk;
+    fn cleanupTemporary(self: *const AutoUpgrade, path: []const u8) void {
+        if (self.should_stop.load(.acquire)) {
+            debug_trace.logf("upgrade", "temporary extraction cleanup deferred reason=shutdown path={s}", .{path});
+            return;
         }
+        std.Io.Dir.cwd().deleteTree(io_mod.getIo(), path) catch {};
     }
 };
 
@@ -290,6 +290,127 @@ test "statusLabel idle returns empty" {
     var buf: [64]u8 = undefined;
     const label = au.statusLabel(&buf);
     try std.testing.expectEqual(@as(usize, 0), label.len);
+}
+
+test "upgrade stop cancels a download after the response body begins" {
+    try testUpgradeStop(false, false);
+}
+
+test "upgrade stop leaves temporary cleanup out of accepted exit" {
+    try testUpgradeStop(true, false);
+}
+
+test "upgrade stop interrupts checksum after actual artifact reads" {
+    if (comptime @import("builtin").os.tag != .macos) return error.SkipZigTest;
+    try testUpgradeStop(false, true);
+}
+
+fn testUpgradeStop(with_cleanup: bool, checksum: bool) !void {
+    const Fixture = struct {
+        server: std.Io.net.Server,
+        path: []const u8,
+        cleanup_path: ?[]const u8 = null,
+        upgrader: *AutoUpgrade,
+        checksum: bool,
+        arrived: std.atomic.Value(bool) = .init(false),
+        stop: std.atomic.Value(bool) = .init(false),
+
+        fn serve(self: *@This()) void {
+            const io = io_mod.getIo();
+            const stream = self.server.accept(io) catch return;
+            defer stream.close(io);
+            var buf: [4096]u8 = undefined;
+            var reader = stream.reader(io, &buf);
+            var last: [4]u8 = @splat(0);
+            for (0..4096) |_| {
+                const byte = reader.interface.takeByte() catch return;
+                last = .{ last[1], last[2], last[3], byte };
+                if (std.mem.eql(u8, &last, "\r\n\r\n")) break;
+            }
+            var writer = stream.writer(io, &.{});
+            writer.interface.writeAll(if (self.checksum)
+                "HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\n" ++ "0" ** 64
+            else
+                "HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\npartial") catch return;
+            self.arrived.store(true, .release);
+            if (self.checksum) return;
+            for (0..100) |_| {
+                if (self.stop.load(.acquire)) return;
+                io_mod.sleep(10 * std.time.ns_per_ms);
+            }
+        }
+
+        fn download(self: *@This()) void {
+            defer if (self.cleanup_path) |path| self.upgrader.cleanupTemporary(path);
+            var url_buf: [96]u8 = undefined;
+            const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/archive", .{self.server.socket.address.getPort()}) catch unreachable;
+            var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = io_mod.getIo() };
+            defer client.deinit();
+            if (self.checksum) {
+                helpers.verifyChecksum(&client, self.path, url) catch {};
+            } else {
+                helpers.downloadFileStreaming(&client, url, self.path) catch {};
+            }
+        }
+
+        fn readStarted(path: []const u8) bool {
+            if (comptime @import("builtin").os.tag != .macos) return false;
+            for (0..256) |raw_fd| {
+                const fd: std.posix.fd_t = @intCast(raw_fd);
+                var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                if (std.c.fcntl(fd, 50, &path_buf) != 0) continue;
+                const observed = std.mem.sliceTo(&path_buf, 0);
+                if (std.mem.eql(u8, observed, path) and std.c.lseek(fd, 0, std.posix.SEEK.CUR) > 0) return true;
+            }
+            return false;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "archive" });
+    defer std.testing.allocator.free(path);
+    if (checksum) {
+        const file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{});
+        defer file.close(io_mod.getIo());
+        try file.setLength(io_mod.getIo(), 4 * 1024 * 1024 * 1024);
+    }
+    try tmp.dir.createDir(io_mod.getIo(), "extraction", .default_dir);
+    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = "extraction/sentinel", .data = "download state" });
+    const before = try tmp.dir.statFile(io_mod.getIo(), "extraction/sentinel", .{});
+    const cleanup_path = try std.fs.path.join(std.testing.allocator, &.{ root, "extraction" });
+    defer std.testing.allocator.free(cleanup_path);
+    var au: AutoUpgrade = .{};
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var fixture: Fixture = .{
+        .server = try address.listen(io_mod.getIo(), .{}),
+        .path = path,
+        .cleanup_path = if (with_cleanup) cleanup_path else null,
+        .upgrader = &au,
+        .checksum = checksum,
+    };
+    defer fixture.server.deinit(io_mod.getIo());
+    const server_thread = try std.Thread.spawn(.{}, Fixture.serve, .{&fixture});
+    defer server_thread.join();
+    defer fixture.stop.store(true, .release);
+    au.thread = try std.Io.concurrent(io_mod.getIo(), Fixture.download, .{&fixture});
+    var began = false;
+    for (0..5000) |_| {
+        began = if (checksum) Fixture.readStarted(path) else fixture.arrived.load(.acquire);
+        if (began) break;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    const arrived = fixture.arrived.load(.acquire);
+    const started = io_mod.milliTimestamp();
+    au.stop();
+    try std.testing.expect(arrived);
+    try std.testing.expect(began);
+    try std.testing.expect(io_mod.milliTimestamp() - started < 500);
+    try std.testing.expect(au.thread == null);
+    const after = try tmp.dir.statFile(io_mod.getIo(), "extraction/sentinel", .{});
+    try std.testing.expectEqual(before.mtime, after.mtime);
+    try std.testing.expectEqual(before.size, after.size);
 }
 
 test "selected release channel is owned by the upgrade runtime" {

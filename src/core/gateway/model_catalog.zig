@@ -6,6 +6,7 @@ const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const types = @import("../shared/types.zig");
+const cancellation = @import("../shared/read_cancellation.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -13,6 +14,8 @@ pub const View = enum {
     full,
     picker,
 };
+
+pub const max_response_bytes = 4 * 1024 * 1024;
 
 pub const FetchInput = struct {
     access: credentials.CatalogAccess = .{ .public_only = .no_credential },
@@ -316,18 +319,18 @@ pub fn projectModelIds(alloc: std.mem.Allocator, candidates: []const ModelCatalo
     return ids;
 }
 
-fn appendClonedModelCatalogEntry(alloc: std.mem.Allocator, entries: *std.ArrayList(ModelCatalogEntry), entry: ModelCatalogEntry) !void {
-    const cloned = try cloneModelCatalogEntry(alloc, entry);
+fn appendClonedModelCatalogEntry(alloc: std.mem.Allocator, entries: *std.ArrayList(ModelCatalogEntry), entry: ModelCatalogEntry, cancel_flag: cancellation.CancelFlag) !void {
+    const cloned = try cloneModelCatalogEntry(alloc, entry, cancel_flag);
     entries.append(alloc, cloned) catch |err| {
         freeModelCatalogEntry(alloc, cloned);
         return err;
     };
 }
 
-fn cloneModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry) !ModelCatalogEntry {
-    const id = try alloc.dupe(u8, entry.id);
+fn cloneModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry, cancel_flag: cancellation.CancelFlag) !ModelCatalogEntry {
+    const id = try cancellation.duplicateBytes(alloc, entry.id, cancel_flag);
     errdefer alloc.free(id);
-    const model_type = try alloc.dupe(u8, entry.model_type);
+    const model_type = try cancellation.duplicateBytes(alloc, entry.model_type, cancel_flag);
     errdefer alloc.free(model_type);
     var reasoning_efforts: std.ArrayList(types.ReasoningEffort) = .empty;
     errdefer reasoning_efforts.deinit(alloc);
@@ -351,7 +354,7 @@ fn cloneModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry) !M
         .web_search_price = null,
     };
     if (entry.web_search_price) |price| {
-        cloned.web_search_price = try alloc.dupe(u8, price);
+        cloned.web_search_price = try cancellation.duplicateBytes(alloc, price, cancel_flag);
     }
     return cloned;
 }
@@ -421,67 +424,73 @@ const featured_picker_families = [_]FeaturedPickerFamily{
     .{ .family = "minimax/minimax", .count = 1 },
 };
 
-pub fn projectPickerModelCatalog(alloc: std.mem.Allocator, candidates: []const ModelCatalogEntry) !std.ArrayList(ModelCatalogEntry) {
+pub fn projectPickerModelCatalog(alloc: std.mem.Allocator, candidates: []const ModelCatalogEntry, cancel_flag: cancellation.CancelFlag) !std.ArrayList(ModelCatalogEntry) {
+    try cancellation.check(cancel_flag);
     var selected: std.ArrayList(ModelCatalogEntry) = .empty;
     errdefer freeModelCatalog(alloc, &selected);
     try selected.ensureTotalCapacity(alloc, candidates.len);
 
     for (featured_picker_families) |featured| {
+        try cancellation.check(cancel_flag);
         var remaining = featured.count;
         while (remaining > 0) : (remaining -= 1) {
-            const candidate = newestUnselectedPickerCandidate(candidates, featured.family, selected.items) orelse break;
-            try appendClonedModelCatalogEntry(alloc, &selected, candidate.*);
+            const candidate = (try newestUnselectedPickerCandidate(candidates, featured.family, selected.items, cancel_flag)) orelse break;
+            try appendClonedModelCatalogEntry(alloc, &selected, candidate.*, cancel_flag);
         }
     }
 
     var providers: std.ArrayList([]const u8) = .empty;
     defer providers.deinit(alloc);
     for (candidates) |candidate| {
+        try cancellation.check(cancel_flag);
         if (!isPickerCandidate(candidate)) continue;
         const provider = modelPickerProvider(candidate.id);
-        if (pickerIdsContain(providers.items, provider)) continue;
+        if (try pickerIdsContain(providers.items, provider, cancel_flag)) continue;
         try providers.append(alloc, provider);
     }
-    sort_utils.sort([]const u8, providers.items, {}, lessThanStrings);
+    try sort_utils.sortInterruptible([]const u8, providers.items, {}, lessThanStrings, cancel_flag);
 
     // After the product highlights, scan providers alphabetically. Each
     // provider contributes its current models, rather than inheriting the
     // Gateway's global quality ranking.
     for (providers.items) |provider| {
-        while (pickerProviderSelectionCount(selected.items, provider) < pickerProviderLimit(provider)) {
-            const candidate = newestUnselectedPickerProviderCandidate(candidates, provider, selected.items) orelse break;
-            try appendClonedModelCatalogEntry(alloc, &selected, candidate.*);
+        while ((try pickerProviderSelectionCount(selected.items, provider, cancel_flag)) < pickerProviderLimit(provider)) {
+            const candidate = (try newestUnselectedPickerProviderCandidate(candidates, provider, selected.items, cancel_flag)) orelse break;
+            try appendClonedModelCatalogEntry(alloc, &selected, candidate.*, cancel_flag);
         }
     }
 
     // Highlights stay on top; the rest of the catalog follows so any model is selectable.
     for (candidates) |candidate| {
-        if (pickerCatalogContains(selected.items, candidate.id)) continue;
-        try appendClonedModelCatalogEntry(alloc, &selected, candidate);
+        try cancellation.check(cancel_flag);
+        if (try pickerCatalogContains(selected.items, candidate.id, cancel_flag)) continue;
+        try appendClonedModelCatalogEntry(alloc, &selected, candidate, cancel_flag);
     }
 
     return selected;
 }
 
-fn newestUnselectedPickerCandidate(candidates: []const ModelCatalogEntry, family: []const u8, selected: []const ModelCatalogEntry) ?*const ModelCatalogEntry {
+fn newestUnselectedPickerCandidate(candidates: []const ModelCatalogEntry, family: []const u8, selected: []const ModelCatalogEntry, cancel_flag: cancellation.CancelFlag) !?*const ModelCatalogEntry {
     var newest: ?*const ModelCatalogEntry = null;
     for (candidates) |*candidate| {
+        try cancellation.check(cancel_flag);
         if (!isPickerCandidate(candidate.*)) continue;
         if (!std.mem.eql(u8, modelPickerFamily(candidate.id), family)) continue;
-        if (pickerCatalogContains(selected, candidate.id)) continue;
+        if (try pickerCatalogContains(selected, candidate.id, cancel_flag)) continue;
 
         if (newest == null or featuredPickerModelIsNewer(family, candidate.*, newest.?.*)) newest = candidate;
     }
     return newest;
 }
 
-fn newestUnselectedPickerProviderCandidate(candidates: []const ModelCatalogEntry, provider: []const u8, selected: []const ModelCatalogEntry) ?*const ModelCatalogEntry {
+fn newestUnselectedPickerProviderCandidate(candidates: []const ModelCatalogEntry, provider: []const u8, selected: []const ModelCatalogEntry, cancel_flag: cancellation.CancelFlag) !?*const ModelCatalogEntry {
     var newest: ?*const ModelCatalogEntry = null;
     for (candidates) |*candidate| {
+        try cancellation.check(cancel_flag);
         if (!isPickerCandidate(candidate.*)) continue;
         if (!std.mem.eql(u8, modelPickerProvider(candidate.id), provider)) continue;
-        if (!isPickerProviderCandidate(provider, candidate.*, candidates)) continue;
-        if (pickerCatalogContains(selected, candidate.id)) continue;
+        if (!try isPickerProviderCandidate(provider, candidate.*, candidates, cancel_flag)) continue;
+        if (try pickerCatalogContains(selected, candidate.id, cancel_flag)) continue;
 
         if (newest == null or pickerModelIsNewer(candidate.*, newest.?.*)) newest = candidate;
     }
@@ -504,12 +513,13 @@ fn isGlmFastVariant(id: []const u8) bool {
         std.mem.endsWith(u8, id, "-fast");
 }
 
-fn isWithinPickerFamilyLimit(candidate: ModelCatalogEntry, candidates: []const ModelCatalogEntry) bool {
+fn isWithinPickerFamilyLimit(candidate: ModelCatalogEntry, candidates: []const ModelCatalogEntry, cancel_flag: cancellation.CancelFlag) !bool {
     if (!isPickerCandidate(candidate)) return false;
 
     const family = modelPickerFamily(candidate.id);
     var newer_count: usize = 0;
     for (candidates) |other| {
+        try cancellation.check(cancel_flag);
         if (!isPickerCandidate(other)) continue;
         if (!std.mem.eql(u8, modelPickerFamily(other.id), family)) continue;
         if (!pickerModelIsNewer(other, candidate)) continue;
@@ -551,24 +561,25 @@ fn pickerProviderLimit(provider: []const u8) usize {
     return picker_provider_limit;
 }
 
-fn pickerProviderSelectionCount(entries: []const ModelCatalogEntry, provider: []const u8) usize {
+fn pickerProviderSelectionCount(entries: []const ModelCatalogEntry, provider: []const u8, cancel_flag: cancellation.CancelFlag) !usize {
     var count: usize = 0;
     for (entries) |entry| {
+        try cancellation.check(cancel_flag);
         if (std.mem.eql(u8, modelPickerProvider(entry.id), provider)) count += 1;
     }
     return count;
 }
 
-fn isPickerProviderCandidate(provider: []const u8, candidate: ModelCatalogEntry, candidates: []const ModelCatalogEntry) bool {
+fn isPickerProviderCandidate(provider: []const u8, candidate: ModelCatalogEntry, candidates: []const ModelCatalogEntry, cancel_flag: cancellation.CancelFlag) !bool {
     const family = modelPickerFamily(candidate.id);
     if (std.mem.eql(u8, provider, "anthropic")) {
         return std.mem.eql(u8, family, "anthropic/claude-opus") and
-            isWithinPickerFamilyLimit(candidate, candidates);
+            (try isWithinPickerFamilyLimit(candidate, candidates, cancel_flag));
     }
     if (std.mem.eql(u8, provider, "openai")) {
         const is_gpt = std.mem.eql(u8, family, "openai/gpt");
         const is_codex = std.mem.eql(u8, family, "openai/gpt-codex");
-        return (is_gpt or is_codex) and isWithinPickerFamilyLimit(candidate, candidates);
+        return (is_gpt or is_codex) and (try isWithinPickerFamilyLimit(candidate, candidates, cancel_flag));
     }
     return true;
 }
@@ -608,15 +619,17 @@ fn lessThanStrings(_: void, a: []const u8, b: []const u8) bool {
     return std.mem.order(u8, a, b) == .lt;
 }
 
-fn pickerIdsContain(ids: []const []const u8, needle: []const u8) bool {
+fn pickerIdsContain(ids: []const []const u8, needle: []const u8, cancel_flag: cancellation.CancelFlag) !bool {
     for (ids) |id| {
+        try cancellation.check(cancel_flag);
         if (std.mem.eql(u8, id, needle)) return true;
     }
     return false;
 }
 
-fn pickerCatalogContains(entries: []const ModelCatalogEntry, needle: []const u8) bool {
+fn pickerCatalogContains(entries: []const ModelCatalogEntry, needle: []const u8, cancel_flag: cancellation.CancelFlag) !bool {
     for (entries) |entry| {
+        try cancellation.check(cancel_flag);
         if (std.mem.eql(u8, entry.id, needle)) return true;
     }
     return false;
@@ -823,7 +836,7 @@ test "picker curation skips fast variants in provider scan but keeps them select
         .{ .id = @constCast("zai/glm-5.1"), .model_type = @constCast("language"), .released = 90, .has_tool_use = true },
     };
 
-    var curated = try projectPickerModelCatalog(std.testing.allocator, &candidates);
+    var curated = try projectPickerModelCatalog(std.testing.allocator, &candidates, null);
     defer freeModelCatalog(std.testing.allocator, &curated);
 
     try std.testing.expectEqual(@as(usize, 3), curated.items.len);
@@ -878,7 +891,7 @@ test "featured deepseek slot prefers the pro variant at equal recency" {
         .{ .id = @constCast("deepseek/deepseek-v4-pro"), .model_type = @constCast("language"), .released = 110, .has_tool_use = true },
     };
 
-    var curated = try projectPickerModelCatalog(std.testing.allocator, &candidates);
+    var curated = try projectPickerModelCatalog(std.testing.allocator, &candidates, null);
     defer freeModelCatalog(std.testing.allocator, &curated);
 
     try std.testing.expectEqual(@as(usize, 3), curated.items.len);

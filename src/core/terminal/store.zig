@@ -12,6 +12,7 @@ const profile_paths = @import("../shared/profile_paths.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
+const read_cancellation = @import("../shared/read_cancellation.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -533,18 +534,21 @@ pub const ProfileStore = struct {
     pub fn register_resident(
         self: *ProfileStore,
         session: *DurableSession,
-    ) Allocator.Error!void {
+        cancel_flag: read_cancellation.CancelFlag,
+    ) (Allocator.Error || error{Cancelled})!void {
         const zio = io_mod.getIo();
-        self.mutex.lockUncancelable(zio);
+        try read_cancellation.lock(zio, &self.mutex, cancel_flag);
         defer self.mutex.unlock(zio);
-        try self.register_resident_locked(session);
+        try self.register_resident_locked(session, cancel_flag);
     }
 
     fn register_resident_locked(
         self: *ProfileStore,
         session: *DurableSession,
-    ) Allocator.Error!void {
+        cancel_flag: read_cancellation.CancelFlag,
+    ) (Allocator.Error || error{Cancelled})!void {
         for (self.residents.items) |resident| {
+            try read_cancellation.check(cancel_flag);
             if (resident == session) return;
             std.debug.assert(!std.mem.eql(
                 u8,
@@ -563,6 +567,17 @@ pub const ProfileStore = struct {
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);
         defer self.mutex.unlock(zio);
+        self.unregister_resident_locked(session);
+    }
+
+    pub fn tryUnregisterResident(self: *ProfileStore, session: *DurableSession) bool {
+        if (!self.mutex.tryLock()) return false;
+        defer self.mutex.unlock(io_mod.getIo());
+        self.unregister_resident_locked(session);
+        return true;
+    }
+
+    fn unregister_resident_locked(self: *ProfileStore, session: *DurableSession) void {
         for (self.residents.items, 0..) |resident, index| {
             if (resident != session) continue;
             _ = self.residents.swapRemove(index);
@@ -588,6 +603,15 @@ pub const ProfileStore = struct {
         owner_session_id: []const u8,
         comptime proof_route: bool,
     ) !session_child_store.SessionChildCapability {
+        return self.open_capability_mode(owner_session_id, proof_route, .writable);
+    }
+
+    fn open_capability_mode(
+        self: *ProfileStore,
+        owner_session_id: []const u8,
+        comptime proof_route: bool,
+        mode: session_child_store.Mode,
+    ) !session_child_store.SessionChildCapability {
         try session_layout.validateSessionId(owner_session_id);
         var owner_dir = self.sessions_dir.dir.openDir(
             io_mod.getIo(),
@@ -609,7 +633,7 @@ pub const ProfileStore = struct {
                 self.alloc,
                 owner_dir,
                 display_path,
-                .writable,
+                mode,
                 .{},
             )
         else
@@ -617,9 +641,33 @@ pub const ProfileStore = struct {
                 self.alloc,
                 owner_dir,
                 display_path,
-                .writable,
+                mode,
                 .{},
             );
+    }
+
+    pub fn authorizeSessionExit(self: *ProfileStore, claim: contracts.SessionExitAuthority) !void {
+        try claim.validate();
+        var owner = try self.open_capability_mode(claim.session_id, true, .read_only);
+        defer owner.deinit();
+        var proof = (try loadSessionExitProof(self.alloc, &owner)) orelse return error.HolderProofNotFound;
+        defer std.crypto.secureZero(u8, @volatileCast(&proof.bytes));
+        if (!std.crypto.timing_safe.eql([32]u8, proof.bytes, claim.proof.bytes)) return error.InvalidHolderProof;
+    }
+
+    pub fn cancelClaim(self: *ProfileStore, terminal_session_id: []const u8, claim: contracts.AuthorityClaim, now_ms: i64) !void {
+        try contracts.validate_session_id(terminal_session_id);
+        try claim.validate();
+        if (!self.mutex.tryLock()) return error.LockBusy;
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.resident_by_id(terminal_session_id)) |resident| {
+            if (!std.mem.eql(u8, resident.record.owner_session_id, claim.principal.durable_session_id)) return error.PrincipalMismatch;
+            return resident.cancel_claim_locked(claim, now_ms);
+        }
+        if (io_mod.getenv("FX_TERMINAL_TEST_FAIL_CANCELLATION_OPEN") != null) return error.InjectedCancellationOpenFailure;
+        var session = try self.open_existing(claim.principal.durable_session_id, terminal_session_id);
+        defer session.deinit();
+        try session.cancel_claim_locked(claim, now_ms);
     }
 
     fn open_existing(
@@ -676,7 +724,7 @@ pub const ProfileStore = struct {
         resident.* = session;
         result = null;
         errdefer resident.deinit();
-        try self.register_resident_locked(resident);
+        try self.register_resident_locked(resident, null);
         return resident;
     }
 
@@ -699,9 +747,10 @@ pub const ProfileStore = struct {
 
         var result = CatalogList{ .alloc = self.alloc };
         errdefer result.deinit();
-        var capability = try self.open_capability(
+        var capability = try self.open_capability_mode(
             claim.principal.durable_session_id,
             false,
+            .read_only,
         );
         defer capability.deinit();
         var names = capability.iterate(self.alloc, .terminal_state) catch |err| switch (err) {
@@ -728,13 +777,6 @@ pub const ProfileStore = struct {
                 claim.principal,
                 authority.value.grant.principal,
             )) continue;
-            _ = try reconcile_takeover_owner_record(
-                self.alloc,
-                self.process_provider,
-                &capability,
-                &record,
-                io_mod.milliTimestamp(),
-            );
             const session_id = try self.alloc.dupe(u8, record.session_id);
             errdefer self.alloc.free(session_id);
             const cwd = try self.alloc.dupe(u8, record.cwd);
@@ -744,8 +786,10 @@ pub const ProfileStore = struct {
                 authority.value.grant.principal.workspace_root,
             );
             errdefer self.alloc.free(workspace_root);
+            var facts = facts_from_record(record, session_id);
+            if (takeover_owner_reclaimable(self.alloc, self.process_provider, record)) facts.attention = .{};
             try result.entries.append(self.alloc, .{
-                .facts = facts_from_record(record, session_id),
+                .facts = facts,
                 .cwd = cwd,
                 .workspace_root = workspace_root,
                 .authorization = catalog_authorization(
@@ -762,25 +806,28 @@ pub const ProfileStore = struct {
         self: *ProfileStore,
         additional: u64,
         active_session_id: []const u8,
+        cancel_flag: read_cancellation.CancelFlag,
     ) !void {
-        try self.retry_pending_cleanups();
+        try self.retry_pending_cleanups(cancel_flag);
         while (true) {
-            var candidates = try self.scan_payload_candidates();
+            try read_cancellation.check(cancel_flag);
+            var candidates = try self.scan_payload_candidates(cancel_flag);
             defer candidates.deinit(self.alloc);
             const required = std.math.add(u64, candidates.total_bytes, additional) catch
                 return error.CapacityExceeded;
             if (required <= self.options.profile_limit) return;
-            const selected = choose_eviction(
+            const selected = try choose_eviction(
                 candidates.items.items,
                 active_session_id,
+                cancel_flag,
             ) orelse
                 return error.CapacityExceeded;
             const candidate = candidates.items.items[selected.index];
             if (self.resident_by_id(candidate.session_id)) |resident| {
                 switch (selected.class) {
-                    .completed_output => try resident.evict_completed_output(),
-                    .completed_checkpoint => try resident.evict_completed_checkpoint(),
-                    .live_covered_journal => try resident.evict_live_covered_journals(),
+                    .completed_output => try resident.evict_completed_output(cancel_flag),
+                    .completed_checkpoint => try resident.evict_completed_checkpoint(cancel_flag),
+                    .live_covered_journal => try resident.evict_live_covered_journals(cancel_flag),
                 }
             } else {
                 var session = try self.open_existing(
@@ -789,24 +836,29 @@ pub const ProfileStore = struct {
                 );
                 defer session.deinit();
                 switch (selected.class) {
-                    .completed_output => try session.evict_completed_output(),
-                    .completed_checkpoint => try session.evict_completed_checkpoint(),
-                    .live_covered_journal => try session.evict_live_covered_journals(),
+                    .completed_output => try session.evict_completed_output(cancel_flag),
+                    .completed_checkpoint => try session.evict_completed_checkpoint(cancel_flag),
+                    .live_covered_journal => try session.evict_live_covered_journals(cancel_flag),
                 }
             }
         }
     }
 
-    fn retry_pending_cleanups(self: *ProfileStore) !void {
+    fn retry_pending_cleanups(self: *ProfileStore, cancel_flag: read_cancellation.CancelFlag) !void {
         var iter = self.sessions_dir.dir.iterate();
         while (try iter.next(io_mod.getIo())) |entry| {
+            try read_cancellation.check(cancel_flag);
             session_layout.validateSessionId(entry.name) catch continue;
             if (entry.kind != .directory) continue;
             var capability = self.open_capability(entry.name, false) catch continue;
             defer capability.deinit();
-            var names = capability.iterate(self.alloc, .terminal_state) catch continue;
+            var names = capability.iterateCancellable(self.alloc, .terminal_state, cancel_flag) catch |err| switch (err) {
+                error.Cancelled => return error.Cancelled,
+                else => continue,
+            };
             defer names.deinit();
             for (names.names) |name| {
+                try read_cancellation.check(cancel_flag);
                 const terminal_id = terminal_id_from_record_name(name) orelse continue;
                 var detached: ?DurableSession = null;
                 const session = self.resident_by_id(terminal_id) orelse blk: {
@@ -814,25 +866,30 @@ pub const ProfileStore = struct {
                     break :blk &detached.?;
                 };
                 defer if (detached) |*value| value.deinit();
-                try session.retry_journal_cleanup();
-                try session.retry_checkpoint_cleanup();
-                try session.retry_event_cleanup_locked();
+                try session.retry_journal_cleanup(cancel_flag);
+                try session.retry_checkpoint_cleanup(cancel_flag);
+                try session.retry_event_cleanup_locked(cancel_flag);
             }
         }
     }
 
-    fn scan_payload_candidates(self: *ProfileStore) !CandidateList {
+    fn scan_payload_candidates(self: *ProfileStore, cancel_flag: read_cancellation.CancelFlag) !CandidateList {
         var list = CandidateList{};
         errdefer list.deinit(self.alloc);
         var iter = self.sessions_dir.dir.iterate();
         while (try iter.next(io_mod.getIo())) |entry| {
+            try read_cancellation.check(cancel_flag);
             session_layout.validateSessionId(entry.name) catch continue;
             if (entry.kind != .directory) continue;
             var capability = self.open_capability(entry.name, false) catch continue;
             defer capability.deinit();
-            var names = capability.iterate(self.alloc, .terminal_state) catch continue;
+            var names = capability.iterateCancellable(self.alloc, .terminal_state, cancel_flag) catch |err| switch (err) {
+                error.Cancelled => return error.Cancelled,
+                else => continue,
+            };
             defer names.deinit();
             for (names.names) |name| {
+                try read_cancellation.check(cancel_flag);
                 if (!is_payload_artifact_name(name)) continue;
                 const stat = capability.stat(.terminal_state, name) catch continue;
                 const payload_bytes = if (std.mem.startsWith(
@@ -850,6 +907,7 @@ pub const ProfileStore = struct {
                 ) catch return error.CapacityExceeded;
             }
             for (names.names) |name| {
+                try read_cancellation.check(cancel_flag);
                 const terminal_id = terminal_id_from_record_name(name) orelse continue;
                 var record = load_record(
                     self.alloc,
@@ -883,6 +941,7 @@ pub const ProfileStore = struct {
                         self.alloc,
                         &capability,
                         record,
+                        cancel_flag,
                     ),
                 });
             }
@@ -1116,7 +1175,7 @@ pub const ProfileStore = struct {
                     .retain_final => {},
                     .isolate_corrupt => unreachable,
                 }
-                session.release_completed_handles();
+                session.release_completed_handles(null);
                 try recovered.sessions.append(self.alloc, session);
                 keep = true;
             }
@@ -1258,6 +1317,14 @@ fn takeover_owner_evidence(
     );
 }
 
+fn takeover_owner_reclaimable(alloc: Allocator, process_provider: process_provider_mod.Provider, record: Record) bool {
+    if (record.attention.write_lease != .human) return false;
+    return switch (takeover_owner_evidence(alloc, process_provider, record)) {
+        .matched, .unavailable => false,
+        .missing, .mismatched => true,
+    };
+}
+
 fn reconcile_takeover_owner_record(
     alloc: Allocator,
     process_provider: process_provider_mod.Provider,
@@ -1265,11 +1332,7 @@ fn reconcile_takeover_owner_record(
     record: *Record,
     now_ms: i64,
 ) !bool {
-    if (record.attention.write_lease != .human) return false;
-    switch (takeover_owner_evidence(alloc, process_provider, record.*)) {
-        .matched, .unavailable => return false,
-        .missing, .mismatched => {},
-    }
+    if (!takeover_owner_reclaimable(alloc, process_provider, record.*)) return false;
 
     const previous_attention = record.attention;
     const previous_owner_pid = record.takeover_owner_pid;
@@ -1348,7 +1411,8 @@ pub const EvictionSelection = struct {
 fn choose_eviction(
     items: []const PayloadCandidate,
     active_session_id: []const u8,
-) ?EvictionSelection {
+    cancel_flag: read_cancellation.CancelFlag,
+) error{Cancelled}!?EvictionSelection {
     const classes = [_]EvictionClass{
         .completed_output,
         .completed_checkpoint,
@@ -1357,6 +1421,7 @@ fn choose_eviction(
     for (classes) |class| {
         var selected: ?usize = null;
         for (items, 0..) |item, index| {
+            try read_cancellation.check(cancel_flag);
             if (std.mem.eql(u8, item.session_id, active_session_id)) continue;
             const eligible = switch (class) {
                 .completed_output => is_completed(item.lifecycle) and
@@ -1543,6 +1608,7 @@ fn covered_live_bytes(
     _: Allocator,
     _: *session_child_store.SessionChildCapability,
     record: Record,
+    cancel_flag: read_cancellation.CancelFlag,
 ) !u64 {
     const checkpoint = switch (record.screen_recovery) {
         .unavailable => return 0,
@@ -1551,6 +1617,7 @@ fn covered_live_bytes(
     if (!is_live(record.lifecycle)) return 0;
     var total: u64 = 0;
     for (record.journal_files) |file| {
+        try read_cancellation.check(cancel_flag);
         if (contracts.compare_raw_cursors(
             file.range.end,
             checkpoint.applied_cursor,
@@ -1954,9 +2021,10 @@ fn verify_owner_catalog_claim(
     claim: contracts.OwnerCatalogAuthorityClaim,
 ) !void {
     try claim.validate();
-    var capability = try profile.open_capability(
+    var capability = try profile.open_capability_mode(
         claim.principal.durable_session_id,
         false,
+        .read_only,
     );
     defer capability.deinit();
     const key = owner_catalog_key(claim.principal, claim.actor);
@@ -2060,6 +2128,7 @@ pub const CreateInput = struct {
     dimensions: contracts.Dimensions,
     persistence: contracts.StartPersistence,
     now_ms: i64,
+    cancel_flag: read_cancellation.CancelFlag = null,
 };
 
 pub const ReadPage = struct {
@@ -2119,6 +2188,46 @@ pub const OwnerCatalogAuthorityReload = struct {
     actor: contracts.ActorRole,
 };
 
+/// Called before a user-authorized hosted job starts. Existing proofs are never
+/// replaced; concurrent first creators may retry after LockBusy.
+pub fn prepareSessionExitProof(alloc: Allocator, owner: *session_child_store.SessionChildCapability) !contracts.HolderProof {
+    var lock = try owner.acquireTimedAdvisoryLock(.terminal_proofs, "owner-exit.lock", 0, null);
+    defer lock.release();
+    if (try loadSessionExitProof(alloc, owner)) |existing| {
+        var proof = existing;
+        defer std.crypto.secureZero(u8, @volatileCast(&proof.bytes));
+        try owner.confirmPublication(.terminal_proofs, "owner-exit");
+        return proof;
+    }
+    var proof: contracts.HolderProof = .{ .bytes = undefined };
+    defer std.crypto.secureZero(u8, @volatileCast(&proof.bytes));
+    try std.Io.randomSecure(io_mod.getIo(), &proof.bytes);
+    try proof.validate();
+    var entry = try owner.atomicReplace(alloc, .terminal_proofs, "owner-exit", &proof.bytes);
+    entry.deinit(alloc);
+    return proof;
+}
+
+/// Missing proof is absence, never an instruction to create one. The returned
+/// secret belongs to the caller and must be zeroized when no longer needed.
+pub fn loadSessionExitProof(alloc: Allocator, owner: *session_child_store.SessionChildCapability) !?contracts.HolderProof {
+    var reader = try owner.cloneReadOnly(alloc);
+    defer reader.deinit();
+    var file = reader.openFileReadOnly(alloc, .terminal_proofs, "owner-exit") catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer file.deinit();
+    var bytes: [33]u8 = undefined;
+    defer std.crypto.secureZero(u8, @volatileCast(&bytes));
+    var input = file.childStdioFile().readerStreaming(io_mod.getIo(), &.{});
+    if (try input.interface.readSliceShort(&bytes) != 32) return error.InvalidHolderProof;
+    var proof: contracts.HolderProof = .{ .bytes = bytes[0..32].* };
+    defer std.crypto.secureZero(u8, @volatileCast(&proof.bytes));
+    try proof.validate();
+    return proof;
+}
+
 pub fn loadOrCreateOwnerCatalogClaim(
     alloc: Allocator,
     owner: *session_child_store.SessionChildCapability,
@@ -2154,6 +2263,7 @@ pub fn loadOrCreateOwnerCatalogClaim(
         .terminal_state,
         lock_name,
         2_000,
+        null,
     );
     defer authority_lock.release();
 
@@ -2392,12 +2502,29 @@ pub const DurableSession = struct {
     journal: ?session_child_store.ManagedFile,
     registered: bool = false,
 
+    pub const OutputState = struct {
+        output_cursor: contracts.RawCursor,
+        available_cursor: contracts.RawCursor,
+        checkpoint_cursor: ?contracts.RawCursor,
+    };
+
+    /// For actual writable adoption of a live backend, not discovery or replay.
+    pub fn ensureSessionExitProof(self: *DurableSession) !void {
+        var owner = try self.profile.open_capability(self.record.owner_session_id, true);
+        defer owner.deinit();
+        var proof = try prepareSessionExitProof(self.profile.alloc, &owner);
+        defer std.crypto.secureZero(u8, @volatileCast(&proof.bytes));
+    }
+
     pub fn create(profile: *ProfileStore, input: CreateInput) !DurableSession {
         const zio = io_mod.getIo();
-        profile.mutex.lockUncancelable(zio);
+        try read_cancellation.lock(zio, &profile.mutex, input.cancel_flag);
         defer profile.mutex.unlock(zio);
         try contracts.validate_session_id(input.session_id);
         try input.dimensions.validate();
+        if (input.persistence.exit_proof) |proof| try proof.validate();
+        const reserve = try checkpoint_reserve_bytes(input.dimensions);
+        if (reserve > profile.options.per_session_limit) return error.CapacityExceeded;
         var state = try profile.open_capability(
             input.persistence.grant.principal.durable_session_id,
             false,
@@ -2408,20 +2535,15 @@ pub const DurableSession = struct {
             true,
         );
         defer proofs.deinit();
-        errdefer |err| if (err != error.InjectedCrash) {
-            cleanup_partial_start(
-                profile.alloc,
-                &state,
-                &proofs,
-                input.session_id,
-            );
-        };
-
-        const reserve = try checkpoint_reserve_bytes(input.dimensions);
-        if (reserve > profile.options.per_session_limit) {
-            return error.CapacityExceeded;
+        {
+            var proof = try prepareSessionExitProof(profile.alloc, &proofs);
+            defer std.crypto.secureZero(u8, @volatileCast(&proof.bytes));
+            if (input.persistence.exit_proof) |supplied| {
+                if (!std.crypto.timing_safe.eql([32]u8, proof.bytes, supplied.bytes)) return error.InvalidHolderProof;
+            }
         }
-        try profile.ensure_profile_capacity(reserve, input.session_id);
+        try profile.ensure_profile_capacity(reserve, input.session_id, input.cancel_flag);
+        try read_cancellation.check(input.cancel_flag);
 
         var backend_random: [16]u8 = undefined;
         io_mod.getIo().random(&backend_random);
@@ -2503,11 +2625,15 @@ pub const DurableSession = struct {
 
         const journal_file_name = try journal_name(alloc, input.session_id, 1);
         defer alloc.free(journal_file_name);
+        try read_cancellation.check(input.cancel_flag);
         var journal = try state.createExclusiveFile(
             alloc,
             .terminal_state,
             journal_file_name,
         );
+        errdefer |err| if (err != error.InjectedCrash) {
+            cleanup_partial_start(profile.alloc, &state, &proofs, input.session_id);
+        };
         errdefer journal.deinit();
         try journal.sync();
         if (profile.options.fail_at == .after_journal_create) {
@@ -2635,9 +2761,12 @@ pub const DurableSession = struct {
         return &self.state.?;
     }
 
-    pub fn release_completed_handles(self: *DurableSession) void {
+    pub fn release_completed_handles(self: *DurableSession, cancel_flag: read_cancellation.CancelFlag) void {
         const zio = io_mod.getIo();
-        self.profile.mutex.lockUncancelable(zio);
+        if (!self.profile.mutex.tryLock()) read_cancellation.lock(zio, &self.profile.mutex, cancel_flag) catch {
+            debug_trace.logf("terminal_store", "completed handle release deferred id={s} reason=owner_shutdown", .{self.record.session_id});
+            return;
+        };
         defer self.profile.mutex.unlock(zio);
         self.release_completed_handles_locked();
     }
@@ -2655,9 +2784,10 @@ pub const DurableSession = struct {
         pid: []const u8,
         token: process_identity.ProcessInstanceToken,
         now_ms: i64,
+        cancel_flag: read_cancellation.CancelFlag,
     ) !void {
         const zio = io_mod.getIo();
-        self.profile.mutex.lockUncancelable(zio);
+        try read_cancellation.lock(zio, &self.profile.mutex, cancel_flag);
         defer self.profile.mutex.unlock(zio);
         try self.reject_close_intent_locked();
         if (self.record.lifecycle != .starting) {
@@ -2696,15 +2826,16 @@ pub const DurableSession = struct {
         };
         if (previous_pid) |value| alloc.free(value);
         if (previous_token) |value| alloc.free(value);
-        _ = try self.append_event_locked(.lifecycle, now_ms);
+        _ = try self.append_event_locked(.lifecycle, now_ms, cancel_flag);
     }
 
-    pub fn mark_timed_out(self: *DurableSession, now_ms: i64) !void {
+    pub fn mark_timed_out(self: *DurableSession, now_ms: i64, cancel_flag: read_cancellation.CancelFlag) !void {
         const zio = io_mod.getIo();
-        self.profile.mutex.lockUncancelable(zio);
+        try read_cancellation.lock(zio, &self.profile.mutex, cancel_flag);
         defer self.profile.mutex.unlock(zio);
         if (self.record.timed_out) return;
         if (self.record.timeout_at_ms == null) return error.InvalidLifecycle;
+        try read_cancellation.check(cancel_flag);
         const previous_timed_out = self.record.timed_out;
         const previous_updated_at_ms = self.record.updated_at_ms;
         self.record.timed_out = true;
@@ -2720,11 +2851,11 @@ pub const DurableSession = struct {
         };
     }
 
-    pub fn append(self: *DurableSession, bytes: []const u8, now_ms: i64) !void {
+    pub fn appendOutput(self: *DurableSession, bytes: []const u8, now_ms: i64, cancel_flag: read_cancellation.CancelFlag) !OutputState {
         const zio = io_mod.getIo();
-        self.profile.mutex.lockUncancelable(zio);
+        try read_cancellation.lock(zio, &self.profile.mutex, cancel_flag);
         defer self.profile.mutex.unlock(zio);
-        if (bytes.len == 0) return;
+        if (bytes.len == 0) return self.outputStateLocked();
         if (self.profile.options.fail_at == .append) return error.InjectedFailure;
         const appended_len = std.math.cast(u64, bytes.len) orelse
             return error.CapacityExceeded;
@@ -2740,8 +2871,7 @@ pub const DurableSession = struct {
             @max(reserve, self.record.checkpoint_payload_bytes),
         ) catch return error.CapacityExceeded;
         if (session_after > self.profile.options.per_session_limit) {
-            self.evict_live_covered_journals() catch
-                return error.CapacityExceeded;
+            self.evict_live_covered_journals(cancel_flag) catch |err| return if (err == error.Cancelled) error.Cancelled else error.CapacityExceeded;
             retained_after = std.math.add(
                 u64,
                 self.record.journal_payload_bytes,
@@ -2759,13 +2889,14 @@ pub const DurableSession = struct {
         self.profile.ensure_profile_capacity(
             appended_len,
             self.record.session_id,
+            cancel_flag,
         ) catch |err| switch (err) {
             error.CapacityExceeded => {
-                self.evict_live_covered_journals() catch
-                    return error.CapacityExceeded;
+                self.evict_live_covered_journals(cancel_flag) catch |eviction_err| return if (eviction_err == error.Cancelled) error.Cancelled else error.CapacityExceeded;
                 try self.profile.ensure_profile_capacity(
                     appended_len,
                     self.record.session_id,
+                    cancel_flag,
                 );
             },
             else => return err,
@@ -2773,6 +2904,7 @@ pub const DurableSession = struct {
 
         var remaining = bytes;
         while (remaining.len != 0) {
+            try read_cancellation.check(cancel_flag);
             const current = self.record.journal_files[
                 self.record.journal_files.len - 1
             ];
@@ -2789,6 +2921,7 @@ pub const DurableSession = struct {
             remaining = remaining[write_len..];
         }
         std.debug.assert(self.record.journal_payload_bytes == retained_after);
+        return self.outputStateLocked();
     }
 
     pub fn begin_raw_gap(self: *DurableSession, now_ms: i64) !contracts.RawGap {
@@ -2907,12 +3040,12 @@ pub const DurableSession = struct {
         if (self.journal) |*previous| previous.deinit();
         self.journal = journal;
         journal_owned = false;
-        self.retry_journal_cleanup() catch |err| debug_trace.logf(
+        self.retry_journal_cleanup(null) catch |err| debug_trace.logf(
             "terminal_store",
             "raw gap journal cleanup deferred id={s} err={s}",
             .{ self.record.session_id, @errorName(err) },
         );
-        self.retry_checkpoint_cleanup() catch |err| debug_trace.logf(
+        self.retry_checkpoint_cleanup(null) catch |err| debug_trace.logf(
             "terminal_store",
             "raw gap checkpoint cleanup deferred id={s} err={s}",
             .{ self.record.session_id, @errorName(err) },
@@ -3183,13 +3316,9 @@ pub const DurableSession = struct {
         };
     }
 
-    pub fn contains(
-        self: *DurableSession,
-        pattern: []const u8,
-        requested: contracts.RawCursor,
-    ) !bool {
+    pub fn containsCancellable(self: *DurableSession, pattern: []const u8, requested: contracts.RawCursor, cancel_flag: read_cancellation.CancelFlag) !bool {
         const zio = io_mod.getIo();
-        self.profile.mutex.lockUncancelable(zio);
+        try read_cancellation.lock(zio, &self.profile.mutex, cancel_flag);
         defer self.profile.mutex.unlock(zio);
         if (pattern.len == 0) return error.InvalidMatchPattern;
         try requested.validate();
@@ -3219,6 +3348,7 @@ pub const DurableSession = struct {
             cursor,
             self.record.output_cursor,
         ) == .lt) {
+            try read_cancellation.check(cancel_flag);
             if (self.record.raw_gap) |gap| {
                 if (contracts.compare_raw_cursors(cursor, gap.missing_from) == .eq) {
                     carry.clearRetainingCapacity();
@@ -3245,10 +3375,11 @@ pub const DurableSession = struct {
             };
             defer file.deinit();
             const offset = cursor.offset - extent.range.start.offset;
-            const length = std.math.cast(usize, extent.payload_bytes - offset) orelse
+            const length = std.math.cast(usize, @min(read_cancellation.work_bytes, extent.payload_bytes - offset)) orelse
                 return error.CapacityExceeded;
             const bytes = try file.readRange(self.profile.alloc, offset, length);
             defer self.profile.alloc.free(bytes);
+            try read_cancellation.check(cancel_flag);
             if (bytes.len != length) return error.CorruptJournalSegment;
             var combined: std.ArrayList(u8) = .empty;
             defer combined.deinit(self.profile.alloc);
@@ -3263,22 +3394,17 @@ pub const DurableSession = struct {
                     combined.items[combined.items.len - tail_len ..],
                 );
             }
-            cursor = extent.range.end;
+            cursor.offset += length;
         }
         return false;
     }
 
-    pub fn store_checkpoint(
-        self: *DurableSession,
-        envelope: contracts.CheckpointEnvelope,
-        payload: []const u8,
-        now_ms: i64,
-    ) !void {
+    pub fn storeCheckpoint(self: *DurableSession, envelope: contracts.CheckpointEnvelope, payload: []const u8, now_ms: i64, cancel_flag: read_cancellation.CancelFlag) !void {
         const zio = io_mod.getIo();
-        self.profile.mutex.lockUncancelable(zio);
+        try read_cancellation.lock(zio, &self.profile.mutex, cancel_flag);
         defer self.profile.mutex.unlock(zio);
-        try self.retry_checkpoint_cleanup();
-        try envelope.validate(payload);
+        try self.retry_checkpoint_cleanup(cancel_flag);
+        try envelope.validateCancellable(payload, cancel_flag);
         if (contracts.compare_raw_cursors(
             envelope.applied_cursor,
             self.record.output_cursor,
@@ -3299,8 +3425,8 @@ pub const DurableSession = struct {
         }
         const additional = @max(reserve, payload_len) -|
             @max(reserve, self.record.checkpoint_payload_bytes);
-        try self.profile.ensure_profile_capacity(additional, self.record.session_id);
-        const bytes = try encode_checkpoint(self.profile.alloc, envelope, payload);
+        try self.profile.ensure_profile_capacity(additional, self.record.session_id, cancel_flag);
+        const bytes = try encode_checkpoint(self.profile.alloc, envelope, payload, cancel_flag);
         defer self.profile.alloc.free(bytes);
         const next_generation = std.math.add(
             u64,
@@ -3313,11 +3439,13 @@ pub const DurableSession = struct {
             next_generation,
         );
         defer self.profile.alloc.free(name);
-        var entry = try (try self.state_capability()).atomicReplace(
+        try read_cancellation.check(cancel_flag);
+        var entry = try (try self.state_capability()).atomicReplaceCancellable(
             self.profile.alloc,
             .terminal_state,
             name,
             bytes,
+            cancel_flag,
         );
         entry.deinit(self.profile.alloc);
         if (self.profile.options.fail_at == .after_checkpoint_write) {
@@ -3351,7 +3479,7 @@ pub const DurableSession = struct {
         if (self.profile.options.fail_at == .after_checkpoint_record) {
             return error.InjectedCrash;
         }
-        try self.retry_checkpoint_cleanup();
+        try self.retry_checkpoint_cleanup(cancel_flag);
     }
 
     pub fn load_checkpoint(
@@ -3403,7 +3531,8 @@ pub const DurableSession = struct {
         return checkpoint;
     }
 
-    fn retry_checkpoint_cleanup(self: *DurableSession) !void {
+    fn retry_checkpoint_cleanup(self: *DurableSession, cancel_flag: read_cancellation.CancelFlag) !void {
+        try read_cancellation.check(cancel_flag);
         const generation = self.record.checkpoint_cleanup_generation orelse return;
         const name = try checkpoint_name(
             self.profile.alloc,
@@ -3415,6 +3544,7 @@ pub const DurableSession = struct {
             error.FileNotFound => {},
             else => return err,
         };
+        try read_cancellation.check(cancel_flag);
         self.record.checkpoint_cleanup_generation = null;
         try save_record(
             self.profile.alloc,
@@ -3431,14 +3561,16 @@ pub const DurableSession = struct {
         const zio = io_mod.getIo();
         self.profile.mutex.lockUncancelable(zio);
         defer self.profile.mutex.unlock(zio);
-        return self.append_event_locked(kind, now_ms);
+        return self.append_event_locked(kind, now_ms, null);
     }
 
     fn append_event_locked(
         self: *DurableSession,
         kind: contracts.HostEvent,
         now_ms: i64,
+        cancel_flag: read_cancellation.CancelFlag,
     ) !u64 {
+        try read_cancellation.check(cancel_flag);
         const event_id = self.record.next_event_id;
         try self.write_event_locked(kind, now_ms);
         if (self.profile.options.fail_at == .after_event_write) {
@@ -3465,7 +3597,7 @@ pub const DurableSession = struct {
             self.record.updated_at_ms = previous_updated_at_ms;
             return err;
         };
-        try self.retry_event_cleanup_locked();
+        try self.retry_event_cleanup_locked(cancel_flag);
         return event_id;
     }
 
@@ -3520,7 +3652,7 @@ pub const DurableSession = struct {
         self.profile.mutex.lockUncancelable(zio);
         defer self.profile.mutex.unlock(zio);
         if (event_id <= self.record.acknowledged_event_id) {
-            try self.retry_event_cleanup_locked();
+            try self.retry_event_cleanup_locked(null);
             return;
         }
         if (event_id >= self.record.next_event_id) return error.UnknownEventId;
@@ -3543,10 +3675,11 @@ pub const DurableSession = struct {
         if (self.profile.options.fail_at == .after_acknowledgement_record) {
             return error.InjectedCrash;
         }
-        try self.retry_event_cleanup_locked();
+        try self.retry_event_cleanup_locked(null);
     }
 
-    fn retry_event_cleanup_locked(self: *DurableSession) !void {
+    fn retry_event_cleanup_locked(self: *DurableSession, cancel_flag: read_cancellation.CancelFlag) !void {
+        try read_cancellation.check(cancel_flag);
         const target = @max(
             self.record.acknowledged_event_id,
             self.record.event_gap_through,
@@ -3554,6 +3687,7 @@ pub const DurableSession = struct {
         if (target <= self.record.event_cleanup_through) return;
         var id = self.record.event_cleanup_through + 1;
         while (id <= target) : (id += 1) {
+            try read_cancellation.check(cancel_flag);
             const name = try event_name(
                 self.profile.alloc,
                 self.record.session_id,
@@ -3566,6 +3700,7 @@ pub const DurableSession = struct {
             };
             if (id == std.math.maxInt(u64)) break;
         }
+        try read_cancellation.check(cancel_flag);
         self.record.event_cleanup_through = target;
         try save_record(self.profile.alloc, try self.state_capability(), self.record);
     }
@@ -3616,10 +3751,17 @@ pub const DurableSession = struct {
         dimensions: contracts.Dimensions,
         now_ms: i64,
     ) !void {
+        return self.resizeCancellable(dimensions, now_ms, null) catch |err| switch (err) {
+            error.Cancelled => unreachable,
+            inline else => |other| return other,
+        };
+    }
+
+    pub fn resizeCancellable(self: *DurableSession, dimensions: contracts.Dimensions, now_ms: i64, cancel_flag: read_cancellation.CancelFlag) !void {
         const zio = io_mod.getIo();
-        self.profile.mutex.lockUncancelable(zio);
+        try read_cancellation.lock(zio, &self.profile.mutex, cancel_flag);
         defer self.profile.mutex.unlock(zio);
-        try self.retry_checkpoint_cleanup();
+        try self.retry_checkpoint_cleanup(cancel_flag);
         try self.check_resize_capacity_locked(dimensions);
         const previous_reserve = if (is_live(self.record.lifecycle))
             @max(
@@ -3638,7 +3780,9 @@ pub const DurableSession = struct {
         try self.profile.ensure_profile_capacity(
             next_reserve -| previous_reserve,
             self.record.session_id,
+            cancel_flag,
         );
+        try read_cancellation.check(cancel_flag);
         const previous_dimensions = self.record.dimensions;
         const previous_raw_replay_exact = self.record.raw_replay_exact;
         const previous_screen_recovery = self.record.screen_recovery;
@@ -3676,8 +3820,15 @@ pub const DurableSession = struct {
         self: *const DurableSession,
         dimensions: contracts.Dimensions,
     ) !void {
+        return self.checkResizeCapacityCancellable(dimensions, null) catch |err| switch (err) {
+            error.Cancelled => unreachable,
+            inline else => |other| return other,
+        };
+    }
+
+    pub fn checkResizeCapacityCancellable(self: *const DurableSession, dimensions: contracts.Dimensions, cancel_flag: read_cancellation.CancelFlag) !void {
         const zio = io_mod.getIo();
-        self.profile.mutex.lockUncancelable(zio);
+        try read_cancellation.lock(zio, &self.profile.mutex, cancel_flag);
         defer self.profile.mutex.unlock(zio);
         try self.check_resize_capacity_locked(dimensions);
     }
@@ -3698,13 +3849,9 @@ pub const DurableSession = struct {
         }
     }
 
-    pub fn persist_termination(
-        self: *DurableSession,
-        termination: PersistedTermination,
-        now_ms: i64,
-    ) !void {
+    pub fn persistTermination(self: *DurableSession, termination: PersistedTermination, now_ms: i64, cancel_flag: read_cancellation.CancelFlag) !void {
         const zio = io_mod.getIo();
-        self.profile.mutex.lockUncancelable(zio);
+        try read_cancellation.lock(zio, &self.profile.mutex, cancel_flag);
         defer self.profile.mutex.unlock(zio);
         try self.reject_close_intent_locked();
         try termination.validate();
@@ -3743,7 +3890,7 @@ pub const DurableSession = struct {
         };
         if (previous_owner_pid) |value| self.profile.alloc.free(value);
         if (previous_owner_process_token) |value| self.profile.alloc.free(value);
-        _ = try self.append_event_locked(.lifecycle, now_ms);
+        _ = try self.append_event_locked(.lifecycle, now_ms, cancel_flag);
     }
 
     pub fn termination_outcome(self: *DurableSession) ?contracts.ReturnOutcome {
@@ -3758,8 +3905,15 @@ pub const DurableSession = struct {
     }
 
     pub fn persist_lost(self: *DurableSession, now_ms: i64) !void {
+        return self.persistLost(now_ms, null) catch |err| switch (err) {
+            error.Cancelled => unreachable,
+            inline else => |other| return other,
+        };
+    }
+
+    pub fn persistLost(self: *DurableSession, now_ms: i64, cancel_flag: read_cancellation.CancelFlag) !void {
         const zio = io_mod.getIo();
-        self.profile.mutex.lockUncancelable(zio);
+        try read_cancellation.lock(zio, &self.profile.mutex, cancel_flag);
         defer self.profile.mutex.unlock(zio);
         try self.reject_close_intent_locked();
         if (self.profile.options.fail_at == .finalization) {
@@ -3784,7 +3938,7 @@ pub const DurableSession = struct {
             self.record.updated_at_ms = previous_updated_at_ms;
             return err;
         };
-        _ = try self.append_event_locked(.lifecycle, now_ms);
+        _ = try self.append_event_locked(.lifecycle, now_ms, cancel_flag);
     }
 
     pub fn revoke(self: *DurableSession, now_ms: i64) !void {
@@ -3848,7 +4002,7 @@ pub const DurableSession = struct {
         };
         if (previous_owner_process_token) |value| self.profile.alloc.free(value);
         if (previous_owner_pid) |value| self.profile.alloc.free(value);
-        _ = try self.append_event_locked(.authority_revoked, now_ms);
+        _ = try self.append_event_locked(.authority_revoked, now_ms, null);
     }
 
     pub fn begin_close(
@@ -4225,10 +4379,19 @@ pub const DurableSession = struct {
         claim: contracts.AuthorityClaim,
         action: contracts.Action,
     ) !Authorization {
+        return self.authorizeCancellable(claim, action, null) catch |err| switch (err) {
+            error.Cancelled => unreachable,
+            inline else => |other| return other,
+        };
+    }
+
+    pub fn authorizeCancellable(self: *DurableSession, claim: contracts.AuthorityClaim, action: contracts.Action, cancel_flag: read_cancellation.CancelFlag) !Authorization {
         const zio = io_mod.getIo();
-        self.profile.mutex.lockUncancelable(zio);
+        try read_cancellation.lock(zio, &self.profile.mutex, cancel_flag);
         defer self.profile.mutex.unlock(zio);
-        return self.authorize_locked(claim, action);
+        const authorization = try self.authorize_locked(claim, action);
+        try read_cancellation.check(cancel_flag);
+        return authorization;
     }
 
     fn authorize_locked(
@@ -4355,14 +4518,11 @@ pub const DurableSession = struct {
         return authorization;
     }
 
-    pub fn cancel_claim(
+    fn cancel_claim_locked(
         self: *DurableSession,
         claim: contracts.AuthorityClaim,
         now_ms: i64,
     ) !void {
-        const zio = io_mod.getIo();
-        self.profile.mutex.lockUncancelable(zio);
-        defer self.profile.mutex.unlock(zio);
         if (self.profile.options.fail_at == .cancellation) {
             return error.InjectedCancellationPersistenceFailure;
         }
@@ -4584,8 +4744,12 @@ pub const DurableSession = struct {
     }
 
     pub fn facts(self: *const DurableSession) contracts.SessionFacts {
+        return self.factsCancellable(null) catch unreachable;
+    }
+
+    pub fn factsCancellable(self: *const DurableSession, cancel_flag: read_cancellation.CancelFlag) error{Cancelled}!contracts.SessionFacts {
         const zio = io_mod.getIo();
-        self.profile.mutex.lockUncancelable(zio);
+        try read_cancellation.lock(zio, &self.profile.mutex, cancel_flag);
         defer self.profile.mutex.unlock(zio);
         return facts_from_record(self.record, self.record.session_id);
     }
@@ -4604,10 +4768,22 @@ pub const DurableSession = struct {
         return self.record.output_cursor;
     }
 
-    pub fn checkpoint_due_cursor(self: *const DurableSession) ?contracts.RawCursor {
+    pub fn outputState(self: *const DurableSession, cancel_flag: read_cancellation.CancelFlag) !OutputState {
         const zio = io_mod.getIo();
-        self.profile.mutex.lockUncancelable(zio);
+        try read_cancellation.lock(zio, &self.profile.mutex, cancel_flag);
         defer self.profile.mutex.unlock(zio);
+        return self.outputStateLocked();
+    }
+
+    fn outputStateLocked(self: *const DurableSession) OutputState {
+        return .{
+            .output_cursor = self.record.output_cursor,
+            .available_cursor = self.record.available_from,
+            .checkpoint_cursor = self.checkpointDueCursorLocked(),
+        };
+    }
+
+    fn checkpointDueCursorLocked(self: *const DurableSession) ?contracts.RawCursor {
         const anchor = switch (self.record.screen_recovery) {
             .available => |checkpoint| checkpoint.applied_cursor,
             .unavailable => contracts.RawCursor{ .segment = 1, .offset = 0 },
@@ -4644,7 +4820,7 @@ pub const DurableSession = struct {
                 .available => {},
             }
         }
-        try self.retry_checkpoint_cleanup();
+        try self.retry_checkpoint_cleanup(null);
         const previous_recovery = self.record.screen_recovery;
         const previous_checkpoint_bytes = self.record.checkpoint_payload_bytes;
         const previous_generation = self.record.checkpoint_generation;
@@ -4670,14 +4846,14 @@ pub const DurableSession = struct {
             self.record.updated_at_ms = previous_updated_at_ms;
             return err;
         };
-        try self.retry_checkpoint_cleanup();
+        try self.retry_checkpoint_cleanup(null);
     }
 
     pub fn reconcile_checkpoint(self: *DurableSession) !void {
         const zio = io_mod.getIo();
         self.profile.mutex.lockUncancelable(zio);
         defer self.profile.mutex.unlock(zio);
-        try self.retry_checkpoint_cleanup();
+        try self.retry_checkpoint_cleanup(null);
         switch (self.record.screen_recovery) {
             .unavailable => return,
             .available => {},
@@ -4768,8 +4944,8 @@ pub const DurableSession = struct {
         const zio = io_mod.getIo();
         self.profile.mutex.lockUncancelable(zio);
         defer self.profile.mutex.unlock(zio);
-        try self.retry_journal_cleanup();
-        try self.retry_checkpoint_cleanup();
+        try self.retry_journal_cleanup(null);
+        try self.retry_checkpoint_cleanup(null);
         const capability = try self.state_capability();
         var names = try capability.iterate(self.profile.alloc, .terminal_state);
         defer names.deinit();
@@ -4833,7 +5009,7 @@ pub const DurableSession = struct {
         const zio = io_mod.getIo();
         self.profile.mutex.lockUncancelable(zio);
         defer self.profile.mutex.unlock(zio);
-        try self.retry_event_cleanup_locked();
+        try self.retry_event_cleanup_locked(null);
         const capability = try self.state_capability();
         var names = try capability.iterate(self.profile.alloc, .terminal_state);
         defer names.deinit();
@@ -4874,13 +5050,13 @@ pub const DurableSession = struct {
         if (gap_through != self.record.event_gap_through) {
             self.record.event_gap_through = gap_through;
             try save_record(self.profile.alloc, capability, self.record);
-            try self.retry_event_cleanup_locked();
+            try self.retry_event_cleanup_locked(null);
         }
         return repaired;
     }
 
     fn reconcile_journals(self: *DurableSession) !bool {
-        try self.retry_journal_cleanup();
+        try self.retry_journal_cleanup(null);
         if (self.record.journal_files.len == 0) return false;
         const alloc = self.profile.alloc;
         const valid = try alloc.alloc(bool, self.record.journal_files.len);
@@ -4992,21 +5168,23 @@ pub const DurableSession = struct {
         }
         try save_record(alloc, try self.state_capability(), self.record);
         alloc.free(previous_files);
-        try self.retry_journal_cleanup();
-        try self.retry_checkpoint_cleanup();
+        try self.retry_journal_cleanup(null);
+        try self.retry_checkpoint_cleanup(null);
         return true;
     }
 
-    fn evict_completed_output(self: *DurableSession) !void {
+    fn evict_completed_output(self: *DurableSession, cancel_flag: read_cancellation.CancelFlag) !void {
+        try read_cancellation.check(cancel_flag);
         if (!is_completed(self.record.lifecycle) or
             self.record.journal_payload_bytes == 0)
         {
             return error.InvalidEviction;
         }
-        try self.commit_journal_eviction(self.record.journal_files.len);
+        try self.commit_journal_eviction(self.record.journal_files.len, cancel_flag);
     }
 
-    fn evict_completed_checkpoint(self: *DurableSession) !void {
+    fn evict_completed_checkpoint(self: *DurableSession, cancel_flag: read_cancellation.CancelFlag) !void {
+        try read_cancellation.check(cancel_flag);
         if (!is_completed(self.record.lifecycle) or
             self.record.checkpoint_payload_bytes == 0)
         {
@@ -5034,10 +5212,11 @@ pub const DurableSession = struct {
         if (self.profile.options.fail_at == .after_eviction_record) {
             return error.InjectedCrash;
         }
-        try self.retry_checkpoint_cleanup();
+        try self.retry_checkpoint_cleanup(cancel_flag);
     }
 
-    fn evict_live_covered_journals(self: *DurableSession) !void {
+    fn evict_live_covered_journals(self: *DurableSession, cancel_flag: read_cancellation.CancelFlag) !void {
+        try read_cancellation.check(cancel_flag);
         if (!is_live(self.record.lifecycle)) return error.InvalidEviction;
         const checkpoint = switch (self.record.screen_recovery) {
             .unavailable => return error.InvalidEviction,
@@ -5045,6 +5224,7 @@ pub const DurableSession = struct {
         };
         var remove_count: usize = 0;
         while (remove_count + 1 < self.record.journal_files.len) : (remove_count += 1) {
+            try read_cancellation.check(cancel_flag);
             const file = self.record.journal_files[remove_count];
             if (file.payload_bytes != self.profile.options.segment_bytes or
                 contracts.compare_raw_cursors(
@@ -5056,13 +5236,15 @@ pub const DurableSession = struct {
             }
         }
         if (remove_count == 0) return error.InvalidEviction;
-        try self.commit_journal_eviction(remove_count);
+        try self.commit_journal_eviction(remove_count, cancel_flag);
     }
 
     fn commit_journal_eviction(
         self: *DurableSession,
         remove_count: usize,
+        cancel_flag: read_cancellation.CancelFlag,
     ) !void {
+        try read_cancellation.check(cancel_flag);
         if (remove_count == 0 or remove_count > self.record.journal_files.len) {
             return error.InvalidEviction;
         }
@@ -5072,6 +5254,7 @@ pub const DurableSession = struct {
         errdefer alloc.free(retained);
         var removed_bytes: u64 = 0;
         for (previous_files[0..remove_count]) |file| {
+            try read_cancellation.check(cancel_flag);
             removed_bytes = std.math.add(
                 u64,
                 removed_bytes,
@@ -5117,14 +5300,16 @@ pub const DurableSession = struct {
             if (self.journal) |*journal| journal.deinit();
             self.journal = null;
         }
-        try self.retry_journal_cleanup();
+        try self.retry_journal_cleanup(cancel_flag);
     }
 
-    fn retry_journal_cleanup(self: *DurableSession) !void {
+    fn retry_journal_cleanup(self: *DurableSession, cancel_flag: read_cancellation.CancelFlag) !void {
+        try read_cancellation.check(cancel_flag);
         const through = self.record.journal_cleanup_through;
         if (through == 0) return;
         var file_id: u64 = 1;
         while (file_id <= through) : (file_id += 1) {
+            try read_cancellation.check(cancel_flag);
             const name = try journal_name(
                 self.profile.alloc,
                 self.record.session_id,
@@ -5137,6 +5322,7 @@ pub const DurableSession = struct {
             };
             if (file_id == std.math.maxInt(u64)) break;
         }
+        try read_cancellation.check(cancel_flag);
         self.record.journal_cleanup_through = 0;
         try save_record(
             self.profile.alloc,
@@ -5651,8 +5837,9 @@ fn encode_checkpoint(
     alloc: Allocator,
     envelope: contracts.CheckpointEnvelope,
     payload: []const u8,
+    cancel_flag: read_cancellation.CancelFlag,
 ) ![]u8 {
-    try envelope.validate(payload);
+    try read_cancellation.check(cancel_flag);
     const total = std.math.add(
         usize,
         checkpoint_header_bytes,
@@ -5667,7 +5854,7 @@ fn encode_checkpoint(
     std.mem.writeInt(u64, bytes[16..24], envelope.applied_cursor.offset, .little);
     std.mem.writeInt(u32, bytes[24..28], envelope.payload_len, .little);
     @memcpy(bytes[28..60], &envelope.checksum);
-    @memcpy(bytes[checkpoint_header_bytes..], payload);
+    try read_cancellation.copyBytes(bytes[checkpoint_header_bytes..], payload, cancel_flag);
     return bytes;
 }
 
@@ -6056,8 +6243,9 @@ const ConcurrentAppend = struct {
     result: ?anyerror = null,
 
     fn run(self: *ConcurrentAppend) void {
-        self.session.append("12345678", 2) catch |err| {
+        _ = self.session.appendOutput("12345678", 2, null) catch |err| {
             self.result = err;
+            return;
         };
     }
 };
@@ -6178,6 +6366,312 @@ fn test_process_owner(
     return contracts.ProcessOwner.init(@intCast(pid), token.view());
 }
 
+test "session exit proof preparation is immutable and reload never changes files" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var owner = try fixture.owner_capability("terminal-store-owner", .writable);
+    defer owner.deinit();
+    try std.testing.expect(try loadSessionExitProof(alloc, &owner) == null);
+    try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(io_mod.getIo(), ".fx/sessions/terminal-store-owner/terminal", .{}));
+    var first = try prepareSessionExitProof(alloc, &owner);
+    defer std.crypto.secureZero(u8, @volatileCast(&first.bytes));
+    const route = ".fx/sessions/terminal-store-owner/terminal/proofs";
+    const proof_path = route ++ "/owner-exit";
+    const before_file = try fixture.tmp.dir.statFile(io_mod.getIo(), proof_path, .{});
+    const before_route = try fixture.tmp.dir.statFile(io_mod.getIo(), route, .{});
+    var fresh_owner = try fixture.owner_capability("terminal-store-owner", .writable);
+    defer fresh_owner.deinit();
+    var loaded = (try loadSessionExitProof(alloc, &fresh_owner)).?;
+    defer std.crypto.secureZero(u8, @volatileCast(&loaded.bytes));
+    try std.testing.expect(std.crypto.timing_safe.eql([32]u8, first.bytes, loaded.bytes));
+    try std.testing.expectEqual(before_route.ctime, (try fixture.tmp.dir.statFile(io_mod.getIo(), route, .{})).ctime);
+    var repeated = try prepareSessionExitProof(alloc, &fresh_owner);
+    defer std.crypto.secureZero(u8, @volatileCast(&repeated.bytes));
+    try std.testing.expect(std.crypto.timing_safe.eql([32]u8, first.bytes, repeated.bytes));
+    const after_file = try fixture.tmp.dir.statFile(io_mod.getIo(), proof_path, .{});
+    try std.testing.expectEqual(before_file.inode, after_file.inode);
+    try std.testing.expectEqual(before_file.mtime, after_file.mtime);
+    try std.testing.expectEqual(before_file.ctime, after_file.ctime);
+}
+
+test "concurrent session exit proof creators cannot replace the first publication" {
+    const Gate = struct {
+        owner: *session_child_store.SessionChildCapability,
+        after_rename: bool,
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        proof: ?contracts.HolderProof = null,
+        failure: ?anyerror = null,
+
+        fn syncFile(raw: ?*anyopaque, file: std.Io.File) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try file.sync(io_mod.getIo());
+            if (!self.after_rename) self.pause();
+        }
+        fn syncDir(raw: ?*anyopaque, dir: std.Io.Dir) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.after_rename) self.pause();
+            try io_mod.syncVerifiedDir(dir);
+        }
+        fn pause(self: *@This()) void {
+            self.entered.set(io_mod.getIo());
+            self.release.waitUncancelable(io_mod.getIo());
+        }
+        fn run(self: *@This()) void {
+            self.proof = prepareSessionExitProof(std.testing.allocator, self.owner) catch |err| failed: {
+                self.failure = err;
+                break :failed null;
+            };
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |after_rename| {
+        var fixture = try TestStoreFixture.init(alloc, test_options());
+        defer fixture.deinit();
+        var owner_dir = try fixture.profile.sessions_dir.dir.openDir(io_mod.getIo(), "terminal-store-owner", .{ .iterate = true });
+        defer owner_dir.close(io_mod.getIo());
+        const display_path = try session_layout.sessionDirPath(alloc, fixture.profile.display_sessions_path, "terminal-store-owner");
+        defer alloc.free(display_path);
+        var first_owner: session_child_store.SessionChildCapability = undefined;
+        var gate: Gate = .{ .owner = &first_owner, .after_rename = after_rename };
+        first_owner = try session_child_store.SessionChildCapability.initForTesting(alloc, owner_dir, display_path, .writable, .{ .replace_ops = .{ .ctx = &gate, .sync_file = Gate.syncFile, .sync_dir = Gate.syncDir } });
+        defer first_owner.deinit();
+        var other_owner = try fixture.owner_capability("terminal-store-owner", .writable);
+        defer other_owner.deinit();
+        const thread = try std.Thread.spawn(.{}, Gate.run, .{&gate});
+        var joined = false;
+        defer {
+            gate.release.set(io_mod.getIo());
+            if (!joined) thread.join();
+            if (gate.proof) |*proof| std.crypto.secureZero(u8, @volatileCast(&proof.bytes));
+        }
+        try gate.entered.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } });
+        var visible = try loadSessionExitProof(alloc, &other_owner);
+        defer if (visible) |*proof| std.crypto.secureZero(u8, @volatileCast(&proof.bytes));
+        try std.testing.expectEqual(after_rename, visible != null);
+        const started = io_mod.nanoTimestamp();
+        var failure: ?anyerror = null;
+        var competing = prepareSessionExitProof(alloc, &other_owner) catch |err| failed: {
+            failure = err;
+            break :failed null;
+        };
+        defer if (competing) |*proof| std.crypto.secureZero(u8, @volatileCast(&proof.bytes));
+        const elapsed = io_mod.nanoTimestamp() - started;
+        gate.release.set(io_mod.getIo());
+        thread.join();
+        joined = true;
+        try std.testing.expectEqual(@as(?anyerror, error.LockBusy), failure);
+        try std.testing.expect(elapsed < 500 * std.time.ns_per_ms);
+        try std.testing.expectEqual(@as(?anyerror, null), gate.failure);
+        var saved = (try loadSessionExitProof(alloc, &other_owner)).?;
+        defer std.crypto.secureZero(u8, @volatileCast(&saved.bytes));
+        try std.testing.expect(std.crypto.timing_safe.eql([32]u8, gate.proof.?.bytes, saved.bytes));
+    }
+}
+
+test "session exit proof rejects malformed storage without repairing it" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var owner = try fixture.owner_capability("terminal-store-owner", .writable);
+    defer owner.deinit();
+    const malformed = [_][]const u8{ "", "x", "x" ** 31, &([_]u8{0} ** 32), "x" ** 33, "x" ** (64 * 1024) };
+    for (malformed) |bytes| {
+        var entry = try owner.atomicReplace(alloc, .terminal_proofs, "owner-exit", bytes);
+        defer entry.deinit(alloc);
+        const path = ".fx/sessions/terminal-store-owner/terminal/proofs/owner-exit";
+        const before = try fixture.tmp.dir.statFile(io_mod.getIo(), path, .{});
+        try std.testing.expectError(error.InvalidHolderProof, loadSessionExitProof(alloc, &owner));
+        try std.testing.expectError(error.InvalidHolderProof, prepareSessionExitProof(alloc, &owner));
+        const after = try fixture.tmp.dir.statFile(io_mod.getIo(), path, .{});
+        try std.testing.expectEqual(before.inode, after.inode);
+        try std.testing.expectEqual(before.mtime, after.mtime);
+        try std.testing.expectEqual(before.ctime, after.ctime);
+    }
+}
+
+test "session exit preparation confirms a previous interrupted publication before admission" {
+    const Sync = struct {
+        calls: usize = 0,
+        reject: bool = true,
+        fn directory(raw: ?*anyopaque, dir: std.Io.Dir) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.reject) return error.InjectedDirectorySyncFailure;
+            try io_mod.syncVerifiedDir(dir);
+        }
+    };
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var dir = try fixture.profile.sessions_dir.dir.openDir(io_mod.getIo(), "terminal-store-owner", .{ .iterate = true });
+    defer dir.close(io_mod.getIo());
+    const path = try session_layout.sessionDirPath(alloc, fixture.profile.display_sessions_path, "terminal-store-owner");
+    defer alloc.free(path);
+    var sync: Sync = .{};
+    {
+        var creator = try session_child_store.SessionChildCapability.initForTesting(alloc, dir, path, .writable, .{ .replace_ops = .{ .ctx = &sync, .sync_dir = Sync.directory } });
+        defer creator.deinit();
+        var failure: ?anyerror = null;
+        var proof = prepareSessionExitProof(alloc, &creator) catch |err| failed: {
+            failure = err;
+            break :failed null;
+        };
+        defer if (proof) |*value| std.crypto.secureZero(u8, @volatileCast(&value.bytes));
+        try std.testing.expectEqual(@as(?anyerror, error.SessionChildCommitIndeterminate), failure);
+    }
+    const proof_path = ".fx/sessions/terminal-store-owner/terminal/proofs/owner-exit";
+    const before = try fixture.tmp.dir.statFile(io_mod.getIo(), proof_path, .{});
+    sync.calls = 0;
+    var reopened = try session_child_store.SessionChildCapability.initForTesting(alloc, dir, path, .writable, .{ .replace_ops = .{ .ctx = &sync, .sync_dir = Sync.directory } });
+    defer reopened.deinit();
+    try std.testing.expect(!reopened.hasIndeterminateEntry(.terminal_proofs, "owner-exit"));
+    var failure: ?anyerror = null;
+    var rejected = prepareSessionExitProof(alloc, &reopened) catch |err| failed: {
+        failure = err;
+        break :failed null;
+    };
+    defer if (rejected) |*value| std.crypto.secureZero(u8, @volatileCast(&value.bytes));
+    try std.testing.expectEqual(@as(?anyerror, error.SessionChildCommitIndeterminate), failure);
+    try std.testing.expectEqual(@as(usize, 1), sync.calls);
+    sync.reject = false;
+    var proof = try prepareSessionExitProof(alloc, &reopened);
+    defer std.crypto.secureZero(u8, @volatileCast(&proof.bytes));
+    try std.testing.expectEqual(@as(usize, 2), sync.calls);
+    var loaded = (try loadSessionExitProof(alloc, &reopened)).?;
+    defer std.crypto.secureZero(u8, @volatileCast(&loaded.bytes));
+    try std.testing.expect(std.crypto.timing_safe.eql([32]u8, proof.bytes, loaded.bytes));
+    const after = try fixture.tmp.dir.statFile(io_mod.getIo(), proof_path, .{});
+    try std.testing.expectEqual(before.inode, after.inode);
+    try std.testing.expectEqual(before.mtime, after.mtime);
+    try std.testing.expectEqual(before.ctime, after.ctime);
+}
+
+test "session exit authorization is exact read-only and independent of the profile mutex" {
+    const Verify = struct {
+        profile: *ProfileStore,
+        claim: contracts.SessionExitAuthority,
+        done: std.Io.Event = .unset,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.profile.authorizeSessionExit(self.claim) catch |err| {
+                self.failure = err;
+            };
+            self.done.set(io_mod.getIo());
+        }
+    };
+    const alloc = std.testing.allocator;
+    const zio = io_mod.getIo();
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    try fixture.create_owner("foreign-owner");
+    try fixture.create_owner("empty-owner");
+    var owner = try fixture.owner_capability("terminal-store-owner", .writable);
+    defer owner.deinit();
+    var foreign = try fixture.owner_capability("foreign-owner", .writable);
+    defer foreign.deinit();
+    var proof = try prepareSessionExitProof(alloc, &owner);
+    defer std.crypto.secureZero(u8, @volatileCast(&proof.bytes));
+    var foreign_proof = try prepareSessionExitProof(alloc, &foreign);
+    defer std.crypto.secureZero(u8, @volatileCast(&foreign_proof.bytes));
+    try owner.delete(.terminal_proofs, "owner-exit.lock");
+    const route = ".fx/sessions/terminal-store-owner/terminal/proofs";
+    const before_route = try fixture.tmp.dir.statFile(zio, route, .{});
+    const before_file = try fixture.tmp.dir.statFile(zio, route ++ "/owner-exit", .{});
+    var verify: Verify = .{ .profile = &fixture.profile, .claim = .{ .session_id = "terminal-store-owner", .proof = proof } };
+    defer std.crypto.secureZero(u8, @volatileCast(&verify.claim.proof.bytes));
+    fixture.profile.mutex.lockUncancelable(zio);
+    var locked = true;
+    defer if (locked) fixture.profile.mutex.unlock(zio);
+    const thread = try std.Thread.spawn(.{}, Verify.run, .{&verify});
+    const completed_while_locked = if (verify.done.waitTimeout(zio, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(500) } })) |_| true else |_| false;
+    fixture.profile.mutex.unlock(zio);
+    locked = false;
+    thread.join();
+    try std.testing.expect(completed_while_locked);
+    try std.testing.expectEqual(@as(?anyerror, null), verify.failure);
+    try std.testing.expectError(error.InvalidHolderProof, fixture.profile.authorizeSessionExit(.{ .session_id = "terminal-store-owner", .proof = foreign_proof }));
+    try std.testing.expectError(error.InvalidHolderProof, fixture.profile.authorizeSessionExit(.{ .session_id = "foreign-owner", .proof = proof }));
+    try std.testing.expectError(error.InvalidSessionId, fixture.profile.authorizeSessionExit(.{ .session_id = "../foreign-owner", .proof = proof }));
+    try std.testing.expectError(error.HolderProofNotFound, fixture.profile.authorizeSessionExit(.{ .session_id = "empty-owner", .proof = proof }));
+    try std.testing.expectError(error.FileNotFound, fixture.profile.authorizeSessionExit(.{ .session_id = "absent-owner", .proof = proof }));
+    try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(zio, ".fx/sessions/empty-owner/terminal", .{}));
+    try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(zio, route ++ "/owner-exit.lock", .{}));
+    const after_route = try fixture.tmp.dir.statFile(zio, route, .{});
+    const after_file = try fixture.tmp.dir.statFile(zio, route ++ "/owner-exit", .{});
+    try std.testing.expectEqual(before_route.ctime, after_route.ctime);
+    try std.testing.expectEqual(before_file.inode, after_file.inode);
+    try std.testing.expectEqual(before_file.mtime, after_file.mtime);
+    try std.testing.expectEqual(before_file.ctime, after_file.ctime);
+}
+
+test "hosted start prepares the owner exit proof before publishing a job" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var legacy = try fixture.create("terminal-legacy-start");
+    defer legacy.deinit();
+    var owner = try fixture.owner_capability("terminal-store-owner", .read_only);
+    defer owner.deinit();
+    var proof = (try loadSessionExitProof(alloc, &owner)) orelse return error.TestExpectedSessionExitProof;
+    defer std.crypto.secureZero(u8, @volatileCast(&proof.bytes));
+    const path = ".fx/sessions/terminal-store-owner/terminal/proofs/owner-exit";
+    const before = try fixture.tmp.dir.statFile(io_mod.getIo(), path, .{});
+    var persistence = test_persistence();
+    persistence.exit_proof = .{ .bytes = proof.bytes };
+    defer std.crypto.secureZero(u8, @volatileCast(&persistence.exit_proof.?.bytes));
+    persistence.exit_proof.?.bytes[0] ^= 1;
+    var failure: ?anyerror = null;
+    var rejected = fixture.create_with_persistence("terminal-rejected-exit-proof", .{ .rows = 24, .columns = 80 }, persistence) catch |err| failed: {
+        failure = err;
+        break :failed null;
+    };
+    defer if (rejected) |*job| job.deinit();
+    try std.testing.expectEqual(@as(?anyerror, error.InvalidHolderProof), failure);
+    var names = try owner.iterate(alloc, .terminal_state);
+    defer names.deinit();
+    for (names.names) |name| try std.testing.expect(std.mem.indexOf(u8, name, "terminal-rejected-exit-proof") == null);
+    persistence.exit_proof.?.bytes[0] ^= 1;
+    var accepted = try fixture.create_with_persistence("terminal-accepted-exit-proof", .{ .rows = 24, .columns = 80 }, persistence);
+    defer accepted.deinit();
+    var reloaded = (try loadSessionExitProof(alloc, &owner)).?;
+    defer std.crypto.secureZero(u8, @volatileCast(&reloaded.bytes));
+    try std.testing.expect(std.crypto.timing_safe.eql([32]u8, proof.bytes, reloaded.bytes));
+    const after = try fixture.tmp.dir.statFile(io_mod.getIo(), path, .{});
+    try std.testing.expectEqual(before.inode, after.inode);
+    try std.testing.expectEqual(before.mtime, after.mtime);
+    try std.testing.expectEqual(before.ctime, after.ctime);
+}
+
+test "live adoption can prepare a missing exit proof without rewriting the job" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var job = try fixture.create("terminal-adopted-exit-proof");
+    defer job.deinit();
+    var owner = try fixture.owner_capability("terminal-store-owner", .writable);
+    defer owner.deinit();
+    try owner.delete(.terminal_proofs, "owner-exit");
+    try owner.delete(.terminal_proofs, "owner-exit.lock");
+    const name = try record_name(alloc, job.record.session_id);
+    defer alloc.free(name);
+    const path = try std.fs.path.join(alloc, &.{ ".fx/sessions/terminal-store-owner/terminal/state", name });
+    defer alloc.free(path);
+    const before = try fixture.tmp.dir.statFile(io_mod.getIo(), path, .{});
+    var scope = try job.load_recovery_execution_scope(alloc);
+    defer scope.deinit(alloc);
+    try std.testing.expect(try loadSessionExitProof(alloc, &owner) == null);
+    try job.ensureSessionExitProof();
+    var proof = (try loadSessionExitProof(alloc, &owner)).?;
+    defer std.crypto.secureZero(u8, @volatileCast(&proof.bytes));
+    try fixture.profile.authorizeSessionExit(.{ .session_id = "terminal-store-owner", .proof = proof });
+    const after = try fixture.tmp.dir.statFile(io_mod.getIo(), path, .{});
+    try std.testing.expectEqual(before.inode, after.inode);
+    try std.testing.expectEqual(before.mtime, after.mtime);
+    try std.testing.expectEqual(before.ctime, after.ctime);
+}
+
 test "owner catalog enumerates the exact durable owner without a terminal anchor" {
     const alloc = std.testing.allocator;
     var fixture = try TestStoreFixture.init(alloc, test_options());
@@ -6260,6 +6754,74 @@ test "owner catalog enumerates the exact durable owner without a terminal anchor
         error.InvalidHolderProof,
         fixture.profile.ownerCatalog(forged),
     );
+}
+
+test "catalog observes a dead takeover owner without publishing repair" {
+    const os = @import("builtin").os.tag;
+    if (os != .macos and os != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const zio = io_mod.getIo();
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    fixture.profile.process_provider = @import("../../tools/shell/process_provider.zig").provider;
+    var session = try fixture.create("terminal-readonly-takeover");
+    defer session.deinit();
+    var owner = try fixture.owner_capability("terminal-store-owner", .writable);
+    defer owner.deinit();
+    var takeover = try reloadHumanTakeoverAuthorityClaim(alloc, &owner, .{
+        .terminal_session_id = session.record.session_id,
+        .profile_user = "profile-user",
+        .durable_session_id = "terminal-store-owner",
+        .workspace_root = "/workspace",
+        .transport_role = .interactive,
+        .actor = .human,
+    });
+    defer takeover.deinit();
+    var process = try std.process.spawn(zio, .{ .argv = &.{ "/bin/sleep", "30" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+    defer if (process.id != null) process.kill(zio);
+    var pid_buffer: [32]u8 = undefined;
+    const pid = try std.fmt.bufPrint(&pid_buffer, "{d}", .{process.id.?});
+    const token = try fixture.profile.process_provider.captureToken(alloc, pid);
+    takeover.value.process_owner = try contracts.ProcessOwner.init(@intCast(process.id.?), token.view());
+    _ = try session.acquire_write_lease(takeover.view(), 2);
+    var catalog_claim = try loadOrCreateOwnerCatalogClaim(alloc, &owner, .{
+        .profile_user = "profile-user",
+        .durable_session_id = "terminal-store-owner",
+        .workspace_root = "/workspace",
+        .transport_role = .interactive,
+        .actor = .agent,
+    });
+    defer catalog_claim.deinit();
+    process.kill(zio);
+    const record_path = ".fx/sessions/terminal-store-owner/terminal/state/record-terminal-readonly-takeover.json";
+    const state_path = ".fx/sessions/terminal-store-owner/terminal/state";
+    const proofs_path = ".fx/sessions/terminal-store-owner/terminal/proofs";
+    const before_bytes = try fixture.tmp.dir.readFileAlloc(zio, record_path, alloc, .limited(max_record_bytes));
+    defer alloc.free(before_bytes);
+    const before_record = try fixture.tmp.dir.statFile(zio, record_path, .{});
+    const before_state = try fixture.tmp.dir.statFile(zio, state_path, .{});
+    const before_proofs = try fixture.tmp.dir.statFile(zio, proofs_path, .{});
+    var catalog = try fixture.profile.ownerCatalog(catalog_claim.view());
+    defer catalog.deinit();
+    try std.testing.expectEqual(@as(usize, 1), catalog.entries.items.len);
+    try std.testing.expectEqual(contracts.AttentionState{}, catalog.entries.items[0].facts.attention);
+    const after_record = try fixture.tmp.dir.statFile(zio, record_path, .{});
+    const after_state = try fixture.tmp.dir.statFile(zio, state_path, .{});
+    const after_proofs = try fixture.tmp.dir.statFile(zio, proofs_path, .{});
+    try std.testing.expectEqual(before_record.inode, after_record.inode);
+    try std.testing.expectEqual(before_record.mtime, after_record.mtime);
+    try std.testing.expectEqual(before_record.ctime, after_record.ctime);
+    try std.testing.expectEqual(before_state.mtime, after_state.mtime);
+    try std.testing.expectEqual(before_state.ctime, after_state.ctime);
+    try std.testing.expectEqual(before_proofs.mtime, after_proofs.mtime);
+    try std.testing.expectEqual(before_proofs.ctime, after_proofs.ctime);
+    const after_bytes = try fixture.tmp.dir.readFileAlloc(zio, record_path, alloc, .limited(max_record_bytes));
+    defer alloc.free(after_bytes);
+    try std.testing.expectEqualSlices(u8, before_bytes, after_bytes);
+    try std.testing.expectEqual(contracts.WriteLease.human, session.record.attention.write_lease);
+    _ = try session.acquire_write_lease(test_claim(test_persistence()), io_mod.milliTimestamp());
+    try std.testing.expectEqual(contracts.WriteLease.agent, session.record.attention.write_lease);
+    try std.testing.expect(session.record.takeover_owner_pid == null and session.record.takeover_owner_process_token == null);
 }
 
 fn recovered_session_index(
@@ -6350,8 +6912,8 @@ test "durable journal rotates with monotonic cursors and reads exact bytes" {
     var session = try fixture.create("terminal-journal");
     defer session.deinit();
 
-    try session.append("abc", 2);
-    try session.append("def", 3);
+    _ = try session.appendOutput("abc", 2, null);
+    _ = try session.appendOutput("def", 3, null);
     try std.testing.expectEqual(
         contracts.RawCursor{ .segment = 1, .offset = 6 },
         session.record.output_cursor,
@@ -6366,9 +6928,10 @@ test "durable journal rotates with monotonic cursors and reads exact bytes" {
     var next = try session.read(alloc, page.range.?.end, 64);
     defer next.deinit(alloc);
     try std.testing.expectEqualStrings("", next.output);
-    try std.testing.expect(try session.contains(
+    try std.testing.expect(try session.containsCancellable(
         "cde",
         .{ .segment = 1, .offset = 0 },
+        null,
     ));
 }
 
@@ -6394,7 +6957,7 @@ test "public raw cursor paginates exactly across private journal rotation" {
     const payload = try alloc.alloc(u8, 1024 * 1024 + 12_345);
     defer alloc.free(payload);
     for (payload, 0..) |*byte, index| byte.* = @intCast('a' + index % 26);
-    try session.append(payload, 2);
+    _ = try session.appendOutput(payload, 2, null);
     const facts = session.facts();
     try std.testing.expect(facts.raw_gap == null);
     try std.testing.expectEqual(
@@ -6429,14 +6992,150 @@ test "public raw cursor paginates exactly across private journal rotation" {
     );
 }
 
+const CheckpointCancellationProbe = struct {
+    cancel_flag: std.atomic.Value(bool) = .init(false),
+    entered: std.Io.Event = .unset,
+    released: std.Io.Event = .unset,
+    allocation_bytes: usize = 0,
+    minimum_allocation: bool = false,
+    observed: bool = false,
+    later_allocations: usize = 0,
+    cancelled_at: i64 = 0,
+
+    fn allocator(self: *@This()) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = free } };
+    }
+    fn allocate(raw: *anyopaque, size: usize, alignment: std.mem.Alignment, address: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.observed) self.later_allocations += 1;
+        const bytes = std.testing.allocator.rawAlloc(size, alignment, address) orelse return null;
+        if (size == self.allocation_bytes or (self.minimum_allocation and size > self.allocation_bytes)) {
+            self.pause();
+        }
+        return bytes;
+    }
+    fn free(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, address: usize) void {
+        std.testing.allocator.rawFree(bytes, alignment, address);
+    }
+    fn pause(self: *@This()) void {
+        self.observed = true;
+        self.entered.set(io_mod.getIo());
+        self.released.waitUncancelable(io_mod.getIo());
+    }
+    fn sync(raw: ?*anyopaque, file: std.Io.File) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        try file.sync(io_mod.getIo());
+        self.pause();
+    }
+    fn cancel(self: *@This()) void {
+        self.entered.waitUncancelable(io_mod.getIo());
+        self.cancelled_at = io_mod.milliTimestamp();
+        self.cancel_flag.store(true, .release);
+        self.released.set(io_mod.getIo());
+    }
+};
+
+test "startup output matching cancels after a real journal read begins" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, .{});
+    defer fixture.deinit();
+    var session = try fixture.create("output-match-cancel");
+    defer session.deinit();
+    const payload = try alloc.alloc(u8, 1024 * 1024);
+    defer alloc.free(payload);
+    @memset(payload, 'x');
+    _ = try session.appendOutput(payload, 2, null);
+    var probe = CheckpointCancellationProbe{ .allocation_bytes = read_cancellation.work_bytes, .minimum_allocation = true };
+    fixture.profile.alloc = probe.allocator();
+    defer fixture.profile.alloc = alloc;
+    const thread = try std.Thread.spawn(.{}, CheckpointCancellationProbe.cancel, .{&probe});
+    var failure: ?anyerror = null;
+    _ = session.containsCancellable("not in output", .{ .segment = 1, .offset = 0 }, &probe.cancel_flag) catch |err| failed: {
+        failure = err;
+        break :failed false;
+    };
+    probe.entered.set(io_mod.getIo());
+    thread.join();
+    try std.testing.expect(probe.observed);
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), failure);
+    try std.testing.expect(io_mod.milliTimestamp() - probe.cancelled_at < 500);
+}
+
+test "checkpoint cancellation after encoding begins leaves the prior checkpoint untouched" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, .{});
+    defer fixture.deinit();
+    var session = try fixture.create("checkpoint-copy-cancel");
+    defer session.deinit();
+    const before_cursor = session.record.output_cursor;
+    const payload = try alloc.alloc(u8, 16 * 1024 * 1024);
+    defer alloc.free(payload);
+    @memset(payload, 'x');
+    const envelope = contracts.CheckpointEnvelope{ .engine_schema_revision = 1, .applied_cursor = before_cursor, .payload_len = @intCast(payload.len), .checksum = contracts.checkpoint_checksum(payload) };
+    var probe = CheckpointCancellationProbe{ .allocation_bytes = payload.len + checkpoint_header_bytes };
+    fixture.profile.alloc = probe.allocator();
+    defer fixture.profile.alloc = alloc;
+    const thread = try std.Thread.spawn(.{}, CheckpointCancellationProbe.cancel, .{&probe});
+    var failure: ?anyerror = null;
+    session.storeCheckpoint(envelope, payload, 2, &probe.cancel_flag) catch |err| {
+        failure = err;
+    };
+    probe.entered.set(io_mod.getIo());
+    thread.join();
+    try std.testing.expect(probe.observed);
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), failure);
+    try std.testing.expectEqual(@as(usize, 0), probe.later_allocations);
+    try std.testing.expect(io_mod.milliTimestamp() - probe.cancelled_at < 500);
+    try std.testing.expectEqual(@as(u64, 0), session.record.checkpoint_generation);
+    try std.testing.expectEqual(before_cursor, session.record.output_cursor);
+    try std.testing.expect((try session.load_checkpoint(alloc)) == null);
+}
+
+test "checkpoint cancellation after temporary sync leaves its published generation unchanged" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, .{});
+    defer fixture.deinit();
+    var session = try fixture.create("checkpoint-sync-cancel");
+    defer session.deinit();
+    const cursor = session.record.output_cursor;
+    const prior = "prior checkpoint";
+    try session.storeCheckpoint(.{ .engine_schema_revision = 1, .applied_cursor = cursor, .payload_len = prior.len, .checksum = contracts.checkpoint_checksum(prior) }, prior, 2, null);
+    const generation = session.record.checkpoint_generation;
+    var owner_dir = try fixture.profile.sessions_dir.dir.openDir(io_mod.getIo(), session.record.owner_session_id, .{ .iterate = true });
+    defer owner_dir.close(io_mod.getIo());
+    const path = try session_layout.sessionDirPath(alloc, fixture.profile.display_sessions_path, session.record.owner_session_id);
+    defer alloc.free(path);
+    var probe = CheckpointCancellationProbe{};
+    session.state.?.deinit();
+    session.state = try session_child_store.SessionChildCapability.initForTesting(alloc, owner_dir, path, .writable, .{ .replace_ops = .{ .ctx = &probe, .sync_file = CheckpointCancellationProbe.sync } });
+    const payload = "replacement" ** 16384;
+    const thread = try std.Thread.spawn(.{}, CheckpointCancellationProbe.cancel, .{&probe});
+    var failure: ?anyerror = null;
+    session.storeCheckpoint(.{ .engine_schema_revision = 1, .applied_cursor = cursor, .payload_len = payload.len, .checksum = contracts.checkpoint_checksum(payload) }, payload, 3, &probe.cancel_flag) catch |err| {
+        failure = err;
+    };
+    probe.entered.set(io_mod.getIo());
+    thread.join();
+    try std.testing.expect(probe.observed);
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), failure);
+    try std.testing.expectEqual(generation, session.record.checkpoint_generation);
+    try std.testing.expect(io_mod.milliTimestamp() - probe.cancelled_at < 500);
+    var checkpoint = (try session.load_checkpoint(alloc)).?;
+    defer checkpoint.deinit(alloc);
+    try std.testing.expectEqualStrings(prior, checkpoint.payload);
+    const unpublished = try checkpoint_name(alloc, session.record.session_id, generation + 1);
+    defer alloc.free(unpublished);
+    try std.testing.expectError(error.FileNotFound, session.state.?.openFileReadOnly(alloc, .terminal_state, unpublished));
+}
+
 test "checkpoint replacement stays opaque and separates raw gaps from screen state" {
     const alloc = std.testing.allocator;
     var fixture = try TestStoreFixture.init(alloc, test_options());
     defer fixture.deinit();
     var session = try fixture.create("terminal-checkpoint");
     defer session.deinit();
-    try session.append("abc", 2);
-    try session.append("def", 3);
+    _ = try session.appendOutput("abc", 2, null);
+    _ = try session.appendOutput("def", 3, null);
     const payload = "opaque-screen";
     const envelope = contracts.CheckpointEnvelope{
         .engine_schema_revision = 1,
@@ -6444,12 +7143,12 @@ test "checkpoint replacement stays opaque and separates raw gaps from screen sta
         .payload_len = payload.len,
         .checksum = contracts.checkpoint_checksum(payload),
     };
-    try session.store_checkpoint(envelope, payload, 4);
+    try session.storeCheckpoint(envelope, payload, 4, null);
     var checkpoint = (try session.load_checkpoint(alloc)).?;
     defer checkpoint.deinit(alloc);
     try std.testing.expectEqualStrings(payload, checkpoint.payload);
 
-    try session.evict_live_covered_journals();
+    try session.evict_live_covered_journals(null);
     try std.testing.expect(session.record.raw_gap != null);
     try std.testing.expect(session.record.screen_recovery == .available);
     var page = try session.read(alloc, .{ .segment = 1, .offset = 0 }, 64);
@@ -6457,7 +7156,7 @@ test "checkpoint replacement stays opaque and separates raw gaps from screen sta
     try std.testing.expect(page.gap != null);
     try std.testing.expectEqualStrings("ef", page.output);
 
-    var encoded = try encode_checkpoint(alloc, envelope, payload);
+    var encoded = try encode_checkpoint(alloc, envelope, payload, null);
     defer alloc.free(encoded);
     encoded[encoded.len - 1] ^= 1;
     try std.testing.expectError(
@@ -6483,7 +7182,7 @@ test "host absence gap retains both raw segments without matching across them" {
     var fixture = try TestStoreFixture.init(alloc, test_options());
     defer fixture.deinit();
     var session = try fixture.create("terminal-host-gap");
-    try session.append("left", 2);
+    _ = try session.appendOutput("left", 2, null);
     const gap = try session.begin_raw_gap(3);
     try std.testing.expectEqual(
         contracts.RawCursor{ .segment = 1, .offset = 4 },
@@ -6493,7 +7192,7 @@ test "host absence gap retains both raw segments without matching across them" {
         contracts.RawCursor{ .segment = 2, .offset = 0 },
         gap.available_from,
     );
-    try session.append("right", 4);
+    _ = try session.appendOutput("right", 4, null);
 
     var before = try session.read(alloc, .{ .segment = 1, .offset = 0 }, 64);
     defer before.deinit(alloc);
@@ -6503,8 +7202,8 @@ test "host absence gap retains both raw segments without matching across them" {
     defer after.deinit(alloc);
     try std.testing.expectEqualStrings("right", after.output);
     try std.testing.expectEqual(gap, after.gap.?);
-    try std.testing.expect(!try session.contains("ftr", .{ .segment = 1, .offset = 0 }));
-    try std.testing.expect(try session.contains("right", .{ .segment = 1, .offset = 0 }));
+    try std.testing.expect(!try session.containsCancellable("ftr", .{ .segment = 1, .offset = 0 }, null));
+    try std.testing.expect(try session.containsCancellable("right", .{ .segment = 1, .offset = 0 }, null));
 
     session.deinit();
     var reopened = try fixture.profile.open_existing(
@@ -6526,7 +7225,7 @@ test "host absence gap retains both raw segments without matching across them" {
         contracts.RawCursor{ .segment = 3, .offset = 0 },
         second_gap.available_from,
     );
-    try reopened.append("third", 6);
+    _ = try reopened.appendOutput("third", 6, null);
     var collapsed = try reopened.read(alloc, .{ .segment = 1, .offset = 0 }, 64);
     defer collapsed.deinit(alloc);
     try std.testing.expectEqualStrings("third", collapsed.output);
@@ -6538,7 +7237,7 @@ test "reopened gap resumes the existing journal segment" {
     var fixture = try TestStoreFixture.init(alloc, test_options());
     defer fixture.deinit();
     var session = try fixture.create("terminal-reopened-gap");
-    try session.append("left", 2);
+    _ = try session.appendOutput("left", 2, null);
     const gap = try session.begin_raw_gap(3);
     session.deinit();
 
@@ -6547,7 +7246,7 @@ test "reopened gap resumes the existing journal segment" {
         "terminal-reopened-gap",
     );
     defer reopened.deinit();
-    try reopened.append("right", 4);
+    _ = try reopened.appendOutput("right", 4, null);
 
     try std.testing.expectEqual(gap, reopened.record.raw_gap.?);
     try std.testing.expectEqual(
@@ -6572,7 +7271,7 @@ test "available checkpoint record payload bytes match envelope" {
         .payload_len = payload.len,
         .checksum = contracts.checkpoint_checksum(payload),
     };
-    try session.store_checkpoint(envelope, payload, 2);
+    try session.storeCheckpoint(envelope, payload, 2, null);
     try session.record.validate();
 
     var malformed = session.record;
@@ -6600,7 +7299,7 @@ test "fresh reopen isolates checkpoint payload byte mismatch before accounting" 
         .payload_len = payload.len,
         .checksum = contracts.checkpoint_checksum(payload),
     };
-    try session.store_checkpoint(envelope, payload, 2);
+    try session.storeCheckpoint(envelope, payload, 2, null);
 
     var malformed = session.record;
     malformed.checkpoint_payload_bytes = @as(u64, envelope.payload_len) + 1;
@@ -6618,7 +7317,7 @@ test "fresh reopen isolates checkpoint payload byte mismatch before accounting" 
     session.deinit();
     try fixture.reopen();
 
-    var candidates = try fixture.profile.scan_payload_candidates();
+    var candidates = try fixture.profile.scan_payload_candidates(null);
     defer candidates.deinit(alloc);
     try std.testing.expectEqual(@as(u64, payload.len), candidates.total_bytes);
     try std.testing.expectEqual(@as(usize, 0), candidates.items.items.len);
@@ -7585,6 +8284,7 @@ test "write leases are exclusive durable and cancellation is actor scoped" {
         "terminal-lease",
     );
     defer reopened.deinit();
+    try fixture.profile.register_resident(&reopened, null);
     try std.testing.expectEqual(
         contracts.WriteLease.agent,
         reopened.facts().attention.write_lease,
@@ -7598,10 +8298,10 @@ test "write leases are exclusive durable and cancellation is actor scoped" {
     );
     try std.testing.expectError(
         error.ActorRoleMismatch,
-        reopened.cancel_claim(human, 4),
+        fixture.profile.cancelClaim("terminal-lease", human, 4),
     );
     try std.testing.expectEqual(contracts.WriteLease.agent, reopened.facts().attention.write_lease);
-    try reopened.cancel_claim(agent, 5);
+    try fixture.profile.cancelClaim("terminal-lease", agent, 5);
     try std.testing.expectEqual(contracts.WriteLease.none, reopened.facts().attention.write_lease);
 }
 
@@ -7618,7 +8318,7 @@ test "terminal completion clears attention and retains the termination outcome" 
         contracts.WriteLease.agent,
         session.facts().attention.write_lease,
     );
-    try session.persist_termination(.{ .exited = 0 }, 3);
+    try session.persistTermination(.{ .exited = 0 }, 3, null);
     try std.testing.expectEqual(contracts.AttentionState{}, session.facts().attention);
     try std.testing.expectEqual(
         contracts.ReturnOutcome{ .exited = 0 },
@@ -7636,13 +8336,14 @@ test "cancellation persistence failure preserves the lease for a clean retry" {
     defer fixture.deinit();
     var session = try fixture.create("terminal-cancellation-failure");
     defer session.deinit();
+    try fixture.profile.register_resident(&session, null);
     const claim = test_claim(test_persistence());
     _ = try session.acquire_write_lease(claim, 2);
 
     fixture.profile.options.fail_at = .cancellation;
     try std.testing.expectError(
         error.InjectedCancellationPersistenceFailure,
-        session.cancel_claim(claim, 3),
+        fixture.profile.cancelClaim("terminal-cancellation-failure", claim, 3),
     );
     try std.testing.expectEqual(
         contracts.WriteLease.agent,
@@ -7650,7 +8351,7 @@ test "cancellation persistence failure preserves the lease for a clean retry" {
     );
 
     fixture.profile.options.fail_at = null;
-    try session.cancel_claim(claim, 4);
+    try fixture.profile.cancelClaim("terminal-cancellation-failure", claim, 4);
     try std.testing.expectEqual(
         contracts.WriteLease.none,
         session.facts().attention.write_lease,
@@ -7984,16 +8685,16 @@ test "quota eviction selects oldest completed output before checkpoints and cove
             .covered_live_bytes = 0,
         },
     };
-    var selected = choose_eviction(&candidates, "active").?;
+    var selected = (try choose_eviction(&candidates, "active", null)).?;
     try std.testing.expectEqual(EvictionClass.completed_output, selected.class);
     try std.testing.expectEqual(@as(usize, 2), selected.index);
     candidates[0].journal_bytes = 0;
     candidates[2].journal_bytes = 0;
-    selected = choose_eviction(&candidates, "active").?;
+    selected = (try choose_eviction(&candidates, "active", null)).?;
     try std.testing.expectEqual(EvictionClass.completed_checkpoint, selected.class);
     candidates[0].checkpoint_bytes = 0;
     candidates[2].checkpoint_bytes = 0;
-    selected = choose_eviction(&candidates, "active").?;
+    selected = (try choose_eviction(&candidates, "active", null)).?;
     try std.testing.expectEqual(EvictionClass.live_covered_journal, selected.class);
 }
 
@@ -8007,7 +8708,7 @@ test "live quota evicts only journal segments covered by the pinned checkpoint" 
     var session = try fixture.create("terminal-live-quota");
     defer session.deinit();
     const block: [1000]u8 = @splat('x');
-    for (0..10) |index| try session.append(&block, @intCast(index + 2));
+    for (0..10) |index| _ = try session.appendOutput(&block, @intCast(index + 2), null);
     const payload = "checkpoint";
     const envelope = contracts.CheckpointEnvelope{
         .engine_schema_revision = 1,
@@ -8015,9 +8716,9 @@ test "live quota evicts only journal segments covered by the pinned checkpoint" 
         .payload_len = payload.len,
         .checksum = contracts.checkpoint_checksum(payload),
     };
-    try session.store_checkpoint(envelope, payload, 20);
+    try session.storeCheckpoint(envelope, payload, 20, null);
     const additional: [5000]u8 = @splat('y');
-    try session.append(&additional, 21);
+    _ = try session.appendOutput(&additional, 21, null);
     try std.testing.expect(session.record.raw_gap != null);
     try std.testing.expectEqual(
         contracts.RawCursor{ .segment = 1, .offset = 9 * 1024 },
@@ -8038,34 +8739,34 @@ test "checkpoint cadence follows the journal byte boundary" {
     defer session.deinit();
 
     for ("abc") |byte| {
-        try session.append(&.{byte}, 2);
-        try std.testing.expect(session.checkpoint_due_cursor() == null);
+        _ = try session.appendOutput(&.{byte}, 2, null);
+        try std.testing.expect((try session.outputState(null)).checkpoint_cursor == null);
     }
     try std.testing.expectEqual(@as(u64, 0), session.record.checkpoint_generation);
 
-    try session.append("d", 3);
-    const first_cursor = session.checkpoint_due_cursor().?;
+    _ = try session.appendOutput("d", 3, null);
+    const first_cursor = (try session.outputState(null)).checkpoint_cursor.?;
     try std.testing.expectEqual(
         contracts.RawCursor{ .segment = 1, .offset = 4 },
         first_cursor,
     );
     const payload = "checkpoint";
-    try session.store_checkpoint(.{
+    try session.storeCheckpoint(.{
         .engine_schema_revision = 1,
         .applied_cursor = first_cursor,
         .payload_len = payload.len,
         .checksum = contracts.checkpoint_checksum(payload),
-    }, payload, 4);
+    }, payload, 4, null);
     try std.testing.expectEqual(@as(u64, 1), session.record.checkpoint_generation);
 
     for ("efg") |byte| {
-        try session.append(&.{byte}, 5);
-        try std.testing.expect(session.checkpoint_due_cursor() == null);
+        _ = try session.appendOutput(&.{byte}, 5, null);
+        try std.testing.expect((try session.outputState(null)).checkpoint_cursor == null);
     }
-    try session.append("h", 6);
+    _ = try session.appendOutput("h", 6, null);
     try std.testing.expectEqual(
         contracts.RawCursor{ .segment = 1, .offset = 8 },
-        session.checkpoint_due_cursor().?,
+        (try session.outputState(null)).checkpoint_cursor.?,
     );
     try std.testing.expectEqual(@as(u64, 1), session.record.checkpoint_generation);
 }
@@ -8078,14 +8779,14 @@ test "failed resize checkpoint stays unavailable after fresh reopen" {
         "terminal-resize-checkpoint-failure",
         .{ .rows = 2, .columns = 4 },
     );
-    try session.append("abcdef", 2);
+    _ = try session.appendOutput("abcdef", 2, null);
     const before_payload = "before";
-    try session.store_checkpoint(.{
+    try session.storeCheckpoint(.{
         .engine_schema_revision = 1,
         .applied_cursor = session.record.output_cursor,
         .payload_len = before_payload.len,
         .checksum = contracts.checkpoint_checksum(before_payload),
-    }, before_payload, 3);
+    }, before_payload, 3, null);
 
     const resized = contracts.Dimensions{ .rows = 2, .columns = 6 };
     try session.resize(resized, 4);
@@ -8097,12 +8798,12 @@ test "failed resize checkpoint stays unavailable after fresh reopen" {
 
     fixture.profile.options.fail_at = .checkpoint_replacement;
     const resized_payload = "resized";
-    try std.testing.expectError(error.InjectedFailure, session.store_checkpoint(.{
+    try std.testing.expectError(error.InjectedFailure, session.storeCheckpoint(.{
         .engine_schema_revision = 1,
         .applied_cursor = session.record.output_cursor,
         .payload_len = resized_payload.len,
         .checksum = contracts.checkpoint_checksum(resized_payload),
-    }, resized_payload, 5));
+    }, resized_payload, 5, null));
     fixture.profile.options.fail_at = null;
     session.deinit();
     try fixture.reopen();
@@ -8118,6 +8819,68 @@ test "failed resize checkpoint stays unavailable after fresh reopen" {
         contracts.ScreenRecovery{ .unavailable = .resize_uncheckpointed },
         reopened.facts().screen_recovery,
     );
+}
+
+test "output quota cancellation stops after real directory enumeration begins" {
+    const Probe = struct {
+        cancel_flag: std.atomic.Value(bool) = .init(false),
+        entered: std.Io.Event = .unset,
+        released: std.Io.Event = .unset,
+        observed: bool = false,
+        late_record_allocations: usize = 0,
+        name_bytes: usize,
+
+        fn allocator(self: *@This()) Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = free } };
+        }
+        fn allocate(raw: *anyopaque, size: usize, alignment: std.mem.Alignment, address: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const bytes = std.testing.allocator.rawAlloc(size, alignment, address);
+            if (size == self.name_bytes) {
+                if (self.observed) {
+                    self.late_record_allocations += 1;
+                } else {
+                    self.observed = true;
+                    self.entered.set(io_mod.getIo());
+                    self.released.waitUncancelable(io_mod.getIo());
+                }
+            }
+            return bytes;
+        }
+        fn free(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, address: usize) void {
+            std.testing.allocator.rawFree(bytes, alignment, address);
+        }
+        fn cancel(self: *@This()) void {
+            self.entered.waitUncancelable(io_mod.getIo());
+            self.cancel_flag.store(true, .release);
+            self.released.set(io_mod.getIo());
+        }
+    };
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var active = try fixture.create_with_dimensions("active-cancelled-quota", .{ .rows = 1, .columns = 1 });
+    defer active.deinit();
+    const id = "q" ** 190;
+    var other = try fixture.create_with_dimensions(id, .{ .rows = 1, .columns = 1 });
+    defer other.deinit();
+    const prior = active.record.output_cursor;
+    var probe: Probe = .{ .name_bytes = "record-".len + id.len + ".json".len };
+    fixture.profile.alloc = probe.allocator();
+    defer fixture.profile.alloc = alloc;
+    const thread = try std.Thread.spawn(.{}, Probe.cancel, .{&probe});
+    var failure: ?anyerror = null;
+    const result: ?DurableSession.OutputState = active.appendOutput("cancelled output", 2, &probe.cancel_flag) catch |err| failed: {
+        failure = err;
+        break :failed null;
+    };
+    _ = result;
+    probe.entered.set(io_mod.getIo());
+    thread.join();
+    try std.testing.expect(probe.observed);
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), failure);
+    try std.testing.expectEqual(@as(usize, 0), probe.late_record_allocations);
+    try std.testing.expectEqual(prior, active.record.output_cursor);
 }
 
 test "profile quota serializes concurrent commitments at fixed limits" {
@@ -8208,8 +8971,8 @@ test "resident quota eviction mutates the single durable owner" {
         .{ .rows = 1, .columns = 1 },
     );
     defer completed.deinit();
-    try fixture.profile.register_resident(&completed);
-    try completed.append("done", 2);
+    try fixture.profile.register_resident(&completed, null);
+    _ = try completed.appendOutput("done", 2, null);
     try completed.persist_lost(3);
 
     var active = try fixture.create_with_dimensions(
@@ -8217,8 +8980,8 @@ test "resident quota eviction mutates the single durable owner" {
         .{ .rows = 1, .columns = 1 },
     );
     defer active.deinit();
-    try fixture.profile.register_resident(&active);
-    try active.append("live", 4);
+    try fixture.profile.register_resident(&active, null);
+    _ = try active.appendOutput("live", 4, null);
     try std.testing.expectEqual(@as(u64, 0), completed.record.journal_payload_bytes);
     const resident_facts = completed.facts();
     try std.testing.expect(resident_facts.raw_gap != null);
@@ -8433,11 +9196,11 @@ test "durable failure boundaries do not report success" {
         .checksum = contracts.checkpoint_checksum(payload),
     };
     fixture.profile.options.fail_at = .append;
-    try std.testing.expectError(error.InjectedFailure, session.append("x", 2));
+    try std.testing.expectError(error.InjectedFailure, session.appendOutput("x", 2, null));
     fixture.profile.options.fail_at = .checkpoint_replacement;
     try std.testing.expectError(
         error.InjectedFailure,
-        session.store_checkpoint(envelope, payload, 3),
+        session.storeCheckpoint(envelope, payload, 3, null),
     );
     fixture.profile.options.fail_at = null;
     const event_id = try session.append_event(.output, 4);
@@ -8490,9 +9253,9 @@ test "fresh reopen reconciles journal checkpoint event authority and cleanup com
     defer fixture.deinit();
 
     var journal = try fixture.create("terminal-crash-journal");
-    try journal.append("base", 2);
+    _ = try journal.appendOutput("base", 2, null);
     fixture.profile.options.fail_at = .after_journal_sync;
-    try std.testing.expectError(error.InjectedCrash, journal.append("tail", 3));
+    try std.testing.expectError(error.InjectedCrash, journal.appendOutput("tail", 3, null));
     fixture.profile.options.fail_at = null;
     journal.deinit();
     try fixture.reopen();
@@ -8509,20 +9272,20 @@ test "fresh reopen reconciles journal checkpoint event authority and cleanup com
 
     var checkpoint = try fixture.create("terminal-crash-checkpoint");
     const first_payload = "first";
-    try checkpoint.store_checkpoint(.{
+    try checkpoint.storeCheckpoint(.{
         .engine_schema_revision = 1,
         .applied_cursor = checkpoint.record.output_cursor,
         .payload_len = first_payload.len,
         .checksum = contracts.checkpoint_checksum(first_payload),
-    }, first_payload, 2);
+    }, first_payload, 2, null);
     const second_payload = "second";
     fixture.profile.options.fail_at = .after_checkpoint_write;
-    try std.testing.expectError(error.InjectedCrash, checkpoint.store_checkpoint(.{
+    try std.testing.expectError(error.InjectedCrash, checkpoint.storeCheckpoint(.{
         .engine_schema_revision = 1,
         .applied_cursor = checkpoint.record.output_cursor,
         .payload_len = second_payload.len,
         .checksum = contracts.checkpoint_checksum(second_payload),
-    }, second_payload, 3));
+    }, second_payload, 3, null));
     fixture.profile.options.fail_at = null;
     checkpoint.deinit();
     try fixture.reopen();
@@ -8581,19 +9344,19 @@ test "fresh reopen reconciles journal checkpoint event authority and cleanup com
     authority_recovery.deinit();
 
     var committed_checkpoint = try fixture.create("terminal-crash-checkpoint-record");
-    try committed_checkpoint.store_checkpoint(.{
+    try committed_checkpoint.storeCheckpoint(.{
         .engine_schema_revision = 1,
         .applied_cursor = committed_checkpoint.record.output_cursor,
         .payload_len = first_payload.len,
         .checksum = contracts.checkpoint_checksum(first_payload),
-    }, first_payload, 2);
+    }, first_payload, 2, null);
     fixture.profile.options.fail_at = .after_checkpoint_record;
-    try std.testing.expectError(error.InjectedCrash, committed_checkpoint.store_checkpoint(.{
+    try std.testing.expectError(error.InjectedCrash, committed_checkpoint.storeCheckpoint(.{
         .engine_schema_revision = 1,
         .applied_cursor = committed_checkpoint.record.output_cursor,
         .payload_len = second_payload.len,
         .checksum = contracts.checkpoint_checksum(second_payload),
-    }, second_payload, 3));
+    }, second_payload, 3, null));
     fixture.profile.options.fail_at = null;
     committed_checkpoint.deinit();
     try fixture.reopen();
@@ -8636,10 +9399,10 @@ test "fresh reopen reconciles journal checkpoint event authority and cleanup com
     acknowledged_recovery.deinit();
 
     var evicted = try fixture.create("terminal-crash-eviction");
-    try evicted.append("gone", 2);
+    _ = try evicted.appendOutput("gone", 2, null);
     try evicted.persist_lost(3);
     fixture.profile.options.fail_at = .after_eviction_record;
-    try std.testing.expectError(error.InjectedCrash, evicted.evict_completed_output());
+    try std.testing.expectError(error.InjectedCrash, evicted.evict_completed_output(null));
     fixture.profile.options.fail_at = null;
     evicted.deinit();
     try fixture.reopen();
@@ -8694,7 +9457,7 @@ test "missing checkpoint is durably reconciled without fabricating a screen" {
         .payload_len = payload.len,
         .checksum = contracts.checkpoint_checksum(payload),
     };
-    try session.store_checkpoint(envelope, payload, 2);
+    try session.storeCheckpoint(envelope, payload, 2, null);
     const name = try checkpoint_name(
         alloc,
         session.record.session_id,
@@ -8714,7 +9477,7 @@ test "journal recovery validates the complete chain and retains only a verified 
     var fixture = try TestStoreFixture.init(alloc, test_options());
     defer fixture.deinit();
     var session = try fixture.create("terminal-corrupt-journal-chain");
-    try session.append("abcdefghijkl", 2);
+    _ = try session.appendOutput("abcdefghijkl", 2, null);
     const name = try journal_name(alloc, session.record.session_id, 2);
     defer alloc.free(name);
     var replacement = try (try session.state_capability()).atomicReplace(
@@ -8757,9 +9520,9 @@ test "completed checkpoint eviction persists an explicit retention marker first"
         .payload_len = payload.len,
         .checksum = contracts.checkpoint_checksum(payload),
     };
-    try session.store_checkpoint(envelope, payload, 2);
+    try session.storeCheckpoint(envelope, payload, 2, null);
     try session.persist_lost(3);
-    try session.evict_completed_checkpoint();
+    try session.evict_completed_checkpoint(null);
     try std.testing.expectEqual(
         contracts.ScreenRecovery{ .unavailable = .retention_evicted },
         session.record.screen_recovery,
@@ -8780,7 +9543,7 @@ test "host restart marks native work lost without restart and reconnect is idemp
     var fixture = try TestStoreFixture.init(alloc, test_options());
     defer fixture.deinit();
     var session = try fixture.create("terminal-restart-loss");
-    try session.append("durable-output", 2);
+    _ = try session.appendOutput("durable-output", 2, null);
     session.deinit();
 
     var first = try fixture.profile.recover("host-two", 3);
@@ -8796,9 +9559,10 @@ test "host restart marks native work lost without restart and reconnect is idemp
     );
     defer page.deinit(alloc);
     try std.testing.expectEqualStrings("durable-output", page.output);
-    try std.testing.expect(try first.sessions.items[0].contains(
+    try std.testing.expect(try first.sessions.items[0].containsCancellable(
         "durable-output",
         .{ .segment = 1, .offset = 0 },
+        null,
     ));
     first.deinit();
 

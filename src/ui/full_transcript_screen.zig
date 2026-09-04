@@ -2419,6 +2419,60 @@ test "legacy command result without replay does not claim permanent loss" {
     try std.testing.expect(std.mem.indexOf(u8, source, "full output unavailable") == null);
 }
 
+test "empty valid command replay uses saved content without inventing output" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io_mod.getIo(), "session", std.Io.File.Permissions.fromMode(0o700));
+    var dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{ .iterate = true, .follow_symlinks = false });
+    defer dir.close(io_mod.getIo());
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
+    defer alloc.free(path);
+    var capability = try session_child_store.SessionChildCapability.initForTesting(alloc, dir, path, .writable, .{});
+    defer capability.deinit();
+    const handle = "fx-command-replay-no-frames.bin";
+    var file = try capability.createExclusiveFile(alloc, .command_artifacts, handle);
+    defer file.deinit();
+    try file.writeAll("FXRPLY01");
+    try file.sync();
+    const entries = [_]transcript_blocks.TranscriptEntry{.{ .raw_bytes = .{
+        .id = 1,
+        .bytes = @constCast("● Ran command\n"),
+        .class = .tool_status,
+    } }};
+    for ([_]bool{ false, true }) |has_output| {
+        var details = [_]ToolDetailRecord{.{
+            .entry_id = 1,
+            .tool_name = try alloc.dupe(u8, "run_command"),
+            .result = try alloc.dupe(u8, if (has_output)
+                "exit_code=0\n<stdout>\nEMPTY_REPLAY_SAVED_CONTENT\n</stdout>\n"
+            else
+                "exit_code=0\n(no output)\n"),
+            .command_output_replay = .{ .available = .{
+                .handle = try alloc.dupe(u8, handle),
+                .framed_bytes = 8,
+            } },
+            .outcome = .completed,
+        }};
+        defer details[0].deinit(alloc);
+        var projection = try buildProjection(alloc, &entries, &details, &.{}, .{
+            .system_notice_label_style = "",
+            .system_notice_text_style = "",
+            .reset_style = "",
+            .dim_style = "",
+            .red_style = "",
+        }, 80, null);
+        defer projection.deinit(alloc);
+        const measurement = try measureProjectionInterruptible(alloc, &projection, &capability, 80, null);
+        const source = try renderProjectionViewportSourceInterruptible(alloc, &projection, &capability, 80, 12, 0, null);
+        defer alloc.free(source);
+        try std.testing.expectEqual(has_output, std.mem.find(u8, source, "EMPTY_REPLAY_SAVED_CONTENT") != null);
+        try std.testing.expect(std.mem.find(u8, source, "full output unavailable") == null);
+        if (!has_output) try std.testing.expect(std.mem.find(u8, source, "│") == null);
+        try std.testing.expect(measurement.total_rows > 0);
+    }
+}
+
 test "bounded command source rejects a truncated absolute record range" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4153,10 +4207,18 @@ fn appendCommandStoredResultContent(
     styles: transcript_blocks.Styles,
     stored: StoredResult,
 ) !bool {
-    if (try appendBoundedCommandSource(alloc, walker, capability, styles, stored)) |keep_scanning| {
-        return keep_scanning;
+    const before = walker.checkpoint();
+    const keep_scanning = if (try appendBoundedCommandSource(alloc, walker, capability, styles, stored)) |bounded|
+        bounded
+    else
+        try appendMergedCommandSource(alloc, walker, capability, styles, stored);
+    if (keep_scanning and stored.kind == .command_replay and
+        stored.start_record == 0 and stored.end_record == null and
+        std.meta.eql(before, walker.checkpoint()))
+    {
+        if (stored.retained_command_fallback) |fallback| return walker.append(fallback);
     }
-    return appendMergedCommandSource(alloc, walker, capability, styles, stored);
+    return keep_scanning;
 }
 
 /// Returns null when canonical content exceeds the bounded scratch budget.
@@ -6008,7 +6070,7 @@ fn appendDeferredCommandRange(
         var stored = stored_value;
         stored.start_record = start_record;
         stored.end_record = end_record;
-        stored.retained_command_fallback = try context.alloc.alloc(u8, 0);
+        stored.retained_command_fallback = try storedCommandRangeFallback(context, stored);
         try context.builder.appendStoredResult(stored);
         return true;
     }
@@ -6042,8 +6104,22 @@ fn appendOpenEndedStoredCommandTail(
     var stored = stored_value;
     stored.start_record = start_record;
     stored.end_record = null;
-    stored.retained_command_fallback = try context.alloc.alloc(u8, 0);
+    stored.retained_command_fallback = try storedCommandRangeFallback(context, stored);
     try context.builder.appendStoredResult(stored);
+}
+
+fn storedCommandRangeFallback(context: *ProjectionComposeContext, stored: StoredResult) ![]u8 {
+    var fallback: std.Io.Writer.Allocating = .init(context.alloc);
+    errdefer fallback.deinit();
+    if (stored.kind == .command_replay) {
+        if (stored.preview) |result| {
+            const parsed = try appendInlineCommandResultRange(&fallback.writer, context.alloc, context.builder.styles(), result, context.cols, stored.start_record, stored.end_record orelse std.math.maxInt(usize));
+            if (!parsed and stored.start_record == 0) {
+                try appendTerminalSafeIndented(&fallback.writer, context.alloc, tool_result_display.contentForDisplay(result));
+            }
+        }
+    }
+    return fallback.toOwnedSlice();
 }
 
 fn prunedRangeCoveringRecord(

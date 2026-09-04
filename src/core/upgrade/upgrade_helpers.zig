@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const update_target = @import("update_target.zig");
+const process_owner = @import("../execution/process_owner.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -243,9 +244,15 @@ fn extractChecksumHex(raw: []const u8) ?[]const u8 {
 }
 
 pub fn extractTarGz(alloc: Allocator, archive_path: []const u8, dest_dir: []const u8) !void {
-    const result = std.process.run(alloc, io_mod.getIo(), .{
+    const result = process_owner.run(alloc, .{
         .argv = &.{ "tar", "-xzf", archive_path, "-C", dest_dir },
-    }) catch return error.ExtractionFailed;
+        .stdout_limit = 4096,
+        .stderr_limit = 4096,
+        .timeout_ms = 5 * 60 * 1000,
+    }) catch |err| switch (err) {
+        error.Canceled, error.Cancelled => return err,
+        else => return error.ExtractionFailed,
+    };
     defer alloc.free(result.stdout);
     defer alloc.free(result.stderr);
 
@@ -319,6 +326,64 @@ fn readAbsoluteFile(alloc: Allocator, path: []const u8) ![]u8 {
 test "platform string is valid" {
     try std.testing.expect(platform.len > 0);
     try std.testing.expect(std.mem.find(u8, platform, "-") != null);
+}
+
+test "extraction cancellation force reaps a stopped tar process" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const process_tree = @import("../execution/process_tree.zig");
+    const Probe = struct {
+        fn run(archive: []const u8, directory: []const u8) !void {
+            try extractTarGz(std.testing.allocator, archive, directory);
+        }
+
+        fn rescue(tracker: *process_tree.Tracker, done: *std.atomic.Value(bool)) void {
+            for (0..100) |_| {
+                if (done.load(.acquire)) return;
+                io_mod.sleep(10 * std.time.ns_per_ms);
+            }
+            _ = tracker.signalAll(.KILL);
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const archive = try std.fs.path.join(alloc, &.{ root, "archive.gz" });
+    defer alloc.free(archive);
+    const mkfifo = try std.process.run(alloc, io_mod.getIo(), .{ .argv = &.{ "/usr/bin/mkfifo", archive } });
+    defer alloc.free(mkfifo.stdout);
+    defer alloc.free(mkfifo.stderr);
+    try std.testing.expect(mkfifo.term == .exited and mkfifo.term.exited == 0);
+    var input = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), archive, .{ .mode = .read_write });
+    defer input.close(io_mod.getIo());
+    var tracker = try process_tree.Tracker.init(alloc);
+    defer tracker.deinit();
+    var task = try std.Io.concurrent(io_mod.getIo(), Probe.run, .{ archive, root });
+    var joined = false;
+    defer if (!joined) task.cancel(io_mod.getIo()) catch {};
+    for (0..5000) |_| {
+        try tracker.refresh(std.c.getpid());
+        if (tracker.processes.items.len != 0) break;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expect(tracker.processes.items.len != 0);
+    // The tracker also retains its discovery root; that is this test process.
+    tracker.root = null;
+    defer _ = tracker.signalAll(.KILL);
+    // The FIFO keeps real extraction in progress; STOP makes TERM insufficient.
+    _ = tracker.signalAll(.STOP);
+    var done = std.atomic.Value(bool).init(false);
+    const rescuer = try std.Thread.spawn(.{}, Probe.rescue, .{ &tracker, &done });
+    defer rescuer.join();
+    const started = io_mod.milliTimestamp();
+    const result = task.cancel(io_mod.getIo());
+    joined = true;
+    const elapsed = io_mod.milliTimestamp() - started;
+    done.store(true, .release);
+    try std.testing.expect(!tracker.anyAlive());
+    try std.testing.expect(elapsed < 500);
+    try std.testing.expectError(error.Canceled, result);
 }
 
 test "E2E upgrade base accepts only explicit IPv4 loopback origins" {

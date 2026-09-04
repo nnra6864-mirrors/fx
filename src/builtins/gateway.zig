@@ -32,6 +32,8 @@ const web_search_provider = @import("../core/tooling/web_search_provider.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const sort_utils = @import("../core/shared/sort_utils.zig");
+const cancellation = @import("../core/shared/read_cancellation.zig");
+const settings_store = @import("../core/config/settings_store.zig");
 
 const Allocator = std.mem.Allocator;
 const FetchGatewayGetResultFn = *const fn (Allocator, ?[]const u8, []const u8) anyerror!gateway_client.GetResult;
@@ -2368,8 +2370,9 @@ fn fetchCatalogForProvider(
     };
     defer alloc.free(json_text);
 
-    const catalog = parseModelCatalogForView(alloc, json_text, input.view) catch |err| {
+    const catalog = parseModelCatalogForView(alloc, json_text, input.view, input.cancel_flag) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (err == error.Cancelled) return .{ .failure = .{ .category = .cancellation } };
         return .{ .failure = .{ .category = .malformed_response, .http_status = .ok } };
     };
     return .{ .catalog = catalog };
@@ -2402,7 +2405,7 @@ fn fetchModelCatalogForView(
     };
     defer alloc.free(json_text);
 
-    return parseModelCatalogForView(alloc, json_text, view);
+    return parseModelCatalogForView(alloc, json_text, view, cancel_flag);
 }
 
 fn fetchModelCatalogResponse(
@@ -2427,10 +2430,15 @@ fn fetchModelCatalogResponse(
 
     const api_key = access.authorizationCredential();
     const gateway_team = modelCatalogHeaderTeam(access);
-    return if (cancel_flag) |flag|
-        gateway_client.fetchGatewayJsonCancellable(alloc, api_key, gateway_team, model_catalog_url, flag)
-    else
-        gateway_client.fetchGatewayJson(alloc, api_key, gateway_team, model_catalog_url);
+    var uncancelled = std.atomic.Value(bool).init(false);
+    return gateway_client.fetchGatewayJsonCancellable(
+        alloc,
+        api_key,
+        gateway_team,
+        model_catalog_url,
+        cancel_flag orelse &uncancelled,
+        .limited(model_catalog.max_response_bytes),
+    );
 }
 
 fn modelCatalogTeamPath(
@@ -2631,12 +2639,164 @@ test "model catalog GET sends fx user agent without attribution headers" {
     if (fixture.failure()) |err| return err;
 }
 
+const CatalogAllocationGate = struct {
+    minimum: usize,
+    maximum: usize = std.math.maxInt(usize),
+    reached: std.Io.Event = .unset,
+    release: std.Io.Event = .unset,
+    triggered: std.atomic.Value(bool) = .init(false),
+
+    fn allocator(self: *@This()) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (len >= self.minimum and len <= self.maximum and !self.triggered.swap(true, .acq_rel)) {
+            self.reached.set(std.testing.io);
+            self.release.waitUncancelable(std.testing.io);
+        }
+        return std.testing.allocator.rawAlloc(len, alignment, ret_addr);
+    }
+    fn resize(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret_addr: usize) bool {
+        return std.testing.allocator.rawResize(memory, alignment, len, ret_addr);
+    }
+    fn remap(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret_addr: usize) ?[*]u8 {
+        return std.testing.allocator.rawRemap(memory, alignment, len, ret_addr);
+    }
+    fn free(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        std.testing.allocator.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test "model catalog parser observes cancellation after allocating parsed content" {
+    var json: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer json.deinit();
+    try json.writer.writeAll("{\"data\":[{\"id\":\"openai/gpt-5\"}],\"description\":\"");
+    try json.writer.splatByteAll('x', 2 * 1024 * 1024);
+    try json.writer.writeAll("\"}");
+    const Parser = struct {
+        gate: CatalogAllocationGate = .{ .minimum = 64 * 1024 },
+        cancel: std.atomic.Value(bool) = .init(false),
+        bytes: []const u8,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            defer self.gate.reached.set(std.testing.io);
+            var catalog = parseModelCatalogForView(self.gate.allocator(), self.bytes, .full, &self.cancel) catch |err| {
+                self.failure = err;
+                return;
+            };
+            freeModelCatalog(self.gate.allocator(), &catalog);
+        }
+    };
+    var parser = Parser{ .bytes = json.written() };
+    const thread = try std.Thread.spawn(.{}, Parser.run, .{&parser});
+    parser.gate.reached.waitUncancelable(std.testing.io);
+    const started_ns = io_mod.nanoTimestamp();
+    parser.cancel.store(true, .release);
+    parser.gate.release.set(std.testing.io);
+    thread.join();
+    try std.testing.expect(parser.gate.triggered.load(.acquire));
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), parser.failure);
+    try std.testing.expect(io_mod.nanoTimestamp() - started_ns < 500 * std.time.ns_per_ms);
+}
+
+test "model catalog provider preserves cancellation after HTTP body parsing" {
+    var fixture = try gateway_client.TestModelCatalogFixture.init();
+    defer fixture.deinit();
+    try fixture.start();
+    try std.testing.expect(fixture.waitForAcceptStart(5000));
+    const env = try installLoopbackModelsEnv(std.testing.allocator, fixture.port());
+    defer env.deinit();
+    const Fetcher = struct {
+        gate: CatalogAllocationGate = .{
+            .minimum = "anthropic/claude-opus-4".len,
+            .maximum = "anthropic/claude-opus-4".len,
+        },
+        cancel: std.atomic.Value(bool) = .init(false),
+        failure: ?model_catalog.FailureCategory = null,
+
+        fn run(self: *@This()) void {
+            defer self.gate.reached.set(std.testing.io);
+            const response = fetchCatalogForProvider(null, self.gate.allocator(), .{
+                .endpoint = models_path,
+                .cancel_flag = &self.cancel,
+                .view = .picker,
+            }) catch {
+                self.failure = .resource_exhausted;
+                return;
+            };
+            switch (response) {
+                .failure => |failure| self.failure = failure.category,
+                .catalog => |value| {
+                    var catalog = value;
+                    freeModelCatalog(self.gate.allocator(), &catalog);
+                },
+            }
+        }
+    };
+    var fetcher: Fetcher = .{};
+    const thread = try std.Thread.spawn(.{}, Fetcher.run, .{&fetcher});
+    fetcher.gate.reached.waitUncancelable(std.testing.io);
+    const started_ns = io_mod.nanoTimestamp();
+    fetcher.cancel.store(true, .release);
+    fetcher.gate.release.set(std.testing.io);
+    thread.join();
+    try std.testing.expect(fetcher.gate.triggered.load(.acquire));
+    try std.testing.expectEqual(@as(?model_catalog.FailureCategory, .cancellation), fetcher.failure);
+    try std.testing.expect(io_mod.nanoTimestamp() - started_ns < 500 * std.time.ns_per_ms);
+    if (fixture.failure()) |err| return err;
+}
+
+test "model picker projection observes cancellation after selection begins" {
+    const Projector = struct {
+        gate: CatalogAllocationGate = .{ .minimum = "openai/gpt-5".len, .maximum = "openai/gpt-5".len },
+        cancel: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            defer self.gate.reached.set(std.testing.io);
+            const candidates = [_]ModelCatalogEntry{
+                .{ .id = @constCast("openai/gpt-5"), .model_type = @constCast("language") },
+                .{ .id = @constCast("private/custom"), .model_type = @constCast("language") },
+            };
+            var catalog = model_catalog.projectPickerModelCatalog(self.gate.allocator(), &candidates, &self.cancel) catch |err| {
+                self.failure = err;
+                return;
+            };
+            freeModelCatalog(self.gate.allocator(), &catalog);
+        }
+    };
+    var projector: Projector = .{};
+    const thread = try std.Thread.spawn(.{}, Projector.run, .{&projector});
+    projector.gate.reached.waitUncancelable(std.testing.io);
+    projector.cancel.store(true, .release);
+    projector.gate.release.set(std.testing.io);
+    thread.join();
+    try std.testing.expect(projector.gate.triggered.load(.acquire));
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), projector.failure);
+}
+
+test "model catalog rejects ids exceeding the writable model bound" {
+    var json: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer json.deinit();
+    try json.writer.writeAll("{\"data\":[{\"id\":\"");
+    try json.writer.splatByteAll('x', settings_store.max_model_bytes + 1);
+    try json.writer.writeAll("\"}]}");
+    const result = parseModelCatalogForView(std.testing.allocator, json.written(), .full, null);
+    if (result) |value| {
+        var catalog = value;
+        freeModelCatalog(std.testing.allocator, &catalog);
+        return error.TestOversizedModelAccepted;
+    } else |err| try std.testing.expectEqual(error.MalformedResponse, err);
+}
+
 fn parseModelIdsForView(
     alloc: std.mem.Allocator,
     json_text: []const u8,
     view: ModelCatalogView,
 ) !std.ArrayList([]u8) {
-    var catalog = try parseModelCatalogForView(alloc, json_text, view);
+    var catalog = try parseModelCatalogForView(alloc, json_text, view, null);
     defer freeModelCatalog(alloc, &catalog);
 
     return model_catalog.projectModelIds(alloc, catalog.items);
@@ -2646,22 +2806,33 @@ pub fn parseModelCatalogForView(
     alloc: std.mem.Allocator,
     json_text: []const u8,
     view: ModelCatalogView,
+    cancel_flag: cancellation.CancelFlag,
 ) !std.ArrayList(ModelCatalogEntry) {
-    var catalog = try parseSortedModelCatalog(alloc, json_text);
+    var catalog = try parseSortedModelCatalog(alloc, json_text, cancel_flag);
     switch (view) {
         .full => return catalog,
         .picker => {
             defer freeModelCatalog(alloc, &catalog);
-            return model_catalog.projectPickerModelCatalog(alloc, catalog.items);
+            return model_catalog.projectPickerModelCatalog(alloc, catalog.items, cancel_flag);
         },
     }
 }
 
-fn parseSortedModelCatalog(alloc: std.mem.Allocator, json_text: []const u8) !std.ArrayList(ModelCatalogEntry) {
+fn parseSortedModelCatalog(alloc: Allocator, json_text: []const u8, cancel_flag: cancellation.CancelFlag) !std.ArrayList(ModelCatalogEntry) {
+    try cancellation.check(cancel_flag);
+    if (json_text.len > model_catalog.max_response_bytes) return error.MalformedResponse;
     var candidates: std.ArrayList(ModelCatalogEntry) = .empty;
     errdefer freeModelCatalog(alloc, &candidates);
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json_text, .{});
+    var source = std.Io.Reader.fixed(json_text);
+    var buffer: [cancellation.work_bytes]u8 = undefined;
+    var checked = cancellation.Reader.init(&source, &buffer, cancel_flag);
+    var reader = std.json.Reader.init(alloc, &checked.interface);
+    defer reader.deinit();
+    var parsed = std.json.parseFromTokenSource(std.json.Value, alloc, &reader, .{ .max_value_len = json_text.len }) catch |err| {
+        try cancellation.check(cancel_flag);
+        return err;
+    };
     defer parsed.deinit();
 
     if (parsed.value != .object) return error.MalformedResponse;
@@ -2669,14 +2840,15 @@ fn parseSortedModelCatalog(alloc: std.mem.Allocator, json_text: []const u8) !std
     if (data_value != .array) return error.MalformedResponse;
 
     for (data_value.array.items) |entry| {
-        const candidate = (try parseModelCatalogEntry(alloc, entry)) orelse continue;
+        try cancellation.check(cancel_flag);
+        const candidate = (try parseModelCatalogEntry(alloc, entry, cancel_flag)) orelse continue;
         candidates.append(alloc, candidate) catch |err| {
             model_catalog.freeModelCatalogEntry(alloc, candidate);
             return err;
         };
     }
 
-    sort_utils.sort(ModelCatalogEntry, candidates.items, {}, model_catalog.compareModelCatalogEntries);
+    try sort_utils.sortInterruptible(ModelCatalogEntry, candidates.items, {}, model_catalog.compareModelCatalogEntries, cancel_flag);
 
     return candidates;
 }
@@ -2686,10 +2858,10 @@ fn parsePickerModelIds(alloc: std.mem.Allocator, json_text: []const u8) !std.Arr
 }
 
 fn parsePickerModelCatalog(alloc: std.mem.Allocator, json_text: []const u8) !std.ArrayList(ModelCatalogEntry) {
-    return parseModelCatalogForView(alloc, json_text, .picker);
+    return parseModelCatalogForView(alloc, json_text, .picker, null);
 }
 
-fn parseModelCatalogEntry(alloc: std.mem.Allocator, entry: std.json.Value) !?ModelCatalogEntry {
+fn parseModelCatalogEntry(alloc: std.mem.Allocator, entry: std.json.Value, cancel_flag: cancellation.CancelFlag) !?ModelCatalogEntry {
     if (entry != .object) return null;
 
     const model_type = if (entry.object.get("type")) |type_value| blk: {
@@ -2701,6 +2873,7 @@ fn parseModelCatalogEntry(alloc: std.mem.Allocator, entry: std.json.Value) !?Mod
 
     const id_value = entry.object.get("id") orelse return null;
     if (id_value != .string) return null;
+    if (id_value.string.len > settings_store.max_model_bytes) return error.MalformedResponse;
 
     const released = if (entry.object.get("released")) |value|
         switch (value) {
@@ -2711,25 +2884,25 @@ fn parseModelCatalogEntry(alloc: std.mem.Allocator, entry: std.json.Value) !?Mod
         0;
 
     const tags_value = entry.object.get("tags");
-    const has_tool_use = optionalTagListContains(tags_value, "tool-use");
-    var reasoning_efforts = try parseReasoningEfforts(alloc, entry.object.get("reasoning_options"));
+    const has_tool_use = try optionalTagListContains(tags_value, "tool-use", cancel_flag);
+    var reasoning_efforts = try parseReasoningEfforts(alloc, entry.object.get("reasoning_options"), cancel_flag);
     errdefer reasoning_efforts.deinit(alloc);
-    const has_reasoning = optionalTagListContains(tags_value, "reasoning") or reasoning_efforts.items.len > 0;
-    const supports_fast_mode = supportsFastMode(entry.object);
-    const has_vision = optionalTagListContains(tags_value, "vision");
-    const has_file_input = optionalTagListContains(tags_value, "file-input");
-    const has_web_search = optionalTagListContains(tags_value, "web-search");
-    const has_explicit_caching = optionalTagListContains(tags_value, "explicit-caching");
-    const has_implicit_caching = optionalTagListContains(tags_value, "implicit-caching");
+    const has_reasoning = (try optionalTagListContains(tags_value, "reasoning", cancel_flag)) or reasoning_efforts.items.len > 0;
+    const supports_fast_mode = try supportsFastMode(entry.object, cancel_flag);
+    const has_vision = try optionalTagListContains(tags_value, "vision", cancel_flag);
+    const has_file_input = try optionalTagListContains(tags_value, "file-input", cancel_flag);
+    const has_web_search = try optionalTagListContains(tags_value, "web-search", cancel_flag);
+    const has_explicit_caching = try optionalTagListContains(tags_value, "explicit-caching", cancel_flag);
+    const has_implicit_caching = try optionalTagListContains(tags_value, "implicit-caching", cancel_flag);
 
     const context_window = optionalUnsignedU32(entry.object.get("context_window"));
     const max_tokens = optionalUnsignedU32(entry.object.get("max_tokens"));
-    const web_search_price = try parseWebSearchPrice(alloc, entry.object.get("pricing"));
+    const web_search_price = try parseWebSearchPrice(alloc, entry.object.get("pricing"), cancel_flag);
     errdefer if (web_search_price) |value| alloc.free(value);
 
-    const id = try alloc.dupe(u8, id_value.string);
+    const id = try cancellation.duplicateBytes(alloc, id_value.string, cancel_flag);
     errdefer alloc.free(id);
-    const owned_model_type = try alloc.dupe(u8, model_type);
+    const owned_model_type = try cancellation.duplicateBytes(alloc, model_type, cancel_flag);
     errdefer alloc.free(owned_model_type);
 
     return .{
@@ -2751,19 +2924,21 @@ fn parseModelCatalogEntry(alloc: std.mem.Allocator, entry: std.json.Value) !?Mod
     };
 }
 
-fn parseReasoningEfforts(alloc: std.mem.Allocator, options: ?std.json.Value) !std.ArrayList(shared_types.ReasoningEffort) {
+fn parseReasoningEfforts(alloc: std.mem.Allocator, options: ?std.json.Value, cancel_flag: cancellation.CancelFlag) !std.ArrayList(shared_types.ReasoningEffort) {
     var efforts: std.ArrayList(shared_types.ReasoningEffort) = .empty;
     errdefer efforts.deinit(alloc);
 
     const value = options orelse return efforts;
     if (value != .array) return efforts;
     for (value.array.items) |option| {
+        try cancellation.check(cancel_flag);
         if (option != .object) continue;
         const option_type = option.object.get("type") orelse continue;
         if (option_type != .string or !std.mem.eql(u8, option_type.string, "effort")) continue;
         const values = option.object.get("values") orelse continue;
         if (values != .array) continue;
         for (values.array.items) |raw| {
+            try cancellation.check(cancel_flag);
             if (efforts.items.len >= shared_types.ReasoningEffort.max_options) break;
             if (raw != .string) continue;
             const effort = shared_types.ReasoningEffort.parse(raw.string) orelse continue;
@@ -2775,10 +2950,11 @@ fn parseReasoningEfforts(alloc: std.mem.Allocator, options: ?std.json.Value) !st
     return efforts;
 }
 
-fn hasToggleOption(options: ?std.json.Value) bool {
+fn hasToggleOption(options: ?std.json.Value, cancel_flag: cancellation.CancelFlag) !bool {
     const value = options orelse return false;
     if (value != .array) return false;
     for (value.array.items) |option| {
+        try cancellation.check(cancel_flag);
         if (option != .object) continue;
         const option_type = option.object.get("type") orelse continue;
         if (option_type == .string and std.mem.eql(u8, option_type.string, "toggle")) return true;
@@ -2786,8 +2962,8 @@ fn hasToggleOption(options: ?std.json.Value) bool {
     return false;
 }
 
-fn supportsFastMode(entry: std.json.ObjectMap) bool {
-    if (hasToggleOption(entry.get("fast_options"))) return true;
+fn supportsFastMode(entry: std.json.ObjectMap, cancel_flag: cancellation.CancelFlag) !bool {
+    if (try hasToggleOption(entry.get("fast_options"), cancel_flag)) return true;
 
     const pricing = entry.get("pricing");
     if (hasObjectField(pricing, "fast")) return true;
@@ -2814,12 +2990,12 @@ fn optionalUnsignedU32(value: ?std.json.Value) u32 {
     return std.math.cast(u32, actual.integer) orelse 0;
 }
 
-fn parseWebSearchPrice(alloc: std.mem.Allocator, pricing: ?std.json.Value) !?[]u8 {
+fn parseWebSearchPrice(alloc: std.mem.Allocator, pricing: ?std.json.Value, cancel_flag: cancellation.CancelFlag) !?[]u8 {
     const pricing_value = pricing orelse return null;
     if (pricing_value != .object) return null;
     const price = pricing_value.object.get("web_search") orelse return null;
     return switch (price) {
-        .string => |value| try alloc.dupe(u8, value),
+        .string => |value| try cancellation.duplicateBytes(alloc, value, cancel_flag),
         .integer, .float => blk: {
             var out: std.Io.Writer.Allocating = .init(alloc);
             defer out.deinit();
@@ -2830,13 +3006,14 @@ fn parseWebSearchPrice(alloc: std.mem.Allocator, pricing: ?std.json.Value) !?[]u
     };
 }
 
-fn optionalTagListContains(value: ?std.json.Value, needle: []const u8) bool {
-    return if (value) |actual| tagListContains(actual, needle) else false;
+fn optionalTagListContains(value: ?std.json.Value, needle: []const u8, cancel_flag: cancellation.CancelFlag) !bool {
+    return if (value) |actual| tagListContains(actual, needle, cancel_flag) else false;
 }
 
-fn tagListContains(value: std.json.Value, needle: []const u8) bool {
+fn tagListContains(value: std.json.Value, needle: []const u8, cancel_flag: cancellation.CancelFlag) !bool {
     if (value != .array) return false;
     for (value.array.items) |item| {
+        try cancellation.check(cancel_flag);
         if (item == .string and std.ascii.eqlIgnoreCase(item.string, needle)) return true;
     }
     return false;
@@ -2998,13 +3175,13 @@ test "gateway catalog rejects malformed envelope shapes" {
     for (malformed_envelopes) |json_text| {
         try std.testing.expectError(
             error.MalformedResponse,
-            parseSortedModelCatalog(std.testing.allocator, json_text),
+            parseSortedModelCatalog(std.testing.allocator, json_text, null),
         );
     }
 }
 
 test "gateway catalog accepts an explicit empty data array" {
-    var catalog = try parseSortedModelCatalog(std.testing.allocator, "{\"data\":[]}");
+    var catalog = try parseSortedModelCatalog(std.testing.allocator, "{\"data\":[]}", null);
     defer freeModelCatalog(std.testing.allocator, &catalog);
 
     try std.testing.expectEqual(@as(usize, 0), catalog.items.len);
@@ -3017,7 +3194,7 @@ test "gateway catalog retains broad capability metadata" {
         \\]}
     ;
 
-    var catalog = try parseSortedModelCatalog(std.testing.allocator, json_text);
+    var catalog = try parseSortedModelCatalog(std.testing.allocator, json_text, null);
     defer freeModelCatalog(std.testing.allocator, &catalog);
 
     try std.testing.expectEqual(@as(usize, 1), catalog.items.len);
@@ -3043,7 +3220,7 @@ test "gateway catalog recognizes structured reasoning without a reasoning tag" {
         \\]}
     ;
 
-    var catalog = try parseSortedModelCatalog(std.testing.allocator, json_text);
+    var catalog = try parseSortedModelCatalog(std.testing.allocator, json_text, null);
     defer freeModelCatalog(std.testing.allocator, &catalog);
 
     try std.testing.expectEqual(@as(usize, 1), catalog.items.len);
@@ -3065,7 +3242,7 @@ test "gateway catalog derives Fast support from explicit provider metadata" {
         \\ ]}
     ;
 
-    var catalog = try parseSortedModelCatalog(std.testing.allocator, json_text);
+    var catalog = try parseSortedModelCatalog(std.testing.allocator, json_text, null);
     defer freeModelCatalog(std.testing.allocator, &catalog);
 
     const expected = [_]struct { id: []const u8, supports_fast_mode: bool }{
@@ -3093,7 +3270,7 @@ test "gateway catalog controls are explicit ordered and bounded" {
         \\ ]}
     ;
 
-    var catalog = try parseSortedModelCatalog(std.testing.allocator, json_text);
+    var catalog = try parseSortedModelCatalog(std.testing.allocator, json_text, null);
     defer freeModelCatalog(std.testing.allocator, &catalog);
 
     try std.testing.expectEqual(@as(usize, 3), catalog.items.len);

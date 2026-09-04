@@ -459,7 +459,7 @@ const ApiKeySaveRuntime = struct {
     const Self = @This();
 
     mutex: std.Io.Mutex = .init,
-    thread: ?std.Thread = null,
+    thread: ?std.Io.Future(void) = null,
     running: bool = false,
     /// Owned for the worker's lifetime and zeroed by it, so the entry stage can
     /// drop its own buffer the moment the save starts.
@@ -480,7 +480,7 @@ const ApiKeySaveRuntime = struct {
         self.deps = deps;
         self.mutex.unlock(io_mod.getIo());
 
-        self.thread = std.Thread.spawn(.{}, workerMain, .{ self, alloc }) catch {
+        self.thread = std.Io.concurrent(io_mod.getIo(), workerMain, .{ self, alloc }) catch {
             self.mutex.lockUncancelable(io_mod.getIo());
             self.running = false;
             var abandoned = self.key;
@@ -519,7 +519,10 @@ const ApiKeySaveRuntime = struct {
         self.outcome = null;
         self.mutex.unlock(io_mod.getIo());
 
-        if (thread) |handle| handle.join();
+        if (thread) |handle| {
+            var task = handle;
+            task.await(io_mod.getIo());
+        }
         _ = alloc;
         return outcome;
     }
@@ -534,7 +537,10 @@ const ApiKeySaveRuntime = struct {
     fn deinit(self: *Self, alloc: Allocator) void {
         const thread = self.thread;
         self.thread = null;
-        if (thread) |handle| handle.join();
+        if (thread) |handle| {
+            var task = handle;
+            task.cancel(io_mod.getIo());
+        }
         if (self.outcome) |*outcome| outcome.deinit(alloc);
         self.outcome = null;
         var spent = self.key;
@@ -606,7 +612,7 @@ const PromptCredentialRefreshTask = struct {
     transport: oauth_transport.Provider,
     source: credentials.Source,
     expected_account_id: ?[]u8,
-    thread: ?std.Thread = null,
+    thread: ?std.Io.Future(void) = null,
     cancel_requested: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
     credential: ?credentials.Credential = null,
@@ -630,7 +636,7 @@ const PromptCredentialRefreshTask = struct {
             .source = source,
             .expected_account_id = owned_account_id,
         };
-        task.thread = try std.Thread.spawn(.{}, workerMain, .{task});
+        task.thread = try std.Io.concurrent(io_mod.getIo(), workerMain, .{task});
         return task;
     }
 
@@ -673,7 +679,7 @@ const PromptCredentialRefreshTask = struct {
     }
 
     fn takeResult(self: *PromptCredentialRefreshTask) PromptCredentialRefreshPoll {
-        if (self.thread) |thread| thread.join();
+        if (self.thread) |*thread| thread.await(io_mod.getIo());
         self.thread = null;
         const result: PromptCredentialRefreshPoll = if (self.credential) |credential|
             .{ .ready = credential }
@@ -689,7 +695,7 @@ const PromptCredentialRefreshTask = struct {
 
     fn deinit(self: *PromptCredentialRefreshTask) void {
         self.cancel_requested.store(true, .seq_cst);
-        if (self.thread) |thread| thread.join();
+        if (self.thread) |*thread| thread.cancel(io_mod.getIo());
         self.thread = null;
         if (self.credential) |*credential| credential.deinit(std.heap.c_allocator);
         self.credential = null;
@@ -706,7 +712,8 @@ const PromptCredentialRefreshTask = struct {
 
 const InventoryRefreshTask = struct {
     alloc: Allocator,
-    thread: ?std.Thread = null,
+    thread: ?std.Io.Future(void) = null,
+    cancel_requested: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     action: InventoryRefreshAction,
     deps: InventoryRefreshDeps,
@@ -724,7 +731,7 @@ const InventoryRefreshTask = struct {
             .action = action,
             .deps = deps,
         };
-        task.thread = std.Thread.spawn(.{}, workerMain, .{task}) catch |err| {
+        task.thread = std.Io.concurrent(io_mod.getIo(), workerMain, .{task}) catch |err| {
             alloc.destroy(task);
             return err;
         };
@@ -732,25 +739,29 @@ const InventoryRefreshTask = struct {
     }
 
     fn workerMain(self: *InventoryRefreshTask) void {
+        defer self.done.store(true, .release);
         var detected: SourceSet = .empty;
         for (credential_source_order) |source| {
+            if (self.cancel_requested.load(.acquire)) {
+                self.failure = error.Cancelled;
+                return;
+            }
             const present = self.deps.probe(
                 self.deps.ctx,
                 self.alloc,
                 source,
             ) catch |err| {
                 self.failure = err;
-                self.done.store(true, .release);
                 return;
             };
             if (present) detected.insert(source);
         }
         self.inventory = detected;
-        self.done.store(true, .release);
     }
 
     fn deinit(self: *InventoryRefreshTask) void {
-        if (self.thread) |thread| thread.join();
+        self.cancel_requested.store(true, .release);
+        if (self.thread) |*thread| thread.cancel(io_mod.getIo());
         const alloc = self.alloc;
         alloc.destroy(self);
     }
@@ -1527,8 +1538,8 @@ pub const Runtime = struct {
     ) ?InventoryRefreshResult {
         const task = self.inventory_refresh_task orelse return null;
         if (!task.done.load(.acquire)) return null;
-        if (task.thread) |thread| {
-            thread.join();
+        if (task.thread) |*thread| {
+            thread.await(io_mod.getIo());
             task.thread = null;
         }
         self.inventory_refresh_task = null;
@@ -3912,6 +3923,115 @@ test "deinit joins a save worker that is still running" {
     // Must not hang, must not leak the loaded credential the worker produced.
     runtime.deinit(alloc);
     try std.testing.expect(runtime.api_key_save.thread == null);
+}
+
+test "auth deinit cancels API key validation after the HTTP request arrives" {
+    try testAuthHttpShutdown(.save);
+}
+
+test "auth deinit cancels inventory after a probe has begun blocking IO" {
+    try testAuthHttpShutdown(.inventory);
+}
+
+test "auth deinit cancels credential refresh during blocking IO outside transport" {
+    try testAuthHttpShutdown(.refresh);
+}
+
+test "auth shutdown stops inventory before another probe after cancellation is translated" {
+    try testAuthHttpShutdown(.inventory_omit);
+}
+
+fn testAuthHttpShutdown(operation: enum { save, inventory, inventory_omit, refresh }) !void {
+    const Fixture = struct {
+        server: std.Io.net.Server,
+        arrived: std.atomic.Value(bool) = .init(false),
+        stop: std.atomic.Value(bool) = .init(false),
+        probes: std.atomic.Value(usize) = .init(0),
+
+        fn serve(self: *@This()) void {
+            const io = io_mod.getIo();
+            const stream = self.server.accept(io) catch return;
+            defer stream.close(io);
+            var buf: [4096]u8 = undefined;
+            var reader = stream.reader(io, &buf);
+            var last: [4]u8 = @splat(0);
+            for (0..4096) |_| {
+                const byte = reader.interface.takeByte() catch return;
+                last = .{ last[1], last[2], last[3], byte };
+                if (std.mem.eql(u8, &last, "\r\n\r\n")) break;
+            }
+            self.arrived.store(true, .release);
+            // A bounded rescue makes the untouched raw-thread join fail, not hang.
+            for (0..100) |_| {
+                if (self.stop.load(.acquire)) return;
+                io_mod.sleep(10 * std.time.ns_per_ms);
+            }
+        }
+
+        fn validate(raw: ?*anyopaque, alloc: Allocator, _: []const u8) api_key_validator.Result {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            var url_buf: [96]u8 = undefined;
+            const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/models", .{self.server.socket.address.getPort()}) catch unreachable;
+            var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
+            defer client.deinit();
+            _ = client.fetch(.{ .location = .{ .url = url } }) catch return .unavailable;
+            return .accepted;
+        }
+
+        fn probe(raw: ?*anyopaque, alloc: Allocator, _: credentials.Source) !bool {
+            _ = validate(raw, alloc, "test-key");
+            return error.CredentialSourceUnavailable;
+        }
+
+        fn probeOmit(raw: ?*anyopaque, alloc: Allocator, _: credentials.Source) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.probes.fetchAdd(1, .monotonic) == 0) _ = validate(raw, alloc, "test-key");
+            return false;
+        }
+
+        fn refresh(self: *@This()) void {
+            _ = validate(self, std.testing.allocator, "test-key");
+        }
+    };
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var fixture: Fixture = .{ .server = try address.listen(io_mod.getIo(), .{}) };
+    defer fixture.server.deinit(io_mod.getIo());
+    const server_thread = try std.Thread.spawn(.{}, Fixture.serve, .{&fixture});
+    defer server_thread.join();
+    defer fixture.stop.store(true, .release);
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    switch (operation) {
+        .save => {
+            runtime.openApiKeyPicker(alloc);
+            for ("test-key") |byte| _ = try runtime.appendApiKeyByte(alloc, byte);
+            try std.testing.expectEqual(ApiKeySaveStart.started, runtime.beginApiKeySaveWithDeps(alloc, .{
+                .validator = .{ .context = &fixture, .validate_fn = Fixture.validate },
+            }));
+        },
+        .inventory, .inventory_omit => runtime.inventory_refresh_task = try InventoryRefreshTask.start(alloc, .{ .provider = .gateway }, .{
+            .ctx = &fixture,
+            .probe = if (operation == .inventory_omit) Fixture.probeOmit else Fixture.probe,
+        }),
+        .refresh => {
+            const task = try std.heap.c_allocator.create(PromptCredentialRefreshTask);
+            task.* = .{ .transport = oauth_transport.unavailable_provider, .source = .fx_login, .expected_account_id = null };
+            task.thread = try std.Io.concurrent(io_mod.getIo(), Fixture.refresh, .{&fixture});
+            runtime.prompt_credential_refresh_task = task;
+        },
+    }
+    for (0..5000) |_| {
+        if (fixture.arrived.load(.acquire)) break;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    const arrived = fixture.arrived.load(.acquire);
+    const started = io_mod.milliTimestamp();
+    runtime.deinit(alloc);
+    if (operation == .inventory_omit) try std.testing.expectEqual(@as(usize, 1), fixture.probes.load(.acquire));
+    try std.testing.expect(arrived);
+    try std.testing.expect(io_mod.milliTimestamp() - started < 500);
+    try std.testing.expect(runtime.api_key_save.thread == null);
+    try std.testing.expectEqual(@as(usize, 0), runtime.api_key_input.capacity);
 }
 
 test "api key entry never reallocates while the key is in memory" {

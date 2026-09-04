@@ -54,6 +54,7 @@ fn collectFromHomeCancelable(
         else => return err,
     };
     defer store.deinit(alloc);
+    store.resume_cancel_flag = cancel_requested;
 
     var marked_sessions = try store.listUsageRecoverySessions(alloc);
     defer {
@@ -77,7 +78,8 @@ fn collectFromHomeCancelable(
 
     for (marked_sessions.items) |marked| {
         if (cancelRequested(cancel_requested)) return error.Cancelled;
-        var state = store.loadReadOnly(alloc, marked.id) catch {
+        var state = store.loadReadOnly(alloc, marked.id) catch |err| {
+            if (err == error.Cancelled) return err;
             unknown_pending = true;
             continue;
         };
@@ -219,6 +221,82 @@ test "empty recovery owns empty slices" {
     try std.testing.expect(!recovery.unknown_pending);
 }
 
+test "usage recovery cancels after a marked session replay begins" {
+    const Reader = struct {
+        home: []const u8,
+        entered: std.atomic.Value(bool) = .init(false),
+        cancel: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+
+        fn allocator(self: *@This()) Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = free } };
+        }
+        fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const bytes = std.testing.allocator.rawAlloc(len, alignment, ra);
+            if (len >= 32 * 1024 and !self.entered.swap(true, .acq_rel)) {
+                while (!self.cancel.load(.acquire)) std.Thread.yield() catch {};
+            }
+            return bytes;
+        }
+        fn free(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            std.testing.allocator.rawFree(bytes, alignment, ra);
+        }
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            var loaded = collectFromHomeConservativeCancelable(self.allocator(), self.home, &self.cancel) catch |err| {
+                self.failure = err;
+                return;
+            };
+            loaded.deinit(self.allocator());
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const history = try alloc.alloc(session.HistoryTurn, 1);
+    history[0] = try session.makeAssistantTurn(alloc, "saved", "x" ** (128 * 1024));
+    var state = session_codec.DurableSessionState{
+        .id = try alloc.dupe(u8, "cancel-recovery"),
+        .origin_workspace_root = try alloc.dupe(u8, home),
+        .workspace_root = try alloc.dupe(u8, home),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = .default(),
+        .preferences = .{ .model = try alloc.dupe(u8, "provider/model"), .effort = .auto, .fast_mode = false },
+        .history = history,
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+    };
+    defer state.deinit(alloc);
+    var store = try session_store.Store.initFromHome(alloc, home, home);
+    defer store.deinit(alloc);
+    var writable = try store.startWritableSession(alloc, state);
+    _ = try writable.appendEvent(alloc, .{ .history_turn_committed = .{
+        .conversation_language = state.conversation_language,
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+        .turn = history[0],
+    } }, 2, .retry_expected_tail, .{ .checkpoint_interval = 0 });
+    writable.deinit(alloc);
+    try store.markUsageRecoveryPending(alloc, state.id, 1);
+    var verified = try store.loadReadOnly(alloc, state.id);
+    defer verified.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), verified.history.len);
+    var reader = Reader{ .home = home };
+    const thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+    while (!reader.entered.load(.acquire) and !reader.done.load(.acquire)) std.Thread.yield() catch {};
+    const started = io_mod.nanoTimestamp();
+    reader.cancel.store(true, .release);
+    thread.join();
+    try std.testing.expect(reader.entered.load(.acquire));
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), reader.failure);
+    try std.testing.expect(io_mod.nanoTimestamp() - started < 500 * std.time.ns_per_ms);
+}
+
 test "cancelled recovery stops before opening profile state" {
     const alloc = std.testing.allocator;
     var cancelled = std.atomic.Value(bool).init(true);
@@ -298,7 +376,7 @@ test "recovery markers are idempotent and clear durably" {
 test "recovery registry reads only marked durable session state" {
     const alloc = std.testing.allocator;
     const Checkpoint = struct {
-        fn persist(_: *anyopaque, _: session_usage.Snapshot) !void {}
+        fn persist(_: *anyopaque, _: session_usage.Snapshot, _: ?*const std.atomic.Value(bool)) !void {}
     };
 
     var tmp = std.testing.tmpDir(.{});

@@ -57,7 +57,7 @@ pub fn execute(
                 switch (completion.kind) {
                     .cancelled => .cancelled,
                     .unavailable => if (completion.is_missing_capability(
-                        contracts.protocol_capability_complete_process_tree_signals,
+                        contracts.protocol_capability_complete_process_tree_signals | contracts.protocol_capability_owner_exit,
                     ))
                         .unsupported_host
                     else
@@ -84,7 +84,7 @@ pub fn execute(
 fn disconnectedActionIsRetryable(action: contracts.Action) bool {
     return switch (action) {
         .read, .screen, .wait, .inspect, .list => true,
-        .start, .write, .resize, .signal, .close => false,
+        .start, .write, .resize, .signal, .close, .close_owner => false,
     };
 }
 
@@ -116,6 +116,7 @@ test "disconnect retryability excludes actions that may already have effects" {
     try std.testing.expect(!disconnectedActionIsRetryable(.write));
     try std.testing.expect(!disconnectedActionIsRetryable(.signal));
     try std.testing.expect(!disconnectedActionIsRetryable(.close));
+    try std.testing.expect(!disconnectedActionIsRetryable(.close_owner));
     try std.testing.expect(disconnectedActionIsRetryable(.list));
     try std.testing.expect(disconnectedActionIsRetryable(.wait));
 }

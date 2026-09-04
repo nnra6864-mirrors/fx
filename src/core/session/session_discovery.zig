@@ -6,6 +6,7 @@ const session_codec = @import("session_codec.zig");
 const session_child_store = @import("session_child_store.zig");
 const session_json = @import("session_json.zig");
 const session_log = @import("session_log.zig");
+const session_read = @import("../shared/read_cancellation.zig");
 const session_projection = @import("session_projection.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
 const Allocator = std.mem.Allocator;
@@ -319,7 +320,7 @@ fn inspectSchemaV3Session(
         return;
     }
 
-    const watermark = session_log.inspectCommitWatermark(alloc, session_dir, session_id) catch |err| {
+    const watermark = session_log.inspectCommitWatermark(alloc, session_dir, session_id, null) catch |err| {
         try appendDoctorDiagnostic(
             diagnostics,
             alloc,
@@ -501,18 +502,19 @@ pub fn classifyReadOnlyCandidate(
     session_id: []const u8,
 ) !ReadOnlyCandidate {
     return switch (try classifyAuthority(alloc, session_dir, session_id)) {
-        .schema_v3 => classifySchemaV3Candidate(alloc, session_dir, session_id),
-        .legacy => classifyLegacyCandidate(alloc, session_dir, session_id),
+        .schema_v3 => classifySchemaV3Candidate(alloc, session_dir, session_id, null),
+        .legacy => classifyLegacyCandidate(alloc, session_dir, session_id, null),
     };
 }
 
 /// Builds a read-only candidate from a schema-v3 manifest, validating the
-/// authority marker, manifest identity, and projection freshness.
+/// authority marker, manifest identity, and bounded committed projection metadata.
 /// Fails with `error.InvalidSessionFormat` / `error.UnsupportedSessionSchema` on mismatch.
 pub fn classifySchemaV3Candidate(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,
     session_id: []const u8,
+    cancel_flag: ?*const std.atomic.Value(bool),
 ) !ReadOnlyCandidate {
     var marker = (try loadAuthorityMarkerOptional(alloc, session_dir)) orelse
         return error.InvalidSessionFormat;
@@ -547,11 +549,16 @@ pub fn classifySchemaV3Candidate(
     {
         return error.InvalidSessionFormat;
     }
-    const current_stat = try eventFileStat(session_dir, "events.jsonl");
-    const projection_state: ProjectionState = if (session_projection.isManifestStale(
+    const committed = session_log.manifestMatchesCommit(
+        alloc,
+        session_dir,
         manifest,
-        current_stat,
-    )) .stale else .current;
+        cancel_flag,
+    ) catch |err| switch (err) {
+        error.OutOfMemory, error.Cancelled => return err,
+        else => false,
+    };
+    const projection_state: ProjectionState = if (committed) .current else .stale;
     try requireAuthorityFenceAbsent(alloc, session_dir, session_id);
 
     const history_len = std.math.cast(usize, manifest.history_len) orelse
@@ -592,7 +599,9 @@ pub fn classifyLegacyCandidate(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,
     session_id: []const u8,
+    cancel_flag: session_read.CancelFlag,
 ) !ReadOnlyCandidate {
+    try session_read.check(cancel_flag);
     if (try entryExistsRelative(session_dir, "authority.json")) {
         return error.InvalidSessionFormat;
     }
@@ -603,15 +612,18 @@ pub fn classifyLegacyCandidate(
     if (stat.size > automatic_legacy_max_bytes) return error.LegacySessionTooLarge;
     var buffer: [16 * 1024]u8 = undefined;
     var reader = file.readerStreaming(io_mod.getIo(), &buffer);
+    var checked_buffer: [session_read.work_bytes]u8 = undefined;
+    var checked = session_read.Reader.init(&reader.interface, &checked_buffer, cancel_flag);
     var legacy = session_json.parseLegacySummaryStreaming(
         LegacyCandidateSummary,
         alloc,
-        &reader.interface,
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return err,
+        &checked.interface,
+    ) catch |err| {
+        try session_read.check(cancel_flag);
+        return err;
     };
     errdefer legacy.deinit(alloc);
+    try session_read.check(cancel_flag);
     if (!std.mem.eql(u8, legacy.id, session_id)) {
         return error.InvalidSessionFormat;
     }

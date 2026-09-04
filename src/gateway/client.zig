@@ -5,6 +5,7 @@ const secret = @import("../core/auth/secret.zig");
 const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
+const cancellation = @import("../core/shared/read_cancellation.zig");
 const types = @import("../core/shared/types.zig");
 
 pub fn isRetryableGatewayError(err: anyerror) bool {
@@ -404,11 +405,12 @@ pub fn fetchGatewayJsonCancellable(
     gateway_team: ?[]const u8,
     url: []const u8,
     cancel_flag: *std.atomic.Value(bool),
+    body_limit: std.Io.Limit,
 ) !GatewayJsonResult {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
     const request_url = try resolveE2eGatewayUrl(e2e_gateway_models_url_env, url);
-    return fetchGatewayJsonAtUrlCancellable(alloc, api_key, gateway_team, request_url, cancel_flag);
+    return fetchGatewayJsonAtUrlCancellable(alloc, api_key, gateway_team, request_url, cancel_flag, body_limit);
 }
 
 fn fetchGatewayJsonAtUrlCancellable(
@@ -417,6 +419,7 @@ fn fetchGatewayJsonAtUrlCancellable(
     gateway_team: ?[]const u8,
     url: []const u8,
     cancel_flag: *std.atomic.Value(bool),
+    body_limit: std.Io.Limit,
 ) !GatewayJsonResult {
     var operation = GatewayJsonFetchOperation{
         .alloc = alloc,
@@ -424,6 +427,7 @@ fn fetchGatewayJsonAtUrlCancellable(
         .gateway_team = gateway_team,
         .url = url,
         .cancel_flag = cancel_flag,
+        .body_limit = body_limit,
     };
     return runCancellableGatewayJsonFetch(alloc, cancel_flag, &operation);
 }
@@ -434,6 +438,7 @@ const GatewayJsonFetchOperation = struct {
     gateway_team: ?[]const u8,
     url: []const u8,
     cancel_flag: *std.atomic.Value(bool),
+    body_limit: std.Io.Limit,
 
     fn run(self: *@This()) !GatewayJsonResult {
         return fetchGatewayJsonAtUrlCore(
@@ -442,6 +447,7 @@ const GatewayJsonFetchOperation = struct {
             self.gateway_team,
             self.url,
             self.cancel_flag,
+            self.body_limit,
         );
     }
 };
@@ -513,6 +519,7 @@ fn fetchGatewayJsonAtUrlCore(
     gateway_team: ?[]const u8,
     url: []const u8,
     cancel_flag: *std.atomic.Value(bool),
+    body_limit: std.Io.Limit,
 ) !GatewayJsonResult {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
@@ -576,16 +583,17 @@ fn fetchGatewayJsonAtUrlCore(
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     if (failedGatewayJsonStatus(response.head.status)) |status| return .{ .http_status = status };
 
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
     var transfer_buffer: [64 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
-    _ = reader.streamRemaining(&out.writer) catch |err| {
+    var buffer: [cancellation.work_bytes]u8 = undefined;
+    var checked = cancellation.Reader.init(reader, &buffer, cancel_flag);
+    const body = checked.interface.allocRemaining(alloc, body_limit) catch |err| {
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
         return err;
     };
+    errdefer alloc.free(body);
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-    return .{ .success = try out.toOwnedSlice() };
+    return .{ .success = body };
 }
 
 fn failedGatewayJsonStatus(status: std.http.Status) ?std.http.Status {
@@ -7001,9 +7009,9 @@ fn expectCancellableGatewayJsonCancellation(
 
     const started = std.Io.Clock.Timestamp.now(zio, .awake);
     const result = if (use_tls)
-        fetchGatewayJsonAtUrlCancellable(std.testing.allocator, api_key, null, models_url, &cancel_flag)
+        fetchGatewayJsonAtUrlCancellable(std.testing.allocator, api_key, null, models_url, &cancel_flag, .unlimited)
     else
-        fetchGatewayJsonCancellable(std.testing.allocator, api_key, null, "https://ai-gateway.vercel.sh/v1/models", &cancel_flag);
+        fetchGatewayJsonCancellable(std.testing.allocator, api_key, null, "https://ai-gateway.vercel.sh/v1/models", &cancel_flag, .unlimited);
     const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
 
     try std.testing.expectError(error.Cancelled, result);
@@ -7014,6 +7022,23 @@ fn expectCancellableGatewayJsonCancellation(
 
 test "cancellable gateway JSON request closes a held response head" {
     try expectCancellableGatewayJsonCancellation(.response_head_stall, "test-key", false, 20, 800, 500);
+}
+
+test "catalog JSON request enforces its caller supplied body limit" {
+    var fixture = try TestModelCatalogFixture.init();
+    defer fixture.deinit();
+    try fixture.start();
+    try std.testing.expect(fixture.waitForAcceptStart(5000));
+    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/models", .{fixture.port()});
+    defer std.testing.allocator.free(url);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const result = fetchGatewayJsonAtUrlCancellable(std.testing.allocator, null, null, url, &cancel_flag, .limited(64));
+    if (result) |value| {
+        var response = value;
+        response.deinit(std.testing.allocator);
+        return error.TestOversizedBodyAccepted;
+    } else |err| try std.testing.expectEqual(error.StreamTooLong, err);
+    if (fixture.failure()) |err| return err;
 }
 
 test "cancellable gateway JSON request closes a stalled request send" {

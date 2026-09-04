@@ -191,12 +191,13 @@ pub fn SubmitRuntime(comptime App: type) type {
         };
 
         const ComposerHistoryProjection = struct {
-            input: []const u8,
+            input: paste_blocks.ExpandResult,
             pasted_blocks: std.ArrayList(paste_blocks.PastedBlock) = .empty,
             image_tokens: std.ArrayList(entity_spans.ImageTokenSpan) = .empty,
             skill_tokens: std.ArrayList(registered_entities.SkillTokenSpan) = .empty,
 
             fn deinit(self: *ComposerHistoryProjection, alloc: std.mem.Allocator) void {
+                if (self.input.owned) alloc.free(self.input.text);
                 self.pasted_blocks.deinit(alloc);
                 self.image_tokens.deinit(alloc);
                 self.skill_tokens.deinit(alloc);
@@ -707,7 +708,10 @@ pub fn SubmitRuntime(comptime App: type) type {
                 try stagePendingImages(app.alloc, app.pending_images.items, extracted.images)
             else
                 null;
-            defer if (staged_images) |*images| deinitOwnedImageList(app.alloc, images);
+            defer if (staged_images) |*images| {
+                image_attachments.deleteUnreferencedImageSnapshots(images.items, app.pending_images.items);
+                deinitOwnedImageList(app.alloc, images);
+            };
 
             var image_occurrences = try projectImageOccurrencesForSubmit(
                 app.alloc,
@@ -732,6 +736,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                     images,
                     image_occurrences.items,
                     firstRemappedImageId(app),
+                    historyForSubmittedImages(app),
                 )
             else
                 VisualText{ .text = effective_text, .owned = false };
@@ -752,7 +757,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             var history_projection: ?ComposerHistoryProjection = if (composerHistoryEnabled(app))
                 try prepareComposerHistoryProjection(
                     app,
-                    expanded.text,
+                    effective_text,
                     visual_text.text,
                     display_skill_tokens,
                     image_occurrences.items,
@@ -765,6 +770,14 @@ pub fn SubmitRuntime(comptime App: type) type {
                 images.items.len > 0
             else
                 app.pending_images.items.len > 0;
+
+            if (staged_images) |*images| {
+                if (comptime @hasDecl(App, "prepareSubmittedImageAttachments")) {
+                    try App.prepareSubmittedImageAttachments(app, images.items);
+                } else {
+                    try image_attachments.prepareSubmittedImageAttachments(app.alloc, images.items, null);
+                }
+            }
 
             const admission = if (staged_images) |*images|
                 try enqueuePromptWithStagedImages(
@@ -780,6 +793,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                     display_skill_tokens,
                 );
             if (admission == .rejected) return;
+            image_attachments.deleteUnreferencedImageSnapshots(extracted.images, app.pending_images.items);
             commitStableExtractedImageIds(app, extracted.images);
             commitRemappedImageIds(app, visual_text.next_image_id);
             if (visual_text.text.len > 0) {
@@ -1076,7 +1090,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             app.pending_images = staged_images.*;
             staged_images.* = .empty;
             errdefer {
-                deinitOwnedImageList(app.alloc, &app.pending_images);
+                staged_images.* = app.pending_images;
                 app.pending_images = original_images;
             }
 
@@ -1092,6 +1106,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             }
 
             var committed_images = original_images;
+            image_attachments.deleteUnreferencedImageSnapshots(committed_images.items, app.pending_images.items);
             deinitOwnedImageList(app.alloc, &committed_images);
             return admission;
         }
@@ -1287,7 +1302,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             recordComposerHistory(
                 app,
                 max_prompt_history,
-                projection.input,
+                projection.input.text,
                 projection.pasted_blocks.items,
                 app.pending_images.items,
                 projection.image_tokens.items,
@@ -1357,11 +1372,13 @@ pub fn SubmitRuntime(comptime App: type) type {
             );
             for (image_occurrences) |occurrence| {
                 if (occurrence.submitted_id == 0) continue;
+                const span = projectSpanThroughSubmittedImages(expanded_text, image_occurrences, occurrence.span) orelse
+                    return error.InvalidImageOccurrence;
                 submitted_image_tokens.appendAssumeCapacity(.{
                     .id = occurrence.submitted_id,
                     .span = .{
-                        .raw_start = occurrence.span.start,
-                        .raw_end = occurrence.span.end,
+                        .raw_start = span.start,
+                        .raw_end = span.end,
                     },
                 });
             }
@@ -1392,7 +1409,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 );
             }
 
-            var fallback = ComposerHistoryProjection{ .input = visual_text };
+            var fallback = ComposerHistoryProjection{ .input = .{ .text = visual_text, .owned = false } };
             errdefer fallback.deinit(app.alloc);
             try fallback.image_tokens.appendSlice(
                 app.alloc,
@@ -1413,95 +1430,52 @@ pub fn SubmitRuntime(comptime App: type) type {
             submitted_image_tokens: []const entity_spans.ImageTokenSpan,
         ) !?ComposerHistoryProjection {
             const raw_input = app.input_runtime.edit_state.input.items;
-            if (!std.mem.eql(u8, expanded_text, visual_text)) return null;
-            const raw_start: usize = 0;
-            const raw_end = raw_input.len;
-
-            var compact = ComposerHistoryProjection{
-                .input = raw_input[raw_start..raw_end],
-            };
+            const raw_tokens = app.input_runtime.entities.image_tokens.items;
+            if (raw_tokens.len != submitted_image_tokens.len) return null;
+            var occurrences: std.ArrayList(ImageOccurrence) = .empty;
+            defer occurrences.deinit(app.alloc);
+            try occurrences.ensureTotalCapacity(app.alloc, raw_tokens.len);
+            for (raw_tokens, submitted_image_tokens, 0..) |token, submitted, index| {
+                if (!validRawImageToken(raw_input, token)) return null;
+                occurrences.appendAssumeCapacity(.{
+                    .span = .{ .start = token.span.raw_start, .end = token.span.raw_end },
+                    .attachment_index = index,
+                    .source_id = token.id,
+                    .submitted_id = submitted.id,
+                });
+            }
+            const changed = !std.mem.eql(u8, expanded_text, visual_text);
+            var compact = ComposerHistoryProjection{ .input = .{
+                .text = if (changed) try rewriteSubmittedImageText(app.alloc, raw_input, occurrences.items) else raw_input,
+                .owned = changed,
+            } };
             var transferred = false;
             defer if (!transferred) compact.deinit(app.alloc);
+            for (occurrences.items) |occurrence| {
+                const span = projectSpanThroughSubmittedImages(raw_input, occurrences.items, occurrence.span) orelse return null;
+                try compact.image_tokens.append(app.alloc, .{ .id = occurrence.submitted_id, .span = .{ .raw_start = span.start, .raw_end = span.end } });
+            }
             for (app.input_runtime.entities.pasted_blocks.items) |block| {
-                if (block.span.raw_end <= raw_start or block.span.raw_start >= raw_end) {
-                    continue;
-                }
-                if (block.span.raw_start < raw_start or block.span.raw_end > raw_end) {
-                    return null;
-                }
-                try compact.pasted_blocks.append(app.alloc, .{
-                    .id = block.id,
-                    .text = block.text,
-                    .line_count = block.line_count,
-                    .span = .{
-                        .raw_start = block.span.raw_start - raw_start,
-                        .raw_end = block.span.raw_end - raw_start,
-                    },
-                });
+                const span = projectSpanThroughSubmittedImages(raw_input, occurrences.items, .{ .start = block.span.raw_start, .end = block.span.raw_end }) orelse return null;
+                try compact.pasted_blocks.append(app.alloc, .{ .id = block.id, .text = block.text, .line_count = block.line_count, .span = .{ .raw_start = span.start, .raw_end = span.end } });
             }
-
-            const expanded_compact = try paste_blocks.expand(
-                app.alloc,
-                compact.input,
-                compact.pasted_blocks.items,
-            );
-            defer if (expanded_compact.owned) app.alloc.free(expanded_compact.text);
-            if (!std.mem.eql(u8, expanded_compact.text, visual_text)) return null;
-
-            for (app.input_runtime.entities.image_tokens.items) |token| {
-                if (token.span.raw_end <= raw_start or token.span.raw_start >= raw_end) {
-                    continue;
-                }
-                if (token.span.raw_start < raw_start or token.span.raw_end > raw_end) {
-                    return null;
-                }
-                try compact.image_tokens.append(app.alloc, .{
-                    .id = token.id,
-                    .span = .{
-                        .raw_start = token.span.raw_start - raw_start,
-                        .raw_end = token.span.raw_end - raw_start,
-                    },
-                });
-            }
-            if (!sameImageTokenIds(
-                compact.image_tokens.items,
-                submitted_image_tokens,
-            )) {
-                return null;
-            }
-
+            const expanded = try paste_blocks.expand(app.alloc, compact.input.text, compact.pasted_blocks.items);
+            defer if (expanded.owned) app.alloc.free(expanded.text);
+            if (!std.mem.eql(u8, expanded.text, visual_text)) return null;
             for (app.input_runtime.entities.skill_tokens.items) |token| {
-                if (token.raw_end <= raw_start or token.raw_start >= raw_end) continue;
-                if (token.raw_start < raw_start or token.raw_end > raw_end) return null;
+                const span = projectSpanThroughSubmittedImages(raw_input, occurrences.items, .{ .start = token.raw_start, .end = token.raw_end }) orelse return null;
                 try compact.skill_tokens.append(app.alloc, .{
-                    .raw_start = token.raw_start - raw_start,
-                    .raw_end = token.raw_end - raw_start,
+                    .raw_start = span.start,
+                    .raw_end = span.end,
                     .name = token.name,
                     .path = token.path,
                     .display_source = token.display_source,
                     .owns_trailing_separator = token.owns_trailing_separator,
                 });
             }
-            if (!sameSkillSources(
-                compact.skill_tokens.items,
-                display_skill_tokens,
-            )) {
-                return null;
-            }
-
+            if (!sameSkillSources(compact.skill_tokens.items, display_skill_tokens)) return null;
             transferred = true;
             return compact;
-        }
-
-        fn sameImageTokenIds(
-            raw_tokens: []const entity_spans.ImageTokenSpan,
-            submitted_tokens: []const entity_spans.ImageTokenSpan,
-        ) bool {
-            if (raw_tokens.len != submitted_tokens.len) return false;
-            for (raw_tokens, submitted_tokens) |raw, submitted| {
-                if (raw.id != submitted.id) return false;
-            }
-            return true;
         }
 
         fn sameSkillSources(
@@ -1640,6 +1614,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             images: *std.ArrayList(types.ImageAttachment),
             occurrences: []ImageOccurrence,
             first_remapped_id: usize,
+            occupied_history: []const types.HistoryTurn,
         ) !VisualText {
             if (images.items.len == 0) return .{ .text = text, .owned = false };
 
@@ -1661,11 +1636,12 @@ pub fn SubmitRuntime(comptime App: type) type {
                 }
                 var image = images.items[occurrence.attachment_index];
                 if (image.id != occurrence.source_id) return error.InvalidImageOccurrence;
-                if (literalImageIdUsed(text, occurrences, image.id)) {
+                if (literalImageIdUsed(text, occurrences, image.id) or historyImageIdUsed(occupied_history, image.id)) {
                     remapped_id = try nextRemappedImageId(
                         text,
                         occurrences,
                         remapped_id,
+                        occupied_history,
                     );
                     image.id = remapped_id;
                     remapped_id = try std.math.add(usize, remapped_id, 1);
@@ -1685,6 +1661,14 @@ pub fn SubmitRuntime(comptime App: type) type {
             if (!ids_changed) {
                 return .{ .text = text, .owned = false };
             }
+            return .{
+                .text = try rewriteSubmittedImageText(alloc, text, occurrences),
+                .owned = true,
+                .next_image_id = remapped_id,
+            };
+        }
+
+        fn rewriteSubmittedImageText(alloc: std.mem.Allocator, text: []const u8, occurrences: []const ImageOccurrence) ![]u8 {
             var out: std.ArrayList(u8) = .empty;
             errdefer out.deinit(alloc);
             var cursor: usize = 0;
@@ -1702,11 +1686,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 cursor = occurrence.span.end;
             }
             try out.appendSlice(alloc, text[cursor..]);
-            return .{
-                .text = try out.toOwnedSlice(alloc),
-                .owned = true,
-                .next_image_id = if (ids_changed) remapped_id else null,
-            };
+            return out.toOwnedSlice(alloc);
         }
 
         fn firstRemappedImageId(app: *const App) usize {
@@ -1714,6 +1694,15 @@ pub fn SubmitRuntime(comptime App: type) type {
                 return app.peekNextImageId();
             }
             return 1;
+        }
+
+        fn historyForSubmittedImages(app: *const App) []const types.HistoryTurn {
+            if (comptime @hasField(App, "session")) {
+                if (comptime @hasField(@TypeOf(app.session), "agent")) {
+                    return app.session.agent.history.items;
+                }
+            }
+            return &.{};
         }
 
         fn commitRemappedImageIds(app: *App, next_image_id: ?usize) void {
@@ -1732,12 +1721,25 @@ pub fn SubmitRuntime(comptime App: type) type {
             text: []const u8,
             occurrences: []const ImageOccurrence,
             first_candidate: usize,
+            occupied_history: []const types.HistoryTurn,
         ) !usize {
             var candidate = first_candidate;
-            while (literalImageIdUsed(text, occurrences, candidate)) {
+            while (literalImageIdUsed(text, occurrences, candidate) or historyImageIdUsed(occupied_history, candidate)) {
                 candidate = try std.math.add(usize, candidate, 1);
             }
             return candidate;
+        }
+
+        fn historyImageIdUsed(history: []const types.HistoryTurn, id: usize) bool {
+            for (history) |turn| {
+                const images = switch (turn) {
+                    .assistant => |entry| entry.user.images,
+                    .interrupted => |entry| entry.user.images,
+                    .compacted_summary => continue,
+                };
+                if (image_attachments.findImageIndexById(images, id) != null) return true;
+            }
+            return false;
         }
 
         fn literalImageIdUsed(
@@ -2051,6 +2053,187 @@ pub fn SubmitRuntime(comptime App: type) type {
 pub fn directCommand(expanded: []const u8) ?[]const u8 {
     if (expanded.len == 0 or expanded[0] != '!') return null;
     return expanded[1..];
+}
+
+test "submitted pasted images avoid IDs in restored history and preserve literal references" {
+    const Runtime = SubmitRuntime(struct {});
+    const alloc = std.testing.allocator;
+    const image = types.ImageAttachment{ .id = 1, .path = @constCast("/tmp/pending.png"), .media_type = @constCast("image/png") };
+    var saved_images = [_]types.ImageAttachment{image};
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("saved [Image #1]"), .images = &saved_images },
+        .assistant = @constCast("saved answer"),
+    } }};
+    for ([_][]const u8{ "[Image #1] $review", "literal [Image #1]; pasted [Image #1] $review" }) |input| {
+        const start = std.mem.lastIndexOf(u8, input, "[Image #1]").?;
+        var pending = try Runtime.stagePendingImages(alloc, &.{image}, &.{});
+        defer Runtime.deinitOwnedImageList(alloc, &pending);
+        var occurrences = [_]Runtime.ImageOccurrence{.{ .span = .{ .start = start, .end = start + 10 }, .attachment_index = 0, .source_id = 1 }};
+        const mapped = try Runtime.mapSubmittedImages(alloc, input, &pending, &occurrences, 42, &history);
+        defer if (mapped.owned) alloc.free(mapped.text);
+        try std.testing.expectEqual(@as(usize, 42), pending.items[0].id);
+        try std.testing.expect(std.mem.endsWith(u8, mapped.text, "[Image #42] $review"));
+        if (start != 0) try std.testing.expect(std.mem.startsWith(u8, mapped.text, "literal [Image #1]; pasted "));
+        const skill_start = std.mem.find(u8, input, "$review").?;
+        const span = Runtime.projectSpanThroughSubmittedImages(input, &occurrences, .{ .start = skill_start, .end = input.len }).?;
+        try std.testing.expectEqualStrings("$review", mapped.text[span.start..span.end]);
+    }
+    try std.testing.expectEqual(@as(usize, 1), saved_images[0].id);
+    try std.testing.expectEqualStrings("saved [Image #1]", history[0].assistant.user.text);
+}
+
+fn checkSubmittedImagePreparationAllocations(alloc: std.mem.Allocator, sources: []const types.ImageAttachment, target: []const u8) !void {
+    const Runtime = SubmitRuntime(struct {});
+    var staged = try Runtime.stagePendingImages(alloc, sources, &.{});
+    defer {
+        image_attachments.deleteUnreferencedImageSnapshots(staged.items, sources);
+        Runtime.deinitOwnedImageList(alloc, &staged);
+    }
+    for (staged.items, 60..) |*image, id| image.id = id;
+    try image_attachments.prepareSubmittedImageAttachments(alloc, staged.items, target);
+}
+
+test "submitted image remapping keeps independent immutable snapshot files" {
+    const App = struct {
+        const Outcome = enum { failed, rejected, accepted };
+        alloc: std.mem.Allocator,
+        pending_images: std.ArrayList(types.ImageAttachment),
+        outcome: Outcome,
+
+        pub fn enqueuePrompt(self: *@This(), _: []const u8) !bool {
+            return switch (self.outcome) {
+                .failed => error.InjectedAdmissionFailure,
+                .rejected => false,
+                .accepted => true,
+            };
+        }
+    };
+    const Runtime = SubmitRuntime(struct {});
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "old-session", std.Io.File.Permissions.fromMode(0o700));
+    try tmp.dir.createDir(std.testing.io, "new-session", std.Io.File.Permissions.fromMode(0o700));
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const dir = try std.fs.path.join(alloc, &.{ root, "old-session", "images" });
+    defer alloc.free(dir);
+    const target = try std.fs.path.join(alloc, &.{ root, "new-session", "images" });
+    defer alloc.free(target);
+    const saved = try image_attachments.captureInlineImageBytes(alloc, 1, "image/png", "\x89PNG\r\n\x1a\nsaved", target);
+    defer image_attachments.discardImageAttachment(alloc, saved);
+    const pasted = try image_attachments.captureInlineImageBytes(alloc, 1, "image/png", "\x89PNG\r\n\x1a\npasted", dir);
+    defer image_attachments.discardImageAttachment(alloc, pasted);
+    var saved_images = [_]types.ImageAttachment{saved};
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("saved [Image #1]"), .images = &saved_images },
+        .assistant = @constCast("saved content"),
+    } }};
+    var staged = try Runtime.stagePendingImages(alloc, &.{pasted}, &.{});
+    defer Runtime.deinitOwnedImageList(alloc, &staged);
+    var occurrences = [_]Runtime.ImageOccurrence{.{ .span = .{ .start = 0, .end = 10 }, .attachment_index = 0, .source_id = 1 }};
+    const mapped = try Runtime.mapSubmittedImages(alloc, "[Image #1]", &staged, &occurrences, 42, &history);
+    defer if (mapped.owned) alloc.free(mapped.text);
+    try image_attachments.prepareSubmittedImageAttachments(alloc, staged.items, target);
+    defer image_attachments.deleteUnreferencedImageSnapshots(staged.items, &.{pasted});
+    try std.testing.expectEqualStrings(target, std.fs.path.dirname(staged.items[0].snapshot_path.?).?);
+    try std.testing.expect(std.mem.startsWith(u8, std.fs.path.basename(staged.items[0].snapshot_path.?), "image-42-"));
+    try std.testing.expectEqualStrings(staged.items[0].snapshot_path.?, staged.items[0].path);
+    var snapshot = try image_attachments.loadVerifiedSnapshot(alloc, staged.items[0], .{});
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqualStrings("\x89PNG\r\n\x1a\npasted", snapshot.bytes);
+    try std.Io.Dir.accessAbsolute(std.testing.io, pasted.snapshot_path.?, .{});
+    var saved_snapshot = try image_attachments.loadVerifiedSnapshot(alloc, saved, .{});
+    defer saved_snapshot.deinit(alloc);
+    try std.testing.expectEqualStrings("\x89PNG\r\n\x1a\nsaved", saved_snapshot.bytes);
+
+    const noncolliding = try image_attachments.captureInlineImageBytes(alloc, 5, "image/png", "\x89PNG\r\n\x1a\nnew", dir);
+    defer image_attachments.discardImageAttachment(alloc, noncolliding);
+    var same_id = try Runtime.stagePendingImages(alloc, &.{noncolliding}, &.{});
+    defer Runtime.deinitOwnedImageList(alloc, &same_id);
+    try image_attachments.prepareSubmittedImageAttachments(alloc, same_id.items, target);
+    defer image_attachments.deleteUnreferencedImageSnapshots(same_id.items, &.{noncolliding});
+    try std.testing.expectEqual(@as(usize, 5), same_id.items[0].id);
+    try std.testing.expectEqualStrings(target, std.fs.path.dirname(same_id.items[0].snapshot_path.?).?);
+    var locator_buffer: [128]u8 = undefined;
+    const locator = try @import("../session/session.zig").projectSnapshotLocator(&locator_buffer, same_id.items[0].snapshot_path.?);
+    const canonical_path = try std.fs.path.join(alloc, &.{ std.fs.path.dirname(target).?, locator });
+    defer alloc.free(canonical_path);
+    try std.testing.expectEqualStrings(same_id.items[0].snapshot_path.?, canonical_path);
+    const before = try std.Io.Dir.cwd().statFile(std.testing.io, canonical_path, .{});
+    try image_attachments.prepareSubmittedImageAttachments(alloc, same_id.items, target);
+    const after = try std.Io.Dir.cwd().statFile(std.testing.io, canonical_path, .{});
+    try std.testing.expectEqual(before, after);
+    const sources = [_]types.ImageAttachment{ pasted, noncolliding };
+    try std.testing.checkAllAllocationFailures(alloc, checkSubmittedImagePreparationAllocations, .{ sources[0..], target });
+
+    for ([_]App.Outcome{ .failed, .rejected, .accepted }, 43..) |outcome, id| {
+        const Submit = SubmitRuntime(App);
+        var app = App{ .alloc = alloc, .pending_images = try Submit.stagePendingImages(alloc, &.{pasted}, &.{}), .outcome = outcome };
+        defer Submit.deinitOwnedImageList(alloc, &app.pending_images);
+        var candidate = try Submit.stagePendingImages(alloc, &.{pasted}, &.{});
+        defer Submit.deinitOwnedImageList(alloc, &candidate);
+        var occurrence = [_]Submit.ImageOccurrence{.{ .span = .{ .start = 0, .end = 10 }, .attachment_index = 0, .source_id = 1 }};
+        const visual = try Submit.mapSubmittedImages(alloc, "[Image #1]", &candidate, &occurrence, id, &history);
+        defer if (visual.owned) alloc.free(visual.text);
+        try image_attachments.prepareSubmittedImageAttachments(alloc, candidate.items, target);
+        const clone_path = try alloc.dupe(u8, candidate.items[0].snapshot_path.?);
+        defer alloc.free(clone_path);
+        if (outcome == .failed) {
+            try std.testing.expectError(error.InjectedAdmissionFailure, Submit.enqueuePromptWithStagedImages(&app, visual.text, &.{}, &candidate));
+        } else {
+            const admission = try Submit.enqueuePromptWithStagedImages(&app, visual.text, &.{}, &candidate);
+            try std.testing.expectEqual(if (outcome == .accepted) Submit.PromptAdmission.enqueued else .rejected, admission);
+        }
+        image_attachments.deleteUnreferencedImageSnapshots(candidate.items, app.pending_images.items);
+        if (outcome == .accepted) {
+            try std.testing.expectEqual(id, app.pending_images.items[0].id);
+            try std.Io.Dir.accessAbsolute(std.testing.io, clone_path, .{});
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(std.testing.io, pasted.snapshot_path.?, .{}));
+            image_attachments.discardImageSnapshots(alloc, app.pending_images.items);
+        } else {
+            try std.testing.expectEqual(@as(usize, 1), app.pending_images.items[0].id);
+            try std.Io.Dir.accessAbsolute(std.testing.io, pasted.snapshot_path.?, .{});
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(std.testing.io, clone_path, .{}));
+        }
+        try std.Io.Dir.accessAbsolute(std.testing.io, saved.snapshot_path.?, .{});
+    }
+}
+
+test "submitted image ID rewrites preserve pasted blocks and skill spans" {
+    const App = struct {
+        alloc: std.mem.Allocator,
+        input_runtime: struct {
+            edit_state: struct { input: std.ArrayList(u8) = .empty } = .{},
+            entities: registered_entities.State = .{},
+        } = .{},
+    };
+    const Runtime = SubmitRuntime(App);
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.input_runtime.edit_state.input.deinit(alloc);
+    defer app.input_runtime.entities.deinit(alloc);
+    const placeholder = "[Pasted text #1, 2 lines]";
+    const raw = "[Image #1] " ++ placeholder ++ " $review";
+    try app.input_runtime.edit_state.input.appendSlice(alloc, raw);
+    try app.input_runtime.entities.image_tokens.append(alloc, .{ .id = 1, .span = .{ .raw_start = 0, .raw_end = 10 } });
+    try app.input_runtime.entities.pasted_blocks.append(alloc, .{ .id = 1, .text = try alloc.dupe(u8, "line one\nline two"), .line_count = 2, .span = .{ .raw_start = 11, .raw_end = 11 + placeholder.len } });
+    try app.input_runtime.entities.skill_tokens.append(alloc, .{ .raw_start = raw.len - 7, .raw_end = raw.len, .name = try alloc.dupe(u8, "review"), .path = try alloc.dupe(u8, "/tmp/review/SKILL.md") });
+    const expanded = try paste_blocks.expand(alloc, raw, app.input_runtime.entities.pasted_blocks.items);
+    defer if (expanded.owned) alloc.free(expanded.text);
+    const visual = "[Image #42] line one\nline two $review";
+    const occurrences = [_]Runtime.ImageOccurrence{.{ .span = .{ .start = 0, .end = 10 }, .attachment_index = 0, .source_id = 1, .submitted_id = 42 }};
+    const skills = try Runtime.projectSkillTokensForSubmit(alloc, raw, expanded.text, expanded.text, expanded.text, visual, app.input_runtime.entities.pasted_blocks.items, app.input_runtime.entities.skill_tokens.items, false, &occurrences);
+    defer alloc.free(skills);
+    var projection = try Runtime.prepareComposerHistoryProjection(&app, expanded.text, visual, skills, &occurrences, false);
+    defer projection.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), projection.pasted_blocks.items.len);
+    try std.testing.expectEqualStrings("[Image #42] " ++ placeholder ++ " $review", projection.input.text);
+    try std.testing.expectEqual(@as(usize, 11), projection.image_tokens.items[0].span.raw_end);
+    const skill = projection.skill_tokens.items[0];
+    try std.testing.expectEqualStrings("$review", projection.input.text[skill.raw_start..skill.raw_end]);
+    const block = projection.pasted_blocks.items[0];
+    try std.testing.expectEqualStrings(placeholder, projection.input.text[block.span.raw_start..block.span.raw_end]);
 }
 
 test "direct terminal route requires the literal first character" {

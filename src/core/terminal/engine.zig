@@ -5,8 +5,70 @@
 const std = @import("std");
 const display_width = @import("../shared/display_width.zig");
 const contracts = @import("contracts.zig");
+const cancellation = @import("../shared/read_cancellation.zig");
 
 const Allocator = std.mem.Allocator;
+
+const CancelAfterAllocation = struct {
+    cancelled: std.atomic.Value(bool) = .init(false),
+    remaining: usize = 1,
+
+    fn allocator(self: *@This()) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = free } };
+    }
+
+    fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, address: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const bytes = std.testing.allocator.rawAlloc(len, alignment, address);
+        if (bytes != null and self.remaining != 0) {
+            self.remaining -= 1;
+            if (self.remaining == 0) self.cancelled.store(true, .release);
+        }
+        return bytes;
+    }
+
+    fn free(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, address: usize) void {
+        std.testing.allocator.rawFree(bytes, alignment, address);
+    }
+};
+
+test "terminal feed cancels after producing a protocol reply allocation" {
+    var probe: CancelAfterAllocation = .{};
+    var grid = try Grid.init(std.testing.allocator, 80, 4);
+    defer grid.deinit();
+    grid.alloc = probe.allocator();
+    var failure: ?anyerror = null;
+    if (grid.feedModeCancellable("before\x1b[6nAFTER_CANCEL", .native_live, &probe.cancelled)) |value| {
+        var result = value;
+        result.deinit(grid.alloc);
+    } else |err| failure = err;
+    try std.testing.expect(probe.cancelled.load(.acquire));
+    try std.testing.expectEqual(@as(u21, 'b'), grid.cellAt(1, 1).?.codepoint);
+    try std.testing.expectEqual(@as(anyerror, error.Cancelled), failure orelse return error.TestExpectedCancellation);
+    try std.testing.expectEqual(@as(u21, ' '), grid.cellAt(1, 7).?.codepoint);
+    var resumed = try grid.feedMode("resumed", .journal_replay);
+    defer resumed.deinit(grid.alloc);
+    try std.testing.expectEqual(@as(u21, 'r'), grid.cellAt(1, 7).?.codepoint);
+}
+
+test "terminal checkpoint cancels after encoding allocation has begun" {
+    const alloc = std.testing.allocator;
+    var grid = try Grid.init(alloc, 80, 40);
+    defer grid.deinit();
+    try grid.feed("saved content");
+    const expected = try grid.checkpointPayload(alloc);
+    defer alloc.free(expected);
+    var probe: CancelAfterAllocation = .{ .remaining = 3 };
+    var failure: ?anyerror = null;
+    if (grid.checkpointPayloadCancellable(probe.allocator(), &probe.cancelled)) |payload| {
+        probe.allocator().free(payload);
+    } else |err| failure = err;
+    try std.testing.expect(probe.cancelled.load(.acquire));
+    try std.testing.expectEqual(@as(anyerror, error.Cancelled), failure orelse return error.TestExpectedCancellation);
+    const after = try grid.checkpointPayload(alloc);
+    defer alloc.free(after);
+    try std.testing.expectEqualSlices(u8, expected, after);
+}
 
 pub const checkpoint_schema_revision: u16 = 1;
 const checkpoint_magic = "FXTE";
@@ -315,8 +377,19 @@ pub const Grid = struct {
     feed_stats: ?*FeedStats = null,
     feed_mode: FeedMode = .journal_replay,
     feed_result: ?*FeedResult = null,
+    // Borrowed only during a feed call, like feed_stats and feed_result.
+    feed_cancel: cancellation.CancelFlag = null,
 
-    pub fn init(alloc: Allocator, cols: u16, rows: u16) !Grid {
+    pub fn init(alloc: Allocator, cols: u16, rows: u16) (Allocator.Error || error{InvalidGridSize})!Grid {
+        return initCancellable(alloc, cols, rows, null) catch |err| switch (err) {
+            error.Cancelled => unreachable,
+            error.OutOfMemory => error.OutOfMemory,
+            error.InvalidGridSize => error.InvalidGridSize,
+        };
+    }
+
+    fn initCancellable(alloc: Allocator, cols: u16, rows: u16, cancel_flag: cancellation.CancelFlag) !Grid {
+        try cancellation.check(cancel_flag);
         if (cols == 0 or rows == 0) return failGrid(error.InvalidGridSize);
         const cell_count = std.math.mul(
             usize,
@@ -328,8 +401,10 @@ pub const Grid = struct {
         }
         const cells = try alloc.alloc(Cell, cell_count);
         errdefer alloc.free(cells);
-        @memset(cells, .{});
+        try clearCells(cells, cancel_flag);
         const tab_stops = try alloc.alloc(bool, cols);
+        errdefer alloc.free(tab_stops);
+        try cancellation.check(cancel_flag);
         initializeTabStops(tab_stops);
         return .{
             .alloc = alloc,
@@ -368,7 +443,19 @@ pub const Grid = struct {
     /// real terminal does when the pane shrinks or grows — content is
     /// not auto-cleared, so the caller (fx) is responsible for
     /// repainting.
-    pub fn resize(self: *Grid, cols: u16, rows: u16) !void {
+    pub fn resize(self: *Grid, cols: u16, rows: u16) (Allocator.Error || error{InvalidGridSize})!void {
+        return self.resizeCancellable(cols, rows, null) catch |err| switch (err) {
+            error.Cancelled => unreachable,
+            error.OutOfMemory => error.OutOfMemory,
+            error.InvalidGridSize => error.InvalidGridSize,
+        };
+    }
+
+    pub fn resizeCancellable(self: *Grid, cols: u16, rows: u16, cancel_flag: cancellation.CancelFlag) !void {
+        try cancellation.check(cancel_flag);
+        const previous_cancel = self.feed_cancel;
+        self.feed_cancel = cancel_flag;
+        defer self.feed_cancel = previous_cancel;
         if (cols == 0 or rows == 0) return error.InvalidGridSize;
         if (cols == self.cols and rows == self.rows) return;
 
@@ -404,6 +491,7 @@ pub const Grid = struct {
         errdefer if (normal_cells) |cells| self.alloc.free(cells);
         const new_tab_stops = try self.resizedTabStops(cols);
         errdefer self.alloc.free(new_tab_stops);
+        try cancellation.check(cancel_flag);
 
         self.alloc.free(self.cells);
         self.alloc.free(self.tab_stops);
@@ -436,6 +524,8 @@ pub const Grid = struct {
 
     fn resizedTabStops(self: Grid, cols: u16) ![]bool {
         const stops = try self.alloc.alloc(bool, cols);
+        errdefer self.alloc.free(stops);
+        try cancellation.check(self.feed_cancel);
         initializeTabStops(stops);
         @memcpy(stops[0..@min(stops.len, self.tab_stops.len)], self.tab_stops[0..@min(stops.len, self.tab_stops.len)]);
         return stops;
@@ -452,12 +542,13 @@ pub const Grid = struct {
     ) ![]Cell {
         const cells = try self.alloc.alloc(Cell, @as(usize, cols) * @as(usize, rows));
         errdefer self.alloc.free(cells);
-        @memset(cells, .{});
+        try clearCells(cells, self.feed_cancel);
 
         const copy_rows = @min(source_rows, rows);
         const copy_cols = @min(source_cols, cols);
         var row: u16 = 0;
         while (row < copy_rows) : (row += 1) {
+            try cancellation.check(self.feed_cancel);
             const source_physical_row = physicalRowIndex(
                 source_row_origin,
                 row,
@@ -465,9 +556,9 @@ pub const Grid = struct {
             );
             const src_base: usize = source_physical_row * @as(usize, source_cols);
             const dst_base: usize = @as(usize, row) * @as(usize, cols);
-            @memcpy(cells[dst_base .. dst_base + copy_cols], source[src_base .. src_base + copy_cols]);
+            try cancellation.copyBytes(std.mem.sliceAsBytes(cells[dst_base .. dst_base + copy_cols]), std.mem.sliceAsBytes(source[src_base .. src_base + copy_cols]), self.feed_cancel);
         }
-        repairWideCells(cells, cols, rows);
+        try repairWideCells(cells, cols, rows, self.feed_cancel);
         return cells;
     }
 
@@ -507,26 +598,41 @@ pub const Grid = struct {
     }
 
     pub fn feedMode(self: *Grid, bytes: []const u8, mode: FeedMode) !FeedResult {
+        return self.feedModeCancellable(bytes, mode, null) catch |err| switch (err) {
+            error.Cancelled => unreachable,
+            else => return err,
+        };
+    }
+
+    /// Cancellation may leave a partially advanced grid; no checkpoint should
+    /// be published from that feed. All owned storage remains deinitializable.
+    pub fn feedModeCancellable(self: *Grid, bytes: []const u8, mode: FeedMode, cancel_flag: cancellation.CancelFlag) !FeedResult {
+        try cancellation.check(cancel_flag);
         var result = FeedResult{};
         errdefer result.deinit(self.alloc);
         const previous_stats = self.feed_stats;
         const previous_mode = self.feed_mode;
         const previous_result = self.feed_result;
+        const previous_cancel = self.feed_cancel;
         self.feed_stats = &result.stats;
         self.feed_mode = mode;
         self.feed_result = &result;
+        self.feed_cancel = cancel_flag;
         defer {
             self.feed_stats = previous_stats;
             self.feed_mode = previous_mode;
             self.feed_result = previous_result;
+            self.feed_cancel = previous_cancel;
         }
         try self.feedBytes(bytes);
+        try cancellation.check(cancel_flag);
         return result;
     }
 
     fn feedBytes(self: *Grid, bytes: []const u8) !void {
         var remaining: []const u8 = bytes;
         while (remaining.len > 0) {
+            try cancellation.check(self.feed_cancel);
             if (!self.defer_sync_updates or !self.sync_active) {
                 const consumed = try self.feedDirect(
                     remaining,
@@ -552,7 +658,7 @@ pub const Grid = struct {
                 self.sync_buffer.items.len - reset.len,
             );
             {
-                const buffered = try self.alloc.dupe(u8, self.sync_buffer.items);
+                const buffered = try cancellation.duplicateBytes(self.alloc, self.sync_buffer.items, self.feed_cancel);
                 defer self.alloc.free(buffered);
                 self.sync_buffer.clearRetainingCapacity();
                 self.sync_active = false;
@@ -566,15 +672,21 @@ pub const Grid = struct {
         const previous_stats = self.feed_stats;
         const previous_mode = self.feed_mode;
         const previous_result = self.feed_result;
+        const previous_cancel = self.feed_cancel;
         self.feed_stats = stats;
         self.feed_mode = .journal_replay;
         self.feed_result = null;
+        self.feed_cancel = null;
         defer {
             self.feed_stats = previous_stats;
             self.feed_mode = previous_mode;
             self.feed_result = previous_result;
+            self.feed_cancel = previous_cancel;
         }
-        try self.feedBytes(bytes);
+        self.feedBytes(bytes) catch |err| switch (err) {
+            error.Cancelled => unreachable,
+            else => return err,
+        };
     }
 
     fn feedDirect(
@@ -584,6 +696,7 @@ pub const Grid = struct {
     ) !usize {
         var i: usize = 0;
         while (i < bytes.len) {
+            try cancellation.check(self.feed_cancel);
             const b = bytes[i];
             if (b == 0x18 or b == 0x1a) {
                 self.cancelControlSequence();
@@ -871,6 +984,7 @@ pub const Grid = struct {
         // Reuse an existing pool entry when the same URL appears
         // again so cells under one logical link share an id.
         for (self.hyperlink_pool.items, 0..) |existing, idx| {
+            try cancellation.check(self.feed_cancel);
             if (std.mem.eql(u8, existing, uri)) {
                 self.replaceActiveHyperlinkParams(owned_params);
                 self.current_style.hyperlink_id = @intCast(idx + 1);
@@ -923,6 +1037,7 @@ pub const Grid = struct {
         const combined_len = std.math.add(usize, existing.len, bytes.len) catch
             return error.CombiningPoolCapacityExceeded;
         for (self.combining_suffix_pool.items, 0..) |candidate, idx| {
+            try cancellation.check(self.feed_cancel);
             if (candidate.len == combined_len and
                 std.mem.startsWith(u8, candidate, existing) and
                 std.mem.eql(u8, candidate[existing.len..], bytes))
@@ -1156,6 +1271,7 @@ pub const Grid = struct {
         }
         var row = top;
         while (row + count <= bottom) : (row += 1) {
+            cancellation.check(self.feed_cancel) catch return;
             const destination = self.rowBase(row);
             const source = self.rowBase(row + count);
             @memcpy(
@@ -1164,6 +1280,7 @@ pub const Grid = struct {
             );
         }
         while (row <= bottom) : (row += 1) {
+            cancellation.check(self.feed_cancel) catch return;
             const base = self.rowBase(row);
             @memset(self.cells[base .. base + self.cols], self.blankCell());
         }
@@ -1176,6 +1293,7 @@ pub const Grid = struct {
         self.markTouchedRows(top, bottom);
         var row = bottom;
         while (row >= top + count) : (row -= 1) {
+            cancellation.check(self.feed_cancel) catch return;
             const destination = self.rowBase(row);
             const source = self.rowBase(row - count);
             @memcpy(
@@ -1185,6 +1303,7 @@ pub const Grid = struct {
         }
         var clear_row = top;
         while (clear_row < top + count) : (clear_row += 1) {
+            cancellation.check(self.feed_cancel) catch return;
             const base = self.rowBase(clear_row);
             @memset(self.cells[base .. base + self.cols], self.blankCell());
         }
@@ -1365,7 +1484,7 @@ pub const Grid = struct {
             self.cells[start .. end - count],
         );
         @memset(self.cells[start .. start + count], self.blankCell());
-        repairWideCells(self.cells[base .. base + self.cols], self.cols, 1);
+        repairWideCells(self.cells[base .. base + self.cols], self.cols, 1, self.feed_cancel) catch return;
         self.pending_wrap = false;
         self.last_printable_idx = null;
     }
@@ -1383,7 +1502,7 @@ pub const Grid = struct {
             self.cells[start + count .. end],
         );
         @memset(self.cells[end - count .. end], self.blankCell());
-        repairWideCells(self.cells[base .. base + self.cols], self.cols, 1);
+        repairWideCells(self.cells[base .. base + self.cols], self.cols, 1, self.feed_cancel) catch return;
         self.pending_wrap = false;
         self.last_printable_idx = null;
     }
@@ -1574,6 +1693,7 @@ pub const Grid = struct {
         const blank = self.blankCell();
         var logical = expanded_start;
         while (logical < expanded_end) {
+            cancellation.check(self.feed_cancel) catch return;
             const col = logical % cols;
             const chunk_len = @min(cols - col, expanded_end - logical);
             const physical = self.physicalIndexForLogicalOffset(logical);
@@ -1764,7 +1884,7 @@ pub const Grid = struct {
 
     fn resetTerminal(self: *Grid) void {
         if (self.saved_normal_screen != null) self.leaveAlternateScreen();
-        @memset(self.cells, .{});
+        clearCells(self.cells, self.feed_cancel) catch return;
         self.row_origin = 0;
         self.cursor_row = 1;
         self.cursor_col = 1;
@@ -1787,18 +1907,34 @@ pub const Grid = struct {
         self.sync_buffer.clearRetainingCapacity();
         self.current_style = .{};
         self.replaceActiveHyperlinkParams(&.{});
-        for (self.hyperlink_pool.items) |url| self.alloc.free(url);
-        self.hyperlink_pool.clearRetainingCapacity();
-        self.hyperlink_pool_bytes = 0;
-        for (self.combining_suffix_pool.items) |suffix| self.alloc.free(suffix);
-        self.combining_suffix_pool.clearRetainingCapacity();
-        self.combining_pool_bytes = 0;
         self.saved_cursor = null;
         self.last_printable_idx = null;
         self.utf8_len = 0;
         self.utf8_expected = 0;
         initializeTabStops(self.tab_stops);
         self.cancelControlSequence();
+        while (self.hyperlink_pool.items.len != 0) {
+            cancellation.check(self.feed_cancel) catch return;
+            const url = self.hyperlink_pool.pop().?;
+            self.hyperlink_pool_bytes -= url.len;
+            self.alloc.free(url);
+        }
+        while (self.combining_suffix_pool.items.len != 0) {
+            cancellation.check(self.feed_cancel) catch return;
+            const suffix = self.combining_suffix_pool.pop().?;
+            self.combining_pool_bytes -= suffix.len;
+            self.alloc.free(suffix);
+        }
+    }
+
+    fn clearCells(cells: []Cell, cancel_flag: cancellation.CancelFlag) !void {
+        var offset: usize = 0;
+        while (offset < cells.len) {
+            try cancellation.check(cancel_flag);
+            const end = offset + @min(cancellation.work_bytes / @sizeOf(Cell), cells.len - offset);
+            @memset(cells[offset..end], .{});
+            offset = end;
+        }
     }
 
     fn enterAlternateScreen(self: *Grid) !void {
@@ -1808,7 +1944,8 @@ pub const Grid = struct {
             Cell,
             @as(usize, self.cols) * @as(usize, self.rows),
         );
-        @memset(alternate_cells, .{});
+        errdefer self.alloc.free(alternate_cells);
+        try clearCells(alternate_cells, self.feed_cancel);
 
         self.saved_normal_screen = SavedScreen.capture(self.*);
         self.cells = alternate_cells;
@@ -1854,9 +1991,17 @@ pub const Grid = struct {
         self: Grid,
         alloc: Allocator,
     ) !contracts.OwnedRenderSnapshot {
+        return self.renderSnapshotCancellable(alloc, null) catch |err| switch (err) {
+            error.Cancelled => unreachable,
+            inline else => |other| return other,
+        };
+    }
+
+    pub fn renderSnapshotCancellable(self: Grid, alloc: Allocator, cancel_flag: cancellation.CancelFlag) !contracts.OwnedRenderSnapshot {
         var text_bytes: usize = 0;
         var row: u16 = 1;
         while (row <= self.rows) : (row += 1) {
+            try cancellation.check(cancel_flag);
             const base = self.rowBase(row);
             var col: u16 = 0;
             while (col < self.cols) : (col += 1) {
@@ -1893,6 +2038,7 @@ pub const Grid = struct {
 
         const cells = try alloc.alloc(contracts.RenderCell, self.cells.len);
         errdefer alloc.free(cells);
+        try cancellation.check(cancel_flag);
         const text_storage = try alloc.alloc(u8, text_bytes);
         errdefer alloc.free(text_storage);
 
@@ -1900,6 +2046,7 @@ pub const Grid = struct {
         var output_index: usize = 0;
         row = 1;
         while (row <= self.rows) : (row += 1) {
+            try cancellation.check(cancel_flag);
             const base = self.rowBase(row);
             var col: u16 = 0;
             while (col < self.cols) : (col += 1) {
@@ -1932,7 +2079,7 @@ pub const Grid = struct {
             }
         }
 
-        var owned = contracts.OwnedRenderSnapshot{
+        const owned = contracts.OwnedRenderSnapshot{
             .dimensions = .{ .rows = self.rows, .columns = self.cols },
             .cursor = .{
                 .row = self.cursor_row - 1,
@@ -1957,16 +2104,25 @@ pub const Grid = struct {
             .cells = cells,
             .text_storage = text_storage,
         };
-        errdefer owned.deinit(alloc);
+        try cancellation.check(cancel_flag);
         try owned.view().validate();
+        try cancellation.check(cancel_flag);
         return owned;
     }
 
     /// Serialize all bounded terminal state. The durable store owns cursor
     /// anchoring and wraps these opaque bytes in its checkpoint envelope.
     pub fn checkpointPayload(self: Grid, alloc: Allocator) ![]u8 {
-        try self.validateCheckpointState();
+        return self.checkpointPayloadCancellable(alloc, null) catch |err| switch (err) {
+            error.Cancelled => unreachable,
+            else => return err,
+        };
+    }
+
+    pub fn checkpointPayloadCancellable(self: Grid, alloc: Allocator, cancel_flag: cancellation.CancelFlag) ![]u8 {
+        try self.validateCheckpointState(cancel_flag);
         var encoder = CheckpointEncoder.init(alloc);
+        encoder.cancel_flag = cancel_flag;
         errdefer encoder.deinit();
         try encoder.bytes(checkpoint_magic);
         try encoder.int(u16, checkpoint_schema_revision);
@@ -1976,11 +2132,24 @@ pub const Grid = struct {
 
     /// Restore an engine payload without performing any I/O or producing
     /// reply effects. Callers replay later journal bytes observationally.
-    pub fn restoreCheckpoint(alloc: Allocator, payload: []const u8) !Grid {
+    pub fn restoreCheckpoint(alloc: Allocator, payload: []const u8) (Allocator.Error || error{ InvalidGridSize, CheckpointTooLarge, InvalidEngineCheckpoint, UnsupportedEngineRevision })!Grid {
+        return restoreCheckpointCancellable(alloc, payload, null) catch |err| switch (err) {
+            error.Cancelled => unreachable,
+            error.OutOfMemory => error.OutOfMemory,
+            error.InvalidGridSize => error.InvalidGridSize,
+            error.CheckpointTooLarge => error.CheckpointTooLarge,
+            error.InvalidEngineCheckpoint => error.InvalidEngineCheckpoint,
+            error.UnsupportedEngineRevision => error.UnsupportedEngineRevision,
+        };
+    }
+
+    pub fn restoreCheckpointCancellable(alloc: Allocator, payload: []const u8, cancel_flag: cancellation.CancelFlag) !Grid {
+        try cancellation.check(cancel_flag);
         if (payload.len > contracts.max_checkpoint_payload_bytes) {
             return failGrid(error.CheckpointTooLarge);
         }
         var decoder = CheckpointDecoder.init(payload);
+        decoder.cancel_flag = cancel_flag;
         const magic = try decoder.fixed(checkpoint_magic.len);
         if (!std.mem.eql(u8, magic, checkpoint_magic)) {
             return failGrid(error.InvalidEngineCheckpoint);
@@ -1991,11 +2160,12 @@ pub const Grid = struct {
         var grid = try decodeGridState(alloc, &decoder);
         errdefer grid.deinit();
         if (!decoder.finished()) return failGrid(error.InvalidEngineCheckpoint);
-        try grid.validateCheckpointState();
+        try grid.validateCheckpointState(cancel_flag);
         return grid;
     }
 
-    fn validateCheckpointState(self: Grid) !void {
+    fn validateCheckpointState(self: Grid, cancel_flag: cancellation.CancelFlag) !void {
+        try cancellation.check(cancel_flag);
         if (self.rows == 0 or self.cols == 0 or
             self.cells.len != @as(usize, self.rows) * @as(usize, self.cols) or
             self.row_origin >= self.rows or
@@ -2025,14 +2195,15 @@ pub const Grid = struct {
             return error.InvalidEngineCheckpoint;
         }
         try validateUtf8Continuation(self);
-        try validatePool(self.hyperlink_pool.items, max_hyperlink_pool_bytes);
-        try validatePool(self.combining_suffix_pool.items, max_combining_pool_bytes);
+        try validatePool(self.hyperlink_pool.items, max_hyperlink_pool_bytes, cancel_flag);
+        try validatePool(self.combining_suffix_pool.items, max_combining_pool_bytes, cancel_flag);
         try validateCells(
             self.cells,
             self.cols,
             self.rows,
             self.hyperlink_pool.items.len,
             self.combining_suffix_pool.items.len,
+            cancel_flag,
         );
         try validateStyle(
             self.current_style,
@@ -2063,6 +2234,7 @@ pub const Grid = struct {
                 saved.rows,
                 self.hyperlink_pool.items.len,
                 self.combining_suffix_pool.items.len,
+                cancel_flag,
             );
             try validateStyle(saved.current_style, self.hyperlink_pool.items.len);
             if (saved.last_printable_idx) |index| {
@@ -2304,6 +2476,7 @@ pub const Grid = struct {
 const CheckpointEncoder = struct {
     alloc: Allocator,
     output: std.ArrayList(u8) = .empty,
+    cancel_flag: cancellation.CancelFlag = null,
 
     fn init(alloc: Allocator) CheckpointEncoder {
         return .{ .alloc = alloc };
@@ -2314,17 +2487,25 @@ const CheckpointEncoder = struct {
     }
 
     fn reserve(self: *CheckpointEncoder, additional: usize) !void {
+        try cancellation.check(self.cancel_flag);
         if (additional > contracts.max_checkpoint_payload_bytes -|
             self.output.items.len)
         {
             return error.CheckpointTooLarge;
         }
         try self.output.ensureUnusedCapacity(self.alloc, additional);
+        try cancellation.check(self.cancel_flag);
     }
 
     fn bytes(self: *CheckpointEncoder, value: []const u8) !void {
         try self.reserve(value.len);
-        self.output.appendSliceAssumeCapacity(value);
+        var offset: usize = 0;
+        while (offset < value.len) {
+            try cancellation.check(self.cancel_flag);
+            const end = offset + @min(cancellation.work_bytes, value.len - offset);
+            self.output.appendSliceAssumeCapacity(value[offset..end]);
+            offset = end;
+        }
     }
 
     fn sizedBytes(self: *CheckpointEncoder, value: []const u8) !void {
@@ -2345,6 +2526,7 @@ const CheckpointEncoder = struct {
     }
 
     fn finish(self: *CheckpointEncoder) ![]u8 {
+        try cancellation.check(self.cancel_flag);
         return self.output.toOwnedSlice(self.alloc);
     }
 };
@@ -2352,12 +2534,14 @@ const CheckpointEncoder = struct {
 const CheckpointDecoder = struct {
     input: []const u8,
     offset: usize = 0,
+    cancel_flag: cancellation.CancelFlag = null,
 
     fn init(input: []const u8) CheckpointDecoder {
         return .{ .input = input };
     }
 
     fn fixed(self: *CheckpointDecoder, length: usize) ![]const u8 {
+        try cancellation.check(self.cancel_flag);
         if (length > self.input.len -| self.offset) {
             return error.InvalidEngineCheckpoint;
         }
@@ -2379,7 +2563,7 @@ const CheckpointDecoder = struct {
     ) ![]u8 {
         const value = try self.sizedBytes(maximum);
         if (value.len == 0) return &.{};
-        return alloc.dupe(u8, value);
+        return cancellation.duplicateBytes(alloc, value, self.cancel_flag);
     }
 
     fn int(self: *CheckpointDecoder, comptime T: type) !T {
@@ -2549,7 +2733,7 @@ fn decodeGridState(
 ) !Grid {
     const rows = try decoder.int(u16);
     const cols = try decoder.int(u16);
-    var grid = try Grid.init(alloc, cols, rows);
+    var grid = try Grid.initCancellable(alloc, cols, rows, decoder.cancel_flag);
     errdefer grid.deinit();
     try decodeCells(decoder, grid.cells);
     grid.row_origin = try decoder.int(u16);
@@ -2748,7 +2932,7 @@ fn decodeSavedScreen(
     const owned_params = if (active_params.len == 0)
         &.{}
     else
-        try alloc.dupe(u8, active_params);
+        try cancellation.duplicateBytes(alloc, active_params, decoder.cancel_flag);
     return .{
         .rows = rows,
         .cols = cols,
@@ -2791,9 +2975,10 @@ fn decodeOptionalIndex(decoder: *CheckpointDecoder) !?usize {
         error.InvalidEngineCheckpoint;
 }
 
-fn validatePool(pool: []const []u8, maximum_bytes: usize) !void {
+fn validatePool(pool: []const []u8, maximum_bytes: usize, cancel_flag: cancellation.CancelFlag) !void {
     var total: usize = 0;
     for (pool) |value| {
+        try cancellation.check(cancel_flag);
         if (value.len == 0 or value.len > max_string_bytes or
             value.len > maximum_bytes -| total)
         {
@@ -2828,12 +3013,14 @@ fn validateCells(
     rows: u16,
     hyperlink_count: usize,
     combining_count: usize,
+    cancel_flag: cancellation.CancelFlag,
 ) !void {
     if (cells.len != @as(usize, cols) * @as(usize, rows)) {
         return error.InvalidEngineCheckpoint;
     }
     var row: u16 = 0;
     while (row < rows) : (row += 1) {
+        try cancellation.check(cancel_flag);
         const base = @as(usize, row) * @as(usize, cols);
         var col: u16 = 0;
         while (col < cols) : (col += 1) {
@@ -3108,12 +3295,13 @@ fn decodeUtf8(bytes: []const u8, start: usize) DecodedRune {
     return .{ .codepoint = cp, .len = seq_len };
 }
 
-fn repairWideCells(cells: []Cell, cols: u16, rows: u16) void {
+fn repairWideCells(cells: []Cell, cols: u16, rows: u16, cancel_flag: cancellation.CancelFlag) error{Cancelled}!void {
     var row: u16 = 0;
     while (row < rows) : (row += 1) {
         const row_base = @as(usize, row) * @as(usize, cols);
         var col: u16 = 0;
         while (col < cols) : (col += 1) {
+            if (col % 128 == 0) try cancellation.check(cancel_flag);
             const idx = row_base + @as(usize, col);
             switch (cells[idx].width) {
                 0 => {
@@ -3144,6 +3332,98 @@ fn repairWideCells(cells: []Cell, cols: u16, rows: u16) void {
 }
 
 const testing = std.testing;
+
+const EngineAllocationCancellation = struct {
+    remaining: usize,
+    entered: std.Io.Event = .unset,
+    released: std.Io.Event = .unset,
+    cancelled: std.atomic.Value(bool) = .init(false),
+    observed: bool = false,
+    cancelled_at: i128 = 0,
+
+    fn allocator(self: *@This()) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = free } };
+    }
+    fn allocate(raw: *anyopaque, size: usize, alignment: std.mem.Alignment, address: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const bytes = testing.allocator.rawAlloc(size, alignment, address) orelse return null;
+        if (self.remaining != 0) {
+            self.remaining -= 1;
+            if (self.remaining == 0) {
+                self.observed = true;
+                self.entered.set(testing.io);
+                self.released.waitUncancelable(testing.io);
+            }
+        }
+        return bytes;
+    }
+    fn free(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, address: usize) void {
+        testing.allocator.rawFree(bytes, alignment, address);
+    }
+    fn cancel(self: *@This()) void {
+        self.entered.waitUncancelable(testing.io);
+        self.cancelled_at = std.Io.Clock.awake.now(testing.io).nanoseconds;
+        self.cancelled.store(true, .release);
+        self.released.set(testing.io);
+    }
+};
+
+test "checkpoint restore cancels after owned grid and pool allocations begin" {
+    var original = try Grid.init(testing.allocator, 256, 128);
+    defer original.deinit();
+    try original.feed("saved normal\x1b]8;;https://example.test\x07link\x1b]8;;\x07\x1b[?1049halternate\x1b[2;");
+    const payload = try original.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(payload);
+    for ([_]usize{ 1, 2, 3, 4, 5 }) |allocation| {
+        var probe = EngineAllocationCancellation{ .remaining = allocation };
+        const thread = try std.Thread.spawn(.{}, EngineAllocationCancellation.cancel, .{&probe});
+        var failure: ?anyerror = null;
+        if (Grid.restoreCheckpointCancellable(probe.allocator(), payload, &probe.cancelled)) |value| {
+            var restored = value;
+            restored.deinit();
+        } else |err| failure = err;
+        probe.entered.set(testing.io);
+        thread.join();
+        try testing.expect(probe.observed);
+        try testing.expectEqual(@as(?anyerror, error.Cancelled), failure);
+        try testing.expect(std.Io.Clock.awake.now(testing.io).nanoseconds - probe.cancelled_at < 500 * std.time.ns_per_ms);
+    }
+    var restored = try Grid.restoreCheckpoint(testing.allocator, payload);
+    defer restored.deinit();
+    const roundtrip = try restored.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(roundtrip);
+    try testing.expectEqualSlices(u8, payload, roundtrip);
+}
+
+test "resize cancellation after each staged allocation preserves both saved screens" {
+    var grid = try Grid.init(testing.allocator, 256, 128);
+    defer grid.deinit();
+    try grid.feed("saved normal\x1b[?1049halternate\x1b[3;4H");
+    const before = try grid.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(before);
+    for ([_]usize{ 1, 2, 3 }) |allocation| {
+        var probe = EngineAllocationCancellation{ .remaining = allocation };
+        grid.alloc = probe.allocator();
+        const thread = try std.Thread.spawn(.{}, EngineAllocationCancellation.cancel, .{&probe});
+        var failure: ?anyerror = null;
+        grid.resizeCancellable(300, 150, &probe.cancelled) catch |err| {
+            failure = err;
+        };
+        probe.entered.set(testing.io);
+        thread.join();
+        grid.alloc = testing.allocator;
+        try testing.expect(probe.observed);
+        try testing.expectEqual(@as(?anyerror, error.Cancelled), failure);
+        try testing.expect(grid.feed_cancel == null);
+        try testing.expect(std.Io.Clock.awake.now(testing.io).nanoseconds - probe.cancelled_at < 500 * std.time.ns_per_ms);
+        const after = try grid.checkpointPayload(testing.allocator);
+        defer testing.allocator.free(after);
+        try testing.expectEqualSlices(u8, before, after);
+    }
+    try grid.resize(300, 150);
+    try testing.expectEqual(@as(u16, 300), grid.cols);
+    try testing.expectEqual(@as(u16, 150), grid.rows);
+}
 
 fn expectRow(grid: Grid, row: u16, expected: []const u8) !void {
     var buf: std.ArrayList(u8) = .empty;
@@ -4223,6 +4503,28 @@ test "fragmented native queries emit one ordered reply and observational modes e
     var replay_result = try replay.feedMode("\x1b[6n\x1b[18t", .journal_replay);
     defer replay_result.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 0), replay_result.replies.items.len);
+}
+
+test "render snapshot cancellation after staging begins preserves the live grid" {
+    const alloc = testing.allocator;
+    var grid = try Grid.init(alloc, 80, 40);
+    defer grid.deinit();
+    try grid.feed("\x1b[31mactual saved content\x1b[12;");
+    const before = try grid.checkpointPayload(alloc);
+    defer alloc.free(before);
+    for ([_]usize{ 1, 2 }) |allocation| {
+        var probe: CancelAfterAllocation = .{ .remaining = allocation };
+        var failure: ?anyerror = null;
+        if (grid.renderSnapshotCancellable(probe.allocator(), &probe.cancelled)) |value| {
+            var snapshot = value;
+            snapshot.deinit(probe.allocator());
+        } else |err| failure = err;
+        try testing.expect(probe.cancelled.load(.acquire));
+        try testing.expectEqual(@as(anyerror, error.Cancelled), failure orelse return error.TestExpectedCancellation);
+        const after = try grid.checkpointPayload(alloc);
+        defer alloc.free(after);
+        try testing.expectEqualSlices(u8, before, after);
+    }
 }
 
 test "render snapshot is immutable row-major styled state" {

@@ -3,6 +3,7 @@ const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const generation_fact_codec = @import("generation_fact_codec.zig");
 const usage_report = @import("usage_report.zig");
+const read_cancellation = @import("../shared/read_cancellation.zig");
 
 const Allocator = std.mem.Allocator;
 const usage_file = profile_paths.usage_file_name;
@@ -95,21 +96,23 @@ pub const Store = struct {
         alloc: Allocator,
         fact: usage_report.GenerationFact,
     ) !AppendOutcome {
-        return self.appendEvent(alloc, .{ .generation = fact });
+        return self.appendEvent(alloc, .{ .generation = fact }, null);
     }
 
     pub fn appendEvent(
         self: *Store,
         alloc: Allocator,
         event: usage_report.ProfileEvent,
+        cancel_flag: read_cancellation.CancelFlag,
     ) !AppendOutcome {
+        try read_cancellation.check(cancel_flag);
         try validateEvent(event);
         const event_line = try serializeEvent(alloc, event);
         defer alloc.free(event_line);
         if (event_line.len > max_record_bytes) return error.UsageRecordTooLarge;
 
         try self.ensureWritable();
-        var lock = self.acquireLock() catch |err| switch (err) {
+        var lock = self.acquireLock(cancel_flag) catch |err| switch (err) {
             error.LockBusy => return error.UsageLockBusy,
             error.LockUnsupported => return error.UsageLockUnsupported,
             else => return err,
@@ -118,10 +121,10 @@ pub const Store = struct {
 
         var file: ?std.Io.File = (try self.openUsage(true, true)).?;
         defer if (file) |open_file| open_file.close(io_mod.getIo());
-        const tail = try inspectTail(file.?);
+        const tail = try inspectTail(file.?, cancel_flag);
         const has_incomplete_tail = tail.incomplete;
         var boundary = tail.length;
-        var loaded = try self.loadFromFile(alloc, file.?, boundary);
+        var loaded = try self.loadFromFile(alloc, file.?, boundary, cancel_flag);
         defer loaded.deinit(alloc);
 
         const decision = classifyEvent(loaded, event);
@@ -156,19 +159,13 @@ pub const Store = struct {
         var compacted_before_append = false;
         var append_committed = false;
         var base_record_count = loaded.record_count;
-        if (shouldCompactBeforeAppend(
-            next_length,
-            base_record_count,
-            append_record_count,
-            loaded,
-            now_ms,
-        )) {
+        if ((try shouldCompactBeforeAppend(next_length, base_record_count, append_record_count, loaded, now_ms, cancel_flag))) {
             compacted_before_append = true;
-            base_record_count = retainedRecordCount(loaded, now_ms);
+            base_record_count = (try retainedRecordCount(loaded, now_ms, cancel_flag));
             if (has_incomplete_tail) {
                 var replacement: std.Io.Writer.Allocating = .init(alloc);
                 defer replacement.deinit();
-                try writeRetainedRecords(&replacement.writer, loaded, now_ms);
+                try writeRetainedRecords(&replacement.writer, loaded, now_ms, cancel_flag);
                 try replacement.writer.writeAll(append_bytes.written());
                 next_length = std.math.cast(u64, replacement.written().len) orelse
                     return error.UsageCapacityExceeded;
@@ -181,7 +178,7 @@ pub const Store = struct {
             } else {
                 file.?.close(io_mod.getIo());
                 file = null;
-                try self.compactLocked(alloc, now_ms);
+                try self.compactLocked(alloc, now_ms, cancel_flag);
                 file = (try self.openUsage(true, false)) orelse
                     return error.UsageReadFailed;
                 boundary = try file.?.length(io_mod.getIo());
@@ -199,11 +196,7 @@ pub const Store = struct {
             if (has_incomplete_tail) {
                 var replacement: std.Io.Writer.Allocating = .init(alloc);
                 defer replacement.deinit();
-                try copyFilePrefix(
-                    &replacement.writer,
-                    file.?,
-                    boundary,
-                );
+                try copyFilePrefix(&replacement.writer, file.?, boundary, cancel_flag);
                 try replacement.writer.writeAll(append_bytes.written());
                 try self.replaceUsageLocked(alloc, replacement.written());
                 file.?.close(io_mod.getIo());
@@ -214,30 +207,25 @@ pub const Store = struct {
             }
         }
 
-        if (shouldCompactAfterAppend(
-            next_length,
-            loaded,
-            eventTimestamp(event),
-            now_ms,
-            compacted_before_append,
-        )) {
+        if ((try shouldCompactAfterAppend(next_length, loaded, eventTimestamp(event), now_ms, compacted_before_append, cancel_flag))) {
             if (file) |open_file| {
                 open_file.close(io_mod.getIo());
                 file = null;
             }
-            try self.compactLocked(alloc, now_ms);
+            try self.compactLocked(alloc, now_ms, cancel_flag);
         }
         return decision.outcome;
     }
 
     /// Loads one stable read-only boundary without creating profile state.
-    pub fn load(self: *Store, alloc: Allocator) !Loaded {
+    pub fn load(self: *Store, alloc: Allocator, cancel_flag: read_cancellation.CancelFlag) !Loaded {
+        try read_cancellation.check(cancel_flag);
         if (self.durable_home == null) {
             self.durable_home = try openExistingDurableHome(self.home_path);
         }
         try self.validateReadable();
         while (true) {
-            const existing_lock = self.acquireExistingLock() catch |err| switch (err) {
+            const existing_lock = self.acquireExistingLock(cancel_flag) catch |err| switch (err) {
                 error.LockBusy => return error.UsageLockBusy,
                 error.LockUnsupported => return error.UsageLockUnsupported,
                 else => return err,
@@ -245,16 +233,16 @@ pub const Store = struct {
             if (existing_lock) |held| {
                 var lock = held;
                 defer lock.release();
-                return self.loadUnlocked(alloc);
+                return self.loadUnlocked(alloc, cancel_flag);
             }
 
-            var loaded = try self.loadUnlocked(alloc);
+            var loaded = try self.loadUnlocked(alloc, cancel_flag);
             if (!try self.lockFileExists()) return loaded;
             loaded.deinit(alloc);
         }
     }
 
-    fn loadUnlocked(self: *Store, alloc: Allocator) !Loaded {
+    fn loadUnlocked(self: *Store, alloc: Allocator, cancel_flag: read_cancellation.CancelFlag) !Loaded {
         var file = (try self.openUsage(false, false)) orelse return .{
             .coverage_started_at_ms = null,
             .facts = try alloc.alloc(usage_report.GenerationFact, 0),
@@ -264,7 +252,7 @@ pub const Store = struct {
         };
         defer file.close(io_mod.getIo());
         const boundary = try file.length(io_mod.getIo());
-        return self.loadFromFile(alloc, file, boundary);
+        return self.loadFromFile(alloc, file, boundary, cancel_flag);
     }
 
     fn validateReadable(self: *Store) !void {
@@ -304,7 +292,14 @@ pub const Store = struct {
         }
     }
 
-    fn acquireLock(self: *Store) !io_mod.TimedAdvisoryLock {
+    fn acquireLock(self: *Store, cancel_flag: read_cancellation.CancelFlag) !io_mod.TimedAdvisoryLock {
+        if (cancel_flag) |flag| return io_mod.acquireTimedAdvisoryLockCancellableWithOps(
+            &self.durable_home.?,
+            usage_lock_file,
+            lock_deadline_ms,
+            flag,
+            self.lock_ops,
+        );
         return io_mod.acquireTimedAdvisoryLockWithOps(
             &self.durable_home.?,
             usage_lock_file,
@@ -313,7 +308,7 @@ pub const Store = struct {
         );
     }
 
-    fn acquireExistingLock(self: *Store) !?io_mod.TimedAdvisoryLock {
+    fn acquireExistingLock(self: *Store, cancel_flag: read_cancellation.CancelFlag) !?io_mod.TimedAdvisoryLock {
         const durable_home = self.durable_home orelse return null;
         const zio = io_mod.getIo();
         const file = durable_home.dir.openFile(zio, usage_lock_file, .{
@@ -338,6 +333,7 @@ pub const Store = struct {
         const started = self.lock_ops.now_ms(self.lock_ops.ctx);
         const deadline = started + @as(i64, @intCast(lock_deadline_ms));
         while (true) {
+            try read_cancellation.check(cancel_flag);
             const locked = self.lock_ops.try_lock(
                 self.lock_ops.ctx,
                 file,
@@ -431,6 +427,7 @@ pub const Store = struct {
         alloc: Allocator,
         file: std.Io.File,
         boundary: u64,
+        cancel_flag: read_cancellation.CancelFlag,
     ) !Loaded {
         _ = self;
         if (boundary > max_file_bytes) return error.UsageCapacityExceeded;
@@ -447,8 +444,15 @@ pub const Store = struct {
             return error.UsageCapacityExceeded;
         const bytes = try alloc.alloc(u8, byte_len);
         defer alloc.free(bytes);
-        const read_count = try file.readPositionalAll(io_mod.getIo(), bytes, 0);
-        if (read_count != byte_len) return error.UsageReadFailed;
+        var offset: usize = 0;
+        while (offset < byte_len) {
+            try read_cancellation.check(cancel_flag);
+            const end = offset + @min(read_cancellation.work_bytes, byte_len - offset);
+            const read_count = try file.readPositionalAll(io_mod.getIo(), bytes[offset..end], offset);
+            if (read_count != end - offset) return error.UsageReadFailed;
+            offset = end;
+        }
+        try read_cancellation.check(cancel_flag);
         if (bytes[bytes.len - 1] != '\n') return error.UsageStoreIncomplete;
 
         var facts: std.ArrayList(usage_report.GenerationFact) = .empty;
@@ -471,6 +475,7 @@ pub const Store = struct {
         var record_count: usize = 0;
         var lines = std.mem.splitScalar(u8, bytes, '\n');
         while (lines.next()) |line| {
+            try read_cancellation.check(cancel_flag);
             if (line.len == 0) continue;
             record_count += 1;
             if (record_count > max_records or line.len > max_record_bytes) {
@@ -573,16 +578,16 @@ pub const Store = struct {
         };
     }
 
-    fn compactLocked(self: *Store, alloc: Allocator, now_ms: i64) !void {
+    fn compactLocked(self: *Store, alloc: Allocator, now_ms: i64, cancel_flag: read_cancellation.CancelFlag) !void {
         var file = (try self.openUsage(false, false)) orelse return;
         defer file.close(io_mod.getIo());
         const boundary = try file.length(io_mod.getIo());
-        var loaded = try self.loadFromFile(alloc, file, boundary);
+        var loaded = try self.loadFromFile(alloc, file, boundary, cancel_flag);
         defer loaded.deinit(alloc);
 
         var replacement: std.Io.Writer.Allocating = .init(alloc);
         defer replacement.deinit();
-        try writeRetainedRecords(&replacement.writer, loaded, now_ms);
+        try writeRetainedRecords(&replacement.writer, loaded, now_ms, cancel_flag);
         try self.replaceUsageLocked(alloc, replacement.written());
     }
 
@@ -638,13 +643,14 @@ fn retentionCutoff(now_ms: i64) i64 {
     return std.math.sub(i64, now_ms, retention_ms) catch 0;
 }
 
-fn hasExpiredRecords(loaded: Loaded, now_ms: i64) bool {
+fn hasExpiredRecords(loaded: Loaded, now_ms: i64, cancel_flag: read_cancellation.CancelFlag) !bool {
     const cutoff_ms = retentionCutoff(now_ms);
     for (loaded.facts) |fact| {
+        try read_cancellation.check(cancel_flag);
         if (fact.created_at_ms < cutoff_ms) return true;
     }
     for (loaded.pending) |marker| {
-        if (marker.observed_at_ms < cutoff_ms or pendingResolved(loaded, marker.id)) {
+        if (marker.observed_at_ms < cutoff_ms or (try pendingResolved(loaded, marker.id, cancel_flag))) {
             return true;
         }
     }
@@ -654,8 +660,9 @@ fn hasExpiredRecords(loaded: Loaded, now_ms: i64) bool {
     return false;
 }
 
-fn pendingResolved(loaded: Loaded, id: []const u8) bool {
+fn pendingResolved(loaded: Loaded, id: []const u8, cancel_flag: read_cancellation.CancelFlag) !bool {
     for (loaded.facts) |fact| {
+        try read_cancellation.check(cancel_flag);
         if (std.mem.eql(u8, fact.id, id)) return true;
     }
     return false;
@@ -673,15 +680,16 @@ fn exceedsRecordCapacity(current: usize, additional: usize) bool {
     return false;
 }
 
-fn retainedRecordCount(loaded: Loaded, now_ms: i64) usize {
+fn retainedRecordCount(loaded: Loaded, now_ms: i64, cancel_flag: read_cancellation.CancelFlag) !usize {
     const cutoff_ms = retentionCutoff(now_ms);
     var count: usize = @intFromBool(loaded.coverage_started_at_ms != null);
     for (loaded.facts) |fact| {
+        try read_cancellation.check(cancel_flag);
         if (fact.created_at_ms >= cutoff_ms) count += 1;
     }
     for (loaded.pending) |marker| {
         if (marker.observed_at_ms >= cutoff_ms and
-            !pendingResolved(loaded, marker.id))
+            !(try pendingResolved(loaded, marker.id, cancel_flag)))
         {
             count += 1;
         }
@@ -698,10 +706,11 @@ fn shouldCompactBeforeAppend(
     append_record_count: usize,
     loaded: Loaded,
     now_ms: i64,
-) bool {
+    cancel_flag: read_cancellation.CancelFlag,
+) !bool {
     return (next_length > max_file_bytes or
         exceedsRecordCapacity(record_count, append_record_count)) and
-        hasExpiredRecords(loaded, now_ms);
+        (try hasExpiredRecords(loaded, now_ms, cancel_flag));
 }
 
 fn shouldCompactAfterAppend(
@@ -710,14 +719,15 @@ fn shouldCompactAfterAppend(
     appended_at_ms: i64,
     now_ms: i64,
     compacted_before_append: bool,
-) bool {
+    cancel_flag: read_cancellation.CancelFlag,
+) !bool {
     return !compacted_before_append and
         next_length > compaction_threshold_bytes and
-        (hasExpiredRecords(loaded, now_ms) or
+        ((try hasExpiredRecords(loaded, now_ms, cancel_flag)) or
             appended_at_ms < retentionCutoff(now_ms));
 }
 
-fn inspectTail(file: std.Io.File) !TailBoundary {
+fn inspectTail(file: std.Io.File, cancel_flag: read_cancellation.CancelFlag) !TailBoundary {
     const length = try file.length(io_mod.getIo());
     if (length == 0) return .{ .length = 0, .incomplete = false };
     var last: [1]u8 = undefined;
@@ -729,6 +739,7 @@ fn inspectTail(file: std.Io.File) !TailBoundary {
     var cursor = length;
     var buffer: [8192]u8 = undefined;
     while (cursor > 0) {
+        try read_cancellation.check(cancel_flag);
         const start = cursor - @min(cursor, buffer.len);
         const read_len: usize = @intCast(cursor - start);
         const read_count = try file.readPositionalAll(
@@ -752,10 +763,12 @@ fn copyFilePrefix(
     writer: *std.Io.Writer,
     file: std.Io.File,
     boundary: u64,
+    cancel_flag: read_cancellation.CancelFlag,
 ) !void {
     var offset: u64 = 0;
     var buffer: [8192]u8 = undefined;
     while (offset < boundary) {
+        try read_cancellation.check(cancel_flag);
         const remaining = boundary - offset;
         const read_len: usize = @intCast(@min(remaining, buffer.len));
         const read_count = try file.readPositionalAll(
@@ -773,24 +786,27 @@ fn writeRetainedRecords(
     writer: *std.Io.Writer,
     loaded: Loaded,
     now_ms: i64,
+    cancel_flag: read_cancellation.CancelFlag,
 ) !void {
     const cutoff_ms = retentionCutoff(now_ms);
     if (loaded.coverage_started_at_ms) |started_at_ms| {
         try writeCoverage(writer, started_at_ms);
     }
     for (loaded.facts) |fact| {
+        try read_cancellation.check(cancel_flag);
         if (fact.created_at_ms < cutoff_ms) continue;
         try writeGeneration(writer, fact);
     }
     for (loaded.pending) |marker| {
         if (marker.observed_at_ms < cutoff_ms or
-            pendingResolved(loaded, marker.id))
+            (try pendingResolved(loaded, marker.id, cancel_flag)))
         {
             continue;
         }
         try writePending(writer, marker);
     }
     for (loaded.incidents) |incident| {
+        try read_cancellation.check(cancel_flag);
         if (incident.occurred_at_ms < cutoff_ms) continue;
         try writeIncident(writer, incident);
     }
@@ -1037,7 +1053,7 @@ test "profile usage store is read-only until first fact and dedupes exact replay
     var store = try Store.initFromHome(alloc, home);
     defer store.deinit(alloc);
 
-    var empty = try store.load(alloc);
+    var empty = try store.load(alloc, null);
     defer empty.deinit(alloc);
     try std.testing.expect(empty.coverage_started_at_ms == null);
 
@@ -1051,7 +1067,7 @@ test "profile usage store is read-only until first fact and dedupes exact replay
     try std.testing.expectEqual(AppendOutcome.appended, try store.appendFact(alloc, fact));
     try std.testing.expectEqual(AppendOutcome.duplicate, try store.appendFact(alloc, fact));
 
-    var loaded = try store.load(alloc);
+    var loaded = try store.load(alloc, null);
     defer loaded.deinit(alloc);
     try std.testing.expect(loaded.coverage_started_at_ms.? > 0);
     try std.testing.expectEqual(@as(usize, 1), loaded.facts.len);
@@ -1081,7 +1097,7 @@ test "profile usage store discovers profile state created after initialization" 
         try writer.appendFact(alloc, fact),
     );
 
-    var loaded = try observer.load(alloc);
+    var loaded = try observer.load(alloc, null);
     defer loaded.deinit(alloc);
     try std.testing.expect(loaded.coverage_started_at_ms != null);
     try std.testing.expectEqual(@as(usize, 1), loaded.facts.len);
@@ -1089,6 +1105,126 @@ test "profile usage store discovers profile state created after initialization" 
         fact,
         loaded.facts[0],
     ));
+}
+
+test "profile usage cancellation interrupts an existing lock wait for reads and writes" {
+    const Worker = struct {
+        store: *Store,
+        writing: bool,
+        entered: std.atomic.Value(bool) = .init(false),
+        cancel: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+
+        fn tryLock(raw: ?*anyopaque, file: std.Io.File) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const locked = try file.tryLock(std.testing.io, .exclusive);
+            if (!locked) self.entered.store(true, .release);
+            return locked;
+        }
+
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            if (self.writing) {
+                _ = self.store.appendEvent(std.testing.allocator, .{ .incident = .{ .occurred_at_ms = 1000, .completeness = .incomplete } }, &self.cancel) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+            } else {
+                var loaded = self.store.load(std.testing.allocator, &self.cancel) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                loaded.deinit(std.testing.allocator);
+            }
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var writer = try Store.initFromHome(alloc, home);
+    defer writer.deinit(alloc);
+    _ = try writer.appendEvent(alloc, .{ .incident = .{ .occurred_at_ms = 999, .completeness = .incomplete } }, null);
+    const before = try writer.durable_home.?.dir.statFile(std.testing.io, usage_file, .{});
+    var held = try writer.acquireLock(null);
+    defer held.release();
+    for ([_]bool{ false, true }) |writing| {
+        var store = try Store.initFromHome(alloc, home);
+        defer store.deinit(alloc);
+        var worker = Worker{ .store = &store, .writing = writing };
+        store.lock_ops = .{ .ctx = &worker, .try_lock = Worker.tryLock };
+        const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+        while (!worker.entered.load(.acquire) and !worker.done.load(.acquire)) std.Thread.yield() catch {};
+        const started = io_mod.nanoTimestamp();
+        worker.cancel.store(true, .release);
+        thread.join();
+        try std.testing.expect(worker.entered.load(.acquire));
+        try std.testing.expectEqual(error.Cancelled, worker.failure.?);
+        try std.testing.expect(io_mod.nanoTimestamp() - started < 500 * std.time.ns_per_ms);
+        const after = try writer.durable_home.?.dir.statFile(std.testing.io, usage_file, .{});
+        try std.testing.expectEqual(before.inode, after.inode);
+        try std.testing.expectEqual(before.size, after.size);
+        try std.testing.expectEqual(before.mtime, after.mtime);
+        try std.testing.expectEqual(before.ctime, after.ctime);
+        try std.testing.expectEqual(before.permissions, after.permissions);
+    }
+}
+
+test "profile usage cancellation interrupts parsing after the first record begins" {
+    const Reader = struct {
+        store: *Store,
+        file_bytes: usize,
+        buffer_allocated: bool = false,
+        entered: std.atomic.Value(bool) = .init(false),
+        cancel: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+
+        fn allocator(self: *@This()) Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = free } };
+        }
+        fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const bytes = std.testing.allocator.rawAlloc(len, alignment, ra);
+            if (self.buffer_allocated and !self.entered.swap(true, .acq_rel)) {
+                while (!self.cancel.load(.acquire)) std.Thread.yield() catch {};
+            }
+            if (len == self.file_bytes) self.buffer_allocated = true;
+            return bytes;
+        }
+        fn free(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            std.testing.allocator.rawFree(bytes, alignment, ra);
+        }
+        fn run(self: *@This()) void {
+            var loaded = self.store.load(self.allocator(), &self.cancel) catch |err| {
+                self.failure = err;
+                return;
+            };
+            loaded.deinit(self.allocator());
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home);
+    defer store.deinit(alloc);
+    _ = try store.appendEvent(alloc, .{ .incident = .{ .occurred_at_ms = 1, .completeness = .incomplete } }, null);
+    const before = try store.durable_home.?.dir.statFile(std.testing.io, usage_file, .{});
+    var reader = Reader{ .store = &store, .file_bytes = @intCast(before.size) };
+    const thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+    while (!reader.entered.load(.acquire)) std.Thread.yield() catch {};
+    const started = io_mod.nanoTimestamp();
+    reader.cancel.store(true, .release);
+    thread.join();
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), reader.failure);
+    try std.testing.expect(io_mod.nanoTimestamp() - started < 500 * std.time.ns_per_ms);
+    const after = try store.durable_home.?.dir.statFile(std.testing.io, usage_file, .{});
+    try std.testing.expectEqual(before.size, after.size);
+    try std.testing.expectEqual(before.mtime, after.mtime);
+    try std.testing.expectEqual(before.ctime, after.ctime);
 }
 
 test "profile usage readers wait for the cross-process writer boundary" {
@@ -1122,7 +1258,7 @@ test "profile usage readers wait for the cross-process writer boundary" {
 
         fn run(self: *@This()) void {
             self.started.store(true, .seq_cst);
-            var loaded = self.store.load(std.heap.c_allocator) catch |err| {
+            var loaded = self.store.load(std.heap.c_allocator, null) catch |err| {
                 self.failure = err;
                 self.done.store(true, .seq_cst);
                 return;
@@ -1133,7 +1269,7 @@ test "profile usage readers wait for the cross-process writer boundary" {
         }
     };
     var worker = Worker{ .store = &reader };
-    var lock = try writer.acquireLock();
+    var lock = try writer.acquireLock(null);
     const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
     while (!worker.started.load(.seq_cst)) std.Thread.yield() catch {};
     for (0..100) |_| std.Thread.yield() catch {};
@@ -1179,7 +1315,7 @@ test "profile usage store preserves conflicting duplicates as incomplete evidenc
     defer file.close(io_mod.getIo());
     try std.testing.expectEqual(conflicted_length, try file.length(io_mod.getIo()));
 
-    var loaded = try store.load(alloc);
+    var loaded = try store.load(alloc, null);
     defer loaded.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), loaded.facts.len);
     try std.testing.expectEqual(@as(usize, 0), loaded.incidents.len);
@@ -1191,6 +1327,7 @@ test "profile usage store preserves conflicting duplicates as incomplete evidenc
         0,
         loaded.facts,
         loaded.incidents,
+        null,
     );
     defer report.deinit(alloc);
     try std.testing.expectEqual(
@@ -1225,7 +1362,7 @@ test "profile usage store repairs an incomplete tail and records the gap" {
     try file.writePositionalAll(io_mod.getIo(), "{\"schema_version\":1", length);
     try file.sync(io_mod.getIo());
     file.close(io_mod.getIo());
-    try std.testing.expectError(error.UsageStoreIncomplete, store.load(alloc));
+    try std.testing.expectError(error.UsageStoreIncomplete, store.load(alloc, null));
 
     var second = try makeTestFact(
         alloc,
@@ -1238,7 +1375,7 @@ test "profile usage store repairs an incomplete tail and records the gap" {
         AppendOutcome.appended,
         try store.appendFact(alloc, second),
     );
-    var loaded = try store.load(alloc);
+    var loaded = try store.load(alloc, null);
     defer loaded.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), loaded.facts.len);
     try std.testing.expectEqual(@as(usize, 1), loaded.incidents.len);
@@ -1279,7 +1416,7 @@ test "profile usage store records a repaired tail when the replayed fact is dupl
         AppendOutcome.duplicate,
         try store.appendFact(alloc, fact),
     );
-    var loaded = try store.load(alloc);
+    var loaded = try store.load(alloc, null);
     defer loaded.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), loaded.facts.len);
     try std.testing.expectEqual(@as(usize, 1), loaded.incidents.len);
@@ -1340,7 +1477,7 @@ test "profile usage store leaves an incomplete tail intact when repair exceeds r
         original_length,
         try unchanged.length(io_mod.getIo()),
     );
-    try std.testing.expectError(error.UsageStoreIncomplete, store.load(alloc));
+    try std.testing.expectError(error.UsageStoreIncomplete, store.load(alloc, null));
 }
 
 test "profile usage store repairs an existing profile directory to private mode" {
@@ -1417,7 +1554,7 @@ test "profile usage reads reject an unsafe profile directory without repairing i
     defer store.deinit(alloc);
     try std.testing.expectError(
         error.PrivateStatePermissionsUnsupported,
-        store.load(alloc),
+        store.load(alloc, null),
     );
 
     const stat = try profile.stat(io_mod.getIo());
@@ -1477,7 +1614,7 @@ test "profile usage store decodes a large ledger with stable id indexing" {
     defer alloc.free(home);
     var store = try Store.initFromHome(alloc, home);
     defer store.deinit(alloc);
-    var loaded = try store.load(alloc);
+    var loaded = try store.load(alloc, null);
     defer loaded.deinit(alloc);
     try std.testing.expectEqual(record_count, loaded.facts.len);
 }
@@ -1502,44 +1639,14 @@ test "profile usage compaction eligibility requires expired records" {
         .incidents = &.{},
         .record_count = 2,
     };
-    try std.testing.expect(!hasExpiredRecords(loaded, now_ms));
-    try std.testing.expect(!shouldCompactAfterAppend(
-        compaction_threshold_bytes + 1,
-        loaded,
-        recent_fact.created_at_ms,
-        now_ms,
-        false,
-    ));
-    try std.testing.expect(!shouldCompactBeforeAppend(
-        max_file_bytes + 1,
-        loaded.record_count,
-        1,
-        loaded,
-        now_ms,
-    ));
+    try std.testing.expect(!(try hasExpiredRecords(loaded, now_ms, null)));
+    try std.testing.expect(!(try shouldCompactAfterAppend(compaction_threshold_bytes + 1, loaded, recent_fact.created_at_ms, now_ms, false, null)));
+    try std.testing.expect(!(try shouldCompactBeforeAppend(max_file_bytes + 1, loaded.record_count, 1, loaded, now_ms, null)));
     loaded.facts[0].created_at_ms = now_ms - std.time.ms_per_day * 36;
-    try std.testing.expect(hasExpiredRecords(loaded, now_ms));
-    try std.testing.expect(shouldCompactAfterAppend(
-        compaction_threshold_bytes + 1,
-        loaded,
-        now_ms - 1,
-        now_ms,
-        false,
-    ));
-    try std.testing.expect(shouldCompactBeforeAppend(
-        max_file_bytes + 1,
-        loaded.record_count,
-        1,
-        loaded,
-        now_ms,
-    ));
-    try std.testing.expect(shouldCompactBeforeAppend(
-        0,
-        max_records,
-        1,
-        loaded,
-        now_ms,
-    ));
+    try std.testing.expect((try hasExpiredRecords(loaded, now_ms, null)));
+    try std.testing.expect((try shouldCompactAfterAppend(compaction_threshold_bytes + 1, loaded, now_ms - 1, now_ms, false, null)));
+    try std.testing.expect((try shouldCompactBeforeAppend(max_file_bytes + 1, loaded.record_count, 1, loaded, now_ms, null)));
+    try std.testing.expect((try shouldCompactBeforeAppend(0, max_records, 1, loaded, now_ms, null)));
 }
 
 test "profile usage record capacity is checked before append" {
@@ -1621,7 +1728,7 @@ test "concurrent profile usage writers serialize without losing facts" {
     try std.testing.expect(second.failure == null);
     try std.testing.expectEqual(AppendOutcome.appended, first.outcome.?);
     try std.testing.expectEqual(AppendOutcome.appended, second.outcome.?);
-    var loaded = try first_store.load(alloc);
+    var loaded = try first_store.load(alloc, null);
     defer loaded.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), loaded.facts.len);
 }
@@ -1660,7 +1767,7 @@ test "profile usage store refuses a symlinked ledger leaf" {
         else => return err,
     };
 
-    try std.testing.expectError(error.DurablePathUnsafe, store.load(alloc));
+    try std.testing.expectError(error.DurablePathUnsafe, store.load(alloc, null));
     try std.testing.expectError(
         error.DurablePathUnsafe,
         store.appendFact(alloc, first),

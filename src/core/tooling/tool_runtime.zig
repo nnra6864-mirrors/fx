@@ -5247,7 +5247,7 @@ test "run_command timeout returns model-visible failure" {
         .{},
     );
     defer parsed.deinit();
-    const decoded = try session_codec.parseHistoryTurn(alloc, parsed.value);
+    const decoded = try session_codec.parseHistoryTurn(alloc, parsed.value, null);
     defer session_runtime.freeHistoryTurn(alloc, decoded);
     const decoded_result = decoded.assistant.execution.tool_steps[0].tool_results[0];
     try expectNotContains(decoded_result.output, "PRE-TIMEOUT-OUT");

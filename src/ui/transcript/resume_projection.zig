@@ -4,6 +4,7 @@ const diff = @import("../../core/output/diff.zig");
 const types = @import("../../core/shared/types.zig");
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
 const command_output_runtime = @import("command_output_runtime.zig");
+const build_checkpoint = @import("../render_engine/build_checkpoint.zig");
 const source_preparation = @import("source_preparation.zig");
 const transcript_runtime = @import("runtime.zig");
 const transcript_store = @import("store.zig");
@@ -42,18 +43,30 @@ pub const ResumeProjection = struct {
         };
     }
 
-    /// Start a detached projection with the source runtime's presentation
-    /// policy but none of its conversation content.
+    /// Copies presentation policy without allocating or copying conversation
+    /// content. Style strings remain borrowed, as in `init`.
     pub fn initEmpty(
         alloc: Allocator,
         source: *TranscriptRuntime,
         created_at_ms: i64,
         next_diff_id: u32,
     ) !ResumeProjection {
-        var projection = try init(alloc, source, created_at_ms, next_diff_id);
-        projection.runtime.clearTranscript(alloc);
-        projection.runtime.next_entry_id = 1;
-        return projection;
+        return .{
+            .runtime = .{
+                .layout = source.layout,
+                .cursor_row = source.owned_top_row,
+                .owned_top_row = source.owned_top_row,
+                .viewport_top_row = source.owned_top_row,
+                .last_rendered_cols = source.last_rendered_cols,
+                .max_transcript_bytes = source.max_transcript_bytes,
+                .max_retained_transcript_bytes = std.math.maxInt(usize),
+                .command_output_render = source.command_output_render,
+            },
+            .alloc = alloc,
+            .created_at_ms = created_at_ms,
+            .retention_cap = source.max_retained_transcript_bytes,
+            .next_diff_id = next_diff_id,
+        };
     }
 
     pub fn deinit(self: *ResumeProjection) void {
@@ -276,22 +289,6 @@ pub const ResumeProjection = struct {
         );
     }
 
-    pub fn attachHistoricalToolDetailAfterCommandOutput(
-        self: *ResumeProjection,
-        entry_id: u32,
-        call: types.ToolCall,
-        activity_kind: types.ToolActivityKind,
-        result: types.PersistedToolResult,
-    ) !void {
-        try self.runtime.attachHistoricalToolDetailAfterCommandOutputDetached(
-            self.alloc,
-            entry_id,
-            call,
-            activity_kind,
-            result,
-        );
-    }
-
     pub fn attachHistoricalToolCallWithoutResult(
         self: *ResumeProjection,
         entry_id: u32,
@@ -302,13 +299,6 @@ pub const ResumeProjection = struct {
             entry_id,
             call,
         );
-    }
-
-    pub fn attachHistoricalCommandOutput(
-        self: *ResumeProjection,
-        entry_id: u32,
-    ) void {
-        self.runtime.attachHistoricalCommandOutput(self.alloc, entry_id);
     }
 
     pub fn attachHistoricalCancelledCommandDetail(
@@ -343,20 +333,23 @@ pub const ResumeProjection = struct {
     }
 
     pub fn finalize(self: *ResumeProjection) !void {
-        return self.finalizeForPresentation(false);
+        return self.finalizeForPresentation(null);
     }
 
-    /// A live projection may end at a valid command-output prefix. Keep that
-    /// block open so later output and its terminal event can continue it.
-    pub fn finalizeLivePresentation(self: *ResumeProjection) !void {
-        return self.finalizeForPresentation(true);
+    /// Returns `InputPending` when the checkpoint requests cancellation.
+    /// On failure the caller must discard this uninstalled projection.
+    pub fn finalizeInterruptible(
+        self: *ResumeProjection,
+        checkpoint: *build_checkpoint.BuildCheckpoint,
+    ) !void {
+        return self.finalizeForPresentation(checkpoint);
     }
 
     fn finalizeForPresentation(
         self: *ResumeProjection,
-        allow_open_command_block: bool,
+        checkpoint: ?*build_checkpoint.BuildCheckpoint,
     ) !void {
-        return self.finalizeInner(allow_open_command_block) catch |err| switch (err) {
+        return self.finalizeInner(checkpoint) catch |err| switch (err) {
             error.WriteFailed => error.OutOfMemory,
             else => err,
         };
@@ -364,38 +357,45 @@ pub const ResumeProjection = struct {
 
     fn finalizeInner(
         self: *ResumeProjection,
-        allow_open_command_block: bool,
+        checkpoint: ?*build_checkpoint.BuildCheckpoint,
     ) !void {
         std.debug.assert(!self.finalized);
         std.debug.assert(!self.consumed);
-        std.debug.assert(
-            allow_open_command_block or
-                self.runtime.command_output_display.open_command_block == null,
-        );
+        std.debug.assert(self.runtime.command_output_display.open_command_block == null);
 
-        _ = try command_output_runtime.syncCommandOutputBlockEntries(
+        try build_checkpoint.poll(checkpoint);
+        _ = try command_output_runtime.syncCommandOutputBlockEntriesInterruptible(
             &self.runtime,
             self.alloc,
+            checkpoint,
         );
-        var source = try source_preparation.prepareTranscriptSource(
+        var source = try source_preparation.prepareTranscriptSourceInterruptible(
             &self.runtime,
             self.alloc,
             null,
+            null,
+            null,
+            checkpoint,
         );
         const full_flow = source.bytes;
         source.bytes = &.{};
         source.deinit(self.alloc);
-        self.publication_source = try source_preparation.prepareFullTranscriptViewportSource(
+        self.publication_source = try source_preparation.prepareFullTranscriptViewportSourceInterruptible(
             &self.runtime,
             self.alloc,
             full_flow,
+            checkpoint,
         );
 
+        try build_checkpoint.poll(checkpoint);
         self.runtime.max_retained_transcript_bytes = self.retention_cap;
-        const retention_changed = try self.runtime.enforceStructuredRetentionAndReport(
+        const retention_changed = try transcript_store.enforceStructuredRetentionAndReportInterruptible(
+            &self.runtime,
             self.alloc,
             null,
+            checkpoint,
         );
+        try build_checkpoint.poll(checkpoint);
         if (!retention_changed) {
             self.runtime.transcript.clearRetainingCapacity();
             self.runtime.replaceable_last_line = false;
@@ -416,7 +416,9 @@ pub const ResumeProjection = struct {
         self.finalized = true;
     }
 
-    pub fn install(self: *ResumeProjection, target: *TranscriptRuntime) void {
+    /// Transfers the new presentation into `target`; caller owns the displaced
+    /// detached storage and may retire it outside the input thread.
+    pub fn install(self: *ResumeProjection, target: *TranscriptRuntime) TranscriptRuntime {
         std.debug.assert(self.finalized);
         std.debug.assert(!self.consumed);
         std.debug.assert(target.pending_resume_source == null);
@@ -447,42 +449,12 @@ pub const ResumeProjection = struct {
         self.publication_source = null;
         target.recomputeCursorFromTranscript();
         target.reconcileDetachedInstallSource(target.pendingResumeFlow());
-        target.markTranscriptDirty();
+        target.markTranscriptStructureDirty();
 
         self.consumed = true;
-        self.runtime.deinit(self.alloc);
-    }
-
-    /// Transfers a finalized detached projection into a standalone transcript
-    /// runtime. The caller owns the returned runtime and must deinitialize it
-    /// with the same allocator.
-    pub fn intoRuntime(self: *ResumeProjection) TranscriptRuntime {
-        std.debug.assert(self.finalized);
-        std.debug.assert(!self.consumed);
-        std.debug.assert(self.runtime.pending_resume_source == null);
-
-        self.runtime.pending_resume_source = self.publication_source;
-        self.publication_source = null;
-        self.runtime.reconcileDetachedInstallSource(
-            self.runtime.pendingResumeFlow(),
-        );
-        self.runtime.markTranscriptDirty();
-
-        self.consumed = true;
-        return self.runtime;
-    }
-
-    /// Transfers the full-diff sidecars that belong to the detached
-    /// presentation. The caller owns the returned entries and must deinitialize
-    /// each entry and the list with `std.heap.c_allocator`.
-    pub fn takePendingDiffs(
-        self: *ResumeProjection,
-    ) std.ArrayList(diff.DiffEntry) {
-        std.debug.assert(self.finalized);
-        std.debug.assert(!self.consumed);
-        const pending = self.pending_diffs;
-        self.pending_diffs = .empty;
-        return pending;
+        const displaced = self.runtime;
+        self.runtime = undefined;
+        return displaced;
     }
 };
 
@@ -548,6 +520,142 @@ test "empty resume projection keeps layout without source conversation" {
     try std.testing.expectEqual(@as(usize, 1), source.entries.items.len);
 }
 
+test "empty resume projection allocation is independent of old conversation size" {
+    const alloc = std.testing.allocator;
+    var source: TranscriptRuntime = .{};
+    source.layout = .{
+        .rows = 24,
+        .cols = 72,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    };
+    source.owned_top_row = 3;
+    source.max_transcript_bytes = 4096;
+    source.max_retained_transcript_bytes = 8192;
+    source.command_output_render.styles.dim_style = "\x1b[2m";
+    defer source.deinit(alloc);
+    const old_content = try alloc.alloc(u8, 1024 * 1024);
+    @memset(old_content, 'x');
+    _ = try source.appendRawBytesEntry(alloc, old_content);
+
+    var budget: [64 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&budget);
+    var projection = try ResumeProjection.initEmpty(fixed.allocator(), &source, 42, 7);
+    defer projection.deinit();
+    try std.testing.expectEqual(@as(usize, 0), fixed.end_index);
+    try std.testing.expectEqual(@as(u16, 3), projection.runtime.owned_top_row);
+    try std.testing.expectEqual(@as(usize, 4096), projection.runtime.max_transcript_bytes);
+    try std.testing.expectEqual(@as(usize, 8192), projection.retention_cap);
+    try std.testing.expectEqualStrings("\x1b[2m", projection.runtime.command_output_render.styles.dim_style);
+    try projection.appendAssistantText("restored content\n");
+    try projection.finalize();
+    try std.testing.expectEqualStrings("  restored content", projection.publication_source.?.bytes);
+    try std.testing.expectEqual(@as(usize, 1), source.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1024 * 1024), source.entries.items[0].raw_bytes.bytes.len);
+}
+
+const CancellationOperation = enum { finalization, retention, command_entries };
+
+fn checkProjectionCancellation(comptime operation: CancellationOperation) !void {
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = counted.allocator();
+    var source: TranscriptRuntime = .{};
+    source.layout.cols = 80;
+    defer source.deinit(alloc);
+    var projection = try ResumeProjection.initEmpty(alloc, &source, 42, 1);
+    defer projection.deinit();
+    for (0..8192) |_| {
+        _ = try projection.appendRawClassified("saved content for cancellation\n", .unknown_raw);
+    }
+    if (operation == .command_entries) {
+        var block = command_output_runtime.CommandOutputBlock{ .total_lines = 1 };
+        errdefer block.deinit(alloc);
+        try block.lines.append(alloc, .{
+            .stream = .stdout,
+            .text = try alloc.dupe(u8, "saved output"),
+            .entry_id = 1,
+        });
+        try projection.runtime.command_output_blocks.append(alloc, block);
+    }
+
+    const Finalizer = struct {
+        projection: *ResumeProjection,
+        counted: *std.testing.FailingAllocator,
+        initial_bytes: usize,
+        reached: std.Io.Event = .unset,
+        cancel: std.Io.Event = .unset,
+        began: bool = false,
+        failure: ?anyerror = null,
+
+        fn cancelled(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.began and self.counted.allocated_bytes > self.initial_bytes) {
+                self.began = true;
+                self.reached.set(std.testing.io);
+                self.cancel.waitUncancelable(std.testing.io);
+            }
+            return self.cancel.isSet();
+        }
+
+        fn run(self: *@This()) void {
+            defer self.reached.set(std.testing.io);
+            var checkpoint = build_checkpoint.BuildCheckpoint.init(self, cancelled);
+            self.prepare(&checkpoint) catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn prepare(self: *@This(), checkpoint: *build_checkpoint.BuildCheckpoint) !void {
+            switch (operation) {
+                .finalization => try self.projection.finalizeInterruptible(checkpoint),
+                .retention => {
+                    _ = try transcript_store.enforceStructuredRetentionAndReportInterruptible(
+                        &self.projection.runtime,
+                        self.projection.alloc,
+                        null,
+                        checkpoint,
+                    );
+                },
+                .command_entries => {
+                    _ = try command_output_runtime.syncCommandOutputBlockEntriesInterruptible(
+                        &self.projection.runtime,
+                        self.projection.alloc,
+                        checkpoint,
+                    );
+                },
+            }
+        }
+    };
+    var finalizer = Finalizer{
+        .projection = &projection,
+        .counted = &counted,
+        .initial_bytes = counted.allocated_bytes,
+    };
+    const thread = try std.Thread.spawn(.{}, Finalizer.run, .{&finalizer});
+    finalizer.reached.waitUncancelable(std.testing.io);
+    finalizer.cancel.set(std.testing.io);
+    thread.join();
+
+    try std.testing.expectEqual(@as(?anyerror, error.InputPending), finalizer.failure);
+    try std.testing.expect(finalizer.began);
+    try std.testing.expect(!projection.finalized);
+}
+
+test "resume projection finalization observes cancellation after work begins" {
+    try checkProjectionCancellation(.finalization);
+}
+
+test "resume projection retention observes cancellation after work begins" {
+    try checkProjectionCancellation(.retention);
+}
+
+test "resume projection command synchronization observes cancellation after work begins" {
+    try checkProjectionCancellation(.command_entries);
+}
+
 test "resume projection installs complete publication and retained continuation together" {
     const alloc = std.testing.allocator;
     var source: TranscriptRuntime = .{};
@@ -576,7 +684,8 @@ test "resume projection installs complete publication and retained continuation 
         _ = try projection.appendRawClassified(line, .unknown_raw);
     }
     try projection.finalize();
-    projection.install(&target);
+    var displaced = projection.install(&target);
+    defer displaced.deinit(alloc);
 
     try std.testing.expect(std.mem.find(u8, target.pendingResumeFlow(), "publication marker 0") != null);
     try std.testing.expect(std.mem.find(u8, target.pendingResumeFlow(), "publication marker 11") != null);
@@ -586,7 +695,7 @@ test "resume projection installs complete publication and retained continuation 
     try std.testing.expectEqualStrings(target.pendingResumeFlow(), prepared.bytes);
 }
 
-test "resume projection transfers a complete standalone runtime" {
+test "resume projection installs new content and returns displaced storage" {
     const alloc = std.testing.allocator;
     var source: TranscriptRuntime = .{};
     source.layout = .{
@@ -600,22 +709,54 @@ test "resume projection transfers a complete standalone runtime" {
     };
     defer source.deinit(alloc);
 
+    var target: TranscriptRuntime = .{ .layout = source.layout };
+    defer target.deinit(alloc);
+    const old_text = try alloc.dupe(u8, "old owned content\n");
+    _ = target.appendRawBytesEntry(alloc, old_text) catch |err| {
+        alloc.free(old_text);
+        return err;
+    };
+
     var projection = try ResumeProjection.initEmpty(alloc, &source, 42, 1);
     defer projection.deinit();
     try projection.appendAssistantText("standalone child\n");
     try projection.finalize();
 
-    var runtime = projection.intoRuntime();
-    defer runtime.deinit(alloc);
-    try std.testing.expectEqual(source.layout.cols, runtime.layout.cols);
+    var displaced = projection.install(&target);
+    defer displaced.deinit(alloc);
+    try std.testing.expectEqual(source.layout.cols, target.layout.cols);
     try std.testing.expect(std.mem.find(
         u8,
-        runtime.pendingResumeFlow(),
+        target.pendingResumeFlow(),
         "standalone child",
     ) != null);
+    try std.testing.expect(std.mem.find(u8, target.pendingResumeFlow(), "old owned content") == null);
+    try std.testing.expectEqualStrings("old owned content\n", displaced.entries.items[0].raw_bytes.bytes);
 }
 
-test "resume projection transfers standalone full diff sidecars" {
+test "resume installation replaces the already painted compact source" {
+    const alloc = std.testing.allocator;
+    var target: TranscriptRuntime = .{ .has_committed_frame = true };
+    target.layout.cols = 80;
+    defer target.deinit(alloc);
+    var prior = try target.cachedTranscriptSource(alloc);
+    prior.deinit(alloc);
+
+    var projection = try ResumeProjection.initEmpty(alloc, &target, 42, 1);
+    defer projection.deinit();
+    try projection.appendAssistantText("RESTORED_AFTER_FIRST_FRAME");
+    try projection.finalize();
+    var displaced = projection.install(&target);
+    defer displaced.deinit(alloc);
+    target.pending_resume_source.?.deinit(alloc);
+    target.pending_resume_source = null;
+
+    var next = try target.cachedTranscriptSource(alloc);
+    defer next.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, next.bytes, "RESTORED_AFTER_FIRST_FRAME") != null);
+}
+
+test "resume projection installs full diff sidecars with their rendered markers" {
     const alloc = std.testing.allocator;
     const c_alloc = std.heap.c_allocator;
     var source: TranscriptRuntime = .{};
@@ -649,13 +790,16 @@ test "resume projection transfers standalone full diff sidecars" {
     owns_payload = false;
     try projection.finalize();
 
-    var pending = projection.takePendingDiffs();
+    var pending: std.ArrayList(diff.DiffEntry) = .empty;
+    std.mem.swap(@TypeOf(pending), &pending, &projection.pending_diffs);
     defer {
         for (pending.items) |*entry| entry.deinit(c_alloc);
         pending.deinit(c_alloc);
     }
-    var runtime = projection.intoRuntime();
+    var runtime: TranscriptRuntime = .{ .layout = source.layout };
     defer runtime.deinit(alloc);
+    var displaced = projection.install(&runtime);
+    defer displaced.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), pending.items.len);
     try std.testing.expectEqual(@as(u32, 7), pending.items[0].id);
@@ -719,7 +863,7 @@ test "resume projection preserves turn timestamps and usage rows" {
     );
 }
 
-test "live resume projection preserves an incomplete command block" {
+test "installed resume projection accepts subsequent command output" {
     const alloc = std.testing.allocator;
     var source: TranscriptRuntime = .{};
     source.layout.cols = 80;
@@ -734,29 +878,35 @@ test "live resume projection preserves an incomplete command block" {
     try projection.appendCommandOutput(
         lifecycle_id,
         .stdout,
-        "partial output\n",
+        "saved output\n",
     );
-    try projection.finalizeLivePresentation();
-    try std.testing.expect(
-        projection.runtime.command_output_display.open_command_block != null,
-    );
-    try std.testing.expect(
-        std.mem.find(u8, projection.publication_source.?.bytes, "partial output") == null,
-    );
-    try std.testing.expectEqualStrings(
-        "partial output",
-        projection.runtime.command_output_blocks.items[0].lines.items[0].text,
-    );
-
-    var runtime = projection.intoRuntime();
+    try projection.finishCommandOutput(lifecycle_id);
+    try projection.finalize();
+    var runtime: TranscriptRuntime = .{ .layout = source.layout };
     defer runtime.deinit(alloc);
+    var displaced = projection.install(&runtime);
+    defer displaced.deinit(alloc);
+    try std.testing.expectEqualStrings("saved output", runtime.command_output_blocks.items[0].lines.items[0].text);
     var metrics: types.Metrics = .{};
+    const next_lifecycle = types.ToolLifecycleId{ .turn_id = 8, .call_id = "continued-command" };
     _ = try command_output_runtime.writeCommandOutputChunkDetached(
         &runtime,
         alloc,
         &metrics,
         runtime.retainedTranscriptStyles(),
-        lifecycle_id,
+        next_lifecycle,
+        .stdout,
+        "partial output\n",
+        true,
+        43,
+    );
+    try std.testing.expect(runtime.command_output_display.open_command_block != null);
+    _ = try command_output_runtime.writeCommandOutputChunkDetached(
+        &runtime,
+        alloc,
+        &metrics,
+        runtime.retainedTranscriptStyles(),
+        next_lifecycle,
         .stdout,
         "completed output\n",
         true,
@@ -766,7 +916,7 @@ test "live resume projection preserves an incomplete command block" {
         &runtime,
         alloc,
         runtime.retainedTranscriptStyles(),
-        lifecycle_id,
+        next_lifecycle,
         44,
     );
     try std.testing.expect(
@@ -807,7 +957,7 @@ test "resume projection releases every failed detached build" {
     );
 }
 
-fn checkLiveResumeProjectionAllocationFailures(alloc: Allocator) !void {
+fn checkCommandResumeProjectionAllocationFailures(alloc: Allocator) !void {
     var source: TranscriptRuntime = .{};
     source.layout.cols = 80;
     defer source.deinit(std.testing.allocator);
@@ -819,13 +969,14 @@ fn checkLiveResumeProjectionAllocationFailures(alloc: Allocator) !void {
         .stdout,
         "partial output\n",
     );
-    try projection.finalizeLivePresentation();
+    try projection.finishCommandOutput(.{ .turn_id = 9, .call_id = "allocation-command" });
+    try projection.finalize();
 }
 
-test "live resume projection releases every failed detached build" {
+test "command resume projection releases every failed detached build" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
-        checkLiveResumeProjectionAllocationFailures,
+        checkCommandResumeProjectionAllocationFailures,
         .{},
     );
 }

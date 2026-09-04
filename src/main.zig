@@ -720,6 +720,18 @@ const App = struct {
         SessionAppRuntime.rebindSubagentHost(self);
     }
 
+    pub fn startupResumeFailure(self: *const App) ?anyerror {
+        return SessionAppRuntime.startupResumeFailure(self);
+    }
+
+    pub fn sessionRestoreActive(self: *const App) bool {
+        return SessionAppRuntime.sessionRestoreActive(self);
+    }
+
+    pub fn cancelSessionRestore(self: *App) bool {
+        return SessionAppRuntime.cancelSessionRestore(self);
+    }
+
     pub fn setNotificationPreferences(
         self: *App,
         turn_end: bool,
@@ -846,11 +858,13 @@ const App = struct {
         self.worker.requestShutdown();
         SessionAppRuntime.requestPersistenceShutdown(self);
         self.file_index.requestStop();
+        app_terminal_runtime.Runtime(App).stopRequests(self);
         self.managed_executions.shutdown();
         self.upgrader.stop();
 
         self.releaseTerminal();
         if (self.worker_thread) |thread| thread.join();
+        app_terminal_runtime.Runtime(App).shutdownOwnedJobs(self);
         self.terminal_client.deinit();
         self.managed_executions.deinit();
         self.model_cache.deinit();
@@ -1008,28 +1022,9 @@ const App = struct {
 
     pub fn run(self: *App) !void {
         const callbacks = RenderAppRuntime.eventLoopCallbacks(self);
-        while (true) {
-            const exit_cause = try event_loop.run(
-                self.terminal,
-                &self.should_exit,
-                active_poll_timeout_ms,
-                callbacks,
-            );
-            switch (exit_cause) {
-                .requested_exit => {},
-                .input_closed => return error.TerminalInputClosed,
-            }
-            switch (app_terminal_runtime.Runtime(App).prepareGracefulExit(self)) {
-                .ready => return,
-                .deferred => {
-                    self.should_exit = false;
-                    debug_trace.logf(
-                        "terminal",
-                        "interactive exit resumed after direct graceful-exit deferral",
-                        .{},
-                    );
-                },
-            }
+        switch (try event_loop.run(self.terminal, &self.should_exit, active_poll_timeout_ms, callbacks)) {
+            .requested_exit => {},
+            .input_closed => return error.TerminalInputClosed,
         }
     }
 
@@ -1086,6 +1081,10 @@ const App = struct {
 
     pub fn captureImageAttachment(self: *App, attachment: *types.ImageAttachment) !void {
         try SessionAppRuntime.captureImageAttachment(self, attachment);
+    }
+
+    pub fn prepareSubmittedImageAttachments(self: *App, images: []types.ImageAttachment) !void {
+        try SessionAppRuntime.prepareSubmittedImageAttachments(self, images);
     }
 
     pub fn enqueuePrompt(self: *App, prompt: []const u8) !bool {
@@ -1238,13 +1237,6 @@ const App = struct {
         try SessionAppRuntime.resetSession(self);
     }
 
-    pub fn prepareLiveSessionResume(
-        self: *App,
-        log_options: session_log.Options,
-    ) !void {
-        try SessionAppRuntime.prepareLiveSessionResume(self, log_options);
-    }
-
     pub fn finishLiveSessionResume(self: *App) !void {
         try SessionAppRuntime.finishLiveSessionResume(self);
     }
@@ -1273,18 +1265,10 @@ const App = struct {
     pub fn installResumeProjection(
         self: *App,
         projection: *ResumeProjection,
-    ) !void {
-        const c_alloc = std.heap.c_allocator;
-        try self.diff_entries.ensureUnusedCapacity(
-            c_alloc,
-            projection.pending_diffs.items.len,
-        );
-        for (projection.pending_diffs.items) |entry| {
-            self.diff_entries.appendAssumeCapacity(entry);
-        }
-        projection.pending_diffs.clearRetainingCapacity();
+    ) TranscriptRuntime {
+        std.mem.swap(@TypeOf(self.diff_entries), &self.diff_entries, &projection.pending_diffs);
         self.next_diff_id = projection.next_diff_id;
-        projection.install(&self.shell);
+        return projection.install(&self.shell);
     }
 
     pub fn historicalToolActivityKind(
@@ -1296,10 +1280,6 @@ const App = struct {
 
     pub fn commitStartupResumeReplayAnchor(self: *App) !void {
         try self.flushRequestedFrame();
-    }
-
-    pub fn persistResumeViewAfterFrame(self: *App) void {
-        SessionAppRuntime.persistResumeViewAfterFrame(self);
     }
 
     pub fn flushDirectTerminalShutdownOutcome(self: *App) !void {
@@ -1381,6 +1361,7 @@ const App = struct {
         turn_id: u64,
         user_prompt_already_presented: bool,
     ) !worker_runtime.QueuedPrompt {
+        try SessionAppRuntime.prepareSessionForPrompt(self);
         const source_images = if (recovery_checkpoint) |checkpoint|
             checkpoint.user.images
         else if (prompt_images) |images|
@@ -2497,19 +2478,7 @@ const App = struct {
         presentation: types.CommittedFilePresentation,
     ) !agent_runtime.DiffEntryPayload {
         _ = self;
-        const diff_mod = @import("core/output/diff.zig");
-        return diff_mod.formatPersistedFileChangePayload(
-            std.heap.c_allocator,
-            presentation,
-            .{
-                .added_fg = ui_render.diff_added_style,
-                .removed_fg = ui_render.diff_removed_style,
-                .context_fg = ui_render.dim_style,
-                .added_marker_fg = ui_render.diff_added_marker_style,
-                .removed_marker_fg = ui_render.diff_removed_marker_style,
-                .reset = ui_render.reset_style,
-            },
-        );
+        return app_session_runtime.prepareHistoricalFileDiff(presentation);
     }
 
     pub fn registerAndEmitDiffBlock(self: *App, payload: agent_runtime.DiffEntryPayload) !void {
@@ -2943,6 +2912,7 @@ const App = struct {
         }
 
         if (comptime !host_target.is_wasm) {
+            try SessionAppRuntime.pollSessionRestore(self);
             try SessionAppRuntime.pollSessionPicker(self);
         }
         try self.shell.prewarmFullTranscriptPage(
@@ -4141,6 +4111,8 @@ test "semantic code block preserves indentation on wrapped continuation rows" {
 }
 
 test {
+    _ = @import("core/session/session_index_publication.zig");
+    _ = resume_projection;
     _ = @import("napi_fetch_state.zig");
     _ = @import("core/config/model_provider.zig");
     _ = provider_runtime;
@@ -4154,6 +4126,9 @@ test {
     _ = @import("core/agent/runtime/prompt_context.zig");
     _ = @import("core/app/app_agent_runtime.zig");
     _ = @import("core/app/app_auth_runtime.zig");
+    _ = @import("core/auth/auth_runtime.zig");
+    _ = @import("core/auth/login_flow.zig");
+    _ = @import("core/hosts/native_keychain.zig");
     _ = @import("core/workspace/context_contract.zig");
     _ = @import("core/workspace/workspace_access.zig");
     _ = @import("core/workspace/workspace_commands.zig");
@@ -4246,6 +4221,7 @@ test {
     _ = @import("core/execution/process_provider.zig");
     _ = @import("core/execution/managed_execution_contract.zig");
     _ = @import("core/execution/managed_execution.zig");
+    _ = @import("core/execution/process_owner.zig");
     _ = @import("core/execution/process_tree.zig");
     _ = @import("core/config/prompt_policy.zig");
     _ = @import("core/workspace/record_tape.zig");
@@ -4267,7 +4243,9 @@ test {
     _ = @import("core/subagent/authority.zig");
     _ = @import("core/subagent/approval_registry.zig");
     _ = @import("core/terminal/contracts.zig");
+    _ = @import("core/terminal/engine.zig");
     _ = @import("core/terminal/operation.zig");
+    _ = @import("core/terminal/action_executor.zig");
     _ = @import("core/terminal/protocol.zig");
     _ = @import("core/terminal/host_policy.zig");
     _ = @import("core/terminal/shell_resolver.zig");

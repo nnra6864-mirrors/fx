@@ -150,6 +150,12 @@ pub const ResumeOptions = struct {
     allow_large_legacy: bool = false,
     seed_preferences: ?session_codec.DurableSessionPreferences = null,
     log: session_log.Options = .{},
+    /// Binds the actual latest selection before replay; may run again when a
+    /// concurrent namespace removal requires the existing bounded retry.
+    on_selected: ?struct {
+        context: *anyopaque,
+        notify: *const fn (*anyopaque, []const u8) Allocator.Error!void,
+    } = null,
 };
 
 /// Options controlling a storage-only migration.

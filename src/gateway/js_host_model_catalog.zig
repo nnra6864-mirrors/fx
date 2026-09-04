@@ -54,7 +54,7 @@ fn fetch(
     defer headers_json.deinit();
     std.json.Stringify.value(headers.items, .{}, &headers_json.writer) catch return error.OutOfMemory;
 
-    const response_cap = 4 * 1024 * 1024;
+    const response_cap = model_catalog.max_response_bytes;
     const response = try alloc.alloc(u8, response_cap);
     defer alloc.free(response);
     var status: u16 = 0;
@@ -82,8 +82,13 @@ fn fetch(
         alloc,
         response[0..@intCast(response_len)],
         input.view,
+        input.cancel_flag,
     ) catch |err| return .{ .failure = .{
-        .category = if (err == error.OutOfMemory) .resource_exhausted else .malformed_response,
+        .category = switch (err) {
+            error.OutOfMemory => .resource_exhausted,
+            error.Cancelled => .cancellation,
+            else => .malformed_response,
+        },
         .http_status = .ok,
     } };
     return .{ .catalog = catalog };

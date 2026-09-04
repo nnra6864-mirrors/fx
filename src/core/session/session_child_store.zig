@@ -39,6 +39,7 @@ pub const SubagentControlInitError = error{
 pub const TerminalInitError = SubagentControlInitError;
 
 pub const AdvisoryLockError = error{
+    Cancelled,
     OutOfMemory,
     InvalidManagedChildName,
     SessionChildReadOnly,
@@ -487,6 +488,10 @@ const CapabilityImpl = struct {
 
     fn resolveIndeterminate(self: *CapabilityImpl, kind: ManagedChildKind) !void {
         const name = self.indeterminate_names[@intFromEnum(kind)] orelse return;
+        try self.confirmPublication(kind, name);
+    }
+
+    fn confirmPublication(self: *CapabilityImpl, kind: ManagedChildKind, name: []const u8) !void {
         const route_dir = try self.route(kind, false) orelse
             return error.FileNotFound;
         var file = try openPrivateFile(route_dir, name, .read_only, self.mode);
@@ -495,7 +500,9 @@ const CapabilityImpl = struct {
             self.replace_ops.ctx,
             route_dir.dir,
         ) catch return error.SessionChildCommitIndeterminate;
-        self.clearIndeterminate(kind);
+        if (self.indeterminate_names[@intFromEnum(kind)]) |pending| {
+            if (std.mem.eql(u8, pending, name)) self.clearIndeterminate(kind);
+        }
     }
 };
 
@@ -953,6 +960,14 @@ pub const SessionChildCapability = struct {
         alloc: Allocator,
         kind: ManagedChildKind,
     ) !ManagedEntryList {
+        return self.iterateCancellable(alloc, kind, null) catch |err| switch (err) {
+            error.Cancelled => unreachable,
+            inline else => |other| return other,
+        };
+    }
+
+    pub fn iterateCancellable(self: *SessionChildCapability, alloc: Allocator, kind: ManagedChildKind, cancel_flag: ?*const std.atomic.Value(bool)) !ManagedEntryList {
+        if (cancel_flag) |flag| if (flag.load(.acquire)) return error.Cancelled;
         const route_dir = try self.impl.route(kind, false) orelse {
             return .{
                 .alloc = alloc,
@@ -967,6 +982,7 @@ pub const SessionChildCapability = struct {
         }
         var iter = route_dir.dir.iterate();
         while (try iter.next(io_mod.getIo())) |entry| {
+            if (cancel_flag) |flag| if (flag.load(.acquire)) return error.Cancelled;
             try validateName(entry.name);
             if (kind == .background_records and
                 std.mem.eql(u8, entry.name, "logs"))
@@ -998,6 +1014,7 @@ pub const SessionChildCapability = struct {
             errdefer alloc.free(owned_name);
             try names.append(alloc, owned_name);
         }
+        if (cancel_flag) |flag| if (flag.load(.acquire)) return error.Cancelled;
         return .{
             .alloc = alloc,
             .names = try names.toOwnedSlice(alloc),
@@ -1011,6 +1028,14 @@ pub const SessionChildCapability = struct {
         name: []const u8,
         bytes: []const u8,
     ) !ManagedEntry {
+        return self.atomicReplaceCancellable(alloc, kind, name, bytes, self.impl.replace_ops.cancel_flag) catch |err| switch (err) {
+            error.Cancelled => return error.SessionChildStoreFailed,
+            inline else => |other| return other,
+        };
+    }
+
+    pub fn atomicReplaceCancellable(self: *SessionChildCapability, alloc: Allocator, kind: ManagedChildKind, name: []const u8, bytes: []const u8, cancel_flag: ?*const std.atomic.Value(bool)) !ManagedEntry {
+        if (cancel_flag) |flag| if (flag.load(.acquire)) return error.Cancelled;
         try validateName(name);
         if (self.impl.mode != .writable) return error.SessionChildReadOnly;
         try self.impl.resolveIndeterminate(kind);
@@ -1018,14 +1043,16 @@ pub const SessionChildCapability = struct {
         var entry = try makeManagedEntry(self.impl, alloc, kind, name);
         errdefer entry.deinit(alloc);
 
+        var replace_ops = self.impl.replace_ops;
+        replace_ops.cancel_flag = cancel_flag;
         io_mod.durableReplaceVerifiedWithOps(
             alloc,
             route_dir,
             name,
             bytes,
-            self.impl.replace_ops,
+            replace_ops,
         ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
+            error.OutOfMemory, error.Cancelled => return err,
             error.DurablePathUnsafe => return error.SessionPathUnsafe,
             error.PrivateStatePermissionsUnsupported => return err,
             error.DurableReplacePostRenameFailed => {
@@ -1043,7 +1070,9 @@ pub const SessionChildCapability = struct {
         kind: ManagedChildKind,
         name: []const u8,
         deadline_ms: u64,
+        cancel_flag: ?*const std.atomic.Value(bool),
     ) AdvisoryLockError!io_mod.TimedAdvisoryLock {
+        if (cancel_flag) |flag| if (flag.load(.acquire)) return error.Cancelled;
         validateName(name) catch return error.InvalidManagedChildName;
         if (self.impl.mode != .writable) return error.SessionChildReadOnly;
         const route_dir = (self.impl.route(kind, true) catch |err| return switch (err) {
@@ -1052,12 +1081,20 @@ pub const SessionChildCapability = struct {
             error.PrivateStatePermissionsUnsupported => error.PrivateStatePermissionsUnsupported,
             else => error.SessionChildStoreFailed,
         }).?;
-        return io_mod.acquireTimedAdvisoryLockWithOps(
+        const acquired = if (cancel_flag) |flag| io_mod.acquireTimedAdvisoryLockCancellableWithOps(
+            route_dir,
+            name,
+            deadline_ms,
+            flag,
+            self.impl.lock_ops,
+        ) else io_mod.acquireTimedAdvisoryLockWithOps(
             route_dir,
             name,
             deadline_ms,
             self.impl.lock_ops,
-        ) catch |err| switch (err) {
+        );
+        return acquired catch |err| switch (err) {
+            error.Cancelled => error.Cancelled,
             error.OutOfMemory => error.OutOfMemory,
             error.LockBusy => error.LockBusy,
             error.LockUnsupported => error.LockUnsupported,
@@ -1150,6 +1187,14 @@ pub const SessionChildCapability = struct {
         if (!self.hasIndeterminateEntry(kind, name)) return false;
         try self.impl.resolveIndeterminate(kind);
         return true;
+    }
+
+    /// Confirms an already-synced private file's namespace without creating or
+    /// replacing it, including after another writer's interrupted publication.
+    pub fn confirmPublication(self: *SessionChildCapability, kind: ManagedChildKind, name: []const u8) !void {
+        try validateName(name);
+        if (self.impl.mode != .writable) return error.SessionChildReadOnly;
+        try self.impl.confirmPublication(kind, name);
     }
 
     pub fn indeterminateEntryName(
@@ -1626,6 +1671,7 @@ test "subagent control capability is route restricted and rejects symlinks" {
         .subagent_control,
         "subagent-control.lock",
         10,
+        null,
     );
     lock.release();
 
@@ -1804,6 +1850,48 @@ test "post rename parent sync failure is indeterminate and next write reopens" {
     const bytes = try file.readToEnd(alloc, 1024);
     defer alloc.free(bytes);
     try std.testing.expectEqualStrings("{\"id\":1,\"resolved\":true}", bytes);
+}
+
+test "publication confirmation is explicit and never creates or replaces files" {
+    const Sync = struct {
+        calls: usize = 0,
+        reject: bool = true,
+        fn directory(raw: ?*anyopaque, dir: std.Io.Dir) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.reject) return error.InjectedDirectorySyncFailure;
+            try io_mod.syncVerifiedDir(dir);
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var session = try openTestSession(alloc, &tmp);
+    defer session.dir.close(io_mod.getIo());
+    defer alloc.free(session.display_path);
+    var writer = try SessionChildCapability.init(alloc, session.dir, session.display_path, .writable);
+    defer writer.deinit();
+    try std.testing.expectError(error.FileNotFound, writer.confirmPublication(.terminal_proofs, "owner-exit"));
+    try std.testing.expectEqual(@as(usize, 0), try countEntries(session.dir));
+    var entry = try writer.atomicReplace(alloc, .terminal_proofs, "owner-exit", "private publication");
+    entry.deinit(alloc);
+    const before = try session.dir.statFile(io_mod.getIo(), "terminal/proofs/owner-exit", .{});
+    var sync: Sync = .{};
+    var fresh = try SessionChildCapability.initForTesting(alloc, session.dir, session.display_path, .writable, .{ .replace_ops = .{ .ctx = &sync, .sync_dir = Sync.directory } });
+    defer fresh.deinit();
+    try std.testing.expect(!try fresh.confirmIndeterminateEntry(.terminal_proofs, "owner-exit"));
+    try std.testing.expectEqual(@as(usize, 0), sync.calls);
+    try std.testing.expectError(error.SessionChildCommitIndeterminate, fresh.confirmPublication(.terminal_proofs, "owner-exit"));
+    sync.reject = false;
+    try fresh.confirmPublication(.terminal_proofs, "owner-exit");
+    try std.testing.expectEqual(@as(usize, 2), sync.calls);
+    var reader = try fresh.cloneReadOnly(alloc);
+    defer reader.deinit();
+    try std.testing.expectError(error.SessionChildReadOnly, reader.confirmPublication(.terminal_proofs, "owner-exit"));
+    const after = try session.dir.statFile(io_mod.getIo(), "terminal/proofs/owner-exit", .{});
+    try std.testing.expectEqual(before.inode, after.inode);
+    try std.testing.expectEqual(before.mtime, after.mtime);
+    try std.testing.expectEqual(before.ctime, after.ctime);
 }
 
 test "rename confirms the recorded target before publication" {

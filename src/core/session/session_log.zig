@@ -1,4 +1,5 @@
 const std = @import("std");
+const session_read = @import("../shared/read_cancellation.zig");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -12,7 +13,6 @@ const session_layout = @import("session_layout.zig");
 const session_projection = @import("session_projection.zig");
 const session_replay = @import("session_replay.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
-const session_resume_view = @import("session_resume_view.zig");
 const session_usage = @import("session_usage.zig");
 const session_usage_sidecar = @import("session_usage_sidecar.zig");
 
@@ -57,11 +57,8 @@ pub const Boundary = enum {
     before_latest_cache_ready,
     before_recovery_proposed_validation,
     before_recovery_prior_validation,
-    after_recovery_latest_snapshot,
     before_recovery_latest_publication,
     before_read_boundary_validation,
-    latest_barrier_contended,
-    latest_barrier_completed,
 };
 
 pub const LockKind = enum {
@@ -85,6 +82,8 @@ pub const TestControls = struct {
 
 pub const Options = struct {
     test_controls: TestControls = .{},
+    /// Borrowed for this operation; cancellation never outlives the caller.
+    cancel_flag: ?*const std.atomic.Value(bool) = null,
     session_lock_deadline_ms: u64 = lock_deadline_ms,
     commit_lock_deadline_ms: u64 = lock_deadline_ms,
     checkpoint_interval: u64 = 32,
@@ -303,34 +302,6 @@ pub const WritableSessionDir = struct {
     }
 };
 
-pub const ResumeViewAdmission = struct {
-    writable: ?WritableSessionDir,
-    view: session_resume_view.LoadOutcome,
-
-    pub fn deinit(self: *ResumeViewAdmission, alloc: Allocator) void {
-        if (self.writable) |*writable| writable.deinit(alloc);
-        self.view.deinit(alloc);
-        self.* = undefined;
-    }
-
-    pub fn sessionId(self: *const ResumeViewAdmission) []const u8 {
-        return self.writable.?.session_id;
-    }
-
-    pub fn resumeForWrite(
-        self: *ResumeViewAdmission,
-        alloc: Allocator,
-        options: Options,
-    ) !LoadedWritableSession {
-        var writable = self.writable orelse return error.SessionResumeAdmissionConsumed;
-        self.writable = null;
-        return openWritableSession(alloc, &writable, options) catch |err| {
-            writable.deinit(alloc);
-            return err;
-        };
-    }
-};
-
 pub const ReadBoundary = struct {
     log_file: std.Io.File,
     position: CommitPosition,
@@ -359,6 +330,7 @@ pub fn recoverManifestBoundary(
         commit_lock_file,
         true,
         options.commit_lock_deadline_ms,
+        options.cancel_flag,
     ) catch |err| return mapCommitLockError(err);
     defer commit_lock.release();
     try requireIntentAbsent(alloc, &writable.dir, authority_intent_file);
@@ -374,6 +346,7 @@ pub fn recoverManifestBoundary(
         alloc,
         &writable.dir,
         writable.session_id,
+        options.cancel_flag,
     );
     if (watermark.status == .valid) return error.SessionRecoveryNotNeeded;
 
@@ -402,6 +375,7 @@ pub fn recoverManifestBoundary(
         manifest.log_generation,
         manifest.last_event_seq,
         manifest.event_log_bytes,
+        options.cancel_flag,
     );
     errdefer replayed.deinit(alloc);
     if (!session_projection.stateMatchesManifest(replayed, manifest)) {
@@ -416,22 +390,14 @@ pub const CommitLifecycle = struct {
         ?*anyopaque,
         Allocator,
         []const u8,
-        []const u8,
-        []const u8,
-        u64,
+        session_read.CancelFlag,
     ) anyerror!void = null,
     publish_fn: ?*const fn (
         ?*anyopaque,
         Allocator,
         session_codec.DurableSessionState,
         CommitPosition,
-    ) anyerror!void = null,
-    write_deferred_fn: ?*const fn (
-        ?*anyopaque,
-        Allocator,
-        []const u8,
-        []const u8,
-        CommitPosition,
+        session_read.CancelFlag,
     ) anyerror!void = null,
     abort_fn: ?*const fn (?*anyopaque) void = null,
     deinit_fn: ?*const fn (?*anyopaque, Allocator) void = null,
@@ -440,81 +406,18 @@ pub const CommitLifecycle = struct {
         self: *CommitLifecycle,
         alloc: Allocator,
         session_id: []const u8,
-        previous_workspace_root: []const u8,
-        next_workspace_root: []const u8,
-        commit_lock_deadline_ms: u64,
+        cancel_flag: session_read.CancelFlag,
     ) !void {
+        try session_read.check(cancel_flag);
         if (self.prepare_fn) |callback| {
-            callback(
-                self.context,
-                alloc,
-                session_id,
-                previous_workspace_root,
-                next_workspace_root,
-                commit_lock_deadline_ms,
-            ) catch |err| return switch (err) {
-                error.LatestCacheLockBusy => error.SessionCommitBoundaryUnavailable,
-                else => err,
-            };
-        }
-    }
-
-    fn prepareRequired(
-        self: *CommitLifecycle,
-        alloc: Allocator,
-        session_id: []const u8,
-        workspace_root: []const u8,
-        commit_lock_deadline_ms: u64,
-    ) !bool {
-        try self.prepare(
-            alloc,
-            session_id,
-            workspace_root,
-            workspace_root,
-            commit_lock_deadline_ms,
-        );
-        return false;
-    }
-
-    fn prepareOpportunistic(
-        self: *CommitLifecycle,
-        alloc: Allocator,
-        session_id: []const u8,
-        workspace_root: []const u8,
-        commit_lock_deadline_ms: u64,
-    ) !bool {
-        if (self.prepare_fn) |callback| {
-            callback(
-                self.context,
-                alloc,
-                session_id,
-                workspace_root,
-                workspace_root,
-                commit_lock_deadline_ms,
-            ) catch |err| return switch (err) {
-                error.LatestCacheLockBusy => true,
-                else => err,
-            };
-        }
-        return false;
-    }
-
-    fn writeDeferred(
-        self: *CommitLifecycle,
-        alloc: Allocator,
-        session_id: []const u8,
-        workspace_root: []const u8,
-        position: CommitPosition,
-    ) !void {
-        if (self.write_deferred_fn) |callback| {
             try callback(
                 self.context,
                 alloc,
                 session_id,
-                workspace_root,
-                position,
+                cancel_flag,
             );
         }
+        try session_read.check(cancel_flag);
     }
 
     pub fn publish(
@@ -522,9 +425,10 @@ pub const CommitLifecycle = struct {
         alloc: Allocator,
         state: session_codec.DurableSessionState,
         position: CommitPosition,
+        cancel_flag: session_read.CancelFlag,
     ) !void {
         if (self.publish_fn) |callback| {
-            try callback(self.context, alloc, state, position);
+            try callback(self.context, alloc, state, position, cancel_flag);
         }
     }
 
@@ -543,6 +447,110 @@ const PersistenceDebt = struct {
     canonical_replacement: bool = false,
     derived_publication: bool = false,
 };
+
+pub const ResumeHandoffBoundary = struct {
+    authority_id: Identifier,
+    position: CommitPosition,
+};
+
+const HandoffHeader = struct {
+    generation: Identifier,
+    event_id: Identifier,
+};
+
+fn parseHandoffHeader(alloc: Allocator, prefix: []const u8) !HandoffHeader {
+    var scanner = std.json.Scanner.initCompleteInput(alloc, prefix);
+    defer scanner.deinit();
+    if (try scanner.next() != .object_begin) return error.InvalidSessionFormat;
+    var generation: ?Identifier = null;
+    var schema: ?u64 = null;
+    var sequence: ?u64 = null;
+    var kind: ?[]const u8 = null;
+    var event_id: ?Identifier = null;
+    var timestamp: ?i64 = null;
+    for (0..7) |_| {
+        const key = try scanner.next();
+        if (key != .string) return error.InvalidSessionFormat;
+        if (std.mem.eql(u8, key.string, "payload")) {
+            if (schema != 1 or sequence != 1 or kind == null or event_id == null or timestamp == null or
+                !std.mem.eql(u8, kind.?, "session_started")) return error.InvalidSessionFormat;
+            return .{ .generation = generation orelse return error.InvalidSessionFormat, .event_id = event_id.? };
+        }
+        const value = try scanner.next();
+        if (std.mem.eql(u8, key.string, "log_generation")) {
+            if (generation != null or value != .string) return error.InvalidSessionFormat;
+            generation = try parseIdentifier(value.string);
+        } else if (std.mem.eql(u8, key.string, "schema_version")) {
+            if (schema != null or value != .number) return error.InvalidSessionFormat;
+            schema = std.fmt.parseInt(u64, value.number, 10) catch return error.InvalidSessionFormat;
+        } else if (std.mem.eql(u8, key.string, "seq")) {
+            if (sequence != null or value != .number) return error.InvalidSessionFormat;
+            sequence = std.fmt.parseInt(u64, value.number, 10) catch return error.InvalidSessionFormat;
+        } else if (std.mem.eql(u8, key.string, "kind")) {
+            if (kind != null or value != .string) return error.InvalidSessionFormat;
+            kind = value.string;
+        } else if (std.mem.eql(u8, key.string, "event_id")) {
+            if (event_id != null or value != .string) return error.InvalidSessionFormat;
+            event_id = try parseIdentifier(value.string);
+        } else if (std.mem.eql(u8, key.string, "timestamp_ms")) {
+            if (timestamp != null or value != .number) return error.InvalidSessionFormat;
+            timestamp = std.fmt.parseInt(i64, value.number, 10) catch return error.InvalidSessionFormat;
+            if (timestamp.? < 0) return error.InvalidSessionFormat;
+        } else return error.InvalidSessionFormat;
+    }
+    return error.SessionCommitBoundaryUnavailable;
+}
+
+fn confirmHandoffMetadata(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+    expected: ?ResumeHandoffBoundary,
+    options: Options,
+) !void {
+    options.test_controls.lock(.commit);
+    var lock = acquireLockWithDeadline(dir, commit_lock_file, false, options.commit_lock_deadline_ms, options.cancel_flag) catch |err| return mapCommitLockError(err);
+    defer lock.release();
+    try requireIntentAbsent(alloc, dir, authority_intent_file);
+    try requireIntentAbsent(alloc, dir, publication_intent_file);
+    var authority = try loadAuthority(alloc, dir, session_id);
+    defer authority.deinit(alloc);
+    var events = try openManagedFile(dir, events_file, .read_only);
+    defer events.close(io_mod.getIo());
+    var prefix: [1024]u8 = undefined;
+    const count = try events.readPositionalAll(io_mod.getIo(), &prefix, 0);
+    const header = try parseHandoffHeader(alloc, prefix[0..count]);
+    const generation = header.generation;
+    const name = try watermarkName(alloc, generation);
+    defer alloc.free(name);
+    var watermark = try openManagedFile(dir, name, .read_only);
+    defer watermark.close(io_mod.getIo());
+    const watermark_stat = try watermark.stat(io_mod.getIo());
+    if (watermark_stat.kind != .file or watermark_stat.nlink != 1) return error.InvalidSessionFormat;
+    const bytes = try io_mod.readFileToEnd(alloc, &watermark, watermark_max_bytes);
+    defer alloc.free(bytes);
+    const position = try decodeWatermark(alloc, bytes, session_id, generation);
+    if (position.through_seq == 0 or
+        (position.through_seq == 1 and !std.mem.eql(u8, &position.through_event_id, &header.event_id)))
+    {
+        return error.InvalidSessionFormat;
+    }
+    const stat = try eventStat(events, position.through_event_log_bytes);
+    if (stat.mtime_ns > watermark_stat.mtime.nanoseconds) return error.InvalidSessionFormat;
+    if (expected) |known| {
+        if (!std.mem.eql(u8, &authority.authority_id, &known.authority_id) or
+            !positionsEqual(position, known.position)) return error.InvalidSessionFormat;
+    } else if (stat.ctime_ns > watermark_stat.ctime.nanoseconds) {
+        var manifest = try loadManifest(alloc, dir);
+        defer manifest.deinit(alloc);
+        if (!std.mem.eql(u8, manifest.id, session_id) or
+            !std.mem.eql(u8, &manifest.authority_id, &authority.authority_id) or
+            !std.mem.eql(u8, &manifest.log_generation, &position.log_generation) or
+            manifest.last_event_seq != position.through_seq or
+            manifest.event_log_bytes != position.through_event_log_bytes or
+            session_projection.isManifestStale(manifest, stat)) return error.SessionCommitBoundaryUnavailable;
+    }
+}
 
 pub const LoadedWritableSession = struct {
     pub const ExternalPromptOrigin = enum {
@@ -570,7 +578,6 @@ pub const LoadedWritableSession = struct {
     migration_source_schema_version: ?u8 = null,
     migration_source_bytes: ?u64 = null,
     usage_sidecar_reseal_pending: bool = false,
-    resume_view_stale: bool = false,
     /// Runtime-only provenance installed by subagent resume admission. These
     /// fields are never written into the session event log.
     external_prompt_origin: ExternalPromptOrigin = .root,
@@ -592,22 +599,6 @@ pub const LoadedWritableSession = struct {
         self.state.deinit(alloc);
         self.log.deinit(alloc);
         self.* = undefined;
-    }
-
-    pub fn writeResumeView(
-        self: *LoadedWritableSession,
-        alloc: Allocator,
-        capture: session_resume_view.Capture,
-        text: []const u8,
-    ) !void {
-        try session_resume_view.write(
-            alloc,
-            &self.log.dir,
-            self.active_id,
-            resumeViewBoundary(self.position),
-            capture,
-            text,
-        );
     }
 
     /// Returns a borrowed address that remains stable until deinit.
@@ -644,10 +635,6 @@ pub const LoadedWritableSession = struct {
             else => false,
         };
         const replacement_was_pending = self.persistence_debt.canonical_replacement;
-        const next_workspace_root = switch (event) {
-            .workspace_rebound => |payload| payload.workspace_root,
-            else => self.state.workspace_root,
-        };
         const usage_sidecar_bytes = switch (event) {
             .usage_checkpointed => |payload| encodeUsageSidecarBestEffort(
                 alloc,
@@ -668,14 +655,7 @@ pub const LoadedWritableSession = struct {
             else => self.usage_sidecar_reseal_pending,
         };
         defer if (usage_sidecar_bytes) |bytes| alloc.free(bytes);
-        self.persistence_debt.canonical_replacement = true;
-        const cache_deferred = switch (event) {
-            .workspace_rebound => blk: {
-                try self.prepareCommitLifecycle(alloc, next_workspace_root, options);
-                break :blk false;
-            },
-            else => try self.prepareCommitLifecycleOpportunistic(alloc, options),
-        };
+        try self.prepareCommitLifecycle(alloc, options.cancel_flag);
         _ = appendEventImpl(
             self,
             alloc,
@@ -685,19 +665,18 @@ pub const LoadedWritableSession = struct {
             options,
             usage_sidecar_bytes,
             write_usage_sidecar,
-            cache_deferred,
         ) catch |err| {
             self.abortCommitLifecycle();
             return err;
         };
         if (!preserves_pristine_start) self.freshly_started = false;
-        const lifecycle_published = !cache_deferred and self.publishCommitLifecycle(alloc);
         maintainCanonicalLogAfterCommit(self, alloc, options) catch |err| {
+            self.abortCommitLifecycle();
             self.persistence_debt.canonical_replacement = true;
             return err;
         };
         self.persistence_debt.canonical_replacement = replacement_was_pending;
-        self.persistence_debt.derived_publication = !lifecycle_published;
+        self.persistence_debt.derived_publication = !self.publishCommitLifecycle(alloc, options.cancel_flag);
         return self.position;
     }
 
@@ -720,22 +699,7 @@ pub const LoadedWritableSession = struct {
         else
             null;
         defer if (usage_sidecar_bytes) |bytes| alloc.free(bytes);
-        self.persistence_debt.canonical_replacement = true;
-        const same_workspace = std.mem.eql(
-            u8,
-            self.state.workspace_root,
-            replacement.workspace_root,
-        );
-        const may_defer_cache = same_workspace and switch (reason) {
-            .compaction, .log_compaction => true,
-            .migration, .recovery => false,
-        };
-        const cache_deferred = if (may_defer_cache)
-            try self.prepareCommitLifecycleOpportunistic(alloc, options)
-        else blk: {
-            try self.prepareCommitLifecycle(alloc, replacement.workspace_root, options);
-            break :blk false;
-        };
+        try self.prepareCommitLifecycle(alloc, options.cancel_flag);
         _ = commitStateReplacementImpl(
             self,
             alloc,
@@ -745,19 +709,18 @@ pub const LoadedWritableSession = struct {
             options,
             usage_sidecar_bytes,
             true,
-            cache_deferred,
         ) catch |err| {
             self.abortCommitLifecycle();
             return err;
         };
         self.freshly_started = false;
-        const lifecycle_published = !cache_deferred and self.publishCommitLifecycle(alloc);
         maintainCanonicalLogAfterCommit(self, alloc, options) catch |err| {
+            self.abortCommitLifecycle();
             self.persistence_debt.canonical_replacement = true;
             return err;
         };
         self.persistence_debt.canonical_replacement = false;
-        self.persistence_debt.derived_publication = !lifecycle_published;
+        self.persistence_debt.derived_publication = !self.publishCommitLifecycle(alloc, options.cancel_flag);
         return self.position;
     }
 
@@ -768,57 +731,28 @@ pub const LoadedWritableSession = struct {
     fn prepareCommitLifecycle(
         self: *LoadedWritableSession,
         alloc: Allocator,
-        next_workspace_root: []const u8,
-        options: Options,
+        cancel_flag: session_read.CancelFlag,
     ) !void {
+        try session_read.check(cancel_flag);
         if (self.commit_lifecycle) |*lifecycle| {
-            try lifecycle.prepare(
+            lifecycle.prepare(
                 alloc,
                 self.active_id,
-                self.state.workspace_root,
-                next_workspace_root,
-                options.commit_lock_deadline_ms,
-            );
+                cancel_flag,
+            ) catch |err| {
+                lifecycle.abort();
+                return err;
+            };
         }
     }
 
-    fn prepareCommitLifecycleOpportunistic(
-        self: *LoadedWritableSession,
-        alloc: Allocator,
-        options: Options,
-    ) !bool {
+    pub fn publishCommitLifecycle(self: *LoadedWritableSession, alloc: Allocator, cancel_flag: session_read.CancelFlag) bool {
         if (self.commit_lifecycle) |*lifecycle| {
-            return lifecycle.prepareOpportunistic(
-                alloc,
-                self.active_id,
-                self.state.workspace_root,
-                options.commit_lock_deadline_ms,
-            );
-        }
-        return false;
-    }
-
-    fn writeDeferredCommitLifecycle(
-        self: *LoadedWritableSession,
-        alloc: Allocator,
-        position: CommitPosition,
-    ) !void {
-        if (self.commit_lifecycle) |*lifecycle| {
-            try lifecycle.writeDeferred(
-                alloc,
-                self.active_id,
-                self.state.workspace_root,
-                position,
-            );
-        }
-    }
-
-    pub fn publishCommitLifecycle(self: *LoadedWritableSession, alloc: Allocator) bool {
-        if (self.commit_lifecycle) |*lifecycle| {
-            lifecycle.publish(alloc, self.state, self.position) catch |err| {
+            lifecycle.publish(alloc, self.state, self.position, cancel_flag) catch |err| {
+                lifecycle.abort();
                 debug_trace.logf(
                     "session",
-                    "event=latest_cache_publish_failed err={s}",
+                    "event=session_index_publish_failed err={s}",
                     .{@errorName(err)},
                 );
                 return false;
@@ -859,13 +793,17 @@ pub const LoadedWritableSession = struct {
         ensure_present: bool,
         options: Options,
     ) !void {
+        const recovering = self.namespace_confirmation_required;
         try confirmWritableNamespace(self, alloc, options);
+        defer if (recovering) {
+            self.persistence_debt.derived_publication = !self.publishCommitLifecycle(alloc, options.cancel_flag);
+        };
         if (!checkpointDue(self, options.checkpoint_interval) and
             !(ensure_present and !self.hasCurrentCheckpoint()))
         {
             return;
         }
-        writeCheckpointProjection(alloc, self) catch |err| switch (err) {
+        writeCheckpointProjection(alloc, self, options.cancel_flag) catch |err| switch (err) {
             error.CheckpointTooLarge => return,
             else => return err,
         };
@@ -878,13 +816,17 @@ pub const LoadedWritableSession = struct {
         alloc: Allocator,
         options: Options,
     ) !void {
+        const recovering = self.namespace_confirmation_required;
         try confirmWritableNamespace(self, alloc, options);
+        errdefer if (recovering) self.abortCommitLifecycle();
         _ = try validateLivePosition(
             alloc,
             &self.log.dir,
             self.active_id,
             self.position,
+            options.cancel_flag,
         );
+        if (recovering) self.persistence_debt.derived_publication = !self.publishCommitLifecycle(alloc, options.cancel_flag);
     }
 
     /// Confirms the writer's current durable boundary without replaying the
@@ -895,6 +837,12 @@ pub const LoadedWritableSession = struct {
         alloc: Allocator,
         options: Options,
     ) !void {
+        return confirmHandoffMetadata(alloc, &self.log.dir, self.active_id, try self.resumeHandoffBoundary(), options);
+    }
+
+    /// Copies the canonical boundary for later confirmation after replay state
+    /// is released. This value is not proof until revalidated at handoff time.
+    pub fn resumeHandoffBoundary(self: *const LoadedWritableSession) !ResumeHandoffBoundary {
         if (self.degraded_tail != null or
             self.namespace_confirmation_required or
             self.persistence_debt.canonical_replacement)
@@ -902,75 +850,10 @@ pub const LoadedWritableSession = struct {
             return error.SessionPersistenceDegraded;
         }
 
-        options.test_controls.lock(.commit);
-        var commit_lock = acquireLockWithDeadline(
-            &self.log.dir,
-            commit_lock_file,
-            true,
-            options.commit_lock_deadline_ms,
-        ) catch |err| return mapCommitLockError(err);
-        defer commit_lock.release();
-
-        try requireIntentAbsent(alloc, &self.log.dir, authority_intent_file);
-        try requireIntentAbsent(alloc, &self.log.dir, publication_intent_file);
-
-        var authority = try loadAuthority(
-            alloc,
-            &self.log.dir,
-            self.active_id,
-        );
-        defer authority.deinit(alloc);
-        if (!std.mem.eql(u8, &authority.authority_id, &self.authority_id)) {
-            return error.InvalidSessionFormat;
-        }
-
-        var event_log = try openManagedFile(
-            &self.log.dir,
-            events_file,
-            .read_only,
-        );
-        defer event_log.close(io_mod.getIo());
-        const generation = try session_replay.readFirstGeneration(
-            alloc,
-            event_log,
-        );
-        if (!std.mem.eql(u8, &generation, &self.position.log_generation)) {
-            return error.InvalidSessionFormat;
-        }
-        const event_stat = try eventStat(
-            event_log,
-            self.position.through_event_log_bytes,
-        );
-
-        const name = try watermarkName(alloc, generation);
-        defer alloc.free(name);
-        var watermark_file = try openManagedFile(
-            &self.log.dir,
-            name,
-            .read_only,
-        );
-        defer watermark_file.close(io_mod.getIo());
-        const watermark_stat = try watermark_file.stat(io_mod.getIo());
-        if (watermark_stat.kind != .file or watermark_stat.nlink != 1) {
-            return error.InvalidSessionFormat;
-        }
-        const watermark_bytes = try io_mod.readFileToEnd(
-            alloc,
-            &watermark_file,
-            watermark_max_bytes,
-        );
-        defer alloc.free(watermark_bytes);
-        const position = try decodeWatermark(
-            alloc,
-            watermark_bytes,
-            self.active_id,
-            generation,
-        );
-        if (!positionsEqual(position, self.position) or
-            event_stat.mtime_ns > watermark_stat.mtime.nanoseconds)
-        {
-            return error.InvalidSessionFormat;
-        }
+        return .{
+            .authority_id = self.authority_id,
+            .position = self.position,
+        };
     }
 
     /// Repairs only a corrupt watermark whose writer authority, complete
@@ -981,52 +864,60 @@ pub const LoadedWritableSession = struct {
         options: Options,
     ) !void {
         try confirmWritableNamespace(self, alloc, options);
-        options.test_controls.lock(.commit);
-        var commit_lock = acquireLockWithDeadline(
-            &self.log.dir,
-            commit_lock_file,
-            true,
-            options.commit_lock_deadline_ms,
-        ) catch |err| return mapCommitLockError(err);
-        defer commit_lock.release();
-        try requireIntentAbsent(alloc, &self.log.dir, authority_intent_file);
-        try requireIntentAbsent(alloc, &self.log.dir, publication_intent_file);
-
-        var event_log = try openManagedFile(
-            &self.log.dir,
-            events_file,
-            .read_only,
-        );
-        defer event_log.close(io_mod.getIo());
-        var recovered = try session_replay.replayExactPosition(
-            alloc,
-            event_log,
-            self.position.log_generation,
-            self.position.through_seq,
-            self.position.through_event_log_bytes,
-        );
-        defer recovered.deinit(alloc);
-        if (!positionsEqual(recovered.position, self.position) or
-            !try durableStatesEqual(recovered.state, self.state))
+        errdefer self.abortCommitLifecycle();
         {
-            return error.InvalidSessionFormat;
-        }
+            options.test_controls.lock(.commit);
+            var commit_lock = acquireLockWithDeadline(
+                &self.log.dir,
+                commit_lock_file,
+                true,
+                options.commit_lock_deadline_ms,
+                options.cancel_flag,
+            ) catch |err| return mapCommitLockError(err);
+            defer commit_lock.release();
+            try requireIntentAbsent(alloc, &self.log.dir, authority_intent_file);
+            try requireIntentAbsent(alloc, &self.log.dir, publication_intent_file);
 
-        const watermark_bytes = try encodeWatermark(
-            alloc,
-            self.log.session_id,
-            self.position,
-        );
-        defer alloc.free(watermark_bytes);
-        const name = try watermarkName(alloc, self.position.log_generation);
-        defer alloc.free(name);
-        try durableReplace(alloc, &self.log.dir, name, watermark_bytes);
-        _ = try validateLivePosition(
-            alloc,
-            &self.log.dir,
-            self.active_id,
-            self.position,
-        );
+            var event_log = try openManagedFile(
+                &self.log.dir,
+                events_file,
+                .read_only,
+            );
+            defer event_log.close(io_mod.getIo());
+            var recovered = try session_replay.replayExactPosition(
+                alloc,
+                event_log,
+                self.position.log_generation,
+                self.position.through_seq,
+                self.position.through_event_log_bytes,
+                options.cancel_flag,
+            );
+            defer recovered.deinit(alloc);
+            if (!positionsEqual(recovered.position, self.position) or
+                !try durableStatesEqualCancellable(recovered.state, self.state, options.cancel_flag))
+            {
+                return error.InvalidSessionFormat;
+            }
+
+            const watermark_bytes = try encodeWatermark(
+                alloc,
+                self.log.session_id,
+                self.position,
+            );
+            defer alloc.free(watermark_bytes);
+            const name = try watermarkName(alloc, self.position.log_generation);
+            defer alloc.free(name);
+            try self.prepareCommitLifecycle(alloc, options.cancel_flag);
+            try durableReplace(alloc, &self.log.dir, name, watermark_bytes);
+            _ = try validateLivePosition(
+                alloc,
+                &self.log.dir,
+                self.active_id,
+                self.position,
+                options.cancel_flag,
+            );
+        }
+        self.persistence_debt.derived_publication = !self.publishCommitLifecycle(alloc, options.cancel_flag);
     }
 
     pub fn hasCurrentCheckpoint(self: *const LoadedWritableSession) bool {
@@ -1064,9 +955,10 @@ pub const LoadedWritableSession = struct {
             &self.log.dir,
             checkpoint_file,
             session_projection.checkpoint_max_bytes,
+            null,
         );
         defer alloc.free(bytes);
-        var checkpoint = try session_projection.decodeCheckpoint(alloc, bytes);
+        var checkpoint = try session_projection.decodeCheckpoint(alloc, bytes, null);
         defer checkpoint.deinit(alloc);
         var manifest = try loadManifest(alloc, &self.log.dir);
         defer manifest.deinit(alloc);
@@ -1075,6 +967,7 @@ pub const LoadedWritableSession = struct {
             &self.log.dir,
             self.log.session_id,
             self.position,
+            null,
         );
         try session_projection.validateCheckpointReference(
             manifest,
@@ -1088,6 +981,7 @@ pub const LoadedWritableSession = struct {
                 .event_log_bytes = checkpoint.through_event_log_bytes,
                 .semantic = true,
             },
+            null,
         );
     }
 };
@@ -1210,6 +1104,17 @@ pub const Root = struct {
                 return error.PrivateStatePermissionsUnsupported;
         }
         try verifyPrivateDir(sessions_dir, mode);
+        if (mode == .writable) {
+            // A concurrent opener can observe any newly created ancestor
+            // before its creator has synced the corresponding parent entry.
+            if (std.fs.path.dirname(home_path)) |parent_path| {
+                var parent = try std.Io.Dir.openDirAbsolute(zio, parent_path, .{ .iterate = true });
+                defer parent.close(zio);
+                try io_mod.syncVerifiedDir(parent);
+            }
+            try io_mod.syncVerifiedDir(home);
+            try io_mod.syncVerifiedDir(durable_home);
+        }
         const display_root = try io_mod.dirRealpathAlloc(alloc, sessions_dir, ".");
         return .{
             .sessions = .{ .dir = sessions_dir },
@@ -1250,10 +1155,14 @@ pub const Root = struct {
         if (self.mode != .writable or self.sessions == null) {
             return failLoadedWritableSession(error.SessionStoreUnavailable);
         }
-        try session_codec.validateState(initial_state);
+        try session_codec.validateState(initial_state, options.cancel_flag);
         const sessions = &self.sessions.?;
         if (try entryExists(sessions, initial_state.id)) {
             return failLoadedWritableSession(error.SessionAlreadyExists);
+        }
+
+        if (lifecycle_value) |*value| {
+            try value.prepare(alloc, initial_state.id, options.cancel_flag);
         }
 
         sessions.dir.createDir(
@@ -1274,6 +1183,7 @@ pub const Root = struct {
             session_lock_file,
             true,
             options.session_lock_deadline_ms,
+            options.cancel_flag,
         ) catch |err| {
             session_dir.close();
             return mapSessionLockError(err);
@@ -1290,44 +1200,6 @@ pub const Root = struct {
         };
         var writable_owned = true;
         errdefer if (writable_owned) writable.deinit(alloc);
-        var cache_deferred = false;
-        if (lifecycle_value) |*value| {
-            const preparation = if (initial_state.history.len == 0)
-                value.prepareOpportunistic(
-                    alloc,
-                    initial_state.id,
-                    initial_state.workspace_root,
-                    options.commit_lock_deadline_ms,
-                )
-            else
-                value.prepareRequired(
-                    alloc,
-                    initial_state.id,
-                    initial_state.workspace_root,
-                    options.commit_lock_deadline_ms,
-                );
-            cache_deferred = preparation catch |err| {
-                writable.deinit(alloc);
-                writable_owned = false;
-                sessions.dir.deleteTree(io_mod.getIo(), initial_state.id) catch |cleanup_err| {
-                    debug_trace.logf(
-                        "session",
-                        "event=uncommitted_session_cleanup_failed err={s}",
-                        .{@errorName(cleanup_err)},
-                    );
-                    return cleanup_err;
-                };
-                io_mod.syncVerifiedDir(sessions.dir) catch |cleanup_err| {
-                    debug_trace.logf(
-                        "session",
-                        "event=uncommitted_session_cleanup_sync_failed err={s}",
-                        .{@errorName(cleanup_err)},
-                    );
-                    return cleanup_err;
-                };
-                return err;
-            };
-        }
         var created = try createNativeSession(
             alloc,
             &writable,
@@ -1335,41 +1207,9 @@ pub const Root = struct {
             options,
         );
         writable_owned = false;
-        var created_owned = true;
-        errdefer if (created_owned) created.deinit(alloc);
-        if (lifecycle_value) |value| {
-            try created.installCommitLifecycle(value);
-            lifecycle_value = null;
-            if (cache_deferred) {
-                created.writeDeferredCommitLifecycle(
-                    alloc,
-                    created.position,
-                ) catch |err| {
-                    created.deinit(alloc);
-                    created_owned = false;
-                    sessions.dir.deleteTree(io_mod.getIo(), initial_state.id) catch |cleanup_err| {
-                        debug_trace.logf(
-                            "session",
-                            "event=deferred_session_cleanup_failed err={s}",
-                            .{@errorName(cleanup_err)},
-                        );
-                        return cleanup_err;
-                    };
-                    io_mod.syncVerifiedDir(sessions.dir) catch |cleanup_err| {
-                        debug_trace.logf(
-                            "session",
-                            "event=deferred_session_cleanup_sync_failed err={s}",
-                            .{@errorName(cleanup_err)},
-                        );
-                        return cleanup_err;
-                    };
-                    return err;
-                };
-                created.persistence_debt.derived_publication = true;
-            } else if (!created.publishCommitLifecycle(alloc)) {
-                created.persistence_debt.derived_publication = true;
-            }
-        }
+        created.commit_lifecycle = lifecycle_value;
+        lifecycle_value = null;
+        created.persistence_debt.derived_publication = !created.publishCommitLifecycle(alloc, options.cancel_flag);
         return created;
     }
 
@@ -1379,16 +1219,44 @@ pub const Root = struct {
         session_id: []const u8,
         options: Options,
     ) !LoadedWritableSession {
+        return self.resumeForWriteWithLifecycle(alloc, session_id, options, null);
+    }
+
+    pub fn resumeForWriteWithLifecycle(
+        self: *Root,
+        alloc: Allocator,
+        session_id: []const u8,
+        options: Options,
+        lifecycle: ?CommitLifecycle,
+    ) !LoadedWritableSession {
+        var lifecycle_value = lifecycle;
+        errdefer if (lifecycle_value) |*value| value.deinit(alloc);
         options.test_controls.lock(.session);
         var writable = try self.openWritableSessionDir(
             alloc,
             session_id,
             options.session_lock_deadline_ms,
+            options.cancel_flag,
         );
-        return openWritableSession(alloc, &writable, options) catch |err| {
+        const transferred = lifecycle_value;
+        lifecycle_value = null;
+        return openWritableSession(alloc, &writable, options, transferred) catch |err| {
             writable.deinit(alloc);
             return err;
         };
+    }
+
+    /// Confirms a stored target from bounded metadata only. This never creates
+    /// files or repairs state; external-resume child admission is separate.
+    pub fn confirmStoredResumeHandoff(self: *Root, alloc: Allocator, session_id: []const u8, expected: ?ResumeHandoffBoundary) !void {
+        try session_layout.validateSessionId(session_id);
+        if (self.sessions == null) return error.SessionNotFound;
+        var dir = try openSessionDir(&self.sessions.?, session_id, .read_only);
+        defer dir.close();
+        return confirmHandoffMetadata(alloc, &dir, session_id, expected, .{
+            .session_lock_deadline_ms = 0,
+            .commit_lock_deadline_ms = 0,
+        });
     }
 
     pub fn captureReadBoundary(
@@ -1415,6 +1283,7 @@ pub const Root = struct {
             commit_lock_file,
             false,
             options.commit_lock_deadline_ms,
+            options.cancel_flag,
         ) catch |err| switch (err) {
             error.FileNotFound, error.LockBusy, error.LockUnsupported => {
                 try requireIntentAbsent(alloc, &session_dir, authority_intent_file);
@@ -1430,7 +1299,7 @@ pub const Root = struct {
         try requireIntentAbsent(alloc, &session_dir, publication_intent_file);
         var log_file = try openManagedFile(&session_dir, events_file, .read_only);
         errdefer log_file.close(io_mod.getIo());
-        const generation = try session_replay.readFirstGeneration(alloc, log_file);
+        const generation = try session_replay.readFirstGeneration(alloc, log_file, options.cancel_flag);
         const position = try loadWatermarkPosition(
             alloc,
             &session_dir,
@@ -1448,7 +1317,7 @@ pub const Root = struct {
         lock_held = false;
 
         try options.test_controls.boundary(.before_read_boundary_validation);
-        _ = try session_replay.scanCommitPosition(alloc, log_file, position);
+        _ = try session_replay.scanCommitPosition(alloc, log_file, position, options.cancel_flag);
         return .{
             .log_file = log_file,
             .position = position,
@@ -1469,6 +1338,7 @@ pub const Root = struct {
             alloc,
             boundary.log_file,
             boundary.position,
+            options.cancel_flag,
         );
         errdefer state.deinit(alloc);
         if (state.usage) |*usage| {
@@ -1490,6 +1360,7 @@ pub const Root = struct {
         self: *const Root,
         alloc: Allocator,
         session_id: []const u8,
+        cancel_flag: session_read.CancelFlag,
     ) !bool {
         var sessions = self.sessions orelse return error.SessionNotFound;
         try session_layout.validateSessionId(session_id);
@@ -1504,26 +1375,7 @@ pub const Root = struct {
         defer session_dir.close();
         var log_file = try openManagedFile(&session_dir, events_file, .read_only);
         defer log_file.close(io_mod.getIo());
-        return session_replay.readSubagentChildIdentity(alloc, log_file);
-    }
-
-    pub fn admitResumeView(
-        self: *Root,
-        alloc: Allocator,
-        session_id: []const u8,
-    ) !ResumeViewAdmission {
-        var writable = try self.openWritableSessionDir(alloc, session_id, 0);
-        errdefer writable.deinit(alloc);
-        const position = try loadCurrentPositionReference(alloc, &writable.dir, session_id);
-        return .{
-            .writable = writable,
-            .view = try session_resume_view.loadMatching(
-                alloc,
-                &writable.dir,
-                session_id,
-                resumeViewBoundary(position),
-            ),
-        };
+        return session_replay.readSubagentChildIdentity(alloc, log_file, cancel_flag);
     }
 
     fn openWritableSessionDir(
@@ -1531,6 +1383,7 @@ pub const Root = struct {
         alloc: Allocator,
         session_id: []const u8,
         deadline_ms: u64,
+        cancel_flag: session_read.CancelFlag,
     ) !WritableSessionDir {
         if (self.mode != .writable or self.sessions == null) return error.SessionNotFound;
         try session_layout.validateSessionId(session_id);
@@ -1543,6 +1396,7 @@ pub const Root = struct {
             session_lock_file,
             true,
             deadline_ms,
+            cancel_flag,
         ) catch |err| {
             dir.close();
             return mapSessionLockError(err);
@@ -1575,14 +1429,6 @@ pub const Root = struct {
         return entryExists(&dir, name);
     }
 };
-
-fn resumeViewBoundary(position: CommitPosition) session_resume_view.Boundary {
-    return .{
-        .log_generation = position.log_generation,
-        .seq = position.through_seq,
-        .event_log_bytes = position.through_event_log_bytes,
-    };
-}
 
 fn validateLeaf(name: []const u8) !void {
     if (name.len == 0 or std.mem.eql(u8, name, ".") or
@@ -1692,7 +1538,7 @@ fn acquireLock(
     name: []const u8,
     create: bool,
 ) !io_mod.TimedAdvisoryLock {
-    return acquireLockWithDeadline(dir, name, create, lock_deadline_ms);
+    return acquireLockWithDeadline(dir, name, create, lock_deadline_ms, null);
 }
 
 fn acquireLockWithDeadline(
@@ -1700,14 +1546,21 @@ fn acquireLockWithDeadline(
     name: []const u8,
     create: bool,
     deadline_ms: u64,
+    cancel_flag: ?*const std.atomic.Value(bool),
 ) !io_mod.TimedAdvisoryLock {
     if (create) {
+        if (cancel_flag) |flag| {
+            return io_mod.acquireTimedAdvisoryLockCancellable(dir, name, deadline_ms, flag);
+        }
         return io_mod.acquireTimedAdvisoryLock(dir, name, deadline_ms);
     }
     var file = try openManagedFile(dir, name, .read_write);
     errdefer file.close(io_mod.getIo());
     const started = io_mod.milliTimestamp();
     while (true) {
+        if (cancel_flag) |flag| {
+            if (flag.load(.acquire)) return error.Cancelled;
+        }
         const locked = file.tryLock(io_mod.getIo(), .exclusive) catch |err| switch (err) {
             error.FileLocksUnsupported => return error.LockUnsupported,
             else => return err,
@@ -1731,12 +1584,20 @@ fn readManagedFileAlloc(
     dir: *io_mod.VerifiedDir,
     name: []const u8,
     max_bytes: usize,
+    cancel_flag: session_read.CancelFlag,
 ) ![]u8 {
     var file = try openManagedFile(dir, name, .read_only);
     defer file.close(io_mod.getIo());
-    return io_mod.readFileToEnd(alloc, &file, max_bytes + 1) catch |err| switch (err) {
-        error.StreamTooLong => error.InvalidSessionFormat,
-        else => err,
+    var file_buffer: [session_read.work_bytes]u8 = undefined;
+    var reader = file.reader(io_mod.getIo(), &file_buffer);
+    var buffer: [session_read.work_bytes]u8 = undefined;
+    var cancellable = session_read.Reader.init(&reader.interface, &buffer, cancel_flag);
+    return cancellable.interface.allocRemaining(alloc, .limited(max_bytes + 1)) catch |err| {
+        try session_read.check(cancel_flag);
+        return switch (err) {
+            error.StreamTooLong => error.InvalidSessionFormat,
+            else => err,
+        };
     };
 }
 
@@ -2097,10 +1958,11 @@ pub fn inspectCommitWatermark(
     alloc: Allocator,
     dir: *io_mod.VerifiedDir,
     session_id: []const u8,
+    cancel_flag: session_read.CancelFlag,
 ) !CommitWatermarkInspection {
     var log = try openManagedFile(dir, events_file, .read_only);
     defer log.close(io_mod.getIo());
-    const generation = try session_replay.readFirstGeneration(alloc, log);
+    const generation = try session_replay.readFirstGeneration(alloc, log, cancel_flag);
     const name = try watermarkName(alloc, generation);
     defer alloc.free(name);
     if (!try entryExists(dir, name)) return .{ .status = .missing };
@@ -2109,8 +1971,9 @@ pub fn inspectCommitWatermark(
         dir,
         name,
         watermark_max_bytes,
+        cancel_flag,
     ) catch |err| switch (err) {
-        error.OutOfMemory, error.SessionPathUnsafe => return err,
+        error.Cancelled, error.OutOfMemory, error.SessionPathUnsafe => return err,
         else => return .{ .status = .invalid },
     };
     defer alloc.free(bytes);
@@ -2129,11 +1992,40 @@ pub fn inspectCommitWatermark(
         dir,
         session_id,
         decoded.position,
+        cancel_flag,
     ) catch |err| switch (err) {
-        error.OutOfMemory => return err,
+        error.Cancelled, error.OutOfMemory => return err,
         else => return .{ .status = .mismatched },
     };
     return .{ .status = .valid, .position = decoded.position };
+}
+
+/// A bounded hint for reusing a derived manifest. A false result or metadata
+/// failure requires canonical replay; this does not validate event contents.
+pub fn manifestMatchesCommit(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    manifest: session_projection.Manifest,
+    cancel_flag: session_read.CancelFlag,
+) !bool {
+    var lock = try acquireLockWithDeadline(dir, commit_lock_file, false, 0, cancel_flag);
+    defer lock.release();
+    try requireIntentAbsent(alloc, dir, authority_intent_file);
+    try requireIntentAbsent(alloc, dir, publication_intent_file);
+    var authority = try loadAuthority(alloc, dir, manifest.id);
+    defer authority.deinit(alloc);
+    if (!std.mem.eql(u8, &authority.authority_id, &manifest.authority_id)) return false;
+    const position = try loadWatermarkPosition(alloc, dir, manifest.id, manifest.log_generation);
+    if (position.through_seq != manifest.last_event_seq or
+        position.through_event_log_bytes != manifest.event_log_bytes)
+    {
+        return false;
+    }
+    var file = try openManagedFile(dir, events_file, .read_only);
+    defer file.close(io_mod.getIo());
+    const stat = try eventStat(file, manifest.event_log_bytes);
+    try session_read.check(cancel_flag);
+    return !session_projection.isManifestStale(manifest, stat);
 }
 
 fn encodePublicationIntent(alloc: Allocator, intent: PublicationIntent) ![]u8 {
@@ -2214,7 +2106,7 @@ fn loadAuthority(
     dir: *io_mod.VerifiedDir,
     session_id: []const u8,
 ) !AuthorityMarker {
-    const bytes = try readManagedFileAlloc(alloc, dir, authority_file, authority_max_bytes);
+    const bytes = try readManagedFileAlloc(alloc, dir, authority_file, authority_max_bytes, null);
     defer alloc.free(bytes);
     var marker = try decodeAuthority(alloc, bytes);
     errdefer marker.deinit(alloc);
@@ -2233,6 +2125,7 @@ fn loadAuthorityIntent(
         dir,
         authority_intent_file,
         authority_intent_max_bytes,
+        null,
     );
     defer alloc.free(bytes);
     return decodeAuthorityIntent(alloc, bytes);
@@ -2247,6 +2140,7 @@ fn loadPublicationIntent(
         dir,
         publication_intent_file,
         publication_intent_max_bytes,
+        null,
     );
     defer alloc.free(bytes);
     return decodePublicationIntent(alloc, bytes);
@@ -2261,6 +2155,7 @@ fn loadManifest(
         dir,
         manifest_file,
         session_projection.manifest_max_bytes,
+        null,
     );
     defer alloc.free(bytes);
     return session_projection.decodeManifest(alloc, bytes);
@@ -2440,6 +2335,7 @@ fn createNativeSession(
         &writable.dir,
         writable.session_id,
         intent,
+        options.cancel_flag,
     ) catch return error.SessionStartIndeterminate;
     options.test_controls.boundary(.after_authority_namespace_sync) catch
         return error.SessionStartIndeterminate;
@@ -2504,96 +2400,116 @@ fn openWritableSession(
     alloc: Allocator,
     writable: *WritableSessionDir,
     options: Options,
+    lifecycle: ?CommitLifecycle,
 ) !LoadedWritableSession {
-    options.test_controls.lock(.commit);
-    var commit_lock = acquireLockWithDeadline(
-        &writable.dir,
-        commit_lock_file,
-        true,
-        options.commit_lock_deadline_ms,
-    ) catch |err| {
-        return mapCommitLockError(err);
-    };
-    defer commit_lock.release();
+    var lifecycle_value = lifecycle;
+    errdefer if (lifecycle_value) |*value| value.deinit(alloc);
+    var prepared = false;
+    var loaded = opened: {
+        options.test_controls.lock(.commit);
+        var commit_lock = acquireLockWithDeadline(
+            &writable.dir,
+            commit_lock_file,
+            true,
+            options.commit_lock_deadline_ms,
+            options.cancel_flag,
+        ) catch |err| {
+            return mapCommitLockError(err);
+        };
+        defer commit_lock.release();
 
-    const marker = try resolveAuthorityIntent(alloc, writable, options);
-    defer {
-        var owned = marker;
-        owned.deinit(alloc);
-    }
-    const position = if (try entryExists(&writable.dir, publication_intent_file))
-        try resolvePublicationIntent(alloc, writable, options)
-    else
-        try loadCurrentPositionReference(
+        const authority_pending = try entryExists(&writable.dir, authority_intent_file);
+        const publication_pending = try entryExists(&writable.dir, publication_intent_file);
+        if ((authority_pending and options.resolve_authority_intent) or (!authority_pending and publication_pending)) {
+            if (lifecycle_value) |*value| {
+                try value.prepare(alloc, writable.session_id, options.cancel_flag);
+                prepared = true;
+            }
+        }
+        const marker = try resolveAuthorityIntent(alloc, writable, options);
+        defer {
+            var owned = marker;
+            owned.deinit(alloc);
+        }
+        const position = if (publication_pending)
+            try resolvePublicationIntent(alloc, writable, options)
+        else
+            try loadCurrentPositionReference(
+                alloc,
+                &writable.dir,
+                writable.session_id,
+                options.cancel_flag,
+            );
+
+        var event_log = try openManagedFile(&writable.dir, events_file, .read_write);
+        defer event_log.close(io_mod.getIo());
+        const length = try event_log.length(io_mod.getIo());
+        if (length < position.through_event_log_bytes) {
+            return failLoadedWritableSession(error.InvalidSessionFormat);
+        }
+        const replay_started_ns = io_mod.nanoTimestamp();
+        var open_state = loadOpenState(
             alloc,
             &writable.dir,
             writable.session_id,
-        );
-    try io_mod.syncVerifiedDir(writable.dir.dir);
-
-    var event_log = try openManagedFile(&writable.dir, events_file, .read_write);
-    defer event_log.close(io_mod.getIo());
-    const length = try event_log.length(io_mod.getIo());
-    if (length < position.through_event_log_bytes) {
-        return failLoadedWritableSession(error.InvalidSessionFormat);
-    }
-    const replay_started_ns = io_mod.nanoTimestamp();
-    var open_state = loadOpenState(
-        alloc,
-        &writable.dir,
-        writable.session_id,
-        marker.authority_id,
-        event_log,
-        position,
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return failLoadedWritableSession(error.SessionReplayResourceExhausted),
-        else => return err,
-    };
-    errdefer open_state.state.deinit(alloc);
-    const usage_sidecar_reseal_pending = try restoreUsageSidecar(
-        alloc,
-        &writable.dir,
-        &open_state.state,
-    );
-    const replay_finished_ns = io_mod.nanoTimestamp();
-    debug_trace.logf(
-        "session",
-        "event=session_replay source={s} checkpoint_seq={?d} tail_bytes={d} elapsed_us={d}",
-        .{
-            @tagName(open_state.source),
-            open_state.checkpoint_seq,
-            open_state.tail_bytes,
-            @divTrunc(replay_finished_ns - replay_started_ns, std.time.ns_per_us),
-        },
-    );
-    if (length > position.through_event_log_bytes) {
-        try event_log.setLength(io_mod.getIo(), position.through_event_log_bytes);
-        try event_log.sync(io_mod.getIo());
-    }
-    const active_id = try alloc.dupe(u8, writable.session_id);
-    errdefer alloc.free(active_id);
-
-    var result = LoadedWritableSession{
-        .active_id = active_id,
-        .state = open_state.state,
-        .log = writable.*,
-        .position = position,
-        .authority_id = marker.authority_id,
-        .generation_base_seq = open_state.generation_base_seq,
-        .generation_base_bytes = open_state.generation_base_bytes,
-        .checkpoint_seq = open_state.checkpoint_seq,
-        .checkpoint_sha256 = open_state.checkpoint_sha256,
-        .projection_status = open_state.projection_status,
-        .usage_sidecar_reseal_pending = usage_sidecar_reseal_pending,
-    };
-    open_state.state = undefined;
-    if (result.projection_status == .stale) {
-        writeManifestProjection(alloc, &result) catch {
-            result.projection_status = .stale;
+            marker.authority_id,
+            event_log,
+            position,
+            options.cancel_flag,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return failLoadedWritableSession(error.SessionReplayResourceExhausted),
+            else => return err,
         };
-    }
+        errdefer open_state.state.deinit(alloc);
+        const usage_sidecar_reseal_pending = try restoreUsageSidecar(
+            alloc,
+            &writable.dir,
+            &open_state.state,
+        );
+        const replay_finished_ns = io_mod.nanoTimestamp();
+        debug_trace.logf(
+            "session",
+            "event=session_replay source={s} checkpoint_seq={?d} tail_bytes={d} elapsed_us={d}",
+            .{
+                @tagName(open_state.source),
+                open_state.checkpoint_seq,
+                open_state.tail_bytes,
+                @divTrunc(replay_finished_ns - replay_started_ns, std.time.ns_per_us),
+            },
+        );
+        if (length > position.through_event_log_bytes) {
+            if (!prepared) {
+                if (lifecycle_value) |*value| {
+                    try value.prepare(alloc, writable.session_id, options.cancel_flag);
+                    prepared = true;
+                }
+            }
+            try rollbackPublicationToPrior(writable, alloc, event_log, position, options);
+        }
+        const active_id = try alloc.dupe(u8, writable.session_id);
+        errdefer alloc.free(active_id);
+
+        const result = LoadedWritableSession{
+            .active_id = active_id,
+            .state = open_state.state,
+            .log = writable.*,
+            .position = position,
+            .authority_id = marker.authority_id,
+            .generation_base_seq = open_state.generation_base_seq,
+            .generation_base_bytes = open_state.generation_base_bytes,
+            .checkpoint_seq = open_state.checkpoint_seq,
+            .checkpoint_sha256 = open_state.checkpoint_sha256,
+            .projection_status = open_state.projection_status,
+            .usage_sidecar_reseal_pending = usage_sidecar_reseal_pending,
+        };
+        open_state.state = undefined;
+        break :opened result;
+    };
+    loaded.commit_lifecycle = lifecycle_value;
+    lifecycle_value = null;
     writable.* = undefined;
-    return result;
+    if (prepared) loaded.persistence_debt.derived_publication = !loaded.publishCommitLifecycle(alloc, options.cancel_flag);
+    return loaded;
 }
 
 fn restoreUsageSidecar(
@@ -2682,6 +2598,7 @@ fn loadOpenState(
     authority_id: Identifier,
     event_log: std.Io.File,
     position: CommitPosition,
+    cancel_flag: session_read.CancelFlag,
 ) !OpenState {
     var manifest: ?OpenManifest = loadCurrentManifestForOpen(
         alloc,
@@ -2721,6 +2638,7 @@ fn loadOpenState(
                 event_log,
                 value,
                 position,
+                cancel_flag,
             )) |replayed| {
                 return .{
                     .state = replayed.state,
@@ -2734,7 +2652,7 @@ fn loadOpenState(
                         replayed.through_event_log_bytes,
                 };
             } else |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
+                error.Cancelled, error.OutOfMemory => return err,
                 else => {
                     checkpoint_failed = true;
                     debug_trace.logf(
@@ -2747,7 +2665,7 @@ fn loadOpenState(
         }
     }
 
-    var state = try session_replay.replayBoundary(alloc, event_log, position);
+    var state = try session_replay.replayBoundary(alloc, event_log, position, cancel_flag);
     errdefer state.deinit(alloc);
     if (manifest) |candidate| {
         const value = candidate.manifest;
@@ -2819,15 +2737,17 @@ fn replayCurrentCheckpoint(
     event_log: std.Io.File,
     manifest: session_projection.Manifest,
     position: CommitPosition,
+    cancel_flag: session_read.CancelFlag,
 ) !CheckpointReplay {
     const bytes = try readManagedFileAlloc(
         alloc,
         dir,
         checkpoint_file,
         session_projection.checkpoint_max_bytes,
+        cancel_flag,
     );
     defer alloc.free(bytes);
-    var checkpoint = try session_projection.decodeCheckpoint(alloc, bytes);
+    var checkpoint = try session_projection.decodeCheckpoint(alloc, bytes, cancel_flag);
     var checkpoint_owns_state = true;
     defer {
         alloc.free(checkpoint.session_id);
@@ -2845,6 +2765,7 @@ fn replayCurrentCheckpoint(
         checkpoint,
         projectionBoundary(position),
         projectionBoundary(checkpoint_position),
+        cancel_flag,
     );
     const checkpoint_state = checkpoint.state;
     checkpoint_owns_state = false;
@@ -2854,6 +2775,7 @@ fn replayCurrentCheckpoint(
         checkpoint_position,
         checkpoint_state,
         position,
+        cancel_flag,
     );
     errdefer state.deinit(alloc);
     if (!session_projection.stateMatchesManifest(state, manifest)) {
@@ -2918,6 +2840,7 @@ fn resolveAuthorityIntent(
         &writable.dir,
         writable.session_id,
         intent,
+        options.cancel_flag,
     );
     var marker = try loadAuthority(alloc, &writable.dir, writable.session_id);
     errdefer marker.deinit(alloc);
@@ -2935,6 +2858,7 @@ fn validateAuthorityTarget(
     dir: *io_mod.VerifiedDir,
     session_id: []const u8,
     intent: AuthorityIntent,
+    cancel_flag: session_read.CancelFlag,
 ) !void {
     var marker = try loadAuthority(alloc, dir, session_id);
     defer marker.deinit(alloc);
@@ -2948,7 +2872,7 @@ fn validateAuthorityTarget(
     {
         return error.InvalidSessionFormat;
     }
-    _ = try validateLivePosition(alloc, dir, session_id, intent.proposed);
+    _ = try validateLivePosition(alloc, dir, session_id, intent.proposed, cancel_flag);
     try io_mod.syncVerifiedDir(dir.dir);
 }
 
@@ -2958,14 +2882,14 @@ fn resolvePublicationIntent(
     options: Options,
 ) !CommitPosition {
     if (!try entryExists(&writable.dir, publication_intent_file)) {
-        return loadCurrentPosition(alloc, &writable.dir, writable.session_id);
+        return loadCurrentPosition(alloc, &writable.dir, writable.session_id, options.cancel_flag);
     }
     var intent = try loadPublicationIntent(alloc, &writable.dir);
     defer intent.deinit(alloc);
     if (!std.mem.eql(u8, intent.session_id, writable.session_id)) {
         return error.InvalidSessionFormat;
     }
-    const current_generation = try liveGeneration(alloc, &writable.dir);
+    const current_generation = try liveGeneration(alloc, &writable.dir, options.cancel_flag);
     var chosen: CommitPosition = undefined;
     if (intent.kind == .watermark_advance) {
         if (!std.mem.eql(u8, &current_generation, &intent.prior.log_generation) or
@@ -2987,6 +2911,7 @@ fn resolvePublicationIntent(
                 alloc,
                 log,
                 intent.proposed,
+                options.cancel_flag,
             )) {
                 .valid => chosen = intent.proposed,
                 .invalid => {
@@ -2995,6 +2920,7 @@ fn resolvePublicationIntent(
                         alloc,
                         log,
                         intent.prior,
+                        options.cancel_flag,
                     );
                     debug_trace.logf(
                         "session",
@@ -3019,16 +2945,20 @@ fn resolvePublicationIntent(
         } else if (positionsEqual(current, intent.prior)) {
             chosen = intent.prior;
             try options.test_controls.boundary(.before_recovery_prior_validation);
-            try requireValidRecoveryPosition(alloc, log, intent.prior);
+            try requireValidRecoveryPosition(
+                alloc,
+                log,
+                intent.prior,
+                options.cancel_flag,
+            );
             const length = try log.length(io_mod.getIo());
             if (length < intent.prior.through_event_log_bytes) {
                 return error.InvalidSessionFormat;
             }
             if (length > intent.prior.through_event_log_bytes) {
-                try log.setLength(io_mod.getIo(), intent.prior.through_event_log_bytes);
-                try log.sync(io_mod.getIo());
+                try rollbackPublicationToPrior(writable, alloc, log, intent.prior, options);
+                return intent.prior;
             }
-            try requireValidRecoveryPosition(alloc, log, intent.prior);
         } else {
             return error.SessionCommitIndeterminate;
         }
@@ -3039,6 +2969,7 @@ fn resolvePublicationIntent(
             &writable.dir,
             writable.session_id,
             chosen,
+            options.cancel_flag,
         );
     } else if (std.mem.eql(u8, &current_generation, &intent.prior.log_generation)) {
         chosen = intent.prior;
@@ -3050,7 +2981,11 @@ fn resolvePublicationIntent(
             writable.session_id,
             current_generation,
             log,
-        ) catch null;
+            options.cancel_flag,
+        ) catch |err| switch (err) {
+            error.Cancelled => return err,
+            else => null,
+        };
         if (current_position == null or
             !positionsEqual(current_position.?, intent.prior))
         {
@@ -3061,14 +2996,15 @@ fn resolvePublicationIntent(
             return error.InvalidSessionFormat;
         }
         if (length > intent.prior.through_event_log_bytes) {
-            try log.setLength(io_mod.getIo(), intent.prior.through_event_log_bytes);
-            try log.sync(io_mod.getIo());
+            try rollbackPublicationToPrior(writable, alloc, log, intent.prior, options);
+            return intent.prior;
         }
         _ = try validateCommitPosition(
             alloc,
             &writable.dir,
             writable.session_id,
             chosen,
+            options.cancel_flag,
         );
     } else {
         return error.SessionCommitIndeterminate;
@@ -3087,8 +3023,9 @@ fn requireValidRecoveryPosition(
     alloc: Allocator,
     log: std.Io.File,
     position: CommitPosition,
+    cancel_flag: session_read.CancelFlag,
 ) !void {
-    switch (try session_replay.validateCommitPositionForRecovery(alloc, log, position)) {
+    switch (try session_replay.validateCommitPositionForRecovery(alloc, log, position, cancel_flag)) {
         .valid => {},
         .invalid => return error.InvalidSessionFormat,
     }
@@ -3104,31 +3041,41 @@ fn positionsEqual(lhs: CommitPosition, rhs: CommitPosition) bool {
 fn liveGeneration(
     alloc: Allocator,
     dir: *io_mod.VerifiedDir,
+    cancel_flag: session_read.CancelFlag,
 ) !Identifier {
     var log = try openManagedFile(dir, events_file, .read_only);
     defer log.close(io_mod.getIo());
-    return session_replay.readFirstGeneration(alloc, log);
+    return session_replay.readFirstGeneration(alloc, log, cancel_flag);
 }
 
 fn loadCurrentPosition(
     alloc: Allocator,
     dir: *io_mod.VerifiedDir,
     session_id: []const u8,
+    cancel_flag: session_read.CancelFlag,
 ) !CommitPosition {
     var log = try openManagedFile(dir, events_file, .read_only);
     defer log.close(io_mod.getIo());
-    const generation = try session_replay.readFirstGeneration(alloc, log);
-    return loadAndValidateWatermark(alloc, dir, session_id, generation, log);
+    const generation = try session_replay.readFirstGeneration(alloc, log, cancel_flag);
+    return loadAndValidateWatermark(
+        alloc,
+        dir,
+        session_id,
+        generation,
+        log,
+        cancel_flag,
+    );
 }
 
 fn loadCurrentPositionReference(
     alloc: Allocator,
     dir: *io_mod.VerifiedDir,
     session_id: []const u8,
+    cancel_flag: session_read.CancelFlag,
 ) !CommitPosition {
     var log = try openManagedFile(dir, events_file, .read_only);
     defer log.close(io_mod.getIo());
-    const generation = try session_replay.readFirstGeneration(alloc, log);
+    const generation = try session_replay.readFirstGeneration(alloc, log, cancel_flag);
     return loadWatermarkPosition(alloc, dir, session_id, generation);
 }
 
@@ -3137,10 +3084,11 @@ fn validateLivePosition(
     dir: *io_mod.VerifiedDir,
     session_id: []const u8,
     expected: CommitPosition,
+    cancel_flag: session_read.CancelFlag,
 ) !session_projection.EventBoundary {
     var log = try openManagedFile(dir, events_file, .read_only);
     defer log.close(io_mod.getIo());
-    const generation = try session_replay.readFirstGeneration(alloc, log);
+    const generation = try session_replay.readFirstGeneration(alloc, log, cancel_flag);
     if (!std.mem.eql(u8, &generation, &expected.log_generation)) {
         return error.InvalidSessionFormat;
     }
@@ -3150,9 +3098,10 @@ fn validateLivePosition(
         session_id,
         generation,
         log,
+        cancel_flag,
     );
     if (!positionsEqual(actual, expected)) return error.InvalidSessionFormat;
-    return validateCommitPosition(alloc, dir, session_id, expected);
+    return validateCommitPosition(alloc, dir, session_id, expected, cancel_flag);
 }
 
 fn loadAndValidateWatermark(
@@ -3161,9 +3110,10 @@ fn loadAndValidateWatermark(
     session_id: []const u8,
     generation: Identifier,
     event_log: std.Io.File,
+    cancel_flag: session_read.CancelFlag,
 ) !CommitPosition {
     const position = try loadWatermarkPosition(alloc, dir, session_id, generation);
-    _ = try session_replay.scanCommitPosition(alloc, event_log, position);
+    _ = try session_replay.scanCommitPosition(alloc, event_log, position, cancel_flag);
     return position;
 }
 
@@ -3175,7 +3125,13 @@ fn loadWatermarkPosition(
 ) !CommitPosition {
     const name = try watermarkName(alloc, generation);
     defer alloc.free(name);
-    const bytes = try readManagedFileAlloc(alloc, dir, name, watermark_max_bytes);
+    const bytes = try readManagedFileAlloc(
+        alloc,
+        dir,
+        name,
+        watermark_max_bytes,
+        null,
+    );
     defer alloc.free(bytes);
     return decodeWatermark(alloc, bytes, session_id, generation);
 }
@@ -3185,10 +3141,11 @@ fn validateCommitPosition(
     dir: *io_mod.VerifiedDir,
     session_id: []const u8,
     position: CommitPosition,
+    cancel_flag: session_read.CancelFlag,
 ) !session_projection.EventBoundary {
     var log = try openManagedFile(dir, events_file, .read_only);
     defer log.close(io_mod.getIo());
-    const generation = try session_replay.readFirstGeneration(alloc, log);
+    const generation = try session_replay.readFirstGeneration(alloc, log, cancel_flag);
     if (!std.mem.eql(u8, &generation, &position.log_generation)) {
         return error.InvalidSessionFormat;
     }
@@ -3198,9 +3155,10 @@ fn validateCommitPosition(
         session_id,
         generation,
         log,
+        cancel_flag,
     );
     if (!positionsEqual(position, watermark)) return error.InvalidSessionFormat;
-    return session_replay.scanCommitPosition(alloc, log, position);
+    return session_replay.scanCommitPosition(alloc, log, position, cancel_flag);
 }
 
 fn appendEventImpl(
@@ -3212,7 +3170,6 @@ fn appendEventImpl(
     options: Options,
     usage_sidecar_bytes: ?[]const u8,
     write_usage_sidecar: bool,
-    cache_deferred: bool,
 ) !CommitPosition {
     try prepareCanonicalWrite(loaded, alloc, options);
     const envelope = session_event.Envelope{
@@ -3223,7 +3180,7 @@ fn appendEventImpl(
         .timestamp_ms = timestamp_ms,
         .event = event,
     };
-    const frame = try session_event.encodeFrame(alloc, envelope);
+    const frame = try session_event.encodeFrameCancellable(alloc, envelope, options.cancel_flag);
     var prepared = try prepareFailedTail(
         loaded,
         alloc,
@@ -3231,16 +3188,8 @@ fn appendEventImpl(
         envelope.seq,
         envelope.event_id,
         .{ .event = envelope.event_id },
+        options.cancel_flag,
     );
-    if (cache_deferred) {
-        loaded.writeDeferredCommitLifecycle(
-            alloc,
-            prepared.proposed,
-        ) catch |err| {
-            prepared.deinit(alloc);
-            return err;
-        };
-    }
     return publishPreparedTail(
         loaded,
         alloc,
@@ -3277,7 +3226,6 @@ fn commitStateReplacementImpl(
     options: Options,
     usage_sidecar_bytes: ?[]const u8,
     write_usage_sidecar: bool,
-    cache_deferred: bool,
 ) !CommitPosition {
     try prepareCanonicalWrite(loaded, alloc, options);
     const timestamp_ms = state.updated_at_ms;
@@ -3296,6 +3244,7 @@ fn commitStateReplacementImpl(
             .event_ids = ids.source(),
             .timestamp_ms = timestamp_ms,
             .reason = reason,
+            .cancel_flag = options.cancel_flag,
         },
     );
     const frames = try out.toOwnedSlice();
@@ -3309,16 +3258,8 @@ fn commitStateReplacementImpl(
             .replacement_id = replacement_id,
             .final_event_id = summary.last_event_id,
         } },
+        options.cancel_flag,
     );
-    if (cache_deferred) {
-        loaded.writeDeferredCommitLifecycle(
-            alloc,
-            prepared.proposed,
-        ) catch |err| {
-            prepared.deinit(alloc);
-            return err;
-        };
-    }
     return publishPreparedTail(
         loaded,
         alloc,
@@ -3346,6 +3287,7 @@ fn prepareFailedTail(
     last_seq: u64,
     last_event_id: Identifier,
     kind: FailedTailKind,
+    cancel_flag: session_read.CancelFlag,
 ) !FailedTail {
     errdefer alloc.free(frames);
     const prior = loaded.position;
@@ -3363,7 +3305,7 @@ fn prepareFailedTail(
         },
         .kind = kind,
         .bytes = frames,
-        .sha256 = session_projection.sha256(frames),
+        .sha256 = try session_read.sha256(frames, cancel_flag),
     };
 }
 
@@ -3422,27 +3364,25 @@ fn publishFrames(
     const current_length = try log.length(io_mod.getIo());
     var reused_tail = false;
     if (current_length == proposed.through_event_log_bytes) {
-        const existing = try alloc.alloc(u8, frames.len);
-        defer alloc.free(existing);
-        const count = try log.readPositionalAll(
-            io_mod.getIo(),
-            existing,
-            prior.through_event_log_bytes,
-        );
-        reused_tail = count == frames.len and std.mem.eql(u8, existing, frames);
+        reused_tail = try fileBytesMatch(io_mod.getIo(), log, prior.through_event_log_bytes, frames, options.cancel_flag);
     }
+    if (current_length < prior.through_event_log_bytes) {
+        loaded.persistence_debt.canonical_replacement = true;
+        return error.InvalidSessionFormat;
+    }
+    try session_read.check(options.cancel_flag);
+    loaded.persistence_debt.canonical_replacement = true;
     if (!reused_tail) {
-        if (current_length < prior.through_event_log_bytes) {
-            return error.InvalidSessionFormat;
-        }
         if (current_length > prior.through_event_log_bytes) {
             try log.setLength(io_mod.getIo(), prior.through_event_log_bytes);
             try log.sync(io_mod.getIo());
         }
-        log.writePositionalAll(
+        session_read.writeFileBytes(
             io_mod.getIo(),
-            frames,
+            log,
             prior.through_event_log_bytes,
+            frames,
+            options.cancel_flag,
         ) catch return handlePreIntentFailure(log, prior, failed_tail);
     }
     options.test_controls.boundary(.after_event_append) catch
@@ -3458,6 +3398,7 @@ fn publishFrames(
         commit_lock_file,
         true,
         options.commit_lock_deadline_ms,
+        options.cancel_flag,
     ) catch |err| return switch (failed_tail) {
         .rollback_before_adapter_continue => blk: {
             rollbackTail(log, prior) catch return error.SessionCommitIndeterminate;
@@ -3471,6 +3412,7 @@ fn publishFrames(
         alloc,
         &loaded.log.dir,
         loaded.log.session_id,
+        options.cancel_flag,
     ) catch |err| return handleIntentFailure(
         loaded,
         alloc,
@@ -3552,13 +3494,13 @@ fn publishFrames(
         err,
         options,
     );
-    loaded.resume_view_stale = true;
     switch (prepared.kind) {
         .event => {
             const published = loadCurrentPositionReference(
                 alloc,
                 &loaded.log.dir,
                 loaded.log.session_id,
+                options.cancel_flag,
             ) catch |err| return handlePublishedTailFailure(
                 loaded,
                 alloc,
@@ -3570,8 +3512,8 @@ fn publishFrames(
             );
             const exact_tail = expectedTailMatches(
                 loaded,
-                alloc,
                 prepared.*,
+                options.cancel_flag,
             ) catch |err| return handlePublishedTailFailure(
                 loaded,
                 alloc,
@@ -3599,6 +3541,7 @@ fn publishFrames(
                 &loaded.log.dir,
                 loaded.log.session_id,
                 proposed,
+                options.cancel_flag,
             ) catch |err| return handlePublishedTailFailure(
                 loaded,
                 alloc,
@@ -3632,6 +3575,7 @@ fn publishFrames(
                             error.InvalidSessionFormat,
                             options,
                         ),
+                    .cancel_flag = options.cancel_flag,
                 },
                 event_id,
             ) catch |err| return handlePublishedTailFailure(
@@ -3649,6 +3593,7 @@ fn publishFrames(
                 alloc,
                 log,
                 proposed,
+                options.cancel_flag,
             ) catch |err| return handlePublishedTailFailure(
                 loaded,
                 alloc,
@@ -3712,25 +3657,20 @@ fn retryDegradedWithStateReplacementImpl(
     loaded.degraded_tail = null;
     var owns_failed = true;
     defer if (owns_failed) failed.deinit(alloc);
-
-    confirmWritableNamespace(loaded, alloc, options) catch |err| {
+    errdefer loaded.abortCommitLifecycle();
+    errdefer if (owns_failed) {
         loaded.degraded_tail = failed;
         owns_failed = false;
-        return err;
     };
+    try confirmWritableNamespace(loaded, alloc, options);
 
     if (positionsEqual(loaded.position, failed.proposed)) {
-        const exact = expectedTailMatches(loaded, alloc, failed) catch |err| {
-            loaded.degraded_tail = failed;
-            owns_failed = false;
-            return err;
-        };
-        if (!exact) {
-            loaded.degraded_tail = failed;
-            owns_failed = false;
-            return error.SessionCommitIndeterminate;
+        if (!try expectedTailMatches(loaded, failed, options.cancel_flag)) return error.SessionCommitIndeterminate;
+        if (try durableStatesRichEqual(loaded.state, current_state, options.cancel_flag)) {
+            loaded.persistence_debt.canonical_replacement = false;
+            loaded.persistence_debt.derived_publication = !loaded.publishCommitLifecycle(alloc, options.cancel_flag);
+            return;
         }
-        if (try durableStatesRichEqual(loaded.state, current_state)) return;
 
         failed.deinit(alloc);
         owns_failed = false;
@@ -3745,18 +3685,11 @@ fn retryDegradedWithStateReplacementImpl(
     }
 
     if (!positionsEqual(loaded.position, failed.prior)) {
-        loaded.degraded_tail = failed;
-        owns_failed = false;
         return error.SessionCommitIndeterminate;
     }
 
-    const exact = expectedTailMatches(loaded, alloc, failed) catch |err| {
-        loaded.degraded_tail = failed;
-        owns_failed = false;
-        return err;
-    };
+    const exact = try expectedTailMatches(loaded, failed, options.cancel_flag);
     if (exact) {
-        owns_failed = false;
         const usage_sidecar_bytes = if (current_state.usage) |usage|
             encodeUsageSidecarBestEffort(
                 alloc,
@@ -3766,11 +3699,8 @@ fn retryDegradedWithStateReplacementImpl(
         else
             null;
         defer if (usage_sidecar_bytes) |bytes| alloc.free(bytes);
-        try loaded.prepareCommitLifecycle(
-            alloc,
-            loaded.state.workspace_root,
-            options,
-        );
+        try loaded.prepareCommitLifecycle(alloc, options.cancel_flag);
+        owns_failed = false;
         _ = publishPreparedTail(
             loaded,
             alloc,
@@ -3783,9 +3713,12 @@ fn retryDegradedWithStateReplacementImpl(
             loaded.abortCommitLifecycle();
             return err;
         };
-        _ = loaded.publishCommitLifecycle(alloc);
         try maintainCanonicalLogAfterCommit(loaded, alloc, options);
-        if (try durableStatesEqual(loaded.state, current_state)) return;
+        if (try durableStatesEqualCancellable(loaded.state, current_state, options.cancel_flag)) {
+            loaded.persistence_debt.canonical_replacement = false;
+            loaded.persistence_debt.derived_publication = !loaded.publishCommitLifecycle(alloc, options.cancel_flag);
+            return;
+        }
         _ = try loaded.commitStateReplacement(
             alloc,
             current_state,
@@ -3796,31 +3729,18 @@ fn retryDegradedWithStateReplacementImpl(
         return;
     }
 
-    var log = openManagedFile(
+    var log = try openManagedFile(
         &loaded.log.dir,
         events_file,
         .read_write,
-    ) catch |err| {
-        loaded.degraded_tail = failed;
-        owns_failed = false;
-        return err;
-    };
+    );
     defer log.close(io_mod.getIo());
-    const length = log.length(io_mod.getIo()) catch |err| {
-        loaded.degraded_tail = failed;
-        owns_failed = false;
-        return err;
-    };
+    const length = try log.length(io_mod.getIo());
     if (length < failed.prior.through_event_log_bytes) {
-        loaded.degraded_tail = failed;
-        owns_failed = false;
         return error.SessionCommitIndeterminate;
     }
-    rollbackTail(log, failed.prior) catch {
-        loaded.degraded_tail = failed;
-        owns_failed = false;
-        return error.SessionPersistenceDegraded;
-    };
+    try loaded.prepareCommitLifecycle(alloc, options.cancel_flag);
+    try rollbackPublicationToPrior(&loaded.log, alloc, log, failed.prior, options);
 
     failed.deinit(alloc);
     owns_failed = false;
@@ -3835,8 +3755,8 @@ fn retryDegradedWithStateReplacementImpl(
 
 fn expectedTailMatches(
     loaded: *LoadedWritableSession,
-    alloc: Allocator,
     failed: FailedTail,
+    cancel_flag: session_read.CancelFlag,
 ) !bool {
     if (!positionsEqual(loaded.position, failed.prior) and
         !positionsEqual(loaded.position, failed.proposed))
@@ -3852,7 +3772,7 @@ fn expectedTailMatches(
             failed.prior.through_event_log_bytes + failed.bytes.len or
         !std.mem.eql(
             u8,
-            &session_projection.sha256(failed.bytes),
+            &try session_read.sha256(failed.bytes, cancel_flag),
             &failed.sha256,
         ))
     {
@@ -3879,37 +3799,97 @@ fn expectedTailMatches(
     defer log.close(io_mod.getIo());
     const length = try log.length(io_mod.getIo());
     if (length != failed.proposed.through_event_log_bytes) return false;
-    const actual = try alloc.alloc(u8, failed.bytes.len);
-    defer alloc.free(actual);
-    const count = try log.readPositionalAll(
-        io_mod.getIo(),
-        actual,
-        failed.prior.through_event_log_bytes,
-    );
-    return count == failed.bytes.len and
-        std.mem.eql(u8, actual, failed.bytes) and
-        std.mem.eql(
-            u8,
-            &session_projection.sha256(actual),
-            &failed.sha256,
-        );
+    return fileBytesMatch(io_mod.getIo(), log, failed.prior.through_event_log_bytes, failed.bytes, cancel_flag);
+}
+
+fn fileBytesMatch(io: std.Io, file: std.Io.File, offset: u64, expected: []const u8, cancel_flag: session_read.CancelFlag) !bool {
+    var buffer: [session_read.work_bytes]u8 = undefined;
+    var consumed: usize = 0;
+    while (consumed < expected.len) {
+        try session_read.check(cancel_flag);
+        const end = consumed + @min(buffer.len, expected.len - consumed);
+        const chunk = buffer[0 .. end - consumed];
+        const position = std.math.add(u64, offset, consumed) catch return error.InvalidSessionFormat;
+        if (try file.readPositionalAll(io, chunk, position) != chunk.len) return false;
+        try session_read.check(cancel_flag);
+        if (!std.mem.eql(u8, chunk, expected[consumed..end])) return false;
+        consumed = end;
+    }
+    return true;
+}
+
+test "tail comparison cancellation after a real positional read leaves files unchanged" {
+    const Observer = struct {
+        var active: *@This() = undefined;
+        entered: std.Io.Event = .unset,
+        released: std.Io.Event = .unset,
+        cancel_flag: std.atomic.Value(bool) = .init(false),
+        requested_at: i128 = 0,
+
+        fn read(ctx: ?*anyopaque, file: std.Io.File, data: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+            const count = try std.testing.io.vtable.fileReadPositional(ctx, file, data, offset);
+            active.entered.set(io_mod.getIo());
+            active.released.waitUncancelable(io_mod.getIo());
+            return count;
+        }
+        fn cancel(self: *@This()) void {
+            self.entered.waitUncancelable(io_mod.getIo());
+            self.requested_at = io_mod.nanoTimestamp();
+            self.cancel_flag.store(true, .release);
+            self.released.set(io_mod.getIo());
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(io_mod.getIo(), "tail", .{ .read = true });
+    defer file.close(io_mod.getIo());
+    const bytes = "x" ** (256 * 1024);
+    try file.writeStreamingAll(io_mod.getIo(), bytes);
+    const before = try file.stat(io_mod.getIo());
+    var observer = Observer{};
+    Observer.active = &observer;
+    var vtable = std.testing.io.vtable.*;
+    vtable.fileReadPositional = Observer.read;
+    const observed_io = std.Io{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    const thread = try std.Thread.spawn(.{}, Observer.cancel, .{&observer});
+    var failure: ?anyerror = null;
+    _ = fileBytesMatch(observed_io, file, 0, bytes, &observer.cancel_flag) catch |err| failed: {
+        failure = err;
+        break :failed false;
+    };
+    observer.entered.set(io_mod.getIo());
+    thread.join();
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), failure);
+    try std.testing.expect(io_mod.nanoTimestamp() - observer.requested_at < 500 * std.time.ns_per_ms);
+    const after = try file.stat(io_mod.getIo());
+    try std.testing.expectEqual(before.size, after.size);
+    try std.testing.expectEqual(before.mtime, after.mtime);
 }
 
 pub fn durableStatesEqual(
     first: session_codec.DurableSessionState,
     second: session_codec.DurableSessionState,
 ) !bool {
+    return durableStatesEqualCancellable(first, second, null) catch |err| switch (err) {
+        error.Cancelled => unreachable,
+        inline else => |failure| return failure,
+    };
+}
+
+fn durableStatesEqualCancellable(first: session_codec.DurableSessionState, second: session_codec.DurableSessionState, cancel_flag: session_read.CancelFlag) !bool {
     var first_buffer: [4096]u8 = undefined;
     var first_discard = std.Io.Writer.Discarding.init(&first_buffer);
-    const first_summary = try session_codec.encodeState(
+    const first_summary = try session_codec.encodeStateCancellable(
         first,
         &first_discard.writer,
+        cancel_flag,
     );
     var second_buffer: [4096]u8 = undefined;
     var second_discard = std.Io.Writer.Discarding.init(&second_buffer);
-    const second_summary = try session_codec.encodeState(
+    const second_summary = try session_codec.encodeStateCancellable(
         second,
         &second_discard.writer,
+        cancel_flag,
     );
     return first_summary.encoded_bytes == second_summary.encoded_bytes and
         std.mem.eql(
@@ -3922,8 +3902,9 @@ pub fn durableStatesEqual(
 fn durableStatesRichEqual(
     first: session_codec.DurableSessionState,
     second: session_codec.DurableSessionState,
+    cancel_flag: session_read.CancelFlag,
 ) !bool {
-    if (!try durableStatesEqual(first, second)) return false;
+    if (!try durableStatesEqualCancellable(first, second, cancel_flag)) return false;
     if (first.usage == null or second.usage == null) {
         return first.usage == null and second.usage == null;
     }
@@ -3936,6 +3917,8 @@ fn confirmWritableNamespace(
     options: Options,
 ) !void {
     if (!loaded.namespace_confirmation_required) return;
+    try loaded.prepareCommitLifecycle(alloc, options.cancel_flag);
+    errdefer loaded.abortCommitLifecycle();
 
     options.test_controls.lock(.commit);
     var commit_lock = acquireLockWithDeadline(
@@ -3943,6 +3926,7 @@ fn confirmWritableNamespace(
         commit_lock_file,
         true,
         options.commit_lock_deadline_ms,
+        options.cancel_flag,
     ) catch |err| return mapCommitLockError(err);
     defer commit_lock.release();
 
@@ -3960,10 +3944,9 @@ fn confirmWritableNamespace(
             return error.SessionCommitIndeterminate;
         }
         if (length > position.through_event_log_bytes) {
-            try log.setLength(io_mod.getIo(), position.through_event_log_bytes);
-            try log.sync(io_mod.getIo());
+            try rollbackPublicationToPrior(&loaded.log, alloc, log, position, options);
         }
-        const next_state = session_replay.replayBoundary(alloc, log, position) catch |err| switch (err) {
+        const next_state = session_replay.replayBoundary(alloc, log, position, options.cancel_flag) catch |err| switch (err) {
             error.OutOfMemory => return error.SessionReplayResourceExhausted,
             else => return err,
         };
@@ -3975,7 +3958,6 @@ fn confirmWritableNamespace(
         loaded.state.deinit(alloc);
         loaded.state = next_state;
         loaded.position = position;
-        loaded.resume_view_stale = true;
         if (generation_changed) {
             loaded.generation_base_seq = position.through_seq;
             loaded.generation_base_bytes = position.through_event_log_bytes;
@@ -4080,6 +4062,7 @@ fn rollbackPublicationToPrior(
         &writable.dir,
         writable.session_id,
         prior,
+        options.cancel_flag,
     );
     if (try entryExists(&writable.dir, publication_intent_file)) {
         try deleteAndSync(
@@ -4097,7 +4080,7 @@ fn refreshProjections(
     options: Options,
 ) !void {
     if (checkpointDue(loaded, options.checkpoint_interval)) {
-        writeCheckpointProjection(alloc, loaded) catch |err| switch (err) {
+        writeCheckpointProjection(alloc, loaded, options.cancel_flag) catch |err| switch (err) {
             error.CheckpointTooLarge => {},
             else => return err,
         };
@@ -4115,6 +4098,7 @@ fn checkpointDue(loaded: *LoadedWritableSession, interval: u64) bool {
 fn writeCheckpointProjection(
     alloc: Allocator,
     loaded: *LoadedWritableSession,
+    cancel_flag: session_read.CancelFlag,
 ) !void {
     const checkpoint = session_projection.Checkpoint{
         .session_id = loaded.log.session_id,
@@ -4124,11 +4108,12 @@ fn writeCheckpointProjection(
         .through_event_log_bytes = loaded.position.through_event_log_bytes,
         .state = loaded.state,
     };
-    const bytes = try session_projection.encodeCheckpoint(alloc, checkpoint);
+    const bytes = try session_projection.encodeCheckpointCancellable(alloc, checkpoint, cancel_flag);
     defer alloc.free(bytes);
-    try durableReplace(alloc, &loaded.log.dir, checkpoint_file, bytes);
+    const digest = try session_read.sha256(bytes, cancel_flag);
+    try io_mod.durableReplaceVerifiedWithOps(alloc, &loaded.log.dir, checkpoint_file, bytes, .{ .cancel_flag = cancel_flag });
     loaded.checkpoint_seq = loaded.position.through_seq;
-    loaded.checkpoint_sha256 = session_projection.sha256(bytes);
+    loaded.checkpoint_sha256 = digest;
 }
 
 fn writeManifestProjection(
@@ -4286,6 +4271,8 @@ fn compactCanonicalLogIfDueImpl(
     }
     compactCanonicalLog(loaded, alloc, options) catch |err| switch (err) {
         error.OutOfMemory,
+        error.Cancelled,
+        error.Canceled,
         error.SessionLogCompactionIndeterminate,
         => return err,
         else => return error.SessionLogCompactionFailed,
@@ -4299,6 +4286,7 @@ fn maintainCanonicalLogAfterCommit(
 ) !void {
     if (loaded.namespace_confirmation_required) return;
     compactCanonicalLogIfDueImpl(loaded, alloc, options) catch |err| {
+        if (err == error.Cancelled or err == error.Canceled) return;
         if (!loaded.compaction_warning_active) {
             const frame_growth =
                 loaded.position.through_seq - loaded.generation_base_seq;
@@ -4346,7 +4334,7 @@ fn compactCanonicalLog(
             .subagent_child = loaded.state.subagent_child,
         } },
     };
-    const first_line = try session_event.encodeFrame(alloc, session_started);
+    const first_line = try session_event.encodeFrameCancellable(alloc, session_started, options.cancel_flag);
     defer alloc.free(first_line);
     var content: std.Io.Writer.Allocating = .init(alloc);
     defer content.deinit();
@@ -4363,6 +4351,7 @@ fn compactCanonicalLog(
             .event_ids = ids.source(),
             .timestamp_ms = loaded.state.updated_at_ms,
             .reason = .log_compaction,
+            .cancel_flag = options.cancel_flag,
         },
     );
     const suffix = identifierHex(new_generation);
@@ -4373,8 +4362,11 @@ fn compactCanonicalLog(
     );
     defer alloc.free(temp_name);
     var temp = try createManagedFile(&loaded.log.dir, temp_name);
+    errdefer |err| if (err == error.Cancelled or err == error.Canceled) {
+        loaded.log.dir.dir.deleteFile(io_mod.getIo(), temp_name) catch |cleanup_err| debug_trace.logf("session", "event=cancelled_compaction_temp_cleanup_failed err={s}", .{@errorName(cleanup_err)});
+    };
     defer temp.close(io_mod.getIo());
-    try temp.writePositionalAll(io_mod.getIo(), content.written(), 0);
+    try session_read.writeFileBytes(io_mod.getIo(), temp, 0, content.written(), options.cancel_flag);
     try temp.sync(io_mod.getIo());
     try options.test_controls.boundary(.after_compaction_temp_sync);
     const proposed = CommitPosition{
@@ -4383,7 +4375,7 @@ fn compactCanonicalLog(
         .through_event_id = replacement.last_event_id,
         .through_event_log_bytes = content.written().len,
     };
-    _ = try session_replay.scanCommitPosition(alloc, temp, proposed);
+    _ = try session_replay.scanCommitPosition(alloc, temp, proposed, options.cancel_flag);
     const watermark_bytes = try encodeWatermark(
         alloc,
         loaded.log.session_id,
@@ -4392,6 +4384,12 @@ fn compactCanonicalLog(
     defer alloc.free(watermark_bytes);
     const new_watermark = try watermarkName(alloc, new_generation);
     defer alloc.free(new_watermark);
+    errdefer |err| if (err == error.Cancelled or err == error.Canceled) {
+        loaded.log.dir.dir.deleteFile(io_mod.getIo(), new_watermark) catch |cleanup_err| switch (cleanup_err) {
+            error.FileNotFound => {},
+            else => debug_trace.logf("session", "event=cancelled_compaction_watermark_cleanup_failed err={s}", .{@errorName(cleanup_err)}),
+        };
+    };
     try durableReplace(
         alloc,
         &loaded.log.dir,
@@ -4406,12 +4404,14 @@ fn compactCanonicalLog(
         commit_lock_file,
         true,
         options.commit_lock_deadline_ms,
-    ) catch |err| return mapCommitLockError(err);
+        options.cancel_flag,
+    ) catch |err| return @as(anyerror!void, mapCommitLockError(err));
     defer commit_lock.release();
     const current = try loadCurrentPosition(
         alloc,
         &loaded.log.dir,
         loaded.log.session_id,
+        options.cancel_flag,
     );
     if (!positionsEqual(current, loaded.position)) {
         return error.SessionLogCompactionFailed;
@@ -4443,7 +4443,6 @@ fn compactCanonicalLog(
         events_file,
         io_mod.getIo(),
     ) catch return error.SessionLogCompactionIndeterminate;
-    loaded.resume_view_stale = true;
     options.test_controls.boundary(.after_compaction_log_rename) catch
         return error.SessionLogCompactionIndeterminate;
     io_mod.syncVerifiedDir(loaded.log.dir.dir) catch
@@ -4455,8 +4454,11 @@ fn compactCanonicalLog(
         &loaded.log.dir,
         loaded.log.session_id,
         proposed,
+        options.cancel_flag,
     ) catch return error.SessionLogCompactionIndeterminate;
     options.test_controls.boundary(.after_compaction_live_confirmation) catch
+        return error.SessionLogCompactionIndeterminate;
+    const compacted_state = session_replay.replayBoundary(alloc, temp, proposed, options.cancel_flag) catch
         return error.SessionLogCompactionIndeterminate;
     var cleanup_pending = false;
     deleteAndSync(
@@ -4476,12 +4478,9 @@ fn compactCanonicalLog(
     loaded.generation_base_bytes = proposed.through_event_log_bytes;
     loaded.checkpoint_seq = null;
     loaded.checkpoint_sha256 = null;
-    var live = try openManagedFile(&loaded.log.dir, events_file, .read_only);
-    defer live.close(io_mod.getIo());
-    const compacted_state = try session_replay.replayBoundary(alloc, live, proposed);
     loaded.state.deinit(alloc);
     loaded.state = compacted_state;
-    writeCheckpointProjection(alloc, loaded) catch {};
+    writeCheckpointProjection(alloc, loaded, options.cancel_flag) catch {};
     writeManifestProjection(alloc, loaded) catch {
         loaded.projection_status = .stale;
     };
@@ -4566,6 +4565,7 @@ fn cleanupOrphansImpl(
         alloc,
         &loaded.log.dir,
         loaded.log.session_id,
+        options.cancel_flag,
     );
     try io_mod.syncVerifiedDir(loaded.log.dir.dir);
 
@@ -4669,7 +4669,13 @@ fn validateOrphanWatermark(
     session_id: []const u8,
     generation: Identifier,
 ) !void {
-    const bytes = try readManagedFileAlloc(alloc, dir, name, watermark_max_bytes);
+    const bytes = try readManagedFileAlloc(
+        alloc,
+        dir,
+        name,
+        watermark_max_bytes,
+        null,
+    );
     defer alloc.free(bytes);
     _ = try decodeWatermark(alloc, bytes, session_id, generation);
 }
@@ -4690,10 +4696,10 @@ fn validateOrphanTemp(
     var replacement_id: Identifier = undefined;
     var last: ?CommitPosition = null;
     while (offset < length) {
-        const line = try session_replay.readLineAt(alloc, file, offset, length) orelse
+        const line = try session_replay.readLineAt(alloc, file, offset, length, null) orelse
             return error.InvalidSessionFormat;
         defer alloc.free(line.bytes);
-        var envelope = session_event.decodeFrame(alloc, line.bytes) catch
+        var envelope = session_event.decodeFrame(alloc, line.bytes, null) catch
             return error.InvalidSessionFormat;
         defer envelope.deinit(alloc);
         validator.validate(envelope) catch return error.InvalidSessionFormat;
@@ -4750,6 +4756,7 @@ fn validateOrphanTemp(
         alloc,
         file,
         last orelse return error.InvalidSessionFormat,
+        null,
     );
 }
 
@@ -4804,6 +4811,453 @@ const TempRoot = struct {
         self.* = undefined;
     }
 };
+
+test "writable recovery prepares publication before mutation and pure opens stay read-only" {
+    const Probe = struct {
+        root: *Root,
+        committed_bytes: u64,
+        prepares: usize = 0,
+        publishes: usize = 0,
+        prepared_before_mutation: bool = false,
+        cancel_flag: session_read.CancelFlag,
+        fail_publication: bool,
+        fn prepare(raw: ?*anyopaque, _: Allocator, id: []const u8, cancel_flag: session_read.CancelFlag) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.cancel_flag == cancel_flag);
+            var dir = try openSessionDir(&self.root.sessions.?, id, .read_only);
+            defer dir.close();
+            var file = try openManagedFile(&dir, events_file, .read_only);
+            defer file.close(io_mod.getIo());
+            self.prepared_before_mutation = try file.length(io_mod.getIo()) > self.committed_bytes or
+                try entryExists(&dir, authority_intent_file) or try entryExists(&dir, publication_intent_file);
+            self.prepares += 1;
+        }
+        fn publish(raw: ?*anyopaque, _: Allocator, state: session_codec.DurableSessionState, _: CommitPosition, cancel_flag: session_read.CancelFlag) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.cancel_flag == cancel_flag);
+            var dir = try openSessionDir(&self.root.sessions.?, state.id, .read_only);
+            defer dir.close();
+            var lock = try acquireLockWithDeadline(&dir, commit_lock_file, false, 0, null);
+            lock.release();
+            self.publishes += 1;
+            if (self.fail_publication) return error.InjectedPublicationFailure;
+        }
+    };
+    const alloc = std.testing.allocator;
+    const Recovery = enum { tail, publication, authority, none };
+    for (std.enums.values(Recovery)) |recovery| {
+        var temp = try TempRoot.init(alloc);
+        defer temp.deinit(alloc);
+        var initial = try testState(alloc, "recovery-publication", 10);
+        defer initial.deinit(alloc);
+        var committed_bytes: u64 = 0;
+        if (recovery == .authority) {
+            var failure = BoundaryFailure{ .target = .after_authority_marker_rename };
+            try std.testing.expectError(error.SessionStartIndeterminate, temp.root.startWritableSession(alloc, initial, .{ .test_controls = failure.test_controls() }));
+        } else {
+            var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+            defer loaded.deinit(alloc);
+            var next = try stateWithTurn(alloc, initial, 20);
+            defer next.deinit(alloc);
+            _ = try loaded.appendEvent(alloc, historyEvent(next), 20, .retry_expected_tail, .{ .checkpoint_interval = 0 });
+            committed_bytes = loaded.position.through_event_log_bytes;
+            if (recovery != .none) {
+                var failure = BoundaryFailure{ .target = if (recovery == .tail) .after_event_sync else .after_commit_intent_sync };
+                try std.testing.expectError(if (recovery == .tail) error.SessionPersistenceDegraded else error.SessionCommitIndeterminate, loaded.appendEvent(alloc, .{ .preferences_changed = .{ .fast_mode = true } }, 21, .retry_expected_tail, .{ .test_controls = failure.test_controls() }));
+            }
+            try loaded.log.dir.dir.deleteFile(io_mod.getIo(), manifest_file);
+        }
+        var cancel = std.atomic.Value(bool).init(false);
+        var probe = Probe{ .root = &temp.root, .committed_bytes = committed_bytes, .cancel_flag = &cancel, .fail_publication = recovery == .publication };
+        var reopened = try temp.root.resumeForWriteWithLifecycle(alloc, initial.id, .{ .cancel_flag = &cancel }, .{ .context = &probe, .prepare_fn = Probe.prepare, .publish_fn = Probe.publish });
+        defer reopened.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, if (recovery != .none) 1 else 0), probe.prepares);
+        try std.testing.expectEqual(probe.prepares, probe.publishes);
+        if (recovery != .none) try std.testing.expect(probe.prepared_before_mutation);
+        try std.testing.expectEqual(probe.fail_publication, reopened.persistence_debt.derived_publication);
+        try std.testing.expect(!try entryExists(&reopened.log.dir, manifest_file));
+        try reopened.confirmResumeHandoffBoundary(alloc, .{});
+    }
+}
+
+test "failed publication preparation preserves the prior canonical handoff" {
+    const Reject = struct {
+        fn prepare(_: ?*anyopaque, _: Allocator, _: []const u8, _: session_read.CancelFlag) !void {
+            return error.InjectedPreparationFailure;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "prepare-failure", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    var next = try stateWithTurn(alloc, initial, 20);
+    defer next.deinit(alloc);
+    _ = try loaded.appendEvent(alloc, historyEvent(next), 20, .retry_expected_tail, .{});
+    const before = loaded.position;
+    try loaded.installCommitLifecycle(.{ .prepare_fn = Reject.prepare });
+    try std.testing.expectError(error.InjectedPreparationFailure, loaded.appendEvent(alloc, .{ .preferences_changed = .{ .fast_mode = true } }, 21, .retry_expected_tail, .{}));
+    try std.testing.expect(positionsEqual(before, loaded.position));
+    try loaded.confirmResumeHandoffBoundary(alloc, .{});
+    try std.testing.expectError(error.InjectedPreparationFailure, loaded.commitStateReplacement(alloc, next, .recovery, .retry_expected_tail, .{}));
+    try loaded.confirmResumeHandoffBoundary(alloc, .{});
+}
+
+test "creation prepares publication before exposing a session directory" {
+    const Probe = struct {
+        root: *Root,
+        visible: bool = false,
+        released: usize = 0,
+        fn prepare(raw: ?*anyopaque, _: Allocator, id: []const u8, _: session_read.CancelFlag) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.visible = try entryExists(&self.root.sessions.?, id);
+            return error.InjectedPreparationFailure;
+        }
+        fn deinit(raw: ?*anyopaque, _: Allocator) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.released += 1;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "prepare-before-create", 10);
+    defer initial.deinit(alloc);
+    var probe = Probe{ .root = &temp.root };
+    try std.testing.expectError(error.InjectedPreparationFailure, temp.root.startWritableSessionWithLifecycle(alloc, initial, .{}, .{ .context = &probe, .prepare_fn = Probe.prepare, .deinit_fn = Probe.deinit }));
+    try std.testing.expect(!probe.visible);
+    try std.testing.expectEqual(@as(usize, 1), probe.released);
+    try std.testing.expect(!try entryExists(&temp.root.sessions.?, initial.id));
+    probe.released = 0;
+    try std.testing.expectError(error.SessionNotFound, temp.root.resumeForWriteWithLifecycle(alloc, initial.id, .{}, .{ .context = &probe, .deinit_fn = Probe.deinit }));
+    try std.testing.expectEqual(@as(usize, 1), probe.released);
+}
+
+test "compaction cancellation preserves the publication fence or removes only unpublished files" {
+    const Stop = struct {
+        target: Boundary,
+        entered: std.Io.Event = .unset,
+        released: std.Io.Event = .unset,
+        cancel: std.atomic.Value(bool) = .init(false),
+        fn boundary(raw: ?*anyopaque, point: Boundary) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (point != self.target) return;
+            self.entered.set(io_mod.getIo());
+            self.released.waitUncancelable(io_mod.getIo());
+        }
+        fn run(self: *@This()) void {
+            self.entered.waitUncancelable(io_mod.getIo());
+            self.cancel.store(true, .release);
+            self.released.set(io_mod.getIo());
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_]Boundary{ .after_compaction_temp_sync, .after_compaction_watermark_sync, .after_compaction_intent_sync, .after_compaction_live_confirmation }) |boundary| {
+        var temp = try TempRoot.init(alloc);
+        defer temp.deinit(alloc);
+        var initial = try testState(alloc, "cancel-compaction-boundary", 10);
+        defer initial.deinit(alloc);
+        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        var next = try stateWithTurn(alloc, initial, 20);
+        defer next.deinit(alloc);
+        _ = try loaded.appendEvent(alloc, historyEvent(next), 20, .retry_expected_tail, .{ .checkpoint_interval = 0 });
+        const prior = loaded.position;
+        var before = loaded.log.dir.dir.iterate();
+        var before_count: usize = 0;
+        while (try before.next(io_mod.getIo())) |_| before_count += 1;
+        var stop = Stop{ .target = boundary };
+        const thread = try std.Thread.spawn(.{}, Stop.run, .{&stop});
+        var failure: ?anyerror = null;
+        loaded.compactCanonicalLogIfDue(alloc, .{ .cancel_flag = &stop.cancel, .compaction_frame_threshold = 0, .test_controls = .{ .context = &stop, .boundary_fn = Stop.boundary } }) catch |err| {
+            failure = err;
+        };
+        stop.entered.set(io_mod.getIo());
+        thread.join();
+        if (boundary == .after_compaction_temp_sync or boundary == .after_compaction_watermark_sync) {
+            try std.testing.expectEqual(@as(?anyerror, error.Cancelled), failure);
+            try std.testing.expect(positionsEqual(prior, loaded.position));
+            try loaded.confirmResumeHandoffBoundary(alloc, .{});
+            var after = loaded.log.dir.dir.iterate();
+            var after_count: usize = 0;
+            while (try after.next(io_mod.getIo())) |_| after_count += 1;
+            try std.testing.expectEqual(before_count, after_count);
+        } else {
+            try std.testing.expectEqual(@as(?anyerror, error.SessionLogCompactionIndeterminate), failure);
+            try std.testing.expect(loaded.namespace_confirmation_required);
+            try std.testing.expectError(error.SessionPersistenceDegraded, loaded.confirmResumeHandoffBoundary(alloc, .{}));
+            try loaded.compactCanonicalLogIfDue(alloc, .{});
+            try loaded.confirmResumeHandoffBoundary(alloc, .{});
+            try std.testing.expectEqualStrings("world", loaded.state.history[0].assistant.assistant);
+        }
+    }
+}
+
+test "cancellation after canonical publication retains its replay fence" {
+    const Stop = struct {
+        cancel: std.atomic.Value(bool) = .init(false),
+        fn boundary(raw: ?*anyopaque, point: Boundary) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (point == .after_target_namespace_sync) self.cancel.store(true, .release);
+        }
+    };
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "cancel-published-replay", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    var next = try stateWithTurn(alloc, initial, 20);
+    defer next.deinit(alloc);
+    var stop = Stop{};
+    try std.testing.expectError(error.SessionCommitIndeterminate, loaded.appendEvent(alloc, historyEvent(next), 20, .retry_expected_tail, .{ .cancel_flag = &stop.cancel, .test_controls = .{ .context = &stop, .boundary_fn = Stop.boundary } }));
+    try std.testing.expect(loaded.namespace_confirmation_required);
+    try std.testing.expectError(error.SessionPersistenceDegraded, loaded.confirmResumeHandoffBoundary(alloc, .{}));
+    try std.testing.expectError(error.SessionCommitBoundaryUnavailable, temp.root.loadReadOnly(alloc, initial.id, .{}));
+    stop.cancel.store(false, .release);
+    try loaded.retryDegradedWithStateReplacement(alloc, next, .{});
+    try loaded.confirmResumeHandoffBoundary(alloc, .{});
+}
+
+test "canonical replacement and derived checkpoint encoding cancel after work begins" {
+    const Pause = struct {
+        cancel: std.atomic.Value(bool) = .init(false),
+        entered: std.Io.Event = .unset,
+        released: std.Io.Event = .unset,
+        observed: bool = false,
+        requested_at: i128 = 0,
+
+        fn allocator(self: *@This()) Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = free } };
+        }
+        fn allocate(raw: *anyopaque, size: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const result = std.testing.allocator.rawAlloc(size, alignment, ra);
+            if (size >= 64 * 1024 and !self.observed) {
+                self.observed = true;
+                self.entered.set(io_mod.getIo());
+                self.released.waitUncancelable(io_mod.getIo());
+            }
+            return result;
+        }
+        fn free(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            std.testing.allocator.rawFree(bytes, alignment, ra);
+        }
+        fn run(self: *@This()) void {
+            self.entered.waitUncancelable(io_mod.getIo());
+            self.requested_at = io_mod.nanoTimestamp();
+            self.cancel.store(true, .release);
+            self.released.set(io_mod.getIo());
+        }
+    };
+    const alloc = std.testing.allocator;
+    const Operation = enum { replacement, replacement_with_debt, checkpoint, compaction };
+    for (std.enums.values(Operation)) |operation| {
+        var temp = try TempRoot.init(alloc);
+        defer temp.deinit(alloc);
+        var initial = try testState(alloc, "cancel-writing", 10);
+        defer initial.deinit(alloc);
+        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        var next = try stateWithPrompt(alloc, initial, 20, "saved", "x" ** (256 * 1024));
+        defer next.deinit(alloc);
+        if (operation == .checkpoint or operation == .compaction) _ = try loaded.appendEvent(alloc, historyEvent(next), 20, .retry_expected_tail, .{ .checkpoint_interval = 0 });
+        if (operation == .replacement_with_debt) loaded.persistence_debt.canonical_replacement = true;
+        const prior = loaded.position;
+        const before = try loaded.log.dir.dir.statFile(io_mod.getIo(), events_file, .{});
+        var pause = Pause{};
+        const thread = try std.Thread.spawn(.{}, Pause.run, .{&pause});
+        var failure: ?anyerror = null;
+        if (operation == .checkpoint) {
+            loaded.writeCheckpointIfDue(pause.allocator(), true, .{ .cancel_flag = &pause.cancel }) catch |err| {
+                failure = err;
+            };
+        } else if (operation == .compaction) {
+            loaded.compactCanonicalLogIfDue(pause.allocator(), .{ .cancel_flag = &pause.cancel, .compaction_frame_threshold = 0 }) catch |err| {
+                failure = err;
+            };
+        } else {
+            _ = loaded.commitStateReplacement(pause.allocator(), next, .recovery, .retry_expected_tail, .{ .cancel_flag = &pause.cancel, .checkpoint_interval = 0 }) catch |err| failed: {
+                failure = err;
+                break :failed loaded.position;
+            };
+        }
+        pause.entered.set(io_mod.getIo());
+        thread.join();
+        try std.testing.expect(pause.observed);
+        try std.testing.expectEqual(@as(?anyerror, error.Cancelled), failure);
+        try std.testing.expect(io_mod.nanoTimestamp() - pause.requested_at < 500 * std.time.ns_per_ms);
+        const after = try loaded.log.dir.dir.statFile(io_mod.getIo(), events_file, .{});
+        try std.testing.expectEqual(before.size, after.size);
+        try std.testing.expectEqual(before.mtime, after.mtime);
+        try std.testing.expect(positionsEqual(prior, loaded.position));
+        if (operation == .replacement_with_debt) {
+            try std.testing.expectError(error.SessionPersistenceDegraded, loaded.confirmResumeHandoffBoundary(alloc, .{}));
+        } else {
+            try loaded.confirmResumeHandoffBoundary(alloc, .{});
+        }
+    }
+}
+
+test "session loading cancels after large event or checkpoint allocation begins" {
+    const alloc = std.testing.allocator;
+    const CancelOnAllocation = struct {
+        child: Allocator,
+        cancel: std.atomic.Value(bool) = .init(false),
+        started: std.Io.Event = .unset,
+        released: std.Io.Event = .unset,
+        observed: bool = false,
+        requested_ms: std.atomic.Value(i64) = .init(0),
+        largest_request: usize = 0,
+        max_trigger_bytes: usize = std.math.maxInt(usize),
+
+        fn request(self: *@This()) void {
+            self.started.waitUncancelable(io_mod.getIo());
+            self.requested_ms.store(io_mod.milliTimestamp(), .release);
+            self.cancel.store(true, .release);
+            self.released.set(io_mod.getIo());
+        }
+        fn observe(self: *@This(), len: usize) void {
+            self.largest_request = @max(self.largest_request, len);
+            if (self.observed or len < 64 * 1024 or len >= self.max_trigger_bytes) return;
+            self.observed = true;
+            self.started.set(io_mod.getIo());
+            self.released.waitUncancelable(io_mod.getIo());
+        }
+        fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, address: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe(len);
+            return self.child.rawAlloc(len, alignment, address);
+        }
+        fn resize(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, address: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe(len);
+            return self.child.rawResize(memory, alignment, len, address);
+        }
+        fn remap(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, address: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe(len);
+            return self.child.rawRemap(memory, alignment, len, address);
+        }
+        fn free(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, address: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.child.rawFree(memory, alignment, address);
+        }
+    };
+    for ([_]bool{ false, true }) |checkpoint| {
+        var temp = try TempRoot.init(alloc);
+        defer temp.deinit(alloc);
+        var initial = try testState(alloc, "cancel-large-session-read", 10);
+        defer initial.deinit(alloc);
+        const text = try alloc.alloc(u8, session_event.event_frame_max_bytes - 4096);
+        defer alloc.free(text);
+        @memset(text, 'x');
+        var next = try stateWithPrompt(alloc, initial, 20, "saved prompt", text);
+        defer next.deinit(alloc);
+        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        const frame_offset = loaded.position.through_event_log_bytes;
+        _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = next.conversation_language,
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .turn = next.history[0],
+        } }, 20, .retry_expected_tail, .{ .checkpoint_interval = 0 });
+        if (checkpoint) try loaded.writeCheckpointIfDue(alloc, true, .{});
+        const decoder_input = if (checkpoint) checkpoint_bytes: {
+            const bytes = try readManagedFileAlloc(alloc, &loaded.log.dir, checkpoint_file, session_projection.checkpoint_max_bytes, null);
+            defer alloc.free(bytes);
+            const padded = try alloc.alloc(u8, session_projection.checkpoint_max_bytes);
+            @memcpy(padded[0..bytes.len], bytes);
+            @memset(padded[bytes.len..], ' ');
+            break :checkpoint_bytes padded;
+        } else event_bytes: {
+            var file = try openManagedFile(&loaded.log.dir, events_file, .read_only);
+            defer file.close(io_mod.getIo());
+            const frame = (try session_replay.readLineAt(alloc, file, frame_offset, loaded.position.through_event_log_bytes, null)).?;
+            break :event_bytes frame.bytes;
+        };
+        defer alloc.free(decoder_input);
+        loaded.deinit(alloc);
+        var directory = try openSessionDir(&temp.root.sessions.?, initial.id, .read_only);
+        defer directory.close();
+        const observed_paths = [_][]const u8{ events_file, manifest_file, session_lock_file, commit_lock_file, checkpoint_file };
+        const observed_count: usize = if (checkpoint) observed_paths.len else observed_paths.len - 1;
+        var before: [observed_paths.len]std.Io.File.Stat = undefined;
+        for (observed_paths[0..observed_count], 0..) |path, index| {
+            var file = try openManagedFile(&directory, path, .read_only);
+            defer file.close(io_mod.getIo());
+            before[index] = try file.stat(io_mod.getIo());
+            before[index].atime = null;
+        }
+
+        const Stage = enum { load, decode, bytes, base64, arguments };
+        for ([_]Stage{ .load, .decode, .bytes, .base64, .arguments }) |stage| {
+            const encoded_binary = try alloc.alloc(u8, 4 * 1024 * 1024);
+            defer alloc.free(encoded_binary);
+            @memset(encoded_binary, '/');
+            var binary: std.json.ObjectMap = .empty;
+            defer binary.deinit(alloc);
+            try binary.put(alloc, "encoding", .{ .string = "base64" });
+            try binary.put(alloc, "data", .{ .string = encoded_binary });
+            var turn = try std.json.parseFromSlice(std.json.Value, alloc, "{\"kind\":\"assistant\",\"user\":{\"text\":\"\",\"images\":[]},\"assistant\":\"\",\"execution\":{\"schema_version\":3,\"tool_steps\":[{\"assistant\":null,\"tool_calls\":[{\"id\":\"call\",\"name\":\"test\",\"arguments_json\":\"{}\",\"provider_result\":null}],\"tool_results\":[]}],\"files\":[]}}", .{});
+            defer turn.deinit();
+            turn.value.object.getPtr("execution").?.object.getPtr("tool_steps").?.array.items[0].object.getPtr("tool_calls").?.array.items[0].object.getPtr("arguments_json").?.* = .{ .string = decoder_input };
+            var cancellation = CancelOnAllocation{ .child = alloc, .max_trigger_bytes = if (stage == .arguments) 1024 * 1024 else std.math.maxInt(usize) };
+            const observed_alloc: Allocator = .{ .ptr = &cancellation, .vtable = &.{
+                .alloc = CancelOnAllocation.allocate,
+                .resize = CancelOnAllocation.resize,
+                .remap = CancelOnAllocation.remap,
+                .free = CancelOnAllocation.free,
+            } };
+            const worker = try std.Thread.spawn(.{}, CancelOnAllocation.request, .{&cancellation});
+            defer {
+                cancellation.started.set(io_mod.getIo());
+                worker.join();
+            }
+            const options = Options{ .cancel_flag = &cancellation.cancel };
+            const failure: ?anyerror = if (stage == .arguments) result: {
+                const restored = session_codec.parseHistoryTurn(observed_alloc, turn.value, &cancellation.cancel) catch |err| break :result err;
+                session.freeHistoryTurn(observed_alloc, restored);
+                break :result null;
+            } else if (stage == .bytes or stage == .base64) result: {
+                const bytes = session_codec.parseDurableBytes(observed_alloc, if (stage == .bytes) .{ .string = decoder_input } else .{ .object = binary }, &cancellation.cancel) catch |err| break :result err;
+                observed_alloc.free(bytes);
+                break :result null;
+            } else if (stage == .decode) result: {
+                if (checkpoint) {
+                    var decoded = session_projection.decodeCheckpoint(observed_alloc, decoder_input, &cancellation.cancel) catch |err| break :result err;
+                    decoded.deinit(observed_alloc);
+                } else {
+                    var decoded = session_event.decodeFrame(observed_alloc, decoder_input, &cancellation.cancel) catch |err| break :result err;
+                    decoded.deinit(observed_alloc);
+                }
+                break :result null;
+            } else if (checkpoint) result: {
+                var reopened = temp.root.resumeForWrite(observed_alloc, initial.id, options) catch |err| break :result err;
+                reopened.deinit(observed_alloc);
+                break :result null;
+            } else result: {
+                var state = temp.root.loadReadOnly(observed_alloc, initial.id, options) catch |err| break :result err;
+                state.deinit(observed_alloc);
+                break :result null;
+            };
+            try std.testing.expect(cancellation.observed);
+            try std.testing.expectEqual(@as(?anyerror, error.Cancelled), failure);
+            try std.testing.expect(io_mod.milliTimestamp() - cancellation.requested_ms.load(.acquire) < 500);
+            if (stage == .load or stage == .decode) try std.testing.expect(cancellation.largest_request < 1024 * 1024);
+            for (observed_paths[0..observed_count], 0..) |path, index| {
+                var file = try openManagedFile(&directory, path, .read_only);
+                defer file.close(io_mod.getIo());
+                var after = try file.stat(io_mod.getIo());
+                after.atime = null;
+                try std.testing.expect(std.meta.eql(before[index], after));
+            }
+        }
+    }
+}
 
 test "root init rejects symlinked durable and sessions roots" {
     const alloc = std.testing.allocator;
@@ -4942,6 +5396,7 @@ fn replaceFrameByteForTest(
         log,
         frame_offset,
         boundary,
+        null,
     ) orelse return error.TestUnexpectedResult;
     defer alloc.free(line.bytes);
     const match = std.mem.find(u8, line.bytes, needle) orelse
@@ -4965,9 +5420,10 @@ fn corruptReplacementCommitTimestampForTest(
             log,
             offset,
             positions.proposed.through_event_log_bytes,
+            null,
         ) orelse return error.TestUnexpectedResult;
         defer alloc.free(line.bytes);
-        var envelope = try session_event.decodeFrame(alloc, line.bytes);
+        var envelope = try session_event.decodeFrame(alloc, line.bytes, null);
         defer envelope.deinit(alloc);
         if (envelope.kind() == .state_replacement_committed) {
             const needle = "\"timestamp_ms\":20";
@@ -4995,6 +5451,7 @@ fn corruptReplacementChunkSchemaForTest(
         log,
         positions.prior.through_event_log_bytes,
         positions.proposed.through_event_log_bytes,
+        null,
     ) orelse return error.TestUnexpectedResult;
     defer alloc.free(start.bytes);
     try replaceFrameByteForTest(
@@ -5040,13 +5497,14 @@ fn capturePublicationBytesForTest(
     errdefer alloc.free(events);
     const name = try watermarkName(alloc, generation);
     defer alloc.free(name);
-    const watermark = try readManagedFileAlloc(alloc, &dir, name, watermark_max_bytes);
+    const watermark = try readManagedFileAlloc(alloc, &dir, name, watermark_max_bytes, null);
     errdefer alloc.free(watermark);
     const intent = try readManagedFileAlloc(
         alloc,
         &dir,
         publication_intent_file,
         publication_intent_max_bytes,
+        null,
     );
     return .{ .events = events, .watermark = watermark, .intent = intent };
 }
@@ -5083,9 +5541,10 @@ test "state replacement uses the durable state timestamp for every frame" {
             log,
             offset,
             committed.through_event_log_bytes,
+            null,
         ) orelse return error.TestUnexpectedResult;
         defer alloc.free(line.bytes);
-        var envelope = try session_event.decodeFrame(alloc, line.bytes);
+        var envelope = try session_event.decodeFrame(alloc, line.bytes, null);
         defer envelope.deinit(alloc);
         try std.testing.expectEqual(@as(i64, 4242), envelope.timestamp_ms);
         offset = line.next_offset;
@@ -5093,7 +5552,7 @@ test "state replacement uses the durable state timestamp for every frame" {
     }
     try std.testing.expect(frame_count >= 3);
 
-    var replayed = try session_replay.replayBoundary(alloc, log, committed);
+    var replayed = try session_replay.replayBoundary(alloc, log, committed, null);
     defer replayed.deinit(alloc);
     try std.testing.expectEqual(@as(i64, 4242), replayed.updated_at_ms);
 }
@@ -5183,6 +5642,7 @@ test "failed canonical append leaves the previous usage sidecar unchanged" {
         &loaded.log.dir,
         session_usage_sidecar.sidecar_file,
         session_usage_sidecar.max_sidecar_bytes,
+        null,
     );
     defer alloc.free(before);
 
@@ -5209,6 +5669,7 @@ test "failed canonical append leaves the previous usage sidecar unchanged" {
         &loaded.log.dir,
         session_usage_sidecar.sidecar_file,
         session_usage_sidecar.max_sidecar_bytes,
+        null,
     );
     defer alloc.free(after);
     try std.testing.expectEqualStrings(before, after);
@@ -5278,17 +5739,17 @@ test "usage sidecar publication stays inside the canonical commit boundary" {
 
 test "torn exact settlement restores stale sidecar backlog over settled rollback" {
     const Checkpoint = struct {
-        fn persist(_: *anyopaque, _: session_usage.Snapshot) !void {}
+        fn persist(_: *anyopaque, _: session_usage.Snapshot, _: ?*const std.atomic.Value(bool)) !void {}
     };
     const RejectPublication = struct {
-        fn publish(_: *anyopaque, event: session_usage.usage_report.ProfileEvent) !void {
+        fn publish(_: *anyopaque, event: session_usage.usage_report.ProfileEvent, _: ?*const std.atomic.Value(bool)) !void {
             if (event == .generation) return error.InjectedPublicationFailure;
         }
     };
     const PublicationProbe = struct {
         generations: usize = 0,
 
-        fn publish(raw: *anyopaque, event: session_usage.usage_report.ProfileEvent) !void {
+        fn publish(raw: *anyopaque, event: session_usage.usage_report.ProfileEvent, _: ?*const std.atomic.Value(bool)) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (event == .generation) self.generations += 1;
         }
@@ -6349,6 +6810,7 @@ test "writable resume preserves the event log when the watermark is invalid" {
         &loaded.log.dir,
         events_file,
         16 * 1024 * 1024,
+        null,
     );
     defer alloc.free(before_events);
     const before_watermark = try readManagedFileAlloc(
@@ -6356,6 +6818,7 @@ test "writable resume preserves the event log when the watermark is invalid" {
         &loaded.log.dir,
         watermark_name,
         watermark_max_bytes,
+        null,
     );
     defer alloc.free(before_watermark);
     loaded.deinit(alloc);
@@ -6372,6 +6835,7 @@ test "writable resume preserves the event log when the watermark is invalid" {
         &dir,
         events_file,
         16 * 1024 * 1024,
+        null,
     );
     defer alloc.free(after_events);
     const after_watermark = try readManagedFileAlloc(
@@ -6379,6 +6843,7 @@ test "writable resume preserves the event log when the watermark is invalid" {
         &dir,
         watermark_name,
         watermark_max_bytes,
+        null,
     );
     defer alloc.free(after_watermark);
     try std.testing.expectEqualSlices(u8, before_events, after_events);
@@ -6544,6 +7009,118 @@ test "rollback required failure is excluded from generic degraded retry" {
     );
 }
 
+test "resume handoff does not recreate a missing commit lock" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "handoff-missing-lock", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    try loaded.log.dir.dir.deleteFile(io_mod.getIo(), commit_lock_file);
+
+    try std.testing.expectError(error.FileNotFound, loaded.confirmResumeHandoffBoundary(alloc, .{
+        .commit_lock_deadline_ms = 0,
+    }));
+    try std.testing.expect(!try entryExists(&loaded.log.dir, commit_lock_file));
+}
+
+test "handoff header rejects missing and duplicate canonical fields" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const generation = "00112233445566778899aabbccddeeff";
+    const invalid = [_][]const u8{
+        "{\"schema_version\":1,\"log_generation\":\"" ++ generation ++ "\",\"seq\":1,\"event_id\":\"" ++ generation ++ "\",\"kind\":\"session_started\",\"payload\":{}}\n",
+        "{\"schema_version\":1,\"log_generation\":\"" ++ generation ++ "\",\"seq\":1,\"event_id\":\"" ++ generation ++ "\",\"event_id\":\"" ++ generation ++ "\",\"kind\":\"session_started\",\"payload\":{}}\n",
+        "{\"schema_version\":1,\"log_generation\":\"" ++ generation ++ "\",\"seq\":1,\"event_id\":\"" ++ generation ++ "\",\"timestamp_ms\":-1,\"kind\":\"session_started\",\"payload\":{}}\n",
+    };
+    for (invalid) |bytes| {
+        var file = try tmp.dir.createFile(std.testing.io, "events.jsonl", .{ .read = true });
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, bytes);
+        var prefix: [1024]u8 = undefined;
+        const count = try file.readPositionalAll(std.testing.io, &prefix, 0);
+        try std.testing.expectError(error.InvalidSessionFormat, parseHandoffHeader(alloc, prefix[0..count]));
+    }
+}
+
+test "stored resume handoff uses bounded metadata and leaves session files unchanged" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "cold-handoff", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    const large = try alloc.alloc(u8, 4 * 1024 * 1024);
+    defer alloc.free(large);
+    @memset(large, 'x');
+    var next = try stateWithPrompt(alloc, initial, 20, "saved", large);
+    defer next.deinit(alloc);
+    _ = try loaded.appendEvent(alloc, historyEvent(next), 20, .retry_expected_tail, .{});
+    var file = try openManagedFile(&loaded.log.dir, events_file, .read_only);
+    var before = try file.stat(io_mod.getIo());
+    before.atime = null;
+    file.close(io_mod.getIo());
+    loaded.deinit(alloc);
+
+    var budget: [64 * 1024]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&budget);
+    try temp.root.confirmStoredResumeHandoff(bounded.allocator(), initial.id, null);
+    var directory = try openSessionDir(&temp.root.sessions.?, initial.id, .read_only);
+    defer directory.close();
+    file = try openManagedFile(&directory, events_file, .read_only);
+    defer file.close(io_mod.getIo());
+    var after = try file.stat(io_mod.getIo());
+    after.atime = null;
+    try std.testing.expect(std.meta.eql(before, after));
+    try directory.dir.deleteFile(io_mod.getIo(), commit_lock_file);
+    try std.testing.expectError(error.FileNotFound, temp.root.confirmStoredResumeHandoff(alloc, initial.id, null));
+    try std.testing.expect(!try entryExists(&directory, commit_lock_file));
+}
+
+test "stored resume handoff rejects an impossible initial watermark" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "cold-handoff-invalid", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    const name = try watermarkName(alloc, loaded.position.log_generation);
+    defer alloc.free(name);
+    for ([_]u64{ 0, 1 }) |sequence| {
+        var corrupt = loaded.position;
+        corrupt.through_seq = sequence;
+        corrupt.through_event_id[0] ^= 1;
+        const bytes = try encodeWatermark(alloc, initial.id, corrupt);
+        defer alloc.free(bytes);
+        try durableReplace(alloc, &loaded.log.dir, name, bytes);
+        try std.testing.expectError(error.InvalidSessionFormat, temp.root.confirmStoredResumeHandoff(alloc, initial.id, null));
+    }
+}
+
+test "retired resume boundary is revalidated against the current canonical position" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "retired-handoff", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    const old = try loaded.resumeHandoffBoundary();
+    try temp.root.confirmStoredResumeHandoff(alloc, initial.id, old);
+    _ = try loaded.appendEvent(alloc, .{ .preferences_changed = .{ .fast_mode = true } }, 20, .retry_expected_tail, .{});
+    try std.testing.expectError(error.InvalidSessionFormat, temp.root.confirmStoredResumeHandoff(alloc, initial.id, old));
+    const current = try loaded.resumeHandoffBoundary();
+    try loaded.log.dir.dir.deleteFile(io_mod.getIo(), manifest_file);
+    try temp.root.confirmStoredResumeHandoff(alloc, initial.id, current);
+    loaded.persistence_debt.derived_publication = true;
+    try std.testing.expect(std.meta.eql(current, try loaded.resumeHandoffBoundary()));
+    loaded.persistence_debt.canonical_replacement = true;
+    try std.testing.expectError(error.SessionPersistenceDegraded, loaded.resumeHandoffBoundary());
+}
+
 test "resume handoff confirmation accepts the current durable metadata" {
     const alloc = std.testing.allocator;
     var temp = try TempRoot.init(alloc);
@@ -6678,6 +7255,7 @@ test "checkpoint clean shutdown preserves a valid bounded tail" {
         loaded.authority_id,
         log,
         loaded.position,
+        null,
     );
     defer opened.state.deinit(alloc);
     try std.testing.expectEqual(ReplaySource.checkpoint, opened.source);
@@ -6871,6 +7449,7 @@ test "writable open state replays only the committed tail after a checkpoint" {
         loaded.authority_id,
         log,
         loaded.position,
+        null,
     );
     defer exact.state.deinit(alloc);
     try std.testing.expectEqual(ReplaySource.checkpoint, exact.source);
@@ -6892,6 +7471,7 @@ test "writable open state replays only the committed tail after a checkpoint" {
                 authority_id,
                 event_log,
                 position,
+                null,
             );
             defer opened.state.deinit(failing_alloc);
             try std.testing.expectEqual(ReplaySource.checkpoint, opened.source);
@@ -6923,6 +7503,7 @@ test "writable open state replays only the committed tail after a checkpoint" {
         loaded.authority_id,
         log,
         loaded.position,
+        null,
     );
     defer tailed.state.deinit(alloc);
     try std.testing.expectEqual(ReplaySource.checkpoint, tailed.source);
@@ -6955,6 +7536,7 @@ test "writable open state falls back when the checkpoint is corrupt" {
         loaded.authority_id,
         log,
         loaded.position,
+        null,
     );
     defer opened.state.deinit(alloc);
     try std.testing.expectEqual(ReplaySource.event_log, opened.source);
@@ -6999,6 +7581,7 @@ test "writable open state preserves compaction accounting after a stale event fi
         loaded.authority_id,
         log,
         loaded.position,
+        null,
     );
     defer opened.state.deinit(alloc);
     try std.testing.expectEqual(ReplaySource.event_log, opened.source);
@@ -7375,7 +7958,6 @@ test "automatic compaction leaves post-rename uncertainty fenced" {
     var next = try stateWithTurn(alloc, loaded.state, 20);
     defer next.deinit(alloc);
     var failure = BoundaryFailure{ .target = .after_compaction_log_rename };
-    loaded.resume_view_stale = false;
 
     try std.testing.expectError(
         error.SessionLogCompactionIndeterminate,
@@ -7393,7 +7975,6 @@ test "automatic compaction leaves post-rename uncertainty fenced" {
     );
 
     try std.testing.expect(loaded.namespace_confirmation_required);
-    try std.testing.expect(loaded.resume_view_stale);
     try std.testing.expectError(
         error.SessionCommitBoundaryUnavailable,
         temp.root.loadReadOnly(alloc, initial.id, .{}),
@@ -7491,7 +8072,6 @@ test "log compaction rename remains fenced until writable resolution" {
         .{},
     );
     var failure = BoundaryFailure{ .target = .after_compaction_log_rename };
-    loaded.resume_view_stale = false;
 
     try std.testing.expectError(
         error.SessionLogCompactionIndeterminate,
@@ -7501,7 +8081,6 @@ test "log compaction rename remains fenced until writable resolution" {
             .compaction_byte_threshold = 1,
         }),
     );
-    try std.testing.expect(loaded.resume_view_stale);
     loaded.deinit(alloc);
     try std.testing.expectError(
         error.SessionCommitBoundaryUnavailable,
@@ -7651,6 +8230,7 @@ test "read boundary validation does not block a concurrent append" {
         alloc,
         boundary.log_file,
         boundary.position,
+        null,
     );
     defer captured.deinit(alloc);
     try std.testing.expect(!captured.preferences.fast_mode);

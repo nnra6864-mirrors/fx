@@ -27,6 +27,7 @@ const identity_max_bytes: usize = 1024;
 // macOS GUI apps commonly inherit 256, below the host's 64-session budget.
 const desired_file_descriptor_limit: u64 = 1024;
 const max_connection_requests: usize = 32;
+const max_connected_sources = @import("../execution/managed_execution_contract.zig").max_live_entries;
 const listener_poll_ms = 50;
 const transport_hash_bytes: usize = 16;
 const transport_hash_context = "fx.terminal.transport.v3\x00";
@@ -191,6 +192,8 @@ pub const Config = struct {
 };
 
 pub const Paths = struct {
+    const OpenMode = enum { create, existing };
+
     home_dir: io_mod.VerifiedDir,
     fx_dir: io_mod.VerifiedDir,
     host_dir: io_mod.VerifiedDir,
@@ -200,6 +203,14 @@ pub const Paths = struct {
     endpoint_path: []u8,
 
     pub fn open(alloc: Allocator, home: []const u8) !Paths {
+        return openMode(alloc, home, .create);
+    }
+
+    pub fn openExisting(alloc: Allocator, home: []const u8) !Paths {
+        return openMode(alloc, home, .existing);
+    }
+
+    fn openMode(alloc: Allocator, home: []const u8, mode: OpenMode) !Paths {
         if (!isSupported()) return error.TerminalHostUnsupported;
         var selection = try resolveEndpointSelection(
             alloc,
@@ -216,14 +227,16 @@ pub const Paths = struct {
             }),
         };
         errdefer home_dir.close();
-        var fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(
+        var fx_dir = try openPrivateChild(
             &home_dir,
             profile_paths.root_dir_name,
+            mode,
         );
         errdefer fx_dir.close();
-        var host_dir = try io_mod.openOrCreateVerifiedPrivateDir(
+        var host_dir = try openPrivateChild(
             &fx_dir,
             host_dir_name,
+            mode,
         );
         errdefer host_dir.close();
         var transport_dir: ?io_mod.VerifiedDir = null;
@@ -232,6 +245,7 @@ pub const Paths = struct {
             transport_dir = try openRuntimeTransportDir(
                 selection.transport_root,
                 std.c.getuid(),
+                mode,
             );
         }
         selection_owned = false;
@@ -263,9 +277,23 @@ pub const Paths = struct {
     }
 };
 
+fn openPrivateChild(parent: *io_mod.VerifiedDir, name: []const u8, mode: Paths.OpenMode) !io_mod.VerifiedDir {
+    if (mode == .create) return io_mod.openOrCreateVerifiedPrivateDir(parent, name);
+    var dir = parent.dir.openDir(io_mod.getIo(), name, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+        error.NotDir, error.SymLinkLoop => return error.DurablePathUnsafe,
+        else => return err,
+    };
+    errdefer dir.close(io_mod.getIo());
+    const stat = try dir.stat(io_mod.getIo());
+    if (stat.kind != .directory) return error.DurablePathUnsafe;
+    if (stat.permissions.toMode() & 0o777 != 0o700) return error.PrivateStatePermissionsUnsupported;
+    return .{ .dir = dir };
+}
+
 fn openRuntimeTransportDir(
     transport_root: []const u8,
     uid: std.c.uid_t,
+    mode: Paths.OpenMode,
 ) !io_mod.VerifiedDir {
     const parent_path = std.fs.path.dirname(transport_root) orelse
         return error.RuntimeDirectoryUnsafe;
@@ -275,13 +303,14 @@ fn openRuntimeTransportDir(
         .follow_symlinks = false,
     });
     defer parent.close(io_mod.getIo());
-    return openVerifiedPrivateRuntimeDir(parent, name, uid);
+    return openVerifiedPrivateRuntimeDir(parent, name, uid, mode);
 }
 
 fn openVerifiedPrivateRuntimeDir(
     parent: std.Io.Dir,
     name: []const u8,
     uid: std.c.uid_t,
+    mode: Paths.OpenMode,
 ) !io_mod.VerifiedDir {
     const zio = io_mod.getIo();
     var dir = parent.openDir(zio, name, .{
@@ -289,6 +318,7 @@ fn openVerifiedPrivateRuntimeDir(
         .follow_symlinks = false,
     }) catch |err| switch (err) {
         error.FileNotFound => blk: {
+            if (mode == .existing) return error.FileNotFound;
             parent.createDir(
                 zio,
                 name,
@@ -478,8 +508,9 @@ fn runSupported(alloc: Allocator, config: Config) !void {
     defer if (identity_created) cleanupIdentity(&paths.host_dir);
 
     var state = HostState{
-        .idle_grace_ms = config.idle_grace_ms,
+        .idle_grace_ms = .init(config.idle_grace_ms),
     };
+    defer state.sources.deinit(alloc);
     var startup = HostStartup{};
     var accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{
         alloc,
@@ -500,7 +531,7 @@ fn runSupported(alloc: Allocator, config: Config) !void {
             debug_trace.logf(
                 "terminal_host",
                 "host startup failed with {d} client thread(s) still running; preserving shared state until process exit",
-                .{state.connected_clients.load(.acquire)},
+                .{state.connectionCount()},
             );
             std.process.exit(1);
         }
@@ -531,6 +562,7 @@ fn runSupported(alloc: Allocator, config: Config) !void {
         .context = &state,
         .update_fn = updateLiveWork,
     }, &persistent_store, &host_instance, paths.authority_root_path, paths.transport_root_path);
+    registry.stop_requested = &state.stopping;
     defer if (clients_drained) registry.deinit();
     defer {
         clients_drained = drainConnectedClients(&state, client_drain_timeout_ms);
@@ -538,7 +570,7 @@ fn runSupported(alloc: Allocator, config: Config) !void {
             debug_trace.logf(
                 "terminal_host",
                 "host exiting immediately with {d} client thread(s) still running; preserving shared state until process exit",
-                .{state.connected_clients.load(.acquire)},
+                .{state.connectionCount()},
             );
             // The registry cannot be freed while detached clients still hold
             // pointers into this frame. Signal its child processes, then stop
@@ -559,7 +591,7 @@ fn runSupported(alloc: Allocator, config: Config) !void {
     startup.registry = &registry;
     startup.ready.set(io_mod.getIo());
     startup_complete = true;
-    var idle_thread = try std.Thread.spawn(.{}, idleOwner, .{&state});
+    var idle_thread = try std.Thread.spawn(.{}, idleOwner, .{ &state, &registry });
     defer {
         state.stopping.store(true, .release);
         state.changed.set(io_mod.getIo());
@@ -588,8 +620,8 @@ fn runSupported(alloc: Allocator, config: Config) !void {
 const client_drain_timeout_ms: u64 = 2_000;
 
 const HostState = struct {
-    idle_grace_ms: u64,
-    connected_clients: std.atomic.Value(usize) = .init(0),
+    idle_grace_ms: std.atomic.Value(u64),
+    sources: std.AutoHashMapUnmanaged(contracts.ProcessOwner, usize) = .empty,
     pending_requests: std.atomic.Value(usize) = .init(0),
     live_work: std.atomic.Value(usize) = .init(0),
     generation: std.atomic.Value(u64) = .init(0),
@@ -597,15 +629,33 @@ const HostState = struct {
     changed: std.Io.Event = .unset,
     ordered_mutex: std.Io.Mutex = .init,
     ordered_changed: std.Io.Condition = .init,
-    next_ordered_ticket: u64 = 0,
-    serving_ordered_ticket: u64 = 0,
+    ordered_mutations: std.DoublyLinkedList = .{},
 
-    fn facts(self: *const HostState) policy.IdleFacts {
+    fn facts(self: *HostState) policy.IdleFacts {
+        self.ordered_mutex.lockUncancelable(io_mod.getIo());
+        defer self.ordered_mutex.unlock(io_mod.getIo());
+        return self.factsLocked();
+    }
+
+    fn factsLocked(self: *const HostState) policy.IdleFacts {
         return .{
-            .connected_clients = self.connected_clients.load(.acquire),
+            .connected_clients = self.connectionCountLocked(),
             .pending_requests = self.pending_requests.load(.acquire),
             .live_work = self.live_work.load(.acquire),
         };
+    }
+
+    fn connectionCountLocked(self: *const HostState) usize {
+        var total: usize = 0;
+        var counts = self.sources.valueIterator();
+        while (counts.next()) |count| total += count.*;
+        return total;
+    }
+
+    fn connectionCount(self: *HostState) usize {
+        self.ordered_mutex.lockUncancelable(io_mod.getIo());
+        defer self.ordered_mutex.unlock(io_mod.getIo());
+        return self.connectionCountLocked();
     }
 
     fn noteChanged(self: *HostState) void {
@@ -613,36 +663,77 @@ const HostState = struct {
         self.changed.set(io_mod.getIo());
     }
 
-    fn issueOrderedMutation(self: *HostState) u64 {
+    fn beginConnection(self: *HostState, alloc: Allocator, source: contracts.ProcessOwner) (Allocator.Error || error{CapacityExceeded})!bool {
+        self.ordered_mutex.lockUncancelable(io_mod.getIo());
+        defer self.ordered_mutex.unlock(io_mod.getIo());
+        if (self.stopping.load(.acquire)) return false;
+        if (!self.sources.contains(source) and self.sources.count() == max_connected_sources) return error.CapacityExceeded;
+        const entry = try self.sources.getOrPut(alloc, source);
+        if (!entry.found_existing) entry.value_ptr.* = 0;
+        entry.value_ptr.* += 1;
+        self.noteChanged();
+        return true;
+    }
+
+    fn endConnection(self: *HostState, source: contracts.ProcessOwner) void {
+        self.ordered_mutex.lockUncancelable(io_mod.getIo());
+        defer self.ordered_mutex.unlock(io_mod.getIo());
+        const count = self.sources.getPtr(source).?;
+        std.debug.assert(count.* != 0);
+        count.* -= 1;
+        if (count.* == 0) _ = self.sources.remove(source);
+        self.noteChanged();
+    }
+
+    fn retireIfIdle(self: *HostState, registry: *native_session.Registry) bool {
+        self.ordered_mutex.lockUncancelable(io_mod.getIo());
+        defer self.ordered_mutex.unlock(io_mod.getIo());
+        return registry.retireIfIdle(self, idleEligible);
+    }
+
+    fn pruneExitedSources(self: *HostState, registry: *native_session.Registry) void {
+        var active: [max_connected_sources]contracts.ProcessOwner = undefined;
+        self.ordered_mutex.lockUncancelable(io_mod.getIo());
+        var keys = self.sources.keyIterator();
+        var count: usize = 0;
+        while (keys.next()) |source| : (count += 1) active[count] = source.*;
+        self.ordered_mutex.unlock(io_mod.getIo());
+        // The accept loop owns additions and includes its incoming reservation.
+        // Concurrent departures only keep an old source alive until next time.
+        registry.pruneExitFences(active[0..count]);
+    }
+
+    fn issueOrderedMutation(self: *HostState, node: *std.DoublyLinkedList.Node) void {
         const zio = io_mod.getIo();
         self.ordered_mutex.lockUncancelable(zio);
         defer self.ordered_mutex.unlock(zio);
-        const ticket = self.next_ordered_ticket;
-        self.next_ordered_ticket += 1;
-        return ticket;
+        self.ordered_mutations.append(node);
     }
 
-    fn awaitOrderedMutation(self: *HostState, ticket: u64) void {
+    fn awaitOrderedMutation(self: *HostState, node: *std.DoublyLinkedList.Node, cancelled: *const std.atomic.Value(bool)) error{Cancelled}!void {
         const zio = io_mod.getIo();
         self.ordered_mutex.lockUncancelable(zio);
-        while (self.serving_ordered_ticket != ticket) {
+        defer self.ordered_mutex.unlock(zio);
+        while (self.ordered_mutations.first != node) {
+            if (cancelled.load(.acquire)) return error.Cancelled;
             self.ordered_changed.waitUncancelable(zio, &self.ordered_mutex);
         }
-        self.ordered_mutex.unlock(zio);
+        if (cancelled.load(.acquire)) return error.Cancelled;
     }
 
-    fn completeOrderedMutation(self: *HostState, ticket: u64) void {
+    fn completeOrderedMutation(self: *HostState, node: *std.DoublyLinkedList.Node) void {
         const zio = io_mod.getIo();
         self.ordered_mutex.lockUncancelable(zio);
-        std.debug.assert(self.serving_ordered_ticket == ticket);
-        self.serving_ordered_ticket += 1;
+        self.ordered_mutations.remove(node);
         self.ordered_changed.broadcast(zio);
         self.ordered_mutex.unlock(zio);
     }
 
-    fn abandonOrderedMutation(self: *HostState, ticket: u64) void {
-        self.awaitOrderedMutation(ticket);
-        self.completeOrderedMutation(ticket);
+    fn wakeOrderedMutations(self: *HostState) void {
+        const zio = io_mod.getIo();
+        self.ordered_mutex.lockUncancelable(zio);
+        defer self.ordered_mutex.unlock(zio);
+        self.ordered_changed.broadcast(zio);
     }
 };
 
@@ -694,19 +785,37 @@ fn acceptLoop(
             stream.close(io_mod.getIo());
             break;
         }
-        _ = state.connected_clients.fetchAdd(1, .acq_rel);
-        state.noteChanged();
+        if (!peerMatchesCurrentUser(stream.socket.handle)) {
+            stream.close(io_mod.getIo());
+            continue;
+        }
+        const source = peerProcessOwner(alloc, process_provider, stream.socket.handle) catch |err| {
+            debug_trace.logf("terminal_host", "client identity rejected err={s}", .{@errorName(err)});
+            stream.close(io_mod.getIo());
+            continue;
+        };
+        const admitted = state.beginConnection(alloc, source) catch |err| {
+            debug_trace.logf("terminal_host", "client admission rejected err={s}", .{@errorName(err)});
+            stream.close(io_mod.getIo());
+            continue;
+        };
+        if (!admitted) {
+            stream.close(io_mod.getIo());
+            break;
+        }
+        if (startup.ready.isSet()) {
+            if (startup.registry) |registry| state.pruneExitedSources(registry);
+        }
         var thread = std.Thread.spawn(.{}, clientMain, .{
             alloc,
             stream,
-            process_provider,
+            source,
             hello,
             state,
             startup,
         }) catch |err| {
             stream.close(io_mod.getIo());
-            _ = state.connected_clients.fetchSub(1, .acq_rel);
-            state.noteChanged();
+            state.endConnection(source);
             debug_trace.logf(
                 "terminal_host",
                 "host client thread failed err={s}",
@@ -747,20 +856,23 @@ fn drainConnectedClients(state: *HostState, timeout_ms: u64) bool {
     const limit_ns = std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch
         std.math.maxInt(u64);
     while (true) {
-        if (state.connected_clients.load(.acquire) == 0) return true;
+        if (state.connectionCount() == 0) return true;
         if (waited_ns >= limit_ns) return false;
         std.Io.sleep(
             io_mod.getIo(),
             .{ .nanoseconds = @intCast(@min(poll_ns, limit_ns - waited_ns)) },
             .awake,
-        ) catch return state.connected_clients.load(.acquire) == 0;
+        ) catch return state.connectionCount() == 0;
         waited_ns += poll_ns;
     }
 }
 
-fn idleOwner(state: *HostState) void {
-    const timeout_ns = std.math.mul(u64, state.idle_grace_ms, std.time.ns_per_ms) catch
-        std.math.maxInt(u64);
+fn idleEligible(raw: ?*anyopaque) bool {
+    const state: *HostState = @ptrCast(@alignCast(raw.?));
+    return policy.idleEligible(state.factsLocked());
+}
+
+fn idleOwner(state: *HostState, registry: *native_session.Registry) void {
     while (!state.stopping.load(.acquire)) {
         const generation = state.generation.load(.acquire);
         state.changed.reset();
@@ -769,6 +881,8 @@ fn idleOwner(state: *HostState) void {
             state.changed.waitUncancelable(io_mod.getIo());
             continue;
         }
+        const timeout_ns = std.math.mul(u64, state.idle_grace_ms.load(.acquire), std.time.ns_per_ms) catch std.math.maxInt(u64);
+        if (timeout_ns == 0 and state.retireIfIdle(registry)) return;
         state.changed.waitTimeout(
             io_mod.getIo(),
             .{ .duration = .{
@@ -781,9 +895,7 @@ fn idleOwner(state: *HostState) void {
         ) catch |err| switch (err) {
             error.Timeout => {
                 if (state.generation.load(.acquire) != generation) continue;
-                if (!policy.idleEligible(state.facts())) continue;
-                state.stopping.store(true, .release);
-                return;
+                if (state.retireIfIdle(registry)) return;
             },
             error.Canceled => return,
         };
@@ -804,19 +916,16 @@ fn listenerReady(handle: std.Io.net.Socket.Handle) !bool {
 fn clientMain(
     alloc: Allocator,
     stream: std.Io.net.Stream,
-    process_provider: process_provider_mod.Provider,
+    peer_process_owner: contracts.ProcessOwner,
     host_hello: contracts.ProtocolHello,
     state: *HostState,
     startup: *HostStartup,
 ) void {
-    defer {
-        _ = state.connected_clients.fetchSub(1, .acq_rel);
-        state.noteChanged();
-    }
+    defer state.endConnection(peer_process_owner);
     handleClient(
         alloc,
         stream,
-        process_provider,
+        peer_process_owner,
         host_hello,
         state,
         startup,
@@ -832,20 +941,12 @@ fn clientMain(
 fn handleClient(
     alloc: Allocator,
     stream: std.Io.net.Stream,
-    process_provider: process_provider_mod.Provider,
+    peer_process_owner: contracts.ProcessOwner,
     host_hello: contracts.ProtocolHello,
     state: *HostState,
     startup: *HostStartup,
 ) !void {
     defer stream.close(io_mod.getIo());
-    if (!peerMatchesCurrentUser(stream.socket.handle)) {
-        return error.ForeignTerminalHostPeer;
-    }
-    const peer_process_owner = try peerProcessOwner(
-        alloc,
-        process_provider,
-        stream.socket.handle,
-    );
     applySocketTimeout(stream);
     var read_buffer: [4096]u8 = undefined;
     var reader = stream.reader(io_mod.getIo(), &read_buffer);
@@ -909,21 +1010,7 @@ fn handleClient(
             .request => |request| {
                 const correlation_id = message.envelope.correlation_id.?;
                 try seen.add(correlation_id);
-                const authority_capability =
-                    contracts.protocol_capability_authority_generations;
-                const tmux_recovery_capability =
-                    contracts.protocol_capability_tmux_recovery;
-                const rejection: ?contracts.StructuredErrorCode = if (message.envelope.required_capabilities & authority_capability == 0)
-                    .protocol_incompatible
-                else if (message.envelope.required_capabilities &
-                    ~negotiated.capabilities != 0)
-                    .unsupported_host
-                else if (request == .start and
-                    request.start.backend == .tmux and
-                    negotiated.capabilities & tmux_recovery_capability == 0)
-                    .protocol_incompatible
-                else
-                    null;
+                const rejection = requestCapabilityFailure(request, message.envelope.required_capabilities, negotiated.capabilities);
                 try connection.start(
                     correlation_id,
                     request,
@@ -937,6 +1024,19 @@ fn handleClient(
             .hello, .response => return error.InvalidClientMessage,
         }
     }
+}
+
+fn requestCapabilityFailure(request: contracts.ActionRequest, declared: u64, negotiated: u64) ?contracts.StructuredErrorCode {
+    if (declared & contracts.protocol_capability_authority_generations == 0) return .protocol_incompatible;
+    if (declared & ~negotiated != 0) return .unsupported_host;
+    const owner_exit = request == .close_owner or (request == .start and request.start.persistence != null and request.start.persistence.?.exit_proof != null);
+    if (owner_exit) {
+        const required = contracts.required_capabilities(request);
+        if (required & ~negotiated != 0) return .unsupported_host;
+        if (required & ~declared != 0) return .protocol_incompatible;
+    }
+    if (request == .start and request.start.backend == .tmux and negotiated & contracts.protocol_capability_tmux_recovery == 0) return .protocol_incompatible;
+    return null;
 }
 
 const Connection = struct {
@@ -994,7 +1094,7 @@ const Connection = struct {
         self.tasks[slot] = task;
         task.slot = slot;
         if (terminal_operation.requiresOrderedMutation(task.request.value)) {
-            task.ordered_ticket = self.state.issueOrderedMutation();
+            self.state.issueOrderedMutation(&task.ordered_node);
         }
         self.active += 1;
         _ = self.state.pending_requests.fetchAdd(1, .acq_rel);
@@ -1002,21 +1102,11 @@ const Connection = struct {
         self.mutex.unlock(zio);
 
         if (testRequestFailureRequested("worker_start", correlation_id)) {
-            if (task.ordered_ticket) |ticket| {
-                self.state.abandonOrderedMutation(ticket);
-            }
             self.complete(task);
-            task.request.deinit(self.alloc);
-            self.alloc.destroy(task);
             return error.ThreadQuotaExceeded;
         }
         var thread = std.Thread.spawn(.{}, RequestTask.run, .{task}) catch |err| {
-            if (task.ordered_ticket) |ticket| {
-                self.state.abandonOrderedMutation(ticket);
-            }
             self.complete(task);
-            task.request.deinit(self.alloc);
-            self.alloc.destroy(task);
             return err;
         };
         thread.detach();
@@ -1033,6 +1123,7 @@ const Connection = struct {
             const task = entry orelse continue;
             if (task.correlation_id.value == correlation_id.value) {
                 task.cancelled.store(true, .release);
+                self.state.wakeOrderedMutations();
                 return;
             }
         }
@@ -1040,11 +1131,13 @@ const Connection = struct {
 
     fn finish(self: *Connection) void {
         const zio = io_mod.getIo();
+        self.fail();
         self.mutex.lockUncancelable(zio);
         for (self.tasks) |entry| {
             const task = entry orelse continue;
             task.cancelled.store(true, .release);
         }
+        self.state.wakeOrderedMutations();
         while (self.active != 0) {
             self.done.waitUncancelable(zio, &self.mutex);
         }
@@ -1053,9 +1146,14 @@ const Connection = struct {
 
     fn complete(self: *Connection, task: *RequestTask) void {
         const zio = io_mod.getIo();
+        if (terminal_operation.requiresOrderedMutation(task.request.value)) {
+            self.state.completeOrderedMutation(&task.ordered_node);
+        }
+        task.request.deinit(self.alloc);
         self.mutex.lockUncancelable(zio);
         std.debug.assert(self.tasks[task.slot] == task);
         self.tasks[task.slot] = null;
+        self.alloc.destroy(task);
         self.active -= 1;
         _ = self.state.pending_requests.fetchSub(1, .acq_rel);
         self.state.noteChanged();
@@ -1105,32 +1203,13 @@ const RequestTask = struct {
     request: contracts.OwnedActionRequest,
     rejection: ?contracts.StructuredErrorCode,
     slot: usize = 0,
-    ordered_ticket: ?u64 = null,
+    ordered_node: std.DoublyLinkedList.Node = .{},
     cancelled: std.atomic.Value(bool) = .init(false),
 
     fn run(self: *RequestTask) void {
         var response_sent = false;
         var cancellation_persisted = false;
-        defer {
-            self.connection.complete(self);
-            self.request.deinit(self.connection.alloc);
-            self.connection.alloc.destroy(self);
-        }
-        defer if (self.ordered_ticket) |ticket| {
-            self.connection.state.completeOrderedMutation(ticket);
-        };
-        if (self.ordered_ticket) |ticket| {
-            noteTestOrderedAdmission(self.correlation_id) catch {
-                self.connection.state.awaitOrderedMutation(ticket);
-                self.connection.fail();
-                return;
-            };
-            self.connection.state.awaitOrderedMutation(ticket);
-            awaitTestOrderedBoundary(self.correlation_id, &self.cancelled) catch {
-                self.connection.fail();
-                return;
-            };
-        }
+        defer self.connection.complete(self);
         defer if (!response_sent and !cancellation_persisted and
             self.rejection == null and
             self.cancelled.load(.acquire))
@@ -1140,7 +1219,18 @@ const RequestTask = struct {
                 self.connection.fail();
             };
         };
-        if (self.cancelled.load(.acquire)) return;
+        if (terminal_operation.requiresOrderedMutation(self.request.value)) {
+            noteTestOrderedAdmission(self.correlation_id) catch {
+                self.connection.fail();
+                return;
+            };
+            self.connection.state.awaitOrderedMutation(&self.ordered_node, &self.cancelled) catch return;
+            awaitTestOrderedBoundary(self.correlation_id, &self.cancelled) catch {
+                self.connection.fail();
+                return;
+            };
+        }
+        if (self.cancelled.load(.acquire) and self.request.value != .close_owner) return;
         if (testRequestFailureRequested("result_allocation", self.correlation_id)) {
             self.connection.fail();
             return;
@@ -1206,6 +1296,10 @@ const RequestTask = struct {
             };
         }
         defer result.deinit(self.connection.alloc);
+        if (self.request.value == .close_owner and result.view() == .success) {
+            self.connection.state.idle_grace_ms.store(0, .release);
+            self.connection.state.noteChanged();
+        }
         self.connection.send(self.correlation_id, result.view()) catch |err| {
             debug_trace.logf(
                 "terminal_host",
@@ -1231,6 +1325,10 @@ const RequestTask = struct {
 
     fn persistCancellation(self: *RequestTask) !void {
         const request = self.request.value;
+        switch (request) {
+            .start, .read, .screen, .inspect, .list, .close_owner => return,
+            .write, .wait, .resize, .signal, .close => {},
+        }
         const claim = terminal_operation.claim(request) orelse return;
         const session_id = terminal_operation.authoritySessionId(request) orelse return;
         try self.connection.registry.cancelAuthorized(session_id, claim);
@@ -1816,6 +1914,7 @@ test "runtime transport directories reject symlinks non-private modes and foreig
         tmp.dir,
         "private",
         std.c.getuid(),
+        .create,
     );
     defer private.close();
     const private_stat = try private.dir.stat(std.testing.io);
@@ -1854,7 +1953,7 @@ test "runtime transport directories reject symlinks non-private modes and foreig
     );
     try std.testing.expectError(
         error.PrivateStatePermissionsUnsupported,
-        openVerifiedPrivateRuntimeDir(tmp.dir, "public", std.c.getuid()),
+        openVerifiedPrivateRuntimeDir(tmp.dir, "public", std.c.getuid(), .create),
     );
 
     try tmp.dir.symLink(
@@ -1865,12 +1964,519 @@ test "runtime transport directories reject symlinks non-private modes and foreig
     );
     try std.testing.expectError(
         error.RuntimeDirectoryUnsafe,
-        openVerifiedPrivateRuntimeDir(tmp.dir, "linked", std.c.getuid()),
+        openVerifiedPrivateRuntimeDir(tmp.dir, "linked", std.c.getuid(), .create),
     );
 }
 
+test "existing host paths never create or repair private directories" {
+    if (!isSupported()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const before_missing = try tmp.dir.stat(io_mod.getIo());
+    try std.testing.expectError(error.FileNotFound, Paths.openExisting(alloc, home));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io_mod.getIo(), ".fx", .{}));
+    try std.testing.expectEqual(before_missing.mtime, (try tmp.dir.stat(io_mod.getIo())).mtime);
+    var created = try Paths.open(alloc, home);
+    defer {
+        if (created.transport_dir) |*dir| {
+            dir.close();
+            created.transport_dir = null;
+            std.Io.Dir.deleteDirAbsolute(io_mod.getIo(), created.transport_root_path) catch {};
+        }
+        created.deinit(alloc);
+    }
+    const before = try created.host_dir.dir.stat(io_mod.getIo());
+    var existing = try Paths.openExisting(alloc, home);
+    existing.deinit(alloc);
+    const after = try created.host_dir.dir.stat(io_mod.getIo());
+    try std.testing.expectEqual(before.inode, after.inode);
+    try std.testing.expectEqual(before.mtime, after.mtime);
+    try std.testing.expectEqual(before.ctime, after.ctime);
+    try created.host_dir.dir.setPermissions(io_mod.getIo(), .fromMode(0o755));
+    try std.testing.expectError(error.PrivateStatePermissionsUnsupported, Paths.openExisting(alloc, home));
+    try std.testing.expectEqual(@as(u32, 0o755), (try created.host_dir.dir.stat(io_mod.getIo())).permissions.toMode() & 0o777);
+}
+
+test "connection admission cannot pass a committed idle retirement" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const Admission = struct {
+        state: *HostState,
+        admitted: bool = false,
+        failure: ?anyerror = null,
+        done: std.Io.Event = .unset,
+        fn run(self: *@This()) void {
+            self.admitted = self.state.beginConnection(std.testing.allocator, .{ .pid = 1, .process_token_len = 1 }) catch |err| failed: {
+                self.failure = err;
+                break :failed false;
+            };
+            self.done.set(io_mod.getIo());
+        }
+    };
+    var state: HostState = .{ .idle_grace_ms = .init(0) };
+    defer state.sources.deinit(std.testing.allocator);
+    state.ordered_mutex.lockUncancelable(io_mod.getIo());
+    var held = true;
+    defer if (held) state.ordered_mutex.unlock(io_mod.getIo());
+    var admission = Admission{ .state = &state };
+    const thread = try std.Thread.spawn(.{}, Admission.run, .{&admission});
+    const admitted_before_commit = if (admission.done.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(50) } })) |_| true else |_| false;
+    state.stopping.store(true, .release);
+    state.ordered_mutex.unlock(io_mod.getIo());
+    held = false;
+    thread.join();
+    try std.testing.expect(!admitted_before_commit);
+    try std.testing.expect(!admission.admitted);
+    try std.testing.expectEqual(@as(?anyerror, null), admission.failure);
+    try std.testing.expectEqual(@as(usize, 0), state.connectionCount());
+}
+
+test "source ownership ends only after request cleanup completes" {
+    if (comptime !isSupported() or builtin.single_threaded) return error.SkipZigTest;
+    const Gate = struct {
+        target: ?[*]u8 = null,
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        fn allocator(self: *@This()) Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = free } };
+        }
+        fn allocate(_: *anyopaque, len: usize, alignment: std.mem.Alignment, address: usize) ?[*]u8 {
+            return std.testing.allocator.rawAlloc(len, alignment, address);
+        }
+        fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, address: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.target == bytes.ptr) {
+                self.entered.set(io_mod.getIo());
+                self.release.waitUncancelable(io_mod.getIo());
+            }
+            std.testing.allocator.rawFree(bytes, alignment, address);
+        }
+    };
+    const Finish = struct {
+        connection: *Connection,
+        source: contracts.ProcessOwner,
+        done: std.Io.Event = .unset,
+        fn run(self: *@This()) void {
+            self.connection.finish();
+            self.connection.state.endConnection(self.source);
+            self.done.set(io_mod.getIo());
+        }
+    };
+    const zio = io_mod.getIo();
+    const source = contracts.ProcessOwner{ .pid = 1, .process_token_len = 1 };
+    var state: HostState = .{ .idle_grace_ms = .init(0) };
+    defer state.sources.deinit(std.testing.allocator);
+    try std.testing.expect(try state.beginConnection(std.testing.allocator, source));
+    var sockets: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &sockets) != 0) return error.SocketPairFailed;
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = sockets[0], .address = .{ .ip4 = .unspecified(0) } } };
+    const peer = std.Io.net.Stream{ .socket = .{ .handle = sockets[1], .address = .{ .ip4 = .unspecified(0) } } };
+    defer stream.close(zio);
+    defer peer.close(zio);
+    var gate: Gate = .{};
+    const alloc = gate.allocator();
+    var connection = Connection{ .alloc = alloc, .stream = stream, .revision = contracts.current_protocol_revision, .capabilities = contracts.known_protocol_capabilities, .state = &state, .registry = undefined, .peer_process_owner = source };
+    const task = try alloc.create(RequestTask);
+    var task_owned = true;
+    defer if (task_owned) alloc.destroy(task);
+    task.* = .{ .connection = &connection, .correlation_id = .{ .value = 1 }, .request = try contracts.OwnedActionRequest.init(alloc, .{ .start = .{ .cwd = "/request-cleanup" } }), .rejection = .unsupported_host };
+    var request_owned = true;
+    defer if (request_owned) {
+        gate.release.set(zio);
+        task.request.deinit(alloc);
+    };
+    gate.target = @constCast(task.request.value.start.cwd.ptr);
+    connection.tasks[0] = task;
+    connection.active = 1;
+    state.pending_requests.store(1, .release);
+    const worker = try std.Thread.spawn(.{}, RequestTask.run, .{task});
+    task_owned = false;
+    request_owned = false;
+    var joined = false;
+    defer if (!joined) {
+        gate.release.set(zio);
+        worker.join();
+    };
+    try gate.entered.waitTimeout(zio, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(5000) } });
+    var finish = Finish{ .connection = &connection, .source = source };
+    const waiter = try std.Thread.spawn(.{}, Finish.run, .{&finish});
+    const released_early = if (finish.done.waitTimeout(zio, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(50) } })) |_| true else |_| false;
+    const retained = state.connectionCount();
+    gate.release.set(zio);
+    worker.join();
+    joined = true;
+    waiter.join();
+    try std.testing.expect(!released_early);
+    try std.testing.expectEqual(@as(usize, 1), retained);
+    try std.testing.expectEqual(@as(usize, 0), state.connectionCount());
+}
+
+test "cancelled ordered requests drain while another connection holds the head" {
+    if (comptime !isSupported() or builtin.single_threaded) return error.SkipZigTest;
+    const Finish = struct {
+        connection: *Connection,
+        done: std.Io.Event = .unset,
+        fn run(self: *@This()) void {
+            self.connection.finish();
+            self.done.set(io_mod.getIo());
+        }
+    };
+    const alloc = std.testing.allocator;
+    const zio = io_mod.getIo();
+    for ([_]bool{ false, true }) |targeted| {
+        var state: HostState = .{ .idle_grace_ms = .init(0) };
+        var head: std.DoublyLinkedList.Node = .{};
+        state.issueOrderedMutation(&head);
+        var head_held = true;
+        defer if (head_held) state.completeOrderedMutation(&head);
+        var sockets: [2]std.posix.fd_t = undefined;
+        if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &sockets) != 0) return error.SocketPairFailed;
+        const stream = std.Io.net.Stream{ .socket = .{ .handle = sockets[0], .address = .{ .ip4 = .unspecified(0) } } };
+        const peer = std.Io.net.Stream{ .socket = .{ .handle = sockets[1], .address = .{ .ip4 = .unspecified(0) } } };
+        defer stream.close(zio);
+        defer peer.close(zio);
+        var cancelled = Connection{ .alloc = alloc, .stream = stream, .revision = contracts.current_protocol_revision, .capabilities = contracts.known_protocol_capabilities, .state = &state, .registry = undefined, .peer_process_owner = .{ .pid = 1, .process_token_len = 1 } };
+        var following = Connection{ .alloc = alloc, .stream = peer, .revision = contracts.current_protocol_revision, .capabilities = contracts.known_protocol_capabilities, .state = &state, .registry = undefined, .peer_process_owner = .{ .pid = 2, .process_token_len = 1 } };
+        defer {
+            if (head_held) {
+                state.completeOrderedMutation(&head);
+                head_held = false;
+            }
+            cancelled.finish();
+            following.finish();
+        }
+        try cancelled.start(.{ .value = 1 }, .{ .close = .{ .session_id = "waiting", .policy = .force } }, .unsupported_host);
+        try following.start(.{ .value = 2 }, .{ .close = .{ .session_id = "following", .policy = .force } }, .unsupported_host);
+        const entered_deadline = io_mod.milliTimestamp() + 5000;
+        while (state.ordered_changed.state.load(.acquire).waiters != 2) {
+            if (io_mod.milliTimestamp() >= entered_deadline) return error.OrderedWaitNotObserved;
+            io_mod.sleep(std.time.ns_per_ms);
+        }
+        if (targeted) cancelled.cancel(.{ .value = 1 });
+        var finish = Finish{ .connection = &cancelled };
+        const worker = try std.Thread.spawn(.{}, Finish.run, .{&finish});
+        const drained = if (finish.done.waitTimeout(zio, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(500) } })) |_| true else |_| false;
+        following.mutex.lockUncancelable(zio);
+        const following_still_waits = following.active == 1;
+        following.mutex.unlock(zio);
+        state.completeOrderedMutation(&head);
+        head_held = false;
+        worker.join();
+        following.finish();
+        try std.testing.expect(drained);
+        try std.testing.expect(following_still_waits);
+        try std.testing.expectEqual(@as(usize, 0), state.pending_requests.load(.acquire));
+        try std.testing.expect(state.ordered_mutations.first == null);
+    }
+}
+
+test "cancelling a queued claimed mutation releases its existing write lease" {
+    if (comptime !isSupported() or builtin.single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const zio = io_mod.getIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const provider = @import("../../tools/shell/process_provider.zig").provider;
+    var profile = try terminal_store.ProfileStore.init(alloc, home, provider);
+    defer profile.deinit();
+    const Ignore = struct {
+        fn update(_: ?*anyopaque, _: bool) void {}
+    };
+    var registry = try native_session.Registry.init(alloc, .{ .context = null, .update_fn = Ignore.update }, &profile, "host", home, home);
+    defer registry.deinit();
+    var owner = try io_mod.openOrCreateVerifiedPrivateDir(&profile.sessions_dir, "queued-owner");
+    defer owner.close();
+    const persistence: contracts.StartPersistence = .{
+        .grant = .{
+            .principal = .{ .profile_user = "queued-user", .durable_session_id = "queued-owner", .workspace_root = home, .cwd = home, .transport_role = .interactive, .backend = .native },
+            .actor = .agent,
+            .controls = .full(),
+            .generation = .{ .value = 1 },
+        },
+        .proof = .{ .bytes = @splat(7) },
+    };
+    var durable = try terminal_store.DurableSession.create(&profile, .{ .session_id = "queued-job", .host_identity = "host", .shell = "/bin/sh", .cwd = home, .command = null, .backend = .native, .dimensions = .{ .columns = 80, .rows = 24 }, .persistence = persistence, .now_ms = 1 });
+    defer durable.deinit();
+    try profile.register_resident(&durable, null);
+    const claim: contracts.AuthorityClaim = .{ .principal = persistence.grant.principal, .actor = .agent, .generation = persistence.grant.generation, .proof = persistence.proof };
+    _ = try durable.acquire_write_lease(claim, 2);
+    var sockets: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &sockets) != 0) return error.SocketPairFailed;
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = sockets[0], .address = .{ .ip4 = .unspecified(0) } } };
+    const peer = std.Io.net.Stream{ .socket = .{ .handle = sockets[1], .address = .{ .ip4 = .unspecified(0) } } };
+    defer stream.close(zio);
+    defer peer.close(zio);
+    var state: HostState = .{ .idle_grace_ms = .init(0) };
+    var head: std.DoublyLinkedList.Node = .{};
+    state.issueOrderedMutation(&head);
+    var connection = Connection{ .alloc = alloc, .stream = stream, .revision = contracts.current_protocol_revision, .capabilities = contracts.known_protocol_capabilities, .state = &state, .registry = &registry, .peer_process_owner = .{ .pid = 1, .process_token_len = 1 } };
+    defer {
+        state.completeOrderedMutation(&head);
+        connection.finish();
+    }
+    try connection.start(.{ .value = 1 }, .{ .write = .{ .session_id = "queued-job", .payload = .{ .text = "never sent" }, .authority = claim } }, null);
+    const deadline = io_mod.milliTimestamp() + 5000;
+    while (state.ordered_changed.state.load(.acquire).waiters != 1) {
+        if (io_mod.milliTimestamp() >= deadline) return error.OrderedWaitNotObserved;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    connection.cancel(.{ .value = 1 });
+    connection.finish();
+    try std.testing.expectEqual(contracts.WriteLease.none, durable.facts().attention.write_lease);
+}
+
+test "cancelling an observation leaves durable attention and record files unchanged" {
+    if (comptime !isSupported()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const zio = io_mod.getIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const provider = @import("../../tools/shell/process_provider.zig").provider;
+    var profile = try terminal_store.ProfileStore.init(alloc, home, provider);
+    defer profile.deinit();
+    const Ignore = struct {
+        fn update(_: ?*anyopaque, _: bool) void {}
+    };
+    var registry = try native_session.Registry.init(alloc, .{ .context = null, .update_fn = Ignore.update }, &profile, "host", home, home);
+    defer registry.deinit();
+    var owner = try io_mod.openOrCreateVerifiedPrivateDir(&profile.sessions_dir, "observed-owner");
+    defer owner.close();
+    const persistence: contracts.StartPersistence = .{
+        .grant = .{
+            .principal = .{ .profile_user = "observer", .durable_session_id = "observed-owner", .workspace_root = home, .cwd = home, .transport_role = .interactive, .backend = .native },
+            .actor = .agent,
+            .controls = .full(),
+            .generation = .{ .value = 1 },
+        },
+        .proof = .{ .bytes = @splat(7) },
+    };
+    var durable = try terminal_store.DurableSession.create(&profile, .{ .session_id = "observed-job", .host_identity = "host", .shell = "/bin/sh", .cwd = home, .command = null, .backend = .native, .dimensions = .{ .columns = 80, .rows = 24 }, .persistence = persistence, .now_ms = 1 });
+    defer durable.deinit();
+    const claim: contracts.AuthorityClaim = .{ .principal = persistence.grant.principal, .actor = .agent, .generation = persistence.grant.generation, .proof = persistence.proof };
+    _ = try durable.acquire_write_lease(claim, 2);
+    const before = try durable.state.?.stat(.terminal_state, "record-observed-job.json");
+    var sockets: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &sockets) != 0) return error.SocketPairFailed;
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = sockets[0], .address = .{ .ip4 = .unspecified(0) } } };
+    const peer = std.Io.net.Stream{ .socket = .{ .handle = sockets[1], .address = .{ .ip4 = .unspecified(0) } } };
+    defer stream.close(zio);
+    defer peer.close(zio);
+    var state: HostState = .{ .idle_grace_ms = .init(0) };
+    var connection = Connection{ .alloc = alloc, .stream = stream, .revision = contracts.current_protocol_revision, .capabilities = contracts.known_protocol_capabilities, .state = &state, .registry = &registry, .peer_process_owner = .{ .pid = 1, .process_token_len = 1 } };
+    const observations = [_]contracts.ActionRequest{
+        .{ .read = .{ .session_id = "observed-job", .cursor = .{ .segment = 1, .offset = 0 }, .authority = claim } },
+        .{ .screen = .{ .session_id = "observed-job", .authority = claim } },
+        .{ .inspect = .{ .session_id = "observed-job", .authority = claim } },
+    };
+    for (observations) |request| {
+        var task = RequestTask{ .connection = &connection, .correlation_id = .{ .value = 1 }, .request = try contracts.OwnedActionRequest.init(alloc, request), .rejection = null, .cancelled = .init(true) };
+        defer task.request.deinit(alloc);
+        try task.persistCancellation();
+        try std.testing.expectEqual(before, try durable.state.?.stat(.terminal_state, "record-observed-job.json"));
+        try std.testing.expectEqual(contracts.WriteLease.agent, durable.facts().attention.write_lease);
+    }
+}
+
+test "connection drain abandons a response after its peer stops reading" {
+    if (comptime !isSupported() or builtin.single_threaded) return error.SkipZigTest;
+    const Sender = struct {
+        task: *RequestTask,
+        output: []const u8,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            const connection = self.task.connection;
+            defer connection.complete(self.task);
+            connection.send(.{ .value = 1 }, .{ .success = .{ .read = .{
+                .session = .{
+                    .session_id = "blocked-response",
+                    .lifecycle = .running,
+                    .attention = .{},
+                    .backend = .native,
+                    .output_cursor = .{ .segment = 1, .offset = self.output.len },
+                    .screen_recovery = .{ .unavailable = .missing },
+                },
+                .output = self.output,
+                .raw_range = .{ .start = .{ .segment = 1, .offset = 0 }, .end = .{ .segment = 1, .offset = self.output.len } },
+            } } }) catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    const Finish = struct {
+        connection: *Connection,
+        done: std.Io.Event = .unset,
+        fn run(self: *@This()) void {
+            self.connection.finish();
+            self.done.set(io_mod.getIo());
+        }
+    };
+    const alloc = std.testing.allocator;
+    const zio = io_mod.getIo();
+    var state: HostState = .{ .idle_grace_ms = .init(0) };
+    var sockets: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &sockets) != 0) return error.SocketPairFailed;
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = sockets[0], .address = .{ .ip4 = .unspecified(0) } } };
+    const peer = std.Io.net.Stream{ .socket = .{ .handle = sockets[1], .address = .{ .ip4 = .unspecified(0) } } };
+    defer stream.close(zio);
+    defer peer.close(zio);
+    try std.posix.setsockopt(sockets[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&@as(c_int, 8192)));
+    applySocketTimeout(stream);
+    var connection = Connection{ .alloc = alloc, .stream = stream, .revision = contracts.current_protocol_revision, .capabilities = contracts.known_protocol_capabilities, .state = &state, .registry = undefined, .peer_process_owner = .{ .pid = 1, .process_token_len = 1 } };
+    const task = try alloc.create(RequestTask);
+    var task_owned = true;
+    defer if (task_owned) alloc.destroy(task);
+    task.* = .{ .connection = &connection, .correlation_id = .{ .value = 1 }, .request = try contracts.OwnedActionRequest.init(alloc, .{ .read = .{ .session_id = "blocked-response", .cursor = .{ .segment = 1, .offset = 0 } } }), .rejection = null };
+    defer if (task_owned) task.request.deinit(alloc);
+    var sender = Sender{ .task = task, .output = "x" ** (64 * 1024) };
+    connection.tasks[0] = task;
+    connection.active = 1;
+    state.pending_requests.store(1, .release);
+    const writer = try std.Thread.spawn(.{}, Sender.run, .{&sender});
+    task_owned = false;
+    var joined = false;
+    defer if (!joined) {
+        stream.shutdown(zio, .both) catch {};
+        peer.shutdown(zio, .both) catch {};
+        writer.join();
+    };
+    var read_buffer: [1]u8 = undefined;
+    var observed = [_]std.posix.pollfd{.{ .fd = sockets[1], .events = std.posix.POLL.IN, .revents = 0 }};
+    if (try std.posix.poll(&observed, 2000) == 0) return error.ResponseWriteNotObserved;
+    try std.testing.expectEqual(@as(isize, 1), std.c.recv(sockets[1], &read_buffer, 1, 0));
+    var finish = Finish{ .connection = &connection };
+    const waiter = try std.Thread.spawn(.{}, Finish.run, .{&finish});
+    const drained = if (finish.done.waitTimeout(zio, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(500) } })) |_| true else |_| false;
+    stream.shutdown(zio, .both) catch {};
+    peer.shutdown(zio, .both) catch {};
+    writer.join();
+    joined = true;
+    waiter.join();
+    try std.testing.expect(drained);
+    try std.testing.expect(sender.failure != null);
+    try std.testing.expectEqual(@as(usize, 0), state.pending_requests.load(.acquire));
+}
+
+test "source accounting deduplicates connections and bounds peer admission" {
+    const alloc = std.testing.allocator;
+    var state: HostState = .{ .idle_grace_ms = .init(0) };
+    defer state.sources.deinit(alloc);
+    const first = try contracts.ProcessOwner.init(1, "instance");
+    try std.testing.expect(try state.beginConnection(alloc, first));
+    try std.testing.expect(try state.beginConnection(alloc, first));
+    for (1..max_connected_sources) |index| {
+        try std.testing.expect(try state.beginConnection(alloc, try contracts.ProcessOwner.init(@intCast(index + 1), "instance")));
+    }
+    try std.testing.expectEqual(max_connected_sources + 1, state.connectionCount());
+    const next = try contracts.ProcessOwner.init(max_connected_sources + 1, "instance");
+    try std.testing.expectError(error.CapacityExceeded, state.beginConnection(alloc, next));
+    state.endConnection(first);
+    try std.testing.expectEqual(max_connected_sources, state.sources.count());
+    state.endConnection(first);
+    try std.testing.expect(try state.beginConnection(alloc, next));
+    try std.testing.expectEqual(max_connected_sources, state.connectionCount());
+}
+
+test "foreign connections do not retain dead source exit history" {
+    if (comptime !isSupported()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const zio = io_mod.getIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const provider = @import("../../tools/shell/process_provider.zig").provider;
+    var profile = try terminal_store.ProfileStore.init(alloc, home, provider);
+    defer profile.deinit();
+    var owner_dir = try io_mod.openOrCreateVerifiedPrivateDir(&profile.sessions_dir, "exit-history-owner");
+    defer owner_dir.close();
+    const owner_path = try std.fs.path.join(alloc, &.{ home, ".fx", "sessions", "exit-history-owner" });
+    defer alloc.free(owner_path);
+    var owner = try @import("../session/session_child_store.zig").SessionChildCapability.init(alloc, owner_dir.dir, owner_path, .writable);
+    defer owner.deinit();
+    const proof = try terminal_store.prepareSessionExitProof(alloc, &owner);
+    const Ignore = struct {
+        fn update(_: ?*anyopaque, _: bool) void {}
+    };
+    var registry = try native_session.Registry.init(alloc, .{ .context = null, .update_fn = Ignore.update }, &profile, "host", home, home);
+    defer registry.deinit();
+    var state: HostState = .{ .idle_grace_ms = .init(0) };
+    defer state.sources.deinit(alloc);
+    var foreign = try std.process.spawn(zio, .{ .argv = &.{ "/bin/sleep", "30" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+    defer foreign.kill(zio);
+    var foreign_pid_buffer: [32]u8 = undefined;
+    const foreign_pid = try std.fmt.bufPrint(&foreign_pid_buffer, "{d}", .{foreign.id.?});
+    const foreign_token = try provider.captureToken(alloc, foreign_pid);
+    const foreign_source = try contracts.ProcessOwner.init(@intCast(foreign.id.?), foreign_token.view());
+    try std.testing.expect(try state.beginConnection(alloc, foreign_source));
+    defer state.endConnection(foreign_source);
+    var cancelled: std.atomic.Value(bool) = .init(false);
+    var draining_source: ?contracts.ProcessOwner = null;
+    defer if (draining_source) |source| state.endConnection(source);
+    for (0..64) |index| {
+        var prior = try std.process.spawn(zio, .{ .argv = &.{ "/bin/sleep", "30" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+        defer if (prior.id != null) prior.kill(zio);
+        var pid_buffer: [32]u8 = undefined;
+        const pid = try std.fmt.bufPrint(&pid_buffer, "{d}", .{prior.id.?});
+        const token = try provider.captureToken(alloc, pid);
+        const source = try contracts.ProcessOwner.init(@intCast(prior.id.?), token.view());
+        if (index == 0) {
+            try std.testing.expect(try state.beginConnection(alloc, source));
+            draining_source = source;
+        }
+        var result = try registry.executeAuthorized(.{ .close_owner = .{ .authority = .{ .session_id = "exit-history-owner", .proof = proof }, .process_owner = source } }, &cancelled);
+        defer result.deinit(alloc);
+        try std.testing.expect(result.view() == .success);
+        prior.kill(zio);
+    }
+    var pid_buffer: [32]u8 = undefined;
+    const pid = try std.fmt.bufPrint(&pid_buffer, "{d}", .{std.c.getpid()});
+    const token = try provider.captureToken(alloc, pid);
+    const incoming = try contracts.ProcessOwner.init(@intCast(std.c.getpid()), token.view());
+    try std.testing.expect(try state.beginConnection(alloc, incoming));
+    defer state.endConnection(incoming);
+    state.pruneExitedSources(&registry);
+    var result = try registry.executeAuthorized(.{ .close_owner = .{ .authority = .{ .session_id = "exit-history-owner", .proof = proof }, .process_owner = incoming } }, &cancelled);
+    defer result.deinit(alloc);
+    try std.testing.expect(result.view() == .success);
+    try std.testing.expectEqual(@as(u16, 0), result.view().success.close_owner.closed_sessions);
+    try std.testing.expectEqual(@as(usize, 3), state.connectionCount());
+    var retained: usize = 0;
+    for (registry.exit_fences) |entry| if (entry != null) {
+        retained += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 2), retained);
+    state.endConnection(draining_source.?);
+    draining_source = null;
+    state.pruneExitedSources(&registry);
+    retained = 0;
+    for (registry.exit_fences) |entry| if (entry != null) {
+        retained += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), retained);
+    try std.testing.expect(std.c.kill(foreign.id.?, @enumFromInt(0)) == 0);
+}
+
+test "owner exit capabilities cannot be omitted from request declarations" {
+    const authority = contracts.protocol_capability_authority_generations;
+    const request: contracts.ActionRequest = .{ .close_owner = .{ .authority = .{ .session_id = "saved-owner", .proof = .{ .bytes = @splat(1) } } } };
+    const required = contracts.required_capabilities(request);
+    try std.testing.expectEqual(@as(?contracts.StructuredErrorCode, .unsupported_host), requestCapabilityFailure(request, authority, authority));
+    try std.testing.expectEqual(@as(?contracts.StructuredErrorCode, .protocol_incompatible), requestCapabilityFailure(request, authority, contracts.known_protocol_capabilities));
+    try std.testing.expectEqual(@as(?contracts.StructuredErrorCode, null), requestCapabilityFailure(request, required, contracts.known_protocol_capabilities));
+    const legacy: contracts.ActionRequest = .{ .start = .{ .cwd = "/workspace" } };
+    try std.testing.expectEqual(@as(?contracts.StructuredErrorCode, null), requestCapabilityFailure(legacy, authority, contracts.known_protocol_capabilities));
+}
+
 test "client drain reports success only when every client thread has left" {
-    var state = HostState{ .idle_grace_ms = 0 };
+    var state = HostState{ .idle_grace_ms = .init(0) };
+    defer state.sources.deinit(std.testing.allocator);
+    const source = contracts.ProcessOwner{ .pid = 1, .process_token_len = 1 };
 
     // No clients: the happy path, and it must not wait.
     try std.testing.expect(drainConnectedClients(&state, 50));
@@ -1879,29 +2485,30 @@ test "client drain reports success only when every client thread has left" {
     // A client that never leaves: the drain is bounded and reports failure
     // rather than blocking the host forever on a fatal path.
     state.stopping.store(false, .release);
-    _ = state.connected_clients.fetchAdd(1, .acq_rel);
+    try std.testing.expect(try state.beginConnection(std.testing.allocator, source));
     try std.testing.expect(!drainConnectedClients(&state, 50));
     try std.testing.expect(state.stopping.load(.acquire));
 
     // The same client leaving makes the drain succeed.
-    _ = state.connected_clients.fetchSub(1, .acq_rel);
+    state.endConnection(source);
     try std.testing.expect(drainConnectedClients(&state, 50));
 }
 
 test "a client that leaves during the drain window still drains" {
-    var state = HostState{ .idle_grace_ms = 0 };
-    _ = state.connected_clients.fetchAdd(1, .acq_rel);
+    var state = HostState{ .idle_grace_ms = .init(0) };
+    defer state.sources.deinit(std.testing.allocator);
+    const source = contracts.ProcessOwner{ .pid = 1, .process_token_len = 1 };
+    try std.testing.expect(try state.beginConnection(std.testing.allocator, source));
 
     const Departing = struct {
         fn run(target: *HostState) void {
             std.Io.sleep(io_mod.getIo(), .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
-            _ = target.connected_clients.fetchSub(1, .acq_rel);
-            target.noteChanged();
+            target.endConnection(.{ .pid = 1, .process_token_len = 1 });
         }
     };
     var thread = try std.Thread.spawn(.{}, Departing.run, .{&state});
     defer thread.join();
 
     try std.testing.expect(drainConnectedClients(&state, 2_000));
-    try std.testing.expectEqual(@as(usize, 0), state.connected_clients.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), state.connectionCount());
 }

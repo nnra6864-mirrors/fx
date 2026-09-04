@@ -2090,10 +2090,7 @@ fn optionalCredentialFieldEqual(left: ?[]const u8, right: ?[]const u8) bool {
     return std.mem.eql(u8, left.?, right.?);
 }
 
-fn persistUsageCheckpoint(
-    raw_ctx: *anyopaque,
-    snapshot: session_usage.Snapshot,
-) !void {
+fn persistUsageCheckpoint(raw_ctx: *anyopaque, snapshot: session_usage.Snapshot, _: ?*const std.atomic.Value(bool)) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
@@ -7547,10 +7544,7 @@ test "saved ask settles profile publication before persistence teardown" {
         allow_generation: bool = false,
         successful_generations: usize = 0,
 
-        fn publish(
-            raw: *anyopaque,
-            event: usage_report.ProfileEvent,
-        ) !void {
+        fn publish(raw: *anyopaque, event: usage_report.ProfileEvent, _: ?*const std.atomic.Value(bool)) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             switch (event) {
                 .generation => {

@@ -4,21 +4,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("host.zig");
 const io_mod = @import("../shared/io.zig");
 const secret = @import("../auth/secret.zig");
-
-const err_sec_success: i32 = 0;
-const err_sec_item_not_found: i32 = -25300;
-const security_framework_path = "/System/Library/Frameworks/Security.framework/Security";
-
-const FindGenericPasswordFn = *const fn (
-    keychain_or_array: ?*const anyopaque,
-    service_name_length: u32,
-    service_name: [*]const u8,
-    account_name_length: u32,
-    account_name: [*]const u8,
-    password_length: ?*u32,
-    password_data: ?*?*anyopaque,
-    item_ref: ?*?*anyopaque,
-) callconv(.c) i32;
+const process_owner = @import("../execution/process_owner.zig");
 
 pub const service_name = "FX_AI_GATEWAY_API_KEY";
 const mcp_credentials_service_name = "FX_MCP_OAUTH_CREDENTIALS_V1";
@@ -30,12 +16,6 @@ pub const AccountBuffer = [256]u8;
 const passwd_scratch_bytes = 2048;
 const max_mcp_credentials_bytes: usize = 1024 * 1024;
 const max_oauth_session_bytes: usize = 64 * 1024;
-const keychain_process_timeout: std.Io.Timeout = .{
-    .duration = .{
-        .raw = .{ .nanoseconds = 10 * std.time.ns_per_s },
-        .clock = .awake,
-    },
-};
 
 pub const Error = error{
     Cancelled,
@@ -90,7 +70,7 @@ fn userDefaultKeychainAvailableForCommand(
         cancel_flag,
         .limited(4096),
     ) catch |err| {
-        if (err == error.Cancelled) return error.Cancelled;
+        if (err == error.Canceled or err == error.Cancelled) return keychainFailure(err, error.KeychainReadFailed);
         debug_trace.logf("keychain", "availability failed step=spawn err={s}", .{@errorName(err)});
         return error.KeychainReadFailed;
     };
@@ -163,127 +143,62 @@ pub fn oauthSessionPresence() Error!host.SecretStorePresence {
 fn containsService(service: []const u8) Error!host.SecretStorePresence {
     if (comptime builtin.os.tag != .macos) return .missing;
     var account_buf: AccountBuffer = undefined;
-    const account = try accountName(&account_buf);
-    const service_len = std.math.cast(u32, service.len) orelse
-        return error.KeychainReadFailed;
-    const account_len = std.math.cast(u32, account.len) orelse
-        return error.KeychainReadFailed;
-    var security = std.DynLib.open(security_framework_path) catch |err| {
-        debug_trace.logf("keychain", "presence failed step=open err={s}", .{@errorName(err)});
-        return error.KeychainReadFailed;
-    };
-    defer security.close();
-    const find_generic_password = security.lookup(
-        FindGenericPasswordFn,
-        "SecKeychainFindGenericPassword",
-    ) orelse {
-        debug_trace.logf("keychain", "presence failed step=lookup", .{});
-        return error.KeychainReadFailed;
-    };
-    const status = find_generic_password(
-        null,
-        service_len,
-        service.ptr,
-        account_len,
-        account.ptr,
-        null,
-        null,
-        null,
-    );
-    if (status == err_sec_success) return .present;
-    if (status == err_sec_item_not_found) return .missing;
-    debug_trace.logf("keychain", "presence failed status={d}", .{status});
+    const argv = mcpScriptArgv("presence", try accountName(&account_buf), service);
+    const alloc = std.heap.c_allocator;
+    const result = runMcpKeychainProcess(alloc, &argv, null, .limited(16)) catch |err|
+        return keychainFailure(err, error.KeychainReadFailed);
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) return error.KeychainReadFailed;
+    const marker = std.mem.trim(u8, result.stdout, "\r\n");
+    if (std.mem.eql(u8, marker, "1")) return .present;
+    if (std.mem.eql(u8, marker, "0")) return .missing;
     return error.KeychainReadFailed;
 }
 
 pub fn loadMcpCredentials(alloc: std.mem.Allocator) !?[]u8 {
-    return loadMcpValueMacControlled(alloc, mcp_credentials_service_name, null);
+    return loadValueMacControlled(alloc, mcp_credentials_service_name, null, max_mcp_credentials_bytes);
 }
 
 pub fn loadOAuthSession(alloc: std.mem.Allocator) !?[]u8 {
-    return loadMcpValueMacControlled(alloc, oauth_session_service_name, null);
+    return loadValueMacControlled(alloc, oauth_session_service_name, null, max_mcp_credentials_bytes);
 }
 
 pub fn loadMcpCredentialsCancellable(
     alloc: std.mem.Allocator,
     cancel_flag: *const std.atomic.Value(bool),
 ) !?[]u8 {
-    return loadMcpValueMacControlled(
+    return loadValueMacControlled(
         alloc,
         mcp_credentials_service_name,
         cancel_flag,
+        max_mcp_credentials_bytes,
     );
 }
 
 fn loadFromService(alloc: std.mem.Allocator, service: []const u8) !?[]u8 {
     if (!isAvailable()) return null;
+    const bytes = (try loadValueMacControlled(alloc, service, null, 8 * 1024)) orelse return null;
+    return trimStoredKey(alloc, bytes);
+}
 
-    var account_buf: AccountBuffer = undefined;
-    const account = try accountName(&account_buf);
-    const result = std.process.run(alloc, io_mod.getIo(), .{
-        .argv = &.{ "/usr/bin/security", "find-generic-password", "-a", account, "-s", service, "-w" },
-    }) catch |err| {
-        debug_trace.logf("keychain", "load failed step=spawn err={s}", .{@errorName(err)});
-        return error.KeychainReadFailed;
-    };
-    defer alloc.free(result.stderr);
-    if (result.term != .exited or result.term.exited != 0) {
-        secret.zeroAndFree(alloc, result.stdout);
-        if (std.mem.indexOf(u8, result.stderr, "could not be found") != null) {
-            debug_trace.logf("keychain", "load failed step=lookup err=KeychainItemNotFound", .{});
-            return error.KeychainItemNotFound;
-        }
-        debug_trace.logf("keychain", "load failed step=lookup err=KeychainReadFailed", .{});
-        return error.KeychainReadFailed;
-    }
-
-    const trimmed = std.mem.trim(u8, result.stdout, "\r\n");
+fn trimStoredKey(alloc: std.mem.Allocator, bytes: []u8) !?[]u8 {
+    const trimmed = std.mem.trim(u8, bytes, "\r\n");
     if (trimmed.len == 0) {
-        secret.zeroAndFree(alloc, result.stdout);
+        secret.zeroAndFree(alloc, bytes);
         return null;
     }
-    if (trimmed.len == result.stdout.len) return result.stdout;
+    if (trimmed.len == bytes.len) return bytes;
 
+    errdefer secret.zeroAndFree(alloc, bytes);
     const key = try alloc.dupe(u8, trimmed);
-    secret.zeroAndFree(alloc, result.stdout);
+    secret.zeroAndFree(alloc, bytes);
     return key;
 }
 
 fn storeArgv(account: []const u8) [8][]const u8 {
     return .{ "/usr/bin/security", "add-generic-password", "-a", account, "-s", service_name, "-U", "-w" };
 }
-
-const store_value_script =
-    \\log_user 0
-    \\set timeout 10
-    \\fconfigure stdin -translation binary -encoding binary
-    \\set account_length [gets stdin]
-    \\set service_length [gets stdin]
-    \\set secret_length [gets stdin]
-    \\set account [read stdin $account_length]
-    \\set service [read stdin $service_length]
-    \\set secret [read stdin $secret_length]
-    \\spawn -noecho /usr/bin/security add-generic-password -a $account -s $service -U -w
-    \\expect {
-    \\    -exact "password data for new item:" {}
-    \\    timeout { exit 124 }
-    \\    eof { exit 1 }
-    \\}
-    \\send -- "$secret\r"
-    \\expect {
-    \\    -exact "retype password for new item:" {}
-    \\    timeout { exit 124 }
-    \\    eof { exit 1 }
-    \\}
-    \\send -- "$secret\r"
-    \\expect {
-    \\    eof {}
-    \\    timeout { exit 124 }
-    \\}
-    \\set result [wait]
-    \\if {![string is integer -strict [lindex $result 3]]} { exit 1 }
-    \\exit [lindex $result 3]
-;
 
 // `security add-generic-password -w` uses a 128-byte interactive buffer. MCP's
 // aggregate credential store is larger, so use the native Security API through
@@ -306,6 +221,13 @@ const mcp_keychain_script =
     \\function run(argv) {
     \\    const operation = argv[0];
     \\    const value = query(argv[1], argv[2]);
+    \\    if (operation === "presence") {
+    \\        value.setObjectForKey(object($.kSecMatchLimitOne), object($.kSecMatchLimit));
+    \\        const status = $.SecItemCopyMatching(value, null);
+    \\        if (status === 0) return "1";
+    \\        if (status === -25300) return "0";
+    \\        failed(status);
+    \\    }
     \\    if (operation === "load") {
     \\        value.setObjectForKey($.NSNumber.numberWithBool(true), object($.kSecReturnData));
     \\        value.setObjectForKey(object($.kSecMatchLimitOne), object($.kSecMatchLimit));
@@ -340,10 +262,6 @@ const mcp_keychain_script =
     \\    failed(-50);
     \\}
 ;
-
-fn storeValueArgv() [3][]const u8 {
-    return .{ "/usr/bin/expect", "-c", store_value_script };
-}
 
 /// The returned argv borrows `account_buf`, which must outlive it.
 pub fn storeInteractiveArgv(account_buf: *AccountBuffer) Error![8][]const u8 {
@@ -422,8 +340,17 @@ pub fn deleteOAuthSession(alloc: std.mem.Allocator) Error!bool {
 }
 
 fn writeFailed(step: []const u8, err: anyerror) Error {
+    if (err == error.Canceled or err == error.Cancelled) return keychainFailure(err, error.KeychainWriteFailed);
     debug_trace.logf("keychain", "store failed step={s} err={s}", .{ step, @errorName(err) });
     return error.KeychainWriteFailed;
+}
+
+fn keychainFailure(err: anyerror, fallback: Error) Error {
+    if (err == error.Canceled) {
+        io_mod.getIo().recancel();
+        return error.Cancelled;
+    }
+    return if (err == error.Cancelled) error.Cancelled else fallback;
 }
 
 fn writeFailedTerm(step: []const u8, term: std.process.Child.Term) Error {
@@ -432,37 +359,7 @@ fn writeFailedTerm(step: []const u8, term: std.process.Child.Term) Error {
 }
 
 fn storeValueMac(service: []const u8, value: []const u8) Error!void {
-    var account_buf: AccountBuffer = undefined;
-    const account = try accountName(&account_buf);
-    const argv = storeValueArgv();
-    var child = std.process.spawn(io_mod.getIo(), .{
-        .argv = &argv,
-        .stdin = .pipe,
-        .stdout = .ignore,
-        .stderr = .ignore,
-    }) catch |err| return writeFailed("spawn", err);
-    defer child.kill(io_mod.getIo());
-
-    var input = child.stdin orelse return writeFailed("stdin", error.BrokenPipe);
-    child.stdin = null;
-    var input_open = true;
-    defer if (input_open) input.close(io_mod.getIo());
-
-    var header_buffer: [96]u8 = undefined;
-    const header = std.fmt.bufPrint(
-        &header_buffer,
-        "{d}\n{d}\n{d}\n",
-        .{ account.len, service.len, value.len },
-    ) catch |err| return writeFailed("header", err);
-    input.writeStreamingAll(io_mod.getIo(), header) catch |err| return writeFailed("write_header", err);
-    input.writeStreamingAll(io_mod.getIo(), account) catch |err| return writeFailed("write_account", err);
-    input.writeStreamingAll(io_mod.getIo(), service) catch |err| return writeFailed("write_service", err);
-    input.writeStreamingAll(io_mod.getIo(), value) catch |err| return writeFailed("write_secret", err);
-    input.close(io_mod.getIo());
-    input_open = false;
-
-    const term = child.wait(io_mod.getIo()) catch |err| return writeFailed("wait", err);
-    if (term != .exited or term.exited != 0) return writeFailedTerm("exit", term);
+    return storeMcpValueMacControlled(service, value, null);
 }
 
 fn mcpScriptArgv(
@@ -486,13 +383,14 @@ fn loadMcpValueMac(
     alloc: std.mem.Allocator,
     service: []const u8,
 ) Error!?[]u8 {
-    return loadMcpValueMacControlled(alloc, service, null);
+    return loadValueMacControlled(alloc, service, null, max_mcp_credentials_bytes);
 }
 
-fn loadMcpValueMacControlled(
+fn loadValueMacControlled(
     alloc: std.mem.Allocator,
     service: []const u8,
     cancel_flag: ?*const std.atomic.Value(bool),
+    max_bytes: usize,
 ) Error!?[]u8 {
     if (!isAvailable()) return error.UnsupportedPlatform;
 
@@ -503,9 +401,9 @@ fn loadMcpValueMacControlled(
         alloc,
         &argv,
         cancel_flag,
-        .limited(max_mcp_credentials_bytes + 1),
+        .limited(max_bytes + 1),
     ) catch |err| {
-        if (err == error.Cancelled) return error.Cancelled;
+        if (err == error.Canceled or err == error.Cancelled) return keychainFailure(err, error.KeychainReadFailed);
         debug_trace.logf("keychain", "load failed step=native err={s}", .{@errorName(err)});
         return error.KeychainReadFailed;
     };
@@ -519,41 +417,11 @@ fn loadMcpValueMacControlled(
         alloc.free(result.stdout);
         return error.KeychainItemNotFound;
     }
-    if (result.stdout.len > max_mcp_credentials_bytes) {
+    if (result.stdout.len > max_bytes) {
         secret.zeroAndFree(alloc, result.stdout);
         return error.KeychainReadFailed;
     }
     return result.stdout;
-}
-
-const McpKeychainRunContext = struct {
-    alloc: std.mem.Allocator,
-    argv: []const []const u8,
-    stdout_limit: std.Io.Limit,
-};
-
-const McpKeychainRunEvent = union(enum) {
-    process: anyerror!std.process.RunResult,
-    cancelled: anyerror!void,
-};
-
-fn runMcpKeychainChild(
-    context: *const McpKeychainRunContext,
-) anyerror!std.process.RunResult {
-    return std.process.run(context.alloc, io_mod.getIo(), .{
-        .argv = context.argv,
-        .stdout_limit = context.stdout_limit,
-        .stderr_limit = .limited(4096),
-        .timeout = keychain_process_timeout,
-    });
-}
-
-fn waitForMcpKeychainCancellation(
-    cancel_flag: *const std.atomic.Value(bool),
-) anyerror!void {
-    while (!cancel_flag.load(.acquire)) {
-        try io_mod.getIo().sleep(.fromMilliseconds(5), .awake);
-    }
 }
 
 fn runMcpKeychainProcess(
@@ -562,113 +430,12 @@ fn runMcpKeychainProcess(
     cancel_flag: ?*const std.atomic.Value(bool),
     stdout_limit: std.Io.Limit,
 ) anyerror!std.process.RunResult {
-    const flag = cancel_flag orelse return runMcpKeychainChild(&.{
-        .alloc = alloc,
+    return process_owner.run(alloc, .{
         .argv = argv,
-        .stdout_limit = stdout_limit,
+        .stdout_limit = stdout_limit.toInt() orelse max_mcp_credentials_bytes + 1,
+        .timeout_ms = 10_000,
+        .cancel_flag = cancel_flag,
     });
-    var context = McpKeychainRunContext{
-        .alloc = alloc,
-        .argv = argv,
-        .stdout_limit = stdout_limit,
-    };
-    var select_buffer: [2]McpKeychainRunEvent = undefined;
-    var select: std.Io.Select(McpKeychainRunEvent) = .init(
-        io_mod.getIo(),
-        &select_buffer,
-    );
-    select.concurrent(.process, runMcpKeychainChild, .{&context}) catch |err|
-        return err;
-    select.concurrent(
-        .cancelled,
-        waitForMcpKeychainCancellation,
-        .{flag},
-    ) catch |err| {
-        select.cancelDiscard();
-        return err;
-    };
-    const event = select.await() catch |err| {
-        select.cancelDiscard();
-        return err;
-    };
-    return switch (event) {
-        .process => |result| blk: {
-            select.cancelDiscard();
-            break :blk result catch |err| return err;
-        },
-        .cancelled => |result| {
-            result catch |err| {
-                select.cancelDiscard();
-                return err;
-            };
-            select.cancelDiscard();
-            return error.Cancelled;
-        },
-    };
-}
-
-const McpStoreEvent = union(enum) {
-    wait: anyerror!std.process.Child.Term,
-    timeout: anyerror!void,
-    cancelled: anyerror!void,
-};
-
-fn waitForMcpStoreChild(child: *std.process.Child) anyerror!std.process.Child.Term {
-    return child.wait(io_mod.getIo());
-}
-
-fn waitForMcpStoreTimeout() anyerror!void {
-    return std.Io.Timeout.sleep(keychain_process_timeout, io_mod.getIo());
-}
-
-fn waitForMcpStore(
-    child: *std.process.Child,
-    cancel_flag: ?*const std.atomic.Value(bool),
-) Error!std.process.Child.Term {
-    var select_buffer: [3]McpStoreEvent = undefined;
-    var select: std.Io.Select(McpStoreEvent) = .init(io_mod.getIo(), &select_buffer);
-    select.concurrent(.wait, waitForMcpStoreChild, .{child}) catch |err|
-        return writeFailed("native_wait_start", err);
-    select.concurrent(.timeout, waitForMcpStoreTimeout, .{}) catch |err| {
-        select.cancelDiscard();
-        return writeFailed("native_timeout_start", err);
-    };
-    if (cancel_flag) |flag| {
-        select.concurrent(
-            .cancelled,
-            waitForMcpKeychainCancellation,
-            .{flag},
-        ) catch |err| {
-            select.cancelDiscard();
-            return writeFailed("native_cancel_start", err);
-        };
-    }
-    const event = select.await() catch |err| {
-        select.cancelDiscard();
-        return writeFailed("native_wait", err);
-    };
-    switch (event) {
-        .wait => |result| {
-            select.cancelDiscard();
-            return result catch |err| writeFailed("native_wait", err);
-        },
-        .timeout => |result| {
-            result catch |err| {
-                select.cancelDiscard();
-                return writeFailed("native_timeout", err);
-            };
-            select.cancelDiscard();
-            return writeFailed("native_wait", error.Timeout);
-        },
-        .cancelled => |result| {
-            result catch |err| {
-                select.cancelDiscard();
-                return writeFailed("native_cancel", err);
-            };
-            select.cancelDiscard();
-            return error.Cancelled;
-        },
-    }
 }
 
 fn storeMcpValueMac(service: []const u8, value: []const u8) Error!void {
@@ -681,28 +448,19 @@ fn storeMcpValueMacControlled(
     cancel_flag: ?*const std.atomic.Value(bool),
 ) Error!void {
     var account_buf: AccountBuffer = undefined;
-    const account = try accountName(&account_buf);
-    const argv = mcpScriptArgv("store", account, service);
-    var child = std.process.spawn(io_mod.getIo(), .{
+    const argv = mcpScriptArgv("store", try accountName(&account_buf), service);
+    const alloc = std.heap.c_allocator;
+    const result = process_owner.run(alloc, .{
         .argv = &argv,
-        .stdin = .pipe,
-        .stdout = .ignore,
-        .stderr = .ignore,
-    }) catch |err| return writeFailed("native_spawn", err);
-    defer child.kill(io_mod.getIo());
-
-    var input = child.stdin orelse return writeFailed("native_stdin", error.BrokenPipe);
-    child.stdin = null;
-    var input_open = true;
-    defer if (input_open) input.close(io_mod.getIo());
-    input.writeStreamingAll(io_mod.getIo(), value) catch |err|
-        return writeFailed("native_write", err);
-    input.close(io_mod.getIo());
-    input_open = false;
-
-    const term = try waitForMcpStore(&child, cancel_flag);
-    if (term != .exited or term.exited != 0) {
-        return writeFailedTerm("native_exit", term);
+        .stdin = value,
+        .stdout_limit = 16,
+        .timeout_ms = 10_000,
+        .cancel_flag = cancel_flag,
+    }) catch |err| return writeFailed("native_store", err);
+    defer secret.zeroAndFree(alloc, result.stdout);
+    defer secret.zeroAndFree(alloc, result.stderr);
+    if (result.term != .exited or result.term.exited != 0) {
+        return writeFailedTerm("native_exit", result.term);
     }
 }
 
@@ -715,12 +473,12 @@ fn deleteMcpValueMac(
     var account_buf: AccountBuffer = undefined;
     const account = try accountName(&account_buf);
     const argv = mcpScriptArgv("delete", account, service);
-    const result = std.process.run(alloc, io_mod.getIo(), .{
+    const result = process_owner.run(alloc, .{
         .argv = &argv,
-        .stdout_limit = .limited(16),
-        .stderr_limit = .limited(4096),
-        .timeout = keychain_process_timeout,
+        .stdout_limit = 16,
+        .timeout_ms = 10_000,
     }) catch |err| {
+        if (err == error.Canceled or err == error.Cancelled) return keychainFailure(err, error.KeychainDeleteFailed);
         debug_trace.logf("keychain", "delete failed step=native err={s}", .{@errorName(err)});
         return error.KeychainDeleteFailed;
     };
@@ -736,40 +494,7 @@ fn deleteMcpValueMac(
     return error.KeychainDeleteFailed;
 }
 
-fn deleteServiceItem(
-    alloc: std.mem.Allocator,
-    service: []const u8,
-) Error!bool {
-    if (!isAvailable()) return error.UnsupportedPlatform;
-
-    var account_buf: AccountBuffer = undefined;
-    const account = try accountName(&account_buf);
-    const result = std.process.run(alloc, io_mod.getIo(), .{
-        .argv = &.{
-            "/usr/bin/security",
-            "delete-generic-password",
-            "-a",
-            account,
-            "-s",
-            service,
-        },
-    }) catch |err| {
-        debug_trace.logf("keychain", "delete failed step=spawn err={s}", .{@errorName(err)});
-        return error.KeychainDeleteFailed;
-    };
-    defer alloc.free(result.stdout);
-    defer alloc.free(result.stderr);
-    if (result.term == .exited and result.term.exited == 0) return true;
-    if (std.mem.find(u8, result.stderr, "could not be found") != null) return false;
-    debug_trace.logf("keychain", "delete failed step=remove term={t}", .{result.term});
-    return error.KeychainDeleteFailed;
-}
-
 const test_service_name = "FX_TEST_AI_GATEWAY_API_KEY";
-
-fn deleteTestServiceItem(alloc: std.mem.Allocator) void {
-    _ = deleteServiceItem(alloc, test_service_name) catch {};
-}
 
 test "account name resolves from the operating system when USER is unset" {
     if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
@@ -790,17 +515,19 @@ test "stored key round-trips byte-identically with USER unset" {
     const written = "vt1-round-trip-value";
 
     storeValueMac(test_service_name, written) catch return error.SkipZigTest;
-    defer deleteTestServiceItem(alloc);
+    defer _ = deleteMcpValueMac(alloc, test_service_name) catch false;
 
     const read_back = (try loadFromService(alloc, test_service_name)) orelse
         return error.KeychainItemNotFound;
     defer secret.zeroAndFree(alloc, read_back);
     try std.testing.expectEqualStrings(written, read_back);
-    try std.testing.expect(try deleteServiceItem(alloc, test_service_name));
+    try std.testing.expect(try deleteMcpValueMac(alloc, test_service_name));
+    try std.testing.expect(!try deleteMcpValueMac(alloc, test_service_name));
     try std.testing.expectError(
         error.KeychainItemNotFound,
         loadFromService(alloc, test_service_name),
     );
+    try std.testing.expectEqual(host.SecretStorePresence.missing, try containsService(test_service_name));
 }
 
 test "MCP Keychain storage round-trips values beyond the security prompt limit" {
@@ -833,6 +560,26 @@ test "Keychain store command has no secret argument" {
     }
 }
 
+test "stored key normalization retains its ownership on allocation failure" {
+    const Probe = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const raw = try alloc.dupe(u8, "\r\ncredential-value\r\n");
+            const value = (try trimStoredKey(alloc, raw)) orelse return error.TestMissingKey;
+            defer secret.zeroAndFree(alloc, value);
+            try std.testing.expectEqualStrings("credential-value", value);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+test "Keychain presence operation does not request credential bytes" {
+    const branch = std.mem.find(u8, mcp_keychain_script, "operation === \"presence\"");
+    try std.testing.expect(branch != null);
+    const end = std.mem.findPos(u8, mcp_keychain_script, branch.?, "operation === \"load\"") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.find(u8, mcp_keychain_script[branch.?..end], "kSecReturnData") == null);
+    try std.testing.expect(std.mem.find(u8, mcp_keychain_script[branch.?..end], "SecItemCopyMatching") != null);
+}
+
 test "cancellable MCP Keychain runner interrupts and reaps a stalled child" {
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         return error.SkipZigTest;
@@ -861,6 +608,95 @@ test "cancellable MCP Keychain runner interrupts and reaps a stalled child" {
     );
     thread.join();
     try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
+}
+
+test "Keychain task cancellation force terminates and reaps after child readiness" {
+    try testKeychainTaskCancellation(false, false);
+}
+
+test "Keychain task cancellation reaps a child that closed output" {
+    try testKeychainTaskCancellation(true, false);
+}
+
+test "Keychain task cancellation interrupts blocked credential input and reaps" {
+    try testKeychainTaskCancellation(false, true);
+}
+
+fn testKeychainTaskCancellation(close_output: bool, block_input: bool) !void {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const Probe = struct {
+        fn run(argv: []const []const u8, blocked_input: bool) !void {
+            const result = if (blocked_input)
+                try process_owner.run(std.testing.allocator, .{
+                    .argv = argv,
+                    .stdin = "credential" ** (128 * 1024),
+                    .stdout_limit = 16,
+                    .timeout_ms = 10_000,
+                })
+            else
+                try runMcpKeychainProcess(std.testing.allocator, argv, null, .limited(16));
+            defer std.testing.allocator.free(result.stdout);
+            defer std.testing.allocator.free(result.stderr);
+        }
+
+        fn rescue(pid: std.posix.pid_t, done: *std.atomic.Value(bool)) void {
+            for (0..100) |_| {
+                if (done.load(.acquire)) return;
+                io_mod.sleep(10 * std.time.ns_per_ms);
+            }
+            std.posix.kill(pid, .KILL) catch {};
+        }
+
+        fn cleanup(pid: std.posix.pid_t) void {
+            var status: c_int = 0;
+            if (std.c.waitpid(pid, &status, std.posix.W.NOHANG) == 0) {
+                std.posix.kill(pid, .KILL) catch {};
+                _ = std.c.waitpid(pid, &status, 0);
+            }
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(root);
+    const ready = try std.fs.path.join(std.testing.allocator, &.{ root, "ready" });
+    defer std.testing.allocator.free(ready);
+    const argv = [_][]const u8{
+        "/usr/bin/python3",
+        "-c",
+        "import os,signal,sys,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); (os.close(1),os.close(2)) if sys.argv[2]=='closed' else None; os.read(0,1) if sys.argv[3]=='input' else None; open(sys.argv[1],'w').write(str(os.getpid())); time.sleep(60)",
+        ready,
+        if (close_output) "closed" else "open",
+        if (block_input) "input" else "empty",
+    };
+    var task = try std.Io.concurrent(io_mod.getIo(), Probe.run, .{ &argv, block_input });
+    var joined = false;
+    defer if (!joined) task.cancel(io_mod.getIo()) catch {};
+    var pid: ?std.posix.pid_t = null;
+    for (0..5000) |_| {
+        if (tmp.dir.openFile(io_mod.getIo(), "ready", .{})) |opened| {
+            var file = opened;
+            defer file.close(io_mod.getIo());
+            const bytes = try io_mod.readFileToEnd(std.testing.allocator, &file, 32);
+            defer std.testing.allocator.free(bytes);
+            pid = std.fmt.parseInt(std.posix.pid_t, bytes, 10) catch null;
+            if (pid != null) break;
+        } else |_| {}
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expect(pid != null);
+    defer Probe.cleanup(pid.?);
+    var done = std.atomic.Value(bool).init(false);
+    const rescuer = try std.Thread.spawn(.{}, Probe.rescue, .{ pid.?, &done });
+    defer rescuer.join();
+    const started = io_mod.milliTimestamp();
+    const result = task.cancel(io_mod.getIo());
+    joined = true;
+    const elapsed = io_mod.milliTimestamp() - started;
+    done.store(true, .release);
+    try std.testing.expectError(error.Canceled, result);
+    try std.testing.expect(elapsed < 500);
+    try std.testing.expectError(error.ProcessNotFound, std.posix.kill(pid.?, @enumFromInt(0)));
 }
 
 test "default Keychain availability probe is cancellable" {
@@ -892,43 +728,69 @@ test "default Keychain availability probe is cancellable" {
     try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
 }
 
-test "cancellable MCP Keychain store wait interrupts a stalled child" {
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
-        return error.SkipZigTest;
-    }
-    const Canceller = struct {
-        flag: *std.atomic.Value(bool),
+test "Keychain value store transports credentials through stdin" {
+    const argv = mcpScriptArgv("store", "user", "test-service");
+    try std.testing.expectEqualStrings("/usr/bin/osascript", argv[0]);
+    try std.testing.expect(std.mem.find(u8, argv[4], "fileHandleWithStandardInput") != null);
+    for (argv) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "vca_secret_value"));
+}
 
-        fn run(self: *@This()) void {
-            io_mod.sleep(25 * std.time.ns_per_ms);
-            self.flag.store(true, .release);
+test "helper cancellation abandons output retained by an external process" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const Probe = struct {
+        fn run(root: []const u8) !void {
+            const result = try runMcpKeychainProcess(std.testing.allocator, &.{
+                "/usr/bin/python3",                                                                                                                                                                                                                                                     "-c",
+                "import array,os,socket,sys; os.chdir(sys.argv[1]); s=socket.socket(socket.AF_UNIX); s.connect('output.sock'); s.sendmsg([b'x'],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,array.array('i',[1]))]); open('sender','w').write(str(os.getpid())); print('output',flush=True)", root,
+            }, null, .limited(32));
+            defer std.testing.allocator.free(result.stdout);
+            defer std.testing.allocator.free(result.stderr);
+        }
+
+        fn waitFile(dir: std.Io.Dir, name: []const u8) !void {
+            for (0..5000) |_| {
+                if (dir.statFile(io_mod.getIo(), name, .{})) |_| return else |_| {}
+                io_mod.sleep(std.time.ns_per_ms);
+            }
+            return error.TestFileNotReady;
         }
     };
-
-    var child = try std.process.spawn(std.testing.io, .{
-        .argv = &.{ "/bin/sh", "-c", "exec sleep 60" },
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    var broker = try std.process.spawn(io_mod.getIo(), .{
+        .argv = &.{
+            "/usr/bin/python3",                                                                                                                                                                                                                                                                                                                 "-c",
+            "import array,os,signal,socket,sys; os.chdir(sys.argv[1]); s=socket.socket(socket.AF_UNIX); s.bind('output.sock'); s.listen(1); open('broker','w').close(); c,_=s.accept(); _,ancillary,_,_=c.recvmsg(1,socket.CMSG_SPACE(4)); fds=array.array('i'); fds.frombytes(ancillary[0][2][:4]); open('held','w').close(); signal.pause()", root,
+        },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
     });
-    defer child.kill(std.testing.io);
-    var cancel = std.atomic.Value(bool).init(false);
-    var canceller = Canceller{ .flag = &cancel };
-    const thread = try std.Thread.spawn(.{}, Canceller.run, .{&canceller});
-    const started_ms = io_mod.milliTimestamp();
-    try std.testing.expectError(
-        error.Cancelled,
-        waitForMcpStore(&child, &cancel),
-    );
-    thread.join();
-    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
-}
-
-test "Keychain value store uses a bounded PTY bridge without a secret argument" {
-    const argv = storeValueArgv();
-    try std.testing.expectEqualStrings("/usr/bin/expect", argv[0]);
-    try std.testing.expect(std.mem.indexOf(u8, argv[2], "set timeout 10") != null);
-    for (argv) |arg| {
-        try std.testing.expect(!std.mem.eql(u8, arg, "vca_secret_value"));
+    const broker_pid = broker.id.?;
+    defer {
+        std.posix.kill(broker_pid, .KILL) catch {};
+        _ = broker.wait(io_mod.getIo()) catch {};
     }
+    try Probe.waitFile(tmp.dir, "broker");
+    var task = try std.Io.concurrent(io_mod.getIo(), Probe.run, .{root});
+    var joined = false;
+    defer if (!joined) task.cancel(io_mod.getIo()) catch {};
+    try Probe.waitFile(tmp.dir, "held");
+    try Probe.waitFile(tmp.dir, "sender");
+    var sender_file = try tmp.dir.openFile(io_mod.getIo(), "sender", .{});
+    defer sender_file.close(io_mod.getIo());
+    const bytes = try io_mod.readFileToEnd(alloc, &sender_file, 32);
+    defer alloc.free(bytes);
+    const sender = try std.fmt.parseInt(std.posix.pid_t, bytes, 10);
+    const started = io_mod.milliTimestamp();
+    const result = task.cancel(io_mod.getIo());
+    joined = true;
+    try std.testing.expectError(error.Canceled, result);
+    try std.testing.expect(io_mod.milliTimestamp() - started < 500);
+    try std.testing.expectError(error.ProcessNotFound, std.posix.kill(sender, @enumFromInt(0)));
+    // This descriptor belongs to an independent owner, which shutdown must not kill.
+    try std.posix.kill(broker_pid, @enumFromInt(0));
 }

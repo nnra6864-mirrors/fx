@@ -14,6 +14,7 @@
 //   enforceStructuredRetentionAndReport
 
 const std = @import("std");
+const build_checkpoint = @import("../render_engine/build_checkpoint.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const io_mod = @import("../../core/shared/io.zig");
@@ -170,7 +171,12 @@ pub const CommandOutputProjection = struct {
     }
 
     pub fn bytesForEntry(self: *const CommandOutputProjection, entry_id: u32) ?[]const u8 {
+        return self.bytesForEntryInterruptible(entry_id, null) catch unreachable;
+    }
+
+    fn bytesForEntryInterruptible(self: *const CommandOutputProjection, entry_id: u32, checkpoint: ?*build_checkpoint.BuildCheckpoint) !?[]const u8 {
         for (self.entries.items) |entry| {
+            try build_checkpoint.tick(checkpoint);
             if (entry.entry_id != entry_id) continue;
             return self.bytes.items[entry.byte_start..entry.byte_end];
         }
@@ -185,8 +191,13 @@ pub fn foldedBlockRetainedBytes(block: FoldedCommandBlock) usize {
 }
 
 pub fn commandOutputBlockRetainedBytes(block: CommandOutputBlock) usize {
+    return commandOutputBlockRetainedBytesInterruptible(block, null) catch unreachable;
+}
+
+pub fn commandOutputBlockRetainedBytesInterruptible(block: CommandOutputBlock, checkpoint: ?*build_checkpoint.BuildCheckpoint) !usize {
     var total = block.retained_text_bytes;
     for (block.lines.items) |line| {
+        try build_checkpoint.tick(checkpoint);
         total +|= command_output_line_descriptor_bytes;
         if (line.entry_id != null) total +|= command_output_entry_descriptor_bytes;
     }
@@ -1003,6 +1014,17 @@ pub fn trimRetainedCommandOutputLine(
     block_index: usize,
     line_index: usize,
 ) !bool {
+    return trimRetainedCommandOutputLineInterruptible(shell, alloc, block_index, line_index, null);
+}
+
+pub fn trimRetainedCommandOutputLineInterruptible(
+    shell: anytype,
+    alloc: Allocator,
+    block_index: usize,
+    line_index: usize,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !bool {
+    try build_checkpoint.tick(checkpoint);
     var block = &shell.command_output_blocks.items[block_index];
     for (block.open_line_indices) |open_index| {
         if (open_index == line_index) return false;
@@ -1042,12 +1064,12 @@ pub fn trimRetainedCommandOutputLine(
             });
         }
     }
-    _ = coalesceCommandOutputPrunedRanges(shell, alloc, block_index);
     block.retention_overflow = true;
     block.overflow_line_index = if (block.overflow_line_index) |overflow_index|
         @min(overflow_index, line_index)
     else
         line_index;
+    _ = try coalesceCommandOutputPrunedRangesInterruptible(shell, alloc, block_index, checkpoint);
     return true;
 }
 
@@ -1462,17 +1484,27 @@ fn sealCommandOutputBlock(
 }
 
 fn rawEntryIndex(shell: anytype, id: u32) ?usize {
+    return rawEntryIndexInterruptible(shell, id, null) catch unreachable;
+}
+
+fn rawEntryIndexInterruptible(shell: anytype, id: u32, checkpoint: ?*build_checkpoint.BuildCheckpoint) !?usize {
     for (shell.entries.items, 0..) |entry, index| {
+        try build_checkpoint.tick(checkpoint);
         if (entry == .raw_bytes and entry.raw_bytes.id == id) return index;
     }
     return null;
 }
 
 fn removeRawEntriesByIds(shell: anytype, alloc: Allocator, ids: []const u32) void {
+    removeRawEntriesByIdsInterruptible(shell, alloc, ids, null) catch unreachable;
+}
+
+fn removeRawEntriesByIdsInterruptible(shell: anytype, alloc: Allocator, ids: []const u32, checkpoint: ?*build_checkpoint.BuildCheckpoint) !void {
     if (ids.len == 0) return;
 
     var i: usize = 0;
     while (i < shell.entries.items.len) {
+        try build_checkpoint.tick(checkpoint);
         const entry = shell.entries.items[i];
         if (entry == .raw_bytes and containsEntryId(ids, entry.raw_bytes.id)) {
             var removed = shell.entries.orderedRemove(i);
@@ -1500,15 +1532,30 @@ pub fn isPrunedRangeAnchor(block: CommandOutputBlock, entry_id: u32) bool {
 }
 
 pub fn commandBlockOwnsEntry(block: CommandOutputBlock, entry_id: u32) bool {
-    return block.entry_id == entry_id or
-        isPrunedRangeAnchor(block, entry_id) or
-        containsEntryId(block.live_entry_ids.items, entry_id) or
-        containsEntryId(block.source_entry_ids.items, entry_id);
+    return commandBlockOwnsEntryInterruptible(block, entry_id, null) catch unreachable;
 }
 
-fn commandBlockOwnsSourcePosition(block: CommandOutputBlock, entry_id: u32) bool {
-    if (commandBlockOwnsEntry(block, entry_id)) return true;
+pub fn commandBlockOwnsEntryInterruptible(block: CommandOutputBlock, entry_id: u32, checkpoint: ?*build_checkpoint.BuildCheckpoint) !bool {
+    if (block.entry_id == entry_id) return true;
+    for (block.pruned_ranges.items) |range| {
+        try build_checkpoint.tick(checkpoint);
+        if (range.anchor_entry_id == entry_id) return true;
+    }
+    for (block.live_entry_ids.items) |id| {
+        try build_checkpoint.tick(checkpoint);
+        if (id == entry_id) return true;
+    }
+    for (block.source_entry_ids.items) |id| {
+        try build_checkpoint.tick(checkpoint);
+        if (id == entry_id) return true;
+    }
+    return false;
+}
+
+fn commandBlockOwnsSourcePosition(block: CommandOutputBlock, entry_id: u32, checkpoint: ?*build_checkpoint.BuildCheckpoint) !bool {
+    if (try commandBlockOwnsEntryInterruptible(block, entry_id, checkpoint)) return true;
     for (block.lines.items) |line| {
+        try build_checkpoint.tick(checkpoint);
         if (line.entry_id == entry_id) return true;
     }
     return false;
@@ -1519,13 +1566,15 @@ fn commandEntriesShareRun(
     block: CommandOutputBlock,
     lhs_entry_id: u32,
     rhs_entry_id: u32,
-) bool {
-    const lhs_index = rawEntryIndex(shell, lhs_entry_id) orelse return false;
-    const rhs_index = rawEntryIndex(shell, rhs_entry_id) orelse return false;
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !bool {
+    const lhs_index = (try rawEntryIndexInterruptible(shell, lhs_entry_id, checkpoint)) orelse return false;
+    const rhs_index = (try rawEntryIndexInterruptible(shell, rhs_entry_id, checkpoint)) orelse return false;
     const start = @min(lhs_index, rhs_index);
     const end = @max(lhs_index, rhs_index);
     for (shell.entries.items[start + 1 .. end]) |entry| {
-        if (!commandBlockOwnsSourcePosition(block, entry.id())) return false;
+        try build_checkpoint.tick(checkpoint);
+        if (!try commandBlockOwnsSourcePosition(block, entry.id(), checkpoint)) return false;
     }
     return true;
 }
@@ -1535,12 +1584,14 @@ fn retargetCommandOutputEntryIdentity(
     block_index: usize,
     removed_entry_id: u32,
     retained_entry_id: u32,
-) void {
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !void {
     var block = &shell.command_output_blocks.items[block_index];
     if (block.entry_id == removed_entry_id) block.entry_id = retained_entry_id;
     const Shell = @TypeOf(shell.*);
     if (comptime @hasField(Shell, "tool_details")) {
         for (shell.tool_details.items) |*detail| {
+            try build_checkpoint.tick(checkpoint);
             if (detail.command_output_entry_id == removed_entry_id) {
                 detail.command_output_entry_id = retained_entry_id;
             }
@@ -1560,21 +1611,33 @@ pub fn coalesceCommandOutputPrunedRanges(
     alloc: Allocator,
     block_index: usize,
 ) bool {
+    return coalesceCommandOutputPrunedRangesInterruptible(shell, alloc, block_index, null) catch unreachable;
+}
+
+pub fn coalesceCommandOutputPrunedRangesInterruptible(
+    shell: anytype,
+    alloc: Allocator,
+    block_index: usize,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !bool {
     var changed = false;
     var left_index: usize = 0;
     while (left_index < shell.command_output_blocks.items[block_index].pruned_ranges.items.len) {
+        try build_checkpoint.tick(checkpoint);
         var right_index = left_index + 1;
         while (right_index < shell.command_output_blocks.items[block_index].pruned_ranges.items.len) {
+            try build_checkpoint.tick(checkpoint);
             const block = shell.command_output_blocks.items[block_index];
             const left = block.pruned_ranges.items[left_index];
             const right = block.pruned_ranges.items[right_index];
             const ordinal_adjacent = left.end_record == right.start_record or
                 right.end_record == left.start_record;
-            if (!ordinal_adjacent or !commandEntriesShareRun(
+            if (!ordinal_adjacent or !try commandEntriesShareRun(
                 shell,
                 block,
                 left.anchor_entry_id,
                 right.anchor_entry_id,
+                checkpoint,
             )) {
                 right_index += 1;
                 continue;
@@ -1601,12 +1664,13 @@ pub fn coalesceCommandOutputPrunedRanges(
             };
             _ = mutable_block.pruned_ranges.orderedRemove(right_index);
             const ids = [_]u32{removed_entry_id};
-            removeRawEntriesByIds(shell, alloc, &ids);
-            retargetCommandOutputEntryIdentity(
+            try removeRawEntriesByIdsInterruptible(shell, alloc, &ids, checkpoint);
+            try retargetCommandOutputEntryIdentity(
                 shell,
                 block_index,
                 removed_entry_id,
                 retained_entry_id,
+                checkpoint,
             );
             changed = true;
         }
@@ -1645,22 +1709,37 @@ pub fn renderCompactCommandOutputWithProcessPresentation(
     cols: u16,
     process_presentation: ?types.CommandProcessPresentation,
 ) !CommandOutputProjection {
+    return renderCompactCommandOutputInterruptible(alloc, block, policy, cols, process_presentation, null);
+}
+
+pub fn renderCompactCommandOutputInterruptible(
+    alloc: Allocator,
+    block: CommandOutputBlock,
+    policy: CommandOutputRenderPolicy,
+    cols: u16,
+    process_presentation: ?types.CommandProcessPresentation,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !CommandOutputProjection {
     var projection: CommandOutputProjection = .{};
     errdefer projection.deinit(alloc);
 
     const plans = try alloc.alloc(CompactLinePlan, block.lines.items.len);
     defer alloc.free(plans);
-    @memset(plans, .{});
+    for (plans) |*plan| {
+        try build_checkpoint.tick(checkpoint);
+        plan.* = .{};
+    }
 
     var remaining_rows: usize = if (cols == 0)
         0
     else
         compact_output_row_limit -| @intFromBool(process_presentation != null);
     var hidden_records = block.total_lines -| block.lines.items.len;
-    const final_position = finalCommandOutputPosition(block);
+    const final_position = try finalCommandOutputPosition(block, checkpoint);
 
     if (cols > 0) {
         for (block.lines.items, 0..) |line, index| {
+            try build_checkpoint.tick(checkpoint);
             if (!line.visible) continue;
             if (remaining_rows == 0) {
                 plans[index].hidden = true;
@@ -1690,6 +1769,7 @@ pub fn renderCompactCommandOutputWithProcessPresentation(
     const terminal_process = if (projection_enabled) process_presentation else null;
 
     for (block.lines.items, 0..) |line, index| {
+        try build_checkpoint.tick(checkpoint);
         const entry_id = commandOutputLineEntryId(block, index) orelse continue;
         const final_line = if (final_position) |position|
             position == .line and position.line == index
@@ -1737,6 +1817,7 @@ pub fn renderCompactCommandOutputWithProcessPresentation(
     }
 
     for (block.pruned_ranges.items, 0..) |range, index| {
+        try build_checkpoint.tick(checkpoint);
         const final_range = if (final_position) |position|
             position == .pruned_range and position.pruned_range == index
         else
@@ -1773,10 +1854,14 @@ const CompactFinalPosition = union(enum) {
     pruned_range: usize,
 };
 
-fn finalCommandOutputPosition(block: CommandOutputBlock) ?CompactFinalPosition {
+fn finalCommandOutputPosition(
+    block: CommandOutputBlock,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !?CompactFinalPosition {
     var best_end: usize = 0;
     var best: ?CompactFinalPosition = null;
     for (block.lines.items, 0..) |line, index| {
+        try build_checkpoint.tick(checkpoint);
         if (commandOutputLineEntryId(block, index) == null) continue;
         const ordinal = if (index > 0 and line.record_ordinal == 0)
             index
@@ -1789,6 +1874,7 @@ fn finalCommandOutputPosition(block: CommandOutputBlock) ?CompactFinalPosition {
         }
     }
     for (block.pruned_ranges.items, 0..) |range, index| {
+        try build_checkpoint.tick(checkpoint);
         if (best == null or range.end_record >= best_end) {
             best_end = range.end_record;
             best = .{ .pruned_range = index };
@@ -1824,9 +1910,18 @@ pub fn processPresentationForBlock(
     shell: anytype,
     block: CommandOutputBlock,
 ) ?types.CommandProcessPresentation {
+    return processPresentationForBlockInterruptible(shell, block, null) catch unreachable;
+}
+
+pub fn processPresentationForBlockInterruptible(
+    shell: anytype,
+    block: CommandOutputBlock,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !?types.CommandProcessPresentation {
     const Shell = @TypeOf(shell.*);
     if (comptime !@hasField(Shell, "tool_details")) return null;
     for (shell.tool_details.items) |detail| {
+        try build_checkpoint.tick(checkpoint);
         if (!detail.isCapturedCommand()) continue;
         if (detail.lifecycle_id != null and block.lifecycle_id != null and
             sameLifecycleId(detail.lifecycle_id, block.lifecycle_id))
@@ -2295,26 +2390,39 @@ test "compact process row names timeout and output capture causes" {
 }
 
 pub fn syncCommandOutputBlockEntries(shell: anytype, alloc: Allocator) !bool {
+    return syncCommandOutputBlockEntriesInterruptible(shell, alloc, null);
+}
+
+pub fn syncCommandOutputBlockEntriesInterruptible(
+    shell: anytype,
+    alloc: Allocator,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !bool {
+    try build_checkpoint.poll(checkpoint);
     if (shell.command_output_blocks.items.len == 0) return false;
     var changed = false;
     const cols: u16 = if (shell.layout.cols > 0) shell.layout.cols else 80;
     var entry_indices: std.AutoHashMapUnmanaged(u32, usize) = .empty;
     defer entry_indices.deinit(alloc);
     for (shell.entries.items, 0..) |entry, index| {
+        try build_checkpoint.tick(checkpoint);
         if (entry != .raw_bytes) continue;
         const result = try entry_indices.getOrPut(alloc, entry.raw_bytes.id);
         if (!result.found_existing) result.value_ptr.* = index;
     }
     for (shell.command_output_blocks.items) |block| {
-        var projection = try renderCompactCommandOutputWithProcessPresentation(
+        try build_checkpoint.tick(checkpoint);
+        var projection = try renderCompactCommandOutputInterruptible(
             alloc,
             block,
             shell.command_output_render,
             cols,
-            processPresentationForBlock(shell, block),
+            try processPresentationForBlockInterruptible(shell, block, checkpoint),
+            checkpoint,
         );
         defer projection.deinit(alloc);
         for (block.lines.items, 0..) |_, line_index| {
+            try build_checkpoint.tick(checkpoint);
             const entry_id = commandOutputLineEntryId(block, line_index) orelse continue;
             changed = try syncCommandOutputEntry(
                 shell,
@@ -2322,15 +2430,18 @@ pub fn syncCommandOutputBlockEntries(shell: anytype, alloc: Allocator) !bool {
                 projection,
                 entry_id,
                 &entry_indices,
+                checkpoint,
             ) or changed;
         }
         for (block.pruned_ranges.items) |range| {
+            try build_checkpoint.tick(checkpoint);
             changed = try syncCommandOutputEntry(
                 shell,
                 alloc,
                 projection,
                 range.anchor_entry_id,
                 &entry_indices,
+                checkpoint,
             ) or changed;
         }
     }
@@ -2343,8 +2454,9 @@ fn syncCommandOutputEntry(
     projection: CommandOutputProjection,
     entry_id: u32,
     entry_indices: *const std.AutoHashMapUnmanaged(u32, usize),
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) !bool {
-    const desired = projection.bytesForEntry(entry_id) orelse "";
+    const desired = (try projection.bytesForEntryInterruptible(entry_id, checkpoint)) orelse "";
     const entry_index = entry_indices.get(entry_id) orelse return false;
     var raw = &shell.entries.items[entry_index].raw_bytes;
     raw.class = .command_output;

@@ -214,6 +214,14 @@ pub fn decodeFrame(alloc: Allocator, bytes: []const u8) DecodeError!DecodedFrame
         else => return failDecodedFrame(error.InvalidPayload),
     };
     errdefer parsed.deinit();
+    switch (parsed.value) {
+        .request => |*request| switch (request.*) {
+            .start => |*value| value.process_owner = null,
+            .close_owner => |*value| value.process_owner = null,
+            else => {},
+        },
+        else => {},
+    }
     try (contracts.HostMessage{
         .envelope = header.envelope,
         .payload = parsed.value,
@@ -281,11 +289,11 @@ fn encodeKind(kind: contracts.MessageKind) WireKind {
 fn decodeKind(kind: u8, subject: u8) DecodeError!contracts.MessageKind {
     return switch (kind) {
         0 => if (subject == 0) .hello else error.InvalidFrameSubject,
-        1 => if (subject <= @intFromEnum(contracts.Action.close))
+        1 => if (subject <= @intFromEnum(contracts.Action.close_owner))
             .{ .request = @enumFromInt(subject) }
         else
             error.InvalidFrameSubject,
-        2 => if (subject <= @intFromEnum(contracts.Action.close))
+        2 => if (subject <= @intFromEnum(contracts.Action.close_owner))
             .{ .response = @enumFromInt(subject) }
         else
             error.InvalidFrameSubject,
@@ -309,6 +317,92 @@ fn testRequestFrame(alloc: Allocator) !void {
     const message = decoded.message();
     try std.testing.expectEqual(@as(u64, 41), message.envelope.correlation_id.?.value);
     try std.testing.expectEqual(contracts.Action.screen, message.payload.request.action());
+}
+
+test "host protocol accepts the appended owner exit request tag" {
+    const payload = "{\"request\":{\"close_owner\":{\"authority\":{\"session_id\":\"session-1\",\"proof\":{\"bytes\":[" ++ "1," ** 31 ++ "1]}}}}}";
+    var bytes: [header_len + payload.len]u8 = @splat(0);
+    @memcpy(bytes[0..4], magic);
+    std.mem.writeInt(u16, bytes[4..6], contracts.current_protocol_revision, .little);
+    bytes[6] = 1;
+    bytes[7] = 10;
+    std.mem.writeInt(u64, bytes[16..24], 1, .little);
+    std.mem.writeInt(u32, bytes[24..28], payload.len, .little);
+    @memcpy(bytes[header_len..], payload);
+    var decoded = try decodeFrame(std.testing.allocator, &bytes);
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("close_owner", @tagName(decoded.message().payload.request));
+}
+
+fn decodeTestRequestPayload(alloc: Allocator, action: contracts.Action, payload: []const u8) !DecodedFrame {
+    const header = try (Header{ .envelope = .{
+        .revision = contracts.current_protocol_revision,
+        .kind = .{ .request = action },
+        .required_capabilities = contracts.known_protocol_capabilities,
+        .correlation_id = .{ .value = 1 },
+        .payload_len = @intCast(payload.len),
+    } }).encode();
+    const bytes = try std.mem.concat(alloc, u8, &.{ &header, payload });
+    defer alloc.free(bytes);
+    return decodeFrame(alloc, bytes);
+}
+
+test "owner lifecycle decoding discards caller supplied process identity" {
+    const forged = try contracts.ProcessOwner.init(99, "forged-instance");
+    const authority = contracts.SessionExitAuthority{ .session_id = "owner-1", .proof = .{ .bytes = @splat(7) } };
+    const payloads = .{
+        .{ .request = .{ .start = .{ .cwd = "/workspace", .process_owner = forged } } },
+        .{ .request = .{ .close_owner = .{ .authority = authority, .process_owner = forged } } },
+    };
+    inline for (payloads, .{ contracts.Action.start, contracts.Action.close_owner }) |payload, action| {
+        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+        try std.json.Stringify.value(payload, .{}, &output.writer);
+        var decoded = try decodeTestRequestPayload(std.testing.allocator, action, output.written());
+        defer decoded.deinit();
+        const request = @field(decoded.message().payload.request, @tagName(action));
+        try std.testing.expect(request.process_owner == null);
+    }
+}
+
+test "owner exit wire validation rejects malformed identifiers and proofs" {
+    const cases = [_]struct { authority: contracts.SessionExitAuthority, expected: anyerror }{
+        .{ .authority = .{ .session_id = "../other", .proof = .{ .bytes = @splat(1) } }, .expected = error.InvalidSessionId },
+        .{ .authority = .{ .session_id = "owner-1", .proof = .{ .bytes = @splat(0) } }, .expected = error.InvalidHolderProof },
+    };
+    for (cases) |case| {
+        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+        try std.json.Stringify.value(.{ .request = .{ .close_owner = .{ .authority = case.authority } } }, .{}, &output.writer);
+        try std.testing.expectError(case.expected, decodeTestRequestPayload(std.testing.allocator, .close_owner, output.written()));
+    }
+    const short_proof = "{\"request\":{\"close_owner\":{\"authority\":{\"session_id\":\"owner-1\",\"proof\":{\"bytes\":[1]}}}}}";
+    try std.testing.expectError(error.InvalidPayload, decodeTestRequestPayload(std.testing.allocator, .close_owner, short_proof));
+}
+
+test "owner exit request and result round trips clean every allocation failure" {
+    const Probe = struct {
+        fn run(alloc: Allocator) !void {
+            const request: contracts.ActionRequest = .{ .close_owner = .{
+                .authority = .{ .session_id = "owner-1", .proof = .{ .bytes = @splat(7) } },
+                .process_owner = try contracts.ProcessOwner.init(42, "verified-instance"),
+            } };
+            var encoded = try encodeFrame(alloc, contracts.current_protocol_revision, contracts.required_capabilities(request), .{ .value = 2 }, .{ .request = request });
+            defer encoded.deinit(alloc);
+            try std.testing.expect(std.mem.find(u8, encoded.bytes[header_len..], "process_owner") == null);
+            var decoded = try decodeFrame(alloc, encoded.bytes);
+            defer decoded.deinit();
+            try std.testing.expectEqualStrings("owner-1", decoded.message().payload.request.close_owner.authority.session_id);
+            try std.testing.expectEqual(request.close_owner.authority.proof, decoded.message().payload.request.close_owner.authority.proof);
+            var response = try encodeFrame(alloc, contracts.current_protocol_revision, contracts.required_capabilities(request), .{ .value = 2 }, .{ .response = .{ .success = .{ .close_owner = .{ .closed_sessions = 3 } } } });
+            defer response.deinit(alloc);
+            var result = try decodeFrame(alloc, response.bytes);
+            defer result.deinit();
+            try std.testing.expectEqual(@as(u16, 3), result.message().payload.response.success.close_owner.closed_sessions);
+            try std.testing.expectEqual(@as(u8, 10), response.bytes[7]);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
 }
 
 test "host protocol round trips owned correlated frames" {

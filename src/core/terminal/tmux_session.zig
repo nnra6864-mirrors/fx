@@ -5,6 +5,7 @@ const host_capabilities = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const process_identity = @import("../execution/process_identity.zig");
+const process_owner = @import("../execution/process_owner.zig");
 const process_provider_mod = @import(
     "../execution/process_provider.zig",
 );
@@ -359,7 +360,7 @@ pub const Backend = struct {
         dimensions: contracts.Dimensions,
         config: LauncherConfig,
     ) !Backend {
-        try probe(alloc);
+        try probe(alloc, null);
         var paths = try Paths.init(
             alloc,
             durable_root,
@@ -400,7 +401,7 @@ pub const Backend = struct {
             "-y",
             rows,
             launcher_command,
-        });
+        }, null, null);
         errdefer {
             killSessionAt(alloc, paths.socket, paths.session_name);
             cleanupSocketIfUnused(alloc, paths.socket);
@@ -419,7 +420,7 @@ pub const Backend = struct {
             "-g",
             namespace_option,
             namespace_value,
-        });
+        }, null, null);
         try runTmuxNoOutput(alloc, paths.socket, &.{
             "set-option",
             "-w",
@@ -427,16 +428,16 @@ pub const Backend = struct {
             paths.session_name,
             "remain-on-exit",
             "on",
-        });
+        }, null, null);
         try runTmuxNoOutput(alloc, paths.socket, &.{
             "set-option",
             "-t",
             paths.session_name,
             namespace_option,
             backend_identity,
-        });
+        }, null, null);
 
-        var pane = try inspectPane(alloc, &paths);
+        var pane = try inspectPane(alloc, &paths, null);
         defer pane.deinit();
         const token = try process_provider.captureToken(
             alloc,
@@ -477,7 +478,7 @@ pub const Backend = struct {
         backend_identity: []const u8,
         executable: []const u8,
     ) !Backend {
-        try probe(alloc);
+        try probe(alloc, null);
         var paths = try Paths.init(
             alloc,
             durable_root,
@@ -495,15 +496,10 @@ pub const Backend = struct {
         errdefer alloc.free(backend_identity_owned);
         const executable_owned = try alloc.dupe(u8, executable);
         errdefer alloc.free(executable_owned);
-        if (!try ownedSessionPresent(alloc, &paths, backend_identity)) {
+        if (!try ownedSessionPresent(alloc, &paths, backend_identity, null)) {
             return error.TmuxRecoveryMissing;
         }
-        const pane_state = validateOwnedPane(
-            alloc,
-            process_provider,
-            &paths,
-            .{ .manifest = parsed },
-        ) catch |err| {
+        const pane_state = validateOwnedPane(alloc, process_provider, &paths, .{ .manifest = parsed }, null) catch |err| {
             debug_trace.logf(
                 "terminal_host",
                 "tmux recovery ownership retained backend={s} stage=pane-validation err={s}",
@@ -535,7 +531,7 @@ pub const Backend = struct {
     }
 
     pub fn deinitRetainingOwnedNamespace(self: *Backend) void {
-        self.stopCapture();
+        self.stopCapture(null);
         const capture_socket_present = blk: {
             std.Io.Dir.accessAbsolute(
                 io_mod.getIo(),
@@ -588,11 +584,11 @@ pub const Backend = struct {
             "-t",
             self.paths.target,
             command,
-        });
+        }, null, null);
     }
 
     pub fn acceptCapture(self: *Backend) !std.Io.net.Stream {
-        errdefer self.stopCapture();
+        errdefer self.stopCapture(null);
         const server = &self.capture_server.?;
         const deadline = PeerDeadline.init(capture_accept_deadline_ms);
         var stream = try acceptBeforeDeadline(server, deadline, null);
@@ -605,12 +601,12 @@ pub const Backend = struct {
         return stream;
     }
 
-    pub fn stopCapture(self: *Backend) void {
+    pub fn stopCapture(self: *Backend, cancel_flag: ?*const std.atomic.Value(bool)) void {
         runTmuxNoOutput(self.alloc, self.paths.socket, &.{
             "pipe-pane",
             "-t",
             self.paths.target,
-        }) catch {};
+        }, cancel_flag, null) catch |err| debug_trace.logf("terminal_host", "tmux capture stop skipped backend={s} err={s}", .{ self.backend_identity, @errorName(err) });
         self.closeCaptureServer();
     }
 
@@ -634,7 +630,7 @@ pub const Backend = struct {
     }
 
     pub fn captureScreen(self: *Backend) !ScreenCapture {
-        var pane = try inspectPane(self.alloc, &self.paths);
+        var pane = try inspectPane(self.alloc, &self.paths, null);
         defer pane.deinit();
         const bytes = try runTmux(self.alloc, self.paths.socket, &.{
             "capture-pane",
@@ -642,7 +638,7 @@ pub const Backend = struct {
             "-e",
             "-t",
             self.paths.target,
-        });
+        }, null, null);
         return .{
             .alloc = self.alloc,
             .bytes = bytes,
@@ -682,7 +678,7 @@ pub const Backend = struct {
         );
     }
 
-    pub fn resize(self: *Backend, dimensions: contracts.Dimensions) !void {
+    pub fn resize(self: *Backend, dimensions: contracts.Dimensions, cancel_flag: ?*const std.atomic.Value(bool)) !void {
         const columns = try formatU16(self.alloc, dimensions.columns);
         defer self.alloc.free(columns);
         const rows = try formatU16(self.alloc, dimensions.rows);
@@ -695,11 +691,11 @@ pub const Backend = struct {
             columns,
             "-y",
             rows,
-        });
+        }, cancel_flag, null);
     }
 
     pub fn killSession(self: *Backend) void {
-        self.stopCapture();
+        self.stopCapture(null);
         killSessionAt(self.alloc, self.paths.socket, self.paths.session_name);
         cleanupFiles(&self.paths);
         cleanupSocketIfUnused(self.alloc, self.paths.socket);
@@ -708,14 +704,9 @@ pub const Backend = struct {
     pub fn cleanupChecked(
         self: *Backend,
         process_provider: process_provider_mod.Provider,
+        deadline_ms: ?i64,
     ) !void {
-        try cleanupOwnedNamespaceWithEvidence(
-            self.alloc,
-            process_provider,
-            &self.paths,
-            self.backend_identity,
-            .{ .manifest = self.manifest },
-        );
+        try cleanupOwnedNamespaceWithEvidence(self.alloc, process_provider, &self.paths, self.backend_identity, .{ .manifest = self.manifest }, deadline_ms);
     }
 
     pub fn paneIsDead(self: *const Backend) bool {
@@ -790,7 +781,7 @@ fn writeTmuxBuffer(
         "delete-buffer",
         "-b",
         buffer_name,
-    }) catch {};
+    }, null, null) catch {};
 
     var paste_args: std.ArrayList([]const u8) = .empty;
     defer paste_args.deinit(alloc);
@@ -802,11 +793,7 @@ fn writeTmuxBuffer(
         "-t",
         target,
     });
-    try runTmuxNoOutput(
-        alloc,
-        socket,
-        paste_args.items,
-    );
+    try runTmuxNoOutput(alloc, socket, paste_args.items, null, null);
 }
 
 pub fn cleanupOwnedNamespace(
@@ -835,7 +822,9 @@ pub fn cleanupOwnedNamespaceChecked(
     transport_root: []const u8,
     backend_identity: []const u8,
     authenticated_process_identity: ?AuthenticatedProcessIdentity,
+    deadline_ms: ?i64,
 ) !void {
+    _ = try remainingCommandTimeout(deadline_ms);
     var paths = try Paths.init(
         alloc,
         durable_root,
@@ -858,14 +847,8 @@ pub fn cleanupOwnedNamespaceChecked(
         .{ .process_identity = identity }
     else
         return error.TmuxRecoveryManifestMissing;
-    if (try privateSocketExists(paths.socket)) try probe(alloc);
-    try cleanupOwnedNamespaceWithEvidence(
-        alloc,
-        process_provider,
-        &paths,
-        backend_identity,
-        evidence,
-    );
+    if (try privateSocketExists(paths.socket)) try probe(alloc, deadline_ms);
+    try cleanupOwnedNamespaceWithEvidence(alloc, process_provider, &paths, backend_identity, evidence, deadline_ms);
 }
 
 fn cleanupOwnedNamespaceWithEvidence(
@@ -874,17 +857,15 @@ fn cleanupOwnedNamespaceWithEvidence(
     paths: *const Paths,
     backend_identity: []const u8,
     evidence: OwnerEvidence,
+    deadline_ms: ?i64,
 ) !void {
-    const session_present = ownedSessionPresent(
-        alloc,
-        paths,
-        backend_identity,
-    ) catch |err| {
+    _ = try remainingCommandTimeout(deadline_ms);
+    const session_present = ownedSessionPresent(alloc, paths, backend_identity, deadline_ms) catch |err| {
         logCleanupFailure(backend_identity, "ownership", err);
         return err;
     };
     if (session_present) {
-        _ = validateOwnedPane(alloc, process_provider, paths, evidence) catch |err| {
+        _ = validateOwnedPane(alloc, process_provider, paths, evidence, deadline_ms) catch |err| {
             logCleanupFailure(backend_identity, "pane", err);
             return err;
         };
@@ -895,13 +876,8 @@ fn cleanupOwnedNamespaceWithEvidence(
             "kill-session",
             "-t",
             paths.session_name,
-        }) catch |err| {
-            waitForOwnedNamespaceAbsent(
-                alloc,
-                process_provider,
-                paths,
-                evidence,
-            ) catch |absence_err| switch (absence_err) {
+        }, null, deadline_ms) catch |err| {
+            waitForOwnedNamespaceAbsent(alloc, process_provider, paths, evidence, deadline_ms) catch |absence_err| switch (absence_err) {
                 error.TmuxCleanupIncomplete => {
                     logCleanupFailure(backend_identity, "kill", err);
                     return err;
@@ -912,32 +888,22 @@ fn cleanupOwnedNamespaceWithEvidence(
                 },
             };
         };
-        waitForOwnedNamespaceAbsent(
-            alloc,
-            process_provider,
-            paths,
-            evidence,
-        ) catch |err| {
+        waitForOwnedNamespaceAbsent(alloc, process_provider, paths, evidence, deadline_ms) catch |err| {
             logCleanupFailure(backend_identity, "absence", err);
             return err;
         };
     } else {
-        waitForOwnedNamespaceAbsent(
-            alloc,
-            process_provider,
-            paths,
-            evidence,
-        ) catch |err| {
+        waitForOwnedNamespaceAbsent(alloc, process_provider, paths, evidence, deadline_ms) catch |err| {
             logCleanupFailure(backend_identity, "absence", err);
             return err;
         };
     }
-    cleanupFilesChecked(paths) catch |err| {
-        logCleanupFailure(backend_identity, "artifacts", err);
+    cleanupSocketIfUnusedChecked(alloc, paths.socket, deadline_ms) catch |err| {
+        logCleanupFailure(backend_identity, "socket", err);
         return err;
     };
-    cleanupSocketIfUnusedChecked(alloc, paths.socket) catch |err| {
-        logCleanupFailure(backend_identity, "socket", err);
+    cleanupFilesChecked(paths) catch |err| {
+        logCleanupFailure(backend_identity, "artifacts", err);
         return err;
     };
 }
@@ -1329,11 +1295,12 @@ test "tmux implementation guard follows canonical platform support" {
     );
 }
 
-fn probe(alloc: Allocator) !void {
-    const result = std.process.run(alloc, io_mod.getIo(), .{
+fn probe(alloc: Allocator, deadline_ms: ?i64) !void {
+    const result = process_owner.run(alloc, .{
         .argv = &.{ "tmux", "-V" },
-        .stdout_limit = .limited(1024),
-        .stderr_limit = .limited(1024),
+        .stdout_limit = 1024,
+        .stderr_limit = 1024,
+        .timeout_ms = try remainingCommandTimeout(deadline_ms),
     }) catch |err| switch (err) {
         error.FileNotFound => return error.TmuxUnavailable,
         else => return err,
@@ -1373,7 +1340,7 @@ fn ensureNamespace(alloc: Allocator, paths: *const Paths) !void {
         "show-options",
         "-gqv",
         namespace_option,
-    }) catch |err| switch (err) {
+    }, null, null) catch |err| switch (err) {
         error.TmuxCommandFailed => return,
         else => return err,
     };
@@ -1389,12 +1356,13 @@ fn ownedSessionPresent(
     alloc: Allocator,
     paths: *const Paths,
     backend_identity: []const u8,
+    deadline_ms: ?i64,
 ) !bool {
     if (!try privateSocketExists(paths.socket)) return false;
-    validateNamespace(alloc, paths, backend_identity) catch |err| switch (err) {
+    validateNamespace(alloc, paths, backend_identity, deadline_ms) catch |err| switch (err) {
         error.ForeignTmuxNamespace, error.TmuxIdentityMismatch => return error.TmuxRecoveryReplaced,
         error.TmuxCommandFailed => {
-            if (!try sessionExists(alloc, paths)) return false;
+            if (!try sessionExists(alloc, paths, deadline_ms)) return false;
             return err;
         },
         else => return err,
@@ -1412,10 +1380,11 @@ fn validateOwnedPane(
     process_provider: process_provider_mod.Provider,
     paths: *const Paths,
     evidence: OwnerEvidence,
+    deadline_ms: ?i64,
 ) !OwnedPaneState {
-    var pane = inspectPane(alloc, paths) catch |err| switch (err) {
+    var pane = inspectPane(alloc, paths, deadline_ms) catch |err| switch (err) {
         error.TmuxCommandFailed => {
-            if (!try sessionExists(alloc, paths)) return .missing;
+            if (!try sessionExists(alloc, paths, deadline_ms)) return .missing;
             return error.TmuxRecoveryReplaced;
         },
         else => return err,
@@ -1450,12 +1419,13 @@ fn validateNamespace(
     alloc: Allocator,
     paths: *const Paths,
     backend_identity: []const u8,
+    deadline_ms: ?i64,
 ) !void {
     const value = try runTmux(alloc, paths.socket, &.{
         "show-options",
         "-gqv",
         namespace_option,
-    });
+    }, null, deadline_ms);
     defer alloc.free(value);
     if (!std.mem.eql(
         u8,
@@ -1468,7 +1438,7 @@ fn validateNamespace(
         "-t",
         paths.session_name,
         namespace_option,
-    });
+    }, null, deadline_ms);
     defer alloc.free(identity);
     if (!std.mem.eql(
         u8,
@@ -1479,7 +1449,7 @@ fn validateNamespace(
     }
 }
 
-fn sessionExists(alloc: Allocator, paths: *const Paths) !bool {
+fn sessionExists(alloc: Allocator, paths: *const Paths, deadline_ms: ?i64) !bool {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(alloc);
     try appendTmuxPrefix(&argv, alloc, paths.socket);
@@ -1488,10 +1458,11 @@ fn sessionExists(alloc: Allocator, paths: *const Paths) !bool {
         "-t",
         paths.session_name,
     });
-    const result = try std.process.run(alloc, io_mod.getIo(), .{
+    const result = try process_owner.run(alloc, .{
         .argv = argv.items,
-        .stdout_limit = .limited(1024),
-        .stderr_limit = .limited(1024),
+        .stdout_limit = 1024,
+        .stderr_limit = 1024,
+        .timeout_ms = try remainingCommandTimeout(deadline_ms),
     });
     defer alloc.free(result.stdout);
     defer alloc.free(result.stderr);
@@ -1503,7 +1474,7 @@ fn sessionExists(alloc: Allocator, paths: *const Paths) !bool {
     };
 }
 
-fn inspectPane(alloc: Allocator, paths: *const Paths) !Pane {
+fn inspectPane(alloc: Allocator, paths: *const Paths, deadline_ms: ?i64) !Pane {
     const format = "#{session_name}|#{window_name}|#{pane_id}|#{pane_pid}|#{pane_dead}|#{pane_dead_status}|#{pane_width}|#{pane_height}|#{cursor_y}|#{cursor_x}|#{cursor_flag}|#{cursor_shape}|#{cursor_blinking}|#{alternate_on}|#{origin_flag}|#{wrap_flag}|#{insert_flag}|#{mouse_standard_flag}|#{mouse_button_flag}|#{mouse_any_flag}|#{keypad_cursor_flag}|#{keypad_flag}";
     const output = try runTmux(alloc, paths.socket, &.{
         "display-message",
@@ -1511,7 +1482,7 @@ fn inspectPane(alloc: Allocator, paths: *const Paths) !Pane {
         "-t",
         paths.target,
         format,
-    });
+    }, null, deadline_ms);
     defer alloc.free(output);
     const trimmed = std.mem.trim(u8, output, "\r\n");
     var fields = std.mem.splitScalar(u8, trimmed, '|');
@@ -1615,12 +1586,21 @@ test "older tmux cursor formats use compatible defaults" {
     try std.testing.expect(try parseTmuxCursorBlinking("1"));
 }
 
+fn remainingCommandTimeout(deadline_ms: ?i64) error{Timeout}!?u64 {
+    const deadline = deadline_ms orelse return null;
+    const remaining = deadline -| io_mod.milliTimestamp();
+    if (remaining <= 0) return error.Timeout;
+    return @intCast(remaining);
+}
+
 fn runTmuxNoOutput(
     alloc: Allocator,
     socket: []const u8,
     args: []const []const u8,
+    cancel_flag: ?*const std.atomic.Value(bool),
+    deadline_ms: ?i64,
 ) !void {
-    const output = try runTmux(alloc, socket, args);
+    const output = try runTmux(alloc, socket, args, cancel_flag, deadline_ms);
     alloc.free(output);
 }
 
@@ -1629,15 +1609,19 @@ fn runTmux(
     alloc: Allocator,
     socket: []const u8,
     args: []const []const u8,
+    cancel_flag: ?*const std.atomic.Value(bool),
+    deadline_ms: ?i64,
 ) ![]u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(alloc);
     try appendTmuxPrefix(&argv, alloc, socket);
     try argv.appendSlice(alloc, args);
-    const result = std.process.run(alloc, io_mod.getIo(), .{
+    const result = process_owner.run(alloc, .{
         .argv = argv.items,
-        .stdout_limit = .limited(max_command_output_bytes),
-        .stderr_limit = .limited(max_command_output_bytes),
+        .stdout_limit = max_command_output_bytes,
+        .stderr_limit = max_command_output_bytes,
+        .timeout_ms = try remainingCommandTimeout(deadline_ms),
+        .cancel_flag = cancel_flag,
     }) catch |err| switch (err) {
         error.FileNotFound => return error.TmuxUnavailable,
         else => return err,
@@ -1651,16 +1635,17 @@ fn runTmux(
 }
 
 fn cleanupSocketIfUnused(alloc: Allocator, socket: []const u8) void {
-    const remaining = runTmux(alloc, socket, &.{"list-sessions"}) catch {
+    const remaining = runTmux(alloc, socket, &.{"list-sessions"}, null, null) catch {
         cleanupPrivateSocket(socket);
         return;
     };
     alloc.free(remaining);
 }
 
-fn cleanupSocketIfUnusedChecked(alloc: Allocator, socket: []const u8) !void {
+fn cleanupSocketIfUnusedChecked(alloc: Allocator, socket: []const u8, deadline_ms: ?i64) !void {
+    _ = try remainingCommandTimeout(deadline_ms);
     if (!try privateSocketExists(socket)) return;
-    const remaining = runTmux(alloc, socket, &.{"list-sessions"}) catch |err| {
+    const remaining = runTmux(alloc, socket, &.{"list-sessions"}, null, deadline_ms) catch |err| {
         if (!try privateSocketExists(socket)) return;
         if (err == error.TmuxCommandFailed and
             !try privateSocketHasListener(socket))
@@ -1751,12 +1736,12 @@ fn killSessionAt(
         "kill-session",
         "-t",
         session_name,
-    }) catch {};
+    }, null, null) catch {};
 }
 
-fn requireSessionAbsent(alloc: Allocator, paths: *const Paths) !void {
+fn requireSessionAbsent(alloc: Allocator, paths: *const Paths, deadline_ms: ?i64) !void {
     if (!try privateSocketExists(paths.socket)) return;
-    if (try sessionExists(alloc, paths)) return error.TmuxCleanupIncomplete;
+    if (try sessionExists(alloc, paths, deadline_ms)) return error.TmuxCleanupIncomplete;
 }
 
 fn requireSavedPaneProcessAbsent(
@@ -1780,8 +1765,9 @@ fn requireOwnedNamespaceAbsent(
     process_provider: process_provider_mod.Provider,
     paths: *const Paths,
     evidence: OwnerEvidence,
+    deadline_ms: ?i64,
 ) !void {
-    try requireSessionAbsent(alloc, paths);
+    try requireSessionAbsent(alloc, paths, deadline_ms);
     try requireSavedPaneProcessAbsent(alloc, process_provider, evidence);
 }
 
@@ -1790,15 +1776,12 @@ fn waitForOwnedNamespaceAbsent(
     process_provider: process_provider_mod.Provider,
     paths: *const Paths,
     evidence: OwnerEvidence,
+    deadline_ms: ?i64,
 ) !void {
     const started_at = io_mod.milliTimestamp();
     while (true) {
-        requireOwnedNamespaceAbsent(
-            alloc,
-            process_provider,
-            paths,
-            evidence,
-        ) catch |err| switch (err) {
+        _ = try remainingCommandTimeout(deadline_ms);
+        requireOwnedNamespaceAbsent(alloc, process_provider, paths, evidence, deadline_ms) catch |err| switch (err) {
             error.TmuxCleanupIncomplete => {
                 if (io_mod.milliTimestamp() - started_at >= cleanup_settle_deadline_ms) {
                     return err;
@@ -2497,6 +2480,219 @@ test "tmux peer deadline bounds accept receive partial frames and cancellation" 
     );
 }
 
+fn stalledTmuxClientPid(alloc: Allocator, socket: []const u8, command: []const u8) !?std.posix.pid_t {
+    const result = try std.process.run(alloc, io_mod.getIo(), .{ .argv = &.{ "/bin/ps", "-axo", "pid=,command=" }, .stdout_limit = .limited(1024 * 1024), .stderr_limit = .limited(4096) });
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.find(u8, line, socket) == null or std.mem.find(u8, line, command) == null) continue;
+        var fields = std.mem.tokenizeAny(u8, line, " \t");
+        const pid = fields.next() orelse continue;
+        return try std.fmt.parseInt(std.posix.pid_t, pid, 10);
+    }
+    return null;
+}
+
+test "tmux control cancellation kills only a stalled client after it starts" {
+    if (comptime builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    const Call = struct {
+        socket: []const u8,
+        args: []const []const u8,
+        cancelled: std.atomic.Value(bool) = .init(false),
+        done: std.Io.Event = .unset,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            runTmuxNoOutput(std.testing.allocator, self.socket, self.args, &self.cancelled, null) catch |err| {
+                self.failure = err;
+            };
+            self.done.set(io_mod.getIo());
+        }
+    };
+    const alloc = std.testing.allocator;
+    const zio = io_mod.getIo();
+    probe(alloc, null) catch |err| switch (err) {
+        error.TmuxUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    var nonce: [16]u8 = undefined;
+    try std.Io.randomSecure(zio, &nonce);
+    const hex = std.fmt.bytesToHex(nonce, .lower);
+    const socket = try std.fmt.allocPrint(alloc, "/tmp/fx-tmux-control-{s}.sock", .{hex});
+    defer alloc.free(socket);
+    var server_pid: ?std.posix.pid_t = null;
+    defer {
+        if (server_pid) |pid| std.posix.kill(pid, .CONT) catch {};
+        runTmuxNoOutput(alloc, socket, &.{ "kill-session", "-t", "owned" }, null, null) catch {};
+        runTmuxNoOutput(alloc, socket, &.{ "kill-session", "-t", "other-owner" }, null, null) catch {};
+        std.Io.Dir.deleteFileAbsolute(zio, socket) catch {};
+    }
+    try runTmuxNoOutput(alloc, socket, &.{ "new-session", "-d", "-s", "owned", "sleep 30" }, null, null);
+    try runTmuxNoOutput(alloc, socket, &.{ "new-session", "-d", "-s", "other-owner", "sleep 30" }, null, null);
+    const server_text = try runTmux(alloc, socket, &.{ "display-message", "-p", "#{pid}" }, null, null);
+    defer alloc.free(server_text);
+    server_pid = try std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, server_text, " \r\n"), 10);
+    const other_pane = try runTmux(alloc, socket, &.{ "display-message", "-p", "-t", "other-owner", "#{pane_pid}" }, null, null);
+    defer alloc.free(other_pane);
+    const other_pid = try std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, other_pane, " \r\n"), 10);
+    const operations = [_][]const []const u8{
+        &.{ "resize-window", "-t", "owned", "-x", "100", "-y", "30" },
+        &.{ "pipe-pane", "-t", "owned" },
+    };
+    var late_operations: usize = 0;
+    var uncancelled_operations: usize = 0;
+    for (operations) |args| {
+        try std.posix.kill(server_pid.?, .STOP);
+        var call = Call{ .socket = socket, .args = args };
+        const thread = try std.Thread.spawn(.{}, Call.run, .{&call});
+        var client_pid: ?std.posix.pid_t = null;
+        const deadline = monotonicMillis() + 5000;
+        while (client_pid == null and monotonicMillis() < deadline) {
+            client_pid = try stalledTmuxClientPid(alloc, socket, args[0]);
+            if (client_pid == null) io_mod.sleep(poll_ns);
+        }
+        const started = monotonicMillis();
+        call.cancelled.store(true, .release);
+        const stopped_while_server_paused = if (call.done.waitTimeout(zio, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(500) } })) |_| true else |_| false;
+        const elapsed = monotonicMillis() - started;
+        if (!stopped_while_server_paused) if (client_pid) |pid| {
+            std.posix.kill(pid, .KILL) catch {};
+        };
+        try std.posix.kill(server_pid.?, .CONT);
+        thread.join();
+        try std.testing.expect(client_pid != null);
+        if (!stopped_while_server_paused or elapsed >= 500) late_operations += 1;
+        if (call.failure == null or call.failure.? != error.Cancelled) uncancelled_operations += 1;
+        try std.testing.expectEqual(std.posix.E.SRCH, std.c.errno(std.c.kill(client_pid.?, @enumFromInt(0))));
+        try std.testing.expectEqual(std.posix.E.SUCCESS, std.c.errno(std.c.kill(other_pid, @enumFromInt(0))));
+        try runTmuxNoOutput(alloc, socket, &.{ "has-session", "-t", "other-owner" }, null, null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), late_operations);
+    try std.testing.expectEqual(@as(usize, 0), uncancelled_operations);
+}
+
+test "checked tmux teardown bounds a stalled server and preserves other namespaces" {
+    if (comptime builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    const Cleanup = struct {
+        paths: *const Paths,
+        identity: []const u8,
+        evidence: OwnerEvidence,
+        deadline_ms: i64,
+        done: std.Io.Event = .unset,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            cleanupOwnedNamespaceWithEvidence(std.testing.allocator, @import("../../tools/shell/process_provider.zig").provider, self.paths, self.identity, self.evidence, self.deadline_ms) catch |err| {
+                self.failure = err;
+            };
+            self.done.set(io_mod.getIo());
+        }
+    };
+    const alloc = std.testing.allocator;
+    const zio = io_mod.getIo();
+    const provider = @import("../../tools/shell/process_provider.zig").provider;
+    probe(alloc, null) catch |err| switch (err) {
+        error.TmuxUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    for ([_]bool{ true, false }) |shared| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(root);
+        const other_echo = try std.fs.path.join(alloc, &.{ root, "other-owner-echo" });
+        defer alloc.free(other_echo);
+        const quoted_echo = try quoteShellWord(alloc, other_echo);
+        defer alloc.free(quoted_echo);
+        const other_command = try std.fmt.allocPrint(alloc, "IFS= read -r line; printf '%s' \"$line\" > {s}.pending; mv {s}.pending {s}; sleep 30", .{ quoted_echo, quoted_echo, quoted_echo });
+        defer alloc.free(other_command);
+        var nonce: [16]u8 = undefined;
+        try std.Io.randomSecure(zio, &nonce);
+        const identity = std.fmt.bytesToHex(nonce, .lower);
+        var paths = try Paths.init(alloc, root, "/tmp", &identity);
+        defer paths.deinit(alloc);
+        alloc.free(paths.socket);
+        paths.socket = try std.fmt.allocPrint(alloc, "/tmp/fx-tmux-teardown-{s}.sock", .{identity});
+        var server_pid: ?std.posix.pid_t = null;
+        defer {
+            if (server_pid) |pid| std.posix.kill(pid, .CONT) catch {};
+            runTmuxNoOutput(alloc, paths.socket, &.{ "kill-session", "-t", paths.session_name }, null, null) catch {};
+            if (shared) runTmuxNoOutput(alloc, paths.socket, &.{ "kill-session", "-t", "other-owner" }, null, null) catch {};
+            std.Io.Dir.deleteFileAbsolute(zio, paths.socket) catch {};
+        }
+        try runTmuxNoOutput(alloc, paths.socket, &.{ "new-session", "-d", "-s", paths.session_name, "-n", "terminal", "exec sleep 30" }, null, null);
+        try runTmuxNoOutput(alloc, paths.socket, &.{ "set-option", "-g", namespace_option, namespace_value }, null, null);
+        try runTmuxNoOutput(alloc, paths.socket, &.{ "set-option", "-t", paths.session_name, namespace_option, &identity }, null, null);
+        try runTmuxNoOutput(alloc, paths.socket, &.{ "set-option", "-w", "-t", paths.session_name, "remain-on-exit", "on" }, null, null);
+        if (shared) try runTmuxNoOutput(alloc, paths.socket, &.{ "new-session", "-d", "-s", "other-owner", other_command }, null, null);
+        const server_text = try runTmux(alloc, paths.socket, &.{ "display-message", "-p", "#{pid}" }, null, null);
+        defer alloc.free(server_text);
+        server_pid = try std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, server_text, " \r\n"), 10);
+        var pane = try inspectPane(alloc, &paths, null);
+        defer pane.deinit();
+        const token = try provider.captureToken(alloc, pane.pane_pid);
+        try writeManifest(alloc, paths.manifest, .{ .backend_identity = &identity, .session_name = paths.session_name, .pane_id = pane.pane_id, .pane_pid = pane.pane_pid, .pane_process_token = token.view() });
+        try writePrivateFile(paths.config, "owned recovery evidence", true);
+        var manifest = try loadOwnedManifest(alloc, &paths, &identity);
+        defer deinitManifest(alloc, &manifest);
+        const manifest_before = try std.Io.Dir.cwd().statFile(zio, paths.manifest, .{});
+        const config_before = try std.Io.Dir.cwd().statFile(zio, paths.config, .{});
+        try provider.signalProcess(alloc, pane.pane_pid, token);
+        const death_deadline = monotonicMillis() + 5000;
+        while (provider.matchToken(alloc, pane.pane_pid, token) == .matched and monotonicMillis() < death_deadline) io_mod.sleep(poll_ns);
+        try requireSavedPaneProcessAbsent(alloc, provider, .{ .manifest = manifest });
+        try std.posix.kill(server_pid.?, .STOP);
+        var cleanup = Cleanup{ .paths = &paths, .identity = &identity, .evidence = .{ .manifest = manifest }, .deadline_ms = io_mod.milliTimestamp() + 200 };
+        const thread = try std.Thread.spawn(.{}, Cleanup.run, .{&cleanup});
+        var client_pid: ?std.posix.pid_t = null;
+        const observation_deadline = monotonicMillis() + 1000;
+        while (client_pid == null and monotonicMillis() < observation_deadline) {
+            client_pid = try stalledTmuxClientPid(alloc, paths.socket, "show-options");
+            if (client_pid == null) io_mod.sleep(poll_ns);
+        }
+        const finished = if (cleanup.done.waitTimeout(zio, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(500) } })) |_| true else |_| false;
+        if (!finished) if (client_pid) |pid| {
+            std.posix.kill(pid, .KILL) catch {};
+        };
+        try std.posix.kill(server_pid.?, .CONT);
+        thread.join();
+        try std.testing.expect(client_pid != null);
+        try std.testing.expect(finished);
+        try std.testing.expectEqual(@as(?anyerror, error.Timeout), cleanup.failure);
+        try std.testing.expectEqual(manifest_before.mtime, (try std.Io.Dir.cwd().statFile(zio, paths.manifest, .{})).mtime);
+        try std.testing.expectEqual(config_before.mtime, (try std.Io.Dir.cwd().statFile(zio, paths.config, .{})).mtime);
+        try std.testing.expect(try privateSocketExists(paths.socket));
+        try std.testing.expectEqual(std.posix.E.SRCH, std.c.errno(std.c.kill(client_pid.?, @enumFromInt(0))));
+        const normal_deadline = io_mod.milliTimestamp() + 300;
+        try cleanupOwnedNamespaceWithEvidence(alloc, provider, &paths, &identity, .{ .manifest = manifest }, normal_deadline);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(zio, paths.manifest, .{}));
+        if (shared) {
+            try runTmuxNoOutput(alloc, paths.socket, &.{ "has-session", "-t", "other-owner" }, null, null);
+            try std.testing.expect(try privateSocketExists(paths.socket));
+            try runTmuxNoOutput(alloc, paths.socket, &.{ "send-keys", "-t", "other-owner", "AFTER_OWNER_EXIT", "Enter" }, null, null);
+            const echo_deadline = monotonicMillis() + 1000;
+            while (true) {
+                std.Io.Dir.accessAbsolute(zio, other_echo, .{}) catch |err| {
+                    if (err == error.FileNotFound and monotonicMillis() < echo_deadline) {
+                        io_mod.sleep(poll_ns);
+                        continue;
+                    }
+                    return err;
+                };
+                break;
+            }
+            var echo_file = try std.Io.Dir.openFileAbsolute(zio, other_echo, .{});
+            defer echo_file.close(zio);
+            const echo = try io_mod.readFileToEnd(alloc, &echo_file, 1024);
+            defer alloc.free(echo);
+            try std.testing.expectEqualStrings("AFTER_OWNER_EXIT", echo);
+        } else {
+            try std.testing.expect(!try privateSocketExists(paths.socket));
+            while (std.c.kill(server_pid.?, @enumFromInt(0)) == 0 and io_mod.milliTimestamp() < normal_deadline) io_mod.sleep(poll_ns);
+            try std.testing.expectEqual(std.posix.E.SRCH, std.c.errno(std.c.kill(server_pid.?, @enumFromInt(0))));
+        }
+    }
+}
+
 test "checked tmux cleanup requires saved process absence without a socket" {
     const alloc = std.testing.allocator;
     const MatchStub = struct {
@@ -2553,14 +2749,7 @@ test "checked tmux cleanup requires saved process absence without a socket" {
     provider.match_token_fn = MatchStub.match;
     try std.testing.expectError(
         error.TmuxCleanupIncomplete,
-        cleanupOwnedNamespaceChecked(
-            alloc,
-            provider,
-            durable_root,
-            transport_root,
-            identity,
-            null,
-        ),
+        cleanupOwnedNamespaceChecked(alloc, provider, durable_root, transport_root, identity, null, null),
     );
     try std.Io.Dir.accessAbsolute(std.testing.io, paths.manifest, .{});
     try std.Io.Dir.accessAbsolute(std.testing.io, paths.config, .{});
@@ -2568,14 +2757,7 @@ test "checked tmux cleanup requires saved process absence without a socket" {
     stub.result = .unavailable;
     try std.testing.expectError(
         error.TmuxRecoveryIdentityUnavailable,
-        cleanupOwnedNamespaceChecked(
-            alloc,
-            provider,
-            durable_root,
-            transport_root,
-            identity,
-            null,
-        ),
+        cleanupOwnedNamespaceChecked(alloc, provider, durable_root, transport_root, identity, null, null),
     );
     try std.Io.Dir.accessAbsolute(std.testing.io, paths.manifest, .{});
 
@@ -2583,28 +2765,14 @@ test "checked tmux cleanup requires saved process absence without a socket" {
     stub.result = .missing;
     try std.Io.Dir.createDirAbsolute(std.testing.io, paths.config, .default_dir);
     var storage_error: ?anyerror = null;
-    cleanupOwnedNamespaceChecked(
-        alloc,
-        provider,
-        durable_root,
-        transport_root,
-        identity,
-        null,
-    ) catch |err| {
+    cleanupOwnedNamespaceChecked(alloc, provider, durable_root, transport_root, identity, null, null) catch |err| {
         storage_error = err;
     };
     try std.testing.expect(storage_error != null);
     try std.Io.Dir.accessAbsolute(std.testing.io, paths.manifest, .{});
     try std.Io.Dir.deleteDirAbsolute(std.testing.io, paths.config);
 
-    try cleanupOwnedNamespaceChecked(
-        alloc,
-        provider,
-        durable_root,
-        transport_root,
-        identity,
-        null,
-    );
+    try cleanupOwnedNamespaceChecked(alloc, provider, durable_root, transport_root, identity, null, null);
     try std.testing.expectError(
         error.FileNotFound,
         std.Io.Dir.accessAbsolute(std.testing.io, paths.manifest, .{}),
@@ -2612,24 +2780,10 @@ test "checked tmux cleanup requires saved process absence without a socket" {
 
     try writeManifest(alloc, paths.manifest, manifest);
     stub.result = .mismatched;
-    try cleanupOwnedNamespaceChecked(
-        alloc,
-        provider,
-        durable_root,
-        transport_root,
-        identity,
-        null,
-    );
+    try cleanupOwnedNamespaceChecked(alloc, provider, durable_root, transport_root, identity, null, null);
     try std.testing.expectError(
         error.TmuxRecoveryManifestMissing,
-        cleanupOwnedNamespaceChecked(
-            alloc,
-            provider,
-            durable_root,
-            transport_root,
-            identity,
-            null,
-        ),
+        cleanupOwnedNamespaceChecked(alloc, provider, durable_root, transport_root, identity, null, null),
     );
 
     const recovered_identity = AuthenticatedProcessIdentity{
@@ -2639,26 +2793,12 @@ test "checked tmux cleanup requires saved process absence without a socket" {
     stub.result = .matched;
     try std.testing.expectError(
         error.TmuxCleanupIncomplete,
-        cleanupOwnedNamespaceChecked(
-            alloc,
-            provider,
-            durable_root,
-            transport_root,
-            identity,
-            recovered_identity,
-        ),
+        cleanupOwnedNamespaceChecked(alloc, provider, durable_root, transport_root, identity, recovered_identity, null),
     );
     stub.result = .missing;
     stub.matches_before_result = 2;
     const settling_match_calls = stub.match_calls;
-    try cleanupOwnedNamespaceChecked(
-        alloc,
-        provider,
-        durable_root,
-        transport_root,
-        identity,
-        recovered_identity,
-    );
+    try cleanupOwnedNamespaceChecked(alloc, provider, durable_root, transport_root, identity, recovered_identity, null);
     try std.testing.expectEqual(
         @as(usize, 3),
         stub.match_calls - settling_match_calls,

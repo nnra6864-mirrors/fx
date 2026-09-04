@@ -82,6 +82,7 @@ pub const Services = struct {
 
 pub const CommitError = error{
     OutOfMemory,
+    Cancelled,
     InvalidWorkId,
     TurnAlreadyCommitted,
     SessionCommitFailed,
@@ -388,17 +389,17 @@ pub const TurnContext = struct {
         timestamp_ms: i64,
     ) CommitError!void {
         if (self.committed) return error.TurnAlreadyCommitted;
-        var committed_turn = session.dupeHistoryTurn(self.alloc, turn) catch
-            return error.OutOfMemory;
-        defer session.freeHistoryTurn(self.alloc, committed_turn);
-        session.copyWorkIdToTurn(self.alloc, &committed_turn, work_id) catch |err| {
-            return switch (err) {
+        const cancel_flag = &self.managed_executions.shutting_down;
+        const committed_turn = owned: {
+            var copy = try types.dupeHistoryTurnCancellable(self.alloc, turn, cancel_flag);
+            errdefer session.freeHistoryTurn(self.alloc, copy);
+            session.copyWorkIdToTurn(self.alloc, &copy, work_id) catch |err| return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.InvalidWorkId, error.ConflictingWorkId => error.InvalidWorkId,
             };
+            try self.runtime.appendOwnedHistoryEntry(self.alloc, copy);
+            break :owned copy;
         };
-        self.runtime.appendHistoryEntry(self.alloc, committed_turn) catch
-            return error.OutOfMemory;
         _ = self.loaded.appendEvent(
             self.alloc,
             .{ .history_turn_committed = .{
@@ -410,9 +411,10 @@ pub const TurnContext = struct {
             } },
             timestamp_ms,
             .retry_expected_tail,
-            .{},
+            .{ .cancel_flag = cancel_flag },
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.Cancelled => return error.Cancelled,
             else => return error.SessionCommitFailed,
         };
         self.committed = true;
@@ -428,9 +430,10 @@ pub const TurnContext = struct {
             .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
             timestamp_ms,
             .retry_expected_tail,
-            .{},
+            .{ .cancel_flag = &self.managed_executions.shutting_down },
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.Cancelled => return error.Cancelled,
             else => return error.SessionCommitFailed,
         };
     }

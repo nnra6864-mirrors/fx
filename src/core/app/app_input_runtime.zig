@@ -81,15 +81,7 @@ pub const file_picker_completion_cap = input_completion_runtime.file_picker_comp
 const ctrl_g_upgrade_byte: u8 = 7;
 const ctrl_x_manager_byte: u8 = 24;
 
-fn classifyResumeFailure(err: anyerror) session_catalog.ResumeFailure {
-    return switch (err) {
-        error.SessionBusy => .open_elsewhere,
-        error.SessionAuthorityBoundaryUnavailable,
-        error.SessionCommitBoundaryUnavailable,
-        => .being_updated,
-        else => .unavailable,
-    };
-}
+const classifyResumeFailure = session_catalog.classifyResumeFailure;
 
 const ExplicitModelSelection = struct {
     model: []const u8,
@@ -274,6 +266,7 @@ pub fn Runtime(comptime App: type) type {
                             if (!intent.extend_selection and
                                 app.input_runtime.edit_state.selectionRange() == null and
                                 !app.stream.active and
+                                !sessionRestoreActive(app) and
                                 app.input_runtime.edit_state.cursor == app.input_runtime.edit_state.input.items.len and
                                 try provider_picker_rt.submit(app))
                             {
@@ -1088,6 +1081,7 @@ pub fn Runtime(comptime App: type) type {
                     } else if (cycleModelMenuProvider(app, -1) or cycleSkillsMenuSource(app, -1)) {
                         app.shell.render_requests.request(.footer);
                     } else {
+                        if (try deferDuringSessionRestore(app)) return .done;
                         try app_permission_runtime.Runtime(App).toggleMode(app);
                     }
                 },
@@ -1095,6 +1089,7 @@ pub fn Runtime(comptime App: type) type {
                     if (comptime @hasField(App, "session_persistence") and
                         runtime_profile.allows(App, .durable_sessions))
                     {
+                        if (try deferDuringSessionRestore(app)) return .done;
                         if (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app)) return .done;
                         if (try refuseSessionActionWithDraft(app, "submit or clear the draft before switching sessions")) return .done;
                         dismissActiveMenusThenRedraw(app);
@@ -1138,6 +1133,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn routeUpgradeShortcut(app: *App, byte: u8) !bool {
             if (byte != ctrl_g_upgrade_byte) return false;
+            if (try deferDuringSessionRestore(app)) return true;
             if (comptime @hasDecl(App, "applyReadyUpgradeShortcut")) {
                 try app.applyReadyUpgradeShortcut();
             }
@@ -1452,6 +1448,7 @@ pub fn Runtime(comptime App: type) type {
                     return;
                 },
                 '\r' => {
+                    if (try deferDuringSessionRestore(app)) return;
                     if (try submitSettingsMenuSelection(app)) return;
                     if (try submitHelpMenuSelection(app, max_input_len, max_prompt_history)) return;
                     if (try submitAuthPickerSelection(app)) return;
@@ -1572,6 +1569,23 @@ pub fn Runtime(comptime App: type) type {
             return app.input_runtime.edit_state.input.items.len > 0 or
                 app.input_runtime.entities.pasted_blocks.items.len > 0 or
                 app.pending_images.items.len > 0;
+        }
+
+        fn sessionRestoreActive(app: *const App) bool {
+            if (comptime @hasDecl(App, "sessionRestoreActive")) return app.sessionRestoreActive();
+            return false;
+        }
+
+        fn deferDuringSessionRestore(app: *App) !bool {
+            if (!sessionRestoreActive(app)) return false;
+            debug_trace.logf("input", "action deferred during session restoration draft_bytes={d}", .{app.input_runtime.edit_state.input.items.len});
+            try app.writeDomainNotice(.{
+                .topic = "session",
+                .tone = .neutral,
+                .body = "Restoring session. Press Esc to cancel.",
+            }, true);
+            app.shell.render_requests.request(.footer);
+            return true;
         }
 
         fn refuseSessionActionWithDraft(app: *App, body: []const u8) !bool {
@@ -2205,6 +2219,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return false;
             if (comptime !@hasField(App, "session_persistence")) return false;
             if (!app.session_persistence.session_picker.active) return false;
+            if (try deferDuringSessionRestore(app)) return true;
             return try app_session_runtime.Runtime(App).toggleSessionPickerScope(app);
         }
 
@@ -2850,6 +2865,11 @@ pub fn Runtime(comptime App: type) type {
 
         fn resolveEscape(app: *App, was_cancel_pending: bool, now: i64) !void {
             if (try full_transcript_rt.routeAction(app, .escape)) return;
+            if (sessionRestoreActive(app)) {
+                try interrupt_rt.cancelActiveOperation(app);
+                _ = disarmEscapeClear(app);
+                return;
+            }
             if (was_cancel_pending) {
                 if (app.question_prompt.isActive()) {
                     // Freeform answers mirror the composer's Esc contract:
@@ -3568,6 +3588,8 @@ const RoutingFakeApp = struct {
     resume_selected_count: usize = 0,
     resume_selected_error: anyerror = error.SessionStoreUnavailable,
     resume_selected_closes_picker: bool = false,
+    session_restore_active: bool = false,
+    session_restore_cancel_requested: bool = false,
     load_more_session_count: usize = 0,
     selected_credential_source: ?types.CredentialSource = null,
     selected_auth_action: ?auth_runtime.AcquisitionAction = null,
@@ -3801,6 +3823,16 @@ const RoutingFakeApp = struct {
             self.session_persistence.session_picker.active = false;
         }
         return self.resume_selected_error;
+    }
+
+    pub fn sessionRestoreActive(self: *const RoutingFakeApp) bool {
+        return self.session_restore_active;
+    }
+
+    pub fn cancelSessionRestore(self: *RoutingFakeApp) bool {
+        if (!self.session_restore_active or self.session_restore_cancel_requested) return false;
+        self.session_restore_cancel_requested = true;
+        return true;
     }
 
     pub fn loadMoreSessionPicker(self: *RoutingFakeApp) !bool {
@@ -7900,6 +7932,98 @@ test "app_input_runtime ctrl+g invokes upgrade shortcut without composer mutatio
     try std.testing.expectEqual(@as(usize, 0), app.upgrade_denied_count);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
+}
+
+test "app_input_runtime session restoration keeps edits and defers submission" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.session_restore_active = true;
+    try feedRoutingBytes(&app, "keep this draft\x7f!\r");
+    try std.testing.expectEqualStrings("keep this draf!", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
+    try std.testing.expect(app.last_command == null);
+    try std.testing.expect(!app.session_restore_cancel_requested);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Restoring session") != null);
+
+    try app.input_runtime.textReplacementState().replace(alloc, "/clear");
+    try feedRoutingBytes(&app, "\r");
+    try std.testing.expectEqualStrings("/clear", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.last_command == null);
+}
+
+test "app_input_runtime session restoration Escape keeps the draft while cancelling" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.session_restore_active = true;
+    try app.input_runtime.textReplacementState().replace(alloc, "keep this draft");
+    for (0..2) |_| {
+        try feedRoutingBytes(&app, "\x1b");
+        try Runtime(RoutingFakeApp).flushPendingEscape(&app, 0);
+    }
+    try std.testing.expect(app.session_restore_cancel_requested);
+    try std.testing.expectEqualStrings("keep this draft", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(!app.input_runtime.gestures.escapeClearArmed());
+    try std.testing.expect(!app.should_exit);
+}
+
+test "app_input_runtime session restoration Ctrl+C cancels then exits without clearing the draft" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.session_restore_active = true;
+    try app.input_runtime.textReplacementState().replace(alloc, "keep this draft");
+    try feedRoutingBytes(&app, "\x03");
+    try std.testing.expect(app.session_restore_cancel_requested);
+    try std.testing.expect(!app.should_exit);
+    try std.testing.expectEqualStrings("keep this draft", app.input_runtime.edit_state.input.items);
+    try feedRoutingBytes(&app, "\x03");
+    try std.testing.expect(app.should_exit);
+    try std.testing.expectEqualStrings("keep this draft", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(app_session_runtime.ResumeHandoffIntent.requested, app.session_persistence.resume_handoff_intent);
+}
+
+test "app_input_runtime session restoration defers upgrade and permission changes" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "\x07", "\x1b[Z", "\x1b[114;9u" }) |sequence| {
+        var app = try RoutingFakeApp.init(alloc);
+        defer app.deinit();
+        app.session_restore_active = true;
+        try feedRoutingBytes(&app, sequence);
+        try std.testing.expectEqual(@as(usize, 0), app.upgrade_apply_count);
+        try std.testing.expectEqual(@as(usize, 0), app.permission_mode_preference_commit_count);
+        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
+        try std.testing.expect(!app.session_persistence.session_picker.active);
+        try std.testing.expect(!app.should_exit);
+        try std.testing.expect(std.mem.find(u8, app.transcript.items, "Restoring session") != null);
+    }
+}
+
+test "app_input_runtime session restoration keeps provider Right as cursor movement" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.session_restore_active = true;
+    try app.input_runtime.textReplacementState().replace(alloc, "/provider codex");
+    try feedRoutingBytes(&app, "\x1b[C");
+    try std.testing.expectEqualStrings("/provider codex", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, "/provider codex".len), app.input_runtime.edit_state.cursor);
+}
+
+test "app_input_runtime session restoration retains picker rows while scope changes wait" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.session_restore_active = true;
+    const picker = &app.session_persistence.session_picker;
+    picker.active = true;
+    picker.load_state = .ready;
+    try appendRoutingSessionPickerSummary(alloc, picker, 0);
+    try feedRoutingBytes(&app, "\t");
+    try std.testing.expectEqual(app_session_runtime.SessionPickerScope.current_workspace, picker.scope);
+    try std.testing.expectEqual(@as(usize, 1), picker.summaries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.resume_selected_count);
 }
 
 test "app_input_runtime immediate ctrl+g follows bare Escape" {

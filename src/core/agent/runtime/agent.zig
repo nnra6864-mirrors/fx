@@ -1,6 +1,7 @@
 const std = @import("std");
 const types = @import("../../shared/types.zig");
 const checkpoint_codec = @import("checkpoint.zig");
+const read_cancellation = @import("../../shared/read_cancellation.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -60,7 +61,12 @@ pub const Agent = struct {
     ) Allocator.Error!void {
         const copy = try types.dupeHistoryTurn(alloc, turn);
         errdefer types.freeHistoryTurn(alloc, copy);
-        try self.history.append(alloc, copy);
+        try self.appendOwnedHistoryEntry(alloc, copy);
+    }
+
+    /// Consumes the turn on success. On error it remains owned by the caller.
+    pub fn appendOwnedHistoryEntry(self: *Agent, alloc: Allocator, turn: types.HistoryTurn) Allocator.Error!void {
+        try self.history.append(alloc, turn);
         self.fresh = false;
     }
 
@@ -73,6 +79,18 @@ pub const Agent = struct {
         self: *const Agent,
         alloc: Allocator,
     ) Allocator.Error![]types.HistoryTurn {
+        return self.snapshotHistoryCancellable(alloc, null) catch |err| switch (err) {
+            error.Cancelled => unreachable,
+            error.OutOfMemory => error.OutOfMemory,
+        };
+    }
+
+    pub fn snapshotHistoryCancellable(
+        self: *const Agent,
+        alloc: Allocator,
+        cancel_flag: read_cancellation.CancelFlag,
+    ) (Allocator.Error || error{Cancelled})![]types.HistoryTurn {
+        try read_cancellation.check(cancel_flag);
         const copy = try alloc.alloc(types.HistoryTurn, self.history.items.len);
         var copied: usize = 0;
         errdefer {
@@ -80,7 +98,7 @@ pub const Agent = struct {
             alloc.free(copy);
         }
         for (self.history.items, 0..) |turn, index| {
-            copy[index] = try types.dupeHistoryTurn(alloc, turn);
+            copy[index] = try types.dupeHistoryTurnCancellable(alloc, turn, cancel_flag);
             copied += 1;
         }
         return copy;
@@ -120,6 +138,27 @@ test "Agent startTurn consumes freshness and resets usage" {
     agent.startTurn();
     try std.testing.expect(!agent.fresh);
     try std.testing.expectEqual(@as(?u64, null), agent.turn_usage.input_tokens);
+}
+
+test "owned history append consumes only after allocation succeeds" {
+    const alloc = std.testing.allocator;
+    var agent: Agent = .{};
+    defer agent.deinit(alloc);
+    const turn = try types.dupeHistoryTurn(alloc, .{ .assistant = .{
+        .user = .{ .text = @constCast("user") },
+        .assistant = @constCast("answer"),
+    } });
+    var transferred = false;
+    defer if (!transferred) types.freeHistoryTurn(alloc, turn);
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, agent.appendOwnedHistoryEntry(failing.allocator(), turn));
+    try std.testing.expectEqual(@as(usize, 0), agent.history.items.len);
+    try std.testing.expect(agent.fresh);
+    try std.testing.expectEqualStrings("answer", turn.assistant.assistant);
+    try agent.appendOwnedHistoryEntry(alloc, turn);
+    transferred = true;
+    try std.testing.expect(!agent.fresh);
+    try std.testing.expect(agent.history.items[0].assistant.assistant.ptr == turn.assistant.assistant.ptr);
 }
 
 test "Agent accumulates per-turn usage with saturation" {

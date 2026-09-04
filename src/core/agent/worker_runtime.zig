@@ -1,4 +1,33 @@
 const std = @import("std");
+
+test "shutdown polling does not wait for an in-flight worker commit" {
+    var worker = WorkerRuntime{};
+    defer worker.deinit(std.testing.allocator);
+    const Attempt = struct {
+        worker: *WorkerRuntime,
+        started: std.Io.Event = .unset,
+        returned: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.started.set(io_mod.getIo());
+            _ = self.worker.tryRequestShutdown();
+            self.returned.store(true, .release);
+        }
+    };
+    worker.worker_mutex.lockUncancelable(io_mod.getIo());
+    var attempt = Attempt{ .worker = &worker };
+    const thread = try std.Thread.spawn(.{}, Attempt.run, .{&attempt});
+    attempt.started.waitUncancelable(io_mod.getIo());
+    const deadline = io_mod.milliTimestamp() + 100;
+    while (!attempt.returned.load(.acquire) and io_mod.milliTimestamp() < deadline) io_mod.sleep(std.time.ns_per_ms);
+    const returned_while_commit_active = attempt.returned.load(.acquire);
+    worker.worker_mutex.unlock(io_mod.getIo());
+    thread.join();
+    try std.testing.expect(returned_while_commit_active);
+    try std.testing.expect(worker.tryRequestShutdown());
+    try std.testing.expect(worker.worker_stop_requested);
+    try std.testing.expect(worker.worker_cancel_requested.load(.acquire));
+}
 const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
 const io_mod = @import("../shared/io.zig");
@@ -448,6 +477,22 @@ pub const WorkerEventBatch = struct {
     cancel_requested: bool,
 };
 
+/// Exclusive idle, drained worker lease. No locking worker method may be
+/// called while this lease is held.
+pub const SessionTransitionLease = struct {
+    worker: *WorkerRuntime,
+
+    pub fn applySettings(self: *SessionTransitionLease, effort: types.ReasoningEffort, fast_mode: bool) void {
+        self.worker.agent_turn_settings.effort = effort;
+        self.worker.agent_turn_settings.fast_mode = fast_mode;
+    }
+
+    pub fn release(self: *SessionTransitionLease) void {
+        self.worker.worker_mutex.unlock(io_mod.getIo());
+        self.* = undefined;
+    }
+};
+
 pub const WorkerRuntime = struct {
     worker_mutex: std.Io.Mutex = .init,
     worker_cond: std.Io.Condition = .init,
@@ -530,8 +575,22 @@ pub const WorkerRuntime = struct {
     }
 
     pub fn requestShutdown(self: *WorkerRuntime) void {
-        self.markExplicitCancellation();
-        self.requestStop();
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.requestShutdownLocked();
+    }
+
+    pub fn tryRequestShutdown(self: *WorkerRuntime) bool {
+        if (!self.worker_mutex.tryLock()) return false;
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.requestShutdownLocked();
+        return true;
+    }
+
+    fn requestShutdownLocked(self: *WorkerRuntime) void {
+        self.markExplicitCancellationLocked();
+        self.worker_stop_requested = true;
+        self.worker_cond.broadcast(io_mod.getIo());
     }
 
     pub fn requestCancel(self: *WorkerRuntime) void {
@@ -552,6 +611,10 @@ pub const WorkerRuntime = struct {
     fn markExplicitCancellation(self: *WorkerRuntime) void {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
+        self.markExplicitCancellationLocked();
+    }
+
+    fn markExplicitCancellationLocked(self: *WorkerRuntime) void {
         self.steering_cancel_turn_id = null;
         self.worker_cancel_requested.store(true, .seq_cst);
     }
@@ -1294,6 +1357,20 @@ pub const WorkerRuntime = struct {
         while (self.worker_processing) {
             self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex) catch break;
         }
+    }
+
+    pub fn tryBeginSessionTransition(self: *WorkerRuntime) ?SessionTransitionLease {
+        self.worker_cancel_requested.store(true, .seq_cst);
+        if (!self.worker_mutex.tryLock()) return null;
+        if (self.worker_processing or self.worker_stop_requested or
+            self.turn_start_held or self.queuedWorkCountLocked() != 0 or
+            self.worker_events.items.len != 0)
+        {
+            self.worker_mutex.unlock(io_mod.getIo());
+            return null;
+        }
+        self.steering_cancel_turn_id = null;
+        return .{ .worker = self };
     }
 
     pub fn isProcessing(self: *WorkerRuntime) bool {
@@ -3952,6 +4029,90 @@ test "dedicated turn finalizer queues before optional finish payload" {
         events.items[0].tool_lifecycle.turn_finished.turn_id,
     );
     try std.testing.expect(events.items[1] == .finish_prompt);
+}
+
+test "session transition lease never waits on an acquired worker mutex" {
+    const Held = struct {
+        worker: *WorkerRuntime,
+        acquired: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.worker.worker_mutex.lockUncancelable(io_mod.getIo());
+            defer self.worker.worker_mutex.unlock(io_mod.getIo());
+            self.acquired.store(true, .release);
+            const deadline = io_mod.nanoTimestamp() + 200 * std.time.ns_per_ms;
+            while (!self.release.load(.acquire) and io_mod.nanoTimestamp() < deadline) std.Thread.yield() catch {};
+        }
+    };
+    const alloc = std.testing.allocator;
+    var worker = WorkerRuntime{};
+    defer worker.deinit(alloc);
+    var held = Held{ .worker = &worker };
+    const thread = try std.Thread.spawn(.{}, Held.run, .{&held});
+    defer {
+        held.release.store(true, .release);
+        thread.join();
+    }
+    while (!held.acquired.load(.acquire)) std.Thread.yield() catch {};
+    const started = io_mod.nanoTimestamp();
+    if (worker.tryBeginSessionTransition()) |value| {
+        var lease = value;
+        lease.release();
+        return error.TestExpectedBusy;
+    }
+    try std.testing.expect(io_mod.nanoTimestamp() - started < 50 * std.time.ns_per_ms);
+    try std.testing.expect(worker.worker_cancel_requested.load(.seq_cst));
+}
+
+test "session transition lease preserves old queued work until normal draining" {
+    const Consumer = struct {
+        worker: *WorkerRuntime,
+        prompt: ?QueuedPrompt = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.prompt = self.worker.waitAndTakeNextPrompt(std.testing.allocator) catch |err| {
+                self.err = err;
+                return;
+            };
+            self.worker.finishProcessing();
+        }
+    };
+    const alloc = std.testing.allocator;
+    var worker = WorkerRuntime{};
+    defer worker.deinit(alloc);
+    try worker.enqueuePrompt(alloc, try makePrompt(alloc, "old session", "old"));
+    if (worker.tryBeginSessionTransition()) |value| {
+        var lease = value;
+        lease.release();
+        return error.TestExpectedBusy;
+    }
+    try std.testing.expectEqualStrings("old session", worker.queued_prompts.items[0].prompt);
+    const old = (try worker.tryTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, old);
+    worker.finishProcessing();
+    try std.testing.expect(worker.tryBeginSessionTransition() == null);
+    var old_events = worker.takeEvents();
+    freeEventList(alloc, &old_events);
+
+    var lease = worker.tryBeginSessionTransition() orelse return error.TestExpectedLease;
+    const was_locked = !worker.worker_mutex.tryLock();
+    lease.applySettings(types.ReasoningEffort.literal("high"), true);
+    lease.release();
+    try std.testing.expect(was_locked);
+    try std.testing.expect(!worker.worker_stop_requested);
+    try worker.enqueuePrompt(alloc, try makePrompt(alloc, "new session", "new"));
+    var consumer = Consumer{ .worker = &worker };
+    const thread = try std.Thread.spawn(.{}, Consumer.run, .{&consumer});
+    thread.join();
+    if (consumer.err) |err| return err;
+    const next = consumer.prompt orelse return error.TestExpectedPrompt;
+    defer freeQueuedPrompt(alloc, next);
+    try std.testing.expectEqualStrings("new session", next.prompt);
+    try std.testing.expect(next.agent_settings.fast_mode);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), next.agent_settings.effort);
+    try std.testing.expect(!worker.worker_cancel_requested.load(.seq_cst));
 }
 
 test "queue, event, snapshot, sync, history, and grant behavior" {

@@ -7,6 +7,8 @@ const session_event = @import("session_event.zig");
 const session_json = @import("session_json.zig");
 const session_log = @import("session_log.zig");
 const session_projection = @import("session_projection.zig");
+const session_read = @import("../shared/read_cancellation.zig");
+const session_replay = @import("session_replay.zig");
 const Allocator = std.mem.Allocator;
 
 const authority_module = @import("session_authority.zig");
@@ -20,7 +22,6 @@ const eventFileStat = authority_module.eventFileStat;
 const exactJsonObject = authority_module.exactJsonObject;
 const jsonU64 = authority_module.jsonU64;
 const loadAuthorityMarkerOptional = authority_module.loadAuthorityMarkerOptional;
-const mapReplayError = authority_module.mapReplayError;
 const objectString = authority_module.objectString;
 const openSessionFile = authority_module.openSessionFile;
 const parseIdentifier = authority_module.parseIdentifier;
@@ -134,6 +135,7 @@ noinline fn migrateLegacyLockedInto(
         alloc,
         writable,
         options.log.commit_lock_deadline_ms,
+        options.log.cancel_flag,
     );
 
     var primary = try openSessionFile(&writable.dir, "session.json", .read_only);
@@ -148,23 +150,27 @@ noinline fn migrateLegacyLockedInto(
         alloc,
         &primary,
         primary_stat.size,
+        options.log.cancel_flag,
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.LegacySessionMigrationResourceExhausted,
+        error.Cancelled => return error.Cancelled,
         else => return error.LegacySessionMigrationFailed,
     };
     defer alloc.free(primary_bytes);
-    const primary_digest = session_projection.sha256(primary_bytes);
+    const primary_digest = try session_read.sha256(primary_bytes, options.log.cancel_flag);
     const schema = session_json.parseLegacySchemaVersion(
         alloc,
         primary_bytes,
+        options.log.cancel_flag,
     ) catch |err| return err;
 
-    try ensureStableLegacyCopy(alloc, writable, primary_bytes, primary_stat.size);
+    try ensureStableLegacyCopy(alloc, writable, primary_bytes, primary_stat.size, options.log.cancel_flag);
 
     var legacy = session_json.parseLegacyExact(
         LegacyStoredSession,
         alloc,
         primary_bytes,
+        options.log.cancel_flag,
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.LegacySessionMigrationResourceExhausted,
         else => return err,
@@ -181,6 +187,7 @@ noinline fn migrateLegacyLockedInto(
         workspace_root,
         preference_source,
         options.seed_preferences,
+        options.log.cancel_flag,
     );
     errdefer state.deinit(alloc);
     if (!legacy_had_workspace) {
@@ -192,9 +199,7 @@ noinline fn migrateLegacyLockedInto(
         try value.prepare(
             alloc,
             writable.session_id,
-            state.workspace_root,
-            state.workspace_root,
-            options.log.commit_lock_deadline_ms,
+            options.log.cancel_flag,
         );
     }
 
@@ -203,25 +208,18 @@ noinline fn migrateLegacyLockedInto(
         state,
         schema,
         primary_bytes,
+        options.log.cancel_flag,
     );
     defer canonical.deinit(alloc);
 
-    const manifest = try writeCanonicalProjection(alloc, writable, state, canonical);
+    const manifest = try writeCanonicalProjection(alloc, writable, state, canonical, options.log.cancel_flag);
     defer alloc.free(manifest);
 
-    try assertLegacyUnchanged(alloc, writable, primary_stat.size, primary_digest);
+    try assertLegacyUnchanged(alloc, writable, primary_stat.size, primary_digest, options.log.cancel_flag);
 
-    try commitMigrationAuthorityLocked(alloc, writable, canonical, manifest, options);
-
-    var root = ctx.canonical_root;
-    var replayed = root.loadReadOnly(
-        alloc,
-        writable.session_id,
-        options.log,
-    ) catch |err| return mapReplayError(err);
+    const replayed = try commitMigrationAuthorityLocked(alloc, writable, canonical, manifest, options);
     state.deinit(alloc);
     state = replayed;
-    replayed = undefined;
     const active_id = try alloc.dupe(u8, writable.session_id);
     errdefer alloc.free(active_id);
     var result = LoadedWritableSession{
@@ -233,7 +231,7 @@ noinline fn migrateLegacyLockedInto(
         .generation_base_seq = 1,
         .generation_base_bytes = canonical.generation_base_bytes,
         .checkpoint_seq = canonical.position.through_seq,
-        .checkpoint_sha256 = session_projection.sha256(canonical.checkpoint),
+        .checkpoint_sha256 = try session_read.sha256(canonical.checkpoint, options.log.cancel_flag),
         .projection_status = .current,
         .migration_source_schema_version = @intFromEnum(schema),
         .migration_source_bytes = primary_stat.size,
@@ -241,7 +239,7 @@ noinline fn migrateLegacyLockedInto(
     };
     lifecycle.* = null;
     writable.* = undefined;
-    _ = result.publishCommitLifecycle(alloc);
+    result.persistence_debt.derived_publication = !result.publishCommitLifecycle(alloc, options.log.cancel_flag);
     out.* = result;
 }
 
@@ -252,20 +250,26 @@ fn assertMigratable(
     alloc: Allocator,
     writable: *session_log.WritableSessionDir,
     commit_lock_deadline_ms: u64,
+    cancel_flag: session_read.CancelFlag,
 ) !void {
-    var commit_lock = io_mod.acquireTimedAdvisoryLock(
-        &writable.dir,
-        "commit.lock",
-        commit_lock_deadline_ms,
-    ) catch |err| switch (err) {
-        error.LockBusy, error.LockUnsupported => return error.SessionCommitBoundaryUnavailable,
-        else => return error.LegacySessionMigrationFailed,
-    };
+    var commit_lock = try acquireMigrationLock(&writable.dir, commit_lock_deadline_ms, cancel_flag);
     defer commit_lock.release();
     try requireAuthorityFenceAbsent(alloc, &writable.dir, writable.session_id);
     if (try entryExistsRelative(&writable.dir, "authority.json")) {
         return error.InvalidSessionFormat;
     }
+}
+
+fn acquireMigrationLock(dir: *io_mod.VerifiedDir, deadline_ms: u64, cancel_flag: session_read.CancelFlag) !io_mod.TimedAdvisoryLock {
+    const result = if (cancel_flag) |flag|
+        io_mod.acquireTimedAdvisoryLockCancellable(dir, "commit.lock", deadline_ms, flag)
+    else
+        io_mod.acquireTimedAdvisoryLock(dir, "commit.lock", deadline_ms);
+    return result catch |err| switch (err) {
+        error.Cancelled, error.Canceled => return err,
+        error.LockBusy, error.LockUnsupported => return error.SessionCommitBoundaryUnavailable,
+        else => return error.LegacySessionMigrationFailed,
+    };
 }
 
 /// Ensures `session.legacy.json` holds an exact copy of the primary snapshot,
@@ -276,25 +280,36 @@ fn ensureStableLegacyCopy(
     writable: *session_log.WritableSessionDir,
     primary_bytes: []const u8,
     primary_size: u64,
+    cancel_flag: session_read.CancelFlag,
 ) !void {
-    if (try readOptionalSessionFile(
+    if (try authority_module.readOptionalSessionFileCancellable(
         alloc,
         &writable.dir,
         "session.legacy.json",
         std.math.cast(usize, primary_size + 1) orelse
             return error.LegacySessionMigrationResourceExhausted,
+        cancel_flag,
     )) |existing_copy| {
         defer alloc.free(existing_copy);
-        if (!std.mem.eql(u8, existing_copy, primary_bytes)) {
-            return error.InvalidSessionFormat;
+        if (existing_copy.len != primary_bytes.len) return error.InvalidSessionFormat;
+        var offset: usize = 0;
+        while (offset < primary_bytes.len) {
+            try session_read.check(cancel_flag);
+            const end = offset + @min(session_read.work_bytes, primary_bytes.len - offset);
+            if (!std.mem.eql(u8, existing_copy[offset..end], primary_bytes[offset..end])) return error.InvalidSessionFormat;
+            offset = end;
         }
     } else {
-        io_mod.durableReplaceVerified(
+        io_mod.durableReplaceVerifiedWithOps(
             alloc,
             &writable.dir,
             "session.legacy.json",
             primary_bytes,
-        ) catch return error.LegacySessionMigrationFailed;
+            .{ .cancel_flag = cancel_flag },
+        ) catch |err| switch (err) {
+            error.Cancelled => return err,
+            else => return error.LegacySessionMigrationFailed,
+        };
     }
 }
 
@@ -306,31 +321,48 @@ fn writeCanonicalProjection(
     writable: *session_log.WritableSessionDir,
     state: session_codec.DurableSessionState,
     canonical: MigrationCanonical,
+    cancel_flag: session_read.CancelFlag,
 ) ![]u8 {
-    io_mod.durableReplaceVerified(
+    io_mod.durableReplaceVerifiedWithOps(
         alloc,
         &writable.dir,
         "events.jsonl",
         canonical.events,
-    ) catch return error.LegacySessionMigrationFailed;
-    io_mod.durableReplaceVerified(
+        .{ .cancel_flag = cancel_flag },
+    ) catch |err| switch (err) {
+        error.Cancelled => return err,
+        else => return error.LegacySessionMigrationFailed,
+    };
+    io_mod.durableReplaceVerifiedWithOps(
         alloc,
         &writable.dir,
         canonical.watermark_name,
         canonical.watermark,
-    ) catch return error.LegacySessionMigrationFailed;
-    io_mod.durableReplaceVerified(
+        .{ .cancel_flag = cancel_flag },
+    ) catch |err| switch (err) {
+        error.Cancelled => return err,
+        else => return error.LegacySessionMigrationFailed,
+    };
+    io_mod.durableReplaceVerifiedWithOps(
         alloc,
         &writable.dir,
         "checkpoint.json",
         canonical.checkpoint,
-    ) catch return error.LegacySessionMigrationFailed;
+        .{ .cancel_flag = cancel_flag },
+    ) catch |err| switch (err) {
+        error.Cancelled => return err,
+        else => return error.LegacySessionMigrationFailed,
+    };
     return encodeMigrationManifest(
         alloc,
         &writable.dir,
         state,
         canonical,
-    ) catch return error.LegacySessionMigrationFailed;
+        cancel_flag,
+    ) catch |err| switch (err) {
+        error.Cancelled => return err,
+        else => return error.LegacySessionMigrationFailed,
+    };
 }
 
 /// Re-reads the primary snapshot and fails with `error.LegacySessionChanged`
@@ -341,6 +373,7 @@ fn assertLegacyUnchanged(
     writable: *session_log.WritableSessionDir,
     primary_size: u64,
     primary_digest: session_projection.Digest,
+    cancel_flag: session_read.CancelFlag,
 ) !void {
     var current_primary = try openSessionFile(
         &writable.dir,
@@ -354,9 +387,13 @@ fn assertLegacyUnchanged(
         alloc,
         &current_primary,
         current_stat.size,
-    ) catch return error.LegacySessionChanged;
+        cancel_flag,
+    ) catch |err| switch (err) {
+        error.Cancelled => return err,
+        else => return error.LegacySessionChanged,
+    };
     defer alloc.free(current_bytes);
-    const current_digest = session_projection.sha256(current_bytes);
+    const current_digest = try session_read.sha256(current_bytes, cancel_flag);
     if (!std.mem.eql(u8, &current_digest, &primary_digest)) {
         return error.LegacySessionChanged;
     }
@@ -373,25 +410,23 @@ fn commitMigrationAuthorityLocked(
     canonical: MigrationCanonical,
     manifest: []const u8,
     options: ResumeOptions,
-) !void {
-    var commit_lock = io_mod.acquireTimedAdvisoryLock(
-        &writable.dir,
-        "commit.lock",
-        options.log.commit_lock_deadline_ms,
-    ) catch |err| switch (err) {
-        error.LockBusy, error.LockUnsupported => return error.SessionCommitBoundaryUnavailable,
-        else => return error.LegacySessionMigrationFailed,
-    };
+) !session_codec.DurableSessionState {
+    var commit_lock = try acquireMigrationLock(&writable.dir, options.log.commit_lock_deadline_ms, options.log.cancel_flag);
     defer commit_lock.release();
     try requireAuthorityFenceAbsent(alloc, &writable.dir, writable.session_id);
-    io_mod.durableReplaceVerified(
+    io_mod.durableReplaceVerifiedWithOps(
         alloc,
         &writable.dir,
         "authority.pending.json",
         canonical.intent,
-    ) catch return error.LegacySessionMigrationFailed;
+        .{ .cancel_flag = options.log.cancel_flag },
+    ) catch |err| switch (err) {
+        error.Cancelled => return err,
+        else => return error.LegacySessionMigrationFailed,
+    };
     runBoundary(options.log.test_controls, .after_authority_intent_sync) catch
         return error.LegacySessionMigrationIndeterminate;
+    session_read.check(options.log.cancel_flag) catch return error.LegacySessionMigrationIndeterminate;
     io_mod.durableReplaceVerified(
         alloc,
         &writable.dir,
@@ -400,6 +435,7 @@ fn commitMigrationAuthorityLocked(
     ) catch return error.LegacySessionMigrationIndeterminate;
     runBoundary(options.log.test_controls, .after_authority_marker_rename) catch
         return error.LegacySessionMigrationIndeterminate;
+    session_read.check(options.log.cancel_flag) catch return error.LegacySessionMigrationIndeterminate;
     io_mod.durableReplaceVerified(
         alloc,
         &writable.dir,
@@ -408,20 +444,23 @@ fn commitMigrationAuthorityLocked(
     ) catch return error.LegacySessionMigrationIndeterminate;
     io_mod.syncVerifiedDir(writable.dir.dir) catch
         return error.LegacySessionMigrationIndeterminate;
-    var validated_state = try validateMigrationTarget(
+    var validated_state = validateMigrationTarget(
         alloc,
         &writable.dir,
         writable.session_id,
         canonical.authority_id,
         canonical.position,
-    );
-    validated_state.deinit(alloc);
+        options.log.cancel_flag,
+    ) catch return error.LegacySessionMigrationIndeterminate;
+    errdefer validated_state.deinit(alloc);
     runBoundary(options.log.test_controls, .after_authority_namespace_sync) catch
         return error.LegacySessionMigrationIndeterminate;
+    session_read.check(options.log.cancel_flag) catch return error.LegacySessionMigrationIndeterminate;
     deleteSessionEntry(&writable.dir, "authority.pending.json") catch
         return error.SessionAuthorityIntentCleanupPending;
     runBoundary(options.log.test_controls, .after_authority_intent_remove) catch
         return error.SessionAuthorityIntentCleanupPending;
+    return validated_state;
 }
 
 fn buildMigrationCanonical(
@@ -429,6 +468,7 @@ fn buildMigrationCanonical(
     state: session_codec.DurableSessionState,
     schema: session_json.LegacySchemaVersion,
     primary_bytes: []const u8,
+    cancel_flag: session_read.CancelFlag,
 ) !MigrationCanonical {
     const generation = randomIdentifier();
     const first_event_id = randomIdentifier();
@@ -448,7 +488,7 @@ fn buildMigrationCanonical(
             .usage = state.usage,
         } },
     };
-    const first_line = try session_event.encodeFrame(alloc, started);
+    const first_line = try session_event.encodeFrameCancellable(alloc, started, cancel_flag);
     defer alloc.free(first_line);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -468,6 +508,7 @@ fn buildMigrationCanonical(
             },
             .timestamp_ms = state.updated_at_ms,
             .reason = .migration,
+            .cancel_flag = cancel_flag,
         },
     );
     const events = try out.toOwnedSlice();
@@ -491,7 +532,7 @@ fn buildMigrationCanonical(
         .through_event_log_bytes = position.through_event_log_bytes,
         .state = state,
     };
-    const checkpoint = try session_projection.encodeCheckpoint(alloc, checkpoint_value);
+    const checkpoint = try session_projection.encodeCheckpointCancellable(alloc, checkpoint_value, cancel_flag);
     errdefer alloc.free(checkpoint);
     const authority = try encodeMigrationAuthority(
         alloc,
@@ -506,6 +547,7 @@ fn buildMigrationCanonical(
         primary_bytes,
         authority_id,
         position,
+        cancel_flag,
     );
     errdefer alloc.free(intent);
     return .{
@@ -526,6 +568,7 @@ fn encodeMigrationManifest(
     session_dir: *io_mod.VerifiedDir,
     state: session_codec.DurableSessionState,
     canonical: MigrationCanonical,
+    cancel_flag: session_read.CancelFlag,
 ) ![]u8 {
     const stat = try eventFileStat(session_dir, "events.jsonl");
     const fingerprint = try session_projection.eventFileStatFingerprint(
@@ -550,7 +593,7 @@ fn encodeMigrationManifest(
         .generation_base_seq = 1,
         .generation_base_bytes = canonical.generation_base_bytes,
         .checkpoint_seq = canonical.position.through_seq,
-        .checkpoint_sha256 = session_projection.sha256(canonical.checkpoint),
+        .checkpoint_sha256 = try session_read.sha256(canonical.checkpoint, cancel_flag),
         .preferences = state.preferences,
     });
 }
@@ -610,12 +653,13 @@ fn encodeMigrationIntent(
     primary_bytes: []const u8,
     authority_id: session_event.Identifier,
     position: session_log.CommitPosition,
+    cancel_flag: session_read.CancelFlag,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     const operation = std.fmt.bytesToHex(randomIdentifier(), .lower);
     const authority = std.fmt.bytesToHex(authority_id, .lower);
-    const digest = std.fmt.bytesToHex(session_projection.sha256(primary_bytes), .lower);
+    const digest = std.fmt.bytesToHex(try session_read.sha256(primary_bytes, cancel_flag), .lower);
     const generation = std.fmt.bytesToHex(position.log_generation, .lower);
     const event_id = std.fmt.bytesToHex(position.through_event_id, .lower);
     try out.writer.writeAll("{\"schema_version\":1,\"session_id\":");
@@ -647,7 +691,9 @@ pub fn validateMigrationTarget(
     session_id: []const u8,
     authority_id: session_event.Identifier,
     position: session_log.CommitPosition,
+    cancel_flag: ?*const std.atomic.Value(bool),
 ) !session_codec.DurableSessionState {
+    try session_read.check(cancel_flag);
     var marker = (try loadAuthorityMarkerOptional(alloc, session_dir)) orelse
         return error.LegacySessionMigrationIndeterminate;
     defer marker.deinit(alloc);
@@ -657,15 +703,18 @@ pub fn validateMigrationTarget(
     {
         return error.LegacySessionMigrationIndeterminate;
     }
-    const manifest_bytes = (try readOptionalSessionFile(
+    const manifest_bytes = (try authority_module.readOptionalSessionFileCancellable(
         alloc,
         session_dir,
         "session.json",
         session_projection.manifest_max_bytes,
+        cancel_flag,
     )) orelse return error.LegacySessionMigrationIndeterminate;
     defer alloc.free(manifest_bytes);
-    var manifest = session_projection.decodeManifest(alloc, manifest_bytes) catch
-        return error.LegacySessionMigrationIndeterminate;
+    var manifest = session_projection.decodeManifest(alloc, manifest_bytes) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.LegacySessionMigrationIndeterminate,
+    };
     defer manifest.deinit(alloc);
     if (!std.mem.eql(u8, manifest.id, session_id) or
         !std.mem.eql(u8, &manifest.authority_id, &authority_id) or
@@ -691,42 +740,55 @@ pub fn validateMigrationTarget(
     }
     const watermark_name = try migrationWatermarkName(alloc, position.log_generation);
     defer alloc.free(watermark_name);
-    const watermark = (try readOptionalSessionFile(
+    const watermark = (try authority_module.readOptionalSessionFileCancellable(
         alloc,
         session_dir,
         watermark_name,
         16 * 1024,
+        cancel_flag,
     )) orelse return error.LegacySessionMigrationIndeterminate;
     defer alloc.free(watermark);
     const watermark_position = decodeMigrationWatermark(
         alloc,
         watermark,
         session_id,
-    ) catch return error.LegacySessionMigrationIndeterminate;
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.LegacySessionMigrationIndeterminate,
+    };
     if (!positionsEqual(watermark_position, position)) {
         return error.LegacySessionMigrationIndeterminate;
     }
-    var state = replayMigrationEvents(
+    var state = session_replay.replayBoundary(
         alloc,
         events,
         position,
-    ) catch return error.LegacySessionMigrationIndeterminate;
+        cancel_flag,
+    ) catch |err| switch (err) {
+        error.OutOfMemory, error.Cancelled => return err,
+        else => return error.LegacySessionMigrationIndeterminate,
+    };
     errdefer state.deinit(alloc);
     if (!session_projection.stateMatchesManifest(state, manifest)) {
         return error.LegacySessionMigrationIndeterminate;
     }
 
-    const checkpoint_bytes = (try readOptionalSessionFile(
+    const checkpoint_bytes = (try authority_module.readOptionalSessionFileCancellable(
         alloc,
         session_dir,
         "checkpoint.json",
         session_projection.checkpoint_max_bytes,
+        cancel_flag,
     )) orelse return error.LegacySessionMigrationIndeterminate;
     defer alloc.free(checkpoint_bytes);
     var checkpoint = session_projection.decodeCheckpoint(
         alloc,
         checkpoint_bytes,
-    ) catch return error.LegacySessionMigrationIndeterminate;
+        cancel_flag,
+    ) catch |err| switch (err) {
+        error.OutOfMemory, error.Cancelled => return err,
+        else => return error.LegacySessionMigrationIndeterminate,
+    };
     defer checkpoint.deinit(alloc);
     const boundary = session_projection.EventBoundary{
         .log_generation = position.log_generation,
@@ -741,7 +803,11 @@ pub fn validateMigrationTarget(
         checkpoint,
         boundary,
         boundary,
-    ) catch return error.LegacySessionMigrationIndeterminate;
+        cancel_flag,
+    ) catch |err| switch (err) {
+        error.Cancelled => return err,
+        else => return error.LegacySessionMigrationIndeterminate,
+    };
     return state;
 }
 
@@ -801,7 +867,10 @@ fn decodeMigrationWatermark(
 ) !session_log.CommitPosition {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{
         .parse_numbers = false,
-    }) catch return error.InvalidSessionFormat;
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidSessionFormat,
+    };
     defer parsed.deinit();
     const expected_keys = [_][]const u8{
         "schema_version",
@@ -832,161 +901,6 @@ fn decodeMigrationWatermark(
     };
 }
 
-const EventLine = struct {
-    bytes: []u8,
-    next_offset: u64,
-};
-
-fn readEventLineAt(
-    alloc: Allocator,
-    file: std.Io.File,
-    offset: u64,
-    max_end: u64,
-) !?EventLine {
-    if (offset >= max_end) return null;
-    var line: std.ArrayList(u8) = .empty;
-    errdefer line.deinit(alloc);
-    var cursor = offset;
-    var chunk: [8192]u8 = undefined;
-    while (cursor < max_end) {
-        const limit = @min(@as(u64, chunk.len), max_end - cursor);
-        const count = try file.readPositionalAll(
-            io_mod.getIo(),
-            chunk[0..@intCast(limit)],
-            cursor,
-        );
-        if (count == 0) return error.InvalidSessionFormat;
-        if (std.mem.findScalar(u8, chunk[0..count], '\n')) |newline| {
-            try line.appendSlice(alloc, chunk[0 .. newline + 1]);
-            cursor += newline + 1;
-            if (line.items.len > session_event.event_frame_max_bytes) {
-                return error.InvalidSessionFormat;
-            }
-            return .{
-                .bytes = try line.toOwnedSlice(alloc),
-                .next_offset = cursor,
-            };
-        }
-        try line.appendSlice(alloc, chunk[0..count]);
-        if (line.items.len > session_event.event_frame_max_bytes) {
-            return error.InvalidSessionFormat;
-        }
-        cursor += count;
-    }
-    return error.InvalidSessionFormat;
-}
-
-fn replayMigrationEvents(
-    alloc: Allocator,
-    file: std.Io.File,
-    position: session_log.CommitPosition,
-) !session_codec.DurableSessionState {
-    const length = try file.length(io_mod.getIo());
-    if (position.through_event_log_bytes == 0 or
-        length < position.through_event_log_bytes)
-    {
-        return error.InvalidSessionFormat;
-    }
-    var validator: session_event.SequenceValidator = .{};
-    var offset: u64 = 0;
-    var last_seq: u64 = 0;
-    var last_event_id: session_event.Identifier = undefined;
-    var replacement_open = false;
-    var replacement_id: session_event.Identifier = undefined;
-    while (offset < position.through_event_log_bytes) {
-        const line = try readEventLineAt(
-            alloc,
-            file,
-            offset,
-            position.through_event_log_bytes,
-        ) orelse return error.InvalidSessionFormat;
-        defer alloc.free(line.bytes);
-        var envelope = session_event.decodeFrame(
-            alloc,
-            line.bytes,
-        ) catch |err| switch (err) {
-            error.UnsupportedEventSchema => return error.UnsupportedSessionSchema,
-            else => return error.InvalidSessionFormat,
-        };
-        defer envelope.deinit(alloc);
-        validator.validate(envelope) catch return error.InvalidSessionFormat;
-        if (!std.mem.eql(
-            u8,
-            &envelope.log_generation,
-            &position.log_generation,
-        )) {
-            return error.InvalidSessionFormat;
-        }
-        switch (envelope.event) {
-            .state_replacement_started => |start| {
-                if (replacement_open) return error.InvalidSessionFormat;
-                replacement_open = true;
-                replacement_id = start.replacement_id;
-            },
-            .state_replacement_chunk => |chunk| {
-                if (!replacement_open or
-                    !std.mem.eql(
-                        u8,
-                        &replacement_id,
-                        &chunk.replacement_id,
-                    ))
-                {
-                    return error.InvalidSessionFormat;
-                }
-            },
-            .state_replacement_committed => |commit| {
-                if (!replacement_open or
-                    !std.mem.eql(
-                        u8,
-                        &replacement_id,
-                        &commit.replacement_id,
-                    ))
-                {
-                    return error.InvalidSessionFormat;
-                }
-                replacement_open = false;
-                last_seq = envelope.seq;
-                last_event_id = envelope.event_id;
-            },
-            else => {
-                if (replacement_open) return error.InvalidSessionFormat;
-                last_seq = envelope.seq;
-                last_event_id = envelope.event_id;
-            },
-        }
-        offset = line.next_offset;
-    }
-    if (offset != position.through_event_log_bytes or
-        replacement_open or
-        last_seq != position.through_seq or
-        !std.mem.eql(u8, &last_event_id, &position.through_event_id))
-    {
-        return error.InvalidSessionFormat;
-    }
-
-    var file_buffer: [8192]u8 = undefined;
-    var file_reader = file.reader(io_mod.getIo(), &file_buffer);
-    var limit_buffer: [4096]u8 = undefined;
-    var limited = file_reader.interface.limited(
-        .limited64(position.through_event_log_bytes),
-        &limit_buffer,
-    );
-    var reduction = session_event.reduceJsonl(
-        alloc,
-        &limited.interface,
-        null,
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.UnsupportedEventSchema => return error.UnsupportedSessionSchema,
-        else => return error.InvalidSessionFormat,
-    };
-    errdefer reduction.deinit(alloc);
-    if (reduction.truncate_from != null) return error.InvalidSessionFormat;
-    const state = reduction.state;
-    reduction.state = undefined;
-    return state;
-}
-
 /// Converts a parsed legacy session into a validated `DurableSessionState`,
 /// resolving the origin/current workspace roots and merging preferences from
 /// the requested or preserved workspace. Consumes `legacy` (transfers its
@@ -998,6 +912,7 @@ pub fn legacyToDurableState(
     requesting_workspace: []const u8,
     preference_source: MigrationPreferenceSource,
     seed_preferences: ?session_codec.DurableSessionPreferences,
+    cancel_flag: ?*const std.atomic.Value(bool),
 ) !session_codec.DurableSessionState {
     const root = legacy.workspace_root orelse ctx.workspace_root;
     try validateWorkspaceRoot(root);
@@ -1033,10 +948,10 @@ pub fn legacyToDurableState(
         .total_input_tokens = legacy.total_input_tokens,
         .total_output_tokens = legacy.total_output_tokens,
     };
+    try session_codec.validateState(state, cancel_flag);
     legacy.id = &.{};
     legacy.workspace_root = null;
     legacy.history = &.{};
-    try session_codec.validateState(state);
     return state;
 }
 
@@ -1088,7 +1003,7 @@ pub fn migratedSourceSchemaVersion(
         max_bytes,
     )) orelse return error.SessionNotFound;
     defer alloc.free(bytes);
-    return @intFromEnum(try session_json.parseLegacySchemaVersion(alloc, bytes));
+    return @intFromEnum(try session_json.parseLegacySchemaVersion(alloc, bytes, null));
 }
 
 /// Returns the byte size of the retained `session.legacy.json` source.
@@ -1099,4 +1014,111 @@ pub fn migratedSourceBytes(session_dir: *io_mod.VerifiedDir) !u64 {
         .{ .follow_symlinks = false },
     );
     return stat.size;
+}
+
+test "legacy migration cancellation stops encoding and preserves authority fences" {
+    const Phase = enum { encoding, authority, validation };
+    const Pause = struct {
+        phase: Phase,
+        armed: bool = false,
+        observed: bool = false,
+        entered: std.Io.Event = .unset,
+        released: std.Io.Event = .unset,
+        cancel_flag: std.atomic.Value(bool) = .init(false),
+        requested_at: i128 = 0,
+
+        fn allocator(self: *@This()) Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = free } };
+        }
+        fn allocate(raw: *anyopaque, size: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const bytes = std.testing.allocator.rawAlloc(size, alignment, ra);
+            if (self.armed and size >= 64 * 1024 and !self.observed) self.pause();
+            return bytes;
+        }
+        fn free(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            std.testing.allocator.rawFree(bytes, alignment, ra);
+        }
+        fn prepare(raw: ?*anyopaque, _: Allocator, _: []const u8, _: ?*const std.atomic.Value(bool)) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.armed = self.phase == .encoding;
+        }
+        fn boundary(raw: ?*anyopaque, boundary_value: session_log.Boundary) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.phase == .authority and boundary_value == .after_authority_intent_sync) self.pause();
+            if (self.phase == .validation and boundary_value == .after_authority_marker_rename) self.armed = true;
+        }
+        fn pause(self: *@This()) void {
+            self.observed = true;
+            self.entered.set(io_mod.getIo());
+            self.released.waitUncancelable(io_mod.getIo());
+        }
+        fn cancel(self: *@This()) void {
+            self.entered.waitUncancelable(io_mod.getIo());
+            self.requested_at = io_mod.nanoTimestamp();
+            self.cancel_flag.store(true, .release);
+            self.released.set(io_mod.getIo());
+        }
+    };
+    const alloc = std.testing.allocator;
+    for (std.enums.values(Phase)) |phase| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(home);
+        var root = try session_log.Root.initFromHome(alloc, home, .writable);
+        defer root.deinit(alloc);
+        var dir = try io_mod.openOrCreateVerifiedPrivateDir(&root.sessions.?, "legacy-cancel");
+        const lock = try io_mod.acquireTimedAdvisoryLock(&dir, "session.lock", 0);
+        var writable = session_log.WritableSessionDir{ .dir = dir, .writer_lock = lock, .session_id = try alloc.dupe(u8, "legacy-cancel") };
+        var owns_writable = true;
+        defer if (owns_writable) writable.deinit(alloc);
+        const history = [_]session.HistoryTurn{.{ .assistant = .{ .user = .{ .text = @constCast("saved") }, .assistant = @constCast("x" ** (256 * 1024)) } }};
+        const bytes = try session_json.renderSessionJson(alloc, "legacy-cancel", 1, 1, .default(), "/workspace", &history, .{});
+        defer alloc.free(bytes);
+        try io_mod.durableReplaceVerified(alloc, &writable.dir, "session.json", bytes);
+        const before = try writable.dir.dir.statFile(io_mod.getIo(), "session.json", .{});
+        var pause = Pause{ .phase = phase };
+        var lifecycle: ?session_log.CommitLifecycle = .{ .context = &pause, .prepare_fn = Pause.prepare };
+        defer if (lifecycle) |*value| value.deinit(alloc);
+        const thread = try std.Thread.spawn(.{}, Pause.cancel, .{&pause});
+        var failure: ?anyerror = null;
+        if (migrateLegacyLocked(.{ .sessions_dir = root.display_root, .home_dir = home, .workspace_root = "/workspace", .canonical_root = root }, pause.allocator(), &writable, "/workspace", .requesting_workspace, .{ .seed_preferences = .{ .model = @constCast("test/model"), .effort = .auto, .fast_mode = false }, .log = .{ .cancel_flag = &pause.cancel_flag, .test_controls = .{ .context = &pause, .boundary_fn = Pause.boundary } } }, &lifecycle)) |value| {
+            owns_writable = false;
+            var loaded = value;
+            loaded.deinit(pause.allocator());
+        } else |err| failure = err;
+        pause.entered.set(io_mod.getIo());
+        thread.join();
+        try std.testing.expect(pause.observed);
+        try std.testing.expectEqual(@as(?anyerror, if (phase == .encoding) error.Cancelled else error.LegacySessionMigrationIndeterminate), failure);
+        try std.testing.expect(io_mod.nanoTimestamp() - pause.requested_at < 500 * std.time.ns_per_ms);
+        const after = try writable.dir.dir.statFile(io_mod.getIo(), "session.json", .{});
+        if (phase != .validation) {
+            try std.testing.expectEqual(before.inode, after.inode);
+            try std.testing.expectEqual(before.size, after.size);
+            try std.testing.expectEqual(before.mtime, after.mtime);
+        }
+        try std.testing.expectEqual(phase != .encoding, try entryExistsRelative(&writable.dir, "authority.pending.json"));
+        if (phase != .encoding) try std.testing.expectError(error.SessionAuthorityBoundaryUnavailable, root.confirmStoredResumeHandoff(alloc, "legacy-cancel", null));
+        if (phase == .validation) {
+            try io_mod.durableReplaceVerified(alloc, &writable.dir, "checkpoint.json", "invalid");
+            var transition = (try authority_module.loadAuthorityTransitionOptional(alloc, &writable.dir)).?;
+            defer transition.deinit(alloc);
+            var rollback_pause = Pause{ .phase = .encoding, .armed = true };
+            const rollback_thread = try std.Thread.spawn(.{}, Pause.cancel, .{&rollback_pause});
+            var rollback_failure: ?anyerror = null;
+            authority_module.restoreLegacyAuthority(rollback_pause.allocator(), &writable, transition, &rollback_pause.cancel_flag) catch |err| {
+                rollback_failure = err;
+            };
+            rollback_pause.entered.set(io_mod.getIo());
+            rollback_thread.join();
+            try std.testing.expect(rollback_pause.observed);
+            try std.testing.expectEqual(@as(?anyerror, error.Cancelled), rollback_failure);
+            try std.testing.expect(io_mod.nanoTimestamp() - rollback_pause.requested_at < 500 * std.time.ns_per_ms);
+            const after_rollback = try writable.dir.dir.statFile(io_mod.getIo(), "session.json", .{});
+            try std.testing.expectEqual(after.inode, after_rollback.inode);
+            try std.testing.expect(try entryExistsRelative(&writable.dir, "authority.pending.json"));
+        }
+    }
 }

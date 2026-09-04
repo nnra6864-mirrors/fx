@@ -301,58 +301,7 @@ fn foregroundSessionOwnerAlive() bool {
     return (std.posix.poll(&poll_fds, 0) catch return false) == 0;
 }
 
-const ChildWaiter = struct {
-    child: *std.process.Child,
-    io: std.Io,
-    ready: std.atomic.Value(bool) = .init(false),
-    result: std.process.Child.WaitError!std.process.Child.Term = undefined,
-    future: ?std.Io.Future(void) = null,
-
-    fn init(child: *std.process.Child) ChildWaiter {
-        return .{
-            .child = child,
-            .io = io_mod.getIo(),
-        };
-    }
-
-    fn start(self: *ChildWaiter) !void {
-        self.future = try std.Io.concurrent(
-            self.io,
-            ChildWaiter.waitMain,
-            .{self},
-        );
-    }
-
-    fn waitMain(self: *ChildWaiter) void {
-        self.result = self.child.wait(self.io);
-        self.ready.store(true, .release);
-    }
-
-    fn isReady(self: *const ChildWaiter) bool {
-        return self.ready.load(.acquire);
-    }
-
-    fn awaitReady(self: *ChildWaiter) !std.process.Child.Term {
-        std.debug.assert(self.isReady());
-        var future = &self.future.?;
-        future.await(self.io);
-        return try self.result;
-    }
-
-    fn awaitDiscard(self: *ChildWaiter) void {
-        var future = &self.future.?;
-        future.await(self.io);
-    }
-
-    fn abort(self: *ChildWaiter, pid: std.posix.pid_t) void {
-        if (self.isReady()) {
-            self.awaitDiscard();
-            return;
-        }
-        signalProcess(pid, std.posix.SIG.KILL) catch {};
-        self.awaitDiscard();
-    }
-};
+const ChildWaiter = @import("process_owner.zig").ChildWaiter;
 
 fn waitForForegroundTarget(
     target: *std.process.Child,
@@ -2773,9 +2722,14 @@ fn updateTerminationSignal(
     }
 
     if (signal_started_ms.*) |sent_ms| {
-        if (!force_kill_sent.* and now_ms - sent_ms >= 800) {
+        const force_requested = cancelRequested(cfg.force_cancel_flag);
+        if (!force_kill_sent.* and (force_requested or now_ms - sent_ms >= 800)) {
             try observer.signal(process_group_id, termination_protocol, .force);
-            debug_trace.logf("core", "command force-killed after termination grace expired", .{});
+            debug_trace.logf(
+                "core",
+                "command force-killed reason={s}",
+                .{if (force_requested) "force_requested" else "termination_grace_expired"},
+            );
             force_kill_sent.* = true;
         }
     }
@@ -3899,6 +3853,46 @@ test "cancellation preserves the termination grace beneath the session superviso
     try std.testing.expect(trigger.seen);
     try std.testing.expect(result.cancelled);
     try std.testing.expect(io_mod.milliTimestamp() - started_ms >= 500);
+}
+
+test "force cancellation interrupts an active termination grace" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const Trigger = struct {
+        cancel: std.atomic.Value(bool) = .init(false),
+        force: std.atomic.Value(bool) = .init(false),
+        force_requested_ms: ?i64 = null,
+
+        fn onChunk(ctx: *anyopaque, _: ?types.ToolLifecycleId, _: CommandOutputStream, chunk: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (std.mem.find(u8, chunk, "COMMAND-READY") != null) {
+                self.cancel.store(true, .seq_cst);
+            }
+            if (std.mem.find(u8, chunk, "TERM-RECEIVED") != null) {
+                self.force_requested_ms = io_mod.milliTimestamp();
+                self.force.store(true, .seq_cst);
+            }
+        }
+    };
+    var trigger: Trigger = .{};
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 4096,
+        .cancel_flag = &trigger.cancel,
+        .force_cancel_flag = &trigger.force,
+        .output_chunk_ctx = @ptrCast(&trigger),
+        .on_output_chunk = Trigger.onChunk,
+    }, std.testing.allocator, "python3 -u -c 'import signal,time\n" ++
+        "def stop(*_):\n" ++
+        " print(\"TERM-RECEIVED\",flush=True)\n" ++
+        " time.sleep(30)\n" ++
+        "signal.signal(signal.SIGTERM,stop)\n" ++
+        "print(\"COMMAND-READY\",flush=True)\n" ++
+        "while True: time.sleep(1)'", "/tmp");
+    defer std.testing.allocator.free(result.output);
+
+    try std.testing.expect(result.cancelled);
+    const force_requested_ms = trigger.force_requested_ms orelse return error.TermNotObserved;
+    try std.testing.expect(io_mod.milliTimestamp() - force_requested_ms < 500);
 }
 
 test "cancellation preserves the termination grace in an invoked script" {

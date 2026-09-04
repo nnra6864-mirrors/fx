@@ -1338,18 +1338,61 @@ fn formatToolAction(
     state: ToolActionState,
     denied_label: ?[]const u8,
 ) ![]const u8 {
+    return formatResolvedToolAction(
+        ctx.tool_registry,
+        ctx.workspace_root,
+        ctx.tool_registry.lookup(call.name) == null and dynamicMcpActionLabel(state) != null and mcpToolAvailable(ctx, call.name),
+        arena,
+        call,
+        display_target,
+        state,
+        denied_label,
+    );
+}
+
+/// Formats saved tool activity from immutable presentation inputs. Caller owns the text.
+pub fn formatHistoricalToolAction(
+    arena: Allocator,
+    registry: tool_dispatch.Registry,
+    workspace_root: []const u8,
+    call: ToolCall,
+    display_target: ?[]const u8,
+    denied_label: ?[]const u8,
+) ![]const u8 {
+    return formatResolvedToolAction(
+        registry,
+        workspace_root,
+        false,
+        arena,
+        call,
+        display_target,
+        if (denied_label != null) .denied else .completed,
+        denied_label,
+    );
+}
+
+fn formatResolvedToolAction(
+    registry: tool_dispatch.Registry,
+    workspace_root: []const u8,
+    mcp_available: bool,
+    arena: Allocator,
+    call: ToolCall,
+    display_target: ?[]const u8,
+    state: ToolActionState,
+    denied_label: ?[]const u8,
+) ![]const u8 {
     if (std.mem.eql(u8, call.name, "web_search") or tool_presentation.isProviderSearchAlias(call.name)) {
         return formatWebSearchAction(arena, call, state, denied_label);
     }
-    const spec = ctx.tool_registry.lookup(call.name) orelse {
+    const spec = registry.lookup(call.name) orelse {
         if (dynamicMcpActionLabel(state)) |label| {
-            if (mcpToolAvailable(ctx, call.name)) {
+            if (mcp_available) {
                 return formatToolActionValue(arena, label, call.name);
             }
         }
         return formatMissingSpecToolAction(arena, state, denied_label, call.name);
     };
-    if (try tool_presentation.formatRunCommandActivity(arena, ctx.tool_registry, ctx.workspace_root, call)) |activity| {
+    if (try tool_presentation.formatRunCommandActivity(arena, registry, workspace_root, call)) |activity| {
         defer arena.free(activity.detail);
         const label = if (activity.compatibility_tool) |compatibility_tool|
             specLabel(compatibility_tool, state, denied_label)

@@ -10,14 +10,10 @@ const identity = @import("../terminal/identity.zig");
 const managed_observer = @import("../terminal/managed_observer.zig");
 const operation = @import("../terminal/operation.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
+const terminal_store = @import("../terminal/store.zig");
 
 const max_direct_output_bytes: usize = 64 * 1024;
 const start_wait_ceiling_ms: u64 = 20_000;
-
-pub const ExitPreparation = enum {
-    ready,
-    deferred,
-};
 
 pub fn Runtime(comptime App: type) type {
     return struct {
@@ -59,6 +55,12 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             defer persistence.deinit();
+            var start_persistence = persistence.view();
+            start_persistence.exit_proof = terminal_store.prepareSessionExitProof(app.alloc, child_capability) catch |err| {
+                try writeAdmissionFailure(app, @errorName(err));
+                return;
+            };
+            defer std.crypto.secureZero(u8, @volatileCast(&start_persistence.exit_proof.?.bytes));
 
             var shell_arena = std.heap.ArenaAllocator.init(app.alloc);
             defer shell_arena.deinit();
@@ -81,7 +83,7 @@ pub fn Runtime(comptime App: type) type {
                 .backend = .native,
                 .return_when = .started,
                 .wait_ceiling_ms = start_wait_ceiling_ms,
-                .persistence = persistence.view(),
+                .persistence = start_persistence,
             } }) catch |err| {
                 try writeAdmissionFailure(app, @errorName(err));
                 return;
@@ -157,8 +159,36 @@ pub fn Runtime(comptime App: type) type {
             });
         }
 
-        pub fn prepareGracefulExit(_: *App) ExitPreparation {
-            return .ready;
+        pub fn stopRequests(app: *App) void {
+            if (shouldStopJobs(app)) retainResumedOwnerExit(app);
+            app.terminal_client.stopRequests();
+        }
+
+        pub fn shutdownOwnedJobs(app: *App) void {
+            if (shouldStopJobs(app)) app.terminal_client.shutdownOwners();
+        }
+
+        fn shouldStopJobs(app: *const App) bool {
+            return app.should_exit and app.session_persistence.resume_handoff_intent != .upgrade_requested;
+        }
+
+        fn retainResumedOwnerExit(app: *App) void {
+            if (app_session_runtime.Runtime(App).activeSessionId(app)) |id| {
+                if (app_session_runtime.Runtime(App).childCapability(app)) |capability| {
+                    var proof = terminal_store.loadSessionExitProof(app.alloc, capability) catch |err| blk: {
+                        debug_trace.logf("terminal", "owner exit proof unavailable session={s} err={s}", .{ id, @errorName(err) });
+                        break :blk null;
+                    };
+                    defer if (proof) |*value| std.crypto.secureZero(u8, @volatileCast(&value.bytes));
+                    if (proof) |value| {
+                        var authority = contracts.SessionExitAuthority{ .session_id = id, .proof = value };
+                        defer std.crypto.secureZero(u8, @volatileCast(&authority.proof.bytes));
+                        app.terminal_client.retainOwnerExit(app.alloc, authority) catch |err| {
+                            debug_trace.logf("terminal", "owner exit retention failed session={s} err={s}", .{ id, @errorName(err) });
+                        };
+                    }
+                }
+            }
         }
 
         fn clearSubmission(app: *App) void {
@@ -254,4 +284,22 @@ test "direct lifecycle mapping contains terminal authority" {
     try std.testing.expect(stateFromLifecycle(.exited) != .running);
     try std.testing.expect(stateFromLifecycle(.lost) == .lost);
     try std.testing.expect(stateFromLifecycle(.closed) != .running);
+}
+
+test "explicit exit stops hosted jobs but disconnect and upgrade preserve them" {
+    const App = struct {
+        should_exit: bool,
+        session_persistence: struct { resume_handoff_intent: app_session_runtime.ResumeHandoffIntent },
+    };
+    const cases = [_]struct { exiting: bool, handoff: app_session_runtime.ResumeHandoffIntent, stop: bool }{
+        .{ .exiting = true, .handoff = .requested, .stop = true },
+        .{ .exiting = true, .handoff = .none, .stop = true },
+        .{ .exiting = false, .handoff = .requested, .stop = false },
+        .{ .exiting = false, .handoff = .none, .stop = false },
+        .{ .exiting = true, .handoff = .upgrade_requested, .stop = false },
+    };
+    for (cases) |case| {
+        const app = App{ .should_exit = case.exiting, .session_persistence = .{ .resume_handoff_intent = case.handoff } };
+        try std.testing.expectEqual(case.stop, Runtime(App).shouldStopJobs(&app));
+    }
 }

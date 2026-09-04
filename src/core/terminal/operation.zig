@@ -35,6 +35,7 @@ pub const PreparedAuthority = struct {
             u8,
             @volatileCast(self.persistence.proof.bytes[0..]),
         );
+        if (self.persistence.exit_proof) |*proof| std.crypto.secureZero(u8, @volatileCast(&proof.bytes));
         free_principal(self.alloc, self.persistence.grant.principal);
         self.* = undefined;
     }
@@ -284,6 +285,7 @@ pub fn validate(request: contracts.ActionRequest) ValidationError!void {
         .resize => |value| try require_claim(value.authority),
         .signal => |value| try require_claim(value.authority),
         .close => |value| try require_claim(value.authority),
+        .close_owner => {},
     }
 }
 
@@ -294,7 +296,7 @@ fn require_claim(presentation: ?contracts.AuthorityClaim) ValidationError!void {
 
 pub fn claim(request: contracts.ActionRequest) ?contracts.AuthorityClaim {
     return switch (request) {
-        .start => null,
+        .start, .close_owner => null,
         .read => |value| value.authority,
         .screen => |value| value.authority,
         .write => |value| value.authority,
@@ -312,7 +314,9 @@ pub fn attachProcessOwner(
     owner: contracts.ProcessOwner,
 ) void {
     switch (request.*) {
-        .start, .list => {},
+        .start => |*value| value.process_owner = owner,
+        .close_owner => |*value| value.process_owner = owner,
+        .list => {},
         inline else => |*value| if (value.authority) |*claim_value| {
             claim_value.process_owner = owner;
         },
@@ -331,13 +335,14 @@ pub fn authoritySessionId(request: contracts.ActionRequest) ?[]const u8 {
         .resize => |value| value.session_id,
         .signal => |value| value.session_id,
         .close => |value| value.session_id,
+        .close_owner => |value| value.authority.session_id,
     };
 }
 
 pub fn requiresOrderedMutation(request: contracts.ActionRequest) bool {
     return switch (request) {
         .write, .resize, .signal, .close => true,
-        .start, .read, .screen, .wait, .inspect, .list => false,
+        .start, .read, .screen, .wait, .inspect, .list, .close_owner => false,
     };
 }
 
@@ -346,7 +351,7 @@ pub fn requiresOrderedMutation(request: contracts.ActionRequest) bool {
 pub fn execute(
     backend: anytype,
     request: contracts.ActionRequest,
-    cancelled: *const std.atomic.Value(bool),
+    cancelled: *std.atomic.Value(bool),
 ) !contracts.OwnedResult {
     try validate(request);
     return backend.executeAuthorized(request, cancelled);
@@ -384,6 +389,27 @@ test "terminal mutations that share session write ownership stay ordered" {
         .return_when = .exit,
         .safety_ceiling_ms = 1,
     } }));
+    try std.testing.expect(!requiresOrderedMutation(.{ .close_owner = .{ .authority = .{
+        .session_id = "owner-1",
+        .proof = .{ .bytes = @splat(1) },
+    } } }));
+}
+
+test "owner lifecycle requests replace supplied process ownership with the verified peer" {
+    const forged = try contracts.ProcessOwner.init(99, "forged");
+    const verified = try contracts.ProcessOwner.init(42, "verified");
+    var close: contracts.ActionRequest = .{ .close_owner = .{
+        .authority = .{ .session_id = "owner-1", .proof = .{ .bytes = @splat(1) } },
+        .process_owner = forged,
+    } };
+    attachProcessOwner(&close, verified);
+    try validate(close);
+    try std.testing.expectEqual(verified, close.close_owner.process_owner.?);
+    try std.testing.expectEqualStrings("owner-1", authoritySessionId(close).?);
+    try std.testing.expect(claim(close) == null);
+    var start: contracts.ActionRequest = .{ .start = .{ .cwd = "/workspace", .process_owner = forged } };
+    attachProcessOwner(&start, verified);
+    try std.testing.expectEqual(verified, start.start.process_owner.?);
 }
 
 fn test_preparation() AuthorityPreparation {

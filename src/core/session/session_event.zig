@@ -1,4 +1,5 @@
 const std = @import("std");
+const session_read = @import("../shared/read_cancellation.zig");
 const session = @import("session.zig");
 const session_codec = @import("session_codec.zig");
 const session_usage = @import("session_usage.zig");
@@ -218,6 +219,7 @@ pub const ReplacementWriteOptions = struct {
     event_ids: IdentifierSource,
     timestamp_ms: i64,
     reason: ReplacementReason,
+    cancel_flag: session_read.CancelFlag = null,
 };
 
 pub const ReplacementWriteSummary = struct {
@@ -231,6 +233,7 @@ pub const ReplacementWriteSummary = struct {
 pub const ReductionStart = struct {
     generation: ?Identifier = null,
     next_seq: u64 = 1,
+    cancel_flag: session_read.CancelFlag = null,
 };
 
 pub const ReductionBoundary = struct {
@@ -253,7 +256,14 @@ pub const Reduction = struct {
 };
 
 pub fn encodeFrame(alloc: Allocator, envelope: Envelope) ![]u8 {
-    try validateEnvelope(envelope);
+    return encodeFrameCancellable(alloc, envelope, null) catch |err| switch (err) {
+        error.Cancelled => unreachable,
+        inline else => |failure| return failure,
+    };
+}
+
+pub fn encodeFrameCancellable(alloc: Allocator, envelope: Envelope, cancel_flag: session_read.CancelFlag) ![]u8 {
+    try validateEnvelope(envelope, cancel_flag);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -262,9 +272,9 @@ pub fn encodeFrame(alloc: Allocator, envelope: Envelope) ![]u8 {
     try out.writer.print(",\"seq\":{d},\"event_id\":", .{envelope.seq});
     try writeHexString(&out.writer, &envelope.event_id);
     try out.writer.print(",\"timestamp_ms\":{d},\"kind\":", .{envelope.timestamp_ms});
-    try writeJsonString(&out.writer, @tagName(envelope.kind()));
+    try writeJsonString(&out.writer, @tagName(envelope.kind()), cancel_flag);
     try out.writer.writeAll(",\"payload\":");
-    try writePayload(&out.writer, envelope.event);
+    try writePayload(&out.writer, envelope.event, cancel_flag);
     try out.writer.writeAll("}\n");
     if (out.written().len > event_frame_max_bytes) return error.EventFrameTooLarge;
     return try out.toOwnedSlice();
@@ -285,20 +295,36 @@ test "session envelope failures preserve exact error types and identities" {
     try std.testing.expectError(error.OutOfMemory, failEnvelope(error.OutOfMemory));
 }
 
-pub fn decodeFrame(alloc: Allocator, line: []const u8) !Envelope {
+pub fn decodeFrame(alloc: Allocator, line: []const u8, cancel_flag: session_read.CancelFlag) !Envelope {
+    try session_read.check(cancel_flag);
     if (line.len > event_frame_max_bytes) return failEnvelope(error.EventFrameTooLarge);
     if (line.len == 0 or line[line.len - 1] != '\n') {
         return failEnvelope(error.InvalidEventFrame);
     }
-    if (std.mem.indexOfScalar(u8, line[0 .. line.len - 1], '\n') != null) {
-        return failEnvelope(error.InvalidEventFrame);
+    var offset: usize = 0;
+    while (offset < line.len - 1) {
+        try session_read.check(cancel_flag);
+        const end = offset + @min(session_read.work_bytes, line.len - 1 - offset);
+        if (std.mem.indexOfScalar(u8, line[offset..end], '\n') != null) {
+            return failEnvelope(error.InvalidEventFrame);
+        }
+        offset = end;
     }
 
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, line[0 .. line.len - 1], .{
+    var source = std.Io.Reader.fixed(line[0 .. line.len - 1]);
+    var buffer: [session_read.work_bytes]u8 = undefined;
+    var cancellable = session_read.Reader.init(&source, &buffer, cancel_flag);
+    var json_reader = std.json.Reader.init(alloc, &cancellable.interface);
+    defer json_reader.deinit();
+    var parsed = std.json.parseFromTokenSource(std.json.Value, alloc, &json_reader, .{
         .parse_numbers = false,
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return failEnvelope(error.OutOfMemory),
-        else => return failEnvelope(error.InvalidEventFrame),
+        .max_value_len = event_frame_max_bytes,
+    }) catch |err| {
+        try session_read.check(cancel_flag);
+        return switch (err) {
+            error.OutOfMemory => return failEnvelope(error.OutOfMemory),
+            else => return failEnvelope(error.InvalidEventFrame),
+        };
     };
     defer parsed.deinit();
     const root = try exactObject(parsed.value, &.{
@@ -318,10 +344,11 @@ pub fn decodeFrame(alloc: Allocator, line: []const u8) !Envelope {
         .seq = try requireU64(root, "seq"),
         .event_id = try parseIdentifier(try requireString(root, "event_id")),
         .timestamp_ms = try requireI64(root, "timestamp_ms"),
-        .event = try parsePayload(alloc, kind, root.get("payload") orelse return failEnvelope(error.InvalidEventFrame)),
+        .event = try parsePayload(alloc, kind, root.get("payload") orelse return failEnvelope(error.InvalidEventFrame), cancel_flag),
     };
     errdefer envelope.deinit(alloc);
-    try validateEnvelope(envelope);
+    try session_read.check(cancel_flag);
+    try validateEnvelope(envelope, cancel_flag);
     return envelope;
 }
 
@@ -333,7 +360,7 @@ pub fn writeStateReplacement(
 ) !ReplacementWriteSummary {
     var discard_buffer: [4096]u8 = undefined;
     var discard = std.Io.Writer.Discarding.init(&discard_buffer);
-    const state_summary = try session_codec.encodeState(state, &discard.writer);
+    const state_summary = try session_codec.encodeStateCancellable(state, &discard.writer, options.cancel_flag);
     if (state_summary.encoded_bytes == 0) return error.InvalidReplacement;
     const chunk_count = std.math.divCeil(
         u64,
@@ -354,14 +381,14 @@ pub fn writeStateReplacement(
             .chunk_count = chunk_count,
         } },
     };
-    const start_line = try encodeFrame(alloc, start);
+    const start_line = try encodeFrameCancellable(alloc, start, options.cancel_flag);
     defer alloc.free(start_line);
     try writer.writeAll(start_line);
 
     var chunk_writer: ReplacementChunkWriter = undefined;
     try chunk_writer.init(alloc, writer, options, state_summary, chunk_count);
     defer chunk_writer.deinit();
-    const second_summary = session_codec.encodeState(state, &chunk_writer.interface) catch |err| {
+    const second_summary = session_codec.encodeStateCancellable(state, &chunk_writer.interface, options.cancel_flag) catch |err| {
         return chunk_writer.failure orelse err;
     };
     chunk_writer.interface.flush() catch |err| return chunk_writer.failure orelse err;
@@ -390,7 +417,7 @@ pub fn writeStateReplacement(
             .chunk_count = chunk_count,
         } },
     };
-    const commit_line = try encodeFrame(alloc, commit);
+    const commit_line = try encodeFrameCancellable(alloc, commit, options.cancel_flag);
     defer alloc.free(commit_line);
     try writer.writeAll(commit_line);
 
@@ -425,28 +452,29 @@ pub fn applyEventFrame(
     }
     const frame_bytes = std.math.cast(u64, frame.len) orelse
         return error.InvalidEventFrame;
-    var envelope = try decodeFrame(alloc, frame);
-    defer envelope.deinit(alloc);
+    var envelope: ?Envelope = try decodeFrame(alloc, frame, start.cancel_flag);
+    defer if (envelope) |*owned| owned.deinit(alloc);
     var validator = SequenceValidator{
         .generation = start.generation,
         .next_seq = start.next_seq,
     };
-    try validator.validate(envelope);
-    if (!std.mem.eql(u8, &envelope.event_id, &expected_event_id)) {
+    try validator.validate(envelope.?);
+    if (!std.mem.eql(u8, &envelope.?.event_id, &expected_event_id)) {
         return error.InvalidEventFrame;
     }
-    if (envelope.kind() == .session_started or
-        envelope.kind() == .state_replacement_started or
-        envelope.kind() == .state_replacement_chunk or
-        envelope.kind() == .state_replacement_committed)
+    if (envelope.?.kind() == .session_started or
+        envelope.?.kind() == .state_replacement_started or
+        envelope.?.kind() == .state_replacement_chunk or
+        envelope.?.kind() == .state_replacement_committed)
     {
         return error.InvalidEventFrame;
     }
 
     var current: ?session_codec.DurableSessionState = state.*;
-    try applyDelta(alloc, &current, envelope);
+    const boundary = reductionBoundary(envelope.?, frame_bytes);
+    try applyDelta(alloc, &current, &envelope, start.cancel_flag);
     state.* = current.?;
-    return reductionBoundary(envelope, frame_bytes);
+    return boundary;
 }
 
 inline fn failReduction(err: anytype) @TypeOf(err)!Reduction {
@@ -472,6 +500,20 @@ pub fn reduceJsonlFrom(
     initial: ?session_codec.DurableSessionState,
     start: ReductionStart,
 ) !Reduction {
+    var buffer: [session_read.work_bytes]u8 = undefined;
+    var cancellable = session_read.Reader.init(source, &buffer, start.cancel_flag);
+    return reduceJsonlImpl(alloc, &cancellable.interface, initial, start) catch |err| {
+        try session_read.check(start.cancel_flag);
+        return err;
+    };
+}
+
+fn reduceJsonlImpl(
+    alloc: Allocator,
+    source: *std.Io.Reader,
+    initial: ?session_codec.DurableSessionState,
+    start: ReductionStart,
+) !Reduction {
     var state = initial;
     errdefer if (state) |*owned| owned.deinit(alloc);
     if (start.next_seq == 0 or
@@ -487,6 +529,7 @@ pub fn reduceJsonlFrom(
     var through: ?ReductionBoundary = null;
 
     while (true) {
+        try session_read.check(start.cancel_flag);
         const line = readFrameLine(alloc, source) catch |err| switch (err) {
             error.EndOfStream => break,
             else => return err,
@@ -495,19 +538,20 @@ pub fn reduceJsonlFrom(
         const frame_start = byte_offset;
         byte_offset += line.len;
 
-        var envelope = try decodeFrame(alloc, line);
-        defer envelope.deinit(alloc);
-        try validator.validate(envelope);
+        var envelope: ?Envelope = try decodeFrame(alloc, line, start.cancel_flag);
+        defer if (envelope) |*owned| owned.deinit(alloc);
+        try validator.validate(envelope.?);
 
-        if (envelope.kind() == .state_replacement_started) {
+        if (envelope.?.kind() == .state_replacement_started) {
             if (state == null) return failReduction(error.InvalidReplacement);
             const replacement = try reduceReplacement(
                 alloc,
                 source,
                 &validator,
                 &byte_offset,
-                envelope,
+                envelope.?,
                 state.?,
+                start.cancel_flag,
             );
             if (replacement.state) |next| {
                 state.?.deinit(alloc);
@@ -523,13 +567,14 @@ pub fn reduceJsonlFrom(
             }
             continue;
         }
-        if (envelope.kind() == .state_replacement_chunk or
-            envelope.kind() == .state_replacement_committed)
+        if (envelope.?.kind() == .state_replacement_chunk or
+            envelope.?.kind() == .state_replacement_committed)
         {
             return failReduction(error.InvalidReplacement);
         }
-        try applyDelta(alloc, &state, envelope);
-        through = reductionBoundary(envelope, byte_offset);
+        const boundary = reductionBoundary(envelope.?, byte_offset);
+        try applyDelta(alloc, &state, &envelope, start.cancel_flag);
+        through = boundary;
     }
 
     return .{
@@ -610,7 +655,8 @@ const ReplacementChunkWriter = struct {
     fn consume(self: *ReplacementChunkWriter, bytes: []const u8) !void {
         var remaining = bytes;
         while (remaining.len > 0) {
-            const count = @min(remaining.len, self.raw.len - self.raw_len);
+            try session_read.check(self.options.cancel_flag);
+            const count = @min(session_read.work_bytes, @min(remaining.len, self.raw.len - self.raw_len));
             @memcpy(self.raw[self.raw_len..][0..count], remaining[0..count]);
             self.raw_len += count;
             remaining = remaining[count..];
@@ -637,11 +683,11 @@ const ReplacementChunkWriter = struct {
                 .replacement_id = self.options.replacement_id,
                 .chunk_index = self.chunk_index,
                 .raw_bytes = chunk.len,
-                .chunk_sha256 = sha256(chunk),
+                .chunk_sha256 = try session_read.sha256(chunk, self.options.cancel_flag),
                 .bytes = chunk,
             } },
         };
-        const line = try encodeFrame(self.alloc, envelope);
+        const line = try encodeFrameCancellable(self.alloc, envelope, self.options.cancel_flag);
         defer self.alloc.free(line);
         try self.destination.writeAll(line);
         self.chunk_index += 1;
@@ -661,6 +707,7 @@ fn reduceReplacement(
     byte_offset: *u64,
     start_envelope: Envelope,
     prior: session_codec.DurableSessionState,
+    cancel_flag: session_read.CancelFlag,
 ) !ReplacementOutcome {
     const start = start_envelope.event.state_replacement_started;
     var chunk_reader: ReplacementStateReader = undefined;
@@ -673,8 +720,9 @@ fn reduceReplacement(
         start,
     );
     defer chunk_reader.deinit();
+    chunk_reader.cancel_flag = cancel_flag;
 
-    var decoded = session_codec.decodeState(alloc, &chunk_reader.interface, .{}) catch |err| {
+    var decoded = session_codec.decodeState(alloc, &chunk_reader.interface, .{ .cancel_flag = cancel_flag }) catch |err| {
         if (chunk_reader.truncated) return .{ .state = null };
         if (chunk_reader.failure) |failure| return failure;
         return err;
@@ -691,7 +739,7 @@ fn reduceReplacement(
     };
     defer alloc.free(commit_line);
     byte_offset.* += commit_line.len;
-    var commit_envelope = try decodeFrame(alloc, commit_line);
+    var commit_envelope = try decodeFrame(alloc, commit_line, cancel_flag);
     defer commit_envelope.deinit(alloc);
     try validator.validate(commit_envelope);
     if (commit_envelope.kind() != .state_replacement_committed) return error.InvalidReplacement;
@@ -734,6 +782,7 @@ fn reductionBoundary(envelope: Envelope, byte_offset: u64) ReductionBoundary {
 
 const ReplacementStateReader = struct {
     alloc: Allocator,
+    cancel_flag: session_read.CancelFlag = null,
     source: *std.Io.Reader,
     validator: *SequenceValidator,
     byte_offset: *u64,
@@ -868,7 +917,7 @@ const ReplacementStateReader = struct {
         };
         defer self.alloc.free(line);
         self.byte_offset.* += line.len;
-        var envelope = try decodeFrame(self.alloc, line);
+        var envelope = try decodeFrame(self.alloc, line, self.cancel_flag);
         errdefer envelope.deinit(self.alloc);
         try self.validator.validate(envelope);
         if (!std.mem.eql(u8, &envelope.log_generation, &self.generation) or
@@ -887,23 +936,27 @@ const ReplacementStateReader = struct {
             chunk.raw_bytes != expected_raw or
             chunk.bytes.len != expected_raw or
             (!final and chunk.raw_bytes != raw_state_chunk_bytes) or
-            (final and (chunk.raw_bytes == 0 or chunk.raw_bytes > raw_state_chunk_bytes)) or
-            !std.mem.eql(u8, &sha256(chunk.bytes), &chunk.chunk_sha256))
+            (final and (chunk.raw_bytes == 0 or chunk.raw_bytes > raw_state_chunk_bytes)))
         {
             return error.InvalidReplacement;
         }
-        self.overall_sha256.update(chunk.bytes);
+        try session_read.updateSha256(&self.overall_sha256, chunk.bytes, self.cancel_flag);
         self.raw_total += chunk.raw_bytes;
         self.chunk_index += 1;
         self.current = envelope;
     }
 };
 
+/// Consumes transferable payloads, clearing the optional owner when ownership
+/// moves. The caller deinitializes any envelope left after success or failure.
 fn applyDelta(
     alloc: Allocator,
     state: *?session_codec.DurableSessionState,
-    envelope: Envelope,
+    owned: *?Envelope,
+    cancel_flag: session_read.CancelFlag,
 ) !void {
+    try session_read.check(cancel_flag);
+    const envelope = owned.*.?;
     switch (envelope.event) {
         .session_started => |payload| {
             if (state.* != null) {
@@ -934,7 +987,7 @@ fn applyDelta(
             else
                 null;
             errdefer if (next.usage) |*usage| usage.deinit(alloc);
-            try session_codec.validateState(next);
+            try session_codec.validateState(next, cancel_flag);
             state.* = next;
         },
         .preferences_changed => |payload| {
@@ -945,7 +998,7 @@ fn applyDelta(
             if (payload.effort) |effort| proposed.preferences.effort = effort;
             if (payload.fast_mode) |fast_mode| proposed.preferences.fast_mode = fast_mode;
             proposed.updated_at_ms = envelope.timestamp_ms;
-            try session_codec.validateState(proposed);
+            try session_codec.validateState(proposed, cancel_flag);
             const model_copy = if (payload.model) |model|
                 try alloc.dupe(u8, model)
             else
@@ -969,7 +1022,7 @@ fn applyDelta(
             var proposed = current.*;
             proposed.workspace_root = payload.workspace_root;
             proposed.updated_at_ms = envelope.timestamp_ms;
-            try session_codec.validateState(proposed);
+            try session_codec.validateState(proposed, cancel_flag);
             const copy = try alloc.dupe(u8, payload.workspace_root);
             alloc.free(current.workspace_root);
             current.workspace_root = copy;
@@ -981,16 +1034,17 @@ fn applyDelta(
                 payload.turn,
                 payload.work_id,
             ) catch return error.InvalidEventFrame;
-            var turn = try session.dupeHistoryTurn(alloc, payload.turn);
+            var turn = payload.turn;
+            const work_id = payload.work_id;
+            owned.* = null;
             errdefer session.freeHistoryTurn(alloc, turn);
+            errdefer if (work_id) |id| alloc.free(id);
             if (association == .copy_event) {
                 session.copyWorkIdToTurn(alloc, &turn, payload.work_id.?) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.InvalidWorkId, error.ConflictingWorkId => return error.InvalidEventFrame,
                 };
             }
-            const work_id = if (payload.work_id) |id| try alloc.dupe(u8, id) else null;
-            errdefer if (work_id) |id| alloc.free(id);
             if (current.history.len == 0) {
                 current.history = try alloc.alloc(session.HistoryTurn, 1);
             } else {
@@ -1016,14 +1070,16 @@ fn applyDelta(
         },
         .usage_checkpointed => |payload| {
             var current = &(state.* orelse return error.MissingSessionStarted);
-            const usage = try session_usage.dupeSnapshotOwned(alloc, payload.usage);
+            const usage = payload.usage;
+            owned.* = null;
             if (current.usage) |*old| old.deinit(alloc);
             current.usage = usage;
             current.updated_at_ms = envelope.timestamp_ms;
         },
         .recovery_checkpoint_set => |payload| {
             var current = &(state.* orelse return error.MissingSessionStarted);
-            const checkpoint = try payload.checkpoint.dupe(alloc);
+            const checkpoint = payload.checkpoint;
+            owned.* = null;
             if (current.recovery_checkpoint) |*old| old.deinit(alloc);
             current.recovery_checkpoint = checkpoint;
             current.updated_at_ms = envelope.timestamp_ms;
@@ -1040,7 +1096,8 @@ fn applyDelta(
     }
 }
 
-fn validateEnvelope(envelope: Envelope) !void {
+fn validateEnvelope(envelope: Envelope, cancel_flag: session_read.CancelFlag) !void {
+    try session_read.check(cancel_flag);
     if (envelope.seq == 0 or envelope.timestamp_ms < 0) return error.InvalidEventFrame;
     switch (envelope.event) {
         .session_started => |payload| {
@@ -1058,7 +1115,7 @@ fn validateEnvelope(envelope: Envelope) !void {
                 .usage = payload.usage,
                 .subagent_child = payload.subagent_child,
             };
-            try session_codec.validateState(state);
+            try session_codec.validateState(state, cancel_flag);
         },
         .preferences_changed => |payload| {
             if (payload.provider == null and payload.model == null and payload.effort == null and payload.fast_mode == null) {
@@ -1081,7 +1138,7 @@ fn validateEnvelope(envelope: Envelope) !void {
                     .total_input_tokens = 0,
                     .total_output_tokens = 0,
                 };
-                try session_codec.validateState(state);
+                try session_codec.validateState(state, cancel_flag);
             }
         },
         .workspace_rebound => |payload| {
@@ -1112,7 +1169,7 @@ fn validateEnvelope(envelope: Envelope) !void {
                 .total_output_tokens = 0,
                 .recovery_checkpoint = payload.checkpoint,
             };
-            try session_codec.validateState(state);
+            try session_codec.validateState(state, cancel_flag);
         },
         .recovery_checkpoint_cleared => {},
         .state_replacement_started => |payload| {
@@ -1123,7 +1180,7 @@ fn validateEnvelope(envelope: Envelope) !void {
         .state_replacement_chunk => |payload| {
             if (payload.raw_bytes == 0 or payload.raw_bytes > raw_state_chunk_bytes or
                 payload.bytes.len != payload.raw_bytes or
-                !std.mem.eql(u8, &sha256(payload.bytes), &payload.chunk_sha256))
+                !std.mem.eql(u8, &try session_read.sha256(payload.bytes, cancel_flag), &payload.chunk_sha256))
             {
                 return error.InvalidReplacement;
             }
@@ -1136,19 +1193,20 @@ fn validateEnvelope(envelope: Envelope) !void {
     }
 }
 
-fn writePayload(writer: *std.Io.Writer, event: Event) !void {
+fn writePayload(writer: *std.Io.Writer, event: Event, cancel_flag: session_read.CancelFlag) !void {
+    try session_read.check(cancel_flag);
     switch (event) {
         .session_started => |payload| {
             try writer.writeAll("{\"id\":");
-            try writeJsonString(writer, payload.id);
+            try writeJsonString(writer, payload.id, cancel_flag);
             try writer.print(",\"created_at_ms\":{d},\"origin_workspace_root\":", .{payload.created_at_ms});
-            try writeJsonString(writer, payload.origin_workspace_root);
+            try writeJsonString(writer, payload.origin_workspace_root, cancel_flag);
             try writer.writeAll(",\"workspace_root\":");
-            try writeJsonString(writer, payload.workspace_root);
+            try writeJsonString(writer, payload.workspace_root, cancel_flag);
             try writer.writeAll(",\"conversation_language\":");
-            try writeJsonString(writer, payload.conversation_language.view());
+            try writeJsonString(writer, payload.conversation_language.view(), cancel_flag);
             try writer.writeAll(",\"preferences\":");
-            try writePreferences(writer, payload.preferences);
+            try writePreferences(writer, payload.preferences, cancel_flag);
             if (payload.usage) |usage| {
                 try writer.writeAll(",\"usage\":");
                 try session_usage.writeSnapshot(writer, usage);
@@ -1163,19 +1221,19 @@ fn writePayload(writer: *std.Io.Writer, event: Event) !void {
             var wrote = false;
             if (payload.provider) |provider| {
                 try writer.writeAll("\"provider\":");
-                try writeJsonString(writer, @tagName(provider));
+                try writeJsonString(writer, @tagName(provider), cancel_flag);
                 wrote = true;
             }
             if (payload.model) |model| {
                 if (wrote) try writer.writeByte(',');
                 try writer.writeAll("\"model\":");
-                try writeJsonString(writer, model);
+                try writeJsonString(writer, model, cancel_flag);
                 wrote = true;
             }
             if (payload.effort) |effort| {
                 if (wrote) try writer.writeByte(',');
                 try writer.writeAll("\"effort\":");
-                try writeJsonString(writer, effort.label());
+                try writeJsonString(writer, effort.label(), cancel_flag);
                 wrote = true;
             }
             if (payload.fast_mode) |fast_mode| {
@@ -1186,22 +1244,22 @@ fn writePayload(writer: *std.Io.Writer, event: Event) !void {
         },
         .workspace_rebound => |payload| {
             try writer.writeAll("{\"previous_workspace_root\":");
-            try writeJsonString(writer, payload.previous_workspace_root);
+            try writeJsonString(writer, payload.previous_workspace_root, cancel_flag);
             try writer.writeAll(",\"workspace_root\":");
-            try writeJsonString(writer, payload.workspace_root);
+            try writeJsonString(writer, payload.workspace_root, cancel_flag);
             try writer.writeByte('}');
         },
         .history_turn_committed => |payload| {
             try writer.writeAll("{\"conversation_language\":");
-            try writeJsonString(writer, payload.conversation_language.view());
+            try writeJsonString(writer, payload.conversation_language.view(), cancel_flag);
             try writer.print(",\"total_input_tokens\":{d},\"total_output_tokens\":{d},\"turn\":", .{
                 payload.total_input_tokens,
                 payload.total_output_tokens,
             });
-            try session_codec.writeHistoryTurn(writer, payload.turn);
+            try session_codec.writeHistoryTurnCancellable(writer, payload.turn, cancel_flag);
             if (payload.work_id) |id| {
                 try writer.writeAll(",\"work_id\":");
-                try writeJsonString(writer, id);
+                try writeJsonString(writer, id, cancel_flag);
             }
             try writer.writeByte('}');
         },
@@ -1212,7 +1270,7 @@ fn writePayload(writer: *std.Io.Writer, event: Event) !void {
         },
         .recovery_checkpoint_set => |payload| {
             try writer.writeAll("{\"checkpoint\":");
-            try session_codec.writeRecoveryCheckpoint(writer, payload.checkpoint);
+            try session_codec.writeRecoveryCheckpointCancellable(writer, payload.checkpoint, cancel_flag);
             try writer.writeByte('}');
         },
         .recovery_checkpoint_cleared => try writer.writeAll("{}"),
@@ -1220,7 +1278,7 @@ fn writePayload(writer: *std.Io.Writer, event: Event) !void {
             try writer.writeAll("{\"replacement_id\":");
             try writeHexString(writer, &payload.replacement_id);
             try writer.writeAll(",\"reason\":");
-            try writeJsonString(writer, @tagName(payload.reason));
+            try writeJsonString(writer, @tagName(payload.reason), cancel_flag);
             try writer.print(",\"encoded_bytes\":{d},\"sha256\":", .{payload.encoded_bytes});
             try writeHexString(writer, &payload.sha256);
             try writer.print(",\"chunk_count\":{d}}}", .{payload.chunk_count});
@@ -1234,7 +1292,7 @@ fn writePayload(writer: *std.Io.Writer, event: Event) !void {
             });
             try writeHexString(writer, &payload.chunk_sha256);
             try writer.writeAll(",\"base64\":\"");
-            try std.base64.standard.Encoder.encodeWriter(writer, payload.bytes);
+            try session_read.writeBase64(writer, payload.bytes, cancel_flag);
             try writer.writeAll("\"}");
         },
         .state_replacement_committed => |payload| {
@@ -1247,7 +1305,8 @@ fn writePayload(writer: *std.Io.Writer, event: Event) !void {
     }
 }
 
-fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
+fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value, cancel_flag: session_read.CancelFlag) !Event {
+    try session_read.check(cancel_flag);
     return switch (kind) {
         .session_started => blk: {
             const source = try requireObject(value);
@@ -1265,15 +1324,16 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
                 "subagent_child",
             });
             const object = source;
-            const id = try dupeString(alloc, object, "id");
+            const id = try dupeString(alloc, object, "id", cancel_flag);
             errdefer alloc.free(id);
-            const origin = try dupeString(alloc, object, "origin_workspace_root");
+            const origin = try dupeString(alloc, object, "origin_workspace_root", cancel_flag);
             errdefer alloc.free(origin);
-            const current = try dupeString(alloc, object, "workspace_root");
+            const current = try dupeString(alloc, object, "workspace_root", cancel_flag);
             errdefer alloc.free(current);
             const preferences = try parsePreferences(
                 alloc,
                 object.get("preferences") orelse return error.InvalidEventFrame,
+                cancel_flag,
             );
             errdefer {
                 var owned = preferences;
@@ -1315,7 +1375,7 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
                 if (provider_value != .string) return error.InvalidEventFrame;
                 break :provider_blk model_provider.parse(provider_value.string) orelse return error.InvalidEventFrame;
             } else null;
-            const model = if (object.get("model")) |_| try dupeString(alloc, object, "model") else null;
+            const model = if (object.get("model")) |_| try dupeString(alloc, object, "model", cancel_flag) else null;
             errdefer if (model) |owned| alloc.free(owned);
             const effort = if (object.get("effort")) |_|
                 types.ReasoningEffort.parse(try requireString(object, "effort")) orelse
@@ -1332,11 +1392,11 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
         },
         .workspace_rebound => blk: {
             const object = try exactObject(value, &.{ "previous_workspace_root", "workspace_root" });
-            const previous = try dupeString(alloc, object, "previous_workspace_root");
+            const previous = try dupeString(alloc, object, "previous_workspace_root", cancel_flag);
             errdefer alloc.free(previous);
             break :blk .{ .workspace_rebound = .{
                 .previous_workspace_root = previous,
-                .workspace_root = try dupeString(alloc, object, "workspace_root"),
+                .workspace_root = try dupeString(alloc, object, "workspace_root", cancel_flag),
             } };
         },
         .history_turn_committed => blk: {
@@ -1359,9 +1419,10 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
             const turn = try session_codec.parseHistoryTurn(
                 alloc,
                 object.get("turn") orelse return error.InvalidEventFrame,
+                cancel_flag,
             );
             errdefer session.freeHistoryTurn(alloc, turn);
-            const work_id = if (object.get("work_id")) |_| try dupeString(alloc, object, "work_id") else null;
+            const work_id = if (object.get("work_id")) |_| try dupeString(alloc, object, "work_id", cancel_flag) else null;
             errdefer if (work_id) |id| alloc.free(id);
             break :blk .{ .history_turn_committed = .{
                 .conversation_language = parseLanguage(
@@ -1390,8 +1451,9 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
             const checkpoint = session_codec.parseRecoveryCheckpoint(
                 alloc,
                 object.get("checkpoint") orelse return error.InvalidEventFrame,
+                cancel_flag,
             ) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
+                error.Cancelled, error.OutOfMemory => return err,
                 else => return error.InvalidEventFrame,
             };
             break :blk .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } };
@@ -1428,15 +1490,11 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
                 "base64",
             });
             const encoded = try requireString(object, "base64");
-            const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch
-                return error.InvalidEventFrame;
-            const bytes = try alloc.alloc(u8, decoded_len);
+            const bytes = session_read.decodeBase64(alloc, encoded, cancel_flag) catch |err| switch (err) {
+                error.InvalidBase64 => return error.InvalidEventFrame,
+                else => return err,
+            };
             errdefer alloc.free(bytes);
-            std.base64.standard.Decoder.decode(bytes, encoded) catch return error.InvalidEventFrame;
-            const canonical = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
-            defer alloc.free(canonical);
-            const rendered = std.base64.standard.Encoder.encode(canonical, bytes);
-            if (!std.mem.eql(u8, rendered, encoded)) return error.InvalidEventFrame;
             break :blk .{ .state_replacement_chunk = .{
                 .replacement_id = try parseIdentifier(try requireString(object, "replacement_id")),
                 .chunk_index = try requireU64(object, "chunk_index"),
@@ -1486,13 +1544,14 @@ fn readFrameLine(alloc: Allocator, source: *std.Io.Reader) ![]u8 {
     return try out.toOwnedSlice();
 }
 
-fn parsePreferences(alloc: Allocator, value: std.json.Value) !session_codec.DurableSessionPreferences {
+fn parsePreferences(alloc: Allocator, value: std.json.Value, cancel_flag: session_read.CancelFlag) !session_codec.DurableSessionPreferences {
+    try session_read.check(cancel_flag);
     const raw_object = try requireObject(value);
     const object = if (raw_object.get("provider") != null)
         try exactObject(value, &.{ "provider", "model", "effort", "fast_mode" })
     else
         try exactObject(value, &.{ "model", "effort", "fast_mode" });
-    const model = try dupeString(alloc, object, "model");
+    const model = try dupeString(alloc, object, "model", cancel_flag);
     errdefer alloc.free(model);
     return .{
         .provider = if (object.get("provider")) |provider_value| blk: {
@@ -1507,18 +1566,16 @@ fn parsePreferences(alloc: Allocator, value: std.json.Value) !session_codec.Dura
     };
 }
 
-fn writePreferences(
-    writer: *std.Io.Writer,
-    preferences: session_codec.DurableSessionPreferences,
-) !void {
+fn writePreferences(writer: *std.Io.Writer, preferences: session_codec.DurableSessionPreferences, cancel_flag: session_read.CancelFlag) !void {
+    try session_read.check(cancel_flag);
     try writer.writeAll("{\"model\":");
-    try writeJsonString(writer, preferences.model);
+    try writeJsonString(writer, preferences.model, cancel_flag);
     try writer.writeAll(",\"effort\":");
-    try writeJsonString(writer, preferences.effort.label());
+    try writeJsonString(writer, preferences.effort.label(), cancel_flag);
     try writer.print(",\"fast_mode\":{s},\"provider\":", .{
         if (preferences.fast_mode) "true" else "false",
     });
-    try writeJsonString(writer, @tagName(preferences.provider));
+    try writeJsonString(writer, @tagName(preferences.provider), cancel_flag);
     try writer.writeByte('}');
 }
 
@@ -1554,8 +1611,9 @@ fn requireString(object: std.json.ObjectMap, key: []const u8) ![]const u8 {
     return value.string;
 }
 
-fn dupeString(alloc: Allocator, object: std.json.ObjectMap, key: []const u8) ![]u8 {
-    return try alloc.dupe(u8, try requireString(object, key));
+fn dupeString(alloc: Allocator, object: std.json.ObjectMap, key: []const u8, cancel_flag: session_read.CancelFlag) ![]u8 {
+    try session_read.check(cancel_flag);
+    return session_read.duplicateBytes(alloc, try requireString(object, key), cancel_flag);
 }
 
 fn requireBool(object: std.json.ObjectMap, key: []const u8) !bool {
@@ -1615,8 +1673,9 @@ fn writeHexString(writer: *std.Io.Writer, bytes: []const u8) !void {
     try writer.writeByte('"');
 }
 
-fn writeJsonString(writer: *std.Io.Writer, bytes: []const u8) !void {
-    try std.json.Stringify.value(bytes, .{}, writer);
+fn writeJsonString(writer: *std.Io.Writer, bytes: []const u8, cancel_flag: session_read.CancelFlag) !void {
+    try session_read.check(cancel_flag);
+    try session_read.writeJsonString(writer, bytes, cancel_flag);
 }
 
 fn sha256(bytes: []const u8) Digest {
@@ -1667,7 +1726,7 @@ test "event frame codec is deterministic and validates contiguous sequence and g
     try std.testing.expectEqualStrings(first, second);
     try std.testing.expect(first[first.len - 1] == '\n');
 
-    var decoded = try decodeFrame(alloc, first);
+    var decoded = try decodeFrame(alloc, first, null);
     defer decoded.deinit(alloc);
     try std.testing.expectEqual(Kind.session_started, decoded.kind());
     try std.testing.expect(decoded.event.session_started.subagent_child);
@@ -1728,7 +1787,7 @@ test "history_turn_committed event decode repairs duplicate-key tool arguments" 
 
     const encoded = try encodeFrame(std.testing.allocator, frame);
     defer std.testing.allocator.free(encoded);
-    var decoded = try decodeFrame(std.testing.allocator, encoded);
+    var decoded = try decodeFrame(std.testing.allocator, encoded, null);
     defer decoded.deinit(std.testing.allocator);
 
     const step = decoded.event.history_turn_committed.turn.assistant.execution.tool_steps[0];
@@ -1756,7 +1815,7 @@ test "event frame cap is inclusive of the required newline" {
     @memcpy(exact[0 .. encoded.len - 1], encoded[0 .. encoded.len - 1]);
     @memset(exact[encoded.len - 1 .. exact.len - 1], ' ');
     exact[exact.len - 1] = '\n';
-    var decoded = try decodeFrame(alloc, exact);
+    var decoded = try decodeFrame(alloc, exact, null);
     decoded.deinit(alloc);
 
     const oversized = try alloc.alloc(u8, event_frame_max_bytes + 1);
@@ -1764,7 +1823,7 @@ test "event frame cap is inclusive of the required newline" {
     @memcpy(oversized[0..exact.len], exact);
     oversized[oversized.len - 2] = ' ';
     oversized[oversized.len - 1] = '\n';
-    try std.testing.expectError(error.EventFrameTooLarge, decodeFrame(alloc, oversized));
+    try std.testing.expectError(error.EventFrameTooLarge, decodeFrame(alloc, oversized, null));
 }
 
 test "replacement writer uses four MiB chunks and reducer commits only complete replacement" {
@@ -2135,6 +2194,39 @@ test "single event application updates caller-owned state without replaying its 
     try std.testing.expectEqual(@as(i64, 30), state.updated_at_ms);
 }
 
+test "reduction transfers an owned history payload without duplicating its bytes" {
+    const alloc = std.testing.allocator;
+    var state: ?session_codec.DurableSessionState = try singleEventTestState("owned-history-payload").dupe(alloc);
+    defer if (state) |*owned| owned.deinit(alloc);
+    var envelope: ?Envelope = .{
+        .log_generation = identifier(1),
+        .seq = 2,
+        .event_id = identifier(2),
+        .timestamp_ms = 20,
+        .event = .{ .history_turn_committed = .{
+            .conversation_language = .literal("en"),
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .turn = try session.makeAssistantTurn(alloc, "saved prompt", "saved response"),
+        } },
+    };
+    defer if (envelope) |*owned| owned.deinit(alloc);
+    var limited = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 1 });
+    try applyDelta(limited.allocator(), &state, &envelope, null);
+    try std.testing.expectEqualStrings("saved response", state.?.history[0].assistant.assistant);
+}
+
+fn applyTestDelta(alloc: Allocator, state: *?session_codec.DurableSessionState, envelope: Envelope) !void {
+    const frame = encodeFrame(alloc, envelope) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer alloc.free(frame);
+    var owned: ?Envelope = try decodeFrame(alloc, frame, null);
+    defer if (owned) |*remaining| remaining.deinit(alloc);
+    try applyDelta(alloc, state, &owned, null);
+}
+
 test "compacted summary event advances the durable replacement boundary" {
     const alloc = std.testing.allocator;
     var state: ?session_codec.DurableSessionState = try singleEventTestState(
@@ -2143,7 +2235,7 @@ test "compacted summary event advances the durable replacement boundary" {
     defer if (state) |*current| current.deinit(alloc);
 
     const generation = identifier(0xb0);
-    try applyDelta(alloc, &state, .{
+    try applyTestDelta(alloc, &state, .{
         .log_generation = generation,
         .seq = 1,
         .event_id = identifier(0xb1),
@@ -2158,7 +2250,7 @@ test "compacted summary event advances the durable replacement boundary" {
             } },
         } },
     });
-    try applyDelta(alloc, &state, .{
+    try applyTestDelta(alloc, &state, .{
         .log_generation = generation,
         .seq = 2,
         .event_id = identifier(0xb2),
@@ -2419,7 +2511,7 @@ test "history_turn_committed leaves absent session usage unchanged" {
     const committed_line = try encodeFrame(alloc, committed);
     defer alloc.free(committed_line);
 
-    var decoded = try decodeFrame(alloc, committed_line);
+    var decoded = try decodeFrame(alloc, committed_line, null);
     defer decoded.deinit(alloc);
     try std.testing.expectEqual(
         @as(u64, 128),
@@ -2468,7 +2560,7 @@ test "replay associates each committed work ID with its exact user turn" {
     const generation = identifier(0x80);
     var state: ?session_codec.DurableSessionState = null;
     defer if (state) |*current| current.deinit(alloc);
-    try applyDelta(alloc, &state, .{
+    try applyTestDelta(alloc, &state, .{
         .log_generation = generation,
         .seq = 1,
         .event_id = identifier(0x81),
@@ -2486,7 +2578,7 @@ test "replay associates each committed work ID with its exact user turn" {
             },
         } },
     });
-    try applyDelta(alloc, &state, .{
+    try applyTestDelta(alloc, &state, .{
         .log_generation = generation,
         .seq = 2,
         .event_id = identifier(0x82),
@@ -2502,7 +2594,7 @@ test "replay associates each committed work ID with its exact user turn" {
             } },
         } },
     });
-    try applyDelta(alloc, &state, .{
+    try applyTestDelta(alloc, &state, .{
         .log_generation = generation,
         .seq = 3,
         .event_id = identifier(0x83),
@@ -2521,7 +2613,7 @@ test "replay associates each committed work ID with its exact user turn" {
             } },
         } },
     });
-    try applyDelta(alloc, &state, .{
+    try applyTestDelta(alloc, &state, .{
         .log_generation = generation,
         .seq = 4,
         .event_id = identifier(0x84),
@@ -2574,7 +2666,7 @@ test "history event provenance rejects conflicts and malformed IDs" {
             } },
         } },
     };
-    try std.testing.expectError(error.InvalidEventFrame, validateEnvelope(base));
+    try std.testing.expectError(error.InvalidEventFrame, validateEnvelope(base, null));
 
     var persisted_conflict = base;
     persisted_conflict.event.history_turn_committed.work_id = @constCast("work-a");
@@ -2586,17 +2678,17 @@ test "history event provenance rejects conflicts and malformed IDs" {
     encoded[final_id + "work-".len] = 'b';
     try std.testing.expectError(
         error.InvalidEventFrame,
-        decodeFrame(std.testing.allocator, encoded),
+        decodeFrame(std.testing.allocator, encoded, null),
     );
 
     var absent_event = base;
     absent_event.event.history_turn_committed.work_id = null;
-    try std.testing.expectError(error.InvalidEventFrame, validateEnvelope(absent_event));
+    try std.testing.expectError(error.InvalidEventFrame, validateEnvelope(absent_event, null));
 
     var malformed = base;
     malformed.event.history_turn_committed.work_id = @constCast("bad\x00id");
     malformed.event.history_turn_committed.turn.assistant.user.work_id = null;
-    try std.testing.expectError(error.InvalidEventFrame, validateEnvelope(malformed));
+    try std.testing.expectError(error.InvalidEventFrame, validateEnvelope(malformed, null));
 
     var summary = base;
     summary.event.history_turn_committed.work_id = @constCast("event-work");
@@ -2605,14 +2697,14 @@ test "history event provenance rejects conflicts and malformed IDs" {
         .removed_turn_count = 1,
         .compaction_count = 1,
     } };
-    try std.testing.expectError(error.InvalidEventFrame, validateEnvelope(summary));
+    try std.testing.expectError(error.InvalidEventFrame, validateEnvelope(summary, null));
 }
 
 fn checkHistoryProvenanceReplayAllocationFailures(alloc: Allocator) !void {
     var state: ?session_codec.DurableSessionState = null;
     defer if (state) |*current| current.deinit(alloc);
     const generation = identifier(0xa0);
-    try applyDelta(alloc, &state, .{
+    try applyTestDelta(alloc, &state, .{
         .log_generation = generation,
         .seq = 1,
         .event_id = identifier(0xa1),
@@ -2630,7 +2722,7 @@ fn checkHistoryProvenanceReplayAllocationFailures(alloc: Allocator) !void {
             },
         } },
     });
-    try applyDelta(alloc, &state, .{
+    try applyTestDelta(alloc, &state, .{
         .log_generation = generation,
         .seq = 2,
         .event_id = identifier(0xa2),
@@ -2682,7 +2774,7 @@ test "usage checkpoint event decodes a cumulative snapshot" {
     try session_usage.writeSnapshot(&frame.writer, snapshot);
     try frame.writer.writeAll("}}\n");
 
-    var decoded = try decodeFrame(alloc, frame.written());
+    var decoded = try decodeFrame(alloc, frame.written(), null);
     defer decoded.deinit(alloc);
     try std.testing.expectEqualStrings("usage_checkpointed", @tagName(decoded.kind()));
 
@@ -2735,7 +2827,7 @@ test "later usage events replace snapshots while legacy turns preserve them" {
     var state: ?session_codec.DurableSessionState = null;
     defer if (state) |*current| current.deinit(alloc);
     const generation = identifier(0x70);
-    try applyDelta(alloc, &state, .{
+    try applyTestDelta(alloc, &state, .{
         .log_generation = generation,
         .seq = 1,
         .event_id = identifier(0x71),
@@ -2756,7 +2848,7 @@ test "later usage events replace snapshots while legacy turns preserve them" {
     });
     try std.testing.expectEqual(@as(u64, 1), state.?.usage.?.lines_added);
 
-    try applyDelta(alloc, &state, .{
+    try applyTestDelta(alloc, &state, .{
         .log_generation = generation,
         .seq = 2,
         .event_id = identifier(0x72),
@@ -2765,7 +2857,7 @@ test "later usage events replace snapshots while legacy turns preserve them" {
     });
     try std.testing.expectEqual(@as(u64, 7), state.?.usage.?.lines_added);
 
-    try applyDelta(alloc, &state, .{
+    try applyTestDelta(alloc, &state, .{
         .log_generation = generation,
         .seq = 3,
         .event_id = identifier(0x73),
@@ -2782,7 +2874,7 @@ test "later usage events replace snapshots while legacy turns preserve them" {
     });
     try std.testing.expectEqual(@as(u64, 7), state.?.usage.?.lines_added);
 
-    try applyDelta(alloc, &state, .{
+    try applyTestDelta(alloc, &state, .{
         .log_generation = generation,
         .seq = 4,
         .event_id = identifier(0x74),
@@ -2797,7 +2889,7 @@ test "recovery checkpoint events replace and clear deterministically" {
     var state: ?session_codec.DurableSessionState = null;
     defer if (state) |*current| current.deinit(alloc);
     const generation = identifier(0x80);
-    try applyDelta(alloc, &state, .{
+    try applyTestDelta(alloc, &state, .{
         .log_generation = generation,
         .seq = 1,
         .event_id = identifier(0x81),
@@ -2828,7 +2920,7 @@ test "recovery checkpoint events replace and clear deterministically" {
         .max_provider_attempts = 10,
         .consumed_provider_attempts = 2,
     };
-    try applyDelta(alloc, &state, .{
+    try applyTestDelta(alloc, &state, .{
         .log_generation = generation,
         .seq = 2,
         .event_id = identifier(0x82),
@@ -2840,7 +2932,7 @@ test "recovery checkpoint events replace and clear deterministically" {
     var replacement = first;
     replacement.assistant_source = @constCast("partial plus more");
     replacement.consumed_provider_attempts = 3;
-    try applyDelta(alloc, &state, .{
+    try applyTestDelta(alloc, &state, .{
         .log_generation = generation,
         .seq = 3,
         .event_id = identifier(0x83),
@@ -2853,7 +2945,7 @@ test "recovery checkpoint events replace and clear deterministically" {
     );
     try std.testing.expectEqual(@as(usize, 3), state.?.recovery_checkpoint.?.consumed_provider_attempts);
 
-    try applyDelta(alloc, &state, .{
+    try applyTestDelta(alloc, &state, .{
         .log_generation = generation,
         .seq = 4,
         .event_id = identifier(0x84),
@@ -2870,14 +2962,14 @@ test "recovery checkpoint events replace and clear deterministically" {
     });
     try std.testing.expect(state.?.recovery_checkpoint == null);
 
-    try applyDelta(alloc, &state, .{
+    try applyTestDelta(alloc, &state, .{
         .log_generation = generation,
         .seq = 5,
         .event_id = identifier(0x85),
         .timestamp_ms = 140,
         .event = .{ .recovery_checkpoint_set = .{ .checkpoint = replacement } },
     });
-    try applyDelta(alloc, &state, .{
+    try applyTestDelta(alloc, &state, .{
         .log_generation = generation,
         .seq = 6,
         .event_id = identifier(0x86),
@@ -2886,7 +2978,7 @@ test "recovery checkpoint events replace and clear deterministically" {
     });
     try std.testing.expect(state.?.recovery_checkpoint == null);
 
-    try applyDelta(alloc, &state, .{
+    try applyTestDelta(alloc, &state, .{
         .log_generation = generation,
         .seq = 7,
         .event_id = identifier(0x87),

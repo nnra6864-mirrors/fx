@@ -4,6 +4,7 @@ const io_mod = @import("../shared/io.zig");
 const profile_usage_store = @import("profile_usage_store.zig");
 const session_usage = @import("session_usage.zig");
 const usage_report = @import("usage_report.zig");
+const read_cancellation = @import("../shared/read_cancellation.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -81,9 +82,9 @@ pub const Runtime = struct {
         recovery: Recovery,
     ) !usage_report.Snapshot {
         if (scope == .session) return error.InvalidUsageScope;
-        var loaded = try self.load(alloc);
+        var loaded = try self.load(alloc, null);
         defer loaded.deinit(alloc);
-        return buildSnapshot(alloc, loaded, scope, snapshot_time_ms, recovery);
+        return buildSnapshot(alloc, loaded, scope, snapshot_time_ms, recovery, null);
     }
 
     pub fn rollingSnapshots(
@@ -91,13 +92,14 @@ pub const Runtime = struct {
         alloc: Allocator,
         snapshot_time_ms: i64,
         recovery: Recovery,
+        cancel_flag: read_cancellation.CancelFlag,
     ) ![3]usage_report.Snapshot {
         const scopes = [_]usage_report.Scope{
             .days_30,
             .days_7,
             .hours_24,
         };
-        var loaded = try self.load(alloc);
+        var loaded = try self.load(alloc, cancel_flag);
         defer loaded.deinit(alloc);
         var snapshots: [scopes.len]usage_report.Snapshot = undefined;
         var built: usize = 0;
@@ -109,17 +111,18 @@ pub const Runtime = struct {
                 scope,
                 snapshot_time_ms,
                 recovery,
+                cancel_flag,
             );
             built += 1;
         }
         return snapshots;
     }
 
-    fn load(self: *Runtime, alloc: Allocator) !profile_usage_store.Loaded {
-        self.mutex.lockUncancelable(io_mod.getIo());
+    fn load(self: *Runtime, alloc: Allocator, cancel_flag: read_cancellation.CancelFlag) !profile_usage_store.Loaded {
+        try read_cancellation.lock(io_mod.getIo(), &self.mutex, cancel_flag);
         defer self.mutex.unlock(io_mod.getIo());
         const store = if (self.store) |*value| value else return error.ProfileUsageUnavailable;
-        const loaded = store.load(alloc) catch |err| {
+        const loaded = store.load(alloc, cancel_flag) catch |err| {
             self.last_error = err;
             return err;
         };
@@ -136,12 +139,13 @@ pub const Runtime = struct {
     fn publishEvent(
         context: *anyopaque,
         event: usage_report.ProfileEvent,
+        cancel_flag: read_cancellation.CancelFlag,
     ) anyerror!void {
         const self: *Runtime = @ptrCast(@alignCast(context));
-        self.mutex.lockUncancelable(io_mod.getIo());
+        try read_cancellation.lock(io_mod.getIo(), &self.mutex, cancel_flag);
         defer self.mutex.unlock(io_mod.getIo());
         const store = if (self.store) |*value| value else return error.ProfileUsageUnavailable;
-        const outcome = store.appendEvent(std.heap.c_allocator, event) catch |err| {
+        const outcome = store.appendEvent(std.heap.c_allocator, event, cancel_flag) catch |err| {
             self.last_error = err;
             return err;
         };
@@ -159,21 +163,26 @@ fn buildSnapshot(
     scope: usage_report.Scope,
     snapshot_time_ms: i64,
     recovery: Recovery,
+    cancel_flag: read_cancellation.CancelFlag,
 ) !usage_report.Snapshot {
+    try read_cancellation.check(cancel_flag);
     var coverage_started_at_ms = loaded.coverage_started_at_ms;
     for (recovery.facts) |fact| {
+        try read_cancellation.check(cancel_flag);
         coverage_started_at_ms = if (coverage_started_at_ms) |started_at_ms|
             @min(started_at_ms, fact.created_at_ms)
         else
             fact.created_at_ms;
     }
     for (recovery.incidents) |incident| {
+        try read_cancellation.check(cancel_flag);
         coverage_started_at_ms = if (coverage_started_at_ms) |started_at_ms|
             @min(started_at_ms, incident.occurred_at_ms)
         else
             incident.occurred_at_ms;
     }
     for (recovery.pending) |marker| {
+        try read_cancellation.check(cancel_flag);
         coverage_started_at_ms = if (coverage_started_at_ms) |started_at_ms|
             @min(started_at_ms, marker.observed_at_ms)
         else
@@ -202,7 +211,10 @@ fn buildSnapshot(
         alloc,
         @intCast(loaded.facts.len),
     );
-    for (loaded.facts) |fact| durable_fact_ids.putAssumeCapacity(fact.id, {});
+    for (loaded.facts) |fact| {
+        try read_cancellation.check(cancel_flag);
+        durable_fact_ids.putAssumeCapacity(fact.id, {});
+    }
 
     var unknown_pending = recovery.unknown_pending;
     const incidents = try alloc.alloc(
@@ -222,10 +234,12 @@ fn buildSnapshot(
     );
     var incident_count = loaded.incidents.len;
     for (recovery.incidents) |incident| {
+        try read_cancellation.check(cancel_flag);
         incidents[incident_count] = incident;
         incident_count += 1;
     }
     for (recovery.facts) |fact| {
+        try read_cancellation.check(cancel_flag);
         if (durable_fact_ids.contains(fact.id)) continue;
         if (fact.created_at_ms >= snapshot_time_ms) {
             unknown_pending = true;
@@ -239,6 +253,7 @@ fn buildSnapshot(
     }
     inline for (.{ loaded.pending, recovery.pending }) |markers| {
         for (markers) |marker| {
+            try read_cancellation.check(cancel_flag);
             if (durable_fact_ids.contains(marker.id)) continue;
             if (marker.observed_at_ms >= snapshot_time_ms) {
                 unknown_pending = true;
@@ -266,6 +281,7 @@ fn buildSnapshot(
         coverage_started_at_ms,
         facts,
         incidents[0..incident_count],
+        cancel_flag,
     );
 }
 
@@ -295,7 +311,7 @@ test "profile runtime snapshots only durable profile facts" {
         .total_cost = 0.25,
     };
     const sink = runtime.publisherSink(alloc);
-    try sink.publish(sink.context, .{ .generation = fact });
+    try sink.publish(sink.context, .{ .generation = fact }, null);
     const snapshot_time_ms = @max(io_mod.milliTimestamp(), now_ms) +| 1;
 
     var snapshot = try runtime.snapshot(
@@ -309,7 +325,7 @@ test "profile runtime snapshots only durable profile facts" {
     try std.testing.expectEqual(@as(u64, 7), snapshot.totals.?.total_tokens);
     try std.testing.expectEqual(@as(u64, 1), snapshot.totals.?.request_count.?);
 
-    var rolling = try runtime.rollingSnapshots(alloc, snapshot_time_ms, .{});
+    var rolling = try runtime.rollingSnapshots(alloc, snapshot_time_ms, .{}, null);
     defer for (&rolling) |*item| item.deinit(alloc);
     const expected_scopes = [_]usage_report.Scope{ .days_30, .days_7, .hours_24 };
     for (rolling, expected_scopes) |item, expected_scope| {
@@ -391,7 +407,7 @@ test "recovered facts stay pending until the profile ledger accepts them" {
         .total_cost = 0.1,
     };
     const sink = runtime.publisherSink(alloc);
-    try sink.publish(sink.context, .{ .generation = durable });
+    try sink.publish(sink.context, .{ .generation = durable }, null);
     const snapshot_time_ms = @max(io_mod.milliTimestamp(), now_ms) +| 1;
     const recovered = usage_report.GenerationFact{
         .id = @constCast("gen_01ARZ3NDEKTSV4RRFFQ69G5FAW"),
@@ -415,7 +431,7 @@ test "recovered facts stay pending until the profile ledger accepts them" {
     try std.testing.expectEqual(usage_report.Completeness.pending, pending.completeness);
     try std.testing.expectEqual(@as(u64, 11), pending.totals.?.total_tokens);
 
-    try sink.publish(sink.context, .{ .generation = recovered });
+    try sink.publish(sink.context, .{ .generation = recovered }, null);
     var settled = try runtime.snapshot(
         alloc,
         .hours_24,
@@ -455,7 +471,7 @@ test "older recovery data extends durable profile coverage" {
         .total_cost = 0.1,
     };
     const sink = runtime.publisherSink(alloc);
-    try sink.publish(sink.context, .{ .generation = durable });
+    try sink.publish(sink.context, .{ .generation = durable }, null);
     const snapshot_time_ms = @max(io_mod.milliTimestamp(), now_ms) +| 1;
     const recovered = usage_report.GenerationFact{
         .id = @constCast("gen_01ARZ3NDEKTSV4RRFFQ69G5FAW"),
@@ -530,7 +546,7 @@ test "profile runtime resolves durable pending markers and preserves incidents" 
     try sink.publish(sink.context, .{ .pending = .{
         .id = @constCast("gen_01ARZ3NDEKTSV4RRFFQ69G5FAV"),
         .observed_at_ms = now_ms - 1,
-    } });
+    } }, null);
     const snapshot_time_ms = @max(io_mod.milliTimestamp(), now_ms) +| 1;
 
     var pending = try runtime.snapshot(alloc, .hours_24, snapshot_time_ms, .{});
@@ -550,7 +566,7 @@ test "profile runtime resolves durable pending markers and preserves incidents" 
         .billable_web_search_calls = 1,
         .total_cost = 0.25,
     };
-    try sink.publish(sink.context, .{ .generation = fact });
+    try sink.publish(sink.context, .{ .generation = fact }, null);
 
     var settled = try runtime.snapshot(alloc, .hours_24, snapshot_time_ms, .{});
     defer settled.deinit(alloc);
@@ -561,8 +577,8 @@ test "profile runtime resolves durable pending markers and preserves incidents" 
         .occurred_at_ms = now_ms,
         .completeness = .incomplete,
     };
-    try sink.publish(sink.context, .{ .incident = incident });
-    try sink.publish(sink.context, .{ .incident = incident });
+    try sink.publish(sink.context, .{ .incident = incident }, null);
+    try sink.publish(sink.context, .{ .incident = incident }, null);
 
     var incomplete = try runtime.snapshot(alloc, .hours_24, snapshot_time_ms, .{});
     defer incomplete.deinit(alloc);
@@ -607,10 +623,7 @@ test "profile runtime serializes publication and snapshots" {
 
         fn run(self: *@This()) void {
             for (0..3) |_| {
-                self.sink.publish(
-                    self.sink.context,
-                    .{ .generation = self.generation },
-                ) catch |err| {
+                self.sink.publish(self.sink.context, .{ .generation = self.generation }, null) catch |err| {
                     self.failure = err;
                     return;
                 };

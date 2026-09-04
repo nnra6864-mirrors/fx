@@ -1,4 +1,5 @@
 const std = @import("std");
+const session_read = @import("../shared/read_cancellation.zig");
 const session = @import("session.zig");
 const session_codec = @import("session_codec.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -198,15 +199,16 @@ pub fn decodeManifest(alloc: Allocator, bytes: []const u8) !Manifest {
     {
         return error.InvalidManifest;
     }
-    const id = try dupeString(alloc, root, "id");
+    const id = try dupeString(alloc, root, "id", null);
     errdefer alloc.free(id);
-    const origin = try dupeString(alloc, root, "origin_workspace_root");
+    const origin = try dupeString(alloc, root, "origin_workspace_root", null);
     errdefer alloc.free(origin);
-    const current = try dupeString(alloc, root, "workspace_root");
+    const current = try dupeString(alloc, root, "workspace_root", null);
     errdefer alloc.free(current);
     const preferences = try parsePreferences(
         alloc,
         root.get("preferences") orelse return error.InvalidManifest,
+        null,
     );
     errdefer {
         var owned = preferences;
@@ -311,7 +313,14 @@ fn durablePreferencesEqual(
 }
 
 pub fn encodeCheckpoint(alloc: Allocator, checkpoint: Checkpoint) ![]u8 {
-    try validateCheckpoint(checkpoint);
+    return encodeCheckpointCancellable(alloc, checkpoint, null) catch |err| switch (err) {
+        error.Cancelled => unreachable,
+        inline else => |failure| return failure,
+    };
+}
+
+pub fn encodeCheckpointCancellable(alloc: Allocator, checkpoint: Checkpoint, cancel_flag: session_read.CancelFlag) ![]u8 {
+    try validateCheckpoint(checkpoint, cancel_flag);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
@@ -326,55 +335,72 @@ pub fn encodeCheckpoint(alloc: Allocator, checkpoint: Checkpoint) ![]u8 {
     try out.writer.print(",\"through_event_log_bytes\":{d},\"state\":", .{
         checkpoint.through_event_log_bytes,
     });
-    _ = try session_codec.encodeState(checkpoint.state, &out.writer);
+    _ = try session_codec.encodeStateCancellable(checkpoint.state, &out.writer, cancel_flag);
     try out.writer.writeByte('}');
 
     if (out.written().len > checkpoint_max_bytes) return error.CheckpointTooLarge;
     return try out.toOwnedSlice();
 }
 
-pub fn decodeCheckpoint(alloc: Allocator, bytes: []const u8) !Checkpoint {
-    return decodeCheckpointImpl(alloc, bytes) catch |err| switch (err) {
-        error.OutOfMemory => return failCheckpoint(error.OutOfMemory),
-        error.CheckpointTooLarge => return failCheckpoint(error.CheckpointTooLarge),
-        else => return failCheckpoint(error.InvalidCheckpoint),
+pub fn decodeCheckpoint(alloc: Allocator, bytes: []const u8, cancel_flag: session_read.CancelFlag) !Checkpoint {
+    return decodeCheckpointImpl(alloc, bytes, cancel_flag) catch |err| {
+        try session_read.check(cancel_flag);
+        return switch (err) {
+            error.OutOfMemory => return failCheckpoint(error.OutOfMemory),
+            error.CheckpointTooLarge => return failCheckpoint(error.CheckpointTooLarge),
+            else => return failCheckpoint(error.InvalidCheckpoint),
+        };
     };
 }
 
-fn decodeCheckpointImpl(alloc: Allocator, bytes: []const u8) !Checkpoint {
+fn decodeCheckpointImpl(alloc: Allocator, bytes: []const u8, cancel_flag: session_read.CancelFlag) !Checkpoint {
     if (bytes.len == 0 or bytes.len > checkpoint_max_bytes) return error.CheckpointTooLarge;
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{
-        .parse_numbers = false,
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidCheckpoint,
-    };
-    defer parsed.deinit();
-    const root = try exactObject(parsed.value, &.{
+    var source = std.Io.Reader.fixed(bytes);
+    var buffer: [session_read.work_bytes]u8 = undefined;
+    var cancellable = session_read.Reader.init(&source, &buffer, cancel_flag);
+    var reader = std.json.Reader.init(alloc, &cancellable.interface);
+    defer reader.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var fields: std.json.ObjectMap = .empty;
+    var state: ?session_codec.DurableSessionState = null;
+    errdefer if (state) |*owned| owned.deinit(alloc);
+    if (try reader.next() != .object_begin) return error.InvalidCheckpoint;
+    while (try reader.peekNextTokenType() != .object_end) {
+        try session_read.check(cancel_flag);
+        const key = try reader.nextAllocMax(scratch, .alloc_always, 64);
+        if (key != .allocated_string) return error.InvalidCheckpoint;
+        if (std.mem.eql(u8, key.allocated_string, "state")) {
+            if (state != null) return error.InvalidCheckpoint;
+            state = try session_codec.decodeStateTokens(alloc, &reader, .{
+                .max_value_bytes = checkpoint_max_bytes,
+                .cancel_flag = cancel_flag,
+            });
+        } else {
+            if (fields.count() >= 6 or fields.contains(key.allocated_string)) return error.InvalidCheckpoint;
+            const value = try std.json.Value.jsonParse(scratch, &reader, .{
+                .parse_numbers = false,
+                .allocate = .alloc_always,
+                .max_value_len = checkpoint_max_bytes,
+            });
+            try fields.put(scratch, key.allocated_string, value);
+        }
+    }
+    _ = try reader.next();
+    if (try reader.next() != .end_of_document) return error.InvalidCheckpoint;
+    try session_read.check(cancel_flag);
+    const root = try exactObject(.{ .object = fields }, &.{
         "schema_version",
         "session_id",
         "log_generation",
         "through_seq",
         "through_event_id",
         "through_event_log_bytes",
-        "state",
     });
     if (try requireU64(root, "schema_version") != 1) return error.InvalidCheckpoint;
 
-    var state_json: std.Io.Writer.Allocating = .init(alloc);
-    defer state_json.deinit();
-    try std.json.Stringify.value(
-        root.get("state") orelse return error.InvalidCheckpoint,
-        .{},
-        &state_json.writer,
-    );
-    var state_source = std.Io.Reader.fixed(state_json.written());
-    var state = session_codec.decodeState(alloc, &state_source, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidCheckpoint,
-    };
-    errdefer state.deinit(alloc);
-    const session_id = try dupeString(alloc, root, "session_id");
+    const session_id = try dupeString(alloc, root, "session_id", cancel_flag);
     errdefer alloc.free(session_id);
     const checkpoint = Checkpoint{
         .session_id = session_id,
@@ -382,9 +408,9 @@ fn decodeCheckpointImpl(alloc: Allocator, bytes: []const u8) !Checkpoint {
         .through_seq = try requireU64(root, "through_seq"),
         .through_event_id = try parseIdentifier(try requireString(root, "through_event_id")),
         .through_event_log_bytes = try requireU64(root, "through_event_log_bytes"),
-        .state = state,
+        .state = state orelse return error.InvalidCheckpoint,
     };
-    try validateCheckpoint(checkpoint);
+    try validateCheckpoint(checkpoint, cancel_flag);
     return checkpoint;
 }
 
@@ -394,9 +420,11 @@ pub fn validateCheckpointReference(
     checkpoint: Checkpoint,
     watermark: EventBoundary,
     checkpoint_boundary: EventBoundary,
+    cancel_flag: session_read.CancelFlag,
 ) !void {
+    try session_read.check(cancel_flag);
     const expected_hash = manifest.checkpoint_sha256 orelse return error.StaleCheckpoint;
-    if (!std.mem.eql(u8, &sha256(checkpoint_bytes), &expected_hash)) {
+    if (!std.mem.eql(u8, &try session_read.sha256(checkpoint_bytes, cancel_flag), &expected_hash)) {
         return error.CheckpointHashMismatch;
     }
     if (manifest.checkpoint_seq == null or
@@ -447,7 +475,7 @@ fn validateManifest(manifest: Manifest) !void {
         .total_input_tokens = manifest.total_input_tokens,
         .total_output_tokens = manifest.total_output_tokens,
     };
-    session_codec.validateState(state) catch return error.InvalidManifest;
+    session_codec.validateState(state, null) catch return error.InvalidManifest;
     if (manifest.last_event_seq == 0 or manifest.event_log_bytes == 0 or
         manifest.generation_base_seq == 0 or
         manifest.generation_base_seq > manifest.last_event_seq or
@@ -462,8 +490,12 @@ fn validateManifest(manifest: Manifest) !void {
     }
 }
 
-fn validateCheckpoint(checkpoint: Checkpoint) !void {
-    session_codec.validateState(checkpoint.state) catch return error.InvalidCheckpoint;
+fn validateCheckpoint(checkpoint: Checkpoint, cancel_flag: session_read.CancelFlag) !void {
+    try session_read.check(cancel_flag);
+    session_codec.validateState(checkpoint.state, cancel_flag) catch |err| switch (err) {
+        error.Cancelled => return err,
+        else => return error.InvalidCheckpoint,
+    };
     if (checkpoint.through_seq == 0 or checkpoint.through_event_log_bytes == 0 or
         !std.mem.eql(u8, checkpoint.session_id, checkpoint.state.id))
     {
@@ -486,13 +518,14 @@ fn writePreferences(
     try writer.writeByte('}');
 }
 
-fn parsePreferences(alloc: Allocator, value: std.json.Value) !session_codec.DurableSessionPreferences {
+fn parsePreferences(alloc: Allocator, value: std.json.Value, cancel_flag: session_read.CancelFlag) !session_codec.DurableSessionPreferences {
+    try session_read.check(cancel_flag);
     const raw_object = if (value == .object) value.object else return error.InvalidManifest;
     const object = if (raw_object.get("provider") != null)
         try exactObject(value, &.{ "provider", "model", "effort", "fast_mode" })
     else
         try exactObject(value, &.{ "model", "effort", "fast_mode" });
-    const model = try dupeString(alloc, object, "model");
+    const model = try dupeString(alloc, object, "model", cancel_flag);
     errdefer alloc.free(model);
     return .{
         .provider = if (object.get("provider")) |provider_value| blk: {
@@ -528,7 +561,8 @@ fn requireString(object: std.json.ObjectMap, key: []const u8) ![]const u8 {
     return value.string;
 }
 
-fn dupeString(alloc: Allocator, object: std.json.ObjectMap, key: []const u8) ![]u8 {
+fn dupeString(alloc: Allocator, object: std.json.ObjectMap, key: []const u8, cancel_flag: session_read.CancelFlag) ![]u8 {
+    try session_read.check(cancel_flag);
     return try alloc.dupe(u8, try requireString(object, key));
 }
 
@@ -696,7 +730,7 @@ test "checkpoint decode semantic validation failure frees owned fields once" {
     const pos = std.mem.find(u8, invalid, needle) orelse return error.TestUnexpectedResult;
     @memcpy(invalid[pos..][0..replacement.len], replacement);
 
-    try std.testing.expectError(error.InvalidCheckpoint, decodeCheckpoint(alloc, invalid));
+    try std.testing.expectError(error.InvalidCheckpoint, decodeCheckpoint(alloc, invalid, null));
 }
 
 test "event stat fingerprint detects same-size replacement and metadata-only change" {
@@ -761,7 +795,7 @@ test "checkpoint validation rejects stale corrupt and non-semantic boundaries" {
     defer alloc.free(bytes);
     try std.testing.expect(bytes.len <= checkpoint_max_bytes);
     const checkpoint_hash = sha256(bytes);
-    var decoded_checkpoint = try decodeCheckpoint(alloc, bytes);
+    var decoded_checkpoint = try decodeCheckpoint(alloc, bytes, null);
     defer decoded_checkpoint.deinit(alloc);
     try std.testing.expectEqualStrings(checkpoint.session_id, decoded_checkpoint.session_id);
     try std.testing.expectEqual(checkpoint.through_seq, decoded_checkpoint.through_seq);
@@ -791,28 +825,28 @@ test "checkpoint validation rejects stale corrupt and non-semantic boundaries" {
         .event_log_bytes = checkpoint.through_event_log_bytes,
         .semantic = true,
     };
-    try validateCheckpointReference(manifest, bytes, checkpoint, watermark, checkpoint_boundary);
+    try validateCheckpointReference(manifest, bytes, checkpoint, watermark, checkpoint_boundary, null);
 
     var corrupt = try alloc.dupe(u8, bytes);
     defer alloc.free(corrupt);
     corrupt[corrupt.len - 1] ^= 1;
     try std.testing.expectError(
         error.CheckpointHashMismatch,
-        validateCheckpointReference(manifest, corrupt, checkpoint, watermark, checkpoint_boundary),
+        validateCheckpointReference(manifest, corrupt, checkpoint, watermark, checkpoint_boundary, null),
     );
 
     var old_generation = checkpoint_boundary;
     old_generation.log_generation = testIdentifier(0x40);
     try std.testing.expectError(
         error.StaleCheckpoint,
-        validateCheckpointReference(manifest, bytes, checkpoint, watermark, old_generation),
+        validateCheckpointReference(manifest, bytes, checkpoint, watermark, old_generation, null),
     );
 
     var provisional_boundary = checkpoint_boundary;
     provisional_boundary.semantic = false;
     try std.testing.expectError(
         error.InvalidCheckpointBoundary,
-        validateCheckpointReference(manifest, bytes, checkpoint, watermark, provisional_boundary),
+        validateCheckpointReference(manifest, bytes, checkpoint, watermark, provisional_boundary, null),
     );
 }
 

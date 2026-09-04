@@ -264,7 +264,7 @@ pub const SignInRuntime = struct {
     const Self = @This();
 
     mutex: std.Io.Mutex = .init,
-    thread: ?std.Thread = null,
+    thread: ?std.Io.Future(void) = null,
     cancel_requested: std.atomic.Value(bool) = .init(false),
     state: SignInState = .idle,
     flow: ?PreparedLogin = null,
@@ -336,7 +336,7 @@ pub const SignInRuntime = struct {
         self.mutex.unlock(io_mod.getIo());
 
         if (cooperative) return true;
-        self.thread = std.Thread.spawn(.{}, workerMain, .{ self, alloc }) catch |err| {
+        self.thread = std.Io.concurrent(io_mod.getIo(), workerMain, .{ self, alloc }) catch |err| {
             self.mutex.lockUncancelable(io_mod.getIo());
             self.state = .idle;
             self.mutex.unlock(io_mod.getIo());
@@ -356,7 +356,10 @@ pub const SignInRuntime = struct {
         self.mutex.unlock(io_mod.getIo());
 
         if (comptime !host_target.is_wasm) {
-            if (thread) |handle| handle.join();
+            if (thread) |handle| {
+                var task = handle;
+                task.cancel(io_mod.getIo());
+            }
         }
         self.clearFlow(alloc);
         return cancelled;
@@ -413,7 +416,10 @@ pub const SignInRuntime = struct {
         if (!terminal) return .none;
 
         if (comptime !host_target.is_wasm) {
-            if (thread) |handle| handle.join();
+            if (thread) |handle| {
+                var task = handle;
+                task.await(io_mod.getIo());
+            }
         }
         self.clearFlow(alloc);
 
@@ -513,17 +519,23 @@ pub const SignInRuntime = struct {
         defer completion.deinit(alloc);
 
         self.mutex.lockUncancelable(io_mod.getIo());
-        defer self.mutex.unlock(io_mod.getIo());
         if (self.state != .polling or self.cancel_requested.load(.seq_cst)) {
             debug_trace.logf("auth", "sign-in discarded session after cancel state={t}", .{self.state});
+            self.mutex.unlock(io_mod.getIo());
             return;
         }
+        self.mutex.unlock(io_mod.getIo());
         self.deps.save(self.deps.ctx, alloc, completion) catch |err| {
             debug_trace.logf("auth", "sign-in session save failed err={s}", .{@errorName(err)});
-            self.failure = err;
-            self.state = .failed;
+            self.publishFailure(err);
             return;
         };
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.state != .polling or self.cancel_requested.load(.seq_cst)) {
+            debug_trace.logf("auth", "sign-in discarded completion after cancel state={t}", .{self.state});
+            return;
+        }
         self.completion = completion.take();
         self.state = .succeeded;
     }
@@ -1715,6 +1727,8 @@ const SignInTestState = struct {
     poll_count: std.atomic.Value(usize) = .init(0),
     complete_count: std.atomic.Value(usize) = .init(0),
     save_count: std.atomic.Value(usize) = .init(0),
+    save_lock_dir: ?*io_mod.VerifiedDir = null,
+    save_waiting: std.atomic.Value(bool) = .init(false),
 
     fn deps(self: *@This()) SignInRuntimeDeps {
         return .{
@@ -1775,12 +1789,54 @@ const SignInTestState = struct {
     fn save(raw: ?*anyopaque, _: Allocator, _: SignInCompletion) !void {
         const self = state(raw);
         _ = self.save_count.fetchAdd(1, .seq_cst);
+        if (self.save_lock_dir) |dir| {
+            var lock = try io_mod.acquireTimedAdvisoryLockWithOps(dir, "auth.lock", 1000, .{
+                .ctx = self,
+                .try_lock = trySaveLock,
+            });
+            lock.release();
+        }
+    }
+
+    fn trySaveLock(raw: ?*anyopaque, file: std.Io.File) !bool {
+        const acquired = try file.tryLock(io_mod.getIo(), .exclusive);
+        if (!acquired) state(raw).save_waiting.store(true, .release);
+        return acquired;
     }
 
     fn state(raw: ?*anyopaque) *@This() {
         return @ptrCast(@alignCast(raw.?));
     }
 };
+
+test "sign-in cancellation interrupts a credential save already waiting on its lock" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir: io_mod.VerifiedDir = .{ .dir = try tmp.dir.openDir(io_mod.getIo(), ".", .{}) };
+    defer dir.close();
+    var held = try io_mod.acquireTimedAdvisoryLock(&dir, "auth.lock", 0);
+    defer held.release();
+    const before = try dir.dir.statFile(io_mod.getIo(), "auth.lock", .{});
+    var state: SignInTestState = .{ .mode = .success, .save_lock_dir = &dir };
+    var runtime: SignInRuntime = .{};
+    defer runtime.deinit(alloc);
+    try std.testing.expect(try runtime.startPrepared(alloc, try makeTestPreparedLogin(alloc), state.deps()));
+    for (0..5000) |_| {
+        if (state.save_waiting.load(.acquire)) break;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    const waiting = state.save_waiting.load(.acquire);
+    const started = io_mod.milliTimestamp();
+    _ = runtime.cancel(alloc);
+    try std.testing.expect(waiting);
+    try std.testing.expect(io_mod.milliTimestamp() - started < 500);
+    try std.testing.expect(runtime.thread == null);
+    try std.testing.expect(runtime.completion == null);
+    const after = try dir.dir.statFile(io_mod.getIo(), "auth.lock", .{});
+    try std.testing.expectEqual(before.mtime, after.mtime);
+    try std.testing.expectEqual(before.size, after.size);
+}
 
 const CooperativeSignInTestState = struct {
     poll: LoginPollTestState,

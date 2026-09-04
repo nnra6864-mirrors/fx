@@ -142,14 +142,13 @@ pub fn listActionablePage(
     continuation: ?session_store.ResumableSessionContinuation,
     limit: usize,
 ) !ActionableSessionPage {
-    return listActionablePageInternal(
-        store,
-        alloc,
-        scope,
-        active_id,
-        continuation,
-        limit,
-    );
+    for (0..2) |_| {
+        return listActionablePageInternal(store, alloc, scope, active_id, continuation, limit) catch |err| switch (err) {
+            error.SessionIndexChanged => continue,
+            else => return err,
+        };
+    }
+    return error.SessionIndexChanged;
 }
 
 fn listActionablePageInternal(
@@ -189,7 +188,11 @@ fn listActionablePageInternal(
             ),
         };
         defer page.deinit(alloc);
-        result.publication = page.publication;
+        if (scanned == 0) {
+            result.publication = page.publication;
+        } else if (!std.meta.eql(result.publication, page.publication)) {
+            return error.SessionIndexChanged;
+        }
         result.has_more = page.has_more;
         if (page.summaries.items.len == 0) break;
 
@@ -224,6 +227,9 @@ fn listActionablePageInternal(
         if (result.summaries.items.len == limit or !page.has_more) break;
     }
 
+    if (result.publication) |publication| {
+        if (!store.sessionIndexPublicationCurrent(publication)) return error.SessionIndexChanged;
+    }
     if (position) |value| {
         result.continuation = value;
         position = null;
@@ -256,42 +262,6 @@ pub fn resumeForExternalPrompt(
     );
     errdefer loaded.deinit(alloc);
     try ensureExternalMarkerAllowed(store, alloc, loaded.active_id);
-    try ensureLoadedExternalPromptAllowed(&loaded);
-    return loaded;
-}
-
-pub fn admitResumeViewForExternalPrompt(
-    store: session_store.Store,
-    alloc: Allocator,
-    target: session_store.ResumeTarget,
-) !?session_store.ResumeViewAdmission {
-    switch (target) {
-        .id => |session_id| try ensureExternalMarkerAllowed(store, alloc, session_id),
-        .last => {},
-    }
-    var admission = (try store.admitResumeView(alloc, target)) orelse return null;
-    errdefer admission.deinit(alloc);
-    try ensureExternalPromptAllowed(store, alloc, admission.sessionId());
-    return admission;
-}
-
-pub fn resumeAdmittedForExternalPrompt(
-    store: session_store.Store,
-    alloc: Allocator,
-    admission: *session_store.ResumeViewAdmission,
-    session_id: []const u8,
-    workspace_root: []const u8,
-    options: session_store.ResumeOptions,
-) !session_store.LoadedWritableSession {
-    try ensureExternalMarkerAllowed(store, alloc, session_id);
-    var loaded = try store.resumeAdmittedForWrite(
-        alloc,
-        admission,
-        session_id,
-        workspace_root,
-        options,
-    );
-    errdefer loaded.deinit(alloc);
     try ensureLoadedExternalPromptAllowed(&loaded);
     return loaded;
 }
@@ -353,7 +323,7 @@ fn ensureExternalMarkerAllowed(
         session_id,
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.SessionNotFound, error.SessionStoreUnavailable => return,
+        error.SessionNotFound => return,
         else => return err,
     };
     if (managed) return error.OneOffSessionNotResumable;
@@ -402,7 +372,7 @@ test "managed child marker is hidden from external access" {
     visible.deinit(alloc);
 
     const state_store = child_state.Store{ .sessions = &store, .parent_id = "parent" };
-    try state_store.markChildSession(alloc, "child");
+    try state_store.markChildSession(alloc, "child", null);
     try std.testing.expectError(
         error.SessionNotFound,
         loadVisibleReadOnlyDetail(store, alloc, "child", .{}),

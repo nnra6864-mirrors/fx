@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -187,6 +188,248 @@ async function waitForFile(path: string): Promise<void> {
   }
   throw new Error(`Timed out waiting for ${path}`);
 }
+
+function createTtyExitCommand(fixture: ReturnType<typeof createFixture>, name: string) {
+  const scriptPath = join(fixture.workspace, `${name}.py`);
+  const markerPath = join(fixture.workspace, `${name}.json`);
+  const echoPath = join(fixture.workspace, `${name}.echo`);
+  writeFileSync(scriptPath, [
+    "import json, os, signal, sys",
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+    "signal.signal(signal.SIGHUP, signal.SIG_IGN)",
+    `with open(${JSON.stringify(markerPath + ".pending")}, 'w') as f: json.dump({'command': os.getpid(), 'launcher': os.getppid()}, f)`,
+    `os.replace(${JSON.stringify(markerPath + ".pending")}, ${JSON.stringify(markerPath)})`,
+    "for line in sys.stdin:",
+    `    with open(${JSON.stringify(echoPath)}, 'w') as f: f.write(line)`,
+    "    print('TTY_ACK:' + line.strip(), flush=True)",
+  ].join("\n") + "\n");
+  return { scriptPath, markerPath, echoPath, command: `exec /usr/bin/python3 -u ${JSON.stringify(scriptPath)}` };
+}
+
+function ttyExitPids(fixture: ReturnType<typeof createFixture>, command: ReturnType<typeof createTtyExitCommand>) {
+  const owned = JSON.parse(readFileSync(command.markerPath, "utf8")) as { command: number; launcher: number };
+  const host = Number(JSON.parse(readFileSync(join(fixture.home, ".fx", "terminal-host-v7", "host.json"), "utf8")).pid);
+  for (const pid of [owned.command, owned.launcher, host]) {
+    expect(Number.isSafeInteger(pid) && pid > 0).toBe(true);
+  }
+  expect(execFileSync("ps", ["-p", String(owned.launcher), "-o", "command="], { encoding: "utf8" }))
+    .toContain("--fx-internal-terminal-launcher");
+  return [
+    { role: "command", pid: owned.command },
+    { role: "launcher", pid: owned.launcher },
+    { role: "host", pid: host },
+  ];
+}
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+async function exitAndObserveTtyOwners(active: TmuxSession, owners: Array<{ role: string; pid: number }>, gesture: "ctrl+c" | "/quit" = "ctrl+c") {
+  const fxPid = active.processPid();
+  if (gesture === "ctrl+c") {
+    active.sendKeysImmediate(["C-c"]);
+    await active.waitForText("press ctrl+c again to exit", TIMEOUT);
+  }
+  const started = performance.now();
+  if (gesture === "ctrl+c") active.sendKeysImmediate(["C-c"]);
+  else await active.sendText("/quit");
+  while (processExists(fxPid) && performance.now() - started < 5_000) await Bun.sleep(5);
+  const exitMs = performance.now() - started;
+  const all = [{ role: "fx", pid: fxPid }, ...owners];
+  const immediate = all.filter(({ pid }) => processExists(pid));
+  await Bun.sleep(Math.max(0, 500 - (performance.now() - started)));
+  const survivors = all.filter(({ pid }) => processExists(pid));
+  expect(active.paneStatus()).toEqual({ dead: true, status: 0 });
+  expect(exitMs).toBeLessThan(500);
+  expect({ immediate, survivors }).toEqual({ immediate, survivors: [] });
+  const scrollback = await active.captureFullScrollback();
+  expect(scrollback.match(/Continue session with: fx --resume \S+/g)).toHaveLength(1);
+}
+
+async function cleanupTtyExitCommand(command: ReturnType<typeof createTtyExitCommand>) {
+  if (!existsSync(command.markerPath)) return;
+  const pid = Number(JSON.parse(readFileSync(command.markerPath, "utf8")).command);
+  if (!Number.isSafeInteger(pid) || pid <= 0 || !processExists(pid)) return;
+  const observed = execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" });
+  if (!observed.includes(command.scriptPath)) throw new Error(`Fixture command identity changed: ${pid}`);
+  process.kill(pid, "SIGKILL");
+  const deadline = Date.now() + 2_000;
+  while (processExists(pid) && Date.now() < deadline) await Bun.sleep(10);
+}
+
+test.skipIf(!tmuxAvailable()).each(["ctrl+c", "/quit"] as const)(
+  "accepted %s reaps the sole session's TTY command launcher and host before cleanup",
+  async (gesture) => {
+    const fixture = createFixture("fx-tty-exit-owner-");
+    const command = createTtyExitCommand(fixture, "sole-owner");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("sole_tty", "shell", { request: {
+        action: "run", command: command.command, profile: "clean", tty: true, yield_time_ms: 0,
+      } }),
+      fakeGatewayFinalText("SOLE_TTY_MODEL_RETURNED"),
+    ]);
+    gateways.push(gateway);
+    try {
+      const active = await launch(fixture, gateway, `/usr/bin/env -u FX_TERMINAL_HOST_IDLE_MS ${JSON.stringify(FX_BIN)}`, true);
+      await active.sendText("Start an interactive command and return control while it waits for input.");
+      await active.waitForText("SOLE_TTY_MODEL_RETURNED", TIMEOUT);
+      await waitForFile(command.markerPath);
+      expect(gateway.requests).toHaveLength(2);
+      expect(toolResultEnvelope(gateway.requests[1]!.body, "sole_tty")).toContain('\\"persistence\\":\\"session\\"');
+      expect(readFileSync(fixture.tracePath, "utf8")).toContain("event=prompt_finish");
+      await exitAndObserveTtyOwners(active, ttyExitPids(fixture, command), gesture);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+    } finally {
+      await cleanupTtyExitCommand(command);
+    }
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "accepted ctrl+c stops only its saved session's TTY jobs on a shared host",
+  async () => {
+    const firstFixture = createFixture("fx-tty-exit-shared-");
+    const secondFixture = {
+      ...firstFixture,
+      tracePath: join(firstFixture.root, "second-trace.log"),
+      stderrPath: join(firstFixture.root, "second-stderr.log"),
+    };
+    const firstCommand = createTtyExitCommand(firstFixture, "first-owner");
+    const secondCommand = createTtyExitCommand(secondFixture, "second-owner");
+    let secondSessionId = "";
+    const firstGateway = startFakeGateway([
+      fakeGatewayToolCall("first_tty", "shell", { request: {
+        action: "run", command: firstCommand.command, profile: "clean", tty: true, yield_time_ms: 0,
+      } }),
+      fakeGatewayFinalText("FIRST_TTY_MODEL_RETURNED"),
+    ]);
+    const secondGateway = startFakeGateway([
+      fakeGatewayToolCall("second_tty", "shell", { request: {
+        action: "run", command: secondCommand.command, profile: "clean", tty: true, yield_time_ms: 0,
+      } }),
+      (body) => {
+        secondSessionId = findSessionId(JSON.parse(body)) ?? "";
+        return fakeGatewayFinalText("SECOND_TTY_MODEL_RETURNED");
+      },
+      () => fakeGatewayToolCall("shared_tty_interact", "shell", { request: {
+        action: "interact", session_id: secondSessionId, chars: "after-owner-exit\n", yield_time_ms: 0,
+      } }),
+      fakeGatewayFinalText("SECOND_TTY_STILL_USABLE"),
+    ]);
+    gateways.push(firstGateway, secondGateway);
+    try {
+      const cmd = `/usr/bin/env -u FX_TERMINAL_HOST_IDLE_MS ${JSON.stringify(FX_BIN)}`;
+      const first = await launch(firstFixture, firstGateway, cmd, true);
+      await first.sendText("Start the first session's interactive command and return control.");
+      await first.waitForText("FIRST_TTY_MODEL_RETURNED", TIMEOUT);
+      await waitForFile(firstCommand.markerPath);
+      const firstPids = ttyExitPids(firstFixture, firstCommand);
+      const second = await launch(secondFixture, secondGateway, cmd, true);
+      await second.sendText("Start the second session's interactive command and return control.");
+      await second.waitForText("SECOND_TTY_MODEL_RETURNED", TIMEOUT);
+      await waitForFile(secondCommand.markerPath);
+      const secondPids = ttyExitPids(secondFixture, secondCommand);
+      expect(secondSessionId).not.toBe("");
+      expect(firstPids.find(({ role }) => role === "host")).toEqual(secondPids.find(({ role }) => role === "host"));
+      const records = terminalRecords(firstFixture.home);
+      const owners = records.filter(record => [firstPids[0]!.pid, secondPids[0]!.pid].includes(Number(record.pid)))
+        .map(record => record.owner_session_id);
+      expect(owners).toHaveLength(2);
+      expect(new Set(owners).size).toBe(2);
+      await exitAndObserveTtyOwners(first, firstPids.filter(({ role }) => role !== "host"));
+      for (const { pid } of secondPids) expect(processExists(pid)).toBe(true);
+      expect(second.isPaneAlive()).toBe(true);
+      await second.sendText("Send follow-up input to the existing interactive command.");
+      await second.waitForText("SECOND_TTY_STILL_USABLE", TIMEOUT);
+      await waitForFile(secondCommand.echoPath);
+      expect(readFileSync(secondCommand.echoPath, "utf8")).toBe("after-owner-exit\n");
+      expect(toolResultEnvelope(secondGateway.requests[3]!.body, "shared_tty_interact"))
+        .toContain("TTY_ACK:after-owner-exit");
+      await exitAndObserveTtyOwners(second, secondPids);
+      expect(readFileSync(firstFixture.stderrPath, "utf8")).toBe("");
+      expect(readFileSync(secondFixture.stderrPath, "utf8")).toBe("");
+    } finally {
+      await cleanupTtyExitCommand(firstCommand);
+      await cleanupTtyExitCommand(secondCommand);
+    }
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "second ctrl+c immediately escalates a command already handling TERM",
+  async () => {
+    const fixture = createFixture("fx-shell-exit-term-grace-");
+    const parentPidPath = join(fixture.workspace, "parent.pid");
+    const childPidPath = join(fixture.workspace, "child.pid");
+    const termPath = join(fixture.workspace, "term.received");
+    const scriptPath = join(fixture.workspace, "term-grace.py");
+    writeFileSync(scriptPath, [
+      "import os, signal, sys, time",
+      "parent_path, child_path, term_path = sys.argv[1:4]",
+      "def stop(*_):",
+      "    open(term_path, 'w').write('TERM')",
+      "    time.sleep(30)",
+      "signal.signal(signal.SIGTERM, stop)",
+      "child = os.fork()",
+      "open(child_path if child == 0 else parent_path, 'w').write(str(os.getpid()))",
+      "while True: time.sleep(1)",
+    ].join("\n"));
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("shell_term_grace", "shell", {
+        request: {
+          action: "run",
+          command: `python3 ${JSON.stringify(scriptPath)} ${JSON.stringify(parentPidPath)} ${JSON.stringify(childPidPath)} ${JSON.stringify(termPath)}`,
+          profile: "clean",
+          yield_time_ms: 30_000,
+        },
+      }),
+      fakeGatewayFinalText("UNEXPECTED_COMPLETION"),
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway, FX_BIN, true);
+    await active.sendText("Start a command whose TERM cleanup is still running when I exit.");
+    await waitForFile(parentPidPath);
+    await waitForFile(childPidPath);
+    const fxPid = active.processPid();
+    const pids = [
+      fxPid,
+      ...execFileSync("pgrep", ["-P", String(fxPid)], { encoding: "utf8" }).trim().split(/\s+/).map(Number),
+      ...[parentPidPath, childPidPath].map((path) => Number(readFileSync(path, "utf8"))),
+    ];
+    expect(pids.every((pid) => Number.isSafeInteger(pid) && pid > 0)).toBe(true);
+
+    active.sendKeysImmediate(["C-c"]);
+    await waitForFile(termPath);
+    expect(readFileSync(termPath, "utf8")).toBe("TERM");
+    expect(readFileSync(fixture.tracePath, "utf8")).toContain(
+      "command termination requested source=cancelled force=false",
+    );
+    const exitStarted = performance.now();
+    active.sendKeysImmediate(["C-c"]);
+    const exitDeadline = Date.now() + 5_000;
+    while (!active.paneStatus().dead && Date.now() < exitDeadline) {
+      await Bun.sleep(10);
+    }
+    const exitMs = performance.now() - exitStarted;
+
+    expect(active.paneStatus().dead).toBe(true);
+    expect(active.paneStatus().status).toBe(0);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+    expect(exitMs).toBeLessThan(500);
+    for (const pid of pids) expect(() => process.kill(pid, 0)).toThrow();
+    expect((await active.captureFullScrollback()).match(/Continue session with: fx --resume \S+/g)).toHaveLength(1);
+  },
+  TIMEOUT,
+);
 
 test.skipIf(!tmuxAvailable())(
   "second ctrl+c exits while an external process retains command output",
@@ -836,7 +1079,7 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "resumed fx reindexes and stops its durable managed TTY",
+  "resumed fx reindexes and stops its durable managed TTY after terminal disconnect",
   async () => {
     const fixture = createFixture("fx-shell-tty-resume-");
     let sessionId = "";
@@ -870,8 +1113,14 @@ test.skipIf(!tmuxAvailable())(
     await first.sendText("Start the durable managed TTY.");
     await first.waitForText("SHELL_TTY_RESUME_STARTED", TIMEOUT);
     expect(sessionId).toMatch(/^shell-[A-Za-z0-9_-]{22}$/);
-    await first.sendText("/quit");
-    expect(await first.waitForSessionEnd(TIMEOUT)).toBe(true);
+    const firstPid = first.processPid();
+    await first.kill();
+    const disconnectedDeadline = Date.now() + 5_000;
+    while (processExists(firstPid) && Date.now() < disconnectedDeadline) await Bun.sleep(5);
+    expect(processExists(firstPid)).toBe(false);
+    const retained = terminalRecords(fixture.home).find((record) => record.session_id === sessionId);
+    expect(retained?.lifecycle).toBe("running");
+    expect(processExists(Number(retained?.pid))).toBe(true);
 
     const resumed = await launch(
       fixture,

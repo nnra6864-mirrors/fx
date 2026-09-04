@@ -26,6 +26,7 @@ pub fn migrate(
         .background_records,
         migration_lock_name,
         2_000,
+        null,
     );
     defer lock.release();
 

@@ -1,6 +1,9 @@
 const std = @import("std");
 const domain = @import("domain.zig");
 const io_mod = @import("../shared/io.zig");
+const cancellation = @import("../shared/read_cancellation.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
+const index_publication = @import("../session/session_index_publication.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const session_store = @import("../session/session_store.zig");
 const types = @import("../shared/types.zig");
@@ -405,7 +408,8 @@ pub const Store = struct {
     parent_id: []const u8,
     options: session_child_store.Options = .{},
 
-    pub fn acquireLock(self: Store, alloc: Allocator) !io_mod.TimedAdvisoryLock {
+    pub fn acquireLock(self: Store, alloc: Allocator, cancel_flag: ?*const std.atomic.Value(bool)) !io_mod.TimedAdvisoryLock {
+        if (cancel_flag) |flag| if (flag.load(.acquire)) return error.Cancelled;
         var capability = try self.sessions.openSubagentControlCapabilityWritable(
             alloc,
             self.parent_id,
@@ -416,6 +420,7 @@ pub const Store = struct {
             .subagent_control,
             lock_file,
             lock_deadline_ms,
+            cancel_flag,
         );
     }
 
@@ -440,33 +445,43 @@ pub const Store = struct {
         return parseRegistry(alloc, bytes, self.parent_id);
     }
 
-    pub fn save(self: Store, alloc: Allocator, registry: Registry) !void {
+    pub fn save(self: Store, alloc: Allocator, registry: Registry, cancel_flag: cancellation.CancelFlag) !void {
+        try cancellation.check(cancel_flag);
         if (!std.mem.eql(u8, registry.parent_id, self.parent_id)) {
             return error.InvalidParentId;
         }
         const bytes = try renderRegistry(alloc, registry);
         defer alloc.free(bytes);
         if (bytes.len > max_state_bytes) return error.StateTooLarge;
+        try cancellation.check(cancel_flag);
         var capability = try self.sessions.openSubagentControlCapabilityWritable(
             alloc,
             self.parent_id,
             self.options,
         );
         defer capability.deinit();
-        var entry = try capability.atomicReplace(
-            alloc,
-            .subagent_control,
-            state_file,
-            bytes,
+        {
+            var invalidation = try index_publication.Invalidation.begin(&self.sessions.canonical_root.sessions.?, self.parent_id, cancel_flag);
+            defer invalidation.release();
+            var entry = try capability.atomicReplace(alloc, .subagent_control, state_file, bytes);
+            entry.deinit(alloc);
+        }
+        var publisher = self.sessions.*;
+        publisher.resume_cancel_flag = cancel_flag;
+        publisher.publishSessionMetadata(alloc) catch |err| debug_trace.logf(
+            "session",
+            "event=child_registry_publication_deferred err={s}",
+            .{@errorName(err)},
         );
-        entry.deinit(alloc);
     }
 
     pub fn markChildSession(
         self: Store,
         alloc: Allocator,
         child_id: []const u8,
+        cancel_flag: cancellation.CancelFlag,
     ) !void {
+        try cancellation.check(cancel_flag);
         var bytes: std.Io.Writer.Allocating = .init(alloc);
         defer bytes.deinit();
         try bytes.writer.writeAll("{\"schema_version\":1,\"parent_id\":");
@@ -478,13 +493,19 @@ pub const Store = struct {
             self.options,
         );
         defer capability.deinit();
-        var entry = try capability.atomicReplace(
-            alloc,
-            .subagent_control,
-            owner_marker_file,
-            bytes.written(),
+        {
+            var invalidation = try index_publication.Invalidation.begin(&self.sessions.canonical_root.sessions.?, child_id, cancel_flag);
+            defer invalidation.release();
+            var entry = try capability.atomicReplace(alloc, .subagent_control, owner_marker_file, bytes.written());
+            entry.deinit(alloc);
+        }
+        var publisher = self.sessions.*;
+        publisher.resume_cancel_flag = cancel_flag;
+        publisher.publishSessionMetadata(alloc) catch |err| debug_trace.logf(
+            "session",
+            "event=child_owner_publication_deferred err={s}",
+            .{@errorName(err)},
         );
-        entry.deinit(alloc);
     }
 };
 
@@ -512,10 +533,9 @@ pub fn hasManagedChildMarker(
     alloc: Allocator,
     session_id: []const u8,
 ) !bool {
-    var capability = sessions.openSubagentControlCapabilityReadOnly(
+    var capability = sessions.openListedChildCapabilityReadOnly(
         alloc,
         session_id,
-        .{},
     ) catch |err| return switch (err) {
         error.SessionNotFound => false,
         else => err,

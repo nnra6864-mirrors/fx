@@ -235,62 +235,41 @@ fn unavailableCliDispatch(_: ?*anyopaque, _: Allocator, _: []const [:0]const u8,
     return error.UnknownCliCommand;
 }
 
+const ExpectedStartupFailure = struct {
+    message: []const u8,
+    outcome: RunOutcome = .{ .exit = 1 },
+};
+
+fn expectedStartupFailure(err: anyerror) ?ExpectedStartupFailure {
+    return switch (err) {
+        error.NotATerminal => .{ .message = "fx requires an interactive terminal (TTY).\n" },
+        error.TerminalTooSmall => .{ .message = "fx needs at least 5 terminal rows.\n", .outcome = .returned },
+        error.RecordingStartFailed => .{ .message = "fx: unable to start terminal recording.\n" },
+        error.NoSavedSessions => .{ .message = "fx: no saved sessions for this workspace.\n" },
+        error.SessionNotFound => .{ .message = "fx: saved session not found.\n" },
+        error.SessionBusy => .{ .message = "fx: another fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n" },
+        error.SessionLockUnsupported => .{ .message = "fx: the filesystem cannot provide the required session lock\n" },
+        error.SessionAuthorityBoundaryUnavailable, error.SessionCommitBoundaryUnavailable => .{ .message = "fx: this session is being updated; wait a moment and retry\n" },
+        error.OneOffSessionNotResumable => .{ .message = "fx: subagent child sessions cannot be resumed directly; message the named agent from its parent session\n" },
+        error.InvalidSessionFormat => .{ .message = "fx: saved session is unreadable. Run `fx doctor`; if it is recoverable, use `fx session recover <id>`.\n" },
+        error.UnsupportedSessionSchema => .{ .message = "fx: saved session uses an unsupported version and cannot be resumed by this fx build.\n" },
+        else => null,
+    };
+}
+
+fn reportStartupFailure(deps: RunDeps, err: anyerror) !RunOutcome {
+    const failure = expectedStartupFailure(err) orelse {
+        reportUnexpectedInteractiveError(deps, err);
+        return err;
+    };
+    writeStderr(deps, failure.message);
+    return failure.outcome;
+}
+
 fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode, deps: RunDeps) !RunOutcome {
     const resume_requested = launch.requested_resume != null;
-    var app = App.init(alloc, launch, auth_mode) catch |err| {
-        switch (err) {
-            error.NotATerminal => {
-                writeStderr(deps, "fx requires an interactive terminal (TTY).\n");
-                return .{ .exit = 1 };
-            },
-            error.TerminalTooSmall => {
-                writeStderr(deps, "fx needs at least 5 terminal rows.\n");
-                return .returned;
-            },
-            error.RecordingStartFailed => {
-                writeStderr(deps, "fx: unable to start terminal recording.\n");
-                return .{ .exit = 1 };
-            },
-            error.NoSavedSessions => {
-                writeStderr(deps, "fx: no saved sessions for this workspace.\n");
-                return .{ .exit = 1 };
-            },
-            error.SessionNotFound => {
-                writeStderr(deps, "fx: saved session not found.\n");
-                return .{ .exit = 1 };
-            },
-            error.SessionBusy => {
-                writeStderr(deps, "fx: another fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n");
-                return .{ .exit = 1 };
-            },
-            error.SessionLockUnsupported => {
-                writeStderr(deps, "fx: the filesystem cannot provide the required session lock\n");
-                return .{ .exit = 1 };
-            },
-            error.SessionAuthorityBoundaryUnavailable,
-            error.SessionCommitBoundaryUnavailable,
-            => {
-                writeStderr(deps, "fx: this session is being updated; wait a moment and retry\n");
-                return .{ .exit = 1 };
-            },
-            error.OneOffSessionNotResumable => {
-                writeStderr(deps, "fx: subagent child sessions cannot be resumed directly; message the named agent from its parent session\n");
-                return .{ .exit = 1 };
-            },
-            error.InvalidSessionFormat => {
-                writeStderr(deps, "fx: saved session is unreadable. Run `fx doctor`; if it is recoverable, use `fx session recover <id>`.\n");
-                return .{ .exit = 1 };
-            },
-            error.UnsupportedSessionSchema => {
-                writeStderr(deps, "fx: saved session uses an unsupported version and cannot be resumed by this fx build.\n");
-                return .{ .exit = 1 };
-            },
-            else => {
-                reportUnexpectedInteractiveError(deps, err);
-                return err;
-            },
-        }
-    };
+    var app = App.init(alloc, launch, auth_mode) catch |err|
+        return reportStartupFailure(deps, err);
     if (comptime !cooperative) {
         if (@hasDecl(App, "startMcpDiscovery")) app.startMcpDiscovery();
         if (@hasDecl(App, "rebindAfterInit")) app.rebindAfterInit();
@@ -319,6 +298,13 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
     app.run() catch |err| {
         app.releaseTerminal();
         if (err == error.TerminalInputClosed) return .returned;
+        if (comptime @hasDecl(App, "startupResumeFailure")) {
+            if (err == error.StartupResumeFailed) {
+                if (app.startupResumeFailure()) |failure| {
+                    return reportStartupFailure(deps, failure);
+                }
+            }
+        }
         reportUnexpectedInteractiveError(deps, err);
         return err;
     };
@@ -616,6 +602,7 @@ const TestCapture = struct {
     init_error: ?anyerror = null,
     worker_error: ?anyerror = null,
     run_error: ?anyerror = null,
+    startup_resume_failure: ?anyerror = null,
     stderr_error: ?anyerror = null,
     stdout_error: ?anyerror = null,
     stderr_calls: usize = 0,
@@ -817,6 +804,10 @@ const TestApp = struct {
     fn run(_: *TestApp) !void {
         appendTestEvent("run");
         if (active_capture.?.run_error) |err| return err;
+    }
+
+    fn startupResumeFailure(_: *const TestApp) ?anyerror {
+        return active_capture.?.startup_resume_failure;
     }
 };
 
@@ -1305,4 +1296,58 @@ test "app entry maps unavailable session state to one expected startup failure" 
         try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
         try expectEvents(&.{"init:none"});
     }
+}
+
+test "app entry reports deferred startup resume failures with the existing guidance" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { failure: anyerror, message: []const u8 }{
+        .{ .failure = error.NoSavedSessions, .message = "fx: no saved sessions for this workspace.\n" },
+        .{ .failure = error.SessionNotFound, .message = "fx: saved session not found.\n" },
+        .{ .failure = error.SessionBusy, .message = "fx: another fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n" },
+        .{ .failure = error.SessionLockUnsupported, .message = "fx: the filesystem cannot provide the required session lock\n" },
+        .{ .failure = error.SessionAuthorityBoundaryUnavailable, .message = "fx: this session is being updated; wait a moment and retry\n" },
+        .{ .failure = error.SessionCommitBoundaryUnavailable, .message = "fx: this session is being updated; wait a moment and retry\n" },
+        .{ .failure = error.OneOffSessionNotResumable, .message = "fx: subagent child sessions cannot be resumed directly; message the named agent from its parent session\n" },
+        .{ .failure = error.InvalidSessionFormat, .message = "fx: saved session is unreadable. Run `fx doctor`; if it is recoverable, use `fx session recover <id>`.\n" },
+        .{ .failure = error.UnsupportedSessionSchema, .message = "fx: saved session uses an unsupported version and cannot be resumed by this fx build.\n" },
+    };
+    for (cases) |case| {
+        var capture = TestCapture.init(.{ .interactive = .{ .requested_resume = .last } });
+        defer capture.deinit();
+        capture.run_error = error.StartupResumeFailed;
+        capture.startup_resume_failure = case.failure;
+        capture.record_stderr_event = true;
+        const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
+        try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+        try std.testing.expectEqualStrings(case.message, capture.stderr.written());
+        try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
+        try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
+        try expectEvents(&.{ "init:last", "mcp-discovery", "rebind-after-init", "resume-reconciliation", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "stderr-attempt", "deinit" });
+    }
+}
+
+test "app entry preserves unrelated run failures when startup requested resume" {
+    const alloc = std.testing.allocator;
+    const failures = [_]anyerror{ error.TestRunFailed, error.SessionBusy, error.InvalidSessionFormat };
+    for (failures) |failure| {
+        var capture = TestCapture.init(.{ .interactive = .{ .requested_resume = .last } });
+        defer capture.deinit();
+        capture.run_error = failure;
+        try std.testing.expectError(failure, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
+        var expected: [64]u8 = undefined;
+        const message = try std.fmt.bufPrint(&expected, "fx: {s}\n", .{@errorName(failure)});
+        try std.testing.expectEqualStrings(message, capture.stderr.written());
+        try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
+    }
+}
+
+test "app entry preserves unexpected deferred resume failure identity" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{ .requested_resume = .last } });
+    defer capture.deinit();
+    capture.run_error = error.StartupResumeFailed;
+    capture.startup_resume_failure = error.TestResumeFailed;
+    try std.testing.expectError(error.TestResumeFailed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
+    try std.testing.expectEqualStrings("fx: TestResumeFailed\n", capture.stderr.written());
+    try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
 }

@@ -98,6 +98,24 @@ pub const Runtime = struct {
         host_authority: authority.HostResolver,
         child_runner: ChildRunner,
     ) !*Runtime {
+        const runtime = try createBound(alloc, sessions, root_id, host_authority, child_runner);
+        runtime.requestBackgroundRecovery(io_mod.milliTimestamp()) catch |err|
+            debug_trace.logf(
+                "subagent",
+                "managed child recovery unavailable root_id={s} err={s}",
+                .{ root_id, @errorName(err) },
+            );
+        return runtime;
+    }
+
+    /// Allocates bindings only; recovery remains an explicit write operation.
+    pub fn createBound(
+        alloc: Allocator,
+        sessions: *session_store.Store,
+        root_id: []const u8,
+        host_authority: authority.HostResolver,
+        child_runner: ChildRunner,
+    ) !*Runtime {
         try domain.validateId(root_id);
         const runtime = try alloc.create(Runtime);
         errdefer alloc.destroy(runtime);
@@ -120,15 +138,22 @@ pub const Runtime = struct {
             .sessions = sessions,
             .root_id = runtime.root_id,
             .host = host_authority,
+            .cancel_flag = &runtime.managed.closed,
         };
         runtime.managed = runtime.managedOwnerValue();
-        runtime.requestBackgroundRecovery(io_mod.milliTimestamp()) catch |err|
-            debug_trace.logf(
-                "subagent",
-                "managed child recovery unavailable root_id={s} err={s}",
-                .{ root_id, @errorName(err) },
-            );
         return runtime;
+    }
+
+    pub fn requestShutdown(self: *Runtime) void {
+        self.managed.requestShutdown();
+    }
+
+    pub fn shutdownComplete(self: *Runtime) bool {
+        return self.managed.shutdownComplete();
+    }
+
+    pub fn isClosing(self: *const Runtime) bool {
+        return self.managed.closed.load(.acquire);
     }
 
     pub fn deinit(self: *Runtime) void {
@@ -211,6 +236,7 @@ pub const Runtime = struct {
         request: *model_contract.Request,
         options: ExecuteOptions,
     ) !ManagedExecutionResult {
+        if (self.isClosing()) return error.OwnerClosed;
         _ = options.max_result_bytes;
         const identity_epoch = if (options.identity_epoch != 0)
             options.identity_epoch
@@ -230,6 +256,12 @@ pub const Runtime = struct {
                         .ok = false,
                         .error_code = "caller_unavailable",
                     });
+                }
+                if (self.recoveryState() == .pending) {
+                    self.managed.mutex.lockUncancelable(io_mod.getIo());
+                    defer self.managed.mutex.unlock(io_mod.getIo());
+                    if (self.isClosing()) return error.OwnerClosed;
+                    if (self.recoveryState() == .pending) try self.requestBackgroundRecovery(options.timestamp_ms);
                 }
                 var admitted = try self.admitManagedWork(
                     alloc,
@@ -307,7 +339,7 @@ pub const Runtime = struct {
         options: ExecuteOptions,
     ) !ManagedAdmission {
         const fingerprint = model_contract.requestFingerprint(request);
-        var lock = try self.managed.state_store.acquireLock(alloc);
+        var lock = try self.managed.state_store.acquireLock(alloc, &self.managed.closed);
         defer lock.release();
         var registry = try self.managed.state_store.load(alloc);
         defer registry.deinit(alloc);
@@ -349,7 +381,7 @@ pub const Runtime = struct {
                 const child_id = try session_store.generateSessionId(alloc);
                 defer alloc.free(child_id);
                 try registry.appendOneOff(alloc, child_id, active);
-                try self.managed.state_store.save(alloc, registry);
+                try self.managed.state_store.save(alloc, registry, &self.managed.closed);
                 try self.ensureManagedChildSession(
                     alloc,
                     child_id,
@@ -382,7 +414,7 @@ pub const Runtime = struct {
                         message.instructions,
                         active,
                     );
-                    try self.managed.state_store.save(alloc, registry);
+                    try self.managed.state_store.save(alloc, registry, &self.managed.closed);
                     return managedAdmissionReady(alloc, started.id);
                 }
                 const child_id = try session_store.generateSessionId(alloc);
@@ -394,7 +426,7 @@ pub const Runtime = struct {
                     message.instructions orelse "",
                     active,
                 );
-                try self.managed.state_store.save(alloc, registry);
+                try self.managed.state_store.save(alloc, registry, &self.managed.closed);
                 try self.ensureManagedChildSession(
                     alloc,
                     child_id,
@@ -424,7 +456,7 @@ pub const Runtime = struct {
             defaults,
         );
         defer state.deinit(alloc);
-        if (self.sessions.startWritableSession(alloc, state)) |writable_value| {
+        if (self.sessions.startWritableSessionWithOptions(alloc, state, .{ .cancel_flag = &self.managed.closed })) |writable_value| {
             var writable = writable_value;
             writable.log.park();
             writable.deinit(alloc);
@@ -432,7 +464,7 @@ pub const Runtime = struct {
             error.SessionAlreadyExists => {},
             else => return err,
         }
-        try self.childStateStore().markChildSession(alloc, child_id);
+        try self.childStateStore().markChildSession(alloc, child_id, &self.managed.closed);
     }
 
     fn observeManagedState(
@@ -479,7 +511,7 @@ pub const Runtime = struct {
         alloc: Allocator,
         child_id: []const u8,
     ) !?[]u8 {
-        var lock = try self.managed.state_store.acquireLock(alloc);
+        var lock = try self.managed.state_store.acquireLock(alloc, &self.managed.closed);
         defer lock.release();
         var registry = try self.managed.state_store.load(alloc);
         defer registry.deinit(alloc);
@@ -503,6 +535,61 @@ pub const Runtime = struct {
         };
     }
 };
+
+test "binding a host does not publish recovery files before child work" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var sessions = try session_store.Store.initFromHome(alloc, home, workspace);
+    defer sessions.deinit(alloc);
+    const state = session_codec.DurableSessionState{
+        .id = @constCast("root"),
+        .origin_workspace_root = workspace,
+        .workspace_root = workspace,
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = .literal("en"),
+        .preferences = .{ .model = @constCast("test/model"), .effort = .auto, .fast_mode = false },
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+    };
+    var writable = try sessions.startWritableSession(alloc, state);
+    writable.deinit(alloc);
+    const Host = struct {
+        fn resolve(_: ?*anyopaque, _: Allocator, _: []const u8) authority.HostResolveError!authority.HostAuthority {
+            return error.HostAuthorityUnavailable;
+        }
+    };
+    const host = try Runtime.createBound(alloc, &sessions, "root", .{ .resolve_fn = Host.resolve }, .{});
+    defer host.deinit();
+    const lock_path = try std.fs.path.join(alloc, &.{ home, ".fx", "sessions", "root", "subagent", "children.lock" });
+    defer alloc.free(lock_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(std.testing.io, lock_path, .{}));
+    var request = model_contract.Request{ .run = .{ .task = @constCast("work") } };
+    const rejected = try host.executeManaged(alloc, &request, .{
+        .caller_id = "not-root",
+        .invocation_id = "operation",
+        .defaults = .{ .provider = .gateway, .model = "test/model", .effort = .auto, .conversation_language = .literal("en") },
+        .max_result_bytes = 1024,
+        .timestamp_ms = 1,
+    });
+    defer alloc.free(rejected.body);
+    try std.testing.expect(!rejected.success);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(std.testing.io, lock_path, .{}));
+    try host.requestBackgroundRecovery(1);
+    try std.Io.Dir.accessAbsolute(std.testing.io, lock_path, .{});
+    try std.testing.expectEqual(RecoveryState.complete, host.recoveryState());
+    const fresh = try Runtime.create(alloc, &sessions, "root", .{ .resolve_fn = Host.resolve }, .{});
+    defer fresh.deinit();
+    try std.testing.expectEqual(RecoveryState.complete, fresh.recoveryState());
+}
 
 fn operationIdAlloc(
     alloc: Allocator,
@@ -711,8 +798,10 @@ fn captureAdmission(
     request: execution.CaptureRequest,
 ) execution.ServiceError!domain.AdmissionSnapshot {
     const self: *Runtime = @ptrCast(@alignCast(raw.?));
-    var snapshot = self.authority_resolver.resolve(alloc, request.child_id) catch
-        return error.AdmissionFailed;
+    var snapshot = self.authority_resolver.resolve(alloc, request.child_id) catch |err| return switch (err) {
+        error.Cancelled => error.Cancelled,
+        else => error.AdmissionFailed,
+    };
     defer snapshot.deinit(alloc);
     return domain.captureAdmission(alloc, .{
         .parent_id = request.parent_id,

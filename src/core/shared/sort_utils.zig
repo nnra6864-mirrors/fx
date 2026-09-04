@@ -1,4 +1,5 @@
 const std = @import("std");
+const cancellation = @import("read_cancellation.zig");
 
 // Share one stable sort across element types to avoid duplicating generic code.
 // Uses insertion-sorted runs and in-place SymMerge (Kim and Kutzner, 2004):
@@ -11,6 +12,18 @@ pub fn sort(
     context: anytype,
     comptime lessThanFn: fn (@TypeOf(context), lhs: T, rhs: T) bool,
 ) void {
+    sortInterruptible(T, items, context, lessThanFn, null) catch unreachable;
+}
+
+/// Preserves element ownership on cancellation; order may be partially sorted.
+pub fn sortInterruptible(
+    comptime T: type,
+    items: []T,
+    context: anytype,
+    comptime lessThanFn: fn (@TypeOf(context), lhs: T, rhs: T) bool,
+    cancel_flag: cancellation.CancelFlag,
+) error{Cancelled}!void {
+    try cancellation.check(cancel_flag);
     if (@sizeOf(T) == 0) return;
     if (items.len < 2) return;
     const Ctx = @TypeOf(context);
@@ -32,8 +45,9 @@ pub fn sort(
         .elem_size = @sizeOf(T),
         .user_ctx = if (comptime @sizeOf(Ctx) == 0) @ptrCast(&zero_bit_sentinel) else @ptrCast(&context),
         .less = thunks.less,
+        .cancel_flag = cancel_flag,
     };
-    sortView(items.len, &view);
+    try sortView(items.len, &view);
 }
 
 const zero_bit_sentinel: u8 = 0;
@@ -49,6 +63,7 @@ const ErasedView = struct {
     elem_size: usize,
     user_ctx: *const anyopaque,
     less: *const fn (user_ctx: *const anyopaque, lhs: *const anyopaque, rhs: *const anyopaque) bool,
+    cancel_flag: cancellation.CancelFlag,
 
     fn lessThan(view: *const ErasedView, a: usize, b: usize) bool {
         return view.less(
@@ -71,16 +86,17 @@ const ErasedView = struct {
 
 const run_length = 20;
 
-fn sortView(len: usize, view: *const ErasedView) void {
+fn sortView(len: usize, view: *const ErasedView) error{Cancelled}!void {
     var lo: usize = 0;
     while (lo < len) : (lo += run_length) {
+        try cancellation.check(view.cancel_flag);
         insertionSortRange(view, lo, @min(lo + run_length, len));
     }
     var width: usize = run_length;
     while (width < len) : (width *= 2) {
         var start: usize = 0;
         while (start + width < len) : (start += 2 * width) {
-            symMerge(view, start, start + width, @min(start + 2 * width, len));
+            try symMerge(view, start, start + width, @min(start + 2 * width, len));
         }
     }
 }
@@ -98,7 +114,8 @@ fn insertionSortRange(view: *const ErasedView, a: usize, b: usize) void {
 
 // Merges the sorted ranges [a, m) and [m, b) in place, keeping equal
 // elements in their original relative order.
-fn symMerge(view: *const ErasedView, a: usize, m: usize, b: usize) void {
+fn symMerge(view: *const ErasedView, a: usize, m: usize, b: usize) error{Cancelled}!void {
+    try cancellation.check(view.cancel_flag);
     std.debug.assert(a < m and m < b);
     if (m - a == 1) {
         // Insert the single left element into the right range.
@@ -109,7 +126,10 @@ fn symMerge(view: *const ErasedView, a: usize, m: usize, b: usize) void {
             if (view.lessThan(mid, a)) lo = mid + 1 else hi = mid;
         }
         var i = a;
-        while (i + 1 < lo) : (i += 1) view.swap(i, i + 1);
+        while (i + 1 < lo) : (i += 1) {
+            try cancellation.check(view.cancel_flag);
+            view.swap(i, i + 1);
+        }
         return;
     }
     if (b - m == 1) {
@@ -121,7 +141,10 @@ fn symMerge(view: *const ErasedView, a: usize, m: usize, b: usize) void {
             if (view.lessThan(m, mid)) hi = mid else lo = mid + 1;
         }
         var i = m;
-        while (i > lo) : (i -= 1) view.swap(i, i - 1);
+        while (i > lo) : (i -= 1) {
+            try cancellation.check(view.cancel_flag);
+            view.swap(i, i - 1);
+        }
         return;
     }
     const mid = a + (b - a) / 2;
@@ -141,35 +164,75 @@ fn symMerge(view: *const ErasedView, a: usize, m: usize, b: usize) void {
         if (!view.lessThan(p - c, c)) start = c + 1 else r = c;
     }
     const end = n - start;
-    if (start < m and m < end) rotate(view, start, m, end);
-    if (a < start and start < mid) symMerge(view, a, start, mid);
-    if (mid < end and end < b) symMerge(view, mid, end, b);
+    if (start < m and m < end) try rotate(view, start, m, end);
+    if (a < start and start < mid) try symMerge(view, a, start, mid);
+    if (mid < end and end < b) try symMerge(view, mid, end, b);
 }
 
 // Rotates [a, b) so that the block starting at m becomes the front,
 // using only pairwise swaps (gcd block-exchange).
-fn rotate(view: *const ErasedView, a: usize, m: usize, b: usize) void {
+fn rotate(view: *const ErasedView, a: usize, m: usize, b: usize) error{Cancelled}!void {
     var i = m - a;
     var j = b - m;
     while (i != j) {
         if (i > j) {
-            swapRange(view, m - i, m, j);
+            try swapRange(view, m - i, m, j);
             i -= j;
         } else {
-            swapRange(view, m - i, m + j - i, i);
+            try swapRange(view, m - i, m + j - i, i);
             j -= i;
         }
     }
-    swapRange(view, m - i, m, i);
+    try swapRange(view, m - i, m, i);
 }
 
-fn swapRange(view: *const ErasedView, a: usize, b: usize, n: usize) void {
-    for (0..n) |i| view.swap(a + i, b + i);
+fn swapRange(view: *const ErasedView, a: usize, b: usize, n: usize) error{Cancelled}!void {
+    for (0..n) |i| {
+        try cancellation.check(view.cancel_flag);
+        view.swap(a + i, b + i);
+    }
 }
 
 const testing = std.testing;
 
 const TestElem = struct { key: u16, seq: u16 };
+
+test "stable sort observes cancellation after comparisons begin" {
+    const Sorter = struct {
+        values: [4096]u32 = undefined,
+        comparisons: usize = 0,
+        reached: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        cancel: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+
+        fn less(self: *@This(), lhs: u32, rhs: u32) bool {
+            self.comparisons += 1;
+            if (self.comparisons == 128) {
+                self.reached.set(std.testing.io);
+                self.release.waitUncancelable(std.testing.io);
+            }
+            return lhs < rhs;
+        }
+
+        fn run(self: *@This()) void {
+            sortInterruptible(u32, &self.values, self, less, &self.cancel) catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var sorter: Sorter = .{};
+    for (&sorter.values, 0..) |*value, index| value.* = @intCast(sorter.values.len - index);
+    const thread = try std.Thread.spawn(.{}, Sorter.run, .{&sorter});
+    sorter.reached.waitUncancelable(std.testing.io);
+    sorter.cancel.store(true, .release);
+    sorter.release.set(std.testing.io);
+    thread.join();
+    try testing.expectEqual(@as(?anyerror, error.Cancelled), sorter.failure);
+    var sum: usize = 0;
+    for (sorter.values) |value| sum += value;
+    try testing.expectEqual(@as(usize, 4096 * 4097 / 2), sum);
+}
 
 fn testElemKeyLess(_: void, lhs: TestElem, rhs: TestElem) bool {
     return lhs.key < rhs.key;

@@ -16,7 +16,6 @@ const viewport_selection = render_engine.viewport_selection;
 const FoldedCommandBlock = command_output_runtime.FoldedCommandBlock;
 const TranscriptBuffer = viewport_selection.TranscriptBuffer;
 const TranscriptRef = viewport_selection.TranscriptRef;
-const buildHardLineStarts = viewport_selection.buildHardLineStarts;
 const buildHardLineStartsInterruptible = viewport_selection.buildHardLineStartsInterruptible;
 const hardLineRefAt = viewport_selection.hardLineRefAt;
 const leadingWelcomeBoundary = transcript_blocks.leadingWelcomeBoundary;
@@ -67,6 +66,7 @@ fn collectFinalityNominations(
     alloc: Allocator,
     omitted_entry_id: ?u32,
     entry_actions: []const transcript_blocks.EntryRenderAction,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) !std.ArrayList(FinalityNomination) {
     var nominations: std.ArrayList(FinalityNomination) = .empty;
     errdefer nominations.deinit(alloc);
@@ -86,6 +86,7 @@ fn collectFinalityNominations(
     var group_terminality: std.AutoHashMapUnmanaged(types.ToolPresentationGroupId, bool) = .empty;
     defer group_terminality.deinit(alloc);
     for (self.tool_details.items) |detail| {
+        try build_checkpoint.tick(checkpoint);
         const group = detail.presentation_group_id orelse continue;
         const result = try group_terminality.getOrPut(alloc, group);
         if (!result.found_existing) result.value_ptr.* = true;
@@ -95,6 +96,7 @@ fn collectFinalityNominations(
     var entry_tool_identities: std.AutoHashMapUnmanaged(u32, ToolFinalityIdentity) = .empty;
     defer entry_tool_identities.deinit(alloc);
     for (self.tool_details.items) |detail| {
+        try build_checkpoint.tick(checkpoint);
         const identity: ToolFinalityIdentity = if (detail.presentation_group_id) |group|
             .{
                 .turn_id = group.turn_id,
@@ -116,6 +118,7 @@ fn collectFinalityNominations(
     var turn_nominations: std.AutoHashMapUnmanaged(u64, ToolTurnNomination) = .empty;
     defer turn_nominations.deinit(alloc);
     for (self.entries.items, 0..) |entry, index| {
+        try build_checkpoint.tick(checkpoint);
         const entry_id = entry.id();
         if (omitted_entry_id == entry_id) continue;
         if (entryHiddenByActions(entry_actions, index)) continue;
@@ -165,6 +168,7 @@ fn collectFinalityNominations(
     }
 
     for (self.entries.items, 0..) |entry, index| {
+        try build_checkpoint.tick(checkpoint);
         const entry_id = entry.id();
         if (omitted_entry_id == entry_id) continue;
         if (entryHiddenByActions(entry_actions, index)) continue;
@@ -422,7 +426,7 @@ pub fn prepareFullTranscriptViewportSourceInterruptible(
 ) !TranscriptPreparationSource {
     errdefer alloc.free(bytes);
     const line_provenance = if (observationEnabled(self, alloc))
-        try unattributedLineProvenance(alloc, bytes)
+        try unattributedLineProvenance(alloc, bytes, checkpoint)
     else
         &.{};
     errdefer if (line_provenance.len > 0) alloc.free(line_provenance);
@@ -553,6 +557,7 @@ fn prepareTranscriptSourceInternal(
             alloc,
             omitted_entry_id,
             entry_actions,
+            checkpoint,
         );
         defer finality_nominations.deinit(alloc);
         const finality_entry_ids = try alloc.alloc(u32, finality_nominations.items.len);
@@ -560,12 +565,14 @@ fn prepareTranscriptSourceInternal(
         const finality_entry_floor_bytes = try alloc.alloc(?usize, finality_nominations.items.len);
         defer alloc.free(finality_entry_floor_bytes);
         for (finality_nominations.items, 0..) |nomination, index| {
+            try build_checkpoint.tick(checkpoint);
             finality_entry_ids[index] = nomination.entry_id;
             finality_entry_floor_bytes[index] = null;
         }
         const summary_entry_ids = try alloc.alloc(?u32, self.folded_command_blocks.items.len);
         defer alloc.free(summary_entry_ids);
         for (self.folded_command_blocks.items, 0..) |block, index| {
+            try build_checkpoint.tick(checkpoint);
             summary_entry_ids[index] = block.summary_entry_id;
         }
 
@@ -595,6 +602,7 @@ fn prepareTranscriptSourceInternal(
         var tool_turn_floors: std.ArrayList(transcript_release.ToolTurnFloor) = .empty;
         errdefer tool_turn_floors.deinit(alloc);
         for (finality_nominations.items, 0..) |nomination, index| {
+            try build_checkpoint.tick(checkpoint);
             const floor_byte = finality_entry_floor_bytes[index] orelse blk: {
                 // An empty assistant tail contributes no mutable rendered
                 // bytes, so the complete prepared flow is final. Other empty
@@ -628,7 +636,7 @@ fn prepareTranscriptSourceInternal(
             folded_summary_indices[index] = block.summary_transcript_index;
         }
         if (observationEnabled(self, alloc)) {
-            line_provenance = try unattributedLineProvenance(alloc, bytes);
+            line_provenance = try unattributedLineProvenance(alloc, bytes, checkpoint);
         }
     }
 
@@ -701,6 +709,7 @@ fn prepareTranscriptSourceInternal(
                 capped,
                 removed_line_count,
                 retained_origin_is_line_start,
+                checkpoint,
             );
             alloc.free(line_provenance);
             line_provenance = rebased;
@@ -916,12 +925,13 @@ fn buildCommandOutputOverridesInterruptible(
 
     for (self.command_output_blocks.items) |block| {
         try build_checkpoint.poll(checkpoint);
-        var projection = try command_output_runtime.renderCompactCommandOutputWithProcessPresentation(
+        var projection = try command_output_runtime.renderCompactCommandOutputInterruptible(
             alloc,
             block,
             self.command_output_render,
             self.layout.cols,
-            command_output_runtime.processPresentationForBlock(self, block),
+            try command_output_runtime.processPresentationForBlockInterruptible(self, block, checkpoint),
+            checkpoint,
         );
         defer projection.deinit(alloc);
         for (projection.entries.items) |entry| {
@@ -962,11 +972,16 @@ fn observationEnabled(self: anytype, alloc: Allocator) bool {
 fn unattributedLineProvenance(
     alloc: Allocator,
     bytes: []const u8,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) ![]transcript_blocks.LineProvenance {
-    const line_count = try sourceLineCount(alloc, bytes);
+    const line_count = try sourceLineCount(alloc, bytes, checkpoint);
     if (line_count == 0) return &.{};
     const provenance = try alloc.alloc(transcript_blocks.LineProvenance, line_count);
-    @memset(provenance, .unattributed);
+    errdefer alloc.free(provenance);
+    for (provenance) |*line| {
+        try build_checkpoint.tick(checkpoint);
+        line.* = .unattributed;
+    }
     return provenance;
 }
 
@@ -976,11 +991,13 @@ fn rebaseLineProvenanceForCappedTail(
     retained_bytes: []const u8,
     removed_line_count: usize,
     retained_origin_is_line_start: bool,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) ![]transcript_blocks.LineProvenance {
-    const retained_line_count = try sourceLineCount(alloc, retained_bytes);
+    const retained_line_count = try sourceLineCount(alloc, retained_bytes, checkpoint);
     if (retained_line_count == 0) return &.{};
 
     const rebased = try alloc.alloc(transcript_blocks.LineProvenance, retained_line_count);
+    errdefer alloc.free(rebased);
     var source_index = removed_line_count;
     var target_index: usize = 0;
     if (!retained_origin_is_line_start) {
@@ -989,6 +1006,7 @@ fn rebaseLineProvenanceForCappedTail(
         source_index += 1;
     }
     while (target_index < rebased.len) : (target_index += 1) {
+        try build_checkpoint.tick(checkpoint);
         rebased[target_index] = if (source_index < source.len)
             source[source_index]
         else
@@ -998,9 +1016,9 @@ fn rebaseLineProvenanceForCappedTail(
     return rebased;
 }
 
-fn sourceLineCount(alloc: Allocator, bytes: []const u8) !usize {
+fn sourceLineCount(alloc: Allocator, bytes: []const u8, checkpoint: ?*build_checkpoint.BuildCheckpoint) !usize {
     if (bytes.len == 0) return 0;
-    const hard_lines = try buildHardLineStarts(alloc, bytes);
+    const hard_lines = try buildHardLineStartsInterruptible(alloc, bytes, checkpoint);
     defer hard_lines.deinit(alloc);
     return hard_lines.len();
 }

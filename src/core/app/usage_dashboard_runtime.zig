@@ -263,6 +263,7 @@ fn loadProfileSnapshots(
             .pending = recovery.pending,
             .unknown_pending = recovery.unknown_pending,
         },
+        cancel_requested,
     ) };
 }
 
@@ -331,6 +332,39 @@ test "usage dashboard loads once off thread and serves every rolling scope" {
         try std.testing.expectEqual(scope, snapshot.scope);
         try std.testing.expectEqual(@as(i64, 100), snapshot.snapshot_time_ms);
     }
+}
+
+test "usage dashboard cancellation reaches a held profile ledger lock" {
+    const Gate = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        fn tryLock(raw: ?*anyopaque, file: std.Io.File) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const acquired = try file.tryLock(std.testing.io, .exclusive);
+            if (!acquired) self.entered.store(true, .release);
+            return acquired;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var profile = profile_usage_runtime.Runtime{};
+    defer profile.deinit(alloc);
+    _ = try profile.initialize(alloc, home);
+    const sink = profile.publisherSink(alloc);
+    try sink.publish(sink.context, .{ .incident = .{ .occurred_at_ms = 1, .completeness = .incomplete } }, null);
+    var directory = profile.store.?.durable_home.?;
+    var held = try io_mod.acquireTimedAdvisoryLock(&directory, "usage.lock", 0);
+    defer held.release();
+    var gate = Gate{};
+    profile.store.?.lock_ops = .{ .ctx = &gate, .try_lock = Gate.tryLock };
+    var dashboard = Runtime.init(alloc);
+    try std.testing.expect(try dashboard.requestRefresh(profileProvider(&profile), home, 1000));
+    while (!gate.entered.load(.acquire)) std.Thread.yield() catch {};
+    const started = io_mod.nanoTimestamp();
+    dashboard.deinit();
+    try std.testing.expect(io_mod.nanoTimestamp() - started < 500 * std.time.ns_per_ms);
 }
 
 test "usage dashboard cancellation joins a loading worker" {

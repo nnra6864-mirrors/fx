@@ -1,4 +1,5 @@
 const std = @import("std");
+const session_read = @import("../shared/read_cancellation.zig");
 const io_mod = @import("../shared/io.zig");
 const session_codec = @import("session_codec.zig");
 const session_event = @import("session_event.zig");
@@ -29,13 +30,16 @@ pub fn readLineAt(
     file: std.Io.File,
     offset: u64,
     max_end: u64,
+    cancel_flag: session_read.CancelFlag,
 ) !?LineRead {
+    try session_read.check(cancel_flag);
     if (offset >= max_end) return null;
     var line: std.ArrayList(u8) = .empty;
     errdefer line.deinit(alloc);
     var cursor = offset;
     var chunk: [8192]u8 = undefined;
     while (cursor < max_end) {
+        try session_read.check(cancel_flag);
         const limit = @min(@as(u64, chunk.len), max_end - cursor);
         const count = try file.readPositionalAll(
             io_mod.getIo(),
@@ -66,25 +70,25 @@ pub fn readLineAt(
     return error.TruncatedEventFrame;
 }
 
-pub fn readFirstGeneration(alloc: Allocator, file: std.Io.File) !Identifier {
-    var envelope = try readSessionStarted(alloc, file);
+pub fn readFirstGeneration(alloc: Allocator, file: std.Io.File, cancel_flag: session_read.CancelFlag) !Identifier {
+    var envelope = try readSessionStarted(alloc, file, cancel_flag);
     defer envelope.deinit(alloc);
     return envelope.log_generation;
 }
 
-pub fn readSubagentChildIdentity(alloc: Allocator, file: std.Io.File) !bool {
-    var envelope = try readSessionStarted(alloc, file);
+pub fn readSubagentChildIdentity(alloc: Allocator, file: std.Io.File, cancel_flag: session_read.CancelFlag) !bool {
+    var envelope = try readSessionStarted(alloc, file, cancel_flag);
     defer envelope.deinit(alloc);
     return envelope.event.session_started.subagent_child;
 }
 
-fn readSessionStarted(alloc: Allocator, file: std.Io.File) !session_event.Envelope {
+fn readSessionStarted(alloc: Allocator, file: std.Io.File, cancel_flag: session_read.CancelFlag) !session_event.Envelope {
     const length = try file.length(io_mod.getIo());
-    const first = try readLineAt(alloc, file, 0, length) orelse
+    const first = try readLineAt(alloc, file, 0, length, cancel_flag) orelse
         return error.InvalidSessionFormat;
     defer alloc.free(first.bytes);
-    var envelope = session_event.decodeFrame(alloc, first.bytes) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
+    var envelope = session_event.decodeFrame(alloc, first.bytes, cancel_flag) catch |err| switch (err) {
+        error.Cancelled, error.OutOfMemory => return err,
         error.UnsupportedEventSchema => return error.UnsupportedSessionSchema,
         else => return error.InvalidSessionFormat,
     };
@@ -99,8 +103,9 @@ pub fn scanCommitPosition(
     alloc: Allocator,
     file: std.Io.File,
     position: CommitPosition,
+    cancel_flag: session_read.CancelFlag,
 ) !session_projection.EventBoundary {
-    var state = try replayBoundary(alloc, file, position);
+    var state = try replayBoundary(alloc, file, position, cancel_flag);
     state.deinit(alloc);
     return eventBoundary(position);
 }
@@ -109,10 +114,11 @@ pub fn validateCommitPositionForRecovery(
     alloc: Allocator,
     file: std.Io.File,
     position: CommitPosition,
+    cancel_flag: session_read.CancelFlag,
 ) !RecoveryValidation {
-    var state = replayBoundaryRaw(alloc, file, position) catch |err| switch (err) {
+    var state = replayBoundaryRaw(alloc, file, position, cancel_flag) catch |err| switch (err) {
         error.UnsupportedEventSchema => return error.UnsupportedSessionSchema,
-        error.OutOfMemory, error.ReadFailed => return err,
+        error.Cancelled, error.OutOfMemory, error.ReadFailed => return err,
         else => return .invalid,
     };
     state.deinit(alloc);
@@ -123,9 +129,10 @@ pub fn replayBoundary(
     alloc: Allocator,
     file: std.Io.File,
     position: CommitPosition,
+    cancel_flag: session_read.CancelFlag,
 ) !session_codec.DurableSessionState {
-    return replayBoundaryRaw(alloc, file, position) catch |err| switch (err) {
-        error.OutOfMemory, error.ReadFailed => return err,
+    return replayBoundaryRaw(alloc, file, position, cancel_flag) catch |err| switch (err) {
+        error.Cancelled, error.OutOfMemory, error.ReadFailed => return err,
         error.UnsupportedEventSchema => return error.UnsupportedSessionSchema,
         else => return error.InvalidSessionFormat,
     };
@@ -139,6 +146,7 @@ pub fn replayExactBoundary(
     expected_generation: Identifier,
     expected_seq: u64,
     expected_bytes: u64,
+    cancel_flag: session_read.CancelFlag,
 ) !session_codec.DurableSessionState {
     var replayed = try replayExactPosition(
         alloc,
@@ -146,6 +154,7 @@ pub fn replayExactBoundary(
         expected_generation,
         expected_seq,
         expected_bytes,
+        cancel_flag,
     );
     return replayed.takeState();
 }
@@ -193,7 +202,9 @@ pub fn replayExactPosition(
     expected_generation: Identifier,
     expected_seq: u64,
     expected_bytes: u64,
+    cancel_flag: session_read.CancelFlag,
 ) !ExactReplay {
+    try session_read.check(cancel_flag);
     if (expected_bytes == 0 or
         try file.length(io_mod.getIo()) != expected_bytes)
     {
@@ -206,12 +217,13 @@ pub fn replayExactPosition(
         .limited64(expected_bytes),
         &limit_buffer,
     );
-    var reduction = session_event.reduceJsonl(
+    var reduction = session_event.reduceJsonlFrom(
         alloc,
         &limited.interface,
         null,
+        .{ .cancel_flag = cancel_flag },
     ) catch |err| switch (err) {
-        error.OutOfMemory, error.ReadFailed => return err,
+        error.Cancelled, error.OutOfMemory, error.ReadFailed => return err,
         error.UnsupportedEventSchema => return failExactReplay(error.UnsupportedSessionSchema),
         else => return failExactReplay(error.InvalidSessionFormat),
     };
@@ -244,6 +256,7 @@ pub fn replayFromCheckpoint(
     checkpoint: CommitPosition,
     state: session_codec.DurableSessionState,
     position: CommitPosition,
+    cancel_flag: session_read.CancelFlag,
 ) !session_codec.DurableSessionState {
     return replayRangeRaw(
         alloc,
@@ -251,8 +264,9 @@ pub fn replayFromCheckpoint(
         checkpoint,
         state,
         position,
+        cancel_flag,
     ) catch |err| switch (err) {
-        error.OutOfMemory, error.ReadFailed => return err,
+        error.Cancelled, error.OutOfMemory, error.ReadFailed => return err,
         error.UnsupportedEventSchema => return error.UnsupportedSessionSchema,
         else => return error.InvalidSessionFormat,
     };
@@ -262,8 +276,9 @@ fn replayBoundaryRaw(
     alloc: Allocator,
     file: std.Io.File,
     position: CommitPosition,
+    cancel_flag: session_read.CancelFlag,
 ) !session_codec.DurableSessionState {
-    return replayRangeRaw(alloc, file, null, null, position);
+    return replayRangeRaw(alloc, file, null, null, position, cancel_flag);
 }
 
 fn replayRangeRaw(
@@ -272,9 +287,11 @@ fn replayRangeRaw(
     checkpoint: ?CommitPosition,
     initial: ?session_codec.DurableSessionState,
     position: CommitPosition,
+    cancel_flag: session_read.CancelFlag,
 ) !session_codec.DurableSessionState {
     var owned_initial = initial;
     errdefer if (owned_initial) |*state| state.deinit(alloc);
+    try session_read.check(cancel_flag);
     if ((checkpoint == null) != (owned_initial == null) or
         position.through_event_log_bytes == 0)
     {
@@ -315,9 +332,10 @@ fn replayRangeRaw(
             .generation = boundary.log_generation,
             .next_seq = std.math.add(u64, boundary.through_seq, 1) catch
                 return error.InvalidSessionFormat,
+            .cancel_flag = cancel_flag,
         }
     else
-        session_event.ReductionStart{};
+        session_event.ReductionStart{ .cancel_flag = cancel_flag };
     const moved_initial = owned_initial;
     owned_initial = null;
     var reduction = try session_event.reduceJsonlFrom(
@@ -387,7 +405,7 @@ fn checkRecoveryValidationAllocationFailures(
     defer file.close(io_mod.getIo());
     try std.testing.expectEqual(
         RecoveryValidation.valid,
-        try validateCommitPositionForRecovery(alloc, file, position),
+        try validateCommitPositionForRecovery(alloc, file, position, null),
     );
 }
 
@@ -481,9 +499,9 @@ test "session replay parser honors exact copied boundary" {
         .through_event_log_bytes = first.len,
     };
 
-    const boundary = try scanCommitPosition(alloc, file, copied);
+    const boundary = try scanCommitPosition(alloc, file, copied, null);
     try std.testing.expectEqual(@as(u64, 1), boundary.seq);
-    var state = try replayBoundary(alloc, file, copied);
+    var state = try replayBoundary(alloc, file, copied, null);
     defer state.deinit(alloc);
     try std.testing.expectEqualStrings("replay-boundary", state.id);
     try std.testing.expect(!state.preferences.fast_mode);
@@ -494,31 +512,33 @@ test "session replay parser honors exact copied boundary" {
         .through_event_id = second_id,
         .through_event_log_bytes = first.len + second.len,
     };
-    const checkpoint_state = try replayBoundary(alloc, file, copied);
+    const checkpoint_state = try replayBoundary(alloc, file, copied, null);
     var resumed = try replayFromCheckpoint(
         alloc,
         file,
         copied,
         checkpoint_state,
         complete,
+        null,
     );
     defer resumed.deinit(alloc);
     try std.testing.expect(resumed.preferences.fast_mode);
 
-    const exact_state = try replayBoundary(alloc, file, copied);
+    const exact_state = try replayBoundary(alloc, file, copied, null);
     var exact = try replayFromCheckpoint(
         alloc,
         file,
         copied,
         exact_state,
         copied,
+        null,
     );
     defer exact.deinit(alloc);
     try std.testing.expect(!exact.preferences.fast_mode);
 
     var mismatched = complete;
     mismatched.through_event_id = .{0xff} ** 16;
-    const rejected_state = try replayBoundary(alloc, file, copied);
+    const rejected_state = try replayBoundary(alloc, file, copied, null);
     try std.testing.expectError(
         error.InvalidSessionFormat,
         replayFromCheckpoint(
@@ -527,6 +547,7 @@ test "session replay parser honors exact copied boundary" {
             copied,
             rejected_state,
             mismatched,
+            null,
         ),
     );
 
@@ -538,9 +559,9 @@ test "session replay parser honors exact copied boundary" {
     defer unreadable.close(io_mod.getIo());
     try std.testing.expectError(
         error.ReadFailed,
-        replayBoundary(alloc, unreadable, complete),
+        replayBoundary(alloc, unreadable, complete, null),
     );
-    const read_failure_state = try replayBoundary(alloc, file, copied);
+    const read_failure_state = try replayBoundary(alloc, file, copied, null);
     try std.testing.expectError(
         error.ReadFailed,
         replayFromCheckpoint(
@@ -549,6 +570,7 @@ test "session replay parser honors exact copied boundary" {
             copied,
             read_failure_state,
             complete,
+            null,
         ),
     );
 
@@ -584,9 +606,9 @@ test "session replay parser rejects malformed or truncated bounded input" {
         .through_event_log_bytes = malformed.len,
     };
 
-    try std.testing.expectError(error.InvalidSessionFormat, replayBoundary(alloc, file, copied));
-    try std.testing.expectError(error.InvalidSessionFormat, scanCommitPosition(alloc, file, copied));
-    try std.testing.expectError(error.TruncatedEventFrame, readLineAt(alloc, file, 0, malformed.len - 1));
+    try std.testing.expectError(error.InvalidSessionFormat, replayBoundary(alloc, file, copied, null));
+    try std.testing.expectError(error.InvalidSessionFormat, scanCommitPosition(alloc, file, copied, null));
+    try std.testing.expectError(error.TruncatedEventFrame, readLineAt(alloc, file, 0, malformed.len - 1, null));
 }
 
 test "session replay parser rejects oversized bounded frame" {
@@ -617,7 +639,7 @@ test "session replay parser rejects oversized bounded frame" {
 
     try std.testing.expectError(
         error.EventFrameTooLarge,
-        readLineAt(alloc, file, 0, copied.through_event_log_bytes),
+        readLineAt(alloc, file, 0, copied.through_event_log_bytes, null),
     );
 }
 
@@ -662,8 +684,8 @@ test "session replay parser frees line allocation on every caller path" {
         .through_event_log_bytes = frame.len,
     };
 
-    const line = try readLineAt(alloc, file, 0, copied.through_event_log_bytes);
+    const line = try readLineAt(alloc, file, 0, copied.through_event_log_bytes, null);
     defer alloc.free(line.?.bytes);
-    _ = try readFirstGeneration(alloc, file);
-    _ = try scanCommitPosition(alloc, file, copied);
+    _ = try readFirstGeneration(alloc, file, null);
+    _ = try scanCommitPosition(alloc, file, copied, null);
 }
