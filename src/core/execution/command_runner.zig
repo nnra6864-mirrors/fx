@@ -23,6 +23,7 @@ pub const CommandExecutionResult = command_contract.RunCommandResult;
 /// must remain valid for the duration of executeCommand.
 pub const Config = struct {
     max_command_output_bytes: usize,
+    agent_model: []const u8 = "",
     cancel_flag: ?*std.atomic.Value(bool) = null,
     force_cancel_flag: ?*std.atomic.Value(bool) = null,
     output_chunk_lifecycle_id: ?types.ToolLifecycleId = null,
@@ -36,6 +37,18 @@ pub const Config = struct {
     command_artifact_capability: ?*session_child_store.SessionChildCapability = null,
     command_artifact_dir: ?[]const u8 = null,
 };
+
+const ai_agent_env = "AI_AGENT";
+const ai_agent_model_env = "AI_AGENT_MODEL";
+const ai_agent_name = "fx";
+
+pub fn applyAgentEnvironment(
+    environment: *std.process.Environ.Map,
+    model: []const u8,
+) !void {
+    try environment.put(ai_agent_env, ai_agent_name);
+    if (model.len > 0) try environment.put(ai_agent_model_env, model);
+}
 
 pub const CallbackProjection = enum {
     model_safe,
@@ -1078,12 +1091,16 @@ fn executeProcessWithInput(
     isolate_process_group: bool,
 ) !CollectedProcess {
     const started_ms = io_mod.milliTimestamp();
+    var environment = try io_mod.cloneEnvironMap(scratch);
+    defer environment.deinit();
+    try applyAgentEnvironment(&environment, cfg.agent_model);
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = argv,
         .stdin = if (closed_input) .pipe else .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
         .cwd = .{ .path = cwd },
+        .environ_map = &environment,
         .pgid = if (isolate_process_group and builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
     });
     if (child.stdin) |input| {
@@ -1189,12 +1206,16 @@ fn executeProcessWithDetachedSession(
     try helper_argv.appendSlice(scratch, argv);
 
     const started_ms = io_mod.milliTimestamp();
+    var environment = try io_mod.cloneEnvironMap(scratch);
+    defer environment.deinit();
+    try applyAgentEnvironment(&environment, cfg.agent_model);
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = helper_argv.items,
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
         .cwd = .{ .path = cwd },
+        .environ_map = &environment,
     });
 
     var output = OutputCollector.init(scratch, cfg);
@@ -1360,12 +1381,16 @@ fn executeProcessWithScriptUnisolated(
     script: []const u8,
 ) !CollectedProcess {
     const started_ms = io_mod.milliTimestamp();
+    var environment = try io_mod.cloneEnvironMap(scratch);
+    defer environment.deinit();
+    try applyAgentEnvironment(&environment, cfg.agent_model);
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = argv,
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
         .cwd = .{ .path = cwd },
+        .environ_map = &environment,
         .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
     });
 
@@ -2901,6 +2926,25 @@ test "raw process execution returns foreground output" {
     try std.testing.expectEqual(@as(usize, 5), command_result.stdout_bytes);
     try std.testing.expectEqual(@as(usize, 0), command_result.stderr_bytes);
     try std.testing.expect(!command_result.truncated);
+}
+
+test "commands receive fx agent and active model environment" {
+    const result = try executeCommand(
+        .{
+            .max_command_output_bytes = 4096,
+            .agent_model = "provider/model",
+        },
+        std.testing.allocator,
+        "printf '%s|%s' \"$AI_AGENT\" \"$AI_AGENT_MODEL\"",
+        "/tmp",
+    );
+    defer std.testing.allocator.free(result.output);
+
+    try std.testing.expect(std.mem.find(
+        u8,
+        result.output,
+        "<stdout>\nfx|provider/model\n</stdout>",
+    ) != null);
 }
 
 test "authorized command executes exactly once" {

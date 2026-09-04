@@ -1515,6 +1515,7 @@ fn toolRunCommand(
 
     const routed = execution_router.executePreparedRoute(.{
         .max_command_output_bytes = ctx.max_command_output_bytes,
+        .agent_model = ctx.model,
         .cancel_flag = runtimeCancelFlag(ctx),
         .output_chunk_lifecycle_id = ctx.output_chunk_lifecycle_id,
         .output_chunk_ctx = ctx.output_chunk_ctx,
