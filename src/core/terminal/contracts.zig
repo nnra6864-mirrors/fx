@@ -3554,6 +3554,7 @@ test "protocol accepts complete process tree signal capability" {
 test "durable actions derive policy specific protocol capabilities" {
     const authority = protocol_capability_authority_generations;
     const complete_signals = protocol_capability_complete_process_tree_signals;
+    const agent_environment = protocol_capability_agent_environment;
     const tmux_recovery = protocol_capability_tmux_recovery;
     const cases = [_]struct {
         request: ActionRequest,
@@ -3561,11 +3562,11 @@ test "durable actions derive policy specific protocol capabilities" {
     }{
         .{
             .request = .{ .start = .{ .cwd = "/" } },
-            .expected = authority | complete_signals,
+            .expected = authority | complete_signals | agent_environment,
         },
         .{
             .request = .{ .start = .{ .cwd = "/", .backend = .tmux } },
-            .expected = authority | complete_signals | tmux_recovery,
+            .expected = authority | complete_signals | agent_environment | tmux_recovery,
         },
         .{
             .request = .{ .read = .{
