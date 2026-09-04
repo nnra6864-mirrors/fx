@@ -327,6 +327,7 @@ pub const Transport = struct {
         []const u8,
         []const u8,
         []const types.ChatMessage,
+        []const types.ChatMessage,
         []const u8,
         std.Io.Clock.Timestamp,
         *std.atomic.Value(bool),
@@ -503,8 +504,6 @@ pub const Reviewer = struct {
         ) catch |err| return constructionFailure(err);
         defer alloc.free(instruction);
 
-        const messages = alloc.alloc(types.ChatMessage, 3) catch |err| return constructionFailure(err);
-        defer alloc.free(messages);
         var owned_context_message: ?[]u8 = null;
         defer if (owned_context_message) |message| alloc.free(message);
         const context_message: []const u8 = switch (view) {
@@ -519,11 +518,10 @@ pub const Reviewer = struct {
                 break :blk message;
             },
         };
-        messages[0] = .{
+        const user_message = types.ChatMessage{
             .role = .user,
             .content = context_message,
         };
-        var message_index: usize = 1;
         const target_call_index = for (review_turn.pending_assistant.tool_calls, 0..) |call, index| {
             if (std.mem.eql(u8, call.id, review_turn.target_call_id)) break index;
         } else return .{ .invalid = .invalid_context };
@@ -533,16 +531,16 @@ pub const Reviewer = struct {
         // attachments are untrusted and do not identify the action.
         target_pending_assistant.images = &.{};
         target_pending_assistant.content = null;
-        messages[message_index] = target_pending_assistant;
-        message_index += 1;
-        messages[message_index] = .{ .role = .system, .content = instruction };
+        const instructions = [_]types.ChatMessage{.{ .role = .system, .content = instruction }};
+        const messages = [_]types.ChatMessage{ user_message, target_pending_assistant };
 
         const payload = transport.build_fn(
             transport.context,
             alloc,
             self.model,
             tools_json,
-            messages,
+            &instructions,
+            &messages,
             review_turn.target_call_id,
             deadline,
             cancel_flag,
@@ -1288,6 +1286,7 @@ fn buildTestReviewPayload(
     alloc: std.mem.Allocator,
     model: []const u8,
     tools_json: []const u8,
+    instructions: []const types.ChatMessage,
     messages: []const types.ChatMessage,
     target_call_id: []const u8,
     _: std.Io.Clock.Timestamp,
@@ -1302,6 +1301,13 @@ fn buildTestReviewPayload(
     try out.writer.writeAll(tools_json);
     try out.writer.writeAll(",\"messages\":[");
     var first = true;
+    for (instructions) |instruction| {
+        if (!first) try out.writer.writeByte(',');
+        first = false;
+        try out.writer.writeAll("{\"role\":\"system\",\"content\":");
+        try std.json.Stringify.value(instruction.content, .{}, &out.writer);
+        try out.writer.writeByte('}');
+    }
     for (messages) |message| {
         if (!first) try out.writer.writeByte(',');
         first = false;
@@ -2105,7 +2111,7 @@ test "normal automatic review serializes the pending call without root task text
             const assistant_index = std.mem.find(u8, payload, "\"role\":\"assistant\"") orelse return error.TestExpectedReviewOrder;
             const result_index = std.mem.find(u8, payload, "\"role\":\"tool\"") orelse return error.TestExpectedReviewOrder;
             const instruction_index = std.mem.find(u8, payload, "<permission_review>") orelse return error.TestExpectedReviewOrder;
-            self.saw_message_order = user_index < assistant_index and assistant_index < result_index and result_index < instruction_index;
+            self.saw_message_order = instruction_index < user_index and user_index < assistant_index and assistant_index < result_index;
             return .{ .completion = .{ .completion = .{
                 .tool_calls = &.{.{
                     .id = "review",

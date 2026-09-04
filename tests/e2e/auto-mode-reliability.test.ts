@@ -1214,7 +1214,14 @@ describe("lean auto mode reliability", () => {
           content: Array<{ type: string; text?: string }>;
         }>;
       };
-      const rootMessage = reviewerPayload.prompt[0];
+      const firstConversationIndex = reviewerPayload.prompt.findIndex(
+        (message) => message.role !== "system",
+      );
+      expect(firstConversationIndex).toBeGreaterThan(0);
+      expect(
+        reviewerPayload.prompt.slice(firstConversationIndex).map((message) => message.role),
+      ).not.toContain("system");
+      const rootMessage = reviewerPayload.prompt[firstConversationIndex];
       expect(rootMessage?.role).toBe("user");
       const rootContext = (rootMessage?.content ?? [])
         .filter((part) => part.type === "text")

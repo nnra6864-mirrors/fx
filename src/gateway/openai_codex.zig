@@ -48,6 +48,7 @@ pub fn buildRequest(
     alloc: Allocator,
     request: stream_provider.RequestData,
 ) ![]u8 {
+    try request.validatePrompt();
     try validateModel(request.model);
     if (request.budget) |budget| {
         if (budget.cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
@@ -56,9 +57,8 @@ pub fn buildRequest(
 
     var instructions: std.Io.Writer.Allocating = .init(alloc);
     defer instructions.deinit();
-    for (request.messages) |message| {
-        if (message.role != .system) continue;
-        const text = message.content orelse continue;
+    for (request.instructions) |instruction| {
+        const text = instruction.content.?;
         if (text.len == 0) continue;
         if (instructions.written().len > 0) try instructions.writer.writeAll("\n\n");
         try instructions.writer.writeAll(text);
@@ -551,8 +551,8 @@ test "OpenAI Codex request uses Responses input and converts AI SDK tool schemas
         .description = "Read",
         .input_schema = .{},
     };
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "Be concise." }};
     const messages = [_]types.ChatMessage{
-        .{ .role = .system, .content = "Be concise." },
         .{ .role = .user, .content = "Read it." },
         .{
             .role = .assistant,
@@ -563,6 +563,7 @@ test "OpenAI Codex request uses Responses input and converts AI SDK tool schemas
     };
     const body = try buildRequest(std.testing.allocator, .{
         .model = "gpt-5.4",
+        .instructions = &instructions,
         .messages = &messages,
         .tools = .{ .additional_functions = &.{read_file_schema} },
         .tool_choice = .auto,

@@ -486,10 +486,90 @@ pub fn activeCompactCommandMenu(ctx: RenderContext) ?CompactCommandMenuProjectio
 pub const steering_composer_gap_rows: u16 = 1;
 pub const max_steering_message_rows: u16 = 2;
 
-pub fn steeringMessageRows(message: []const u8, width: u16) u16 {
-    const content_width = width -| 2;
-    if (content_width == 0) return 1;
-    return if (text_utils.terminalSafeVisibleWidth(message) <= content_width) 1 else max_steering_message_rows;
+const SteeringMessageLayout = struct {
+    rows: [max_steering_message_rows][]const u8 = @splat(""),
+    row_count: u16 = 0,
+    content_width: u16,
+    truncated: bool = false,
+};
+
+fn steering_unit_width(raw: []const u8) usize {
+    var width: usize = 0;
+    var safe_start: usize = 0;
+    var index: usize = 0;
+    while (index < raw.len) {
+        const rune = display_width.decodeNextRune(raw, index);
+        const end = index + rune.len;
+        if (!text_utils.isTerminalSafe(raw[index..end])) {
+            width += display_width.visibleWidth(raw[safe_start..index]);
+            width += text_utils.terminalSafeVisibleWidth(raw[index..end]);
+            safe_start = end;
+        }
+        index = end;
+    }
+    return width + display_width.visibleWidth(raw[safe_start..]);
+}
+
+/// Borrows at most two visible row slices; measurement and painting share this layout.
+pub fn steering_message_layout(
+    message: []const u8,
+    width: u16,
+    waits_for_tool: bool,
+    row_limit: u16,
+) SteeringMessageLayout {
+    var layout: SteeringMessageLayout = .{
+        .content_width = if (waits_for_tool) width -| 2 else width,
+    };
+    const limit = @min(row_limit, max_steering_message_rows);
+    var offset: usize = 0;
+    while (layout.row_count < limit) {
+        const start = offset;
+        var cells: usize = 0;
+        var ellipsis_end = start;
+        var last_space: ?usize = null;
+        while (offset < message.len and message[offset] != '\n' and message[offset] != '\r') {
+            const unit = display_width.displayUnitAt(message, offset);
+            const raw = message[offset .. offset + unit.byte_len];
+            const unit_width = if (message[offset] == '\t')
+                1
+            else if (text_utils.isTerminalSafe(raw))
+                unit.cell_width
+            else
+                steering_unit_width(raw);
+            if (unit_width > layout.content_width - cells) break;
+            if (message[offset] == ' ' or message[offset] == '\t') last_space = offset;
+            cells += unit_width;
+            offset += unit.byte_len;
+            if (cells < layout.content_width) ellipsis_end = offset;
+        }
+        var end = offset;
+        const soft_separator = offset < message.len and (message[offset] == ' ' or message[offset] == '\t');
+        if (soft_separator) {
+            while (offset < message.len and (message[offset] == ' ' or message[offset] == '\t')) offset += 1;
+        }
+        const hard_break = offset < message.len and (message[offset] == '\n' or message[offset] == '\r');
+        if (hard_break) {
+            const cr = message[offset] == '\r';
+            offset += 1;
+            if (cr and offset < message.len and message[offset] == '\n') offset += 1;
+        } else if (!soft_separator and offset < message.len) {
+            if (last_space) |space| {
+                if (space > start) {
+                    end = space;
+                    offset = space + 1;
+                }
+            }
+        }
+        layout.rows[layout.row_count] = message[start..end];
+        layout.row_count += 1;
+        if (offset == message.len) break;
+        if (layout.row_count == limit or (!hard_break and end == start)) {
+            layout.rows[layout.row_count - 1] = message[start..@min(end, ellipsis_end)];
+            layout.truncated = true;
+            break;
+        }
+    }
+    return layout;
 }
 
 pub fn steeringBannerRowsForMessages(
@@ -498,13 +578,9 @@ pub fn steeringBannerRowsForMessages(
     width: u16,
 ) u16 {
     if (messages.len == 0) return 0;
-    if (!waits_for_tool) {
-        return @as(u16, @intCast(@min(messages.len, std.math.maxInt(u16)))) +|
-            steering_composer_gap_rows;
-    }
     var rows: u16 = 0;
     for (messages) |message| {
-        rows +|= steeringMessageRows(message, width);
+        rows +|= steering_message_layout(message, width, waits_for_tool, max_steering_message_rows).row_count;
     }
     return rows +| steering_composer_gap_rows;
 }
@@ -518,6 +594,9 @@ pub fn steeringBannerRows(ctx: RenderContext, width: u16) u16 {
 }
 
 test "steering banner reserves message rows and one composer gap" {
+    for ([_]bool{ false, true }) |waiting| {
+        try std.testing.expectEqual(@as(u16, 3), steeringBannerRowsForMessages(&.{"first\nsecond\nthird"}, waiting, 80));
+    }
     try std.testing.expectEqual(
         @as(u16, 0),
         steeringBannerRowsForMessages(&.{}, true, 80),
@@ -530,6 +609,25 @@ test "steering banner reserves message rows and one composer gap" {
         @as(u16, 5),
         steeringBannerRowsForMessages(&.{ "first steering message", "second steering message" }, true, 12),
     );
+}
+
+test "steering preview layout retains prefix slices at row boundaries" {
+    const cases = [_]struct { text: []const u8, width: u16, first: []const u8, second: []const u8, truncated: bool }{
+        .{ .text = "first\r\nsecond\nthird", .width = 20, .first = "first", .second = "second", .truncated = true },
+        .{ .text = "abcdefghij", .width = 4, .first = "abcd", .second = "efg", .truncated = true },
+        .{ .text = "abcd\nefgh", .width = 4, .first = "abcd", .second = "efgh", .truncated = false },
+        .{ .text = "one two three", .width = 7, .first = "one two", .second = "three", .truncated = false },
+        .{ .text = "abc \ndef", .width = 3, .first = "abc", .second = "def", .truncated = false },
+        .{ .text = "界海語", .width = 3, .first = "界", .second = "海", .truncated = true },
+        .{ .text = "first\n\nthird", .width = 20, .first = "first", .second = "", .truncated = true },
+    };
+    for (cases) |case| {
+        const layout = steering_message_layout(case.text, case.width, false, 2);
+        try std.testing.expectEqual(@as(u16, 2), layout.row_count);
+        try std.testing.expectEqualStrings(case.first, layout.rows[0]);
+        try std.testing.expectEqualStrings(case.second, layout.rows[1]);
+        try std.testing.expectEqual(case.truncated, layout.truncated);
+    }
 }
 
 pub fn transientActivityGapRows(shell: *const TranscriptRuntime, tool_before_activity: bool) u16 {

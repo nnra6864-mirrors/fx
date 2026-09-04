@@ -160,8 +160,10 @@ pub const CredentialRefreshMode = auth_runtime.CredentialRefreshMode;
 /// Ordered text emitted by the agent runtime. Payloads are borrowed for the
 /// duration of the callback.
 pub const TextEmission = union(enum) {
+    assistant_started,
     assistant_source: []const u8,
     assistant_rendered: []const u8,
+    assistant_restarted: []const u8,
     operational: []const u8,
 };
 
@@ -177,6 +179,7 @@ pub const AgentRuntimeDeps = struct {
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
     compaction_route: provider_set.CompactionRouteDecision = .{ .unavailable = .missing_policy },
     flush_assistant_stream_per_content_chunk: bool = false,
+    render_assistant_text: bool = true,
     cooperative_transport_pulse: ?agent_stream_provider.CooperativePulse = null,
     tool_registry: tool_dispatch.Registry = .{},
     context_registry: ?context_contract.Registry = null,

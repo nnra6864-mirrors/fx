@@ -5746,9 +5746,11 @@ test.skipIf(!tmuxAvailable())(
       const resumed = await waitForScrollback(active, "UPGRADE_CTRL_G_INITIAL_DONE");
       expect(resumed).toContain("UPGRADE_CTRL_G_INITIAL_DONE");
       expect(resumed).toContain(updatedNotice);
-      expect(await active.capturePaneEscapes()).toContain(
-        `\x1b[4m\x1b]8;;https://fx.sh/changelog#v${version}\x1b\\(notes)\x1b]8;;\x1b\\`,
+      const noticeEscapes = await active.capturePaneEscapes();
+      expect(noticeEscapes).toContain(
+        `(\x1b[4m\x1b]8;;https://fx.sh/changelog#v${version}\x1b\\notes\x1b[0m`,
       );
+      expect(noticeEscapes).toContain("\x1b]8;;\x1b\\)");
       expect(resumed).not.toContain("● Session resumed:");
       expect(resumed).not.toContain("● Session: resumed:");
 

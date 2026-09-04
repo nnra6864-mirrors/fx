@@ -8,6 +8,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
 const model_provider = @import("../config/model_provider.zig");
+const provider_catalog = @import("provider_catalog.zig");
 const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
@@ -347,10 +348,16 @@ pub const FxLoginReadStatus = enum {
     unavailable,
 };
 
+pub const LoadFailure = struct {
+    source: Source,
+    err: anyerror,
+};
+
 pub const Resolution = struct {
     credential: ?Credential = null,
     stored_key_status: StoredKeyReadStatus = .not_attempted,
     fx_login_status: FxLoginReadStatus = .not_attempted,
+    failure: ?LoadFailure = null,
 };
 
 /// The single credential resolution method. Walks source precedence, then falls back to
@@ -372,22 +379,14 @@ pub fn resolveForProvider(
     provider: model_provider.ProviderId,
     preferred: ?Source,
 ) !Resolution {
-    switch (provider) {
-        .codex => {
-            const credential = switch (mode) {
-                .stored => try loadStoredChatGptCredential(alloc),
-                .refresh_if_needed => try loadChatGptCredential(alloc, transport, .if_needed),
-            };
-            return .{ .credential = credential };
-        },
-        .grok => {
-            const credential = switch (mode) {
-                .stored => try loadStoredGrokCredential(alloc),
-                .refresh_if_needed => try loadGrokCredential(alloc, transport, .if_needed),
-            };
-            return .{ .credential = credential };
-        },
-        .gateway => {},
+    if (provider != .gateway) {
+        const source = provider_catalog.find(provider).login_source;
+        const credential = loadPreferredSource(alloc, transport, secret_store, mode, source) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            debug_trace.logf("auth", "provider source load failed source={t} err={s}", .{ source, @errorName(err) });
+            return .{ .failure = .{ .source = source, .err = err } };
+        };
+        return .{ .credential = credential };
     }
     return resolvePreferring(
         alloc,
@@ -418,7 +417,7 @@ pub fn resolvePreferring(
         const chosen = loadPreferredSource(alloc, transport, secret_store, mode, source) catch |err| {
             if (err == error.OutOfMemory) return err;
             debug_trace.logf("auth", "explicit source load failed source={t} err={s}", .{ source, @errorName(err) });
-            return unavailableExplicitResolution(source);
+            return unavailableExplicitResolution(source, err);
         };
         if (chosen) |credential| return .{ .credential = credential };
         debug_trace.logf("auth", "explicit source unavailable source={t}", .{source});
@@ -433,25 +432,28 @@ pub fn resolvePreferring(
     // fall through on failure, and a rejected refresh token must not hide a
     // stored key that works. OutOfMemory stays fatal, as it does for them.
     var fx_login_status: FxLoginReadStatus = .absent;
+    var failure: ?LoadFailure = null;
     const fx_login = loadFxLoginForPrecedence(alloc, transport, mode) catch |err| blk: {
         if (err == error.OutOfMemory) return err;
         fx_login_status = .unavailable;
+        failure = .{ .source = .fx_login, .err = err };
         debug_trace.logf("auth", "fx login load failed mode={t} err={s}; using precedence", .{ mode, @errorName(err) });
         break :blk null;
     };
     if (fx_login) |credential| return .{ .credential = credential };
 
-    if (secret_store.isDisabled()) return .{ .fx_login_status = fx_login_status };
+    if (secret_store.isDisabled()) return .{ .fx_login_status = fx_login_status, .failure = failure };
 
     var status: StoredKeyReadStatus = .not_found;
     const stored = loadSource(alloc, transport, secret_store, .stored_key) catch |err| blk: {
         if (err == error.OutOfMemory) return err;
         status = .unavailable;
+        failure = .{ .source = .stored_key, .err = err };
         debug_trace.logf("auth", "stored key load failed err={s} status={t}", .{ @errorName(err), status });
         break :blk null;
     };
     if (stored) |credential| return .{ .credential = credential, .fx_login_status = fx_login_status };
-    return .{ .stored_key_status = status, .fx_login_status = fx_login_status };
+    return .{ .stored_key_status = status, .fx_login_status = fx_login_status, .failure = failure };
 }
 
 fn missingExplicitResolution(source: Source) Resolution {
@@ -462,12 +464,14 @@ fn missingExplicitResolution(source: Source) Resolution {
     };
 }
 
-fn unavailableExplicitResolution(source: Source) Resolution {
-    return switch (source) {
+fn unavailableExplicitResolution(source: Source, err: anyerror) Resolution {
+    var resolution: Resolution = switch (source) {
         .fx_login => .{ .fx_login_status = .unavailable },
         .stored_key => .{ .stored_key_status = .unavailable },
         else => .{},
     };
+    resolution.failure = .{ .source = source, .err = err };
+    return resolution;
 }
 
 fn loadFxLoginForPrecedence(
@@ -530,6 +534,7 @@ pub fn sourceExists(
     secret_store: host.SecretStore,
     source: Source,
 ) !bool {
+    try requireSourceStorage(source);
     return switch (source) {
         .vercel_oidc_token => nonEmptyEnvValue("VERCEL_OIDC_TOKEN") != null,
         .ai_gateway_api_key => nonEmptyEnvValue("AI_GATEWAY_API_KEY") != null,
@@ -602,6 +607,24 @@ pub fn sourcePresence(
     };
 }
 
+/// Shared admission for reading a saved OAuth credential.
+pub fn requireSourceStorage(source: Source) error{CredentialStorageUnavailable}!void {
+    if (!sourceRefreshable(source)) return;
+    if (sourcePresence(host.unavailable_secret_store, source) == .unavailable) {
+        debug_trace.logf("auth", "credential storage unavailable source={t}", .{source});
+        return error.CredentialStorageUnavailable;
+    }
+}
+
+pub fn requireSignInStorage(source: Source) error{CredentialStorageUnavailable}!void {
+    switch (source) {
+        .fx_login => try oauth_session.requireSignInStorage(),
+        .chatgpt_subscription => try chatgpt_session.requireSignInStorage(),
+        .grok_subscription => try grok_session.requireSignInStorage(),
+        else => {},
+    }
+}
+
 fn loadEnvCredential(
     alloc: std.mem.Allocator,
     name: []const u8,
@@ -628,6 +651,7 @@ fn loadChatGptCredential(
     transport: oauth_transport.Provider,
     mode: chatgpt_oauth.RefreshMode,
 ) !?Credential {
+    try requireSourceStorage(.chatgpt_subscription);
     var access = (try chatgpt_oauth.loadAccess(alloc, transport, mode)) orelse return null;
     defer access.deinit(alloc);
     const token = access.access_token;
@@ -651,6 +675,7 @@ fn loadGrokCredential(
     transport: oauth_transport.Provider,
     mode: grok_oauth.RefreshMode,
 ) !?Credential {
+    try requireSourceStorage(.grok_subscription);
     var access = (try grok_oauth.loadAccess(alloc, transport, mode)) orelse return null;
     defer access.deinit(alloc);
     const token = access.access_token;
@@ -683,6 +708,7 @@ pub fn loadFxLoginCredential(
     alloc: std.mem.Allocator,
     transport: oauth_transport.Provider,
 ) !?Credential {
+    try requireSourceStorage(.fx_login);
     var session = (try oauth_session.load(alloc)) orelse return null;
     defer session.deinit(alloc);
 
@@ -694,6 +720,7 @@ pub fn loadFxLoginCredential(
 }
 
 fn loadStoredFxLoginCredential(alloc: std.mem.Allocator) !?Credential {
+    try requireSourceStorage(.fx_login);
     var session = (try oauth_session.load(alloc)) orelse return null;
     defer session.deinit(alloc);
     return takeCredentialFromSession(&session, null);
@@ -725,6 +752,7 @@ fn refreshFxLoginCredentialLocked(
     transport: oauth_transport.Provider,
     mode: FxLoginRefreshMode,
 ) !?Credential {
+    try requireSourceStorage(.fx_login);
     var mutation = (try oauth_session.beginExistingMutation()) orelse return null;
     defer mutation.deinit();
 
@@ -745,6 +773,7 @@ pub fn refreshFxSession(
     mutation: *oauth_session.Mutation,
     session: *oauth_session.Session,
 ) !void {
+    try mutation.requireWritable();
     const issuer_url = session.issuer;
     var metadata = try oauth.discover(alloc, transport, issuer_url);
     defer metadata.deinit(alloc);

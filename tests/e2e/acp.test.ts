@@ -15,7 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { FX_BIN, HAS_API_KEY, REPO_ROOT, runFx } from "../evals/eval-helpers";
+import { FX_BIN, HAS_API_KEY, REPO_ROOT, runFx, providerVersionTestEnv } from "../evals/eval-helpers";
 import {
   AUTO_EXA_SERIALIZED_TOOL_NAMES,
   customProviderGuidanceState,
@@ -259,6 +259,32 @@ function occurrenceCount(text: string, needle: string): number {
   return text.split(needle).length - 1;
 }
 
+function expectRestartedAcpResponse(
+  previousMessages: any[],
+  resumedMessages: any[],
+  partialText: string,
+  replacementText: string,
+): void {
+  const preview = previousMessages.find((message) =>
+    message.params?.update?.sessionUpdate === "agent_message_chunk" &&
+    message.params.update.content.text === partialText
+  )?.params.update;
+  expect(preview).toBeDefined();
+  const resumed = resumedMessages.filter((message) =>
+    message.params?.update?.sessionUpdate === "agent_message_chunk"
+  ).map((message) => message.params.update);
+  expect(resumed.map((update) => update.content.text)).toEqual([
+    "\n\n[Response interrupted. Restarting.]\n\n",
+    replacementText,
+  ]);
+  const ids = [preview.messageId, ...resumed.map((update) => update.messageId)];
+  for (const id of ids) {
+    expect(typeof id).toBe("string");
+    expect(id.length).toBeGreaterThan(0);
+  }
+  expect(new Set(ids).size).toBe(3);
+}
+
 function acpPromptText(body: string): string {
   return acpGatewayRequest(body).prompt
     .map((message) => acpContentText(message.content))
@@ -358,6 +384,7 @@ function startAcpFakeCodex(options: {
   const modelRequests: Array<{ path: string; authorization: string | null }> = [];
   const tokenRequests: Array<{ path: string; authorization: string | null }> = [];
   let unauthorizedResponses = options.unauthorizedResponses ?? 0;
+  const extraModels: string[] = [];
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
@@ -370,6 +397,7 @@ function startAcpFakeCodex(options: {
           { slug: "gpt-5.6-sol", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "high" }], additional_speed_tiers: ["fast"], input_modalities: ["text", "image"], context_window: 272000 },
           { slug: "gpt-5.6-luna", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "medium" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
           { slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128000 },
+          ...extraModels.map((slug) => ({ slug, visibility: "list", supported_in_api: true })),
         ] });
       }
       if (path === "/token") {
@@ -401,6 +429,7 @@ function startAcpFakeCodex(options: {
     responsesUrl: `http://127.0.0.1:${server.port}/responses`,
     modelsUrl: `http://127.0.0.1:${server.port}/models`,
     tokenUrl: `http://127.0.0.1:${server.port}/token`,
+    addModel(slug: string) { extraModels.push(slug); },
     stop() { server.stop(true); },
   };
 }
@@ -588,11 +617,11 @@ class AcpClient {
       }
     }
     const proc = nodeSpawn(FX_BIN, args, {
-      env: {
+      env: providerVersionTestEnv({
         ...inheritedEnv,
         NO_COLOR: "1",
         PATH: inheritedEnv.PATH ?? "",
-      },
+      }),
       cwd: opts?.cwd ?? REPO_ROOT,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -1241,11 +1270,11 @@ describe("acp: model-independent", () => {
     async () => {
       const root = createIsolatedRoot("fx-acp-model-recovery-");
       const partialText = "ACP partial output before EOF.";
-      const finalTextSuffix = "ACP recovery completed.";
+      const replacementText = `${partialText} ACP recovery completed.`;
       const gateway = startFakeGateway([
         partialEofResponse(partialText),
         ...Array.from({ length: 9 }, () => retryAfterUnavailable(0)),
-        finalText(`${partialText}${finalTextSuffix}`),
+        finalText(replacementText),
       ]);
       try {
         client = await AcpClient.create({
@@ -1281,8 +1310,102 @@ describe("acp: model-independent", () => {
           "Preserve this ACP prompt through recovery.",
         );
         const allUpdates = JSON.stringify([...paused.messages, ...resumed.messages]);
-        expect(occurrenceCount(allUpdates, partialText)).toBe(1);
-        expect(occurrenceCount(allUpdates, finalTextSuffix)).toBe(1);
+        expectRestartedAcpResponse(paused.messages, resumed.messages, partialText, replacementText);
+        expect(occurrenceCount(allUpdates, partialText)).toBe(2);
+        expect(occurrenceCount(allUpdates, replacementText)).toBe(1);
+        expect(gateway.requests[10]!.body).not.toContain(partialText);
+        expect(acpLatestPromptText(gateway.requests[10]!.body)).toContain("Restart that response");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP cancellation preserves earlier preview while replacement language is rejected",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-rejected-replacement-");
+      const tracePath = join(root.root, "trace.log");
+      const partialText = "The accepted English preview before the connection stopped.";
+      const rejectedText = "我会先检查锁文件和依赖清单。";
+      const laterText = "The later English answer is complete.";
+      const heldReplacement = new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(
+            `data: ${JSON.stringify({ type: "text-delta", id: "replacement", delta: rejectedText })}\n\n`,
+          ));
+        },
+      }), { headers: { "content-type": "text/event-stream" } });
+      const gateway = startFakeGateway([
+        partialEofResponse(partialText),
+        heldReplacement,
+        finalText(laterText),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            FX_TRACE_LOG: tracePath,
+            FX_TRACE_SCOPES: "sse",
+          },
+        });
+        const sessionId = await startCodeSession(client);
+        sendPrompt(client, 40, "Explain the repository findings in English without using tools.");
+        await waitForCondition("both response text events", () => {
+          if (!existsSync(tracePath)) return false;
+          return (readFileSync(tracePath, "utf8").match(/event type=text-delta/g) ?? []).length === 2;
+        }, TIMEOUT);
+        expect(client.rawLines.join("\n")).toContain(partialText);
+        expect(client.rawLines.join("\n")).not.toContain(rejectedText);
+        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.requests[1]!.body).not.toContain(partialText);
+
+        client.send({ jsonrpc: "2.0", id: 41, method: "session/cancel", params: {} });
+        const responses = new Map<number, any>();
+        while (responses.size < 2) {
+          const message = await client.readLine() as any;
+          if (message.id === 40 || message.id === 41) responses.set(message.id, message);
+        }
+        expect(responses.get(40)?.result?.stopReason).toBe("cancelled");
+        expect(responses.get(41)?.result).toBeNull();
+        expect(gateway.requests).toHaveLength(2);
+
+        await client.close();
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 50);
+        client.send({
+          jsonrpc: "2.0",
+          id: 51,
+          method: "session/load",
+          params: { sessionId, mcpServers: [] },
+        });
+        const loaded: any[] = [];
+        while (true) {
+          const message = await client.readLine() as any;
+          if (message.id === 51) {
+            expect(message.error).toBeUndefined();
+            break;
+          }
+          loaded.push(message);
+        }
+        expect(occurrenceCount(JSON.stringify(loaded), partialText)).toBe(1);
+        expect(JSON.stringify(loaded)).not.toContain(rejectedText);
+
+        const later = await runPrompt(client, "Return another English answer.", TIMEOUT);
+        expect(later.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(later.messages)).toContain(laterText);
+        expect(JSON.stringify(later.messages)).not.toContain(partialText);
+        expect(gateway.requests).toHaveLength(3);
+        expect(gateway.requests[2]!.body).toContain(partialText);
+        expect(gateway.requests[2]!.body).not.toContain(rejectedText);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
@@ -1645,7 +1768,7 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-reload-model-recovery-");
       const toolEvidence = "ACP_RESTART_TOOL_EVIDENCE";
       const partialText = "ACP_RESTART_PARTIAL_SENTINEL";
-      const finalTextSuffix = "ACP_RESTART_FINAL_SENTINEL";
+      const replacementText = "ACP_RESTART_FINAL_SENTINEL";
       writeFileSync(join(root.workspace, "recovery-fixture.txt"), `${toolEvidence}\n`);
       const gateway = startFakeGateway([
         fakeGatewayToolCall("recovery_read_1", "read_file", {
@@ -1653,7 +1776,7 @@ describe("acp: model-independent", () => {
         }),
         partialEofResponse(partialText),
         ...Array.from({ length: 9 }, () => retryAfterUnavailable(0)),
-        finalText(`${partialText}${finalTextSuffix}`),
+        finalText(replacementText),
       ]);
       try {
         client = await AcpClient.create({
@@ -1711,8 +1834,11 @@ describe("acp: model-independent", () => {
           ...loadMessages,
           ...resumed.messages,
         ]);
+        expectRestartedAcpResponse(loadMessages, resumed.messages, partialText, replacementText);
         expect(occurrenceCount(restartedUpdates, partialText)).toBe(1);
-        expect(occurrenceCount(restartedUpdates, finalTextSuffix)).toBe(1);
+        expect(occurrenceCount(restartedUpdates, replacementText)).toBe(1);
+        expect(gateway.requests[11]!.body).not.toContain(partialText);
+        expect(acpLatestPromptText(gateway.requests[11]!.body)).toContain("Restart that response");
 
         await client.close();
         client = await AcpClient.create({
@@ -1740,11 +1866,83 @@ describe("acp: model-independent", () => {
         const completedLoadUpdates = JSON.stringify(completedLoadMessages);
         expect(completedLoadUpdates).not.toContain("modelResponseRecovery");
         expect(occurrenceCount(completedLoadUpdates, toolEvidence)).toBe(1);
-        expect(occurrenceCount(completedLoadUpdates, partialText)).toBe(1);
-        expect(occurrenceCount(completedLoadUpdates, finalTextSuffix)).toBe(1);
+        expect(occurrenceCount(completedLoadUpdates, partialText)).toBe(0);
+        expect(occurrenceCount(completedLoadUpdates, replacementText)).toBe(1);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP retains interrupted preview when the process dies during a retry",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-retry-crash-");
+      const partialText = "ACP_CRASH_PARTIAL_PREVIEW";
+      const toolEvidence = "ACP_CRASH_SETTLED_TOOL";
+      const replacementText = "ACP_CRASH_REPLACEMENT";
+      writeFileSync(join(root.workspace, "fixture.txt"), `${toolEvidence}\n`);
+      const held = heldFakeGatewayFinalText();
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("crash_read_1", "read_file", { path: "fixture.txt" }),
+        partialEofResponse(partialText),
+        held.response,
+        finalText(replacementText),
+      ]);
+      const proc = nodeSpawn(FX_BIN, ["acp"], {
+        cwd: root.workspace,
+        env: { ...process.env, ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      try {
+        client = new AcpClient(proc);
+        const sessionId = await startCodeSession(client);
+        sendPrompt(client, 40, "Read fixture.txt once and preserve its result through recovery.");
+        await waitForCondition("reserved retry request", () => gateway.requests.length === 3, TIMEOUT);
+        expect(gateway.requests[2]!.body).not.toContain(partialText);
+        const exited = client.waitForExit();
+        proc.kill("SIGKILL");
+        await exited;
+        expect(proc.signalCode).toBe("SIGKILL");
+
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 10);
+        client.send({
+          jsonrpc: "2.0",
+          id: 11,
+          method: "session/load",
+          params: { sessionId, mcpServers: [] },
+        });
+        const loaded: any[] = [];
+        while (true) {
+          const message = await client.readLine() as any;
+          if (message.id === 11) {
+            expect(message.error).toBeUndefined();
+            break;
+          }
+          loaded.push(message);
+        }
+        const loadUpdates = JSON.stringify(loaded);
+        expect(occurrenceCount(loadUpdates, partialText)).toBe(1);
+        expect(occurrenceCount(loadUpdates, toolEvidence)).toBe(1);
+
+        const resumed = await continueRecovery(client, TIMEOUT, sessionId);
+        expect(resumed.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(4);
+        expect(acpToolResultText(gateway.requests[3]!.body, "crash_read_1")).toContain(toolEvidence);
+        expect(gateway.requests[3]!.body).not.toContain(partialText);
+        expectRestartedAcpResponse(loaded, resumed.messages, partialText, replacementText);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        held.dispose();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
@@ -5911,6 +6109,18 @@ describe("acp: model-independent", () => {
           message: "Prompt already in progress",
         });
 
+        client.send({
+          jsonrpc: "2.0",
+          id: 98,
+          method: "session/set_config_option",
+          params: { configId: "provider", value: "codex" },
+        });
+        const providerChange = await readResponse(client, 98);
+        expect(providerChange.error).toEqual({
+          code: -32600,
+          message: "Prompt already in progress",
+        });
+
         heldResponse.resolve(finalText("held prompt complete"));
         const prompt = await readResponse(client, 96);
         expect(prompt.error).toBeUndefined();
@@ -8017,6 +8227,239 @@ describe("acp: model catalog authentication", () => {
     },
     TIMEOUT,
   );
+  test(
+    "session provider changes use Codex credentials without crossing origins",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-chatgpt-route-");
+      const gateway = startFakeGateway([]);
+      const codex = startAcpFakeCodex({ unauthorizedResponses: 1 });
+      writeSeededAcpChatGptLogin(root.home, codex.accessToken);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+            FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+            FX_E2E_CHATGPT_TOKEN_URL: codex.tokenUrl,
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine(); // consume session/update notification
+
+        const changed = await client.request("session/set_config_option", {
+          configId: "provider",
+          value: "codex",
+        }, 3) as any;
+        expect(changed.result.configOptions.find((option: any) => option.id === "provider").currentValue)
+          .toBe("codex");
+        expect(changed.result.configOptions.find((option: any) => option.id === "model").currentValue)
+          .toBe("gpt-5.6-sol");
+
+        const prompt = await runPrompt(client, "Answer directly.", TIMEOUT);
+        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(prompt.messages)).toContain("ACP_CHATGPT_RESPONSE");
+        const secondPrompt = await runPrompt(client, "Answer again.", TIMEOUT);
+        expect(secondPrompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(codex.requests).toHaveLength(3);
+        expect(codex.modelRequests).toHaveLength(1);
+        expect(codex.requests[0]!.authorization).toBe(`Bearer ${codex.accessToken}`);
+        expect(codex.requests[1]!.authorization).toBe(`Bearer ${codex.refreshedAccessToken}`);
+        expect(codex.requests[2]!.authorization).toBe(`Bearer ${codex.refreshedAccessToken}`);
+        expect(codex.tokenRequests).toHaveLength(1);
+        for (const request of [...gateway.requests, ...gateway.modelRequests]) {
+          expect(request.headers.get("authorization")).not.toBe(`Bearer ${codex.accessToken}`);
+        }
+      } finally {
+        await client?.close();
+        codex.stop();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  for (const provider of ["codex", "grok"] as const) {
+    for (const transition of ["cancel", "load", "resume"] as const) {
+      test(`provider selection after session/${transition} activates ${provider}`, async () => {
+        const root = createIsolatedRoot("fx-acp-recovery-");
+        const gateway = startFakeGateway([]);
+        const codex = startAcpFakeCodex();
+        const grok = startAcpFakeGrok();
+        writeSeededAcpChatGptLogin(root.home, codex.accessToken);
+        writeSeededAcpGrokLogin(root.home, grok.accessToken);
+        try {
+          client = await AcpClient.create({
+            cwd: root.workspace,
+            env: {
+              ...fakeGatewayEnv(root, gateway),
+              FX_DISABLE_KEYCHAIN: "1",
+              FX_SOUND: "0",
+              FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+              FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+              FX_E2E_CHATGPT_TOKEN_URL: codex.tokenUrl,
+              FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
+              FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
+              FX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
+              FX_E2E_GROK_TOKEN_URL: grok.tokenUrl,
+              FX_E2E_GROK_USERINFO_URL: grok.userinfoUrl,
+            },
+          });
+          const initialized = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
+          expect(initialized.error).toBeUndefined();
+          const created = await client.request("session/new", { mcpServers: [] }, 2) as any;
+          expect(created.error).toBeUndefined();
+          const transitioned = await client.request(`session/${transition}`, {
+            sessionId: created.result.sessionId,
+            ...(transition === "cancel" ? {} : { cwd: root.workspace, mcpServers: [] }),
+          }, 3) as any;
+          expect(transitioned.error).toBeUndefined();
+
+          const changed = await client.request("session/set_config_option", {
+            configId: "provider",
+            value: provider,
+          }, 4) as any;
+          expect(changed.error).toBeUndefined();
+          expect(changed.result.configOptions.find((option: any) => option.id === "provider").currentValue)
+            .toBe(provider);
+          const selected = provider === "codex" ? codex : grok;
+          const other = provider === "codex" ? grok : codex;
+          expect(selected.modelRequests.filter((request) => request.path === "/models")).toHaveLength(1);
+          expect(other.modelRequests).toHaveLength(0);
+
+          const prompt = await runPrompt(client, "Answer after changing providers.", TIMEOUT);
+          expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+          expect(JSON.stringify(prompt.messages)).toContain(
+            provider === "codex" ? "ACP_CHATGPT_RESPONSE" : "ACP_GROK_RESPONSE",
+          );
+          expect(selected.requests).toHaveLength(1);
+          expect(selected.requests[0]!.authorization).toBe(`Bearer ${selected.accessToken}`);
+          expect(selected.tokenRequests).toHaveLength(0);
+          expect(other.requests).toHaveLength(0);
+          expect(gateway.requests).toHaveLength(0);
+          client.endStdin();
+          expect(await client.waitForExit()).toBe(0);
+          expect(client.stderr).toBe("");
+        } finally {
+          await client?.close();
+          codex.stop();
+          grok.stop();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      }, TIMEOUT);
+    }
+  }
+
+  test("an open ACP connection refreshes subscription model options before selection", async () => {
+    const root = createIsolatedRoot("fx-acp-catalog-refresh-");
+    const gateway = startFakeGateway([]);
+    const codex = startAcpFakeCodex();
+    writeSeededAcpChatGptLogin(root.home, codex.accessToken);
+    try {
+      client = await AcpClient.create({
+        cwd: root.workspace,
+        env: {
+          ...fakeGatewayEnv(root, gateway),
+          FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+          FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+          FX_E2E_CHATGPT_TOKEN_URL: codex.tokenUrl,
+        },
+      });
+      await client.request("initialize", { protocolVersion: 1 }, 1);
+      await client.request("session/new", { mcpServers: [] }, 2);
+      await client.readLine();
+      await client.request("session/set_config_option", { configId: "provider", value: "codex" }, 3);
+      expect(codex.modelRequests).toHaveLength(1);
+      codex.addModel("gpt-next-fixture");
+      await Bun.sleep(61_000);
+      const listed = await client.request("session/set_config_option", { configId: "mode", value: "code" }, 4) as any;
+      expect(JSON.stringify(listed.result.configOptions)).toContain("gpt-next-fixture");
+      const selected = await client.request("session/set_config_option", { configId: "model", value: "gpt-next-fixture" }, 5) as any;
+      expect(selected.result.configOptions.find((option: any) => option.id === "model").currentValue).toBe("gpt-next-fixture");
+      expect(codex.modelRequests).toHaveLength(2);
+      expect(client.stderr).toBe("");
+    } finally {
+      await client?.close();
+      codex.stop();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  test(
+    "session provider changes use Grok credentials with byte-identical account-stable replay",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-grok-route-");
+      const gateway = startFakeGateway([]);
+      const grok = startAcpFakeGrok({ unauthorizedResponses: 1 });
+      writeSeededAcpGrokLogin(root.home, grok.accessToken);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
+            FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
+            FX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
+            FX_E2E_GROK_TOKEN_URL: grok.tokenUrl,
+            FX_E2E_GROK_USERINFO_URL: grok.userinfoUrl,
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine();
+
+        const changed = await client.request("session/set_config_option", {
+          configId: "provider",
+          value: "grok",
+        }, 3) as any;
+        expect(changed.result.configOptions.find((option: any) => option.id === "provider").currentValue)
+          .toBe("grok");
+        expect(changed.result.configOptions.find((option: any) => option.id === "model").currentValue)
+          .toBe("grok-4.20");
+
+        const prompt = await runPrompt(client, "Answer directly.", TIMEOUT);
+        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(prompt.messages)).toContain("ACP_GROK_RESPONSE");
+        const secondPrompt = await runPrompt(client, "Answer again.", TIMEOUT);
+        expect(secondPrompt.promptResult.result.stopReason).toBe("end_turn");
+
+        expect(grok.requests).toHaveLength(3);
+        expect(grok.requests[0]!.body).toBe(grok.requests[1]!.body);
+        expect(grok.requests[0]!.conversationId).toBeTruthy();
+        expect(grok.requests[0]!.conversationId).toBe(grok.requests[1]!.conversationId);
+        expect(grok.modelRequests.map((request) => request.path)).toEqual(["/models", "/modalities"]);
+        expect(grok.requests[0]!.authorization).toBe(`Bearer ${grok.accessToken}`);
+        expect(grok.requests[1]!.authorization).toBe(`Bearer ${grok.refreshedAccessToken}`);
+        expect(grok.requests[2]!.authorization).toBe(`Bearer ${grok.refreshedAccessToken}`);
+        for (const request of grok.requests) {
+          expect(request.tokenAuth).toBe("xai-grok-cli");
+          expect(request.authenticateResponse).toBe("authenticate-response");
+          expect(request.clientIdentifier).toBe("fx");
+          expect(request.clientVersion).toBe("1.0.6");
+          expect(request.modelOverride).toBe("grok-4.20");
+          expect(request.grokUserId).toBe("acct_grok_acp");
+        }
+        expect(grok.tokenRequests).toHaveLength(1);
+        expect(grok.tokenRequests[0]!.body).toContain("grant_type=refresh_token");
+        expect(grok.userinfoRequests).toHaveLength(1);
+        expect(grok.userinfoRequests[0]!.authorization).toBe(`Bearer ${grok.refreshedAccessToken}`);
+        for (const request of [...gateway.requests, ...gateway.modelRequests]) {
+          expect(request.headers.get("authorization")).not.toContain("grok-acp-");
+        }
+      } finally {
+        await client?.close();
+        grok.stop();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
 });
 
 describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
@@ -8211,131 +8654,6 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
         expect(modelOpt.currentValue).toBe("o4-mini");
       } finally {
         await client?.close();
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "session provider changes use Codex credentials without crossing origins",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-chatgpt-route-");
-      const gateway = startFakeGateway([]);
-      const codex = startAcpFakeCodex({ unauthorizedResponses: 1 });
-      writeSeededAcpChatGptLogin(root.home, codex.accessToken);
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: {
-            ...fakeGatewayEnv(root, gateway),
-            FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
-            FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
-            FX_E2E_CHATGPT_TOKEN_URL: codex.tokenUrl,
-          },
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 1);
-        await client.request("session/new", { mcpServers: [] }, 2);
-        await client.readLine(); // consume session/update notification
-
-        const changed = await client.request("session/set_config_option", {
-          configId: "provider",
-          value: "codex",
-        }, 3) as any;
-        expect(changed.result.configOptions.find((option: any) => option.id === "provider").currentValue)
-          .toBe("codex");
-        expect(changed.result.configOptions.find((option: any) => option.id === "model").currentValue)
-          .toBe("gpt-5.6-sol");
-
-        const prompt = await runPrompt(client, "Answer directly.", TIMEOUT);
-        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
-        expect(JSON.stringify(prompt.messages)).toContain("ACP_CHATGPT_RESPONSE");
-        const secondPrompt = await runPrompt(client, "Answer again.", TIMEOUT);
-        expect(secondPrompt.promptResult.result.stopReason).toBe("end_turn");
-        expect(codex.requests).toHaveLength(3);
-        expect(codex.modelRequests).toHaveLength(1);
-        expect(codex.requests[0]!.authorization).toBe(`Bearer ${codex.accessToken}`);
-        expect(codex.requests[1]!.authorization).toBe(`Bearer ${codex.refreshedAccessToken}`);
-        expect(codex.requests[2]!.authorization).toBe(`Bearer ${codex.refreshedAccessToken}`);
-        expect(codex.tokenRequests).toHaveLength(1);
-        for (const request of [...gateway.requests, ...gateway.modelRequests]) {
-          expect(request.headers.get("authorization")).not.toBe(`Bearer ${codex.accessToken}`);
-        }
-      } finally {
-        await client?.close();
-        codex.stop();
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "session provider changes use Grok credentials with byte-identical account-stable replay",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-grok-route-");
-      const gateway = startFakeGateway([]);
-      const grok = startAcpFakeGrok({ unauthorizedResponses: 1 });
-      writeSeededAcpGrokLogin(root.home, grok.accessToken);
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: {
-            ...fakeGatewayEnv(root, gateway),
-            FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
-            FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
-            FX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
-            FX_E2E_GROK_TOKEN_URL: grok.tokenUrl,
-            FX_E2E_GROK_USERINFO_URL: grok.userinfoUrl,
-          },
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 1);
-        await client.request("session/new", { mcpServers: [] }, 2);
-        await client.readLine();
-
-        const changed = await client.request("session/set_config_option", {
-          configId: "provider",
-          value: "grok",
-        }, 3) as any;
-        expect(changed.result.configOptions.find((option: any) => option.id === "provider").currentValue)
-          .toBe("grok");
-        expect(changed.result.configOptions.find((option: any) => option.id === "model").currentValue)
-          .toBe("grok-4.20");
-
-        const prompt = await runPrompt(client, "Answer directly.", TIMEOUT);
-        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
-        expect(JSON.stringify(prompt.messages)).toContain("ACP_GROK_RESPONSE");
-        const secondPrompt = await runPrompt(client, "Answer again.", TIMEOUT);
-        expect(secondPrompt.promptResult.result.stopReason).toBe("end_turn");
-
-        expect(grok.requests).toHaveLength(3);
-        expect(grok.requests[0]!.body).toBe(grok.requests[1]!.body);
-        expect(grok.requests[0]!.conversationId).toBeTruthy();
-        expect(grok.requests[0]!.conversationId).toBe(grok.requests[1]!.conversationId);
-        expect(grok.modelRequests.map((request) => request.path)).toEqual(["/models", "/modalities"]);
-        expect(grok.requests[0]!.authorization).toBe(`Bearer ${grok.accessToken}`);
-        expect(grok.requests[1]!.authorization).toBe(`Bearer ${grok.refreshedAccessToken}`);
-        expect(grok.requests[2]!.authorization).toBe(`Bearer ${grok.refreshedAccessToken}`);
-        for (const request of grok.requests) {
-          expect(request.tokenAuth).toBe("xai-grok-cli");
-          expect(request.authenticateResponse).toBe("authenticate-response");
-          expect(request.clientIdentifier).toBe("fx");
-          expect(request.clientVersion).toBe("1.0.6");
-          expect(request.modelOverride).toBe("grok-4.20");
-          expect(request.grokUserId).toBe("acct_grok_acp");
-        }
-        expect(grok.tokenRequests).toHaveLength(1);
-        expect(grok.tokenRequests[0]!.body).toContain("grant_type=refresh_token");
-        expect(grok.userinfoRequests).toHaveLength(1);
-        expect(grok.userinfoRequests[0]!.authorization).toBe(`Bearer ${grok.refreshedAccessToken}`);
-        for (const request of [...gateway.requests, ...gateway.modelRequests]) {
-          expect(request.headers.get("authorization")).not.toContain("grok-acp-");
-        }
-      } finally {
-        await client?.close();
-        grok.stop();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }

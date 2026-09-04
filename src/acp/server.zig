@@ -770,7 +770,7 @@ pub fn runWithTransport(
         .cfg = cfg,
         .writer = writer_value,
         .web_search_runtime = web_search_runtime.Runtime.init(.{
-            .provider = cfg.provider_set.gateway.fx_search.?,
+            .provider = cfg.provider_set.gateway.fx_search,
         }),
         .terminal_client = terminal_client_runtime.Runtime.init(
             cfg.process_provider,
@@ -820,9 +820,10 @@ pub fn runWithTransport(
         }
 
         dispatch(&state, alloc, &msg) catch |err| {
+            const auth_notice = auth_runtime.preparationFailureNotice(err);
             state.writer.writeError(alloc, msg.id, .{
-                .code = ErrorCode.internal_error,
-                .message = @errorName(err),
+                .code = if (auth_notice != null) ErrorCode.invalid_request else ErrorCode.internal_error,
+                .message = auth_notice orelse @errorName(err),
             }) catch break;
         };
         if (state.terminate_connection) break;
@@ -1764,6 +1765,13 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         });
     };
     defer startup.deinit(alloc);
+    if (state.cfg.auth_mode == .local and startup.credential == null and
+        !(startup.provider == .gateway and state.cfg.credential_override != null))
+    {
+        if (startup.credential_load_failure) |failure| {
+            if (auth_runtime.preparationError(auth_runtime.classifyCredentialFailure(failure.source, failure.err))) |err| return err;
+        }
+    }
     if (!state.cfg.minimal_kernel) {
         try app_lifecycle.applyWorkspaceLaunch(
             &startup,
@@ -2036,6 +2044,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             });
         if (comptime !host_target.is_wasm) {
             if (session.provider != .gateway) {
+                try refreshModelCatalogForOptions(state);
                 var model_available = false;
                 if (state.capability_resolver.catalogEntries()) |entries| {
                     for (entries) |entry| {
@@ -2167,10 +2176,12 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     staged_credential.?.gatewayTeam(),
                     staged_credential.?.accountId(),
                 );
+            // Provider selection is independent of earlier prompt cancellation.
+            var catalog_cancel_flag = std.atomic.Value(bool).init(false);
             const fetched = try catalog_provider.fetch(alloc, .{
                 .access = access,
                 .endpoint = state.cfg.gateway_models_path,
-                .cancel_flag = &session.cancel_flag,
+                .cancel_flag = &catalog_cancel_flag,
                 .view = .picker,
             });
             var catalog = switch (fetched) {
@@ -2217,7 +2228,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     .message = "Failed to persist session provider",
                 });
             };
-            state.capability_resolver.adoptOwnedCatalog(alloc, &catalog);
+            state.capability_resolver.adoptOwnedCatalog(alloc, catalog_provider, access, &catalog);
             if (staged_credential) |*credential| {
                 adoptServerCredential(state, credential);
             } else {
@@ -2235,6 +2246,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
         }
     }
 
+    try refreshModelCatalogForOptions(state);
     const current_model = if (state.active_session) |s| s.model else state.selected_model;
     const current_mode: []const u8 = if (state.active_session) |s| s.mode else state.cfg.mode_registry.default_mode_id;
 
@@ -2257,6 +2269,29 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
     try sessions.writeModeConfigOption(&out.writer, state.cfg.mode_registry, current_mode);
     try out.writer.writeAll("]}");
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
+}
+
+pub fn refreshModelCatalogForOptions(state: *ServerState) !void {
+    if (comptime host_target.is_wasm) return;
+    if (state.cfg.minimal_kernel) return;
+    const active = if (state.active_session) |*session| session else return;
+    const provider = catalogProviderFor(state, active.provider) orelse return;
+    std.debug.assert(state.active_prompt == null);
+    // Restoring the same session can leave its previous cancellation flag set.
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    try state.capability_resolver.refreshIfDue(state.alloc, provider, .{
+        .access = if (state.cfg.auth_mode == .host_managed)
+            .host_managed
+        else
+            credentials.catalogAccessForCredentialAndAccount(
+                active.credential_source,
+                active.api_key,
+                state.gateway_team,
+                active.account_id,
+            ),
+        .endpoint = state.cfg.gateway_models_path,
+        .cancel_flag = &cancel_flag,
+    });
 }
 
 fn commitActiveSessionProvider(

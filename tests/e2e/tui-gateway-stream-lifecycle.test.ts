@@ -28,7 +28,6 @@ import {
   contentText,
 } from "./conditional-guidance-oracle";
 import {
-  classifierEvidenceFromRequest,
   composerContains,
   fakeGatewayFinalText,
   fakeGatewayPermissionDecision,
@@ -2361,7 +2360,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         [
           partialEofResponse(partialText),
           ...Array.from({ length: 9 }, () => retryAfterUnavailable(0)),
-          fakeGatewayFinalText(`${partialText}${finalText}`),
+          fakeGatewayFinalText(finalText),
         ],
       );
 
@@ -2377,6 +2376,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(queuedGateway.requests).toHaveLength(11);
       expect(scrollback.split(partialText).length - 1).toBe(1);
       expect(scrollback.split(finalText).length - 1).toBe(1);
+      expect(scrollback).toContain("Response interrupted. Restarting.");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT * 2,
@@ -2447,10 +2447,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "provider error after assistant output continues the same visible response",
+    "provider error after assistant output restarts a separate visible response",
     async () => {
       const firstCatalogModel = "anthropic/claude-fable-5";
-      const finalText = "partial unsafe output completed";
+      const finalText = "A complete replacement response.";
       const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
         "fx-tui-route-unsafe-text-",
         [providerErrorAfterTextResponse(), fakeGatewayFinalText(finalText)],
@@ -3204,7 +3204,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const command =
         `while [ ! -f ${JSON.stringify(releasePath)} ]; do sleep 0.05; done; ` +
         "printf COOPERATIVE_TOOL_DONE";
-      const firstSteering = "FIRST_BEGIN use COOPERATIVE_STEERING_SENTINEL in the answer FIRST_END";
+      const firstSteering = "FIRST_BEGIN what is this\nLockfile failed policy check\nHIDDEN_STEERING_TAIL keep the entire message";
       const secondSteering = "SECOND_BEGIN keep the answer concise while preserving its result SECOND_END";
       const thirdSteering = "THIRD_BEGIN mention the completed command before the conclusion THIRD_END";
       const finalText = "COOPERATIVE_STEERING_COMPLETE";
@@ -3245,15 +3245,19 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Run the cooperative steering fixture.");
       await session.waitForText("Running while", TIMEOUT);
-      await session.sendText(firstSteering);
+      await session.pasteText(firstSteering);
+      await session.sendKeys("Enter");
       await session.sendText(secondSteering);
       await session.sendText(thirdSteering);
       await Bun.sleep(150);
       const pendingPane = await session.capturePane();
-      expect(pendingPane).toContain(`┋ ${firstSteering}`);
+      expect(pendingPane).toContain("┋ FIRST_BEGIN what is this");
+      expect(pendingPane).toContain("┋ Lockfile failed policy check…");
+      expect(pendingPane).not.toContain("HIDDEN_STEERING_TAIL");
+      expect(pendingPane).not.toContain("\\x0a");
       expect(pendingPane).toContain(`┋ ${secondSteering}`);
       expect(pendingPane).toContain(`┋ ${thirdSteering}`);
-      expect(pendingPane.indexOf(firstSteering)).toBeLessThan(
+      expect(pendingPane.indexOf("FIRST_BEGIN")).toBeLessThan(
         pendingPane.indexOf(secondSteering),
       );
       expect(pendingPane.indexOf(secondSteering)).toBeLessThan(
@@ -3276,7 +3280,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const narrowPane = await session.capturePane();
       for (const marker of [
         "FIRST_BEGIN",
-        "FIRST_END",
+        "Lockfile failed policy check…",
         "SECOND_BEGIN",
         "SECOND_END",
         "THIRD_BEGIN",
@@ -3308,17 +3312,20 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const continuedBody = steeringGateway.requests[1]!.body;
       const trace = readFileSync(tracePath, "utf8");
       expect(continuedBody.indexOf("COOPERATIVE_TOOL_DONE")).toBeGreaterThanOrEqual(0);
-      expect(continuedBody.indexOf(firstSteering)).toBeGreaterThan(
+      expect(continuedBody.indexOf(JSON.stringify(firstSteering).slice(1, -1))).toBeGreaterThan(
         continuedBody.indexOf("COOPERATIVE_TOOL_DONE"),
       );
       expect(continuedBody.indexOf(secondSteering)).toBeGreaterThan(
-        continuedBody.indexOf(firstSteering),
+        continuedBody.indexOf(JSON.stringify(firstSteering).slice(1, -1)),
       );
       expect(continuedBody.indexOf(thirdSteering)).toBeGreaterThan(
         continuedBody.indexOf(secondSteering),
       );
       expect(continuedBody).toContain("live user update");
       expect(trace).toContain("event=prompt_steering_consumed");
+      const fullScrollback = await session.captureFullScrollback();
+      expect(fullScrollback).toContain("HIDDEN_STEERING_TAIL");
+      expect(fullScrollback).not.toContain("\\x0a");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);

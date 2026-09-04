@@ -1658,11 +1658,13 @@ pub const FakeAgentRuntimeDeps = struct {
     fn pushText(raw: *anyopaque, emission: runtime_deps.TextEmission) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         const text = switch (emission) {
+            .assistant_started => return,
             .assistant_source => |text| {
                 try self.assistant_sources.append(self.alloc, try self.alloc.dupe(u8, text));
                 return;
             },
             .assistant_rendered => |text| text,
+            .assistant_restarted => |text| text,
             .operational => |text| text,
         };
         try self.texts.append(self.alloc, try self.alloc.dupe(u8, text));

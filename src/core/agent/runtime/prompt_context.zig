@@ -210,23 +210,39 @@ pub fn usableInputTokens(
     return context_tokens;
 }
 
-pub fn buildGatewayMessages(
+pub const ProviderPrompt = struct {
+    instructions: std.ArrayList(ChatMessage),
+    messages: std.ArrayList(ChatMessage),
+
+    pub fn deinit(self: *ProviderPrompt, alloc: Allocator) void {
+        self.instructions.deinit(alloc);
+        self.messages.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub fn buildProviderPrompt(
     alloc: Allocator,
     stable_prefix: []const ChatMessage,
     ephemeral_overlay: []const ChatMessage,
     durable_history: []const ChatMessage,
     current_user_message: ChatMessage,
     within_turn_suffix: []const ChatMessage,
-) !std.ArrayList(ChatMessage) {
+) !ProviderPrompt {
+    var instructions: std.ArrayList(ChatMessage) = .empty;
+    errdefer instructions.deinit(alloc);
     var messages: std.ArrayList(ChatMessage) = .empty;
     errdefer messages.deinit(alloc);
 
-    try messages.appendSlice(alloc, stable_prefix);
-    try appendEphemeralOverlayMessages(alloc, &messages, ephemeral_overlay);
+    try instructions.appendSlice(alloc, stable_prefix);
+    try appendEphemeralOverlayMessages(alloc, &instructions, ephemeral_overlay);
     try messages.appendSlice(alloc, durable_history);
     try messages.append(alloc, current_user_message);
     try messages.appendSlice(alloc, within_turn_suffix);
-    return messages;
+    return .{
+        .instructions = instructions,
+        .messages = messages,
+    };
 }
 
 fn appendEphemeralOverlayMessages(alloc: Allocator, messages: *std.ArrayList(ChatMessage), ephemeral_overlay: []const ChatMessage) !void {
@@ -237,7 +253,7 @@ fn appendEphemeralOverlayMessages(alloc: Allocator, messages: *std.ArrayList(Cha
     }
 }
 
-test "buildGatewayMessages orders transient overlay before history and current prompt" {
+test "buildProviderPrompt separates instructions from chronological messages" {
     const alloc = std.testing.allocator;
     const stable_prefix = [_]ChatMessage{
         .{ .role = .system, .content = "stable system prompt" },
@@ -255,21 +271,22 @@ test "buildGatewayMessages orders transient overlay before history and current p
         .{ .role = .assistant, .content = "within turn assistant" },
     };
 
-    var messages = try buildGatewayMessages(alloc, &stable_prefix, &overlay, &history, current, &suffix);
-    defer messages.deinit(alloc);
+    var prompt = try buildProviderPrompt(alloc, &stable_prefix, &overlay, &history, current, &suffix);
+    defer prompt.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 7), messages.items.len);
-    try std.testing.expectEqualStrings("stable system prompt", messages.items[0].content.?);
-    try std.testing.expectEqualStrings("stable project context", messages.items[1].content.?);
-    try std.testing.expectEqualStrings("volatile runtime overlay", messages.items[2].content.?);
-    try std.testing.expectEqualStrings("history user prompt", messages.items[3].content.?);
-    try std.testing.expectEqualStrings("history assistant answer", messages.items[4].content.?);
-    try std.testing.expectEqualStrings("current user prompt", messages.items[5].content.?);
-    try std.testing.expectEqualStrings("within turn assistant", messages.items[6].content.?);
-    try std.testing.expectEqual(types.ChatCachePolicy.no_cache, messages.items[2].cache_policy);
+    try std.testing.expectEqual(@as(usize, 3), prompt.instructions.items.len);
+    try std.testing.expectEqual(@as(usize, 4), prompt.messages.items.len);
+    try std.testing.expectEqualStrings("stable system prompt", prompt.instructions.items[0].content.?);
+    try std.testing.expectEqualStrings("stable project context", prompt.instructions.items[1].content.?);
+    try std.testing.expectEqualStrings("volatile runtime overlay", prompt.instructions.items[2].content.?);
+    try std.testing.expectEqualStrings("history user prompt", prompt.messages.items[0].content.?);
+    try std.testing.expectEqualStrings("history assistant answer", prompt.messages.items[1].content.?);
+    try std.testing.expectEqualStrings("current user prompt", prompt.messages.items[2].content.?);
+    try std.testing.expectEqualStrings("within turn assistant", prompt.messages.items[3].content.?);
+    try std.testing.expectEqual(types.ChatCachePolicy.no_cache, prompt.instructions.items[2].cache_policy);
 }
 
-test "buildGatewayMessages preserves one system prefix for projected session history" {
+test "buildProviderPrompt keeps compacted session context out of instructions" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -338,7 +355,7 @@ test "buildGatewayMessages preserves one system prefix for projected session his
     const overlay = [_]ChatMessage{.{ .role = .system, .content = "ephemeral overlay" }};
     const current = ChatMessage{ .role = .user, .content = "current portable prompt" };
     const suffix = [_]ChatMessage{.{ .role = .assistant, .content = "within-turn suffix" }};
-    var messages = try buildGatewayMessages(
+    var prompt = try buildProviderPrompt(
         arena,
         &stable_prefix,
         &overlay,
@@ -346,22 +363,18 @@ test "buildGatewayMessages preserves one system prefix for projected session his
         current,
         &suffix,
     );
-    defer messages.deinit(arena);
+    defer prompt.deinit(arena);
 
-    var saw_non_system = false;
     var leading_summary_count: usize = 0;
     var late_summary_count: usize = 0;
     var file_evidence_count: usize = 0;
     var interruption_count: usize = 0;
-    for (messages.items) |entry| {
-        if (entry.role == .system) {
-            try std.testing.expect(!saw_non_system);
-        } else {
-            saw_non_system = true;
-        }
+    for (prompt.instructions.items) |entry| try std.testing.expectEqual(types.ChatRole.system, entry.role);
+    for (prompt.messages.items) |entry| {
+        try std.testing.expect(entry.role != .system);
         const content = entry.content orelse continue;
         if (std.mem.find(u8, content, "LEADING_SUMMARY_ONLY") != null) {
-            try std.testing.expectEqual(types.ChatRole.system, entry.role);
+            try std.testing.expectEqual(types.ChatRole.user, entry.role);
             leading_summary_count += 1;
         }
         if (std.mem.find(u8, content, "LATE_SUMMARY_ONLY") != null) {
@@ -383,8 +396,8 @@ test "buildGatewayMessages preserves one system prefix for projected session his
     try std.testing.expectEqual(@as(usize, 1), late_summary_count);
     try std.testing.expectEqual(@as(usize, 1), file_evidence_count);
     try std.testing.expectEqual(@as(usize, 1), interruption_count);
-    try std.testing.expectEqualStrings("current portable prompt", messages.items[messages.items.len - 2].content.?);
-    try std.testing.expectEqualStrings("within-turn suffix", messages.items[messages.items.len - 1].content.?);
+    try std.testing.expectEqualStrings("current portable prompt", prompt.messages.items[prompt.messages.items.len - 2].content.?);
+    try std.testing.expectEqualStrings("within-turn suffix", prompt.messages.items[prompt.messages.items.len - 1].content.?);
 }
 
 test "provider request measurement includes serialized structure" {

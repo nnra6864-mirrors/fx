@@ -2766,50 +2766,91 @@ fn completionContentBytes(completion: types.ModelCompletion) usize {
 fn streamReplaySafe(
     stream_ctx: *const runtime_assistant_stream.StreamChunkContext,
 ) bool {
-    return stream_ctx.accepted_source().len == 0 and !stream_ctx.saw_tool_start;
+    return stream_ctx.interruption_source_or("").len == 0 and !stream_ctx.saw_tool_start;
 }
 
-const read_failure_tool_recovery_instruction =
-    \\<network_recovery>
-    \\The previous response stream ended because the network connection was interrupted.
-    \\fx did not execute the incomplete tool call from that stream. Recreate the tool call if it is still needed.
-    \\</network_recovery>
-;
+const continue_response_recovery_prompt =
+    "The previous response was interrupted. Restart that response from the beginning using the completed tool results above. Do not repeat completed tool actions.";
+const regenerate_tool_recovery_prompt =
+    "The previous response ended during an incomplete tool call. fx did not execute that call. Recreate it only if it is still needed.";
+const continue_after_confirmed_tool_recovery_prompt =
+    "Continue from the confirmed tool result above without repeating the tool.";
+const reconcile_tool_recovery_prompt =
+    "Reconcile the available tool evidence above before continuing. Do not repeat the tool unless the evidence proves it is safe.";
 
-fn appendReadFailureRecoveryContext(
+fn appendRecoveryConversationContext(
     alloc: Allocator,
-    messages: []const ChatMessage,
+    messages: *std.ArrayList(ChatMessage),
     strategy: ?model_response_recovery.Strategy,
-    partial_assistant: []const u8,
-) ![]const ChatMessage {
-    const selected = strategy orelse return messages;
-    const projected = try alloc.alloc(ChatMessage, messages.len + 1);
-    @memcpy(projected[0..messages.len], messages);
-    const instruction = switch (selected) {
-        .continue_response => try std.fmt.allocPrint(
-            alloc,
-            "<network_recovery>\nThe response stream was interrupted. Continue the same response from the exact partial source below. Do not repeat it and do not start a new answer.\n<partial_assistant>\n{s}\n</partial_assistant>\n</network_recovery>",
-            .{partial_assistant},
-        ),
-        .regenerate_tool => read_failure_tool_recovery_instruction,
-        .continue_after_confirmed_tool => "<network_recovery>\nThe response stream was interrupted after a confirmed tool result. Continue from the confirmed result without repeating the tool.\n</network_recovery>",
-        .reconcile_tool => "<network_recovery>\nThe response stream was interrupted after provider tool activity with an uncertain outcome. Reconcile the existing evidence before proposing any repeat action. Do not blindly replay the tool.\n</network_recovery>",
-        .retry_request => "<network_recovery>\nThe provider response was interrupted before any assistant output or tool activity escaped. Re-run the response for the same user request.\n</network_recovery>",
-        .pause, .stop => return messages,
+) !void {
+    const selected = strategy orelse return;
+    const prompt = switch (selected) {
+        .retry_request, .pause, .stop => return,
+        .continue_response => continue_response_recovery_prompt,
+        .regenerate_tool => regenerate_tool_recovery_prompt,
+        .continue_after_confirmed_tool => continue_after_confirmed_tool_recovery_prompt,
+        .reconcile_tool => reconcile_tool_recovery_prompt,
     };
-    projected[messages.len] = .{
-        .role = .system,
-        .content = instruction,
-    };
-    return projected;
+    try messages.append(alloc, .{
+        .role = .user,
+        .content = prompt,
+        .cache_policy = .no_cache,
+    });
 }
 
-const GatewayMessageProjection = struct {
+test "recovery conversation context is chronological and system free" {
+    const alloc = std.testing.allocator;
+
+    {
+        var messages: std.ArrayList(ChatMessage) = .empty;
+        defer messages.deinit(alloc);
+        try messages.append(alloc, .{ .role = .user, .content = "request" });
+        try appendRecoveryConversationContext(alloc, &messages, .retry_request);
+        try std.testing.expectEqual(@as(usize, 1), messages.items.len);
+    }
+
+    {
+        var messages: std.ArrayList(ChatMessage) = .empty;
+        defer messages.deinit(alloc);
+        try messages.append(alloc, .{ .role = .user, .content = "request" });
+        try appendRecoveryConversationContext(alloc, &messages, .continue_response);
+        try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+        try std.testing.expectEqual(types.ChatRole.user, messages.items[1].role);
+        try std.testing.expectEqualStrings(continue_response_recovery_prompt, messages.items[1].content.?);
+        try std.testing.expectEqual(types.ChatCachePolicy.no_cache, messages.items[1].cache_policy);
+    }
+
+    const prompted = [_]model_response_recovery.Strategy{
+        .regenerate_tool,
+        .continue_after_confirmed_tool,
+        .reconcile_tool,
+    };
+    for (prompted) |strategy| {
+        var messages: std.ArrayList(ChatMessage) = .empty;
+        defer messages.deinit(alloc);
+        try messages.append(alloc, .{ .role = .user, .content = "request" });
+        try appendRecoveryConversationContext(alloc, &messages, strategy);
+        try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+        try std.testing.expectEqual(types.ChatRole.user, messages.items[1].role);
+        try std.testing.expectEqual(types.ChatCachePolicy.no_cache, messages.items[1].cache_policy);
+    }
+
+    for ([_]model_response_recovery.Strategy{ .pause, .stop }) |strategy| {
+        var messages: std.ArrayList(ChatMessage) = .empty;
+        defer messages.deinit(alloc);
+        try messages.append(alloc, .{ .role = .user, .content = "request" });
+        try appendRecoveryConversationContext(alloc, &messages, strategy);
+        try std.testing.expectEqual(@as(usize, 1), messages.items.len);
+    }
+}
+
+const ProviderPromptProjection = struct {
+    instructions: std.ArrayList(ChatMessage),
     messages: std.ArrayList(ChatMessage),
     current_user_index: usize,
 };
 
-fn build_gateway_messages_with_response_language_control(
+fn build_provider_prompt_with_response_language_control(
     alloc: Allocator,
     stable_prefix: []const ChatMessage,
     ephemeral_overlay: []const ChatMessage,
@@ -2822,7 +2863,7 @@ fn build_gateway_messages_with_response_language_control(
     compaction_handoff: ?[]const u8,
     compaction_history_tail: []const ChatMessage,
     compacted_suffix_len: usize,
-) !GatewayMessageProjection {
+) !ProviderPromptProjection {
     const effective_overlay = if (enforce_response_language and origin == .root) blk: {
         const projected = try alloc.alloc(ChatMessage, ephemeral_overlay.len + 1);
         @memcpy(projected[0..ephemeral_overlay.len], ephemeral_overlay);
@@ -2833,7 +2874,7 @@ fn build_gateway_messages_with_response_language_control(
         };
         break :blk projected;
     } else ephemeral_overlay;
-    var messages = try buildGatewayMessagesForCompactionWindow(
+    var prompt = try buildProviderPromptForCompactionWindow(
         alloc,
         stable_prefix,
         effective_overlay,
@@ -2844,18 +2885,18 @@ fn build_gateway_messages_with_response_language_control(
         compaction_history_tail,
         compacted_suffix_len,
     );
-    errdefer messages.deinit(alloc);
+    errdefer prompt.deinit(alloc);
     if (enforce_response_language and origin == .root and correction_attempted) {
-        try messages.append(alloc, .{
+        try prompt.messages.append(alloc, .{
             .role = .user,
             .content = response_language_correction_control,
             .cache_policy = .no_cache,
         });
     }
     return .{
-        .messages = messages,
-        .current_user_index = stable_prefix.len + effective_overlay.len +
-            if (compaction_handoff == null) durable_history.len else 0,
+        .instructions = prompt.instructions,
+        .messages = prompt.messages,
+        .current_user_index = if (compaction_handoff == null) durable_history.len else 0,
     };
 }
 
@@ -4377,7 +4418,7 @@ test "vision policy keeps image route and tool visibility coherent" {
     }
 }
 
-fn buildGatewayMessagesForCompactionWindow(
+fn buildProviderPromptForCompactionWindow(
     alloc: Allocator,
     stable_prefix: []const ChatMessage,
     ephemeral_overlay: []const ChatMessage,
@@ -4387,8 +4428,8 @@ fn buildGatewayMessagesForCompactionWindow(
     handoff: ?[]const u8,
     retained_history_tail: []const ChatMessage,
     compacted_suffix_len: usize,
-) !std.ArrayList(ChatMessage) {
-    if (handoff == null) return runtime_prompt_context.buildGatewayMessages(
+) !runtime_prompt_context.ProviderPrompt {
+    if (handoff == null) return runtime_prompt_context.buildProviderPrompt(
         alloc,
         stable_prefix,
         ephemeral_overlay,
@@ -4407,7 +4448,7 @@ fn buildGatewayMessagesForCompactionWindow(
         alloc,
         within_turn_suffix[@min(compacted_suffix_len, within_turn_suffix.len)..],
     );
-    return runtime_prompt_context.buildGatewayMessages(
+    return runtime_prompt_context.buildProviderPrompt(
         alloc,
         stable_prefix,
         ephemeral_overlay,
@@ -4908,7 +4949,7 @@ fn processQueuedPromptLoop(
             overlay_arena,
             &ephemeral_overlay,
         );
-        var gateway_projection = try build_gateway_messages_with_response_language_control(
+        var provider_prompt = try build_provider_prompt_with_response_language_control(
             overlay_arena,
             stable_prefix.items,
             ephemeral_overlay.items,
@@ -4922,18 +4963,20 @@ fn processQueuedPromptLoop(
             active_compaction_history_tail,
             compacted_suffix_len,
         );
-        var gateway_messages = gateway_projection.messages;
+        var gateway_instructions = provider_prompt.instructions;
+        var gateway_messages = provider_prompt.messages;
         const initial_decision_pending = recovery_strategy == .continue_after_confirmed_tool;
-        last_gateway_message_count = gateway_messages.items.len + @intFromBool(initial_decision_pending);
-        var current_user_message_index = gateway_projection.current_user_index;
+        last_gateway_message_count = gateway_instructions.items.len + gateway_messages.items.len +
+            @intFromBool(initial_decision_pending);
+        var current_user_message_index = provider_prompt.current_user_index;
         const response_language_hold_until_completion =
             response_language_context_conflicts(response_language_expectation, stable_prefix.items) or
             response_language_context_conflicts(response_language_expectation, ephemeral_overlay.items) or
             response_language_context_conflicts(response_language_expectation, history_messages.items) or
             response_language_context_conflicts(response_language_expectation, within_turn_suffix.items);
 
-        debug_trace.logf("agent", "step start step={d} limit={d} messages={d}", .{ current_step_index, config.agent_step_limit, gateway_messages.items.len });
-        debug_trace.eventf("agent", "step_begin", step_ctx, "step_index={d} step_limit={d} gateway_messages={d}", .{ current_step_index, config.agent_step_limit, gateway_messages.items.len });
+        debug_trace.logf("agent", "step start step={d} limit={d} messages={d}", .{ current_step_index, config.agent_step_limit, gateway_instructions.items.len + gateway_messages.items.len });
+        debug_trace.eventf("agent", "step_begin", step_ctx, "step_index={d} step_limit={d} gateway_messages={d}", .{ current_step_index, config.agent_step_limit, gateway_instructions.items.len + gateway_messages.items.len });
 
         var stream_ctx = runtime_assistant_stream.StreamChunkContext{
             .hooks = deps,
@@ -4956,7 +4999,7 @@ fn processQueuedPromptLoop(
                 checkpoint.assistant_source,
                 job.recovery_source_already_presented,
             );
-            stream_ctx.beginRecoveryAttempt();
+            try stream_ctx.beginRecoveryAttempt();
             restore_recovery_source = false;
         }
 
@@ -4964,8 +5007,6 @@ fn processQueuedPromptLoop(
         var stream_result: runtime_gateway_step.StreamResult = undefined;
         var stream_result_set = false;
         var gateway_model: []const u8 = job.model;
-        var successful_request_messages: []const ChatMessage = &.{};
-        var successful_source_messages: []const ChatMessage = &.{};
         var successful_gateway_model: []const u8 = "";
         var successful_request_cost: ?runtime_prompt_context.RequestCost = null;
         var successful_vision_route: runtime_vision_contracts.VisionRoute = .native_images;
@@ -5005,7 +5046,7 @@ fn processQueuedPromptLoop(
 
         while (true) {
             if (reset_stream_for_next_attempt) {
-                stream_ctx.beginRecoveryAttempt();
+                try stream_ctx.beginRecoveryAttempt();
                 reset_stream_for_next_attempt = false;
             }
 
@@ -5020,7 +5061,7 @@ fn processQueuedPromptLoop(
                     try recoveryCheckpointAssistantSource(
                         arena,
                         stop_state,
-                        stream_ctx.accepted_source(),
+                        stream_ctx.interruption_source_or(""),
                     ),
                     gateway_model,
                     selected_fast_mode,
@@ -5057,7 +5098,7 @@ fn processQueuedPromptLoop(
                     try recoveryCheckpointAssistantSource(
                         arena,
                         stop_state,
-                        stream_ctx.accepted_source(),
+                        stream_ctx.interruption_source_or(""),
                     ),
                     gateway_model,
                     selected_fast_mode,
@@ -5096,7 +5137,7 @@ fn processQueuedPromptLoop(
                     step_ctx,
                 );
             }
-            gateway_projection = try build_gateway_messages_with_response_language_control(
+            provider_prompt = try build_provider_prompt_with_response_language_control(
                 overlay_arena,
                 stable_prefix.items,
                 ephemeral_overlay.items,
@@ -5110,9 +5151,10 @@ fn processQueuedPromptLoop(
                 active_compaction_history_tail,
                 compacted_suffix_len,
             );
-            gateway_messages = gateway_projection.messages;
-            current_user_message_index = gateway_projection.current_user_index;
-            debug_trace.eventf("agent", "before_provider_preflight", step_ctx, "model={s} messages={d}", .{ gateway_model, gateway_messages.items.len });
+            gateway_instructions = provider_prompt.instructions;
+            gateway_messages = provider_prompt.messages;
+            current_user_message_index = provider_prompt.current_user_index;
+            debug_trace.eventf("agent", "before_provider_preflight", step_ctx, "model={s} messages={d}", .{ gateway_model, gateway_instructions.items.len + gateway_messages.items.len });
             const vision_policy = visionPolicy(
                 request_capabilities.image_input_support,
                 config.provider_capabilities.vision_fallback,
@@ -5137,16 +5179,12 @@ fn processQueuedPromptLoop(
                     pending_image_ids.len,
                 },
             );
-            const recovery_source_messages = try appendReadFailureRecoveryContext(
+            try appendRecoveryConversationContext(
                 overlay_arena,
-                gateway_messages.items,
+                &gateway_messages,
                 recovery_strategy,
-                try recoveryCheckpointAssistantSource(
-                    arena,
-                    stop_state,
-                    stream_ctx.accepted_source(),
-                ),
             );
+            const recovery_source_messages = gateway_messages.items;
             const projected_request_messages = blk: {
                 if (job.authorized_image_catalog.len == 0 and job.images.len == 0) {
                     break :blk recovery_source_messages;
@@ -5205,7 +5243,7 @@ fn processQueuedPromptLoop(
                 read_tool_result_request_eligible,
                 subagent_request_messages,
             );
-            last_gateway_message_count = request_messages.len;
+            last_gateway_message_count = gateway_instructions.items.len + request_messages.len;
             const provider_opts = model_capabilities.resolveProviderOptionsForCapabilities(request_capabilities, config.effort, route_fast_mode);
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, route_fast_mode, config.effort, provider_opts);
             const tool_choice: types.ToolChoice = if (recovery_strategy == .reconcile_tool)
@@ -5237,6 +5275,7 @@ fn processQueuedPromptLoop(
             );
             const request_data = agent_stream_provider.RequestData{
                 .model = gateway_model,
+                .instructions = gateway_instructions.items,
                 .messages = request_messages,
                 .tools = .{
                     .registry = deps.tool_registry,
@@ -5470,7 +5509,7 @@ fn processQueuedPromptLoop(
                     arena,
                     job,
                     within_turn_suffix.items,
-                    stream_ctx.accepted_source(),
+                    stream_ctx.interruption_source_or(""),
                     gateway_model,
                     selected_fast_mode,
                     route_fast_mode,
@@ -5513,6 +5552,7 @@ fn processQueuedPromptLoop(
                 .session_id = lifecycle.scope.session_id,
                 .model = gateway_model,
                 .retry_count = config.gateway_retry_count,
+                .instructions = request_data.instructions,
                 .messages = request_data.messages,
                 .tools = request_data.tools,
                 .tool_choice = request_data.tool_choice,
@@ -5569,7 +5609,7 @@ fn processQueuedPromptLoop(
                         try recoveryCheckpointAssistantSource(
                             arena,
                             stop_state,
-                            stream_ctx.accepted_source(),
+                            stream_ctx.interruption_source_or(""),
                         ),
                         gateway_model,
                         selected_fast_mode,
@@ -5613,7 +5653,7 @@ fn processQueuedPromptLoop(
                         },
                         .attempts = .{ .consumed = consumed_attempts, .limit = semantic_limit },
                         .pacing = retry_pacing,
-                        .output = if (stream_ctx.accepted_source().len > 0) .partial else .none,
+                        .output = if (stream_ctx.interruption_source_or("").len > 0) .partial else .none,
                         .tool = effectiveRecoveryToolEvidence(
                             preserved_tool_evidence,
                             null,
@@ -5666,7 +5706,7 @@ fn processQueuedPromptLoop(
                     try recoveryCheckpointAssistantSource(
                         arena,
                         stop_state,
-                        stream_ctx.accepted_source(),
+                        stream_ctx.interruption_source_or(""),
                     ),
                     gateway_model,
                     selected_fast_mode,
@@ -5708,7 +5748,7 @@ fn processQueuedPromptLoop(
                         try recoveryCheckpointAssistantSource(
                             arena,
                             stop_state,
-                            stream_ctx.accepted_source(),
+                            stream_ctx.interruption_source_or(""),
                         ),
                         gateway_model,
                         selected_fast_mode,
@@ -5822,7 +5862,7 @@ fn processQueuedPromptLoop(
                 }
                 if (network_failure != null) {
                     const exhausted_retryable =
-                        stream_ctx.accepted_source().len == 0 and
+                        stream_ctx.interruption_source_or("").len == 0 and
                         !stream_ctx.saw_provider_tool_start and
                         consumed_attempts >= semantic_limit;
                     if (replay_safe or exhausted_retryable) {
@@ -5853,7 +5893,7 @@ fn processQueuedPromptLoop(
                     pending_auto_retry_status = null;
                 }
                 try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
-                const failed_assistant_source = stream_ctx.accepted_source();
+                const failed_assistant_source = stream_ctx.interruption_source_or("");
                 if (stop_state.retained_candidate != null) {
                     try copyLatestStopPartial(
                         arena,
@@ -5899,7 +5939,7 @@ fn processQueuedPromptLoop(
             const auth_replay = auth_transition.decideAuthReplay(.{
                 .authentication_rejected = first_failure != null and first_failure.?.kind == .unauthorized,
                 .refreshable = if (job.credential_source) |source| credentials.sourceRefreshable(source) else false,
-                .delivery_safe = stream_ctx.accepted_source().len == 0 and
+                .delivery_safe = stream_ctx.interruption_source_or("").len == 0 and
                     !stream_ctx.saw_tool_start and
                     streamCompletion(stream_result).tool_calls.len == 0,
                 .already_replayed = auth_retry_used,
@@ -5975,7 +6015,7 @@ fn processQueuedPromptLoop(
                     try recoveryCheckpointAssistantSource(
                         arena,
                         stop_state,
-                        stream_ctx.accepted_source(),
+                        stream_ctx.interruption_source_or(""),
                     ),
                     gateway_model,
                     selected_fast_mode,
@@ -6036,7 +6076,7 @@ fn processQueuedPromptLoop(
                     try recoveryCheckpointAssistantSource(
                         arena,
                         stop_state,
-                        stream_ctx.accepted_source_or(response_completion.content orelse ""),
+                        stream_ctx.interruption_source_or(response_completion.content orelse ""),
                     ),
                     gateway_model,
                     selected_fast_mode,
@@ -6114,7 +6154,7 @@ fn processQueuedPromptLoop(
                     .delivery = .possibly_sent,
                     .attempts = .{ .consumed = semantic_attempt + 1, .limit = semantic_limit },
                     .pacing = retry_pacing,
-                    .output = if (stream_ctx.accepted_source().len > 0) .partial else .none,
+                    .output = if (stream_ctx.interruption_source_or("").len > 0) .partial else .none,
                     .tool = effectiveRecoveryToolEvidence(
                         preserved_tool_evidence,
                         response_completion,
@@ -6132,7 +6172,7 @@ fn processQueuedPromptLoop(
                         try recoveryCheckpointAssistantSource(
                             arena,
                             stop_state,
-                            stream_ctx.accepted_source(),
+                            stream_ctx.interruption_source_or(""),
                         ),
                         gateway_model,
                         selected_fast_mode,
@@ -6172,7 +6212,7 @@ fn processQueuedPromptLoop(
                             try recoveryCheckpointAssistantSource(
                                 arena,
                                 stop_state,
-                                stream_ctx.accepted_source(),
+                                stream_ctx.interruption_source_or(""),
                             ),
                             gateway_model,
                             selected_fast_mode,
@@ -6270,7 +6310,7 @@ fn processQueuedPromptLoop(
                 content
             else
                 "";
-            const accepted_partial_assistant = stream_ctx.accepted_source_or(
+            const accepted_partial_assistant = stream_ctx.interruption_source_or(
                 attempt_completion.content orelse "",
             );
 
@@ -6655,8 +6695,6 @@ fn processQueuedPromptLoop(
                 return error.ModelError;
             }
 
-            successful_request_messages = request_messages;
-            successful_source_messages = recovery_source_messages;
             successful_gateway_model = gateway_model;
             successful_request_cost = request_cost_for_attempt;
             successful_vision_route = vision_route;
@@ -6684,11 +6722,12 @@ fn processQueuedPromptLoop(
                 };
             }
         }
-        const filtered_provider_calls = try filterMaterializedProviderCalls(
+        const tool_admission = types.authoritativeToolAdmission(completion);
+        const filtered_provider_calls: FilteredProviderCalls = if (tool_admission == .admitted) try filterMaterializedProviderCalls(
             arena,
             within_turn_suffix.items,
             completion.tool_calls,
-        );
+        ) else .{ .calls = completion.tool_calls, .removed = 0 };
         completion.tool_calls = filtered_provider_calls.calls;
         if (filtered_provider_calls.removed > 0) {
             debug_trace.eventf(
@@ -6707,6 +6746,7 @@ fn processQueuedPromptLoop(
                     " \t\r\n",
                 ).len > 0;
                 if (!has_novel_content) {
+                    try stream_ctx.start_response();
                     if (successful_recovery_strategy != null) {
                         try pushAutoRecoveredStatus(deps, semantic_attempt, semantic_limit);
                     }
@@ -6888,8 +6928,7 @@ fn processQueuedPromptLoop(
         agent.observeUsage(completion.usage);
 
         if (disposition == .completed and completion.tool_calls.len > 0) {
-            const admission = types.authoritativeToolAdmission(completion);
-            switch (admission) {
+            switch (tool_admission) {
                 .admitted => reportProviderExecutedUsage(deps, completion.tool_calls),
                 .reject_duplicate_identity => {
                     try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, turn_id, completion.tool_calls, advertised_dynamic_tool_names);
@@ -6928,6 +6967,7 @@ fn processQueuedPromptLoop(
                 },
             }
         }
+        if (disposition == .completed) try stream_ctx.start_response();
         var step_has_visible_tool_calls = false;
         for (completion.tool_calls) |call| {
             if (runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, call) == .ask) continue;
@@ -9584,7 +9624,11 @@ fn processQueuedPromptLoop(
             };
             replay_handed_off = true;
             if (execution.system_notice) |notice| {
-                try within_turn_suffix.append(arena, .{ .role = .system, .content = notice });
+                try within_turn_suffix.append(arena, .{
+                    .role = .user,
+                    .content = notice,
+                    .cache_policy = .no_cache,
+                });
             }
             if (execution.interactive_notice) |notice| {
                 if (deps.push_interactive_notice) |push_notice| {

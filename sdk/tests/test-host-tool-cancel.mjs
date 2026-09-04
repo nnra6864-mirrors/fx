@@ -19,6 +19,10 @@ const server = createServer((request, response) => {
     }
     modelRequests += 1;
     response.writeHead(200, { "content-type": "text/event-stream" });
+    if (modelRequests > 1) {
+      response.end('data: {"type":"text-delta","delta":"recovered"}\n\ndata: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"}}\n\ndata: [DONE]\n\n');
+      return;
+    }
     response.end('data: {"type":"tool-call","toolCallId":"cancel_1","toolName":"wait","input":{}}\n\ndata: {"type":"finish","finishReason":{"unified":"tool-calls","raw":"tool-calls"}}\n\ndata: [DONE]\n\n');
   });
 });
@@ -66,6 +70,12 @@ try {
   assert.equal(result.stopReason, "cancelled");
   assert.equal(toolSignalAborted, true);
   assert.equal(modelRequests, 1);
+  const followup = agent.prompt("continue after cancellation");
+  let text = "";
+  for await (const event of followup) if (event.type === "text_delta") text += event.delta;
+  assert.equal((await followup.result).stopReason, "end_turn");
+  assert.equal(text, "recovered");
+  assert.equal(modelRequests, 2);
   await agent.close();
   console.log(`${backend} host tool cancellation passed`);
 } finally {

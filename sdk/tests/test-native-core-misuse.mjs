@@ -36,6 +36,7 @@ if (ambientTraceChild) {
 
 for (const [name, args] of [
   ["createCore", []],
+  ["takeCoreReadyFd", []],
   ["writeCore", []],
   ["writeCore", [{}]],
   ["closeCore", []],

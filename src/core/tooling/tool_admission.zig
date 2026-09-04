@@ -4051,6 +4051,7 @@ test "missing contextual review authority maps to unavailable without reviewer t
             _: []const u8,
             _: []const u8,
             _: []const types.ChatMessage,
+            _: []const types.ChatMessage,
             _: []const u8,
             _: std.Io.Clock.Timestamp,
             _: *std.atomic.Value(bool),

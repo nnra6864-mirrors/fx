@@ -729,8 +729,10 @@ fn discardGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
 fn pushLiveText(raw: *anyopaque, emission: agent_runtime.TextEmission) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
     switch (emission) {
+        .assistant_started => {},
         .assistant_source => {},
         .assistant_rendered => |text| context.turn.appendLiveText(text),
+        .assistant_restarted => |text| context.turn.appendLiveText(text),
         .operational => |text| context.turn.appendLiveText(text),
     }
 }

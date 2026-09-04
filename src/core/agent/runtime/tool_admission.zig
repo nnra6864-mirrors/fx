@@ -403,6 +403,34 @@ test "terminal validation retry state retains independent batch corrections" {
     try std.testing.expect(state.finishBatch());
 }
 
+test "shell request corrections stop after the complete repeated batch" {
+    const alloc = std.testing.allocator;
+    const shell = @import("../../../tools/shell/shell.zig");
+    var state: TerminalValidationRetryState = .{};
+    defer state.deinit(alloc);
+    const inputs = [_][]const u8{
+        "{\"command\":\"true\",\"yield_time_ms\":\"1000\"}",
+        "{\"yield_time_ms\":\"1000\",\"command\":\"true\"}",
+    };
+    for (inputs, 0..) |args, index| {
+        const call: ToolCall = .{ .id = "invalid", .name = "shell", .arguments_json = args };
+        state.beginBatch();
+        const decoded = try shell.decode(.{ .allocator = alloc }, args);
+        switch (decoded) {
+            .failure => |failure| {
+                defer alloc.free(failure);
+                try state.observe(alloc, call, failure);
+            },
+            .input => |input| {
+                input.deinit(alloc);
+                return error.TestUnexpectedResult;
+            },
+        }
+        try state.observe(alloc, call, "ordinary successful neighboring result");
+        try std.testing.expectEqual(index == 1, state.finishBatch());
+    }
+}
+
 test "shell execution failures retain independent batch identities" {
     const alloc = std.testing.allocator;
     const first: ToolCall = .{

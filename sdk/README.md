@@ -67,6 +67,9 @@ agent:
 const restored = await createFxAgent({ apiKey, model, checkpoint });
 ```
 
+An already-aborted prompt signal returns `cancelled` without a model request
+or a history change. The next prompt can run normally.
+
 The checkpoint contains conversation history and usage only. The host owns
 durable storage and must resupply models, credentials, instructions, tools,
 MCP clients, and skill records.

@@ -341,6 +341,8 @@ function yieldToHostTask() {
 }
 
 function createRuntime(options) {
+  // Creating this inside a Wasm call would retain that instance through the error stack.
+  const abortReason = new DOMException("This operation was aborted", "AbortError");
   const stdin = new ByteQueue();
   const streams = new Map();
   const workspaceExecs = new Set();
@@ -857,7 +859,7 @@ function createRuntime(options) {
   }
 
   function abortHostEffects() {
-    streams.forEach((state) => state.controller.abort());
+    streams.forEach((state) => state.controller.abort(abortReason));
     workspaceExecs.forEach((state) => state.abort(-3));
   }
 
@@ -915,7 +917,7 @@ function createRuntime(options) {
     fx_http_stream_open: streamOpen,
     fx_http_stream_status: new WebAssembly.Suspending(streamStatus),
     fx_http_stream_next: new WebAssembly.Suspending(streamNext),
-    fx_http_stream_close(handle) { const state = streams.get(handle); state?.controller.abort(); streams.delete(handle); },
+    fx_http_stream_close(handle) { const state = streams.get(handle); state?.controller.abort(abortReason); streams.delete(handle); },
     fx_http_request: new WebAssembly.Suspending(httpRequest),
     fx_host_tool_call: new WebAssembly.Suspending(hostToolCall),
     fx_open_url: new WebAssembly.Suspending(openUrl),
@@ -978,8 +980,12 @@ async function instantiate(options) {
   runtime.setInstance(instance);
   const start = WebAssembly.promising(instance.exports._start);
   start().then(
-    () => runtime.markExited(0),
+    () => {
+      runtime.setInstance(null);
+      runtime.markExited(0);
+    },
     (error) => {
+      runtime.setInstance(null);
       if (!String(error).includes("proc_exit")) console.error(error);
       runtime.markExited(runtime.aborted ? 130 : 1);
     },
@@ -1176,6 +1182,10 @@ export async function createFxAgent(options = {}) {
       const attempt = activeTurn ? ++activeTurn.transportAttempts : attemptIndex + 1;
       emit("transport.start", { attempt, method, endpoint, model: options.model });
       try {
+        if (activeTurn?.cancelled) {
+          runtime.abortHostEffects();
+          throw new DOMException("Aborted", "AbortError");
+        }
         if (!hostFetch) throw new TypeError("fetch is unavailable");
         const response = await hostFetch(input, init);
         const headers = response.headers;
@@ -1406,6 +1416,7 @@ export async function createFxAgent(options = {}) {
       push(update) { const waiter = waiters.shift(); if (waiter) waiter({ value: update, done: false }); else queue.push(update); },
       toolControllers,
       transportAttempts: 0,
+      get cancelled() { return cancelled; },
       cancel() {
         if (finished || cancelled) return;
         cancelled = true;
@@ -1415,6 +1426,11 @@ export async function createFxAgent(options = {}) {
       },
       [Symbol.asyncIterator]() { return { next() { if (queue.length) return Promise.resolve({ value: queue.shift(), done: false }); if (finished) return Promise.resolve({ done: true }); return new Promise((resolve) => waiters.push(resolve)); } }; },
     };
+    if (signal?.aborted) {
+      finished = true;
+      turn.result = Promise.resolve({ stopReason: "cancelled" });
+      return turn;
+    }
     activeTurn = turn;
     const abort = () => turn.cancel();
     signal?.addEventListener("abort", abort, { once: true });

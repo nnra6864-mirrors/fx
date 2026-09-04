@@ -49,9 +49,15 @@ fx
 
 `fx login codex` and `fx login grok` select that provider and a model from its authenticated catalog. Inside fx, run `/provider` (alias `/setup`) to move between Gateway, Codex, and Grok: Enter on a subscription provider switches to it or starts its sign-in, and `vercel` opens further columns for the sign-in method, the API key to use, and the Vercel team. `/model` lists the active provider's fetched models. Subscription model IDs are the raw IDs returned by each authenticated catalog. Use `/logout codex` or `/logout grok` to remove that subscription session without affecting other providers; choosing the provider again from `/provider` starts sign-in.
 
+If a saved credential cannot be checked, `/login`, `/provider`, and `/setup` still open and identify the unavailable source. Other credentials remain usable. Fix the saved credential and reopen `/provider` to retry. Storage or connection failures do not start another sign-in, and browser authorization reports success only after the new credential is saved.
+
+If credential storage fails when you submit a prompt, fx keeps the prompt and the selected account. Repair the saved credential, then press Enter to retry. A sign-in that cannot save its credential reports a storage failure. Resumed sessions restore their provider's credential and model catalog before the first prompt.
+
 The OpenAI Codex route uses ChatGPT subscription access directly and never sends its OAuth token to Vercel AI Gateway. The session is stored privately at `~/.fx/chatgpt-auth.json` and refreshed when needed. On supported Codex models, `/fast` requests OpenAI's priority service tier and consumes ChatGPT credits at the higher Fast mode rate.
 
 The Grok route uses subscription access directly at xAI and never sends its OAuth token to Vercel AI Gateway or OpenAI. Its session is stored privately at `~/.fx/grok-auth.json`, refreshed when needed, and used only with the authenticated xAI catalog and Responses API.
+
+Codex and Grok discover current stable client versions from upstream release metadata without requiring either CLI to be installed. fx caches release metadata for one minute. Opening `/model` or requesting ACP model options refreshes an expired subscription catalog. If a release lookup temporarily fails, fx uses the last successfully fetched version.
 
 To use an AI Gateway API key instead:
 
@@ -68,7 +74,7 @@ cd your_project
 fx
 ```
 
-The current directory becomes the primary workspace. Enter a prompt, or run `/help` to browse interactive commands. While fx is working, Enter steers the active turn at its next safe model boundary. If a tool is running, fx waits for it to finish; press Escape to interrupt the active work and apply the update as soon as the turn settles.
+The current directory becomes the primary workspace. Enter a prompt, or run `/help` to browse interactive commands. While fx is working, Enter steers the active turn at its next safe model boundary. The pending update shows its first two lines, with an ellipsis when more text is hidden. If a tool is running, fx waits for it to finish; press Escape to interrupt the active work and apply the update as soon as the turn settles.
 
 Tool calls are expanded by default. Enable `Collapse tool calls` in `/settings`, or set `"collapse_tool_calls": true` in `~/.fx/settings.json`, to show one summary per tool-call group in the main transcript. Individual calls remain available in the full transcript with Ctrl+O.
 
@@ -103,11 +109,13 @@ Use `fx ask` for a single request:
 fx ask "explain the changes in this repository"
 ```
 
-With `--json`, `output` contains accumulated assistant Markdown across the request, while `final_output` contains only a completed final assistant response and is `""` for interrupted, failed, background, or otherwise absent final responses.
+With `--json`, `output` contains accumulated assistant Markdown across the request. Recovery replaces failed preview text rather than joining separate responses. If recovery pauses before a replacement is accepted, `output` keeps the latest preview. `final_output` contains only a completed final assistant response and is `""` for interrupted, failed, background, or otherwise absent final responses.
 
 Foreground terminal commands run with an explicit finite deadline. fx uses durable terminal sessions for services, watchers, GUI applications, and other long-lived work, and keeps captured foreground output available through an opaque bounded-read handle for the active session or `--no-save` process.
 
 Explicit exit with `/quit` or confirmed Ctrl+C requests shutdown of this application's terminal jobs, including managed-child jobs, while preserving unrelated sessions. A terminal disconnect or upgrade handoff preserves durable jobs. Saved conversation history remains available to resume.
+
+Invalid Shell requests return the specific argument problems before any command runs. When the intended repair is unambiguous, the error includes a `retry_with` request for the agent to submit through normal validation and permissions. Repeated equivalent corrections stop the tool loop.
 
 fx starts in `auto` permission mode. Routine understood development actions run directly. Each unresolved action receives one narrow review of the exact pending action for concrete security danger. Prepared file mutations and static tools are reviewed without task text; reviewed commands, dynamic tools, and delegated actions also receive bounded trusted root-request context. A clear result authorizes only that action. A caution or unavailable review holds the action and returns advice to the agent without opening a permission prompt or ending the turn. See [Permissions](https://fx.sh/docs/configure-fx/permissions) for other modes and persistent rules.
 

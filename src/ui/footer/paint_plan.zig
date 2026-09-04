@@ -589,13 +589,12 @@ fn pushSteeringRows(
     var oldest_row_limit: u16 = 0;
     while (visible_start > 0 and remaining_rows > 0) {
         const candidate = visible_start - 1;
-        const candidate_rows = if (ctx.steering_waits_for_tool)
-            render_input.steeringMessageRows(
-                ctx.steering_messages[candidate],
-                width,
-            )
-        else
-            1;
+        const candidate_rows = render_input.steering_message_layout(
+            ctx.steering_messages[candidate],
+            width,
+            ctx.steering_waits_for_tool,
+            render_input.max_steering_message_rows,
+        ).row_count;
         visible_start = candidate;
         oldest_row_limit = @min(candidate_rows, remaining_rows);
         if (candidate_rows >= remaining_rows) break;
@@ -605,41 +604,26 @@ fn pushSteeringRows(
     var painted: u16 = 0;
     for (ctx.steering_messages[visible_start..], visible_start..) |message, index| {
         if (painted >= steering_row_budget) break;
-        if (ctx.steering_waits_for_tool) {
-            const row_limit = if (index == visible_start)
-                oldest_row_limit
-            else
-                render_input.max_steering_message_rows;
-            var rows = try input_presentation.composeSteeringMessageRows(
-                alloc,
-                message,
-                width,
-                row_limit,
-            );
-            defer rows.deinit(alloc);
-            for (rows.rows.items) |*row| {
-                if (painted >= steering_row_budget) break;
-                try pushFooterBandRow(
-                    alloc,
-                    frame,
-                    plan,
-                    plan.footer.banner +| painted,
-                    row,
-                );
-                painted +|= 1;
-            }
-        } else {
-            var row = try input_presentation.composeImmediateSteeringMessageRow(
-                alloc,
-                message,
-                width,
-            );
+        const row_limit = if (index == visible_start)
+            oldest_row_limit
+        else
+            render_input.max_steering_message_rows;
+        var rows = try input_presentation.composeSteeringMessageRows(
+            alloc,
+            message,
+            width,
+            row_limit,
+            ctx.steering_waits_for_tool,
+        );
+        defer rows.deinit(alloc);
+        for (rows.rows.items) |*row| {
+            if (painted >= steering_row_budget) break;
             try pushFooterBandRow(
                 alloc,
                 frame,
                 plan,
                 plan.footer.banner +| painted,
-                &row,
+                row,
             );
             painted +|= 1;
         }
@@ -1449,55 +1433,57 @@ test "footer paints an inline completion suffix without moving the composer curs
     );
 }
 
-test "steering banner wraps one message onto dotted rails above a blank composer gap" {
-    const alloc = std.testing.allocator;
+test "steering banner keeps two clean lines and a composer gap in both delivery modes" {
+    for ([_]bool{ false, true }) |waiting| {
+        const alloc = std.testing.allocator;
 
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
+        var input = InputRuntime{};
+        defer input.deinit(alloc);
 
-    var shell = TranscriptRuntime{
-        .layout = .{
-            .rows = 12,
-            .cols = 48,
-            .content_bottom = 6,
-            .divider_top_row = 7,
-            .input_row = 8,
-            .divider_bottom_row = 9,
-            .hint_row = 10,
-        },
-        .owned_top_row = 1,
-        .viewport_top_row = 1,
-        .cursor_row = 4,
-        .cursor_col = 1,
-    };
-    defer shell.deinit(alloc);
+        var shell = TranscriptRuntime{
+            .layout = .{
+                .rows = 12,
+                .cols = 48,
+                .content_bottom = 6,
+                .divider_top_row = 7,
+                .input_row = 8,
+                .divider_bottom_row = 9,
+                .hint_row = 10,
+            },
+            .owned_top_row = 1,
+            .viewport_top_row = 1,
+            .cursor_row = 4,
+            .cursor_col = 1,
+        };
+        defer shell.deinit(alloc);
 
-    const messages = [_][]const u8{"FOURTH_BEGIN change the implementation direction while keeping this distinguishing FOURTH_END"};
-    var ctx = testContext(&input);
-    ctx.steering_messages = &messages;
-    ctx.steering_waits_for_tool = true;
-    const planner_input: FooterPlannerInput = .{
-        .active_label = null,
-        .ctx = ctx,
-        .place_mid_line_active = false,
-        .input_extra = 0,
-        .input_visible = true,
-        .composer_top_chrome_rows = composerTopChromeRows(),
-        .picker_rows = 0,
-        .footer_extra_rows = 3,
-        .banner_active = true,
-        .banner_rows = 3,
-    };
+        const messages = [_][]const u8{"FIRST_LINE\nSECOND_LINE\nHIDDEN_END"};
+        var ctx = testContext(&input);
+        ctx.steering_messages = &messages;
+        ctx.steering_waits_for_tool = waiting;
+        const planner_input: FooterPlannerInput = .{
+            .active_label = null,
+            .ctx = ctx,
+            .place_mid_line_active = false,
+            .input_extra = 0,
+            .input_visible = true,
+            .composer_top_chrome_rows = composerTopChromeRows(),
+            .picker_rows = 0,
+            .footer_extra_rows = 3,
+            .banner_active = true,
+            .banner_rows = 3,
+        };
 
-    const frame_plan = planFooterPaint(&shell, planner_input);
-    var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
-    defer frame.deinit(alloc);
+        const frame_plan = planFooterPaint(&shell, planner_input);
+        var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
+        defer frame.deinit(alloc);
 
-    const banner = frame_plan.paint.footer.banner;
-    try expectFrameRowContains(&frame, banner, shell.layout.cols, "┋ FOURTH_BEGIN");
-    try expectFrameRowContains(&frame, banner + 1, shell.layout.cols, "FOURTH_END");
-    try expectFrameRowTextTrimmed(&frame, banner + 2, shell.layout.cols, "");
-    try expectFrameCellForeground(&frame, banner, shell.layout.cols, 1, .{ .indexed = 245 });
+        const banner = frame_plan.paint.footer.banner;
+        try expectFrameRowContains(&frame, banner, shell.layout.cols, if (waiting) "┋ FIRST_LINE" else "FIRST_LINE");
+        try expectFrameRowContains(&frame, banner + 1, shell.layout.cols, "SECOND_LINE…");
+        try expectFrameRowTextTrimmed(&frame, banner + 2, shell.layout.cols, "");
+        try expectFrameCellForeground(&frame, banner, shell.layout.cols, 1, .{ .indexed = if (waiting) 245 else 255 });
+    }
 }
 
 test "current composer renders a white connected rail across its rows" {

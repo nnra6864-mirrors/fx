@@ -2336,7 +2336,7 @@ pub const SessionRuntime = struct {
         messages: *std.ArrayList(message.Message),
         history: []const HistoryTurn,
     ) !void {
-        _ = try appendHistoryMessagesImpl(alloc, messages, history, true);
+        try appendHistoryMessagesImpl(alloc, messages, history);
     }
 
     pub fn appendHistoryChatMessages(
@@ -2344,7 +2344,7 @@ pub const SessionRuntime = struct {
         messages: *std.ArrayList(core_types.ChatMessage),
         history: []const HistoryTurn,
     ) !void {
-        _ = try appendHistoryChatMessagesImpl(alloc, messages, history, true, .closed);
+        try appendHistoryChatMessagesImpl(alloc, messages, history, .closed);
     }
 
     pub fn setConversationLanguageFromUserMessage(self: *SessionRuntime, text: []const u8) void {
@@ -2724,7 +2724,7 @@ pub fn appendHistoryMessages(
     messages: *std.ArrayList(message.Message),
     history: []const HistoryTurn,
 ) !void {
-    _ = try appendHistoryMessagesImpl(alloc, messages, history, true);
+    try appendHistoryMessagesImpl(alloc, messages, history);
 }
 
 pub fn appendHistoryChatMessages(
@@ -2732,7 +2732,7 @@ pub fn appendHistoryChatMessages(
     messages: *std.ArrayList(core_types.ChatMessage),
     history: []const HistoryTurn,
 ) !void {
-    _ = try appendHistoryChatMessagesImpl(alloc, messages, history, true, .closed);
+    try appendHistoryChatMessagesImpl(alloc, messages, history, .closed);
 }
 
 /// Projects complete raw canonical turns for semantic compaction. Prior
@@ -2745,11 +2745,10 @@ pub fn appendCompactionHistoryChatMessages(
 ) !void {
     for (history, 0..) |turn, index| {
         if (turn == .compacted_summary) continue;
-        _ = try appendHistoryChatMessagesImpl(
+        try appendHistoryChatMessagesImpl(
             alloc,
             messages,
             history[index .. index + 1],
-            false,
             .closed,
         );
     }
@@ -2832,11 +2831,10 @@ fn appendActiveContextHistoryChatMessagesWithTrailingProjection(
         return error.InvalidContextHistoryStart;
     }
     const retained_count = raw_before - checkpoint.removed_turn_count;
-    _ = try appendHistoryChatMessagesImpl(
+    try appendHistoryChatMessagesImpl(
         alloc,
         messages,
         history[context_history_start .. context_history_start + 1],
-        true,
         .closed,
     );
     if (retained_count > 0) {
@@ -2849,21 +2847,19 @@ fn appendActiveContextHistoryChatMessagesWithTrailingProjection(
         if (remaining != 0) return error.InvalidContextHistoryStart;
         for (history[retained_start..context_history_start], retained_start..) |turn, index| {
             if (turn == .compacted_summary) continue;
-            _ = try appendHistoryChatMessagesImpl(
+            try appendHistoryChatMessagesImpl(
                 alloc,
                 messages,
                 history[index .. index + 1],
-                false,
                 .closed,
             );
         }
     }
     if (context_history_start + 1 < history.len) {
-        _ = try appendHistoryChatMessagesImpl(
+        try appendHistoryChatMessagesImpl(
             alloc,
             messages,
             history[context_history_start + 1 ..],
-            false,
             interrupted_projection,
         );
     }
@@ -2891,11 +2887,10 @@ pub fn retainedHistoryTurnCountForMessageTail(
         if (history[index] == .compacted_summary) continue;
         var projected: std.ArrayList(core_types.ChatMessage) = .empty;
         defer projected.deinit(alloc);
-        _ = try appendHistoryChatMessagesImpl(
+        try appendHistoryChatMessagesImpl(
             alloc,
             &projected,
             history[index .. index + 1],
-            false,
             .closed,
         );
         if (projected.items.len == 0) continue;
@@ -3113,22 +3108,13 @@ pub fn appendHistoryMessagesBudgeted(
     errdefer if (owns_trimmed_context) alloc.free(trimmed_context);
     try messages.append(
         alloc,
-        message.Message.systemOwned(trimmed_context),
+        message.Message.userOwned(trimmed_context),
     );
     owns_trimmed_context = false;
 
-    var in_leading_summary_prefix = true;
-    for (history, 0..) |turn, idx| {
-        if (!keep[idx]) {
-            in_leading_summary_prefix = continuesLeadingSummaryPrefix(in_leading_summary_prefix, turn);
-            continue;
-        }
-        in_leading_summary_prefix = try appendHistoryMessagesImpl(
-            alloc,
-            messages,
-            history[idx .. idx + 1],
-            in_leading_summary_prefix,
-        );
+    for (history, 0..) |_, idx| {
+        if (!keep[idx]) continue;
+        try appendHistoryMessagesImpl(alloc, messages, history[idx .. idx + 1]);
     }
 }
 
@@ -3188,19 +3174,14 @@ fn appendHistoryChatMessagesBudgetedImpl(
 
     const trimmed_context = try formatBudgetTrimmedHistoryContext(alloc, history, keep);
     errdefer alloc.free(trimmed_context);
-    try messages.append(alloc, .{ .role = .system, .content = trimmed_context });
+    try messages.append(alloc, .{ .role = .user, .content = trimmed_context });
 
-    var in_leading_summary_prefix = true;
-    for (history, 0..) |turn, idx| {
-        if (!keep[idx]) {
-            in_leading_summary_prefix = continuesLeadingSummaryPrefix(in_leading_summary_prefix, turn);
-            continue;
-        }
-        in_leading_summary_prefix = try appendHistoryChatMessagesImpl(
+    for (history, 0..) |_, idx| {
+        if (!keep[idx]) continue;
+        try appendHistoryChatMessagesImpl(
             alloc,
             messages,
             history[idx .. idx + 1],
-            in_leading_summary_prefix,
             if (idx + 1 == history.len)
                 trailing_interrupted_projection
             else
@@ -3216,31 +3197,24 @@ fn appendHistoryChatMessagesWithTrailingProjection(
     trailing_interrupted_projection: InterruptedChatProjection,
 ) !void {
     if (history.len == 0 or trailing_interrupted_projection == .closed) {
-        _ = try appendHistoryChatMessagesImpl(alloc, messages, history, true, .closed);
+        try appendHistoryChatMessagesImpl(alloc, messages, history, .closed);
         return;
     }
 
-    var in_leading_summary_prefix = true;
     if (history.len > 1) {
-        in_leading_summary_prefix = try appendHistoryChatMessagesImpl(
+        try appendHistoryChatMessagesImpl(
             alloc,
             messages,
             history[0 .. history.len - 1],
-            true,
             .closed,
         );
     }
-    _ = try appendHistoryChatMessagesImpl(
+    try appendHistoryChatMessagesImpl(
         alloc,
         messages,
         history[history.len - 1 ..],
-        in_leading_summary_prefix,
         trailing_interrupted_projection,
     );
-}
-
-fn continuesLeadingSummaryPrefix(in_leading_summary_prefix: bool, turn: HistoryTurn) bool {
-    return in_leading_summary_prefix and turn == .compacted_summary;
 }
 
 fn selectBudgetedHistoryTurns(
@@ -3278,24 +3252,13 @@ fn appendHistoryMessagesImpl(
     alloc: Allocator,
     messages: *std.ArrayList(message.Message),
     history: []const HistoryTurn,
-    starts_in_leading_summary_prefix: bool,
-) !bool {
-    var in_leading_summary_prefix = starts_in_leading_summary_prefix;
+) !void {
     for (history) |turn| {
-        in_leading_summary_prefix = continuesLeadingSummaryPrefix(in_leading_summary_prefix, turn);
         switch (turn) {
             .compacted_summary => |entry| {
-                const summary_is_system = in_leading_summary_prefix and
-                    !isCurrentCompactionCheckpoint(turn);
                 const text = try formatCompactedContinuationMessage(alloc, entry.summary);
                 errdefer alloc.free(text);
-                try messages.append(
-                    alloc,
-                    if (summary_is_system)
-                        message.Message.systemOwned(text)
-                    else
-                        message.Message.userOwned(text),
-                );
+                try messages.append(alloc, message.Message.userOwned(text));
             },
             .assistant => |entry| {
                 try messages.append(alloc, .{
@@ -3364,7 +3327,6 @@ fn appendHistoryMessagesImpl(
             },
         }
     }
-    return in_leading_summary_prefix;
 }
 
 fn appendExecutionMemoryMessages(
@@ -3508,20 +3470,15 @@ fn appendHistoryChatMessagesImpl(
     alloc: Allocator,
     messages: *std.ArrayList(core_types.ChatMessage),
     history: []const HistoryTurn,
-    starts_in_leading_summary_prefix: bool,
     interrupted_projection: InterruptedChatProjection,
-) !bool {
-    var in_leading_summary_prefix = starts_in_leading_summary_prefix;
+) !void {
     for (history) |turn| {
-        in_leading_summary_prefix = continuesLeadingSummaryPrefix(in_leading_summary_prefix, turn);
         switch (turn) {
             .compacted_summary => |entry| {
-                const summary_is_system = in_leading_summary_prefix and
-                    !isCurrentCompactionCheckpoint(turn);
                 const text = try formatCompactedContinuationMessage(alloc, entry.summary);
                 errdefer alloc.free(text);
                 try messages.append(alloc, .{
-                    .role = if (summary_is_system) .system else .user,
+                    .role = .user,
                     .content = text,
                 });
             },
@@ -3565,7 +3522,6 @@ fn appendHistoryChatMessagesImpl(
             },
         }
     }
-    return in_leading_summary_prefix;
 }
 /// Infers a conversation language tag from text using core's script-counting heuristic.
 pub fn inferConversationLanguage(text: []const u8, fallback: ConversationLanguage) ConversationLanguage {
@@ -4344,7 +4300,7 @@ test "history projection keeps system role only for leading summaries" {
         try std.testing.expectEqualStrings(@tagName(projected.role), @tagName(chat.role));
         try std.testing.expectEqualStrings(projected.content.?.asText(), chat.content.?);
     }
-    try std.testing.expectEqual(.system, messages.items[0].role);
+    try std.testing.expectEqual(.user, messages.items[0].role);
     try std.testing.expectEqual(.user, messages.items[3].role);
     try std.testing.expect(std.mem.find(u8, messages.items[3].content.?.asText(), "nonleading summary marker") != null);
     try std.testing.expectEqual(.user, messages.items[6].role);
@@ -4384,7 +4340,7 @@ test "history projection keeps system role only for leading summaries" {
             saw_interruption_marker = true;
         }
     }
-    try std.testing.expectEqual(.system, budgeted_messages.items[0].role);
+    try std.testing.expectEqual(.user, budgeted_messages.items[0].role);
     try std.testing.expect(saw_nonleading_summary);
     try std.testing.expect(saw_interruption_marker);
 }
@@ -4774,7 +4730,7 @@ test "budgeted resume projection preserves latest turn and summarizes trimmed ha
     try appendHistoryChatMessagesBudgeted(arena, &messages, &history, .{ .max_tokens = 12 });
 
     try std.testing.expect(messages.items.len >= 3);
-    try std.testing.expectEqual(core_types.ChatRole.system, messages.items[0].role);
+    try std.testing.expectEqual(core_types.ChatRole.user, messages.items[0].role);
     try std.testing.expect(std.mem.find(u8, messages.items[0].content.?, "result-call_large-abc.txt") != null);
     try std.testing.expect(std.mem.find(u8, messages.items[0].content.?, "preview evidence") != null);
     try std.testing.expectEqualStrings("latest request that must survive", messages.items[messages.items.len - 2].content.?);
@@ -4830,7 +4786,7 @@ test "budgeted resume projection preserves compacted summary when older handle e
     try appendHistoryChatMessagesBudgeted(arena, &messages, &history, .{ .max_tokens = 12 });
 
     try std.testing.expect(messages.items.len >= 3);
-    try std.testing.expectEqual(core_types.ChatRole.system, messages.items[0].role);
+    try std.testing.expectEqual(core_types.ChatRole.user, messages.items[0].role);
     try std.testing.expect(std.mem.find(u8, messages.items[0].content.?, "Prior compacted decision needle") != null);
     try std.testing.expect(std.mem.find(u8, messages.items[0].content.?, "result-call_large-summary.txt") != null);
     try std.testing.expect(std.mem.find(u8, messages.items[0].content.?, "summary preview evidence") != null);
@@ -5520,7 +5476,7 @@ test "compactLineText preserves complete UTF-8 codepoints at the byte cap" {
     try std.testing.expectEqualStrings("alpha beta", collapsed);
 }
 
-test "compacted Unicode history serializes system content as a string" {
+test "compacted Unicode history remains conversational context" {
     const alloc = std.testing.allocator;
     var runtime: SessionRuntime = .{ .max_history_turns = 2 };
     defer runtime.deinit(alloc);
@@ -5544,7 +5500,7 @@ test "compacted Unicode history serializes system content as a string" {
     try appendHistoryChatMessages(arena, &messages, context);
     try messages.append(arena, .{ .role = .user, .content = "current user" });
 
-    try std.testing.expectEqual(core_types.ChatRole.system, messages.items[0].role);
+    try std.testing.expectEqual(core_types.ChatRole.user, messages.items[0].role);
     try std.testing.expect(messages.items[0].content != null);
     try std.testing.expect(std.unicode.utf8ValidateSlice(context[0].compacted_summary.summary));
     try std.testing.expectEqual(@as(usize, 3), runtime.historyLen());

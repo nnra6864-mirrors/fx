@@ -2025,12 +2025,14 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn startResumedSessionReconciliation(app: *App) void {
             if (sessionRestoreActive(app)) return;
+            if (comptime @hasDecl(App, "startModelCacheWarmup")) app.startModelCacheWarmup();
             if (comptime !@hasField(App, "auth") or !provider_runtime.supported(App)) return;
             if (comptime !@hasDecl(@TypeOf(app.auth), "credentialSource") or
                 !@hasDecl(@TypeOf(app.auth), "accountId") or
                 !@hasDecl(@TypeOf(app.session.usage), "replaceProviderReconciliationCredential")) return;
 
             const source = app.auth.credentialSource() orelse return;
+            if (!model_provider.authorizesCredential(provider_runtime.provider(app), source)) return;
             const credential = app.auth.apiKey() orelse return;
             app.session.usage.replaceProviderReconciliationCredential(
                 app.alloc,
@@ -2128,6 +2130,7 @@ pub fn Runtime(comptime App: type) type {
                             return;
                         }
                     }
+                    const previous_provider = provider_runtime.provider(app);
                     const retired = blk: {
                         var lease: ?worker_runtime.SessionTransitionLease = null;
                         if (comptime @hasDecl(@TypeOf(app.worker), "tryBeginSessionTransition")) {
@@ -2151,6 +2154,9 @@ pub fn Runtime(comptime App: type) type {
                     task.result = .{ .retired = retired };
                     task.phase.store(.retiring, .release);
                     task.release.set(io_mod.getIo());
+                    if (comptime @hasDecl(App, "restoreSessionCredential")) {
+                        try app.restoreSessionCredential(previous_provider);
+                    }
                     syncTerminalTitle(app);
                     if (task.origin == .startup) {
                         try app.commitStartupResumeReplayAnchor();
@@ -2264,6 +2270,7 @@ pub fn Runtime(comptime App: type) type {
             display_title: []const u8,
             notice: ResumeNotice,
         ) !void {
+            const previous_provider = provider_runtime.provider(app);
             if (comptime @hasField(App, "next_image_id")) {
                 app.next_image_id = try nextImageIdForResumedHistory(
                     state.history,
@@ -2332,6 +2339,9 @@ pub fn Runtime(comptime App: type) type {
                     @divTrunc(install_finished_ns - finalization_finished_ns, std.time.ns_per_us),
                 },
             );
+            if (comptime @hasDecl(App, "restoreSessionCredential")) {
+                try app.restoreSessionCredential(previous_provider);
+            }
         }
 
         pub fn openSessionPicker(app: *App) !void {
@@ -5224,7 +5234,15 @@ const TestApp = struct {
     terminal_title_label_len: usize = 0,
     input_runtime: core_input_runtime.Runtime = .{},
     terminal_input_runtime: ui_input.Runtime = .{},
-    shell: transcript_runtime.TranscriptRuntime = .{},
+    shell: transcript_runtime.TranscriptRuntime = .{ .layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 21,
+        .divider_top_row = 22,
+        .input_row = 23,
+        .divider_bottom_row = 24,
+        .hint_row = 22,
+    } },
     diff_entries: std.ArrayList(diff.DiffEntry) = .empty,
     next_diff_id: u32 = 1,
     metrics: types.Metrics = .{},
@@ -7180,7 +7198,7 @@ test "upgrade notice body identifies stable notes and dev changes" {
                 .previous_revision = "",
                 .revision = "",
             },
-            .expected = "fx has been updated to v9.9.9 \x1b]8;;https://fx.sh/changelog#v9.9.9\x1b\\\x1b[4m(notes)\x1b[24m\x1b]8;;\x1b\\",
+            .expected = "fx has been updated to v9.9.9 (\x1b]8;;https://fx.sh/changelog#v9.9.9\x1b\\\x1b[4mnotes\x1b[24m\x1b]8;;\x1b\\)",
         },
         .{
             .upgrade = .{
@@ -7189,7 +7207,7 @@ test "upgrade notice body identifies stable notes and dev changes" {
                 .previous_revision = "1111111111111111111111111111111111111111",
                 .revision = "abcdef0123456789abcdef0123456789abcdef01",
             },
-            .expected = "fx has been updated to dev abcdef012345 (v9.9.9) \x1b]8;;https://github.com/vercel-labs/fx/compare/1111111111111111111111111111111111111111...abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4m(changes)\x1b[24m\x1b]8;;\x1b\\",
+            .expected = "fx has been updated to dev abcdef012345 (v9.9.9) (\x1b]8;;https://github.com/vercel-labs/fx/compare/1111111111111111111111111111111111111111...abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4mchanges\x1b[24m\x1b]8;;\x1b\\)",
         },
         .{
             .upgrade = .{
@@ -7198,7 +7216,7 @@ test "upgrade notice body identifies stable notes and dev changes" {
                 .previous_revision = "",
                 .revision = "abcdef0123456789abcdef0123456789abcdef01",
             },
-            .expected = "fx has been updated to dev abcdef012345 (v9.9.9) \x1b]8;;https://github.com/vercel-labs/fx/commit/abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4m(changes)\x1b[24m\x1b]8;;\x1b\\",
+            .expected = "fx has been updated to dev abcdef012345 (v9.9.9) (\x1b]8;;https://github.com/vercel-labs/fx/commit/abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4mchanges\x1b[24m\x1b]8;;\x1b\\)",
         },
     };
 
@@ -7648,7 +7666,7 @@ test "upgrade resume restores active session with the installed version notice" 
     try std.testing.expectEqualStrings("run server", context[2].assistant.user.text);
     try std.testing.expectEqual(@as(usize, 2), resumedEntryCount(&app, .semantic_notice));
     try std.testing.expectEqualStrings(
-        "fx has been updated to v9.9.9 \x1b]8;;https://fx.sh/changelog#v9.9.9\x1b\\\x1b[4m(notes)\x1b[24m\x1b]8;;\x1b\\",
+        "fx has been updated to v9.9.9 (\x1b]8;;https://fx.sh/changelog#v9.9.9\x1b\\\x1b[4mnotes\x1b[24m\x1b]8;;\x1b\\)",
         (try resumedEntry(&app, .semantic_notice, 0)).semantic_notice.body,
     );
     try std.testing.expect(std.mem.find(u8, (try resumedEntry(&app, .semantic_notice, 1)).semantic_notice.body, "older context") != null);
@@ -10671,6 +10689,24 @@ test "resumed sessions install provider-scoped usage reconciliation authority" {
     Runtime(ReconciliationOriginApp).startResumedSessionReconciliation(&gateway);
     try std.testing.expectEqual(model_provider.ProviderId.gateway, gateway.session.usage.replaced_provider.?);
     try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, gateway.session.usage.replaced_source.?);
+}
+
+test "resumed usage reconciliation rejects the previous provider credential" {
+    const cases = .{
+        .{ model_provider.ProviderId.gateway, types.CredentialSource.chatgpt_subscription },
+        .{ model_provider.ProviderId.gateway, types.CredentialSource.grok_subscription },
+        .{ model_provider.ProviderId.codex, types.CredentialSource.fx_login },
+        .{ model_provider.ProviderId.grok, types.CredentialSource.fx_login },
+    };
+    inline for (cases) |case| {
+        var app = ReconciliationOriginApp{
+            .auth = .{ .source = case[1] },
+            .selected_provider = case[0],
+        };
+        Runtime(ReconciliationOriginApp).startResumedSessionReconciliation(&app);
+        try std.testing.expect(app.session.usage.replaced_provider == null);
+        try std.testing.expect(app.session.usage.replaced_source == null);
+    }
 }
 
 test "ensureCachedSessionTitle derives from the first prompt and then freezes" {

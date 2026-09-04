@@ -3140,6 +3140,9 @@ fn consumeSseStreamTraced(
 ) !types.ModelCompletion {
     var content_buf: std.ArrayList(u8) = .empty;
     defer content_buf.deinit(alloc);
+    // Reuse event storage instead of pinning old response buffers in the caller's arena.
+    var event_arena = std.heap.ArenaAllocator.init(alloc);
+    defer event_arena.deinit();
 
     var streamed_tool_inputs: std.ArrayList(SseStreamedToolInput) = .empty;
     defer {
@@ -3204,14 +3207,12 @@ fn consumeSseStreamTraced(
         };
         data_event_count += 1;
 
-        var parsed = std.json.parseFromSlice(std.json.Value, alloc, json_text, .{}) catch |err| {
+        defer _ = event_arena.reset(.retain_capacity);
+        const root = std.json.parseFromSliceLeaky(std.json.Value, event_arena.allocator(), json_text, .{}) catch |err| {
             if (err == error.OutOfMemory) return err;
             traceMalformedSseEvent(json_text.len);
             continue;
         };
-        defer parsed.deinit();
-
-        const root = parsed.value;
         traceParsedSseEvent(alloc, root, json_text.len);
         if (root != .object) continue;
         try captureGenerationMetadata(
@@ -3615,7 +3616,7 @@ fn consumeSseStreamTraced(
     errdefer deinitGatewayCompletion(alloc, &completion);
 
     if (content_buf.items.len > 0) {
-        completion.content = try alloc.dupe(u8, content_buf.items);
+        completion.content = try content_buf.toOwnedSlice(alloc);
     }
 
     completion.tool_calls = try materializeToolCalls(alloc, tool_accumulators.items);
@@ -3654,6 +3655,31 @@ fn readTraceFileForTest(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
     defer file.close(io_mod.getIo());
     return io_mod.readFileToEnd(alloc, &file, 65536);
+}
+
+test "SSE text capture keeps arena capacity proportional to the retained response" {
+    const alloc = std.testing.allocator;
+    const chunk = "x" ** 256;
+    const chunk_count = 2048;
+    const output_bytes = chunk.len * chunk_count;
+    var wire: std.Io.Writer.Allocating = .init(alloc);
+    defer wire.deinit();
+    for (0..chunk_count) |_| {
+        try wire.writer.writeAll("data: {\"type\":\"text-delta\",\"delta\":\"" ++ chunk ++ "\"}\n\n");
+    }
+    try wire.writer.writeAll("data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"}}\n\n");
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var reader = std.Io.Reader.fixed(wire.written());
+    var cancelled = std.atomic.Value(bool).init(false);
+    const Noop = struct {
+        fn discard(_: *anyopaque, _: []const u8) void {}
+    };
+    var completion = try consumeSseStream(arena.allocator(), &reader, undefined, Noop.discard, null, &cancelled);
+    defer deinitGatewayCompletion(arena.allocator(), &completion);
+    try std.testing.expectEqual(output_bytes, completion.content.?.len);
+    try std.testing.expect(std.mem.allEqual(u8, completion.content.?, 'x'));
+    try std.testing.expect(arena.queryCapacity() <= output_bytes * 4);
 }
 
 test "consumeSseStream preserves provider finish_reason" {

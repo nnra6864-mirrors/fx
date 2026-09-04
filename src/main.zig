@@ -970,6 +970,10 @@ const App = struct {
         return AuthAppRuntime.admitPromptCredential(self);
     }
 
+    pub fn restoreSessionCredential(self: *App, previous_provider: model_provider.ProviderId) !void {
+        try AuthAppRuntime.restoreSessionCredential(self, previous_provider);
+    }
+
     pub fn startPromptCredentialPrewarm(self: *App) void {
         if (comptime !host_target.is_wasm) {
             AuthAppRuntime.startPromptCredentialPrewarm(self);

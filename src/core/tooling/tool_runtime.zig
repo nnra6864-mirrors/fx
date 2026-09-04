@@ -5818,8 +5818,9 @@ test "shell run rejects legacy background input without creating state" {
     });
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-    try expectContains(result.model_output, "\"code\":\"invalid_action_fields\"");
-    try expectContains(result.model_output, "\"invalid_fields\":[\"background\"]");
+    try expectContains(result.model_output, "\"code\":\"invalid_shell_request\"");
+    try expectContains(result.model_output, "request.background is not accepted for run.");
+    try std.testing.expect(std.mem.find(u8, result.model_output, "retry_with") == null);
 }
 
 const PermissionThreadState = struct {

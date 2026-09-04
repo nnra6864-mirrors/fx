@@ -55,99 +55,44 @@ pub const ComposedInputRows = struct {
     }
 };
 
-fn appendSteeringMessageRow(
-    alloc: Allocator,
-    composed: *ComposedInputRows,
-    content: []const u8,
-    width: u16,
-) !void {
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    try row.appendSlice(alloc, ui_render.dim_style);
-    try row_text.appendClipped(alloc, &row, "┋", width);
-    if (width > 1) try row_text.appendClipped(alloc, &row, " ", width - 1);
-    if (width > 2) try row_text.appendClipped(alloc, &row, content, width - 2);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    try composed.rows.append(alloc, row);
-}
-
 pub fn composeSteeringMessageRows(
     alloc: Allocator,
     message: []const u8,
     width: u16,
     row_limit: u16,
+    waits_for_tool: bool,
 ) !ComposedInputRows {
     var composed: ComposedInputRows = .{};
     errdefer composed.deinit(alloc);
-    const max_rows = @min(row_limit, render_input.max_steering_message_rows);
-    if (max_rows == 0) return composed;
-
-    var safe_message = try text_utils.encodeTerminalSafe(
-        alloc,
-        message,
-        std.math.maxInt(usize),
-    );
-    defer safe_message.deinit(alloc);
-
-    const content_width: usize = width -| 2;
-    const visible_width = display_width.visibleWidth(safe_message.bytes);
-    if (content_width == 0 or max_rows == 1 or visible_width <= content_width) {
-        var content: std.ArrayList(u8) = .empty;
-        defer content.deinit(alloc);
-        try row_text.appendSingleLineMiddleEllipsized(
-            alloc,
-            &content,
-            safe_message.bytes,
-            content_width,
-        );
-        try appendSteeringMessageRow(alloc, &composed, content.items, width);
-        return composed;
-    }
-
-    const first = text_utils.prefixTerminalSafeByWidth(safe_message.bytes, content_width);
-    try appendSteeringMessageRow(alloc, &composed, first, width);
-
-    const remaining = safe_message.bytes[first.len..];
-    var second: std.ArrayList(u8) = .empty;
-    defer second.deinit(alloc);
-    if (display_width.visibleWidth(remaining) <= content_width) {
-        try second.appendSlice(alloc, remaining);
-    } else {
-        try second.appendSlice(alloc, "…");
-        if (content_width > 1) {
-            try second.appendSlice(
-                alloc,
-                text_utils.suffixTerminalSafeByWidth(remaining, content_width - 1),
-            );
+    const layout = render_input.steering_message_layout(message, width, waits_for_tool, row_limit);
+    for (layout.rows[0..layout.row_count], 0..) |content, index| {
+        const normalized = try alloc.dupe(u8, content);
+        defer alloc.free(normalized);
+        for (normalized) |*byte| {
+            if (byte.* == '\t') byte.* = ' ';
         }
+        var safe = try text_utils.encodeTerminalSafe(alloc, normalized, std.math.maxInt(usize));
+        defer safe.deinit(alloc);
+
+        var row: std.ArrayList(u8) = .empty;
+        errdefer row.deinit(alloc);
+        try row.appendSlice(alloc, if (waits_for_tool) ui_render.dim_style else ui_render.hint_style);
+        if (waits_for_tool) try row_text.appendClipped(alloc, &row, "┋ ", width);
+        const ellipsis = layout.truncated and index + 1 == layout.row_count and layout.content_width > 0;
+        try row_text.appendClipped(alloc, &row, safe.bytes, layout.content_width - @as(u16, @intFromBool(ellipsis)));
+        if (ellipsis) {
+            try row.appendSlice(alloc, "…");
+        }
+        try row.appendSlice(alloc, ui_render.reset_style);
+        try composed.rows.append(alloc, row);
     }
-    try appendSteeringMessageRow(alloc, &composed, second.items, width);
     return composed;
 }
 
-pub fn composeImmediateSteeringMessageRow(
-    alloc: Allocator,
-    message: []const u8,
-    width: u16,
-) !std.ArrayList(u8) {
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    try row.appendSlice(alloc, ui_render.hint_style);
-    var safe_message = try text_utils.encodeTerminalSafe(
-        alloc,
-        message,
-        std.math.maxInt(usize),
-    );
-    defer safe_message.deinit(alloc);
-    try row_text.appendSingleLineMiddleEllipsized(alloc, &row, safe_message.bytes, width);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
-}
-
 test "steering rows use the dotted rail without an escape hint" {
-    var first = try composeSteeringMessageRows(std.testing.allocator, "First steer", 80, 2);
+    var first = try composeSteeringMessageRows(std.testing.allocator, "First steer", 80, 2, true);
     defer first.deinit(std.testing.allocator);
-    var second = try composeSteeringMessageRows(std.testing.allocator, "Second steer", 80, 2);
+    var second = try composeSteeringMessageRows(std.testing.allocator, "Second steer", 80, 2, true);
     defer second.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 1), first.rows.items.len);
@@ -158,32 +103,70 @@ test "steering rows use the dotted rail without an escape hint" {
     try std.testing.expect(std.mem.find(u8, second.rows.items[0].items, "Esc to steer now") == null);
 }
 
-test "narrow steering row preserves distinguishing message ends without the escape hint" {
-    const message = "BEGIN change the implementation direction and retain this unique END";
-    var rows = try composeSteeringMessageRows(std.testing.allocator, message, 48, 2);
+test "steering preview preserves the first two lines and hides the rest" {
+    const alloc = std.testing.allocator;
+    var rows = try composeSteeringMessageRows(alloc, "what is this\r\nLockfile\tfailed\nHIDDEN_TAIL", 40, 2, true);
+    defer rows.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), rows.rows.items.len);
+    const first = rows.rows.items[0].items;
+    const second = rows.rows.items[1].items;
+    try std.testing.expectEqualStrings("┋ what is this", first[ui_render.dim_style.len .. first.len - ui_render.reset_style.len]);
+    try std.testing.expectEqualStrings("┋ Lockfile failed…", second[ui_render.dim_style.len .. second.len - ui_render.reset_style.len]);
+}
+
+test "steering preview keeps the beginning of long paragraphs" {
+    const message = "one two three four five six seven eight nine ten HIDDEN_END";
+    var rows = try composeSteeringMessageRows(std.testing.allocator, message, 18, 2, true);
     defer rows.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 2), rows.rows.items.len);
-    try std.testing.expect(std.mem.find(u8, rows.rows.items[0].items, "┋ BEGIN") != null);
+    try std.testing.expect(std.mem.find(u8, rows.rows.items[0].items, "┋ one two three") != null);
     try std.testing.expect(std.mem.find(u8, rows.rows.items[1].items, "┋ ") != null);
-    try std.testing.expect(std.mem.find(u8, rows.rows.items[1].items, "END") != null);
+    try std.testing.expect(std.mem.find(u8, rows.rows.items[1].items, "┋ four five six…") != null);
     for (rows.rows.items) |row| {
+        try std.testing.expect(std.mem.find(u8, row.items, "HIDDEN_END") == null);
         try std.testing.expect(std.mem.find(u8, row.items, "Esc to steer now") == null);
-        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 48);
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 18);
     }
 }
 
-test "two steering rows preserve a wide glyph tail when cells do not pack evenly" {
-    var rows = try composeSteeringMessageRows(std.testing.allocator, "界海語", 5, 2);
+test "steering preview layout and painted rows agree at narrow widths" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "", "first\nsecond\nthird", "alpha\tbeta", "界海語", "é\xff\x1b[2Jtail", "abc\n\ndef", "12\r\n34\r56", "\u{1f469}\u{200d}\u{2764}\u{fe0f}\u{200d}\u{1f48b}\u{200d}\u{1f469}" }) |message| {
+        for ([_]u16{ 0, 1, 2, 3, 5, 12, 31, 33, 80 }) |width| {
+            for ([_]bool{ false, true }) |waiting| {
+                for ([_]u16{ 0, 1, 2 }) |limit| {
+                    const layout = render_input.steering_message_layout(message, width, waiting, limit);
+                    var rows = try composeSteeringMessageRows(alloc, message, width, limit, waiting);
+                    defer rows.deinit(alloc);
+                    try std.testing.expectEqual(@as(usize, layout.row_count), rows.rows.items.len);
+                    try std.testing.expect(rows.rows.items.len <= limit);
+                    for (rows.rows.items) |row| {
+                        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= width);
+                        try std.testing.expect(std.unicode.utf8ValidateSlice(row.items));
+                        try std.testing.expect(std.mem.find(u8, row.items, "\\x0a") == null);
+                        try std.testing.expect(std.mem.find(u8, row.items, "\\x0d") == null);
+                        try std.testing.expect(std.mem.find(u8, row.items, "\\x09") == null);
+                        try std.testing.expect(std.mem.find(u8, row.items, "\x1b[2J") == null);
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "steering preview truncates after the second wide glyph" {
+    var rows = try composeSteeringMessageRows(std.testing.allocator, "界海語", 5, 2, true);
     defer rows.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 2), rows.rows.items.len);
     try std.testing.expect(std.mem.find(u8, rows.rows.items[0].items, "┋ 界") != null);
-    try std.testing.expect(std.mem.find(u8, rows.rows.items[1].items, "┋ …語") != null);
+    try std.testing.expect(std.mem.find(u8, rows.rows.items[1].items, "┋ 海…") != null);
 }
 
 test "steering rows visibly escape terminal control bytes" {
-    var unsafe = try composeSteeringMessageRows(std.testing.allocator, "before\x1b[2Jafter", 80, 2);
+    var unsafe = try composeSteeringMessageRows(std.testing.allocator, "before\x1b[2Jafter", 80, 2, true);
     defer unsafe.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), unsafe.rows.items.len);
     try std.testing.expect(std.mem.find(u8, unsafe.rows.items[0].items, "┋ before\\x1b[2Jafter") != null);

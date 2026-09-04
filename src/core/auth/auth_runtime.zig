@@ -69,6 +69,10 @@ pub const CredentialFailure = struct {
     pub fn retryable(self: CredentialFailure) bool {
         return self.reason == .temporary_unavailable;
     }
+
+    pub fn requiresSignIn(self: CredentialFailure) bool {
+        return self.reason == .invalid_credential or self.reason == .persistence_uncertain;
+    }
 };
 
 pub fn classifyCredentialFailure(
@@ -90,13 +94,28 @@ pub fn classifyCredentialFailure(
             error.InvalidOAuthKeychainSession,
             error.InvalidOAuthStorageState,
             error.KeychainItemNotFound,
+            error.CredentialStorageUnavailable,
+            error.DurablePathUnsafe,
+            error.InsecureAuthFile,
+            error.StoredKeyUnreadable,
+            error.StoredKeyInsecure,
+            error.InvalidChatGptAuthSession,
+            error.InvalidGrokAuthSession,
+            error.KeychainReadFailed,
+            error.PrivateStatePermissionsUnsupported,
+            error.HomeNotSet,
+            error.UserNotSet,
             => .invalid_storage,
             error.KeychainWriteFailed,
             error.OAuthSessionKeychainWriteMismatch,
             error.OAuthSessionCleanupUncertain,
             error.CredentialRefreshPersistenceUncertain,
+            error.CredentialPersistenceFailed,
+            error.DurableReplacePreRenameFailed,
+            error.DurableReplacePostRenameFailed,
             => .persistence_uncertain,
             error.CredentialAuthorityChanged,
+            error.SessionChanged,
             error.ChatGptAccountChanged,
             error.GrokAccountChanged,
             => .authority_changed,
@@ -219,16 +238,24 @@ fn loadCredentialForRefresh(
     };
 }
 
+pub const CredentialPreparationError = Allocator.Error || error{
+    CredentialStorageUnavailable,
+    CredentialTemporarilyUnavailable,
+    CredentialRefreshPersistenceUncertain,
+    CredentialAuthorityChanged,
+};
+
 /// Resolves and refreshes one provider credential. The returned value is owned
 /// by the caller and must be released with `Credential.deinit`.
-/// Non-null `preferred` is exact; only null permits Gateway precedence.
+/// Null means authentication is needed; storage, transport and authority
+/// failures stay errors. Non-null `preferred` is an exact Gateway source.
 pub fn prepareCredential(
     alloc: Allocator,
     transport: oauth_transport.Provider,
     secret_store: host.SecretStore,
     provider: model_provider.ProviderId,
     preferred: ?credentials.Source,
-) Allocator.Error!?credentials.Credential {
+) CredentialPreparationError!?credentials.Credential {
     var resolution = credentials.resolveForProvider(
         alloc,
         transport,
@@ -236,7 +263,7 @@ pub fn prepareCredential(
         .refresh_if_needed,
         provider,
         preferred,
-    ) catch |err| {
+    ) catch |err| failure: {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         debug_trace.logf(
             "auth",
@@ -247,7 +274,10 @@ pub fn prepareCredential(
                 @errorName(err),
             },
         );
-        return null;
+        break :failure credentials.Resolution{ .failure = .{
+            .source = requestedSource(provider, preferred) orelse .fx_login,
+            .err = err,
+        } };
     };
     return prepareResolvedCredential(
         alloc,
@@ -262,8 +292,17 @@ fn prepareResolvedCredential(
     provider: model_provider.ProviderId,
     now_ms: i64,
     resolution: *credentials.Resolution,
-) ?credentials.Credential {
-    var credential = resolution.credential orelse return null;
+) CredentialPreparationError!?credentials.Credential {
+    var credential = resolution.credential orelse {
+        if (resolution.failure) |failure| {
+            if (preparationError(classifyCredentialFailure(failure.source, failure.err))) |err| return err;
+            return null;
+        }
+        if (resolution.fx_login_status == .unavailable or resolution.stored_key_status == .unavailable) {
+            return error.CredentialStorageUnavailable;
+        }
+        return null;
+    };
     resolution.credential = null;
 
     const blocked = credential.token.len == 0 or
@@ -287,22 +326,45 @@ fn requestedSource(
     provider: model_provider.ProviderId,
     preferred: ?credentials.Source,
 ) ?credentials.Source {
-    return switch (provider) {
-        .gateway => preferred,
-        .codex => .chatgpt_subscription,
-        .grok => .grok_subscription,
+    return if (provider == .gateway) preferred else provider_catalog.find(provider).login_source;
+}
+
+pub fn preparationError(failure: CredentialFailure) ?CredentialPreparationError {
+    return switch (failure.reason) {
+        .invalid_credential => null,
+        .invalid_storage => error.CredentialStorageUnavailable,
+        .temporary_unavailable => error.CredentialTemporarilyUnavailable,
+        .persistence_uncertain => error.CredentialRefreshPersistenceUncertain,
+        .authority_changed => error.CredentialAuthorityChanged,
     };
+}
+
+pub fn preparationFailureNotice(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.CredentialStorageUnavailable => "Saved credential storage is unavailable. Check the saved credential, then retry.",
+        error.CredentialTemporarilyUnavailable => "Credential refresh is temporarily unavailable. Retry shortly.",
+        error.CredentialRefreshPersistenceUncertain => "Credential could not be saved. Check authentication storage before signing in again.",
+        error.CredentialAuthorityChanged => "The credential account or team changed. Review authentication before retrying.",
+        else => null,
+    };
+}
+
+/// Returns an owned, secret-free explanation shared by activation surfaces.
+pub fn preparationFailureText(alloc: Allocator, provider: model_provider.ProviderId, err: anyerror) ![]u8 {
+    const label = provider_catalog.label(provider);
+    const failure = classifyCredentialFailure(provider_catalog.find(provider).login_source, err);
+    const normalized = preparationError(failure) orelse return std.fmt.allocPrint(alloc, "{s} requires a new sign-in.", .{label});
+    return std.fmt.allocPrint(alloc, "{s}: {s}", .{ label, preparationFailureNotice(normalized).? });
 }
 
 test "credential preparation blocks an unavailable explicit source" {
     var resolution = credentials.Resolution{ .fx_login_status = .unavailable };
-    const prepared = prepareResolvedCredential(
+    try std.testing.expectError(error.CredentialStorageUnavailable, prepareResolvedCredential(
         std.testing.allocator,
         .gateway,
         100,
         &resolution,
-    );
-    try std.testing.expect(prepared == null);
+    ));
 }
 
 test "credential preparation moves one fresh provider-authorized credential" {
@@ -312,12 +374,12 @@ test "credential preparation moves one fresh provider-authorized credential" {
         .team_id = try std.testing.allocator.dupe(u8, "team_123"),
         .refresh_after_ms = 200,
     } };
-    var credential = prepareResolvedCredential(
+    var credential = (try prepareResolvedCredential(
         std.testing.allocator,
         .gateway,
         100,
         &resolution,
-    ) orelse return error.TestExpectedPreparedCredential;
+    )) orelse return error.TestExpectedPreparedCredential;
     defer credential.deinit(std.testing.allocator);
 
     try std.testing.expect(resolution.credential == null);
@@ -350,7 +412,7 @@ test "credential preparation rejects refresh-due and provider-mismatched credent
     };
     for (cases) |case| {
         var resolution = credentials.Resolution{ .credential = case.credential };
-        var prepared = prepareResolvedCredential(
+        var prepared = try prepareResolvedCredential(
             std.testing.allocator,
             case.provider,
             100,
@@ -358,6 +420,24 @@ test "credential preparation rejects refresh-due and provider-mismatched credent
         );
         defer if (prepared) |*credential| credential.deinit(std.testing.allocator);
         try std.testing.expect(prepared == null);
+    }
+}
+
+test "credential preparation preserves failure categories across providers" {
+    const alloc = std.testing.allocator;
+    for (provider_catalog.entries) |provider| {
+        const cases = [_]struct { original: anyerror, expected: CredentialPreparationError }{
+            .{ .original = error.CredentialStorageUnavailable, .expected = error.CredentialStorageUnavailable },
+            .{ .original = error.ConnectionResetByPeer, .expected = error.CredentialTemporarilyUnavailable },
+            .{ .original = error.CredentialRefreshPersistenceUncertain, .expected = error.CredentialRefreshPersistenceUncertain },
+            .{ .original = error.CredentialAuthorityChanged, .expected = error.CredentialAuthorityChanged },
+        };
+        for (cases) |case| {
+            var resolution: credentials.Resolution = .{ .failure = .{ .source = provider.login_source, .err = case.original } };
+            try std.testing.expectError(case.expected, prepareResolvedCredential(alloc, provider.id, 100, &resolution));
+        }
+        var rejected: credentials.Resolution = .{ .failure = .{ .source = provider.login_source, .err = error.CredentialRefreshRejected } };
+        try std.testing.expect((try prepareResolvedCredential(alloc, provider.id, 100, &rejected)) == null);
     }
 }
 
@@ -572,15 +652,31 @@ pub const InventoryRefreshResult = union(enum) {
     failed: InventoryRefreshAction,
 };
 
-const InventoryProbeFn = *const fn (
-    ctx: ?*anyopaque,
-    alloc: Allocator,
-    source: credentials.Source,
-) anyerror!bool;
-
 const InventoryRefreshDeps = struct {
     ctx: ?*anyopaque,
-    probe: InventoryProbeFn,
+    probe: SourceProbeFn,
+};
+
+const SourceInventory = struct {
+    available: SourceSet = .empty,
+    unavailable: SourceSet = .empty,
+
+    fn detect(alloc: Allocator, ctx: ?*anyopaque, probe: SourceProbeFn, cancelled: ?*const std.atomic.Value(bool)) !SourceInventory {
+        var inventory: SourceInventory = .{};
+        for (credential_source_order) |source| {
+            if (cancelled) |flag| if (flag.load(.acquire)) return error.Cancelled;
+            const present = probe(ctx, alloc, source) catch |err| switch (err) {
+                error.CredentialStorageUnavailable => {
+                    debug_trace.logf("auth", "inventory source unavailable source={t}", .{source});
+                    inventory.unavailable.insert(source);
+                    continue;
+                },
+                else => return err,
+            };
+            if (present) inventory.available.insert(source);
+        }
+        return inventory;
+    }
 };
 
 pub const PromptCredentialRefreshStart = enum {
@@ -717,7 +813,7 @@ const InventoryRefreshTask = struct {
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     action: InventoryRefreshAction,
     deps: InventoryRefreshDeps,
-    inventory: ?SourceSet = null,
+    inventory: ?SourceInventory = null,
     failure: ?anyerror = null,
 
     fn start(
@@ -740,23 +836,10 @@ const InventoryRefreshTask = struct {
 
     fn workerMain(self: *InventoryRefreshTask) void {
         defer self.done.store(true, .release);
-        var detected: SourceSet = .empty;
-        for (credential_source_order) |source| {
-            if (self.cancel_requested.load(.acquire)) {
-                self.failure = error.Cancelled;
-                return;
-            }
-            const present = self.deps.probe(
-                self.deps.ctx,
-                self.alloc,
-                source,
-            ) catch |err| {
-                self.failure = err;
-                return;
-            };
-            if (present) detected.insert(source);
-        }
-        self.inventory = detected;
+        self.inventory = SourceInventory.detect(self.alloc, self.deps.ctx, self.deps.probe, &self.cancel_requested) catch |err| {
+            self.failure = err;
+            return;
+        };
     }
 
     fn deinit(self: *InventoryRefreshTask) void {
@@ -813,6 +896,7 @@ pub const Choice = union(enum) {
 pub const PickerView = struct {
     active: bool,
     available_sources: SourceSet,
+    unavailable_sources: SourceSet = .empty,
     selected_choice: ?Choice,
     active_source: ?credentials.Source,
     active_provider: model_provider.ProviderId = .gateway,
@@ -1016,6 +1100,7 @@ pub const StatusSnapshot = struct {
     owned_team: ?[]u8 = null,
     stored_key_status: credentials.StoredKeyReadStatus = .not_attempted,
     fx_login_status: credentials.FxLoginReadStatus = .not_attempted,
+    failure: ?CredentialFailure = null,
     gateway_connected: bool = false,
     chatgpt_connected: bool = false,
     grok_connected: bool = false,
@@ -1040,6 +1125,9 @@ pub const StatusSnapshot = struct {
     pub fn missingHelp(self: StatusSnapshot, surface: MissingHelpSurface) ?[]const u8 {
         if (self.active_source != null) return null;
         if (self.stored_key_status == .unavailable) return credentials.unreadable_store_message;
+        if (self.failure) |failure| {
+            if (preparationError(failure)) |err| return preparationFailureNotice(err);
+        }
         if (self.required_source == .fx_login) {
             return if (self.fx_login_status == .unavailable)
                 "The saved fx login could not be loaded. Run fx login to repair this source; no other credential was selected."
@@ -1177,6 +1265,7 @@ pub fn loadStatusSnapshotForProvider(
             preferred,
         .stored_key_status = resolution.stored_key_status,
         .fx_login_status = resolution.fx_login_status,
+        .failure = if (resolution.failure) |failure| classifyCredentialFailure(failure.source, failure.err) else null,
         .gateway_connected = gateway_connected,
         .chatgpt_connected = chatgpt_connected,
         .grok_connected = grok_connected,
@@ -1208,6 +1297,13 @@ pub const GatewayCredential = struct {
     source: credentials.Source,
 };
 
+pub const ProviderCredentialSelection = union(enum) {
+    unchanged,
+    selected,
+    missing,
+    failed: credentials.LoadFailure,
+};
+
 pub const Runtime = struct {
     const Self = @This();
 
@@ -1218,6 +1314,7 @@ pub const Runtime = struct {
     selected_credential: ?credentials.Credential = null,
     credential_failure: ?CredentialFailure = null,
     source_inventory: SourceSet = .empty,
+    unavailable_sources: SourceSet = .empty,
     stored_key_status: credentials.StoredKeyReadStatus = .not_attempted,
     fx_login_status: credentials.FxLoginReadStatus = .not_attempted,
     onboarding_skipped: bool = false,
@@ -1284,7 +1381,7 @@ pub const Runtime = struct {
         auth_mode: credentials.AuthMode,
     ) void {
         comptime {
-            if (std.meta.fields(Self).len != 29) {
+            if (std.meta.fields(Self).len != 30) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
@@ -1296,6 +1393,7 @@ pub const Runtime = struct {
         storage.selected_credential = null;
         storage.credential_failure = null;
         storage.source_inventory = .empty;
+        storage.unavailable_sources = .empty;
         storage.stored_key_status = .not_attempted;
         storage.fx_login_status = .not_attempted;
         storage.onboarding_skipped = false;
@@ -1498,6 +1596,7 @@ pub const Runtime = struct {
     pub fn refreshSourceInventory(self: *Self, alloc: Allocator) !void {
         if (self.auth_mode == .host_managed) {
             self.source_inventory = .empty;
+            self.unavailable_sources = .empty;
             return;
         }
         try self.refreshSourceInventoryWithProbe(alloc, self, probeCredentialSource);
@@ -1547,10 +1646,7 @@ pub const Runtime = struct {
         if (task.failure != null or task.inventory == null) {
             return .{ .failed = task.action };
         }
-        var detected = task.inventory.?;
-        self.fx_login_session_available = detected.contains(.fx_login);
-        if (self.credentialSource()) |source| detected.insert(source);
-        self.source_inventory = detected;
+        self.applySourceInventory(task.inventory.?);
         return .{ .ready = task.action };
     }
 
@@ -1582,13 +1678,16 @@ pub const Runtime = struct {
         ctx: ?*anyopaque,
         probe: SourceProbeFn,
     ) !void {
-        var detected: SourceSet = .empty;
-        for (credential_source_order) |source| {
-            if (try probe(ctx, alloc, source)) detected.insert(source);
+        self.applySourceInventory(try SourceInventory.detect(alloc, ctx, probe, null));
+    }
+
+    fn applySourceInventory(self: *Self, inventory: SourceInventory) void {
+        self.source_inventory = inventory.available;
+        self.unavailable_sources = inventory.unavailable;
+        self.fx_login_session_available = inventory.available.contains(.fx_login);
+        if (self.credentialSource()) |source| {
+            if (source != .host_managed and !inventory.unavailable.contains(source)) self.source_inventory.insert(source);
         }
-        self.fx_login_session_available = detected.contains(.fx_login);
-        if (self.credentialSource()) |source| detected.insert(source);
-        self.source_inventory = detected;
     }
 
     pub fn openPicker(self: *Self, alloc: Allocator) void {
@@ -1622,6 +1721,7 @@ pub const Runtime = struct {
         return .{
             .active = self.picker_active,
             .available_sources = self.source_inventory,
+            .unavailable_sources = self.unavailable_sources,
             .selected_choice = self.picker_selection,
             .active_source = self.credentialSource(),
             .active_provider = self.provider_picker_active,
@@ -2207,6 +2307,7 @@ pub const Runtime = struct {
         credential.team_id = null;
         credential.team_slug = null;
         self.source_inventory.insert(source);
+        self.unavailable_sources.remove(source);
         if (source == .fx_login) self.fx_login_session_available = true;
         if (source == .stored_key) self.stored_key_status = .not_attempted;
         return change;
@@ -2248,37 +2349,31 @@ pub const Runtime = struct {
         self: *Self,
         alloc: Allocator,
         provider: model_provider.ProviderId,
-    ) !?bool {
-        if (self.auth_mode == .host_managed) return false;
-        return switch (provider) {
-            .codex => if (self.credentialSource() == .chatgpt_subscription)
-                false
-            else
-                self.selectSourceWithLoader(
-                    alloc,
-                    .chatgpt_subscription,
-                    self,
-                    loadRuntimeCredentialSource,
-                ),
-            .grok => if (self.credentialSource() == .grok_subscription)
-                false
-            else
-                self.selectSourceWithLoader(
-                    alloc,
-                    .grok_subscription,
-                    self,
-                    loadRuntimeCredentialSource,
-                ),
-            .gateway => if (self.credentialSource() != .chatgpt_subscription and self.credentialSource() != .grok_subscription)
-                false
-            else
-                @as(?bool, try self.reselectByPrecedenceWithDeps(
-                    alloc,
-                    self,
-                    probeCredentialSource,
-                    loadRuntimeCredentialSource,
-                )),
+        preferred: ?credentials.Source,
+    ) Allocator.Error!ProviderCredentialSelection {
+        if (self.auth_mode == .host_managed or
+            model_provider.authorizesCredential(provider, self.credentialSource())) return .unchanged;
+
+        var resolution = credentials.resolveForProvider(
+            alloc,
+            self.oauth_transport,
+            self.secret_store,
+            .stored,
+            provider,
+            preferred,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return .{ .failed = .{
+                .source = requestedSource(provider, preferred) orelse .fx_login,
+                .err = err,
+            } };
         };
+        defer if (resolution.credential) |*credential| credential.deinit(alloc);
+        if (resolution.credential) |*credential| {
+            return if (self.adoptCredential(alloc, credential)) .selected else .unchanged;
+        }
+        if (resolution.failure) |failure| return .{ .failed = failure };
+        return .missing;
     }
 
     pub fn beginPromptCredentialRefresh(self: *Self) PromptCredentialRefreshStart {
@@ -2509,11 +2604,13 @@ test "host-managed runtime exposes authority without local credential state" {
 
 fn probeCredentialSource(raw_context: ?*anyopaque, _: Allocator, source: credentials.Source) !bool {
     const self: *Runtime = @ptrCast(@alignCast(raw_context.?));
+    if (self.auth_mode == .host_managed) return false;
     return sourcePresenceAvailable(credentials.sourcePresence(self.secret_store, source), .fail);
 }
 
 fn probeCredentialSourceForLogout(raw_context: ?*anyopaque, _: Allocator, source: credentials.Source) !bool {
     const self: *Runtime = @ptrCast(@alignCast(raw_context.?));
+    if (self.auth_mode == .host_managed) return false;
     const presence = credentials.sourcePresence(self.secret_store, source);
     if (presence == .unavailable) {
         debug_trace.logf("auth", "logout inventory omitted unavailable source={s}", .{@tagName(source)});
@@ -2524,12 +2621,12 @@ fn probeCredentialSourceForLogout(raw_context: ?*anyopaque, _: Allocator, source
 fn sourcePresenceAvailable(
     presence: host.SecretStorePresence,
     unavailable_policy: UnavailableSourcePolicy,
-) error{CredentialSourceUnavailable}!bool {
+) error{CredentialStorageUnavailable}!bool {
     return switch (presence) {
         .present => true,
         .missing => false,
         .unavailable => switch (unavailable_policy) {
-            .fail => error.CredentialSourceUnavailable,
+            .fail => error.CredentialStorageUnavailable,
             .omit => false,
         },
     };
@@ -2846,6 +2943,22 @@ test "credential refresh failures preserve repair and retry semantics" {
     }
 }
 
+test "credential failure classification keeps storage failures out of sign-in recovery" {
+    for ([_]credentials.Source{ .fx_login, .chatgpt_subscription, .grok_subscription }) |source| {
+        for ([_]anyerror{
+            error.CredentialStorageUnavailable,
+            error.DurablePathUnsafe,
+            error.InsecureAuthFile,
+            error.StoredKeyUnreadable,
+            error.InvalidChatGptAuthSession,
+            error.InvalidGrokAuthSession,
+        }) |err| {
+            const failure = classifyCredentialFailure(source, err);
+            try std.testing.expectEqual(CredentialFailureReason.invalid_storage, failure.reason);
+        }
+    }
+}
+
 test "catalog access records a refresh failure until another credential is adopted" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
@@ -3083,7 +3196,10 @@ test "auth status snapshot distinguishes an absent store from an unreadable one"
     const absent = StatusSnapshot{ .stored_key_status = .not_found };
     try std.testing.expectEqualStrings(credentials.missing_credential_message, absent.missingHelp(.cli).?);
 
-    const unreadable = StatusSnapshot{ .stored_key_status = .unavailable };
+    const unreadable = StatusSnapshot{
+        .stored_key_status = .unavailable,
+        .failure = .{ .source = .stored_key, .reason = .invalid_storage },
+    };
     try std.testing.expectEqualStrings(credentials.unreadable_store_message, unreadable.missingHelp(.cli).?);
     try std.testing.expectEqualStrings(credentials.unreadable_store_message, unreadable.missingHelp(.interactive).?);
 
@@ -3162,10 +3278,56 @@ test "credential inventory treats unavailable sources according to command polic
     try std.testing.expect(try sourcePresenceAvailable(.present, .fail));
     try std.testing.expect(!try sourcePresenceAvailable(.missing, .fail));
     try std.testing.expectError(
-        error.CredentialSourceUnavailable,
+        error.CredentialStorageUnavailable,
         sourcePresenceAvailable(.unavailable, .fail),
     );
     try std.testing.expect(!try sourcePresenceAvailable(.unavailable, .omit));
+}
+
+test "auth inventory skips unavailable sources and keeps later sources" {
+    const Probe = struct {
+        unavailable: bool = true,
+
+        fn exists(ctx: ?*anyopaque, _: Allocator, source: credentials.Source) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (source == .fx_login and self.unavailable) return error.CredentialStorageUnavailable;
+            return source == .ai_gateway_api_key or source == .stored_key or source == .fx_login;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    runtime.selected_credential = .{ .source = .fx_login, .token = try alloc.dupe(u8, "loaded-token") };
+    var probe: Probe = .{};
+    const expected = SourceSet.initMany(&.{ .ai_gateway_api_key, .stored_key });
+
+    try runtime.refreshSourceInventoryWithProbe(alloc, &probe, Probe.exists);
+    try std.testing.expectEqual(expected, runtime.source_inventory);
+    try std.testing.expect(runtime.pickerView().unavailable_sources.contains(.fx_login));
+    try std.testing.expect(!runtime.fx_login_session_available);
+    try std.testing.expectEqual(credentials.Source.fx_login, runtime.credentialSource().?);
+
+    try std.testing.expectEqual(InventoryRefreshStart.started, runtime.beginSourceInventoryRefreshWithDeps(
+        alloc,
+        .{ .provider = .gateway },
+        .{ .ctx = &probe, .probe = Probe.exists },
+    ));
+    var result: ?InventoryRefreshResult = null;
+    for (0..100_000) |_| {
+        result = runtime.takeSourceInventoryRefresh();
+        if (result != null) break;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    try std.testing.expect(result != null);
+    try std.testing.expect(result.? == .ready);
+    try std.testing.expectEqual(expected, runtime.source_inventory);
+    try std.testing.expect(runtime.pickerView().unavailable_sources.contains(.fx_login));
+
+    probe.unavailable = false;
+    try runtime.refreshSourceInventoryWithProbe(alloc, &probe, Probe.exists);
+    try std.testing.expect(runtime.source_inventory.contains(.fx_login));
+    try std.testing.expect(runtime.fx_login_session_available);
+    try std.testing.expectEqual(SourceSet.empty, runtime.pickerView().unavailable_sources);
 }
 
 test "auth inventory worker publishes one current action and preserves state on failure" {
@@ -3325,6 +3487,70 @@ test "auth runtime failed selection preserves the active credential" {
     );
     try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, runtime.credentialSource().?);
     try std.testing.expectEqualStrings("active-token", runtime.apiKey().?);
+}
+
+test "provider selection preserves failure provenance and prior authority until recovery" {
+    const FailedAllocation = struct {
+        fn load(_: ?*anyopaque, _: Allocator) host.SecretStoreLoadError!?[]u8 {
+            return error.OutOfMemory;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var fixture: ApiKeySaveFixture = .{ .fail_load = true };
+    var runtime: Runtime = .{ .secret_store = fixture.secretStore() };
+    defer runtime.deinit(alloc);
+    var previous = try makeTestCredential(alloc, "previous-token", .grok_subscription, null, null);
+    defer previous.deinit(alloc);
+    _ = runtime.adoptCredential(alloc, &previous);
+
+    switch (try runtime.selectForProvider(alloc, .gateway, .stored_key)) {
+        .failed => |failure| {
+            try std.testing.expectEqual(credentials.Source.stored_key, failure.source);
+            try std.testing.expectEqual(error.StoredKeyUnreadable, failure.err);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(credentials.Source.grok_subscription, runtime.credentialSource().?);
+    try std.testing.expectEqualStrings("previous-token", runtime.selected_credential.?.token);
+
+    runtime.secret_store = host.unavailable_secret_store;
+    try std.testing.expectEqual(ProviderCredentialSelection.missing, try runtime.selectForProvider(alloc, .gateway, .stored_key));
+    try std.testing.expectEqual(credentials.Source.grok_subscription, runtime.credentialSource().?);
+    runtime.secret_store.load_fn = FailedAllocation.load;
+    try std.testing.expectError(error.OutOfMemory, runtime.selectForProvider(alloc, .gateway, .stored_key));
+    try std.testing.expectEqualStrings("previous-token", runtime.selected_credential.?.token);
+
+    fixture.fail_load = false;
+    runtime.secret_store = fixture.secretStore();
+    try std.testing.expectEqual(ProviderCredentialSelection.selected, try runtime.selectForProvider(alloc, .gateway, .stored_key));
+    try std.testing.expectEqual(credentials.Source.stored_key, runtime.credentialSource().?);
+    try std.testing.expectEqualStrings("loaded-key", runtime.selected_credential.?.token);
+}
+
+test "provider selection leaves compatible expired credentials for deferred refresh" {
+    const alloc = std.testing.allocator;
+    var fixture: ApiKeySaveFixture = .{ .fail_load = true };
+    var runtime: Runtime = .{ .secret_store = fixture.secretStore() };
+    defer runtime.deinit(alloc);
+    var credential = try makeTestCredential(alloc, "expired-token", .fx_login, "team_1", null);
+    defer credential.deinit(alloc);
+    credential.refresh_after_ms = 0;
+    _ = runtime.adoptCredential(alloc, &credential);
+
+    try std.testing.expectEqual(ProviderCredentialSelection.unchanged, try runtime.selectForProvider(alloc, .gateway, .stored_key));
+    try std.testing.expectEqual(@as(usize, 0), fixture.load_calls);
+    try std.testing.expectEqual(@as(?i64, 0), runtime.selected_credential.?.refresh_after_ms);
+}
+
+test "host-managed provider selection never reads local credentials" {
+    const alloc = std.testing.allocator;
+    var fixture: ApiKeySaveFixture = .{ .fail_load = true };
+    var runtime: Runtime = .{ .auth_mode = .host_managed, .secret_store = fixture.secretStore() };
+    defer runtime.deinit(alloc);
+    for ([_]model_provider.ProviderId{ .gateway, .codex, .grok }) |provider| {
+        try std.testing.expectEqual(ProviderCredentialSelection.unchanged, try runtime.selectForProvider(alloc, provider, .stored_key));
+    }
+    try std.testing.expectEqual(@as(usize, 0), fixture.load_calls);
 }
 
 const LogoutFixture = struct {

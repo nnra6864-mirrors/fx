@@ -462,6 +462,24 @@ CI uses `--runs 100` with a reduced warmup and skips the build step because the
 workflow builds ReleaseSafe first. Results are written to
 `benchmarks/results/` (gitignored).
 
+The libfx runtime job measures cold startup, warm prompts, host-tool calls,
+stream throughput, and Agent cleanup. Its direct Pi comparison uses an external
+Zig HTTP server, Pi 0.84.4, and three alternating 100-sample rounds. On Bun,
+native libfx must match or beat Pi p50 and stay within 0.25 ms of Pi p95.
+The Node comparison is report-only because Node's bundled fetch client and
+Pi's dispatcher have different warm-request overhead. Both runtimes still
+require valid measurements, 300 samples, and exactly one inference request per
+prompt. Native/Wasm latency, host-tool, and resource gates remain blocking.
+Live model latency and bulk-stream throughput remain informational.
+
+```sh
+zig build-exe benchmarks/libfx/fake-inference-server.zig -O ReleaseSafe -femit-bin=/tmp/libfx-bench-server
+node benchmarks/libfx/bench-competitive.mjs --server /tmp/libfx-bench-server --pi-root /tmp/libfx-pi --out benchmarks/results/libfx
+```
+
+Build the SDK artifacts and install the pinned Pi package first, as shown in
+`.github/workflows/bench.yml`. Raw per-prompt samples remain in the output directory.
+
 ## Before Marking a PR Ready
 
 Minimum checklist:

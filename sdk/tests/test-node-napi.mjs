@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 const scripts = [
+  "test-native-core-ready.mjs",
   "test-native-core-misuse.mjs",
   "test-native-core-workers.mjs",
   "test-native-core-worker-termination.mjs",
@@ -30,6 +31,7 @@ for (const script of scripts) {
   const result = spawnSync(process.execPath, args, {
     cwd: repoRoot,
     stdio: "inherit",
+    timeout: 30_000,
   });
   if (result.error) throw result.error;
   if (result.status !== 0) process.exit(result.status ?? 1);
