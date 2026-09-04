@@ -1,4 +1,5 @@
 const std = @import("std");
+const credentials = @import("credentials.zig");
 const browser_callback = @import("browser_callback.zig");
 const grok_session = @import("grok_session.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -62,14 +63,26 @@ const BrowserLoginContext = struct {
     transport: oauth_transport.Provider,
     manual_code_mutex: std.Io.Mutex = .init,
     manual_code: ?[]u8 = null,
+    pending_callback: ?browser_callback.Accepted(BrowserCallback) = null,
 
     fn deinit(self: *BrowserLoginContext, alloc: Allocator) void {
+        self.finishCallback(alloc, false);
         self.listener.deinit(io_mod.getIo());
         alloc.free(self.redirect_uri);
         secret.zeroAndFree(alloc, self.code_verifier);
         secret.zeroAndFree(alloc, self.state);
         if (self.manual_code) |code| secret.zeroAndFree(alloc, code);
         self.* = undefined;
+    }
+
+    fn finishCallback(self: *BrowserLoginContext, alloc: Allocator, saved: bool) void {
+        var callback = self.pending_callback orelse return;
+        self.pending_callback = null;
+        defer callback.deinit();
+        defer callback.callback.deinit(alloc);
+        callback.respond(if (saved) .ok else .failed) catch |err| {
+            debug_trace.logf("auth", "Grok completion response failed err={s}", .{@errorName(err)});
+        };
     }
 
     fn submitManualCode(self: *BrowserLoginContext, alloc: Allocator, input: []const u8) !void {
@@ -108,6 +121,7 @@ pub fn startSignIn(
     alloc: Allocator,
     transport: oauth_transport.Provider,
 ) !bool {
+    try credentials.requireSignInStorage(.grok_subscription);
     const browser = try prepareBrowserSignIn(alloc, transport);
     return runtime.startPrepared(
         alloc,
@@ -122,6 +136,7 @@ pub fn startSignIn(
             },
             .complete = completeSignIn,
             .save = saveSignIn,
+            .finish = finishSignIn,
             .submit_manual_code = submitBrowserManualCode,
         },
     );
@@ -282,7 +297,6 @@ fn pollBrowserToken(
         return err;
     };
     errdefer token.deinit(alloc);
-    if (accepted) |*callback| try callback.respond(.ok);
 
     const scope = try alloc.dupe(u8, "");
     errdefer if (scope.len > 0) alloc.free(scope);
@@ -292,6 +306,8 @@ fn pollBrowserToken(
     token.access_token = &.{};
     const refresh_token = token.refresh_token;
     token.refresh_token = &.{};
+    context.pending_callback = accepted;
+    accepted = null;
     return .{ .success = .{
         .access_token = access_token,
         .refresh_token = refresh_token,
@@ -371,6 +387,11 @@ fn saveSignIn(_: ?*anyopaque, alloc: Allocator, completion: login_flow.SignInCom
         .vercel, .chatgpt => return error.InvalidSignInCompletion,
     };
     try grok_session.saveNewSession(alloc, session);
+}
+
+fn finishSignIn(raw: ?*anyopaque, alloc: Allocator, saved: bool) void {
+    const context: *BrowserLoginContext = @ptrCast(@alignCast(raw.?));
+    context.finishCallback(alloc, saved);
 }
 
 pub fn runLogin(
@@ -470,7 +491,12 @@ pub fn logout(alloc: Allocator, transport: oauth_transport.Provider) !LogoutResu
     };
     defer mutation.deinit();
     var revocation_failed = false;
-    if (try mutation.load(alloc)) |loaded| {
+    const loaded_session = mutation.load(alloc) catch |err| blk: {
+        debug_trace.logf("auth", "Grok logout could not load the saved credential err={s}", .{@errorName(err)});
+        revocation_failed = true;
+        break :blk null;
+    };
+    if (loaded_session) |loaded| {
         var session = loaded;
         defer session.deinit(alloc);
         revokeToken(alloc, transport, session.refresh_token) catch {
@@ -529,6 +555,7 @@ fn refreshSession(
     mutation: *grok_session.Mutation,
     session: *grok_session.Session,
 ) !void {
+    try mutation.requireWritable();
     var body: std.Io.Writer.Allocating = .init(alloc);
     defer body.deinit();
     var form: FormBody = .{};

@@ -330,6 +330,16 @@ pub fn Runtime(comptime App: type) type {
             const result = app.auth.takeSourceInventoryRefresh() orelse return;
             switch (result) {
                 .ready => |action| {
+                    var unavailable = app.auth.pickerView().unavailable_sources.iterator();
+                    while (unavailable.next()) |source| {
+                        const body = try std.fmt.allocPrint(
+                            app.alloc,
+                            "{s} is unavailable. Check the saved credential or choose another option.",
+                            .{credentials.sourceLabel(source)},
+                        );
+                        defer app.alloc.free(body);
+                        try writeAuthNotice(app, .{ .topic = "auth", .tone = .warning, .body = body });
+                    }
                     switch (action.destination) {
                         .auth_picker => app.auth.openPickerForProvider(app.alloc, action.provider),
                         .provider_picker_login, .provider_picker_command => if (comptime @hasField(App, "input_runtime")) {
@@ -952,15 +962,14 @@ pub fn Runtime(comptime App: type) type {
                     target,
                     if (target == .gateway) settings.credential_source else null,
                 ) catch |err| {
+                    if (err == error.OutOfMemory) return err;
                     debug_trace.logf("provider", "credential preparation failed provider={t} err={s}", .{ target, @errorName(err) });
+                    const body = try auth_runtime.preparationFailureText(app.alloc, target, err);
+                    defer app.alloc.free(body);
                     try app.writeDomainNotice(.{
                         .topic = "provider",
                         .tone = .@"error",
-                        .body = providerFailureMessage(
-                            intent,
-                            "Could not prepare the target provider credential. The current provider is unchanged.",
-                            "Subscription sign-in completed, but its credential could not be prepared. The current provider is unchanged.",
-                        ),
+                        .body = body,
                     }, true);
                     return;
                 }) orelse {
@@ -1136,17 +1145,26 @@ pub fn Runtime(comptime App: type) type {
             /// A session exists but its teams could not be listed. The reason
             /// has already been reported.
             unavailable,
+            /// Credential preparation failed; no source may be activated.
+            blocked,
         };
 
         pub fn loadTeamsForProviderPicker(app: *App) !TeamColumn {
+            const view = app.auth.pickerView();
+            if (view.unavailable_sources.contains(.fx_login)) {
+                const body = try auth_runtime.preparationFailureText(app.alloc, .gateway, error.CredentialStorageUnavailable);
+                defer app.alloc.free(body);
+                try writeAuthNotice(app, .{ .topic = "auth", .tone = .warning, .body = body });
+                return .blocked;
+            }
             if (comptime @hasDecl(@TypeOf(app.auth), "credentialFailure")) {
                 if (app.auth.credentialFailure()) |failure| {
-                    if (failure.source == .fx_login and !failure.retryable()) {
+                    if (failure.source == .fx_login and failure.requiresSignIn()) {
                         return .needs_sign_in;
                     }
                 }
             }
-            if (!app.auth.pickerView().fx_login_session_available) return .needs_sign_in;
+            if (!view.fx_login_session_available) return .needs_sign_in;
             try app.flushBeforeBlockingExternalWork();
 
             var selection = login_flow.loadTeamSelection(app.alloc, app.auth.oauthTransport()) catch |err| {
@@ -1154,11 +1172,15 @@ pub fn Runtime(comptime App: type) type {
                 // A session file that exists but can no longer be refreshed is
                 // not a listing failure: there is nothing to list until the
                 // user signs in again.
-                if (err == error.NoSession or
-                    err == error.SessionChanged or
-                    !auth_runtime.classifyCredentialFailure(.fx_login, err).retryable())
-                {
+                if (err == error.NoSession or auth_runtime.classifyCredentialFailure(.fx_login, err).requiresSignIn()) {
                     return .needs_sign_in;
+                }
+                if (err != error.NoTeams and err != error.TeamRequestFailed) {
+                    if (err == error.OutOfMemory) return err;
+                    const body = try auth_runtime.preparationFailureText(app.alloc, .gateway, err);
+                    defer app.alloc.free(body);
+                    try writeAuthNotice(app, .{ .topic = "auth", .tone = .warning, .body = body });
+                    return .blocked;
                 }
                 try app.writeDomainNotice(.{
                     .topic = "auth",
@@ -1492,7 +1514,7 @@ pub fn Runtime(comptime App: type) type {
         fn preparePromptCredential(app: *App) !bool {
             if (comptime @hasDecl(@TypeOf(app.auth), "credentialFailure")) {
                 if (app.auth.credentialFailure()) |failure| {
-                    if (!failure.retryable()) {
+                    if (failure.requiresSignIn()) {
                         try beginCredentialRepair(app, failure);
                         return false;
                     }
@@ -1591,7 +1613,7 @@ pub fn Runtime(comptime App: type) type {
                 ),
                 .invalid_storage => std.fmt.allocPrint(
                     alloc,
-                    "{s} saved sign-in is unreadable.\nPress Enter to sign in again. Your prompt is saved.",
+                    "{s} saved sign-in is unreadable.\nCheck credential storage, then press Enter to retry. Your prompt is saved.",
                     .{source_label},
                 ),
                 .persistence_uncertain => std.fmt.allocPrint(
@@ -1606,7 +1628,7 @@ pub fn Runtime(comptime App: type) type {
                 ),
                 .temporary_unavailable => std.fmt.allocPrint(
                     alloc,
-                    "{s} credential refresh failed.\nCheck your connection and press Enter to retry. Your prompt is saved.",
+                    "{s} credential refresh failed.\nPress Enter to retry. Your prompt is saved.",
                     .{source_label},
                 ),
             };
@@ -1675,6 +1697,14 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn writeLoginError(app: *App, source: credentials.Source, err: anyerror) !void {
+            const failure = auth_runtime.classifyCredentialFailure(source, err);
+            if (failure.reason == .invalid_storage or failure.reason == .persistence_uncertain) {
+                const notice = auth_runtime.preparationFailureNotice(auth_runtime.preparationError(failure).?).?;
+                const body = try std.fmt.allocPrint(app.alloc, "{s}: {s}", .{ credentials.sourceLabel(source), notice });
+                defer app.alloc.free(body);
+                try writeAuthNotice(app, .{ .topic = "auth", .tone = .@"error", .body = body });
+                return;
+            }
             const notice: types.SemanticNotice = if (source == .chatgpt_subscription)
                 switch (err) {
                     error.ChatGptAuthorizationFailed => .{ .topic = "auth", .tone = .@"error", .body = "Codex sign-in was denied. The current credential is unchanged." },
@@ -2765,7 +2795,7 @@ test "prompt credential refresh failure is recoverable and detail-free" {
 
     try std.testing.expect(!try Runtime(TestApp).preparePromptCredential(&app));
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "fx login credential refresh failed.") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Check your connection and press Enter to retry.") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Press Enter to retry.") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Your prompt is saved.") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Choose another source") == null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "OAuthRequestFailed") == null);

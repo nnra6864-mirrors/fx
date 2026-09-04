@@ -13,7 +13,7 @@ const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const Allocator = std.mem.Allocator;
 const endpoint = "https://cli-chat-proxy.grok.com/v1/responses";
 // The proxy gates this as Grok wire compatibility; fx identifies itself separately below.
-const proxy_compatibility_version = "1.0.6";
+const version_lookup = @import("provider_versions.zig");
 const e2e_endpoint_env = "FX_E2E_XAI_GROK_RESPONSES_URL";
 const max_error_body_bytes: usize = 256 * 1024;
 const max_sse_line_bytes: usize = 1024 * 1024;
@@ -259,6 +259,10 @@ pub fn streamPrepared(
         break :endpoint override;
     } else endpoint;
     const uri = try std.Uri.parse(request_endpoint);
+    const compatibility = if (auth_headers.include_subscription_headers)
+        try version_lookup.resolve(alloc, .grok, request.cancel_flag, request.deadline)
+    else
+        null;
 
     var extra_headers_buf: [10]std.http.Header = undefined;
     var extra_count: usize = 0;
@@ -270,8 +274,10 @@ pub fn streamPrepared(
         extra_headers_buf[extra_count] = .{ .name = "x-authenticateresponse", .value = "authenticate-response" };
         extra_count += 1;
     }
-    extra_headers_buf[extra_count] = .{ .name = "x-grok-client-version", .value = proxy_compatibility_version };
-    extra_count += 1;
+    if (compatibility) |*version| {
+        extra_headers_buf[extra_count] = .{ .name = "x-grok-client-version", .value = version.slice() };
+        extra_count += 1;
+    }
     extra_headers_buf[extra_count] = .{ .name = "x-grok-client-identifier", .value = "fx" };
     extra_count += 1;
     extra_headers_buf[extra_count] = .{ .name = "x-grok-model-override", .value = request.model };
@@ -963,6 +969,7 @@ const XaiTestEnvironment = struct {
         };
         errdefer self.map.deinit();
         try self.map.put(e2e_endpoint_env, responses_url);
+        try self.map.put("FX_E2E_GROK_CLIENT_VERSION", "1.0.6");
         io_mod.setEnvironMap(&self.map);
         return self;
     }

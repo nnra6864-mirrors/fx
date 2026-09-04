@@ -10,7 +10,7 @@ import { execFileSync, execSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, REPO_ROOT } from "../evals/eval-helpers";
+import { FX_BIN, REPO_ROOT, providerVersionTestEnv } from "../evals/eval-helpers";
 
 let sessionCounter = 0;
 
@@ -447,7 +447,7 @@ export class TmuxSession {
     const {
       cmd = FX_BIN,
       cwd = REPO_ROOT,
-      env = {},
+      env: requestedEnv = {},
       width = 120,
       height = 40,
       stderrPath,
@@ -457,6 +457,7 @@ export class TmuxSession {
       isolated = false,
       socketName,
     } = opts ?? {};
+    const env = providerVersionTestEnv(requestedEnv);
 
     if (
       minimumHistoryLines !== undefined &&

@@ -1655,7 +1655,7 @@ describe("cli: logout", () => {
   );
 
   test(
-    "fx logout removes a saved login rejected for unsafe permissions",
+    "fx logout removes an unsafe saved login and warns that it could not revoke it",
     async () => {
       const home = mkdtempSync(join(tmpdir(), "fx-e2e-logout-rejected-login-"));
       const issuer = startLogoutIssuer([200, 200]);
@@ -1674,7 +1674,9 @@ describe("cli: logout", () => {
 
         expect(logout.code).toBe(0);
         expect(logout.stdout).toBe("Signed out of fx.\n");
-        expect(logout.stderr).toBe("");
+        expect(logout.stderr).toBe(
+          "Warning: signed out locally, but the remote session could not be revoked.\n",
+        );
         expect(existsSync(authPath)).toBe(false);
         expect(issuer.requests).toEqual([]);
         for (const secret of [

@@ -1193,6 +1193,7 @@ fn writeAskUsage(deps: RunDeps, usage: []const u8) !void {
 }
 
 fn askErrorNotice(err: anyerror) ?[]const u8 {
+    if (auth_runtime.preparationFailureNotice(err)) |notice| return notice;
     return switch (err) {
         error.ImagePreparationFailed => image_attachments.image_preparation_failed_notice,
         error.ModelImageCapabilityUnavailable => image_attachments.model_image_capability_unavailable_notice,
@@ -1489,6 +1490,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     if (cfg.auth_mode == .local and
         !options.continue_recovery and options.resume_target == null and startup.credential == null)
     {
+        if (startup.credential_load_failure) |failure| {
+            if (auth_runtime.preparationError(auth_runtime.classifyCredentialFailure(failure.source, failure.err))) |err| return err;
+        }
         return missingCredentialResult(alloc, options, startup.provider);
     }
 

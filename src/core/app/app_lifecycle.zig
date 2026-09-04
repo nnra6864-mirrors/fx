@@ -116,6 +116,7 @@ pub const StartupState = struct {
     workspace_root: []u8 = &.{},
     workspace_access: workspace_access.WorkspaceAccess = .{},
     credential: ?credentials.Credential = null,
+    credential_load_failure: ?credentials.LoadFailure = null,
     auth_mode: credentials.AuthMode = .local,
     credential_source_preference: ?credentials.Source = null,
     credential_onboarding_skipped: bool = false,
@@ -511,6 +512,7 @@ fn loadStartupStateFromOwnedWorkspace(
                 settings.credential_source,
             );
             state.credential = resolution.credential;
+            state.credential_load_failure = resolution.failure;
             state.stored_key_status = resolution.stored_key_status;
             state.fx_login_status = resolution.fx_login_status;
         }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const credentials = @import("credentials.zig");
 const browser_callback = @import("browser_callback.zig");
 const chatgpt_session = @import("chatgpt_session.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -57,13 +58,25 @@ const BrowserLoginContext = struct {
     redirect_uri: []u8,
     code_verifier: []u8,
     state: []u8,
+    pending_callback: ?browser_callback.Accepted(BrowserCallback) = null,
 
     fn deinit(self: *BrowserLoginContext, alloc: Allocator) void {
+        self.finishCallback(alloc, false);
         self.listener.deinit(io_mod.getIo());
         alloc.free(self.redirect_uri);
         secret.zeroAndFree(alloc, self.code_verifier);
         secret.zeroAndFree(alloc, self.state);
         self.* = undefined;
+    }
+
+    fn finishCallback(self: *BrowserLoginContext, alloc: Allocator, saved: bool) void {
+        var callback = self.pending_callback orelse return;
+        self.pending_callback = null;
+        defer callback.deinit();
+        defer callback.callback.deinit(alloc);
+        callback.respond(if (saved) .ok else .failed) catch |err| {
+            debug_trace.logf("auth", "Codex completion response failed err={s}", .{@errorName(err)});
+        };
     }
 };
 
@@ -77,6 +90,7 @@ pub fn startSignIn(
     alloc: Allocator,
     transport: oauth_transport.Provider,
 ) !bool {
+    try credentials.requireSignInStorage(.chatgpt_subscription);
     const browser = try prepareBrowserSignIn(alloc);
     return runtime.startPrepared(
         alloc,
@@ -91,6 +105,7 @@ pub fn startSignIn(
             },
             .complete = completeSignIn,
             .save = saveSignIn,
+            .finish = finishSignIn,
         },
     );
 }
@@ -229,10 +244,11 @@ fn pollBrowserToken(
         context.state,
         cancel_flag,
     )) orelse return .pending;
-    defer {
+    var callback_owned = true;
+    defer if (callback_owned) {
         accepted.callback.deinit(alloc);
         accepted.deinit();
-    }
+    };
 
     var token = exchangeAuthorizationCodeForRedirectWithBounds(
         alloc,
@@ -248,7 +264,6 @@ fn pollBrowserToken(
         return err;
     };
     errdefer token.deinit(alloc);
-    try accepted.respond(.ok);
 
     const scope = try alloc.dupe(u8, "");
     errdefer if (scope.len > 0) alloc.free(scope);
@@ -258,6 +273,8 @@ fn pollBrowserToken(
     token.access_token = &.{};
     const refresh_token = token.refresh_token;
     token.refresh_token = &.{};
+    context.pending_callback = accepted;
+    callback_owned = false;
     return .{ .success = .{
         .access_token = access_token,
         .refresh_token = refresh_token,
@@ -341,6 +358,11 @@ fn saveSignIn(_: ?*anyopaque, alloc: Allocator, completion: login_flow.SignInCom
         .vercel, .grok => return error.InvalidSignInCompletion,
     };
     try chatgpt_session.saveNewSession(alloc, session);
+}
+
+fn finishSignIn(raw: ?*anyopaque, alloc: Allocator, saved: bool) void {
+    const context: *BrowserLoginContext = @ptrCast(@alignCast(raw.?));
+    context.finishCallback(alloc, saved);
 }
 
 pub fn runLogin(
@@ -428,6 +450,7 @@ fn refreshSession(
     mutation: *chatgpt_session.Mutation,
     session: *chatgpt_session.Session,
 ) !void {
+    try mutation.requireWritable();
     var body: std.Io.Writer.Allocating = .init(alloc);
     defer body.deinit();
     try body.writer.writeAll("{\"client_id\":");

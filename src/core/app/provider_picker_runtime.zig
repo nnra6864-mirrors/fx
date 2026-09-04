@@ -291,9 +291,10 @@ pub fn Runtime(comptime App: type) type {
                     const provider_slug = try app.alloc.dupe(u8, app.input_runtime.picker.provider_picker_pending_provider.items);
                     defer app.alloc.free(provider_slug);
 
-                    switch (try app_auth_runtime.Runtime(App).loadTeamsForProviderPicker(app)) {
+                    const teams = try app_auth_runtime.Runtime(App).loadTeamsForProviderPicker(app);
+                    switch (teams) {
                         .ready => {},
-                        .needs_sign_in => {
+                        .needs_sign_in, .blocked => {
                             // An ambient OIDC token satisfies oauth without a
                             // browser round trip; switch to it instead of
                             // forcing a sign-in it does not need.
@@ -301,6 +302,7 @@ pub fn Runtime(comptime App: type) type {
                                 try commitSource(app, source, provider);
                                 return true;
                             }
+                            if (teams == .blocked) return true;
                             app.input_runtime.picker.clearProviderPickerFlow();
                             app.input_runtime.inputResetState().clearCurrent(app.alloc);
                             try app_auth_runtime.Runtime(App).beginSignInForProviderPicker(app);

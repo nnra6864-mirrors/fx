@@ -317,7 +317,7 @@ pub const Runtime = struct {
         provider: model_catalog.Provider,
         access: credentials.CatalogAccess,
     ) void {
-        if (!self.beginLoad(access)) return;
+        if (!self.beginLoad(access, provider.refresh_interval_ms)) return;
 
         const owned_access = OwnedCatalogAccess.init(self.alloc, access) catch {
             self.markFailed(.{
@@ -347,7 +347,7 @@ pub const Runtime = struct {
         provider: model_catalog.Provider,
         access: credentials.CatalogAccess,
     ) void {
-        if (!self.beginLoad(access)) return;
+        if (!self.beginLoad(access, provider.refresh_interval_ms)) return;
 
         const result = model_catalog.fetchWithPublicFallback(provider, self.alloc, .{
             .access = access,
@@ -390,7 +390,7 @@ pub const Runtime = struct {
         self.mutex.unlock(io_mod.getIo());
     }
 
-    fn beginLoad(self: *Self, access: credentials.CatalogAccess) bool {
+    fn beginLoad(self: *Self, access: credentials.CatalogAccess, refresh_interval_ms: ?i64) bool {
         self.finishThreadIfDone();
 
         const requested_access = model_catalog.AccessMetadata.init(access);
@@ -421,13 +421,17 @@ pub const Runtime = struct {
 
         const now = io_mod.milliTimestamp();
         self.mutex.lockUncancelable(io_mod.getIo());
+        const expired = if (refresh_interval_ms) |interval|
+            now < self.last_attempt_ms or now - self.last_attempt_ms >= interval
+        else
+            false;
         const should_load = switch (self.state) {
             .idle => true,
             .failed => now - self.last_attempt_ms >= 1000,
             .ready => if (self.outcome.last_failure) |failed|
-                failed.failure.retryable and now - self.last_attempt_ms >= 1000
+                expired or (failed.failure.retryable and now - self.last_attempt_ms >= 1000)
             else
-                false,
+                expired,
             .loading => false,
         };
         if (!should_load) {
@@ -924,6 +928,24 @@ const StaleCatalog = struct {
         return .{ .context = self, .fetch_fn = fetch };
     }
 };
+
+test "model cache expires successful catalogs only when the provider requests refresh" {
+    for ([_]bool{ false, true }) |expires| {
+        var runtime = Runtime.init(std.testing.allocator, "/v1/models");
+        defer runtime.deinit();
+        var source = AuthChangeCatalog{ .model_id = "first" };
+        var provider = source.provider();
+        provider.refresh_interval_ms = if (expires) 60_000 else null;
+        runtime.loadCooperative(provider, .{ .public_only = .no_credential });
+        source.model_id = "new-release";
+        runtime.loadCooperative(provider, .{ .public_only = .no_credential });
+        try std.testing.expectEqual(@as(usize, 1), source.calls);
+        runtime.last_attempt_ms -= 60_000;
+        runtime.loadCooperative(provider, .{ .public_only = .no_credential });
+        try std.testing.expectEqual(@as(usize, if (expires) 2 else 1), source.calls);
+        try std.testing.expectEqualStrings(if (expires) "new-release" else "first", runtime.catalog.items[0].id);
+    }
+}
 
 test "model cache clears an old failure after a clean empty refresh" {
     var runtime = Runtime.init(std.testing.allocator, "/v1/models");

@@ -418,7 +418,11 @@ describe("host-managed authentication", () => {
   }
 
   test("runs Gateway Codex and Grok without local authentication headers", async () => {
-    const childEnv = env();
+    const childEnv = {
+      ...env(),
+      FX_E2E_CODEX_CLIENT_VERSION: "invalid-host-owned-version",
+      FX_E2E_GROK_CLIENT_VERSION: "invalid-host-owned-version",
+    };
     const status = await runFx(["status", "--json"], { cwd: workspace, env: childEnv });
     expect(status.code).toBe(0);
     expect(status.stderr).toBe("");
@@ -503,13 +507,15 @@ describe("host-managed authentication", () => {
       expect(request.headers.get("x-authenticateresponse"), request.path).toBeNull();
       expect(request.headers.get("x-grok-user-id"), request.path).toBeNull();
       expect(request.headers.get("x-userid"), request.path).toBeNull();
+      expect(request.headers.get("x-grok-client-version"), request.path).toBeNull();
     }
     for (const request of upstreamRequests) {
       expect(request.headers.get("authorization"), request.path).not.toBe(`Bearer ${BROKER_TOKEN}`);
       expect(request.headers.get("x-fx-host-protocol"), request.path).toBeNull();
     }
     const codexModels = brokerRequests.find((request) => request.path === "/fx/v1/codex/models");
-    expect(codexModels?.search).toBe("?client_version=0.148.0");
+    expect(codexModels?.search).toBe("");
+    expect(existsSync(join(home, ".fx", "provider-versions"))).toBe(false);
     expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
   }, TIMEOUT);
 

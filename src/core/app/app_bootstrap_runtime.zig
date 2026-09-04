@@ -388,19 +388,19 @@ pub fn Runtime(comptime App: type) type {
             }
             if (comptime @hasField(App, "auth")) {
                 const auth_view = app.auth.view();
-                if (auth_view.active_source == null and auth_view.stored_key_status == .unavailable) {
-                    debug_trace.logf("keychain", "interactive read skipped", .{});
-                    try app.writeDomainNotice(.{
-                        .topic = "keychain",
-                        .tone = .warning,
-                        .body = "fx could not access " ++ credentials.stored_key_backend_label ++ ". Continuing without an API key.",
-                    }, true);
-                }
-                if (auth_view.active_source == null and auth_view.fx_login_status == .unavailable) {
+                const load_error: ?anyerror = if (startup.credential_load_failure) |failure|
+                    failure.err
+                else if (auth_view.stored_key_status == .unavailable or auth_view.fx_login_status == .unavailable)
+                    error.CredentialStorageUnavailable
+                else
+                    null;
+                if (auth_view.active_source == null and load_error != null) {
+                    const body = try auth_runtime.preparationFailureText(app.alloc, startup.provider, load_error.?);
+                    defer app.alloc.free(body);
                     try app.writeDomainNotice(.{
                         .topic = "auth",
                         .tone = .warning,
-                        .body = "The saved fx login could not be loaded. No other credential was selected; run /login to repair this source.",
+                        .body = body,
                     }, true);
                 }
             }
