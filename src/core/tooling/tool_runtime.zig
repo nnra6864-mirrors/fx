@@ -355,6 +355,7 @@ pub fn executeToolCallAuthorized(
         request.command_replay_capture.?.abort(request.result_allocator);
     };
     var execution_ctx = ctx;
+    execution_ctx.model = request.model;
     if (request.permission_mode) |permission_mode| {
         execution_ctx.permission_mode = permission_mode;
     }
@@ -1002,6 +1003,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .max_read_file_lines = ctx.max_read_file_lines,
         .max_read_file_line_len = ctx.max_read_file_line_len,
         .max_tool_result_bytes = ctx.max_tool_result_bytes,
+        .agent_model = ctx.model,
         .tool_result_dir = ctx.tool_result_dir,
         .session_child_capability = ctx.session_child_capability,
         .ephemeral_command_replay = ctx.ephemeral_command_replay,

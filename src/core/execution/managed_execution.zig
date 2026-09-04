@@ -25,6 +25,7 @@ pub const StartCapturedInput = struct {
     cwd: []const u8,
     environment: command_environment.Environment,
     authority: command_admission.CommandExecutionAuthority,
+    agent_model: []const u8 = "",
     max_output_bytes: usize,
     timeout_ms: ?usize,
     command_artifact_dir: ?[]const u8,
@@ -168,6 +169,7 @@ const Entry = struct {
     command: []const u8,
     cwd: []const u8,
     environment: command_environment.Environment,
+    agent_model: []const u8 = "",
     max_output_bytes: usize,
     timeout_ms: ?usize,
     command_artifact_dir: ?[]const u8,
@@ -217,6 +219,7 @@ const Entry = struct {
         const cwd = try owned.dupe(u8, input.cwd);
         const execution_id = try owned.dupe(u8, input.execution_id);
         const environment = try dupeEnvironment(owned, input.environment);
+        const agent_model = try owned.dupe(u8, input.agent_model);
         const command_artifact_dir = if (input.command_artifact_dir) |path|
             try owned.dupe(u8, path)
         else
@@ -261,6 +264,7 @@ const Entry = struct {
             .command = command,
             .cwd = cwd,
             .environment = environment,
+            .agent_model = agent_model,
             .max_output_bytes = input.max_output_bytes,
             .timeout_ms = input.timeout_ms,
             .command_artifact_dir = command_artifact_dir,
@@ -369,6 +373,7 @@ const Entry = struct {
             std.mem.eql(u8, self.command, input.command) and
             std.mem.eql(u8, self.cwd, input.cwd) and
             self.environment.eql(input.environment) and
+            std.mem.eql(u8, self.agent_model, input.agent_model) and
             self.max_output_bytes == input.max_output_bytes and
             self.timeout_ms == input.timeout_ms and
             optionalStringEql(self.command_artifact_dir, input.command_artifact_dir);
@@ -429,6 +434,7 @@ const Entry = struct {
         const started_ms = io_mod.milliTimestamp();
         const routed = execution_router.executePreparedRoute(.{
             .max_command_output_bytes = self.max_output_bytes,
+            .agent_model = self.agent_model,
             .cancel_flag = &self.cancel,
             .force_cancel_flag = &self.force_cancel,
             .output_chunk_lifecycle_id = self.output_chunk_lifecycle_id,

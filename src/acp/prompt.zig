@@ -4441,6 +4441,7 @@ test "ACP prompt projection configures web search then blocks native execution" 
             .arguments_json = "{\"query\":\"current Zig release\"}",
         },
         .authority = .ordinary,
+        .model = "test/model",
         .session_grants = &.{},
         .advertised_dynamic_tool_names = &.{},
         .max_tool_result_bytes = session.max_tool_result_bytes,

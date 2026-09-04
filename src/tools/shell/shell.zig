@@ -567,6 +567,7 @@ fn callRun(
         .cwd = cwd,
         .environment = environment,
         .authority = authority,
+        .agent_model = ctx.agent_model,
         .max_output_bytes = ctx.max_command_output_bytes,
         .timeout_ms = if (input.timeout_ms) |value|
             std.math.cast(usize, value) orelse return unavailable(ctx)

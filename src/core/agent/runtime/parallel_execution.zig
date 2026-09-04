@@ -96,6 +96,7 @@ pub const ParallelRunResult = struct {
 pub const ParallelHookExecContext = struct {
     hooks: *const AgentRuntimeDeps,
     turn_id: u64,
+    model: []const u8,
     root_user_intent_context: []const u8,
     current_turn_messages: []const ChatMessage,
     session_grants: []const PermissionGrant,
@@ -281,6 +282,7 @@ pub fn parallelHookExecute(ctx: *anyopaque, alloc: Allocator, call: ToolCall, in
         .result_allocator = alloc,
         .call = call,
         .authority = .ordinary,
+        .model = exec_ctx.model,
         .permission_mode = exec_ctx.permission_mode,
         .root_user_intent_context = exec_ctx.root_user_intent_context,
         .current_turn_messages = exec_ctx.current_turn_messages,

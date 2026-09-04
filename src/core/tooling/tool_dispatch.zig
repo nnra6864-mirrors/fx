@@ -246,6 +246,7 @@ pub const DispatchContext = struct {
     max_read_file_line_len: usize = default_max_read_file_line_len,
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     max_command_output_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
+    agent_model: []const u8 = "",
     skills_dir: []const u8 = "",
     context_limits: context_limits.Values = .{},
     permission_ctx: ?*const PermissionContext = null,

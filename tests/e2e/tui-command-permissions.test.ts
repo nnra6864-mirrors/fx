@@ -3098,6 +3098,35 @@ describe("effect-aware command permissions", () => {
   );
 
   test(
+    "fx ask forwards agent identity and its resolved model to commands",
+    async () => {
+      const root = createIsolatedRoot();
+      const gateway = startFakeGateway([
+        toolCall(`printf '%s|%s' "$AI_AGENT" "$FX_MODEL"`),
+        finalText("agent environment complete"),
+      ]);
+      const result = await runFx(
+        ["ask", "--yolo", "--quiet", "--json", "--no-save", "Report the agent environment."],
+        {
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway, { FX_MODEL: undefined }),
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(result.stderr.toLowerCase()).not.toContain("error");
+      const json = JSON.parse(result.stdout.trim()) as { model: string };
+      expect(JSON.parse(toolResultText(gateway.requests[1].body, "command_1"))).toMatchObject({
+        state: "completed",
+        output_delta: `fx|${json.model}`,
+        exit_code: 0,
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
     "fx ask yolo executes pwd through the default user profile with process-scoped replay",
     async () => {
       const root = createIsolatedRoot();
