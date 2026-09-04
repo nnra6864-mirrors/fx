@@ -150,12 +150,6 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn hasQuery(app: *App) bool {
             if (comptime !supported(App)) return false;
-            // The queued-prompt review borrows the composer to edit drafts;
-            // a draft that happens to spell a picker path must not make
-            // arrows or Enter act on providers.
-            if (comptime @hasField(App, "queued_prompt_review")) {
-                if (app.queued_prompt_review.visible) return false;
-            }
             return app.input_runtime.picker.activeProviderPickerQuery(&app.input_runtime.edit_state) != null;
         }
 

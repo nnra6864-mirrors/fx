@@ -1,4 +1,5 @@
 const std = @import("std");
+const stream_provider = @import("../core/agent/stream_provider.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const io_mod = @import("../core/shared/io.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
@@ -208,6 +209,7 @@ pub fn buildGatewayRequiredToolRequestBodyWithMaxOutputTokens(
 pub fn buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
     alloc: std.mem.Allocator,
     tools_json: []const u8,
+    instructions: []const ChatMessage,
     messages: []const ChatMessage,
     target_call_id: []const u8,
     options: model_capabilities.ResolvedProviderOptions,
@@ -216,6 +218,8 @@ pub fn buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
     cancel_flag: *std.atomic.Value(bool),
 ) ![]u8 {
     const budget = BuildBudget{ .deadline = deadline, .cancel_flag = cancel_flag };
+    stream_provider.validate_prompt_lanes(instructions, messages) catch
+        return error.InvalidGatewayHistory;
     const expanded = try expandPendingToolReviewMessages(
         alloc,
         messages,
@@ -225,10 +229,16 @@ pub fn buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
     );
     defer alloc.free(expanded);
 
+    const prompt_len = try std.math.add(usize, instructions.len, expanded.len);
+    const prompt = try alloc.alloc(ChatMessage, prompt_len);
+    defer alloc.free(prompt);
+    @memcpy(prompt[0..instructions.len], instructions);
+    @memcpy(prompt[instructions.len..], expanded);
+
     return buildGatewayRequestBodyValidated(
         alloc,
         tools_json,
-        expanded,
+        prompt,
         options,
         "required",
         max_output_tokens,
@@ -238,8 +248,8 @@ pub fn buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
     );
 }
 
-/// Returns an owned message slice that closes the pending tool call before the
-/// reviewer instruction. Message contents remain borrowed from `messages`.
+/// Returns an owned message slice that closes the pending tool call. Message
+/// contents remain borrowed from `messages`.
 pub fn expandPendingToolReviewMessages(
     alloc: std.mem.Allocator,
     messages: []const ChatMessage,
@@ -252,23 +262,22 @@ pub fn expandPendingToolReviewMessages(
     try validatePendingToolReviewMessages(alloc, messages, target_call_id, budget);
     try budget.check();
 
-    const pending_index = messages.len - 2;
+    const pending_index = messages.len - 1;
     const pending = messages[pending_index];
     const expanded_len = try std.math.add(usize, messages.len, pending.tool_calls.len);
     const expanded = try alloc.alloc(ChatMessage, expanded_len);
     errdefer alloc.free(expanded);
 
-    @memcpy(expanded[0 .. pending_index + 1], messages[0 .. pending_index + 1]);
+    @memcpy(expanded[0..messages.len], messages);
     for (pending.tool_calls, 0..) |call, i| {
         try budget.check();
-        expanded[pending_index + 1 + i] = .{
+        expanded[messages.len + i] = .{
             .role = .tool,
             .content = pending_tool_review_result_text,
             .tool_call_id = call.id,
             .tool_name = call.name,
         };
     }
-    expanded[expanded.len - 1] = messages[messages.len - 1];
     try budget.check();
     try validateToolMessageHistory(alloc, expanded);
     try budget.check();
@@ -324,6 +333,14 @@ fn buildGatewayRequestBodyValidated(
     verified_image_override: ?VerifiedImageOverride,
 ) ![]u8 {
     if (budget) |active| try active.check();
+    var saw_conversation = false;
+    for (messages) |message| {
+        if (message.role == .system) {
+            if (saw_conversation) return error.InvalidGatewayHistory;
+        } else {
+            saw_conversation = true;
+        }
+    }
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -429,12 +446,10 @@ fn validatePendingToolReviewMessages(
     budget: BuildBudget,
 ) !void {
     try budget.check();
-    if (messages.len < 2 or target_call_id.len == 0) return error.InvalidGatewayHistory;
-    const pending = messages[messages.len - 2];
-    const instruction = messages[messages.len - 1];
+    if (messages.len < 1 or target_call_id.len == 0) return error.InvalidGatewayHistory;
+    const pending = messages[messages.len - 1];
     if (pending.role != .assistant or pending.tool_calls.len == 0) return error.InvalidGatewayHistory;
-    if (instruction.role != .system or instruction.content == null) return error.InvalidGatewayHistory;
-    try validateToolMessageHistory(alloc, messages[0 .. messages.len - 2]);
+    try validateToolMessageHistory(alloc, messages[0 .. messages.len - 1]);
     try budget.check();
     try validateAssistantToolCalls(alloc, pending.tool_calls);
     try budget.check();
@@ -1200,24 +1215,37 @@ test "required gateway request validates history" {
     );
 }
 
+test "gateway request rejects system messages after conversation" {
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "question" },
+        .{ .role = .system, .content = "late instruction" },
+    };
+
+    try std.testing.expectError(
+        error.InvalidGatewayHistory,
+        buildGatewayRequestBody(std.testing.allocator, "[]", &messages),
+    );
+}
+
 test "pending tool review closes the exact assistant step with synthetic pending results" {
     var cancel = std.atomic.Value(bool).init(false);
     const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
         .raw = .fromMilliseconds(1000),
     });
+    const instructions = [_]ChatMessage{.{ .role = .system, .content = "Review only install." }};
     const messages = [_]ChatMessage{
         .{ .role = .user, .content = "Install dependencies." },
         .{ .role = .assistant, .tool_calls = &.{
             .{ .id = "install", .name = "run_command", .arguments_json = "{\"command\":\"pnpm install\"}" },
             .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"package.json\"}" },
         } },
-        .{ .role = .system, .content = "Review only install." },
     };
 
     const body = try buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
         std.testing.allocator,
         "[]",
+        &instructions,
         &messages,
         "install",
         .{ .reasoning = types.ReasoningEffort.literal("minimal") },
@@ -1234,6 +1262,9 @@ test "pending tool review closes the exact assistant step with synthetic pending
         @as(usize, 2),
         std.mem.count(u8, body, "Tool call has not executed; it is pending permission review."),
     );
+    const system_index = std.mem.find(u8, body, "\"role\":\"system\"").?;
+    const user_index = std.mem.find(u8, body, "\"role\":\"user\"").?;
+    try std.testing.expect(system_index < user_index);
     try std.testing.expect(std.mem.find(u8, body, "\"maxOutputTokens\":2048") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"reasoning\":\"minimal\"") != null);
     try std.testing.expectError(
@@ -1242,19 +1273,63 @@ test "pending tool review closes the exact assistant step with synthetic pending
     );
 }
 
-test "pending tool review rejects missing or duplicate target ids" {
+test "pending review and model requests enforce the same prompt lanes" {
     var cancel = std.atomic.Value(bool).init(false);
     const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
         .raw = .fromMilliseconds(1000),
     });
     const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "Read this." },
+        .{ .role = .assistant, .tool_calls = &.{
+            .{ .id = "read", .name = "read_file", .arguments_json = "{}" },
+        } },
+    };
+    const invalid = [_]ChatMessage{
+        .{ .role = .user, .content = "not instructions" },
+        .{ .role = .system },
+        .{ .role = .system, .content = "rules", .provider_state_json = "{}" },
+        .{ .role = .system, .content = "rules", .permission_feedback = true },
+    };
+    for (invalid) |instruction| {
+        const request = stream_provider.RequestData{
+            .model = "review-model",
+            .instructions = &.{instruction},
+            .messages = &messages,
+            .tool_choice = .auto,
+            .provider_options = .{},
+        };
+        try std.testing.expectError(error.InvalidProviderPrompt, request.validatePrompt());
+        try std.testing.expectError(
+            error.InvalidGatewayHistory,
+            buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
+                std.testing.allocator,
+                "[]",
+                &.{instruction},
+                &messages,
+                "read",
+                .{},
+                2048,
+                deadline,
+                &cancel,
+            ),
+        );
+    }
+}
+
+test "pending tool review rejects missing or duplicate target ids" {
+    var cancel = std.atomic.Value(bool).init(false);
+    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(1000),
+    });
+    const instructions = [_]ChatMessage{.{ .role = .system, .content = "Review it." }};
+    const messages = [_]ChatMessage{
         .{ .role = .user, .content = "Run this." },
         .{ .role = .assistant, .tool_calls = &.{
             .{ .id = "duplicate", .name = "run_command", .arguments_json = "{}" },
             .{ .id = "duplicate", .name = "read_file", .arguments_json = "{}" },
         } },
-        .{ .role = .system, .content = "Review it." },
     };
 
     try std.testing.expectError(
@@ -1262,6 +1337,7 @@ test "pending tool review rejects missing or duplicate target ids" {
         buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
             std.testing.allocator,
             "[]",
+            &instructions,
             &messages,
             "duplicate",
             .{},
@@ -1275,6 +1351,7 @@ test "pending tool review rejects missing or duplicate target ids" {
         buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
             std.testing.allocator,
             "[]",
+            &instructions,
             &messages,
             "missing",
             .{},

@@ -16,7 +16,6 @@ const diagnostics = @import("../workspace/diagnostics.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
-const input_queue_runtime = @import("input_queue_runtime.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const io_mod = @import("../shared/io.zig");
@@ -1611,9 +1610,6 @@ pub fn Runtime(comptime App: type) type {
         fn beginLiveSessionCancellation(app: *App) void {
             app.worker.requestCancel();
             app.pacer.clear(app.alloc);
-            if (comptime @hasField(App, "queued_prompt_review")) {
-                input_queue_runtime.Runtime(App).reset(app);
-            }
             if (comptime @hasDecl(App, "clearPendingSubmissionForSessionTransition")) {
                 App.clearPendingSubmissionForSessionTransition(app);
             } else {

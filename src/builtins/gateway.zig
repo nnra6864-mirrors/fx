@@ -177,6 +177,7 @@ pub fn buildAgentRequest(
     alloc: Allocator,
     request: agent_stream_provider_contract.RequestData,
 ) anyerror![]u8 {
+    try request.validatePrompt();
     const budget: ?vercel_protocol.BuildBudget = if (request.budget) |value|
         .{ .deadline = value.deadline, .cancel_flag = value.cancel_flag }
     else
@@ -185,6 +186,15 @@ pub fn buildAgentRequest(
 
     const tools_json = try buildAgentToolsJson(alloc, request);
     defer alloc.free(tools_json);
+    const prompt_len = try std.math.add(
+        usize,
+        request.instructions.len,
+        request.messages.len,
+    );
+    const prompt = try alloc.alloc(shared_types.ChatMessage, prompt_len);
+    defer alloc.free(prompt);
+    @memcpy(prompt[0..request.instructions.len], request.instructions);
+    @memcpy(prompt[request.instructions.len..], request.messages);
 
     if (request.verified_images) |images| {
         const response_format = request.response_format orelse
@@ -192,7 +202,7 @@ pub fn buildAgentRequest(
         const body = try vercel_protocol.buildGatewayRequestBodyWithVerifiedImagesAndBudget(
             alloc,
             tools_json,
-            request.messages,
+            prompt,
             images,
             request.provider_options,
             request.tool_choice,
@@ -212,7 +222,7 @@ pub fn buildAgentRequest(
             vercel_protocol.buildGatewayRequestBodyWithOptionsAndBudget(
                 alloc,
                 tools_json,
-                request.messages,
+                prompt,
                 request.provider_options,
                 request.tool_choice,
                 request.max_output_tokens,
@@ -222,7 +232,7 @@ pub fn buildAgentRequest(
             vercel_protocol.buildGatewayRequestBodyWithOptionsAndOutputLimit(
                 alloc,
                 tools_json,
-                request.messages,
+                prompt,
                 request.provider_options,
                 request.tool_choice,
                 request.max_output_tokens,
@@ -235,7 +245,7 @@ pub fn buildAgentRequest(
             vercel_protocol.buildGatewayRequiredToolRequestBodyWithOptionsAndBudget(
                 alloc,
                 tools_json,
-                request.messages,
+                prompt,
                 request.provider_options,
                 request.max_output_tokens,
                 active,
@@ -244,7 +254,7 @@ pub fn buildAgentRequest(
             vercel_protocol.buildGatewayRequiredToolRequestBodyWithOptionsAndOutputLimit(
                 alloc,
                 tools_json,
-                request.messages,
+                prompt,
                 request.provider_options,
                 request.max_output_tokens,
             );
@@ -363,9 +373,11 @@ fn finalizeAgentRequestBody(
 }
 
 test "agent request builder keeps default reasoning silent and emits output limit" {
+    const instructions = [_]shared_types.ChatMessage{.{ .role = .system, .content = "Be concise." }};
     const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
     const body = try buildAgentRequest(std.testing.allocator, .{
         .model = "anthropic/claude-opus-4.8",
+        .instructions = &instructions,
         .messages = &messages,
         .tool_choice = .auto,
         .provider_options = resolveGatewayProviderOptions(
@@ -378,8 +390,12 @@ test "agent request builder keeps default reasoning silent and emits output limi
     defer std.testing.allocator.free(body);
 
     try std.testing.expect(std.mem.find(u8, body, "\"maxOutputTokens\":32000") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"role\":\"system\",\"content\":\"Be concise.\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"role\":\"user\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"reasoning\"") == null);
-    try std.testing.expect(std.mem.find(u8, body, "\"providerOptions\"") == null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("providerOptions") == null);
 }
 
 test "agent request builder scopes the product user agent to GLM 5.2" {

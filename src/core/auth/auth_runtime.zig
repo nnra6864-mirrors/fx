@@ -661,6 +661,133 @@ const InventoryRefreshDeps = struct {
     probe: InventoryProbeFn,
 };
 
+pub const PromptCredentialRefreshStart = enum {
+    not_needed,
+    started,
+    pending,
+    failed,
+};
+
+pub const PromptCredentialRefreshPoll = union(enum) {
+    idle,
+    pending,
+    ready: credentials.Credential,
+    failed: struct {
+        source: credentials.Source,
+        err: anyerror,
+    },
+
+    pub fn deinit(self: *PromptCredentialRefreshPoll) void {
+        switch (self.*) {
+            .ready => |*credential| credential.deinit(std.heap.c_allocator),
+            .idle, .pending, .failed => {},
+        }
+        self.* = .idle;
+    }
+};
+
+const PromptCredentialRefreshTask = struct {
+    transport: oauth_transport.Provider,
+    source: credentials.Source,
+    expected_account_id: ?[]u8,
+    thread: ?std.Thread = null,
+    cancel_requested: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+    credential: ?credentials.Credential = null,
+    failure: ?anyerror = null,
+
+    fn start(
+        transport: oauth_transport.Provider,
+        source: credentials.Source,
+        expected_account_id: ?[]const u8,
+    ) !*PromptCredentialRefreshTask {
+        const alloc = std.heap.c_allocator;
+        const task = try alloc.create(PromptCredentialRefreshTask);
+        errdefer alloc.destroy(task);
+        const owned_account_id = if (expected_account_id) |account_id|
+            try alloc.dupe(u8, account_id)
+        else
+            null;
+        errdefer if (owned_account_id) |account_id| alloc.free(account_id);
+        task.* = .{
+            .transport = transport,
+            .source = source,
+            .expected_account_id = owned_account_id,
+        };
+        task.thread = try std.Thread.spawn(.{}, workerMain, .{task});
+        return task;
+    }
+
+    fn workerMain(self: *PromptCredentialRefreshTask) void {
+        self.credential = refreshCredentialForAccount(
+            self.cancellableTransport(),
+            std.heap.c_allocator,
+            self.source,
+            .if_needed,
+            self.expected_account_id,
+        ) catch |err| {
+            self.failure = err;
+            self.done.store(true, .release);
+            return;
+        };
+        if (self.credential == null) self.failure = error.CredentialRefreshUnavailable;
+        self.done.store(true, .release);
+    }
+
+    fn cancellableTransport(self: *PromptCredentialRefreshTask) oauth_transport.Provider {
+        return .{
+            .context = self,
+            .execute_fn = executeCancellable,
+        };
+    }
+
+    fn executeCancellable(
+        raw: ?*anyopaque,
+        alloc: Allocator,
+        request: oauth_transport.Request,
+    ) !oauth_transport.Response {
+        const self: *PromptCredentialRefreshTask = @ptrCast(@alignCast(raw.?));
+        var bounded = request;
+        bounded.cancel_flag = &self.cancel_requested;
+        return self.transport.execute(alloc, bounded);
+    }
+
+    fn poll(self: *const PromptCredentialRefreshTask) bool {
+        return self.done.load(.acquire);
+    }
+
+    fn takeResult(self: *PromptCredentialRefreshTask) PromptCredentialRefreshPoll {
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        const result: PromptCredentialRefreshPoll = if (self.credential) |credential|
+            .{ .ready = credential }
+        else
+            .{ .failed = .{
+                .source = self.source,
+                .err = self.failure orelse error.CredentialRefreshUnavailable,
+            } };
+        self.credential = null;
+        self.destroy();
+        return result;
+    }
+
+    fn deinit(self: *PromptCredentialRefreshTask) void {
+        self.cancel_requested.store(true, .seq_cst);
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        if (self.credential) |*credential| credential.deinit(std.heap.c_allocator);
+        self.credential = null;
+        self.destroy();
+    }
+
+    fn destroy(self: *PromptCredentialRefreshTask) void {
+        const alloc = std.heap.c_allocator;
+        if (self.expected_account_id) |account_id| alloc.free(account_id);
+        self.expected_account_id = null;
+        alloc.destroy(self);
+    }
+};
+
 const InventoryRefreshTask = struct {
     alloc: Allocator,
     thread: ?std.Thread = null,
@@ -1187,6 +1314,7 @@ pub const Runtime = struct {
     api_key_returns_to_root: bool = false,
     api_key_save: ApiKeySaveRuntime = .{},
     inventory_refresh_task: ?*InventoryRefreshTask = null,
+    prompt_credential_refresh_task: ?*PromptCredentialRefreshTask = null,
 
     pub fn init(
         validator: api_key_validator.Provider,
@@ -1229,7 +1357,7 @@ pub const Runtime = struct {
         auth_mode: credentials.AuthMode,
     ) void {
         comptime {
-            if (std.meta.fields(Self).len != 28) {
+            if (std.meta.fields(Self).len != 29) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
@@ -1262,11 +1390,14 @@ pub const Runtime = struct {
         storage.api_key_returns_to_root = false;
         storage.api_key_save = .{};
         storage.inventory_refresh_task = null;
+        storage.prompt_credential_refresh_task = null;
     }
 
     pub fn deinit(self: *Self, alloc: Allocator) void {
         if (self.inventory_refresh_task) |task| task.deinit();
         self.inventory_refresh_task = null;
+        if (self.prompt_credential_refresh_task) |task| task.deinit();
+        self.prompt_credential_refresh_task = null;
         self.api_key_save.deinit(alloc);
         self.sign_in_flow.deinit(alloc);
         self.clearSignInCodeInput(alloc, .runtime_deinit);
@@ -2138,6 +2269,7 @@ pub const Runtime = struct {
         credential: *credentials.Credential,
     ) auth_transition.CredentialChange {
         const change = self.preparedCredentialChange(credential.*);
+        self.cancelPromptCredentialRefresh();
         const source = credential.source;
         if (self.selected_credential) |*selected| selected.deinit(alloc);
 
@@ -2220,6 +2352,33 @@ pub const Runtime = struct {
                     loadRuntimeCredentialSource,
                 )),
         };
+    }
+
+    pub fn beginPromptCredentialRefresh(self: *Self) PromptCredentialRefreshStart {
+        if (comptime host_target.is_wasm) return .not_needed;
+        if (self.auth_mode == .host_managed) return .not_needed;
+        if (self.prompt_credential_refresh_task != null) return .pending;
+        const credential = self.selected_credential orelse return .not_needed;
+        if (!credentials.sourceRefreshable(credential.source)) return .not_needed;
+        self.prompt_credential_refresh_task = PromptCredentialRefreshTask.start(
+            self.oauth_transport,
+            credential.source,
+            credential.accountId(),
+        ) catch return .failed;
+        return .started;
+    }
+
+    pub fn pollPromptCredentialRefresh(self: *Self) PromptCredentialRefreshPoll {
+        const task = self.prompt_credential_refresh_task orelse return .idle;
+        if (!task.poll()) return .pending;
+        self.prompt_credential_refresh_task = null;
+        return task.takeResult();
+    }
+
+    pub fn cancelPromptCredentialRefresh(self: *Self) void {
+        const task = self.prompt_credential_refresh_task orelse return;
+        self.prompt_credential_refresh_task = null;
+        task.deinit();
     }
 
     pub fn refreshSelectedCredentialIfNeeded(

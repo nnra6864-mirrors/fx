@@ -22,7 +22,6 @@ const interaction_state = @import("../../ui/footer/interaction_state.zig");
 const render_request = @import("../../ui/render_request.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 
-const QueuePreview = worker_runtime.QueuePreview;
 const WorkerEvent = worker_runtime.WorkerEvent;
 const InputRuntime = core_input_runtime.Runtime;
 
@@ -252,10 +251,6 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
             return true;
-        }
-
-        pub fn queuePreview(app: *App) QueuePreview {
-            return app.worker.queuePreview();
         }
 
         pub fn syncQueuedPromptModel(app: *App, model: []const u8) !void {
@@ -507,10 +502,6 @@ pub fn Runtime(comptime App: type) type {
             }
 
             const modal_active = app.approval_prompt.isActive() or app.question_prompt.isActive();
-            const queue_review_active = if (comptime @hasField(@TypeOf(snapshot), "queue_review_reason"))
-                snapshot.queue_review_reason != null
-            else
-                false;
             const worker_events_pending = if (comptime @hasField(@TypeOf(snapshot), "pending_event_count"))
                 snapshot.pending_event_count > 0
             else
@@ -521,7 +512,7 @@ pub fn Runtime(comptime App: type) type {
                 !cancellation_stops_turn and
                 (snapshot.processing or
                     worker_events_pending or
-                    (snapshot.queued_count > 0 and !queue_review_active));
+                    snapshot.queued_count > 0);
             const awaiting_tool_terminal = snapshot.cancel_requested and
                 activeToolStatusCount(presenter) > 0;
             if (!modal_active and
@@ -1154,11 +1145,6 @@ const FakeWorker = struct {
     fn deinit(self: *FakeWorker) void {
         for (self.events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
         self.events.deinit(std.heap.c_allocator);
-    }
-
-    fn queuePreview(self: *FakeWorker) QueuePreview {
-        _ = self;
-        return .{};
     }
 
     fn pushEvent(self: *FakeWorker, alloc: std.mem.Allocator, event: WorkerEvent) !void {
@@ -2489,7 +2475,6 @@ test "core.app_worker_runtime suppresses route recovery activity while question 
         .stream = app.stream,
         .has_api_key = true,
         .model = "gpt-5.1",
-        .queued_count = 0,
         .question = .{
             .current_entry = null,
             .current_index = 0,

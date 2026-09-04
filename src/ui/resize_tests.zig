@@ -908,7 +908,6 @@ fn defaultFooterContext(input: *const InputRuntime) render_input.RenderContext {
         .stream = .{},
         .has_api_key = true,
         .model = "test-model",
-        .queued_count = 0,
         .input = input,
     };
 }
@@ -2385,12 +2384,12 @@ test "entry-bound shimmer is suppressed when footer banner covers its row" {
     try std.testing.expectEqual(status_row, try findRowContaining(&h, "bottom status row"));
     try expectGridNotContains(&h, "Overlay should fit");
 
-    ctx.queued_count = 1;
+    ctx.steering_messages = &.{"pending steering"};
     h.frame_redraw = true;
     try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
     try h.flush();
 
-    try expectGridContains(&h, "1 queued message");
+    try expectGridContains(&h, "pending steering");
     try expectGridNotContains(&h, "Overlay should fit");
     try std.testing.expect(!h.shell.shimmer_active);
 }
@@ -2410,13 +2409,13 @@ test "footer banner keeps a gap after entry-bound activity" {
 
     var ctx = defaultFooterContext(&input);
     setToolActivity(&ctx, status_id, "Overlay should be hidden by banner");
-    ctx.queued_count = 1;
+    ctx.steering_messages = &.{"pending steering"};
     h.frame_redraw = true;
     try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
     try h.flush();
 
     const activity_row = try findRowContaining(&h, "Opening file");
-    const banner_row = try findRowContaining(&h, "1 queued message");
+    const banner_row = try findRowContaining(&h, "pending steering");
     try expectExactlyOneBlankRowBetween(&h, activity_row, banner_row);
     try expectGridNotContains(&h, "Overlay should be hidden by banner");
     try std.testing.expect(!h.shell.shimmer_active);
@@ -2448,13 +2447,13 @@ test "footer banner reserves blank row after bottom entry-bound activity" {
 
     var ctx = defaultFooterContext(&input);
     setToolActivity(&ctx, status_id, "Creating project");
-    ctx.queued_count = 1;
+    ctx.steering_messages = &.{"pending steering"};
     h.frame_redraw = true;
     try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
     try h.flush();
 
     const activity_row = try findRowContaining(&h, "Creating project");
-    const banner_row = try findRowContaining(&h, "1 queued message");
+    const banner_row = try findRowContaining(&h, "pending steering");
     try expectExactlyOneBlankRowBetween(&h, activity_row, banner_row);
     try std.testing.expect(!h.shell.shimmer_active);
 
@@ -2463,7 +2462,7 @@ test "footer banner reserves blank row after bottom entry-bound activity" {
     try h.flush();
 
     const activity_row_after = try findRowContaining(&h, "Creating project");
-    const banner_row_after = try findRowContaining(&h, "1 queued message");
+    const banner_row_after = try findRowContaining(&h, "pending steering");
     try expectExactlyOneBlankRowBetween(&h, activity_row_after, banner_row_after);
     try std.testing.expect(!h.shell.shimmer_active);
 }
@@ -2496,13 +2495,13 @@ test "banner-suppressed overlay restore keeps reserved footer gap" {
     try h.flush();
     try std.testing.expect(!h.shell.shimmer_active);
 
-    ctx.queued_count = 1;
+    ctx.steering_messages = &.{"pending steering"};
     h.frame_redraw = true;
     try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
     try h.flush();
 
     const activity_row = try findRowContaining(&h, "Creating project");
-    const banner_row = try findRowContaining(&h, "1 queued message");
+    const banner_row = try findRowContaining(&h, "pending steering");
     try expectExactlyOneBlankRowBetween(&h, activity_row, banner_row);
     try std.testing.expect(!h.shell.shimmer_active);
 }
@@ -4308,7 +4307,7 @@ test "render engine preserves transcript footer activity behavior" {
     try expectGridNotContains(&h, "Overlay writing render-engine-plan");
     try std.testing.expectEqual(status_row, try findRowContaining(&h, "Writing render-engine-plan"));
 
-    ctx.queued_count = 1;
+    ctx.steering_messages = &.{"pending steering"};
     setToolActivity(&ctx, status_id, "Overlay hidden by banner");
     h.frame_redraw = true;
     try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
@@ -4317,7 +4316,7 @@ test "render engine preserves transcript footer activity behavior" {
     try expectGridNotContains(&h, "Overlay writing render-engine-plan");
     try std.testing.expect(!h.shell.shimmer_active);
     const restored_status_row = try findRowContaining(&h, "Writing render-engine-plan");
-    const banner_row = try findRowContaining(&h, "1 queued message");
+    const banner_row = try findRowContaining(&h, "pending steering");
     try expectGridNotContains(&h, "│ line two");
     try std.testing.expect(restored_status_row < banner_row);
     try std.testing.expect(banner_row < h.shell.layout.rows);
@@ -4402,7 +4401,7 @@ test "runtime decomposition preserves command output state and replaceable paint
     try std.testing.expectEqualStrings("hidden", h.shell.command_output_blocks.items[0].lines.items[1].text);
 }
 
-fn checkQueuedPromptAdmissionPreservesCommittedHistory(resize_before_cancel: bool) !void {
+fn checkNextPromptAdmissionPreservesCommittedHistory(resize_before_cancel: bool) !void {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 124, 36, 4);
     defer h.deinit();
@@ -4469,13 +4468,13 @@ fn checkQueuedPromptAdmissionPreservesCommittedHistory(resize_before_cancel: boo
     _ = try h.shell.writeUserPromptCard(
         alloc,
         &h.metrics,
-        .{ .text = @constCast("QUEUE_SCROLL_FIRST"), .images = &.{} },
+        .{ .text = @constCast("NEXT_PROMPT_SCROLL_FIRST"), .images = &.{} },
         true,
         &.{},
     );
     if (h.shell.transcriptCommitDiagnostic().state != .stable) {
         std.debug.print(
-            "queued prompt invalidated committed history resize={} diagnostic={any}\n",
+            "next prompt invalidated committed history resize={} diagnostic={any}\n",
             .{ resize_before_cancel, h.shell.transcriptCommitDiagnostic() },
         );
         return error.TestExpectedStableTranscript;
@@ -4495,15 +4494,15 @@ fn checkQueuedPromptAdmissionPreservesCommittedHistory(resize_before_cancel: boo
         h.shell.transcriptCommitDiagnostic().state,
     );
     try expectGridContains(&h, "SCROLLBACK_LINE_24");
-    try expectGridContains(&h, "QUEUE_SCROLL_FIRST");
+    try expectGridContains(&h, "NEXT_PROMPT_SCROLL_FIRST");
 }
 
-test "queued prompt admission preserves committed history at stable geometry" {
-    try checkQueuedPromptAdmissionPreservesCommittedHistory(false);
+test "next prompt admission preserves committed history at stable geometry" {
+    try checkNextPromptAdmissionPreservesCommittedHistory(false);
 }
 
-test "queued prompt admission preserves committed history after a settled resize" {
-    try checkQueuedPromptAdmissionPreservesCommittedHistory(true);
+test "next prompt admission preserves committed history after a settled resize" {
+    try checkNextPromptAdmissionPreservesCommittedHistory(true);
 }
 
 test "long context notice survives full transcript growth and later compact resizes" {

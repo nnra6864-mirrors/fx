@@ -352,6 +352,32 @@ function occurrenceCount(text: string, needle: string): number {
   return text.split(needle).length - 1;
 }
 
+function expectRestartedAcpResponse(
+  previousMessages: any[],
+  resumedMessages: any[],
+  partialText: string,
+  replacementText: string,
+): void {
+  const preview = previousMessages.find((message) =>
+    message.params?.update?.sessionUpdate === "agent_message_chunk" &&
+    message.params.update.content.text === partialText
+  )?.params.update;
+  expect(preview).toBeDefined();
+  const resumed = resumedMessages.filter((message) =>
+    message.params?.update?.sessionUpdate === "agent_message_chunk"
+  ).map((message) => message.params.update);
+  expect(resumed.map((update) => update.content.text)).toEqual([
+    "\n\n[Response interrupted. Restarting.]\n\n",
+    replacementText,
+  ]);
+  const ids = [preview.messageId, ...resumed.map((update) => update.messageId)];
+  for (const id of ids) {
+    expect(typeof id).toBe("string");
+    expect(id.length).toBeGreaterThan(0);
+  }
+  expect(new Set(ids).size).toBe(3);
+}
+
 function acpPromptText(body: string): string {
   return acpGatewayRequest(body).prompt
     .map((message) => acpContentText(message.content))
@@ -1429,11 +1455,11 @@ describe("acp: model-independent", () => {
     async () => {
       const root = createIsolatedRoot("fx-acp-model-recovery-");
       const partialText = "ACP partial output before EOF.";
-      const finalTextSuffix = "ACP recovery completed.";
+      const replacementText = `${partialText} ACP recovery completed.`;
       const gateway = startFakeGateway([
         partialEofResponse(partialText),
         ...Array.from({ length: 9 }, () => retryAfterUnavailable(0)),
-        finalText(`${partialText}${finalTextSuffix}`),
+        finalText(replacementText),
       ]);
       try {
         client = await AcpClient.create({
@@ -1469,8 +1495,11 @@ describe("acp: model-independent", () => {
           "Preserve this ACP prompt through recovery.",
         );
         const allUpdates = JSON.stringify([...paused.messages, ...resumed.messages]);
-        expect(occurrenceCount(allUpdates, partialText)).toBe(1);
-        expect(occurrenceCount(allUpdates, finalTextSuffix)).toBe(1);
+        expectRestartedAcpResponse(paused.messages, resumed.messages, partialText, replacementText);
+        expect(occurrenceCount(allUpdates, partialText)).toBe(2);
+        expect(occurrenceCount(allUpdates, replacementText)).toBe(1);
+        expect(gateway.requests[10]!.body).not.toContain(partialText);
+        expect(acpLatestPromptText(gateway.requests[10]!.body)).toContain("Restart that response");
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
@@ -1833,7 +1862,7 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-reload-model-recovery-");
       const toolEvidence = "ACP_RESTART_TOOL_EVIDENCE";
       const partialText = "ACP_RESTART_PARTIAL_SENTINEL";
-      const finalTextSuffix = "ACP_RESTART_FINAL_SENTINEL";
+      const replacementText = "ACP_RESTART_FINAL_SENTINEL";
       writeFileSync(join(root.workspace, "recovery-fixture.txt"), `${toolEvidence}\n`);
       const gateway = startFakeGateway([
         fakeGatewayToolCall("recovery_read_1", "read_file", {
@@ -1841,7 +1870,7 @@ describe("acp: model-independent", () => {
         }),
         partialEofResponse(partialText),
         ...Array.from({ length: 9 }, () => retryAfterUnavailable(0)),
-        finalText(`${partialText}${finalTextSuffix}`),
+        finalText(replacementText),
       ]);
       try {
         client = await AcpClient.create({
@@ -1899,8 +1928,11 @@ describe("acp: model-independent", () => {
           ...loadMessages,
           ...resumed.messages,
         ]);
+        expectRestartedAcpResponse(loadMessages, resumed.messages, partialText, replacementText);
         expect(occurrenceCount(restartedUpdates, partialText)).toBe(1);
-        expect(occurrenceCount(restartedUpdates, finalTextSuffix)).toBe(1);
+        expect(occurrenceCount(restartedUpdates, replacementText)).toBe(1);
+        expect(gateway.requests[11]!.body).not.toContain(partialText);
+        expect(acpLatestPromptText(gateway.requests[11]!.body)).toContain("Restart that response");
 
         await client.close();
         client = await AcpClient.create({
@@ -1928,11 +1960,83 @@ describe("acp: model-independent", () => {
         const completedLoadUpdates = JSON.stringify(completedLoadMessages);
         expect(completedLoadUpdates).not.toContain("modelResponseRecovery");
         expect(occurrenceCount(completedLoadUpdates, toolEvidence)).toBe(1);
-        expect(occurrenceCount(completedLoadUpdates, partialText)).toBe(1);
-        expect(occurrenceCount(completedLoadUpdates, finalTextSuffix)).toBe(1);
+        expect(occurrenceCount(completedLoadUpdates, partialText)).toBe(0);
+        expect(occurrenceCount(completedLoadUpdates, replacementText)).toBe(1);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP retains interrupted preview when the process dies during a retry",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-retry-crash-");
+      const partialText = "ACP_CRASH_PARTIAL_PREVIEW";
+      const toolEvidence = "ACP_CRASH_SETTLED_TOOL";
+      const replacementText = "ACP_CRASH_REPLACEMENT";
+      writeFileSync(join(root.workspace, "fixture.txt"), `${toolEvidence}\n`);
+      const held = heldFakeGatewayFinalText();
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("crash_read_1", "read_file", { path: "fixture.txt" }),
+        partialEofResponse(partialText),
+        held.response,
+        finalText(replacementText),
+      ]);
+      const proc = nodeSpawn(FX_BIN, ["acp"], {
+        cwd: root.workspace,
+        env: { ...process.env, ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      try {
+        client = new AcpClient(proc);
+        const sessionId = await startCodeSession(client);
+        sendPrompt(client, 40, "Read fixture.txt once and preserve its result through recovery.");
+        await waitForCondition("reserved retry request", () => gateway.requests.length === 3, TIMEOUT);
+        expect(gateway.requests[2]!.body).not.toContain(partialText);
+        const exited = client.waitForExit();
+        proc.kill("SIGKILL");
+        await exited;
+        expect(proc.signalCode).toBe("SIGKILL");
+
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 10);
+        client.send({
+          jsonrpc: "2.0",
+          id: 11,
+          method: "session/load",
+          params: { sessionId, mcpServers: [] },
+        });
+        const loaded: any[] = [];
+        while (true) {
+          const message = await client.readLine() as any;
+          if (message.id === 11) {
+            expect(message.error).toBeUndefined();
+            break;
+          }
+          loaded.push(message);
+        }
+        const loadUpdates = JSON.stringify(loaded);
+        expect(occurrenceCount(loadUpdates, partialText)).toBe(1);
+        expect(occurrenceCount(loadUpdates, toolEvidence)).toBe(1);
+
+        const resumed = await continueRecovery(client, TIMEOUT, sessionId);
+        expect(resumed.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(4);
+        expect(acpToolResultText(gateway.requests[3]!.body, "crash_read_1")).toContain(toolEvidence);
+        expect(gateway.requests[3]!.body).not.toContain(partialText);
+        expectRestartedAcpResponse(loaded, resumed.messages, partialText, replacementText);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        held.dispose();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }

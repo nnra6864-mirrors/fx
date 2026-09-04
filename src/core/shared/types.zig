@@ -483,7 +483,7 @@ pub const RouteRecoveryStatus = struct {
         };
         const action = switch (self.action orelse .retrying_request) {
             .retrying_request => "retrying request",
-            .continuing_response => "continuing response",
+            .continuing_response => "restarting response",
             .regenerating_tool => "regenerating unstarted tool",
             .continuing_after_tool => "continuing after confirmed tool",
             .reconciling_tool => "checking uncertain tool state",

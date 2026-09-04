@@ -2,7 +2,6 @@ const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
-const input_queue_runtime = @import("input_queue_runtime.zig");
 
 const CancellationTarget = enum {
     none,
@@ -46,8 +45,6 @@ test "cancellation target distinguishes agent turns and manual compaction" {
 
 pub fn InterruptRuntime(comptime App: type) type {
     return struct {
-        const queue_rt = input_queue_runtime.Runtime(App);
-
         pub fn hasActiveOperation(app: *App) bool {
             return activeCancellationTarget(app) != .none;
         }
@@ -79,12 +76,11 @@ pub fn InterruptRuntime(comptime App: type) type {
             const tool_active = activeToolStatusCount(app) > 0;
             debug_trace.logf("input", "cancel active operation queued={d}", .{app.worker.queuedPromptCount()});
             traceInterruptRequested(app, "input_active_stream");
-            const queue_review_opened = if (comptime @hasField(App, "queued_prompt_review"))
-                queue_rt.requestCancelAndOpen(app)
-            else blk: {
+            if (comptime @hasDecl(@TypeOf(app.worker), "requestInteractiveCancel")) {
+                app.worker.requestInteractiveCancel();
+            } else {
                 app.worker.requestCancel();
-                break :blk false;
-            };
+            }
             app.pacer.clear(app.alloc);
             if (comptime @hasDecl(App, "playCancelSound")) app.playCancelSound();
             if (tool_active) {
@@ -102,7 +98,7 @@ pub fn InterruptRuntime(comptime App: type) type {
                     );
                 }
             }
-            if (tool_active and !queue_review_opened) {
+            if (tool_active) {
                 app.shell.render_requests.request(.footer);
                 return;
             }

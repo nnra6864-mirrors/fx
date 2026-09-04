@@ -212,11 +212,7 @@ noinline fn parseWorkspaceCommand(rest: []const u8) !?workspace_commands.Action 
 }
 
 noinline fn tryBeginWorkspaceMutation(app: anytype) bool {
-    const queued_review_active = if (comptime @hasField(@TypeOf(app.*), "queued_prompt_review"))
-        app.queued_prompt_review.active()
-    else
-        false;
-    if (app.stream.active or queued_review_active) return false;
+    if (app.stream.active) return false;
     return app.worker.tryHoldTurnStart();
 }
 

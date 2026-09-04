@@ -85,6 +85,12 @@ const TeamCatalogValidation = union(enum) {
     }
 };
 
+pub const PendingPromptCredentialReadiness = enum {
+    pending,
+    current,
+    rejected,
+};
+
 pub fn Runtime(comptime App: type) type {
     return struct {
         fn ensurePromptCredential(app: *App) !bool {
@@ -689,6 +695,7 @@ pub fn Runtime(comptime App: type) type {
                 .tone = .neutral,
                 .body = "Using automatic credential precedence again.",
             }, true);
+            try resumePromptAfterAuth(app);
         }
 
         fn forgetCredentialSource(app: *App) void {
@@ -733,6 +740,7 @@ pub fn Runtime(comptime App: type) type {
                 .tone = .neutral,
                 .body = body,
             }, true);
+            try resumePromptAfterAuth(app);
             return true;
         }
 
@@ -1383,6 +1391,13 @@ pub fn Runtime(comptime App: type) type {
 
         fn refreshFxLoginCredentialIfNeeded(app: *App) !void {
             const change = try app.auth.refreshSelectedCredentialIfNeeded(app.alloc);
+            applyCredentialRefreshChange(app, change);
+        }
+
+        fn applyCredentialRefreshChange(
+            app: *App,
+            change: auth_transition.CredentialChange,
+        ) void {
             if (change == .none) return;
             reconcileGatewayCredential(app);
             if (app.auth.modelCatalogAccess().authorizationCredential() == null) return;
@@ -1404,6 +1419,74 @@ pub fn Runtime(comptime App: type) type {
             }
             if (!try ensurePromptCredential(app)) return false;
             return preparePromptCredential(app);
+        }
+
+        pub fn startPromptCredentialPrewarm(app: *App) void {
+            if (comptime !@hasDecl(@TypeOf(app.auth), "beginPromptCredentialRefresh")) return;
+            const outcome = app.auth.beginPromptCredentialRefresh();
+            debug_trace.logf(
+                "auth",
+                "prompt credential prewarm start outcome={s}",
+                .{@tagName(outcome)},
+            );
+        }
+
+        pub fn collectPendingPromptCredential(
+            app: *App,
+        ) !PendingPromptCredentialReadiness {
+            if (comptime host_target.is_wasm) {
+                return if (try admitPromptCredential(app)) .current else .rejected;
+            }
+            if (!try ensurePromptCredential(app)) return .rejected;
+            const source = app.auth.credentialSource() orelse return .rejected;
+            if (!credentials.sourceRefreshable(source)) {
+                return if (app.auth.gatewayCredential() != null) .current else .rejected;
+            }
+
+            var refresh = app.auth.pollPromptCredentialRefresh();
+            defer refresh.deinit();
+            switch (refresh) {
+                .idle => {
+                    return switch (app.auth.beginPromptCredentialRefresh()) {
+                        .started, .pending => .pending,
+                        .not_needed => if (app.auth.gatewayCredential() != null) .current else .rejected,
+                        .failed => if (try admitPromptCredential(app)) .current else .rejected,
+                    };
+                },
+                .pending => return .pending,
+                .failed => |failure| {
+                    _ = try recoverCredentialFailure(app, failure.source, failure.err);
+                    return .rejected;
+                },
+                .ready => |*refreshed| {
+                    var owned = try refreshed.clone(app.alloc);
+                    defer owned.deinit(app.alloc);
+                    const change = app.auth.adoptPreparedCredential(app.alloc, &owned);
+                    applyCredentialRefreshChange(app, change);
+                    return if (app.auth.gatewayCredential() != null) .current else .pending;
+                },
+            }
+        }
+
+        pub fn retryPendingPromptCredential(
+            app: *App,
+        ) !PendingPromptCredentialReadiness {
+            if (comptime host_target.is_wasm) {
+                return if (try admitPromptCredential(app)) .current else .rejected;
+            }
+            if (comptime @hasDecl(@TypeOf(app.auth), "credentialFailure")) {
+                if (app.auth.credentialFailure()) |failure| {
+                    if (!failure.retryable()) {
+                        return if (try preparePromptCredential(app)) .current else .rejected;
+                    }
+                }
+            }
+            app.auth.cancelPromptCredentialRefresh();
+            return switch (app.auth.beginPromptCredentialRefresh()) {
+                .started, .pending => .pending,
+                .not_needed => if (app.auth.gatewayCredential() != null) .current else .rejected,
+                .failed => if (try preparePromptCredential(app)) .current else .rejected,
+            };
         }
 
         fn preparePromptCredential(app: *App) !bool {
@@ -1531,6 +1614,9 @@ pub fn Runtime(comptime App: type) type {
 
         fn applyCredentialChange(app: *App, changed: bool) void {
             if (!changed) return;
+            if (comptime @hasDecl(@TypeOf(app.auth), "cancelPromptCredentialRefresh")) {
+                app.auth.cancelPromptCredentialRefresh();
+            }
             reconcileGatewayCredential(app);
             app.model_cache.reset();
             if (comptime @hasDecl(App, "startModelCacheWarmup")) {
@@ -1876,10 +1962,36 @@ const TestAuth = struct {
     sign_in_code_submit_succeeds: bool = true,
     inventory_refresh_action: ?auth_runtime.InventoryRefreshAction = null,
     inventory_refresh_fails: bool = false,
+    prompt_refresh_start: auth_runtime.PromptCredentialRefreshStart = .not_needed,
 
     fn credentialSource(self: *const TestAuth) ?credentials.Source {
         return self.active_source;
     }
+
+    fn view(self: *const TestAuth) auth_runtime.View {
+        return .{
+            .active_source = self.active_source,
+            .available_inactive_sources = .empty,
+            .selected_team = null,
+            .refreshable = if (self.active_source) |source|
+                credentials.sourceRefreshable(source)
+            else
+                false,
+            .stored_key_status = .not_attempted,
+            .fx_login_status = .not_attempted,
+            .onboarding_skipped = false,
+        };
+    }
+
+    fn beginPromptCredentialRefresh(self: *TestAuth) auth_runtime.PromptCredentialRefreshStart {
+        return self.prompt_refresh_start;
+    }
+
+    fn pollPromptCredentialRefresh(_: *TestAuth) auth_runtime.PromptCredentialRefreshPoll {
+        return .idle;
+    }
+
+    fn cancelPromptCredentialRefresh(_: *TestAuth) void {}
 
     fn selectSource(self: *TestAuth, _: std.mem.Allocator, source: credentials.Source) !?bool {
         self.selected_source = source;
@@ -2001,6 +2113,14 @@ const TestAuth = struct {
         return if (self.gateway_ready) .{ .api_key = "refreshed-key" } else null;
     }
 
+    fn adoptPreparedCredential(
+        self: *TestAuth,
+        _: std.mem.Allocator,
+        _: *credentials.Credential,
+    ) auth_transition.CredentialChange {
+        return self.refresh_change;
+    }
+
     fn modelCatalogAccess(self: *const TestAuth) credentials.CatalogAccess {
         return if (self.catalog_ready)
             credentials.catalogAccessForCredential(.fx_login, "refreshed-key", "team_123")
@@ -2015,6 +2135,10 @@ const TestAuth = struct {
 
     fn refreshSourceInventory(self: *TestAuth, _: std.mem.Allocator) !void {
         self.source_inventory_refresh_count += 1;
+    }
+
+    fn openOnboardingPicker(self: *TestAuth, _: std.mem.Allocator) void {
+        self.picker_opened = true;
     }
 
     fn refreshSourceInventoryForLogout(self: *TestAuth, _: std.mem.Allocator) !void {
@@ -2710,4 +2834,27 @@ test "prompt credential refresh allows only OutOfMemory to escape" {
     try std.testing.expect(!app.shell.render_requests.footer_requested);
     try std.testing.expectEqual(@as(usize, 0), app.auth.source_inventory_refresh_count);
     try std.testing.expect(!app.auth.picker_opened);
+}
+
+test "prompt credential refresh falls back when its task cannot start" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.auth.active_source = .fx_login;
+    app.auth.prompt_refresh_start = .failed;
+    app.auth.gateway_ready = false;
+    app.auth.gateway_ready_after_refresh_count = 1;
+
+    try std.testing.expectEqual(
+        PendingPromptCredentialReadiness.current,
+        try Runtime(TestApp).collectPendingPromptCredential(&app),
+    );
+    try std.testing.expectEqual(@as(usize, 1), app.auth.refresh_count);
+
+    app.auth.gateway_ready = false;
+    app.auth.gateway_ready_after_refresh_count = 2;
+    try std.testing.expectEqual(
+        PendingPromptCredentialReadiness.current,
+        try Runtime(TestApp).retryPendingPromptCredential(&app),
+    );
+    try std.testing.expectEqual(@as(usize, 2), app.auth.refresh_count);
 }

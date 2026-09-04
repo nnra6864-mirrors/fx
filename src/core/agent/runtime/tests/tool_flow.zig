@@ -5811,6 +5811,34 @@ test "processQueuedPrompt emits context notice for a continuing tool" {
     try std.testing.expectEqualStrings("second context notice", deps.context_notices.items[1]);
 }
 
+test "processQueuedPrompt projects a continuing tool notice as conversation" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    deps.exec_plans = &.{.{ .result = .{
+        .model_output = "tool output",
+        .system_notice = "continue with degraded visual evidence",
+    } }};
+    defer deps.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &deps, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyContainsInOrder(&gateway, 1, &.{
+        "\"toolName\":\"read_file\"",
+        "\"value\":\"tool output\"",
+        "\"role\":\"user\"",
+        "continue with degraded visual evidence",
+    });
+}
+
 test "parallel result assembly emits context notices in call order" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);

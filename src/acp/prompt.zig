@@ -1330,6 +1330,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
             ctx.state.active_session.?.credential_source,
         ),
         .flush_assistant_stream_per_content_chunk = host_target.is_wasm,
+        .render_assistant_text = false,
         .tool_registry = ctx.toolRegistry(),
         .context_registry = ctx.state.cfg.context_registry,
         .context_enabled = ctx.state.context_enabled,
@@ -2267,8 +2268,13 @@ fn pushRouteRecoveryStatus(
 fn pushText(raw_ctx: *anyopaque, emission: agent_runtime.TextEmission) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const text, const message_id = switch (emission) {
+        .assistant_started => {
+            ctx.message_kind = null;
+            return;
+        },
         .assistant_source => |text| .{ text, ctx.assistantMessageId() },
         .assistant_rendered => return,
+        .assistant_restarted => |text| .{ text, ctx.operationalMessageId() },
         .operational => |text| .{ text, ctx.operationalMessageId() },
     };
     if (text.len == 0) return;
@@ -3566,6 +3572,8 @@ test "ACP stream adapter forwards raw Markdown and suppresses rendered duplicate
         source_spans[1],
         source_spans[2],
         "status\n[docs](https://example.com)\n",
+        "Response interrupted. Restarting.\n",
+        "Replacement response.",
     };
     const operational_span =
         "\x1b[1mstatus\x1b[22m\n" ++
@@ -3596,6 +3604,11 @@ test "ACP stream adapter forwards raw Markdown and suppresses rendered duplicate
         }
         try deps.push_text(deps.ctx, .{ .assistant_source = "" });
         try deps.push_text(deps.ctx, .{ .operational = operational_span });
+        try deps.push_text(deps.ctx, .{ .assistant_restarted = "Response interrupted. Restarting.\n" });
+        const interrupted_message_id = ctx.message_id;
+        try deps.push_text(deps.ctx, .assistant_started);
+        try deps.push_text(deps.ctx, .{ .assistant_source = "Replacement response." });
+        try std.testing.expect(!std.mem.eql(u8, &interrupted_message_id, &ctx.message_id));
         try capture.sync(io_mod.getIo());
     }
 

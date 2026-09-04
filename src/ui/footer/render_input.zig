@@ -405,14 +405,10 @@ pub fn modelMenuProjection(cache: *const model_cache_runtime.Runtime) ModelMenuP
 
 const max_static_status_activity_rows: u16 = 3;
 
-pub const QueuedPromptCard = struct {
-    bytes: []const u8,
-    editing: bool = false,
-};
-
 pub const RenderContext = struct {
     slash_registry: command_specs.SlashRegistry = .{},
     stream: StreamState,
+    pending_prompt_activity: bool = false,
     completed_assistant_presentation_tail: bool = false,
     // Pacer emitting visible text, including the post-finish tail drain.
     writing_response: bool = false,
@@ -421,14 +417,8 @@ pub const RenderContext = struct {
     pending_images: []const types.ImageAttachment = &.{},
     composer_visible: bool = true,
     permission_mode: types.PermissionMode = .ask,
-    queued_count: usize,
     steering_messages: []const []const u8 = &.{},
     steering_waits_for_tool: bool = false,
-    queued_paused: bool = false,
-    queued_cancel_all_available: bool = false,
-    queued_prompt_cards: []const QueuedPromptCard = &.{},
-    queued_prompt_card_rows: u16 = 0,
-    queued_editor_active: bool = false,
     fast_indicator_active: bool = false,
     effort: types.ReasoningEffort = .auto,
     model_supports_effort: bool = false,
@@ -493,51 +483,8 @@ pub fn activeCompactCommandMenu(ctx: RenderContext) ?CompactCommandMenuProjectio
     return null;
 }
 
-// Trailing blank row that keeps the collapsed summary off the composer.
-pub const collapsed_queue_banner_gap_rows: u16 = 1;
+pub const steering_composer_gap_rows: u16 = 1;
 pub const max_steering_message_rows: u16 = 2;
-
-// Expanded cards plus one blank row between adjacent prompts, so queued drafts
-// read as separate items instead of a single connected block.
-pub fn queuedCardContentRows(ctx: RenderContext) u16 {
-    const between_cards: u16 = @intCast(@min(
-        ctx.queued_prompt_cards.len -| 1,
-        std.math.maxInt(u16),
-    ));
-    return ctx.queued_prompt_card_rows +| between_cards;
-}
-
-// Blank rows framing the expanded cards: one closing the band off the composer,
-// plus one above the paused hint so it reads as the block's footer.
-pub fn queuedCardSpacerRows(ctx: RenderContext) u16 {
-    const above_hint: u16 = @intFromBool(ctx.queued_paused);
-    return 1 +| above_hint;
-}
-
-pub const QueuedBannerFacts = struct {
-    queued_count: usize = 0,
-    paused: bool = false,
-    card_count: usize = 0,
-    card_rows: u16 = 0,
-    steering_rows: u16 = 0,
-};
-
-pub fn queuedBannerRowsForFacts(facts: QueuedBannerFacts) u16 {
-    if (facts.queued_count == 0) return 0;
-    const paused_hint_rows: u16 = @intFromBool(facts.paused);
-    if (facts.steering_rows > 0) {
-        return facts.steering_rows +| paused_hint_rows +| collapsed_queue_banner_gap_rows;
-    }
-    if (facts.card_rows > 0) {
-        const between_cards: u16 = @intCast(@min(
-            facts.card_count -| 1,
-            std.math.maxInt(u16),
-        ));
-        const spacer_rows: u16 = 1 +| paused_hint_rows;
-        return facts.card_rows +| between_cards +| paused_hint_rows +| spacer_rows;
-    }
-    return 1 +| paused_hint_rows +| collapsed_queue_banner_gap_rows;
-}
 
 pub fn steeringMessageRows(message: []const u8, width: u16) u16 {
     const content_width = width -| 2;
@@ -545,50 +492,44 @@ pub fn steeringMessageRows(message: []const u8, width: u16) u16 {
     return if (text_utils.terminalSafeVisibleWidth(message) <= content_width) 1 else max_steering_message_rows;
 }
 
-fn steeringRows(ctx: RenderContext, width: u16) u16 {
-    if (!ctx.steering_waits_for_tool) {
-        return @intCast(@min(ctx.steering_messages.len, std.math.maxInt(u16)));
+pub fn steeringBannerRowsForMessages(
+    messages: []const []const u8,
+    waits_for_tool: bool,
+    width: u16,
+) u16 {
+    if (messages.len == 0) return 0;
+    if (!waits_for_tool) {
+        return @as(u16, @intCast(@min(messages.len, std.math.maxInt(u16)))) +|
+            steering_composer_gap_rows;
     }
     var rows: u16 = 0;
-    for (ctx.steering_messages) |message| {
+    for (messages) |message| {
         rows +|= steeringMessageRows(message, width);
     }
-    return rows;
+    return rows +| steering_composer_gap_rows;
 }
 
-pub fn queuedBannerRows(ctx: RenderContext, width: u16) u16 {
-    return queuedBannerRowsForFacts(.{
-        .queued_count = ctx.queued_count,
-        .paused = ctx.queued_paused,
-        .card_count = ctx.queued_prompt_cards.len,
-        .card_rows = ctx.queued_prompt_card_rows,
-        .steering_rows = steeringRows(ctx, width),
-    });
+pub fn steeringBannerRows(ctx: RenderContext, width: u16) u16 {
+    return steeringBannerRowsForMessages(
+        ctx.steering_messages,
+        ctx.steering_waits_for_tool,
+        width,
+    );
 }
 
-test "queued banner row policy consumes aggregate card facts" {
-    try std.testing.expectEqual(@as(u16, 2), queuedBannerRowsForFacts(.{
-        .queued_count = 2,
-    }));
-    try std.testing.expectEqual(@as(u16, 3), queuedBannerRowsForFacts(.{
-        .queued_count = 2,
-        .paused = true,
-    }));
-    try std.testing.expectEqual(@as(u16, 3), queuedBannerRowsForFacts(.{
-        .queued_count = 2,
-        .steering_rows = 2,
-    }));
-    try std.testing.expectEqual(@as(u16, 7), queuedBannerRowsForFacts(.{
-        .queued_count = 2,
-        .card_count = 2,
-        .card_rows = 5,
-    }));
-    try std.testing.expectEqual(@as(u16, 9), queuedBannerRowsForFacts(.{
-        .queued_count = 2,
-        .paused = true,
-        .card_count = 2,
-        .card_rows = 5,
-    }));
+test "steering banner reserves message rows and one composer gap" {
+    try std.testing.expectEqual(
+        @as(u16, 0),
+        steeringBannerRowsForMessages(&.{}, true, 80),
+    );
+    try std.testing.expectEqual(
+        @as(u16, 3),
+        steeringBannerRowsForMessages(&.{ "first", "second" }, false, 80),
+    );
+    try std.testing.expectEqual(
+        @as(u16, 5),
+        steeringBannerRowsForMessages(&.{ "first steering message", "second steering message" }, true, 12),
+    );
 }
 
 pub fn transientActivityGapRows(shell: *const TranscriptRuntime, tool_before_activity: bool) u16 {
@@ -660,6 +601,9 @@ pub fn frameOwnedActivityProjection(
     approval: ?approval_prompt.Projection,
 ) ActivityProjection {
     if (approval != null or ctx.question != null) return .none;
+    if (!ctx.stream.active and ctx.pending_prompt_activity) {
+        return .{ .turn_thinking = .{ .label = "• Thinking" } };
+    }
     switch (ctx.activity) {
         .tool_slot => {},
         .turn_thinking => |thinking| {
@@ -879,13 +823,42 @@ test "frame-owned thinking activity projects the thinking label" {
         .stream = .{ .active = true },
         .has_api_key = true,
         .model = "gpt-5.1",
-        .queued_count = 0,
         .shimmer_pos = 0,
         .input = &input,
     };
 
     var dot_buf: [128]u8 = undefined;
     switch (frameOwnedActivityProjection(&dot_buf, &shell, ctx, null)) {
+        .turn_thinking => |thinking| try std.testing.expectEqualStrings("• Thinking", thinking.label),
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+}
+
+test "pending prompt projects thinking before the worker stream starts" {
+    var input = InputRuntime{};
+    defer input.deinit(std.testing.allocator);
+    var shell = TranscriptRuntime{};
+    defer shell.deinit(std.testing.allocator);
+    const ctx: RenderContext = .{
+        .stream = .{},
+        .pending_prompt_activity = true,
+        .has_api_key = true,
+        .model = "gpt-5.1",
+        .input = &input,
+    };
+
+    var label_buf: [128]u8 = undefined;
+    switch (frameOwnedActivityProjection(&label_buf, &shell, ctx, null)) {
+        .turn_thinking => |thinking| try std.testing.expectEqualStrings("• Thinking", thinking.label),
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+
+    var retry_ctx = ctx;
+    retry_ctx.activity = .{ .turn_thinking = .{
+        .label = "Previous request failed",
+        .tone = .danger,
+    } };
+    switch (frameOwnedActivityProjection(&label_buf, &shell, retry_ctx, null)) {
         .turn_thinking => |thinking| try std.testing.expectEqualStrings("• Thinking", thinking.label),
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
@@ -902,7 +875,6 @@ test "frame-owned activity renders the thinking elapsed counter from the frame c
         .now_ms = 4_200,
         .has_api_key = true,
         .model = "gpt-5.1",
-        .queued_count = 0,
         .input = &input,
     };
 
@@ -925,7 +897,6 @@ test "frame-owned activity keeps active tools out of the turn status row" {
         .stream = .{ .active = true, .last_activity_kind = .read, .read_count = 1 },
         .has_api_key = true,
         .model = "gpt-5.1",
-        .queued_count = 0,
         .activity = .{ .tool_slot = .{
             .entry_id = 123,
             .fallback_label = "reading src/main.zig",
@@ -967,7 +938,6 @@ test "current frame-owned activity leaves the focused tool in the transcript" {
         },
         .has_api_key = true,
         .model = "test-model",
-        .queued_count = 0,
         .activity = .{ .tool_slot = .{
             .entry_id = 123,
             .fallback_label = "● Running\x1b[0m \x1b[38;5;245mzig build test\x1b[0m\n",
@@ -1031,7 +1001,6 @@ test "frame-owned activity preserves route recovery status tone" {
         .stream = .{},
         .has_api_key = true,
         .model = "gpt-5.1",
-        .queued_count = 0,
         .activity = .{ .turn_thinking = .{
             .label = "⚠ API error · attempt 1/3 failed · retrying",
             .tone = .warning,
@@ -1077,7 +1046,6 @@ test "frame-owned activity shows live streaming token progress" {
         .writing_response = true,
         .has_api_key = true,
         .model = "test-model",
-        .queued_count = 0,
         .activity = .none,
         .now_ms = 13_000,
         .input = &input,
@@ -1177,7 +1145,6 @@ test "frame-owned activity uses clipped command activity label" {
         },
         .has_api_key = true,
         .model = "gpt-5.1",
-        .queued_count = 0,
         .activity = .{ .tool_slot = .{
             .entry_id = 123,
             .fallback_label = "running read-only tools",

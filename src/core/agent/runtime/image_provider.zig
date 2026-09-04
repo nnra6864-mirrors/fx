@@ -58,10 +58,8 @@ pub fn inspect(
     images: []const image_attachments.VerifiedSnapshot,
     request: Request,
 ) !Inspection {
-    const messages = [_]ChatMessage{
-        .{ .role = .system, .content = system_prompt },
-        .{ .role = .user, .content = user_prompt },
-    };
+    const instructions = [_]ChatMessage{.{ .role = .system, .content = system_prompt }};
+    const messages = [_]ChatMessage{.{ .role = .user, .content = user_prompt }};
     var capture = StreamCapture{
         .alloc = alloc,
         .max_bytes = request.capture_limit_bytes,
@@ -84,6 +82,7 @@ pub fn inspect(
             .session_id = request.session_id,
             .model = model,
             .retry_count = request.retry_count,
+            .instructions = &instructions,
             .messages = &messages,
             .tool_choice = .none,
             .provider_options = .{},

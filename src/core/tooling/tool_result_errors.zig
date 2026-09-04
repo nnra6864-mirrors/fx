@@ -84,6 +84,16 @@ pub fn inspectTerminalActionFieldCorrection(
         .string => |value| value,
         else => return null,
     };
+    if (std.mem.eql(u8, code, "invalid_shell_request")) {
+        const executed = error_value.get("executed") orelse return null;
+        if (executed != .bool or executed.bool) return null;
+        const problems = error_value.get("problems") orelse return null;
+        if (problems != .array or problems.array.items.len == 0) return null;
+        for (problems.array.items) |problem| {
+            if (problem != .string) return null;
+        }
+        return .{ .invalid_field_count = problems.array.items.len };
+    }
     if (!std.mem.eql(u8, code, terminal_action_field_error_code)) return null;
     const action = error_value.get("action") orelse return null;
     if (action != .string) return null;

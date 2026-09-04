@@ -28,7 +28,6 @@ import {
   contentText,
 } from "./conditional-guidance-oracle";
 import {
-  classifierEvidenceFromRequest,
   composerContains,
   fakeGatewayFinalText,
   fakeGatewayPermissionDecision,
@@ -776,12 +775,6 @@ function normalizedPaneText(pane: string): string {
 function countOccurrences(value: string, needle: string): number {
   if (needle.length === 0) throw new Error("needle must not be empty");
   return value.split(needle).length - 1;
-}
-
-function queuedSummaryText(count: number): string {
-  return count === 1
-    ? "1 queued message · ↑ to edit"
-    : `${count} queued messages · ↑ to edit`;
 }
 
 function writeDelayedMcpFixture(
@@ -2367,7 +2360,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         [
           partialEofResponse(partialText),
           ...Array.from({ length: 9 }, () => retryAfterUnavailable(0)),
-          fakeGatewayFinalText(`${partialText}${finalText}`),
+          fakeGatewayFinalText(finalText),
         ],
       );
 
@@ -2383,6 +2376,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(queuedGateway.requests).toHaveLength(11);
       expect(scrollback.split(partialText).length - 1).toBe(1);
       expect(scrollback.split(finalText).length - 1).toBe(1);
+      expect(scrollback).toContain("Response interrupted. Restarting.");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT * 2,
@@ -2453,10 +2447,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "provider error after assistant output continues the same visible response",
+    "provider error after assistant output restarts a separate visible response",
     async () => {
       const firstCatalogModel = "anthropic/claude-fable-5";
-      const finalText = "partial unsafe output completed";
+      const finalText = "A complete replacement response.";
       const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
         "fx-tui-route-unsafe-text-",
         [providerErrorAfterTextResponse(), fakeGatewayFinalText(finalText)],
@@ -2960,7 +2954,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(splitGateway.requests[1]!.body).toContain("<user_steering>");
       expect(splitGateway.requests[1]!.body).toContain(SPLIT_NEW_USER_PROMPT);
       const trace = readFileSync(tracePath, "utf8");
-      expect(trace).not.toContain("event=queue_review_started");
       expect(scrollback).toContain("SPLIT_OLD_TAIL_FINAL");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(existsSync(tapePath)).toBe(true);
@@ -3326,7 +3319,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
       expect(continuedBody).toContain("live user update");
       expect(trace).toContain("event=prompt_steering_consumed");
-      expect(trace).not.toContain("event=queue_review_started");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);
@@ -3434,9 +3426,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(continuedBody).not.toContain("Interrupted by user after completing");
       const trace = readFileSync(tracePath, "utf8");
       expect(trace).toContain("outcome_kind=steering_handoff");
-      expect(trace).not.toContain("event=queue_review_started");
       const scrollback = await session.captureFullScrollback();
-      expect(scrollback).not.toContain(queuedSummaryText(1));
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);
@@ -3516,7 +3506,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(continuedBody).toContain("<user_steering>");
       const trace = readFileSync(tracePath, "utf8");
       expect(trace).toContain("event=prompt_steering_consumed");
-      expect(trace).not.toContain("event=queue_review_started");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);
@@ -3591,7 +3580,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(continuedBody).toContain(steering);
       expect(trace).toContain("steering_pending=true");
       expect(trace).toContain("outcome_kind=interrupted");
-      expect(trace).not.toContain("event=queue_review_started");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);
@@ -3755,7 +3743,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(steeringPromptIndex).toBeGreaterThanOrEqual(0);
       expect(steeringDoneIndex).toBeGreaterThan(steeringPromptIndex);
       expect(countOccurrences(finalScrollback, steeringPrompt)).toBe(1);
-      expect(finalScrollback).not.toContain(queuedSummaryText(1));
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(existsSync(tapePath)).toBe(true);
       expect(session.isAlive()).toBe(true);

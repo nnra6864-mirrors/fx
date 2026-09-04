@@ -55,31 +55,6 @@ pub const ComposedInputRows = struct {
     }
 };
 
-// Ordinary queued work stays collapsed until review opens.
-pub fn composeQueuedSummaryRow(
-    alloc: Allocator,
-    queued_count: usize,
-    queued_paused: bool,
-    width: u16,
-) !std.ArrayList(u8) {
-    var row: std.ArrayList(u8) = .empty;
-    try row.appendSlice(alloc, ui_render.hint_style);
-
-    // The paused hint row already owns the controls, so it drops the affordance.
-    const affordance = if (queued_paused) "" else " · ↑ to edit";
-    var row_buf: [max_top_row_len]u8 = undefined;
-    const label = if (queued_count == 0)
-        "queued"
-    else if (queued_count == 1)
-        std.fmt.bufPrint(&row_buf, "1 queued message{s}", .{affordance}) catch "1 queued message"
-    else
-        std.fmt.bufPrint(&row_buf, "{d} queued messages{s}", .{ queued_count, affordance }) catch "queued messages";
-
-    try row_text.appendClipped(alloc, &row, label, width);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
-}
-
 fn appendSteeringMessageRow(
     alloc: Allocator,
     composed: *ComposedInputRows,
@@ -169,35 +144,6 @@ pub fn composeImmediateSteeringMessageRow(
     return row;
 }
 
-pub fn composeQueueReviewHintRow(
-    alloc: Allocator,
-    width: u16,
-    empty_draft: bool,
-    cancel_all_available: bool,
-) !std.ArrayList(u8) {
-    var row: std.ArrayList(u8) = .empty;
-    try row.appendSlice(alloc, ui_render.dim_style);
-    const hint = if (cancel_all_available)
-        "paused · enter to send · press esc to cancel all queued"
-    else if (empty_draft)
-        "paused · delete again to remove queued prompt · enter to send unchanged"
-    else
-        "paused · enter to send";
-    try row_text.appendClipped(alloc, &row, hint, width);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
-}
-
-test "collapsed queue banner counts the waiting prompts and offers the review" {
-    var single = try composeQueuedSummaryRow(std.testing.allocator, 1, false, 80);
-    defer single.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, single.items, "1 queued message · ↑ to edit") != null);
-
-    var many = try composeQueuedSummaryRow(std.testing.allocator, 3, false, 80);
-    defer many.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, many.items, "3 queued messages · ↑ to edit") != null);
-}
-
 test "steering rows use the dotted rail without an escape hint" {
     var first = try composeSteeringMessageRows(std.testing.allocator, "First steer", 80, 2);
     defer first.deinit(std.testing.allocator);
@@ -243,29 +189,6 @@ test "steering rows visibly escape terminal control bytes" {
     try std.testing.expect(std.mem.find(u8, unsafe.rows.items[0].items, "┋ before\\x1b[2Jafter") != null);
     try std.testing.expect(std.mem.find(u8, unsafe.rows.items[0].items, "Esc to steer now") == null);
     try std.testing.expect(std.mem.find(u8, unsafe.rows.items[0].items, "\x1b[2J") == null);
-}
-
-test "collapsed queue banner drops the affordance while the review is paused" {
-    var row = try composeQueuedSummaryRow(std.testing.allocator, 2, true, 80);
-    defer row.deinit(std.testing.allocator);
-
-    try std.testing.expect(std.mem.find(u8, row.items, "2 queued messages") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "↑ to edit") == null);
-}
-
-test "queue review hint explains empty draft deletion" {
-    var row = try composeQueueReviewHintRow(std.testing.allocator, 100, true, false);
-    defer row.deinit(std.testing.allocator);
-
-    try std.testing.expect(std.mem.find(u8, row.items, "delete again to remove queued prompt") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "enter to send unchanged") != null);
-}
-
-test "post-cancel queue review hint offers cancelling every queued prompt" {
-    var row = try composeQueueReviewHintRow(std.testing.allocator, 100, false, true);
-    defer row.deinit(std.testing.allocator);
-
-    try std.testing.expect(std.mem.find(u8, row.items, "press esc to cancel all queued") != null);
 }
 
 // Ordered widest-first; every fallback keeps the enter/esc controls so narrow
@@ -434,16 +357,14 @@ pub fn measureRawInputGeometryPreparedWithProvider(
     show_file_query: bool,
     prepared_slash_completion_count: ?usize,
 ) RawInputGeometry {
-    const display_input: []const u8 = if (ctx.queued_editor_active) "" else ctx.input.edit_state.input.items;
-    const display_cursor: usize = if (ctx.queued_editor_active) 0 else ctx.input.edit_state.cursor;
-    const display_images: []const types.ImageAttachment = if (ctx.queued_editor_active) &.{} else ctx.pending_images;
-    const display_pasted_blocks: []const paste_blocks.PastedBlock = if (ctx.queued_editor_active) &.{} else ctx.input.entities.pasted_blocks.items;
-    const display_image_tokens: []const visual_layout.ImageTokenSpan = if (ctx.queued_editor_active) &.{} else ctx.input.entities.image_tokens.items;
-    const display_skill_tokens: []const visual_layout.SkillTokenSpan = if (ctx.queued_editor_active) &.{} else ctx.input.entities.skill_tokens.items;
+    const display_input = ctx.input.edit_state.input.items;
+    const display_cursor = ctx.input.edit_state.cursor;
+    const display_images = ctx.pending_images;
+    const display_pasted_blocks = ctx.input.entities.pasted_blocks.items;
+    const display_image_tokens = ctx.input.entities.image_tokens.items;
+    const display_skill_tokens = ctx.input.entities.skill_tokens.items;
     const slash_prefix = slashInputPrefix(ctx.slash_registry, ctx.input.edit_state.input.items);
-    const raw_anchor: ?usize = if (ctx.queued_editor_active)
-        null
-    else if (show_model_query)
+    const raw_anchor: ?usize = if (show_model_query)
         ctx.model_completion_anchor
     else if (show_provider_query)
         ctx.provider_picker_completion_anchor
@@ -567,7 +488,6 @@ fn authPickerInteractionHint(view: auth_runtime.PickerView, width: u16) ?[]const
 pub fn composeHintRow(
     alloc: Allocator,
     approval_active: bool,
-    active_label: ?[]const u8,
     ctx: RenderContext,
     width: u16,
 ) !std.ArrayList(u8) {
@@ -582,13 +502,10 @@ pub fn composeHintRow(
         null;
     var hint_buf: [max_status_line_len]u8 = undefined;
     const base_hint_line = ui_render.buildHintLine(
-        ctx.stream.active,
         approval_active,
         ctx.has_api_key or (ctx.auth_picker.active and ctx.auth_picker.include_skip),
         ctx.model,
         ctx.permission_mode,
-        ctx.queued_count -| ctx.steering_messages.len,
-        active_label,
         ctx.fast_indicator_active,
         ctx.effort,
         ctx.model_supports_effort,
@@ -1020,29 +937,6 @@ pub fn composeVisibleInputRows(
     return result;
 }
 
-// A queued prompt is an unsent draft, so it wears the composer's chrome instead
-// of a submitted-turn card. Rows stay newline-terminated for the banner painter.
-pub fn composeQueuedPromptCard(
-    alloc: Allocator,
-    source: visual_layout.Source,
-) ![]u8 {
-    const summary = visual_layout.summarize(source, null);
-    var rows = try composeVisibleInputRows(
-        alloc,
-        source,
-        .{ .first_row = 0, .row_count = summary.total_rows },
-    );
-    defer rows.deinit(alloc);
-
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    for (rows.rows.items) |row| {
-        try out.writer.writeAll(row.items);
-        try out.writer.writeByte('\n');
-    }
-    return out.toOwnedSlice();
-}
-
 pub fn appendInlineCompletionSuffix(
     alloc: Allocator,
     row: *std.ArrayList(u8),
@@ -1199,7 +1093,6 @@ fn testRenderContext(input: *const InputRuntime) RenderContext {
         .stream = .{},
         .has_api_key = true,
         .model = "gpt-5.1",
-        .queued_count = 0,
         .input = input,
     };
 }
@@ -1381,22 +1274,6 @@ test "trailing empty clipped composer row remains visibly nonempty" {
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(rows.rows.items[0].items) <= source.terminal_cols);
 }
 
-test "queued prompt card wears composer chrome without a card background" {
-    const alloc = std.testing.allocator;
-    const source = visual_layout.Source{
-        .input = "queued one\nqueued two",
-        .cursor = 0,
-        .terminal_cols = 40,
-    };
-
-    const card = try composeQueuedPromptCard(alloc, source);
-    defer alloc.free(card);
-    try std.testing.expect(std.mem.find(u8, card, "\x1b[48;") == null);
-    try std.testing.expect(std.mem.find(u8, card, "❯") == null);
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, card, "┃"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, card, "\n"));
-}
-
 test "footer raw input row composition matches hard newlines and soft wraps" {
     const alloc = std.testing.allocator;
     var hard_input = InputRuntime{};
@@ -1441,23 +1318,6 @@ test "footer raw geometry windows capped input around the cursor" {
     try std.testing.expect(geometry.window.first_row <= geometry.summary.cursor.row_index);
     try std.testing.expect(geometry.summary.cursor.row_index < geometry.window.first_row + geometry.window.row_count);
     try std.testing.expectEqual(geometry.window.row_count, geometry.total_lines);
-}
-
-test "queued editor keeps standalone composer geometry empty" {
-    const alloc = std.testing.allocator;
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    try input.edit_state.input.appendSlice(alloc, "first queued line\nsecond queued line");
-    input.edit_state.cursor = input.edit_state.input.items.len;
-
-    var ctx = testRenderContext(&input);
-    ctx.queued_editor_active = true;
-    const geometry = measureRawInputGeometry(ctx, 12, 20, true, false, false, false);
-
-    try std.testing.expectEqual(@as(usize, 1), geometry.summary.total_rows);
-    try std.testing.expectEqual(@as(u16, 1), geometry.total_lines);
-    try std.testing.expectEqual(@as(u16, 0), geometry.input_extra);
-    try std.testing.expectEqual(@as(usize, 0), geometry.summary.cursor.raw_offset);
 }
 
 test "footer image badges wrap atomically and close clipped OSC output" {
@@ -1713,12 +1573,11 @@ test "compose hint row keeps model in left hint text" {
         .stream = .{},
         .has_api_key = true,
         .model = "gpt-5.1",
-        .queued_count = 0,
         .fast_indicator_active = true,
         .input = &input,
     };
 
-    var row = try composeHintRow(std.testing.allocator, false, null, ctx, 32);
+    var row = try composeHintRow(std.testing.allocator, false, ctx, 32);
     defer row.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.startsWith(u8, row.items, ui_render.statusline_style));
@@ -1738,7 +1597,7 @@ test "compose hint row replaces model status with setup navigation" {
         .include_skip = false,
     };
 
-    var root = try composeHintRow(std.testing.allocator, false, null, ctx, 96);
+    var root = try composeHintRow(std.testing.allocator, false, ctx, 96);
     defer root.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, root.items, "↑↓ Navigate") != null);
     try std.testing.expect(std.mem.find(u8, root.items, "Enter Open") != null);
@@ -1747,7 +1606,7 @@ test "compose hint row replaces model status with setup navigation" {
 
     ctx.auth_picker.stage = .connections;
     ctx.auth_picker.selected_choice = .{ .action = .login };
-    var child = try composeHintRow(std.testing.allocator, false, null, ctx, 96);
+    var child = try composeHintRow(std.testing.allocator, false, ctx, 96);
     defer child.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, child.items, "Esc Back") != null);
 }
@@ -1792,7 +1651,7 @@ test "compose hint row replaces model status with subscription sign-in controls"
             .sign_in_code_visible = case.manual_code_visible,
         };
 
-        var row = try composeHintRow(alloc, false, null, ctx, 80);
+        var row = try composeHintRow(alloc, false, ctx, 80);
         defer row.deinit(alloc);
         try std.testing.expect(std.mem.find(u8, row.items, case.expected) != null);
         try std.testing.expect(std.mem.find(u8, row.items, "model-status-sentinel") == null);
@@ -1807,12 +1666,11 @@ test "compose hint row keeps configured fast mode visible" {
         .stream = .{},
         .has_api_key = true,
         .model = "gpt-5.1",
-        .queued_count = 0,
         .fast_indicator_active = true,
         .input = &input,
     };
 
-    var row = try composeHintRow(std.testing.allocator, false, null, ctx, 96);
+    var row = try composeHintRow(std.testing.allocator, false, ctx, 96);
     defer row.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.find(u8, row.items, "gpt-5.1 · ⚡︎") != null);
@@ -1824,7 +1682,7 @@ test "compose hint row does not advertise background terminals" {
     var ctx = testRenderContext(&input);
     ctx.shimmer_pos = 1;
 
-    var row = try composeHintRow(std.testing.allocator, false, null, ctx, 96);
+    var row = try composeHintRow(std.testing.allocator, false, ctx, 96);
     defer row.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.find(u8, row.items, "gpt-5.1") != null);
@@ -1839,7 +1697,6 @@ test "compose hint row right-aligns upgrade status" {
         .stream = .{},
         .has_api_key = true,
         .model = "gpt-5.1",
-        .queued_count = 0,
         .upgrade_status = "update ready: ctrl+g to reload",
         .statusline = .{
             .workspace_label = "/a/long/workspace/path/that/uses/the/statusline-tail",
@@ -1847,7 +1704,7 @@ test "compose hint row right-aligns upgrade status" {
         .input = &input,
     };
 
-    var row = try composeHintRow(std.testing.allocator, false, null, ctx, 48);
+    var row = try composeHintRow(std.testing.allocator, false, ctx, 48);
     defer row.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.find(u8, row.items, "gpt-5.1") != null);
@@ -1864,13 +1721,12 @@ test "compose hint row right-aligns upgrade status after styled auto mode" {
         .has_api_key = true,
         .model = "openai/gpt-4o",
         .permission_mode = .auto,
-        .queued_count = 0,
         .upgrade_status = "update ready: ctrl+g to reload",
         .input = &input,
     };
 
     ui_render.initTheme(false, null);
-    var row = try composeHintRow(std.testing.allocator, false, null, ctx, 56);
+    var row = try composeHintRow(std.testing.allocator, false, ctx, 56);
     defer row.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.find(u8, row.items, "auto") != null);
@@ -1887,18 +1743,18 @@ test "compose hint row prioritizes red yolo warning with compact fallback" {
     ctx.danger_status = "YOLO enabled: fx permission checks disabled";
     ctx.danger_status_compact = "YOLO: unrestricted";
 
-    var full = try composeHintRow(std.testing.allocator, false, null, ctx, 80);
+    var full = try composeHintRow(std.testing.allocator, false, ctx, 80);
     defer full.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, full.items, ctx.danger_status) != null);
     try std.testing.expect(std.mem.find(u8, full.items, ui_render.red_style) != null);
 
-    var compact = try composeHintRow(std.testing.allocator, false, null, ctx, 24);
+    var compact = try composeHintRow(std.testing.allocator, false, ctx, 24);
     defer compact.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, compact.items, ctx.danger_status_compact) != null);
     try std.testing.expect(std.mem.find(u8, compact.items, ctx.danger_status) == null);
 
     ctx.esc_clear_armed = true;
-    var suppressed = try composeHintRow(std.testing.allocator, false, null, ctx, 80);
+    var suppressed = try composeHintRow(std.testing.allocator, false, ctx, 80);
     defer suppressed.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, suppressed.items, "esc again to clear") != null);
     try std.testing.expect(std.mem.find(u8, suppressed.items, "YOLO") == null);
@@ -1915,7 +1771,7 @@ test "compose hint row yields the yolo warning to a pending ctrl+c quit hint" {
     // Reported as unpainted so the warning's visible budget pauses.
     try std.testing.expectEqualStrings("", dangerStatusText(false, ctx, 60));
 
-    var pending = try composeHintRow(std.testing.allocator, false, null, ctx, 60);
+    var pending = try composeHintRow(std.testing.allocator, false, ctx, 60);
     defer pending.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, pending.items, "press ctrl+c again to exit") != null);
     try std.testing.expect(std.mem.find(u8, pending.items, "YOLO") == null);
@@ -1923,7 +1779,7 @@ test "compose hint row yields the yolo warning to a pending ctrl+c quit hint" {
     ctx.ctrl_c_pending = false;
     try std.testing.expectEqualStrings(ctx.danger_status, dangerStatusText(false, ctx, 60));
 
-    var resumed = try composeHintRow(std.testing.allocator, false, null, ctx, 60);
+    var resumed = try composeHintRow(std.testing.allocator, false, ctx, 60);
     defer resumed.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, resumed.items, ctx.danger_status) != null);
     try std.testing.expect(std.mem.find(u8, resumed.items, "press ctrl+c again to exit") == null);
@@ -1969,7 +1825,7 @@ test "question hint row excludes model and upgrade status at supported widths" {
         ctx.question = prompt.projection();
         ctx.model = "model-x";
         ctx.upgrade_status = "update ready: ctrl+g to reload";
-        var row = try composeHintRow(std.testing.allocator, false, null, ctx, case.width);
+        var row = try composeHintRow(std.testing.allocator, false, ctx, case.width);
         defer row.deinit(std.testing.allocator);
 
         try std.testing.expect(std.mem.find(u8, row.items, case.hint) != null);
@@ -1998,12 +1854,12 @@ test "question hint row right-aligns batch progress and drops it when narrow" {
     var ctx = testRenderContext(&input);
     ctx.question = prompt.projection();
 
-    var row = try composeHintRow(std.testing.allocator, false, null, ctx, 120);
+    var row = try composeHintRow(std.testing.allocator, false, ctx, 120);
     defer row.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, row.items, "  Question 1 of 3") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 120);
 
-    var narrow = try composeHintRow(std.testing.allocator, false, null, ctx, 40);
+    var narrow = try composeHintRow(std.testing.allocator, false, ctx, 40);
     defer narrow.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, narrow.items, "Question 1 of 3") == null);
 }
@@ -2018,7 +1874,7 @@ test "question hint assigns tab to question pagination" {
     var ctx = testRenderContext(&input);
     ctx.question = prompt.projection();
 
-    var row = try composeHintRow(std.testing.allocator, false, null, ctx, 120);
+    var row = try composeHintRow(std.testing.allocator, false, ctx, 120);
     defer row.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.find(u8, row.items, "Tab Questions") != null);

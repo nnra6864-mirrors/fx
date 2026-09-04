@@ -180,15 +180,6 @@ export function fakeGatewayPermissionDecision(
   });
 }
 
-export function classifierEvidenceFromRequest(body: string): string {
-  const parsed = JSON.parse(body) as any;
-  const instruction = parsed.prompt.at(-1);
-  if (instruction?.role !== "system" || typeof instruction.content !== "string") {
-    throw new Error("classifier instruction missing");
-  }
-  return instruction.content;
-}
-
 export function fakeGatewaySerializedToolCall(
   id: string,
   name: string,
