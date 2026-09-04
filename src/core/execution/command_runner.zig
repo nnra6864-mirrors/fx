@@ -39,7 +39,7 @@ pub const Config = struct {
 };
 
 const ai_agent_env = "AI_AGENT";
-const ai_agent_model_env = "AI_AGENT_MODEL";
+const fx_model_env = "FX_MODEL";
 const ai_agent_name = "fx";
 
 pub fn applyAgentEnvironment(
@@ -47,7 +47,7 @@ pub fn applyAgentEnvironment(
     model: []const u8,
 ) !void {
     try environment.put(ai_agent_env, ai_agent_name);
-    if (model.len > 0) try environment.put(ai_agent_model_env, model);
+    if (model.len > 0) try environment.put(fx_model_env, model);
 }
 
 pub const CallbackProjection = enum {
@@ -2935,7 +2935,7 @@ test "commands receive fx agent and active model environment" {
             .agent_model = "provider/model",
         },
         std.testing.allocator,
-        "printf '%s|%s' \"$AI_AGENT\" \"$AI_AGENT_MODEL\"",
+        "printf '%s|%s' \"$AI_AGENT\" \"$FX_MODEL\"",
         "/tmp",
     );
     defer std.testing.allocator.free(result.output);

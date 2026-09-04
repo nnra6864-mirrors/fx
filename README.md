@@ -74,7 +74,7 @@ cd your_project
 fx
 ```
 
-Commands run by fx receive `AI_AGENT=fx` and `AI_AGENT_MODEL=<model-id>` in
+Commands run by fx receive `AI_AGENT=fx` and `FX_MODEL=<model-id>` in
 their environment. This lets development tools identify fx and the model that
 requested the command.
 

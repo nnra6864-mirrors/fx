@@ -452,7 +452,7 @@ test "direct commands receive fx agent and active model environment" {
     try std.testing.expect(std.mem.find(
         u8,
         result.output,
-        "AI_AGENT_MODEL=provider/model",
+        "FX_MODEL=provider/model",
     ) != null);
 }
 
