@@ -48,6 +48,7 @@ describe("host-managed authentication", () => {
   let visionFailureStatus: number | null = null;
   let compactionFailureStatus: number | null = null;
   let compactionRequests = 0;
+  let gatewayResponseText = "GATEWAY_HOST_MANAGED_OK";
   const heldRequests = new Map<string, { controller: AbortController; settled: Promise<void> }>();
   let cancelRequestCount = 0;
   let rejectCancellation = false;
@@ -141,7 +142,7 @@ describe("host-managed authentication", () => {
               id: "answer_1",
               providerMetadata: { gateway: { generationId: GENERATION_ID } },
             },
-            { type: "text-delta", id: "answer_1", delta: "GATEWAY_HOST_MANAGED_OK" },
+            { type: "text-delta", id: "answer_1", delta: gatewayResponseText },
             { type: "text-end", id: "answer_1" },
             {
               type: "finish",
@@ -776,10 +777,11 @@ describe("host-managed authentication", () => {
       const session = await TmuxSession.create({ cwd: workspace, env: childEnv, isolated: true });
       try {
         await session.waitForComposer(TIMEOUT);
-        for (const prompt of ["Remember the first context fact.", "Remember the second context fact.", "Remember the third context fact."]) {
+        for (const [index, prompt] of ["Remember the first context fact.", "Remember the second context fact.", "Remember the third context fact."].entries()) {
+          gatewayResponseText = `HOST_CONTEXT_${status}_${index}`;
           await session.sendText(prompt);
-          await session.waitForText("GATEWAY_HOST_MANAGED_OK", TIMEOUT);
-          await session.waitForComposer(TIMEOUT);
+          await session.waitForText(gatewayResponseText, TIMEOUT);
+          await session.waitForStableComposer(TIMEOUT);
         }
         compactionFailureStatus = status;
         const before = compactionRequests;
@@ -789,11 +791,14 @@ describe("host-managed authentication", () => {
         expect(pane).toContain("Host");
         expect(pane).not.toContain("Run /login");
         compactionFailureStatus = null;
-        await session.waitForComposer(TIMEOUT);
+        await session.waitForStableComposer(TIMEOUT);
+        gatewayResponseText = `HOST_CONTEXT_RECOVERED_${status}`;
         await session.sendText("Continue after the compaction rejection.");
-        await session.waitForText("GATEWAY_HOST_MANAGED_OK", TIMEOUT);
+        await session.waitForText(gatewayResponseText, TIMEOUT);
+        await session.waitForStableComposer(TIMEOUT);
       } finally {
         compactionFailureStatus = null;
+        gatewayResponseText = "GATEWAY_HOST_MANAGED_OK";
         await session.kill();
       }
     }
