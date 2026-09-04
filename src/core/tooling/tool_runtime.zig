@@ -355,7 +355,6 @@ pub fn executeToolCallAuthorized(
         request.command_replay_capture.?.abort(request.result_allocator);
     };
     var execution_ctx = ctx;
-    execution_ctx.model = request.model;
     if (request.permission_mode) |permission_mode| {
         execution_ctx.permission_mode = permission_mode;
     }
@@ -572,7 +571,6 @@ pub fn executeToolCall(
         .result_allocator = arena,
         .call = call,
         .authority = .ordinary,
-        .model = ctx.model,
         .current_turn_messages = ctx.current_turn_messages,
         .session_grants = ctx.session_grants,
         .advertised_dynamic_tool_names = ctx.advertised_dynamic_tool_names,
@@ -1004,7 +1002,6 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .max_read_file_lines = ctx.max_read_file_lines,
         .max_read_file_line_len = ctx.max_read_file_line_len,
         .max_tool_result_bytes = ctx.max_tool_result_bytes,
-        .agent_model = ctx.model,
         .tool_result_dir = ctx.tool_result_dir,
         .session_child_capability = ctx.session_child_capability,
         .ephemeral_command_replay = ctx.ephemeral_command_replay,
@@ -1518,7 +1515,6 @@ fn toolRunCommand(
 
     const routed = execution_router.executePreparedRoute(.{
         .max_command_output_bytes = ctx.max_command_output_bytes,
-        .agent_model = ctx.model,
         .cancel_flag = runtimeCancelFlag(ctx),
         .output_chunk_lifecycle_id = ctx.output_chunk_lifecycle_id,
         .output_chunk_ctx = ctx.output_chunk_ctx,
@@ -2365,7 +2361,6 @@ fn executeTestRunCommand(
             .fingerprint = .init(command_ctx),
             .source = .configured_rule,
         } } },
-        .model = ctx.model,
         .session_grants = ctx.session_grants,
         .advertised_dynamic_tool_names = ctx.advertised_dynamic_tool_names,
         .max_tool_result_bytes = ctx.max_tool_result_bytes,
@@ -2413,7 +2408,6 @@ test "registered terminal exec preserves invalid execution authority error" {
             .result_allocator = arena,
             .call = call,
             .authority = .ordinary,
-            .model = rt.model,
             .session_grants = &.{},
             .advertised_dynamic_tool_names = &.{},
             .max_tool_result_bytes = rt.max_tool_result_bytes,
@@ -3001,7 +2995,6 @@ test "ask_user_question execution uses supplied registry entry and interactive h
         .result_allocator = arena,
         .call = call,
         .authority = .ordinary,
-        .model = rt.model,
         .session_grants = &.{},
         .advertised_dynamic_tool_names = &.{},
         .max_tool_result_bytes = rt.max_tool_result_bytes,
@@ -3016,7 +3009,6 @@ test "ask_user_question execution uses supplied registry entry and interactive h
         .result_allocator = arena,
         .call = call,
         .authority = .ordinary,
-        .model = rt.model,
         .session_grants = &.{},
         .advertised_dynamic_tool_names = &.{},
         .max_tool_result_bytes = rt.max_tool_result_bytes,
@@ -3103,7 +3095,6 @@ test "terminal exec execution uses supplied registry entry" {
             .fingerprint = .init(command_ctx),
             .source = .configured_rule,
         } } },
-        .model = ctx.model,
         .session_grants = &.{},
         .advertised_dynamic_tool_names = &.{},
         .max_tool_result_bytes = rt.max_tool_result_bytes,
@@ -4203,7 +4194,6 @@ test "file mutation lifecycle decodes each call at most once" {
         .result_allocator = result_arena,
         .call = committed_call,
         .authority = .{ .file_mutation = committed_authorization },
-        .model = rt.model,
         .session_grants = &.{},
         .advertised_dynamic_tool_names = &.{},
         .max_tool_result_bytes = 64 * 1024,
@@ -5486,7 +5476,6 @@ test "run_command post-spawn cancellation returns structured evidence in every m
             .fingerprint = .init(command_ctx),
             .source = .auto_classifier,
         } } },
-        .model = retry_ctx.model,
         .session_grants = &.{},
         .advertised_dynamic_tool_names = &.{},
         .max_tool_result_bytes = rt.max_tool_result_bytes,
@@ -6309,7 +6298,6 @@ test "MCP execution binds the last live action generation before transport" {
             .arguments_json = "{}",
         },
         .authority = .ordinary,
-        .model = tool_ctx.model,
         .session_grants = &.{},
         .live_authority = .{
             .generation = 41,
@@ -6853,7 +6841,6 @@ fn executeVisionForTest(
         .result_allocator = alloc,
         .call = .{ .id = "vision-call", .name = "vision", .arguments_json = args_json },
         .authority = .ordinary,
-        .model = rt.model,
         .authorized_image_catalog = catalog,
         .session_grants = &.{},
         .advertised_dynamic_tool_names = &.{},
@@ -6908,7 +6895,6 @@ fn executeVisionPathTargetsForTest(
         .result_allocator = alloc,
         .call = .{ .id = "vision-call", .name = "vision", .arguments_json = args_json },
         .authority = .{ .vision_paths = .{ .targets = targets } },
-        .model = rt.model,
         .authorized_image_catalog = &.{},
         .session_grants = &.{},
         .advertised_dynamic_tool_names = &.{},

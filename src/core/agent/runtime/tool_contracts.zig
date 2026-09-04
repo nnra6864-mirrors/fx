@@ -131,8 +131,6 @@ pub const ToolExecutionRequest = struct {
     result_allocator: Allocator,
     call: ToolCall,
     authority: command_admission.ToolExecutionAuthority,
-    /// Model that produced this tool call. Borrowed from the active agent job.
-    model: []const u8,
     credential: types.CredentialLease = .{ .direct = .{} },
     /// Action-scoped root mode sampled before permission admission. Direct
     /// callers without a sampled mode retain their execution context value.

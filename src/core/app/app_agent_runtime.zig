@@ -2129,7 +2129,6 @@ test "app prompt projection configures web search then blocks native execution" 
             .arguments_json = "{\"query\":\"current Zig release\"}",
         },
         .authority = .ordinary,
-        .model = app.selected_model.items,
         .session_grants = &.{},
         .advertised_dynamic_tool_names = &.{},
         .max_tool_result_bytes = 2048,

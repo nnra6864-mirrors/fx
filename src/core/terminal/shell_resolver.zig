@@ -241,18 +241,12 @@ pub fn buildBootstrap(
     executable: []const u8,
     control_path: []const u8,
     nonce: []const u8,
-    agent_model: []const u8,
     command_path: ?[]const u8,
 ) Allocator.Error![]u8 {
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(alloc);
 
-    try output.appendSlice(alloc, "set +x; ");
-    if (agent_model.len > 0) {
-        try output.appendSlice(alloc, "export AI_AGENT=fx FX_MODEL=");
-        try appendShellWord(&output, alloc, agent_model);
-        try output.appendSlice(alloc, "; ");
-    }
+    try output.appendSlice(alloc, "set +x; export AI_AGENT=fx; ");
     if (command_path) |path| {
         try output.appendSlice(alloc, "fx_terminal_command=$(< ");
         try appendShellWord(&output, alloc, path);
@@ -527,12 +521,11 @@ test "bootstrap quotes private paths and separates command completion" {
         "/tmp/fx'bin",
         "/tmp/control",
         "nonce",
-        "",
         null,
     );
     defer std.testing.allocator.free(commandless);
     try std.testing.expectEqualStrings(
-        "set +x; '/tmp/fx'\"'\"'bin' '--fx-internal-terminal-control' " ++
+        "set +x; export AI_AGENT=fx; '/tmp/fx'\"'\"'bin' '--fx-internal-terminal-control' " ++
             "'/tmp/control' 'nonce' 'shell-ready' || exit 125\n",
         commandless,
     );
@@ -542,7 +535,6 @@ test "bootstrap quotes private paths and separates command completion" {
         "/tmp/fx",
         "/tmp/control",
         "nonce",
-        "",
         "/tmp/command",
     );
     defer std.testing.allocator.free(command);
@@ -573,7 +565,6 @@ fn checkBootstrapAllocationFailures(alloc: Allocator) !void {
         "/tmp/fx",
         "/tmp/control",
         "nonce",
-        "",
         "/tmp/command",
     );
     defer alloc.free(bootstrap);

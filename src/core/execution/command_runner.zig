@@ -23,7 +23,6 @@ pub const CommandExecutionResult = command_contract.RunCommandResult;
 /// must remain valid for the duration of executeCommand.
 pub const Config = struct {
     max_command_output_bytes: usize,
-    agent_model: []const u8 = "",
     cancel_flag: ?*std.atomic.Value(bool) = null,
     force_cancel_flag: ?*std.atomic.Value(bool) = null,
     output_chunk_lifecycle_id: ?types.ToolLifecycleId = null,
@@ -39,15 +38,10 @@ pub const Config = struct {
 };
 
 const ai_agent_env = "AI_AGENT";
-const fx_model_env = "FX_MODEL";
 const ai_agent_name = "fx";
 
-pub fn applyAgentEnvironment(
-    environment: *std.process.Environ.Map,
-    model: []const u8,
-) !void {
+pub fn applyAgentEnvironment(environment: *std.process.Environ.Map) !void {
     try environment.put(ai_agent_env, ai_agent_name);
-    if (model.len > 0) try environment.put(fx_model_env, model);
 }
 
 pub const CallbackProjection = enum {
@@ -1093,7 +1087,7 @@ fn executeProcessWithInput(
     const started_ms = io_mod.milliTimestamp();
     var environment = try io_mod.cloneEnvironMap(scratch);
     defer environment.deinit();
-    try applyAgentEnvironment(&environment, cfg.agent_model);
+    try applyAgentEnvironment(&environment);
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = argv,
         .stdin = if (closed_input) .pipe else .ignore,
@@ -1208,7 +1202,7 @@ fn executeProcessWithDetachedSession(
     const started_ms = io_mod.milliTimestamp();
     var environment = try io_mod.cloneEnvironMap(scratch);
     defer environment.deinit();
-    try applyAgentEnvironment(&environment, cfg.agent_model);
+    try applyAgentEnvironment(&environment);
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = helper_argv.items,
         .stdin = .pipe,
@@ -1383,7 +1377,7 @@ fn executeProcessWithScriptUnisolated(
     const started_ms = io_mod.milliTimestamp();
     var environment = try io_mod.cloneEnvironMap(scratch);
     defer environment.deinit();
-    try applyAgentEnvironment(&environment, cfg.agent_model);
+    try applyAgentEnvironment(&environment);
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = argv,
         .stdin = .pipe,
@@ -2928,14 +2922,11 @@ test "raw process execution returns foreground output" {
     try std.testing.expect(!command_result.truncated);
 }
 
-test "commands receive fx agent and active model environment" {
+test "commands receive fx agent environment" {
     const result = try executeCommand(
-        .{
-            .max_command_output_bytes = 4096,
-            .agent_model = "provider/model",
-        },
+        .{ .max_command_output_bytes = 4096 },
         std.testing.allocator,
-        "printf '%s|%s' \"$AI_AGENT\" \"$FX_MODEL\"",
+        "printf '%s' \"$AI_AGENT\"",
         "/tmp",
     );
     defer std.testing.allocator.free(result.output);
@@ -2943,7 +2934,7 @@ test "commands receive fx agent and active model environment" {
     try std.testing.expect(std.mem.find(
         u8,
         result.output,
-        "<stdout>\nfx|provider/model\n</stdout>",
+        "<stdout>\nfx\n</stdout>",
     ) != null);
 }
 

@@ -5,7 +5,6 @@ const types = @import("../shared/types.zig");
 const Allocator = std.mem.Allocator;
 
 pub const max_authority_text_bytes: usize = 4096;
-pub const max_agent_model_bytes: usize = 1024;
 pub const max_command_bytes: usize = 64 * 1024;
 pub const max_shell_path_bytes: usize = 4096;
 pub const max_write_bytes: usize = 64 * 1024;
@@ -29,14 +28,12 @@ pub const protocol_capability_screen_checkpoints: u64 = 1 << 1;
 pub const protocol_capability_tmux_recovery: u64 = 1 << 2;
 pub const protocol_capability_path_outside_workspace_error: u64 = 1 << 3;
 pub const protocol_capability_complete_process_tree_signals: u64 = 1 << 4;
-pub const protocol_capability_agent_environment: u64 = 1 << 5;
 pub const known_protocol_capabilities: u64 =
     protocol_capability_authority_generations |
     protocol_capability_screen_checkpoints |
     protocol_capability_tmux_recovery |
     protocol_capability_path_outside_workspace_error |
-    protocol_capability_complete_process_tree_signals |
-    protocol_capability_agent_environment;
+    protocol_capability_complete_process_tree_signals;
 
 pub const Action = enum {
     start,
@@ -307,7 +304,6 @@ pub const MonitorLifetime = union(enum) {
 pub const StartRequest = struct {
     cwd: []const u8,
     command: ?[]const u8 = null,
-    agent_model: []const u8 = "",
     shell: ShellSpec = .user_login,
     backend: Backend = .native,
     return_when: ?ReturnCondition = null,
@@ -419,7 +415,6 @@ pub const CloseRequest = struct {
 };
 
 pub const RequestValidationError = error{
-    InvalidAgentModel,
     InvalidCommand,
     InvalidCwd,
     InvalidShell,
@@ -477,11 +472,6 @@ pub const ActionRequest = union(enum) {
                     return error.InvalidCwd;
                 }
                 try request.shell.validate();
-                if (request.agent_model.len > 0 and
-                    !valid_bounded_text(request.agent_model, max_agent_model_bytes))
-                {
-                    return error.InvalidAgentModel;
-                }
                 if (request.command) |command| {
                     if (!valid_bounded_text(command, max_command_bytes)) {
                         return error.InvalidCommand;
@@ -564,7 +554,6 @@ pub fn required_capabilities(request: ActionRequest) u64 {
     switch (request) {
         .start => |start| {
             required |= protocol_capability_complete_process_tree_signals;
-            required |= protocol_capability_agent_environment;
             if (start.backend == .tmux) {
                 required |= protocol_capability_tmux_recovery;
             }
@@ -736,8 +725,6 @@ fn clone_start_request(alloc: Allocator, request: StartRequest) Allocator.Error!
     errdefer alloc.free(cwd);
     const command = if (request.command) |value| try alloc.dupe(u8, value) else null;
     errdefer if (command) |value| alloc.free(value);
-    const agent_model = try alloc.dupe(u8, request.agent_model);
-    errdefer alloc.free(agent_model);
     const shell = try clone_shell_spec(alloc, request.shell);
     errdefer deinit_shell_spec(alloc, shell);
     const return_when = if (request.return_when) |value|
@@ -756,7 +743,6 @@ fn clone_start_request(alloc: Allocator, request: StartRequest) Allocator.Error!
     return .{
         .cwd = cwd,
         .command = command,
-        .agent_model = agent_model,
         .shell = shell,
         .backend = request.backend,
         .return_when = return_when,
@@ -994,7 +980,6 @@ fn deinit_action_request(alloc: Allocator, request: *ActionRequest) void {
         .start => |value| {
             alloc.free(value.cwd);
             if (value.command) |command| alloc.free(command);
-            alloc.free(value.agent_model);
             deinit_shell_spec(alloc, value.shell);
             if (value.return_when) |condition| {
                 deinit_return_condition(alloc, condition);
@@ -3554,7 +3539,6 @@ test "protocol accepts complete process tree signal capability" {
 test "durable actions derive policy specific protocol capabilities" {
     const authority = protocol_capability_authority_generations;
     const complete_signals = protocol_capability_complete_process_tree_signals;
-    const agent_environment = protocol_capability_agent_environment;
     const tmux_recovery = protocol_capability_tmux_recovery;
     const cases = [_]struct {
         request: ActionRequest,
@@ -3562,11 +3546,11 @@ test "durable actions derive policy specific protocol capabilities" {
     }{
         .{
             .request = .{ .start = .{ .cwd = "/" } },
-            .expected = authority | complete_signals | agent_environment,
+            .expected = authority | complete_signals,
         },
         .{
             .request = .{ .start = .{ .cwd = "/", .backend = .tmux } },
-            .expected = authority | complete_signals | agent_environment | tmux_recovery,
+            .expected = authority | complete_signals | tmux_recovery,
         },
         .{
             .request = .{ .read = .{

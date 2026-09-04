@@ -216,7 +216,7 @@ fn executeDirectReadOnlyWithLimitAndTestControls(
         const stage = plan.stages[child_count];
         var environment = try environmentForProfile(scratch, stage.environment_profile);
         defer environment.deinit();
-        try command_runner.applyAgentEnvironment(&environment, execution_cfg.agent_model);
+        try command_runner.applyAgentEnvironment(&environment);
 
         const child = std.process.spawn(io_mod.getIo(), .{
             .argv = stage.argv,
@@ -430,7 +430,7 @@ fn environmentForProfile(
     return environment;
 }
 
-test "direct commands receive fx agent and active model environment" {
+test "direct commands receive fx agent environment" {
     if (builtin.os.tag != .macos and builtin.os.tag != .linux) return;
 
     const stages = [_]command_effect.DirectStage{.{
@@ -440,7 +440,6 @@ test "direct commands receive fx agent and active model environment" {
     }};
     const result = try executeDirectReadOnly(.{
         .max_command_output_bytes = 4096,
-        .agent_model = "provider/model",
     }, std.testing.allocator, .{
         .command = "env",
         .cwd = "/tmp",
@@ -449,11 +448,6 @@ test "direct commands receive fx agent and active model environment" {
     defer std.testing.allocator.free(result.output);
 
     try std.testing.expect(std.mem.find(u8, result.output, "AI_AGENT=fx") != null);
-    try std.testing.expect(std.mem.find(
-        u8,
-        result.output,
-        "FX_MODEL=provider/model",
-    ) != null);
 }
 
 const DirectTerminationCause = enum {

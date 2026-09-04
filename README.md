@@ -74,9 +74,8 @@ cd your_project
 fx
 ```
 
-Commands run by fx receive `AI_AGENT=fx` and `FX_MODEL=<model-id>` in
-their environment. This lets development tools identify fx and the model that
-requested the command.
+Commands run by fx receive `AI_AGENT=fx` in their environment. This lets
+development tools identify fx.
 
 The current directory becomes the primary workspace. Enter a prompt, or run `/help` to browse interactive commands. While fx is working, Enter steers the active turn at its next safe model boundary. The pending update shows its first two lines, with an ellipsis when more text is hidden. If a tool is running, fx waits for it to finish; press Escape to interrupt the active work and apply the update as soon as the turn settles.
 

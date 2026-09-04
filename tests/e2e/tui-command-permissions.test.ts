@@ -3098,29 +3098,29 @@ describe("effect-aware command permissions", () => {
   );
 
   test(
-    "fx ask forwards agent identity and its resolved model to captured and TTY commands",
+    "fx ask forwards agent identity to captured and TTY commands",
     async () => {
       for (const tty of [false, true]) {
         const root = createIsolatedRoot();
         const gateway = startFakeGateway([
-          toolCall(`printf '%s|%s' "$AI_AGENT" "$FX_MODEL"`, { tty }),
+          toolCall(`printf 'agent=%s' "$AI_AGENT"`, { tty }),
           finalText("agent environment complete"),
         ]);
         const result = await runFx(
           ["ask", "--yolo", "--quiet", "--json", "Report the agent environment."],
           {
             cwd: root.workspace,
-            env: gatewayEnv(root, gateway, { FX_MODEL: undefined }),
+            env: gatewayEnv(root, gateway),
             timeoutMs: TIMEOUT,
           },
         );
 
         expect(result.code).toBe(0);
         expect(result.stderr.toLowerCase()).not.toContain("error");
-        const json = JSON.parse(result.stdout.trim()) as { model: string };
+        JSON.parse(result.stdout.trim());
         const toolResult = JSON.parse(toolResultText(gateway.requests[1].body, "command_1"));
         expect(toolResult).toMatchObject({ state: "completed", exit_code: 0 });
-        expect(toolResult.output_delta).toContain(`fx|${json.model}`);
+        expect(toolResult.output_delta).toContain("agent=fx");
       }
     },
     TIMEOUT,

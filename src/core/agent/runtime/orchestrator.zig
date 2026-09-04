@@ -7966,7 +7966,6 @@ fn processQueuedPromptLoop(
                     var parallel_exec_ctx = runtime_parallel_execution.ParallelHookExecContext{
                         .hooks = deps,
                         .turn_id = turn_id,
-                        .model = successful_gateway_model,
                         .root_user_intent_context = parallel_execution_root_user_context,
                         .current_turn_messages = within_turn_suffix.items,
                         .session_grants = local_grants.items,
@@ -9262,7 +9261,6 @@ fn processQueuedPromptLoop(
                 .result_allocator = arena,
                 .call = execution_call,
                 .authority = execution_authority,
-                .model = successful_gateway_model,
                 .credential = activeCredentialLease(active_api_key, job),
                 .permission_mode = action_permission_mode,
                 .root_user_intent_context = tool_execution_root_user_context,
