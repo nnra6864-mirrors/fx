@@ -55,7 +55,10 @@ fn discardCodeBlock(_: *anyopaque, block: assistant_presentation.CodeBlockPayloa
 }
 
 fn discardThematicRule(_: *anyopaque) !void {}
-fn discardContextCompaction(_: *anyopaque, _: types.HistoryTurn) !void {}
+fn discardContextCompaction(_: *anyopaque, _: worker_runtime.ContextCompaction) !void {}
+fn unavailableFreshPrompt(_: *anyopaque, _: worker_runtime.FreshPromptPreparation) !worker_runtime.FreshPromptHistory {
+    return error.SessionPersistenceUnavailable;
+}
 fn discardCredentialRefresh(_: *anyopaque, _: credentials.Credential) !void {}
 
 pub const WorkerEventHandlers = struct {
@@ -74,7 +77,8 @@ pub const WorkerEventHandlers = struct {
     command_output: *const fn (*anyopaque, ?types.ToolLifecycleId, command_output_content.Stream, []const u8) anyerror!void,
     command_output_complete: *const fn (*anyopaque, ?types.ToolLifecycleId) anyerror!void,
     diff_block: *const fn (*anyopaque, diff_mod.DiffEntryPayload) anyerror!void,
-    context_compaction: *const fn (*anyopaque, types.HistoryTurn) anyerror!void = discardContextCompaction,
+    context_compaction: worker_runtime.ContextCompactionHandler = discardContextCompaction,
+    prepare_fresh_prompt: worker_runtime.FreshPromptHandler = unavailableFreshPrompt,
     append_history_turn: *const fn (*anyopaque, types.FinishedPrompt) anyerror!void,
     session_grant: *const fn (*anyopaque, types.PermissionGrant) anyerror!void,
     error_text: *const fn (*anyopaque, types.SemanticNotice) anyerror!void,
@@ -220,6 +224,7 @@ pub fn Runtime(comptime App: type) type {
                 .clear_route_recovery_status,
                 .api_status_text,
                 .context_compaction,
+                .prepare_fresh_prompt,
                 .credential_refreshed,
                 .finish_prompt,
                 .session_grant,
@@ -282,19 +287,22 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn commitContextCompaction(
             app: *App,
-            turn: types.HistoryTurn,
+            summary: types.CompactedSummaryHistoryTurn,
+            active_prefix: ?types.AssistantHistoryTurn,
+            retained_from: ?types.ContextHistoryCut,
             max_history_turns: usize,
         ) !void {
             if (comptime @hasDecl(@TypeOf(app.worker), "commitContextCompaction")) {
                 try app.worker.commitContextCompaction(
                     std.heap.c_allocator,
-                    turn,
+                    summary,
+                    active_prefix,
+                    retained_from,
                     max_history_turns,
                 );
                 return;
             }
-            try propagateHistoryTurn(app, turn, max_history_turns);
-            try pushEvent(app, .{ .context_compaction = turn });
+            return error.ContextCompactionPersistenceUnavailable;
         }
 
         pub fn propagateGrant(app: *App, tool_name: []const u8, target_path: []const u8) !void {
@@ -614,6 +622,9 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn drainEvents(app: *App, handlers: WorkerEventHandlers) !void {
+            errdefer if (comptime @hasDecl(@TypeOf(app.worker), "failPendingHistoryPublication")) {
+                app.worker.failPendingHistoryPublication(error.HistoryPublicationDeliveryFailed);
+            };
             const taken = app.worker.takeEventBatch();
             var batch = DetachedWorkerEventBatch.init(
                 std.heap.c_allocator,
@@ -859,8 +870,21 @@ pub fn Runtime(comptime App: type) type {
                         drain_owns_current = false;
                         try handlers.diff_block(handlers.ctx, payload);
                     },
-                    .context_compaction => |turn| {
-                        try handlers.context_compaction(handlers.ctx, turn);
+                    .context_compaction => |value| {
+                        if (comptime @hasDecl(@TypeOf(app.worker), "resolveContextCompaction")) {
+                            app.worker.resolveContextCompaction(
+                                std.heap.c_allocator,
+                                value,
+                                handlers.ctx,
+                                handlers.context_compaction,
+                            );
+                        } else {
+                            try handlers.context_compaction(handlers.ctx, value);
+                        }
+                    },
+                    .prepare_fresh_prompt => |value| {
+                        const current = app_session_runtime.Runtime(App).normalizeFreshPromptPreparation(app, value);
+                        app.worker.resolveFreshPrompt(std.heap.c_allocator, current, handlers.ctx, handlers.prepare_fresh_prompt);
                     },
                     .tool_lifecycle => |lifecycle| {
                         switch (lifecycle) {
@@ -1141,6 +1165,11 @@ const FakeWorker = struct {
     propagated_grants: usize = 0,
     reset_cancel_after_take_events: bool = false,
     admission_snapshot: worker_runtime.InteractiveAdmissionSnapshot = .open,
+
+    fn resolveFreshPrompt(_: *FakeWorker, alloc: std.mem.Allocator, value: worker_runtime.FreshPromptPreparation, ctx: *anyopaque, handler: worker_runtime.FreshPromptHandler) void {
+        var result = handler(ctx, value) catch return;
+        result.deinit(alloc);
+    }
 
     fn deinit(self: *FakeWorker) void {
         for (self.events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);

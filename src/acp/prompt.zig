@@ -340,10 +340,6 @@ const AcpContext = struct {
             .max_tool_result_bytes = session.max_tool_result_bytes,
             .api_key = session.api_key,
             .agent_stream_provider = server.streamProviderFor(self.state, session.provider),
-            .compaction_route = self.state.cfg.provider_set.compactionRoute(
-                session.provider,
-                session.credential_source,
-            ),
             .credential_source = session.credential_source,
             .account_id = session.account_id,
             .provider = session.provider,
@@ -735,6 +731,12 @@ pub fn handlePrompt(
             },
         };
         recovery_checkpoint = try checkpoint.dupe(alloc);
+    } else if (session.writable) |*writable| {
+        if (writable.conversation_writer.turn_open) {
+            const checkpoint = writable.state.recovery_checkpoint orelse
+                return error.InvalidRecoveryCheckpoint;
+            try persistAcpHistoryTurn(alloc, session, checkpoint.interruptedTurn(), false, null);
+        }
     }
 
     var tool_projection = try state.cfg.mode_registry.buildModelToolProjection(alloc, activeToolSet(state), captured_mode, .{
@@ -807,7 +809,6 @@ pub fn handlePrompt(
         .gateway_team = state.gateway_team,
         .permission_mode = captured_permission_mode,
         .history = context_history,
-        .context_history_start = session.session_rt.contextHistoryStart(),
         .unversioned_history_count = session.session_rt.unversionedHistoryEnd(),
         .root_user_intent_context = root_user_intent_context,
         .grants = session.session_grants,
@@ -1325,10 +1326,6 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
     return .{
         .ctx = @ptrCast(ctx),
         .agent_stream_provider = server.streamProviderFor(ctx.state, ctx.state.active_session.?.provider),
-        .compaction_route = ctx.state.cfg.provider_set.compactionRoute(
-            ctx.state.active_session.?.provider,
-            ctx.state.active_session.?.credential_source,
-        ),
         .flush_assistant_stream_per_content_chunk = host_target.is_wasm,
         .render_assistant_text = false,
         .tool_registry = ctx.toolRegistry(),
@@ -1351,6 +1348,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .publish_deferred_tool_completion = publishDeferredToolCompletion,
         .propagate_history_turn = propagateHistoryTurn,
+        .commit_context_compaction = .{ .commit = commitContextCompaction },
         .recovery_checkpoint = if (session.writable != null)
             .{
                 .set = setRecoveryCheckpoint,
@@ -1427,26 +1425,10 @@ fn persistUsageCheckpoint(
         writable,
         snapshot,
     );
-    if (writable.degradedTail() != null) {
-        var current = try currentAcpState(
-            ctx.alloc,
-            active,
-            writable,
-            recovery_checkpoint.timestamp_ms,
-        );
-        defer current.deinit(ctx.alloc);
-        try writable.retryDegradedWithStateReplacement(
-            ctx.alloc,
-            current,
-            .{},
-        );
-    }
     _ = try writable.appendEvent(
         ctx.alloc,
         .{ .usage_checkpointed = .{ .usage = snapshot } },
         recovery_checkpoint.timestamp_ms,
-        .retry_expected_tail,
-        .{ .checkpoint_interval = 0 },
     );
     try store.finishUsageRecoveryCheckpoint(
         writable.active_id,
@@ -1969,7 +1951,6 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
             turn,
             ctx.retain_external_root_user_turn,
             ctx.current_prompt_input,
-            .{},
         );
     }
 }
@@ -1980,182 +1961,103 @@ fn persistAcpHistoryTurn(
     turn: HistoryTurn,
     prompt_is_root_authority: bool,
     current_prompt_input: ?*ParsedPromptInput,
-    options: session_log.Options,
 ) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
-    try session.session_rt.appendHistoryEntry(alloc, turn);
-    if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
+    var prepared = try session.session_rt.prepareHistoryEntry(alloc, turn);
+    var prepared_owned = true;
+    defer if (prepared_owned) types.freeHistoryTurn(alloc, prepared);
     if (comptime host_target.is_wasm) {
+        session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
+        prepared_owned = false;
+        if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
         if (session.wasm_state != null) try sessions.commitWasmSessionLocked(alloc, session);
         return;
     }
-    const writable = if (session.writable) |*value| value else return;
+    const writable = if (session.writable) |*value| value else {
+        session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
+        prepared_owned = false;
+        if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
+        return;
+    };
+    try writable.prepareHistoryTurnForCommit(alloc, &prepared);
     try subagent_resume_admission.retainExternalRootUserTurn(
         session.store,
         alloc,
         writable,
-        turn,
+        prepared,
         prompt_is_root_authority,
     );
-    if (writable.degradedTail() != null) {
-        const now_ms = io_mod.milliTimestamp();
-        var current = try currentAcpState(alloc, session, writable, now_ms);
-        defer current.deinit(alloc);
-        if (current.recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
-        current.recovery_checkpoint = null;
-        try writable.retryDegradedWithStateReplacement(
-            alloc,
-            current,
-            .{},
-        );
-        if (current.usage) |usage| session.session_rt.usage.markClean(usage);
-        return;
-    }
-    _ = writable.appendEvent(
+    _ = try writable.appendEvent(
         alloc,
         .{ .history_turn_committed = .{
             .conversation_language = session.session_rt.languageSnapshot(),
             .total_input_tokens = writable.state.total_input_tokens,
             .total_output_tokens = writable.state.total_output_tokens,
-            .turn = turn,
+            .turn = prepared,
         } },
         io_mod.milliTimestamp(),
-        .retry_expected_tail,
-        options,
-    ) catch |err| switch (err) {
-        error.EventFrameTooLarge => {
-            try commitAcpStateReplacement(alloc, session, writable, true);
-            return;
-        },
-        else => return err,
-    };
+    );
+    session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
+    prepared_owned = false;
+    if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
 }
 
-test "ACP degraded history repair commits the finished turn once" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(workspace);
-
-    var store = try session_store.Store.initFromHome(alloc, home, workspace);
-    defer store.deinit(alloc);
-    var state = session_codec.DurableSessionState{
-        .id = try alloc.dupe(u8, "acp-degraded-history"),
-        .origin_workspace_root = try alloc.dupe(u8, workspace),
-        .workspace_root = try alloc.dupe(u8, workspace),
-        .created_at_ms = 1,
-        .updated_at_ms = 1,
-        .conversation_language = session_runtime.ConversationLanguage.literal("en"),
-        .preferences = .{
-            .model = try alloc.dupe(u8, "test/model"),
-            .effort = .auto,
-            .fast_mode = false,
-        },
-        .history = try alloc.alloc(HistoryTurn, 0),
-        .total_input_tokens = 0,
-        .total_output_tokens = 0,
-    };
-    defer state.deinit(alloc);
-    const writable = try store.startWritableSession(alloc, state);
-    var session = server.ActiveSessionState{
-        .session_id = try alloc.dupe(u8, state.id),
-        .writable = writable,
-        .model = try alloc.dupe(u8, state.preferences.model),
-        .mode = "code",
-        .workspace_root = workspace,
-        .api_key = "",
-        .agent_step_limit = 1,
-        .max_tool_result_bytes = 1024,
-        .fast_mode = false,
-        .effort = .auto,
-        .first_call_tool_choice = .auto,
-        .permission_mode = .auto,
-        .permission_rules = .{},
-        .session_rt = .{ .max_history_turns = 8 },
-        .cancel_flag = std.atomic.Value(bool).init(false),
-        .pending_prompt_id = null,
-    };
-    defer {
-        session.session_rt.deinit(alloc);
-        session.writable.?.deinit(alloc);
-        alloc.free(session.model);
-        alloc.free(session.session_id);
-    }
-
-    const Failure = struct {
-        fn boundary(_: ?*anyopaque, point: session_log.Boundary) !void {
-            if (point == .after_event_sync) return error.InjectedBoundaryFailure;
+fn commitContextCompaction(
+    raw_ctx: *anyopaque,
+    summary: types.CompactedSummaryHistoryTurn,
+    active_prefix: ?types.AssistantHistoryTurn,
+    retained_from: ?types.ContextHistoryCut,
+) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*value| value else return error.SessionPersistenceUnavailable;
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const prepared = try session_runtime.prepareCompactedHistory(ctx.alloc, session.session_rt.agent.history.items, summary, retained_from orelse .{ .turns = session_runtime.rawHistoryTurnCount(session.session_rt.agent.history.items) });
+    var prepared_owned = true;
+    defer if (prepared_owned) types.freeHistoryTurnSlice(ctx.alloc, prepared);
+    if (session.writable) |*writable| {
+        _ = try writable.commitContextCompaction(ctx.alloc, summary, active_prefix, retained_from, io_mod.milliTimestamp());
+        if (active_prefix != null) {
+            if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
         }
-    };
-    try std.testing.expectError(
-        error.SessionPersistenceDegraded,
-        session.writable.?.appendEvent(
-            alloc,
-            .{ .preferences_changed = .{ .fast_mode = true } },
-            2,
-            .retry_expected_tail,
-            .{ .test_controls = .{ .boundary_fn = Failure.boundary } },
-        ),
-    );
-    try std.testing.expect(session.writable.?.degradedTail() != null);
-
-    const turn = try session_runtime.makeAssistantTurn(alloc, "hello", "done");
-    defer types.freeHistoryTurn(alloc, turn);
-    try persistAcpHistoryTurn(alloc, &session, turn, true, null, .{});
-
-    try std.testing.expect(session.writable.?.degradedTail() == null);
-    try std.testing.expectEqual(@as(usize, 1), session.session_rt.agent.history.items.len);
-    try std.testing.expectEqual(@as(usize, 1), session.writable.?.state.history.len);
-    try std.testing.expectEqualStrings(
-        "done",
-        session.writable.?.state.history[0].assistant.assistant,
-    );
-
-    const image_path = try std.fs.path.join(alloc, &.{ workspace, "image-1.bin" });
-    defer alloc.free(image_path);
-    var image_file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), image_path, .{});
-    image_file.close(io_mod.getIo());
-    const input_images = try alloc.alloc(types.ImageAttachment, 1);
-    input_images[0] = .{
-        .id = 1,
-        .path = try alloc.dupe(u8, "/tmp/image.png"),
-        .media_type = try alloc.dupe(u8, "image/png"),
-        .snapshot_path = try alloc.dupe(u8, image_path),
-        .snapshot_sha256 = try alloc.dupe(u8, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-    };
-    var prompt_input = ParsedPromptInput{
-        .text = try alloc.dupe(u8, "[Image #1]"),
-        .images = input_images,
-    };
-    const failed_turn: HistoryTurn = .{ .assistant = .{
-        .user = .{
-            .text = try alloc.dupe(u8, prompt_input.text),
-            .images = try types.dupeImageAttachmentSlice(alloc, prompt_input.images),
-        },
-        .assistant = try alloc.dupe(u8, "not persisted"),
-    } };
-    defer types.freeHistoryTurn(alloc, failed_turn);
-    try std.testing.expectError(
-        error.SessionPersistenceDegraded,
-        persistAcpHistoryTurn(
-            alloc,
-            &session,
-            failed_turn,
-            true,
-            &prompt_input,
-            .{ .test_controls = .{ .boundary_fn = Failure.boundary } },
-        ),
-    );
-    try std.testing.expect(prompt_input.retain_image_snapshots);
-    prompt_input.deinit(alloc);
-    try std.Io.Dir.accessAbsolute(io_mod.getIo(), image_path, .{});
-    try std.testing.expectEqual(@as(usize, 2), session.session_rt.agent.history.items.len);
+    }
+    if (comptime host_target.is_wasm) {
+        if (session.wasm_state) |*base| {
+            var next = try base.dupe(ctx.alloc);
+            var next_owned = true;
+            defer if (next_owned) next.deinit(ctx.alloc);
+            const history = try session_runtime.snapshotOwnedContextHistory(ctx.alloc, prepared, 0, 0);
+            types.freeHistoryTurnSlice(ctx.alloc, next.history);
+            next.history = history;
+            const permission_state = try session.session_rt.snapshotPermissionState(ctx.alloc);
+            next.permission_state.deinit(ctx.alloc);
+            next.permission_state = permission_state;
+            next.context_history_start = 0;
+            next.conversation_language = session.session_rt.languageSnapshot();
+            next.updated_at_ms = io_mod.milliTimestamp();
+            const model = try ctx.alloc.dupe(u8, session.model);
+            ctx.alloc.free(next.preferences.model);
+            next.preferences.model = model;
+            next.preferences.provider = session.provider;
+            next.preferences.effort = session.effort;
+            next.preferences.fast_mode = session.fast_mode;
+            const usage = try session.session_rt.usage.snapshot(ctx.alloc);
+            if (next.usage) |*old| old.deinit(ctx.alloc);
+            next.usage = usage;
+            const revision = try @import("../core/session/js_host_session_store.zig").commit(ctx.alloc, next, session.wasm_revision);
+            if (session.wasm_revision) |old| ctx.alloc.free(old);
+            base.deinit(ctx.alloc);
+            session.wasm_state = next;
+            session.wasm_revision = revision;
+            next_owned = false;
+            if (active_prefix != null) {
+                if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
+            }
+        }
+    }
+    session.session_rt.commitCompactedHistory(ctx.alloc, prepared);
+    prepared_owned = false;
 }
 
 fn setRecoveryCheckpoint(
@@ -2168,75 +2070,11 @@ fn setRecoveryCheckpoint(
     defer session.session_write_mutex.unlock(io_mod.getIo());
     const writable = if (session.writable) |*value| value else return error.SessionPersistenceUnavailable;
     const now_ms = io_mod.milliTimestamp();
-    _ = writable.appendEvent(
+    _ = try writable.appendEvent(
         ctx.alloc,
         .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
         now_ms,
-        .retry_expected_tail,
-        .{},
-    ) catch |err| switch (err) {
-        error.EventFrameTooLarge => {
-            var current = try currentAcpState(ctx.alloc, session, writable, now_ms);
-            defer current.deinit(ctx.alloc);
-            if (current.recovery_checkpoint) |*old| old.deinit(ctx.alloc);
-            current.recovery_checkpoint = try checkpoint.dupe(ctx.alloc);
-            _ = try writable.commitStateReplacement(
-                ctx.alloc,
-                current,
-                .compaction,
-                .retry_expected_tail,
-                .{},
-            );
-        },
-        else => return err,
-    };
-}
-
-fn currentAcpState(
-    alloc: Allocator,
-    session: *server.ActiveSessionState,
-    writable: *session_store.LoadedWritableSession,
-    now_ms: i64,
-) !session_codec.DurableSessionState {
-    var state = try writable.state.dupe(alloc);
-    errdefer state.deinit(alloc);
-    const history = try session.session_rt.snapshotHistory(alloc);
-    types.freeHistoryTurnSlice(alloc, state.history);
-    state.history = history;
-    const permission_state = try session.session_rt.snapshotPermissionState(alloc);
-    state.permission_state.deinit(alloc);
-    state.permission_state = permission_state;
-    state.conversation_language = session.session_rt.languageSnapshot();
-    state.updated_at_ms = now_ms;
-    const usage = try session.session_rt.usage.snapshot(alloc);
-    if (state.usage) |*old| old.deinit(alloc);
-    state.usage = usage;
-    return state;
-}
-
-fn commitAcpStateReplacement(
-    alloc: Allocator,
-    session: *server.ActiveSessionState,
-    writable: *session_store.LoadedWritableSession,
-    clear_recovery_checkpoint: bool,
-) !void {
-    const now_ms = io_mod.milliTimestamp();
-    var state = try currentAcpState(alloc, session, writable, now_ms);
-    defer state.deinit(alloc);
-    if (clear_recovery_checkpoint) {
-        if (state.recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
-        state.recovery_checkpoint = null;
-    }
-    _ = try writable.commitStateReplacement(
-        alloc,
-        state,
-        .compaction,
-        .retry_expected_tail,
-        .{},
     );
-    if (state.usage) |usage| {
-        session.session_rt.usage.markClean(usage);
-    }
 }
 
 /// Stores grants on the active ACP session without persisting them.

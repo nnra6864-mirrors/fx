@@ -907,7 +907,7 @@ describe("effect-aware command permissions", () => {
         ],
         { cwd: root.workspace, env: gatewayEnv(root, cliResumeGateway) },
       );
-      expect(cliResume.code).toBe(0);
+      expect(cliResume.code, cliResume.stdout + cliResume.stderr).toBe(0);
       expect(cliResume.stderr).toBe("");
       expect(cliResumeGateway.requests).toHaveLength(1);
       expectGroupedContinuationRequest(cliResumeGateway.requests[0]!.body, feedback);

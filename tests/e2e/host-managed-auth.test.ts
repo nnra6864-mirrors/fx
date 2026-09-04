@@ -100,7 +100,7 @@ describe("host-managed authentication", () => {
             return Response.json({ error: { message: "missing gateway authentication" } }, { status: 401 });
           }
           const body = await request.text();
-          if (compactionFailureStatus !== null && body.includes("Summarize only conversation goals")) {
+          if (compactionFailureStatus !== null && body.includes("Summarize only what this excerpt establishes")) {
             compactionRequests += 1;
             return Response.json({ error: { message: "host compaction rejected" } }, { status: compactionFailureStatus });
           }
@@ -602,6 +602,29 @@ describe("host-managed authentication", () => {
     expect(after - before).toBe(1);
     expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
   }, TIMEOUT);
+
+  test("host-managed context overflow does not start compaction or replay", async () => {
+    const childEnv = env();
+    const selected = await runFx(["provider", "codex"], { cwd: workspace, env: childEnv });
+    expect(selected.code).toBe(0);
+    const session = await TmuxSession.create({ cwd: workspace, env: childEnv, isolated: true });
+    try {
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Remember this context for the next turn.");
+      await session.waitForText("CODEX_HOST_MANAGED_OK", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      const before = brokerRequests.filter((request) => request.path === "/fx/v1/codex/responses").length;
+      brokerFailureStatus = 413;
+      await session.sendText("Continue from the earlier context.");
+      const pane = await session.waitForText("HTTP 413", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      expect(brokerRequests.filter((request) => request.path === "/fx/v1/codex/responses").length - before).toBe(1);
+      expect(pane).not.toContain("Run /login");
+    } finally {
+      brokerFailureStatus = null;
+      await session.kill();
+    }
+  }, TIMEOUT * 2);
 
   test("host authorization and availability failures give host-owned recovery", async () => {
     const childEnv = env();

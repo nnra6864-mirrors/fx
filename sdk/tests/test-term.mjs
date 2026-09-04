@@ -43,6 +43,7 @@ const terminal = {
     if (steeringSubmittedAt !== undefined) postSubmitText += decoded;
     if (draftVisibleAt === undefined && streamedText.includes(liveDraft)) draftVisibleAt = performance.now();
     process.stdout.write(chunk);
+    return true;
   },
   async drain() {
     drainCalls += 1;

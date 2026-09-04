@@ -1969,7 +1969,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "provider route recovery counts down, times out a silent head, and recovers",
+    "provider route recovery counts down and accepts slow response headers",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-route-recovery-")));
       const home = join(root, "home");
@@ -1985,9 +1985,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         retryAfterUnavailable(4),
         async () => {
           await Bun.sleep(35_000);
-          return fakeGatewayFinalText("late response must be ignored");
+          return fakeGatewayFinalText(finalText);
         },
-        fakeGatewayFinalText(finalText),
       ], {
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
       });
@@ -2035,15 +2034,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(narrowPane).not.toContain("▲");
 
       await session.resizeWindow(72, 24);
-      await waitForCondition(
-        () => queuedGateway.requests.length === 3,
-        "retry after silent response head timeout",
-        TIMEOUT * 2,
-      );
-      await session.waitForText(finalText, TIMEOUT);
+      await session.waitForText(finalText, TIMEOUT * 2);
       const scrollback = await session.captureFullScrollback();
 
-      expect(queuedGateway.requests.length).toBe(3);
+      expect(queuedGateway.requests.length).toBe(2);
       expect(scrollback).not.toContain("System");
       expect(scrollback).not.toContain("Attempt 1 failed. Retrying route.");
       expect(scrollback).not.toContain("✓ recovered");
@@ -2569,14 +2563,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         () =>
           existsSync(sessionsRoot) &&
           readdirSync(sessionsRoot).some((entry) =>
-            existsSync(join(sessionsRoot, entry, "checkpoint.json")),
+            existsSync(join(sessionsRoot, entry, "events.jsonl")),
           ),
-        "session checkpoint",
+        "session event log",
       );
       const sessionId = readdirSync(sessionsRoot).find((entry) =>
-        existsSync(join(sessionsRoot, entry, "checkpoint.json")),
+        existsSync(join(sessionsRoot, entry, "events.jsonl")),
       );
-      if (!sessionId) throw new Error("session checkpoint was not found");
+      if (!sessionId) throw new Error("session event log was not found");
 
       const readSavedSession = () =>
         execFileSync(FX_BIN, ["session", "--id", sessionId, "--json"], {
@@ -3204,7 +3198,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const command =
         `while [ ! -f ${JSON.stringify(releasePath)} ]; do sleep 0.05; done; ` +
         "printf COOPERATIVE_TOOL_DONE";
-      const firstSteering = "FIRST_BEGIN use COOPERATIVE_STEERING_SENTINEL in the answer FIRST_END";
+      const firstSteering = "FIRST_BEGIN what is this\nLockfile failed policy check\nHIDDEN_STEERING_TAIL keep the entire message";
       const secondSteering = "SECOND_BEGIN keep the answer concise while preserving its result SECOND_END";
       const thirdSteering = "THIRD_BEGIN mention the completed command before the conclusion THIRD_END";
       const finalText = "COOPERATIVE_STEERING_COMPLETE";
@@ -3245,15 +3239,19 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Run the cooperative steering fixture.");
       await session.waitForText("Running while", TIMEOUT);
-      await session.sendText(firstSteering);
+      await session.pasteText(firstSteering);
+      await session.sendKeys("Enter");
       await session.sendText(secondSteering);
       await session.sendText(thirdSteering);
       await Bun.sleep(150);
       const pendingPane = await session.capturePane();
-      expect(pendingPane).toContain(`┋ ${firstSteering}`);
+      expect(pendingPane).toContain("┋ FIRST_BEGIN what is this");
+      expect(pendingPane).toContain("┋ Lockfile failed policy check…");
+      expect(pendingPane).not.toContain("HIDDEN_STEERING_TAIL");
+      expect(pendingPane).not.toContain("\\x0a");
       expect(pendingPane).toContain(`┋ ${secondSteering}`);
       expect(pendingPane).toContain(`┋ ${thirdSteering}`);
-      expect(pendingPane.indexOf(firstSteering)).toBeLessThan(
+      expect(pendingPane.indexOf("FIRST_BEGIN")).toBeLessThan(
         pendingPane.indexOf(secondSteering),
       );
       expect(pendingPane.indexOf(secondSteering)).toBeLessThan(
@@ -3276,7 +3274,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const narrowPane = await session.capturePane();
       for (const marker of [
         "FIRST_BEGIN",
-        "FIRST_END",
+        "Lockfile failed policy check…",
         "SECOND_BEGIN",
         "SECOND_END",
         "THIRD_BEGIN",
@@ -3308,17 +3306,20 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const continuedBody = steeringGateway.requests[1]!.body;
       const trace = readFileSync(tracePath, "utf8");
       expect(continuedBody.indexOf("COOPERATIVE_TOOL_DONE")).toBeGreaterThanOrEqual(0);
-      expect(continuedBody.indexOf(firstSteering)).toBeGreaterThan(
+      expect(continuedBody.indexOf(JSON.stringify(firstSteering).slice(1, -1))).toBeGreaterThan(
         continuedBody.indexOf("COOPERATIVE_TOOL_DONE"),
       );
       expect(continuedBody.indexOf(secondSteering)).toBeGreaterThan(
-        continuedBody.indexOf(firstSteering),
+        continuedBody.indexOf(JSON.stringify(firstSteering).slice(1, -1)),
       );
       expect(continuedBody.indexOf(thirdSteering)).toBeGreaterThan(
         continuedBody.indexOf(secondSteering),
       );
       expect(continuedBody).toContain("live user update");
       expect(trace).toContain("event=prompt_steering_consumed");
+      const fullScrollback = await session.captureFullScrollback();
+      expect(fullScrollback).toContain("HIDDEN_STEERING_TAIL");
+      expect(fullScrollback).not.toContain("\\x0a");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);

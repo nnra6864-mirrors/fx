@@ -62,6 +62,12 @@ pub fn Runtime(comptime App: type) type {
             // a caller-retained buffer.
             column.count = 0;
             if (comptime !supported(App)) return 0;
+            if (app.auth.sourceInventoryRefreshActive()) {
+                column.labels[0] = "checking credentials...";
+                column.annotations[0] = "";
+                column.count = 1;
+                return column.count;
+            }
             const active_provider = provider_runtime.provider(app);
             var count: usize = 0;
             switch (query.stage) {
@@ -71,7 +77,8 @@ pub fn Runtime(comptime App: type) type {
                     for (slugs[0..count], 0..) |slug, i| {
                         column.labels[i] = slug;
                         const id = provider_catalog.parse(slug) orelse .gateway;
-                        column.annotations[i] = if (id == active_provider) "current" else "";
+                        column.annotations[i] = if (id == active_provider and
+                            model_provider.authorizesCredential(id, app.auth.credentialSource())) "current" else "";
                     }
                 },
                 .method => {
@@ -155,6 +162,7 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn navigate(app: *App, delta: i32) void {
             if (comptime !supported(App)) return;
+            if (app.auth.sourceInventoryRefreshActive()) return;
             if (!hasQuery(app)) return;
             const query = app.input_runtime.picker.activeProviderPickerQuery(&app.input_runtime.edit_state) orelse return;
             var column: ColumnBuffer = .{};
@@ -174,6 +182,7 @@ pub fn Runtime(comptime App: type) type {
         /// composer replacement does), so the stage is re-established after.
         pub fn autocomplete(app: *App) !void {
             if (comptime !supported(App)) return;
+            if (app.auth.sourceInventoryRefreshActive()) return;
             if (!hasQuery(app)) return;
             const query = app.input_runtime.picker.activeProviderPickerQuery(&app.input_runtime.edit_state) orelse return;
             const stage = query.stage;
@@ -212,6 +221,7 @@ pub fn Runtime(comptime App: type) type {
         /// never commits and never touches the network.
         pub fn advanceOnSpace(app: *App) !bool {
             if (comptime !supported(App)) return false;
+            if (app.auth.sourceInventoryRefreshActive()) return false;
             if (!hasQuery(app)) return false;
             const query = app.input_runtime.picker.activeProviderPickerQuery(&app.input_runtime.edit_state) orelse return false;
             if (app.input_runtime.edit_state.cursor != app.input_runtime.edit_state.input.items.len) return false;
@@ -238,6 +248,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn submit(app: *App) !bool {
             if (comptime !supported(App)) return false;
             if (!hasQuery(app)) return false;
+            if (app.auth.sourceInventoryRefreshActive()) return true;
             const query = app.input_runtime.picker.activeProviderPickerQuery(&app.input_runtime.edit_state) orelse return false;
             var column: ColumnBuffer = .{};
             _ = columnOptions(app, query, &column);
@@ -597,12 +608,22 @@ const ColumnTestApp = struct {
     input_runtime: core_input_runtime.Runtime = .{},
     provider_selection: provider_runtime.Runtime,
     auth: TestAuth = .{},
+    shell: struct {
+        render_requests: struct {
+            fn request(_: *@This(), _: enum { footer }) void {}
+        } = .{},
+    } = .{},
 
     const TestAuth = struct {
         source: ?credentials.Source = null,
         mask_count: usize = 0,
         save_in_flight: bool = false,
+        inventory_refresh_active: bool = false,
         available: auth_runtime.SourceSet = .empty,
+
+        fn sourceInventoryRefreshActive(self: *const TestAuth) bool {
+            return self.inventory_refresh_active;
+        }
 
         fn credentialSource(self: *const TestAuth) ?credentials.Source {
             return self.source;
@@ -660,6 +681,7 @@ test "provider column lists every provider and marks the active one" {
     const alloc = std.testing.allocator;
     var app = ColumnTestApp.init(alloc);
     defer app.deinit();
+    app.auth.source = .ai_gateway_api_key;
 
     const column = columnFor(&app, .provider, "");
     try std.testing.expect(column.count >= 2);
@@ -670,6 +692,20 @@ test "provider column lists every provider and marks the active one" {
     }
 }
 
+test "provider column requires matching authentication for a current annotation" {
+    var app = ColumnTestApp.init(std.testing.allocator);
+    defer app.deinit();
+    for ([_]?credentials.Source{ null, .chatgpt_subscription }) |source| {
+        app.auth.source = source;
+        const column = columnFor(&app, .provider, "");
+        for (column.annotations[0..column.count]) |annotation| {
+            try std.testing.expectEqualStrings("", annotation);
+        }
+    }
+    app.auth.source = .host_managed;
+    try std.testing.expectEqualStrings("current", columnFor(&app, .provider, "").annotations[0]);
+}
+
 test "provider column narrows to what was typed" {
     const alloc = std.testing.allocator;
     var app = ColumnTestApp.init(alloc);
@@ -678,6 +714,30 @@ test "provider column narrows to what was typed" {
     const column = columnFor(&app, .provider, "gro");
     try std.testing.expectEqual(@as(usize, 1), column.count);
     try std.testing.expectEqualStrings("grok", column.labels[0]);
+}
+
+test "provider picker loading preserves query and selection instead of exposing cached options" {
+    const alloc = std.testing.allocator;
+    var app = ColumnTestApp.init(alloc);
+    defer app.deinit();
+    app.auth.inventory_refresh_active = true;
+    try app.input_runtime.textReplacementState().replace(alloc, "/provider co");
+    app.input_runtime.picker.provider_column_index = 2;
+
+    const pending = columnFor(&app, .provider, "co");
+    try std.testing.expectEqual(@as(usize, 1), pending.count);
+    try std.testing.expectEqualStrings("checking credentials...", pending.labels[0]);
+    try Runtime(ColumnTestApp).autocomplete(&app);
+    Runtime(ColumnTestApp).navigate(&app, 1);
+    try std.testing.expectEqualStrings("/provider co", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 2), app.input_runtime.picker.provider_column_index);
+
+    app.auth.inventory_refresh_active = false;
+    const ready = columnFor(&app, .provider, "co");
+    try std.testing.expectEqual(@as(usize, 1), ready.count);
+    try std.testing.expectEqualStrings("codex", ready.labels[0]);
+    try Runtime(ColumnTestApp).autocomplete(&app);
+    try std.testing.expectEqualStrings("/provider codex", app.input_runtime.edit_state.input.items);
 }
 
 test "method column marks the credential the active provider is using" {

@@ -199,6 +199,7 @@ pub const FakeCompletion = struct {
     chunks: []const []const u8 = &.{},
     reasoning_chunks: []const []const u8 = &.{},
     content: ?[]const u8 = null,
+    provider_state_json: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
     streamed_tool_starts: []const ToolCall = &.{},
     provider_result_identity_failure: ?types.ProviderResultIdentityFailure = null,
@@ -227,6 +228,7 @@ pub const FakeGateway = struct {
     request_session_ids: std.ArrayList(?[]u8) = .empty,
     admitted_requests: usize = 0,
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,
+    observe_request: ?*const fn (agent_stream_provider.ModelRequest) anyerror!void = null,
 
     pub fn init(alloc: Allocator, completions: []const FakeCompletion) FakeGateway {
         return .{ .alloc = alloc, .completions = completions };
@@ -257,6 +259,7 @@ pub const FakeGateway = struct {
         alloc: Allocator,
         request: agent_stream_provider.ModelRequest,
     ) !agent_stream_provider.Result {
+        if (self.observe_request) |observe| try observe(request);
         const payload = request.prepared_request_body orelse
             try builtin_gateway.buildAgentRequest(alloc, request.data());
         defer if (request.prepared_request_body == null) alloc.free(payload);
@@ -336,6 +339,7 @@ pub const FakeGateway = struct {
         return .{ .completed = .{
             .completion = .{
                 .content = completion.content,
+                .provider_state_json = completion.provider_state_json,
                 .tool_calls = completion.tool_calls,
                 .provider_result_identity_failure = completion.provider_result_identity_failure,
                 .provider_failure_cause = completion.provider_failure_cause,
@@ -591,6 +595,7 @@ pub const FakeAgentRuntimeDeps = struct {
     background_history_log_path: ?[]u8 = null,
     background_event_log_path: ?[]u8 = null,
     history_turns: std.ArrayList(HistoryTurn) = .empty,
+    compaction_prefixes: std.ArrayList(?HistoryTurn) = .empty,
     interrupted_history_count: usize = 0,
     interrupted_event_count: usize = 0,
     interrupted_tool_name: ?[]u8 = null,
@@ -645,9 +650,6 @@ pub const FakeAgentRuntimeDeps = struct {
     },
     capability_overrides: []const ModelCapabilityOverride = &.{},
     available_capability_overrides: []const ModelCapabilityOverride = &.{},
-    compaction_route: provider_set.CompactionRouteDecision = .{
-        .ready = .{ .provider = .gateway, .model = "openai/gpt-5.6-luna" },
-    },
     capability_queries: std.ArrayList([]u8) = .empty,
     cancel_on_capability_resolution: ?*std.atomic.Value(bool) = null,
     cancel_after_capability_resolution: ?*std.atomic.Value(bool) = null,
@@ -724,6 +726,8 @@ pub const FakeAgentRuntimeDeps = struct {
         if (self.background_event_log_path) |value| self.alloc.free(value);
         for (self.history_turns.items) |turn| types.freeHistoryTurn(self.alloc, turn);
         self.history_turns.deinit(self.alloc);
+        for (self.compaction_prefixes.items) |prefix| if (prefix) |turn| types.freeHistoryTurn(self.alloc, turn);
+        self.compaction_prefixes.deinit(self.alloc);
         if (self.interrupted_tool_name) |value| self.alloc.free(value);
         if (self.http_detail) |value| self.alloc.free(value);
         if (self.diff_preview) |value| self.alloc.free(value);
@@ -744,7 +748,6 @@ pub const FakeAgentRuntimeDeps = struct {
         return .{
             .ctx = self,
             .agent_stream_provider = self.agent_stream_provider,
-            .compaction_route = self.compaction_route,
             .tool_registry = self.tool_registry,
             .live_tool_authority = self.live_tool_authority,
             .tool_activity_recorder = self.tool_activity_recorder,
@@ -771,6 +774,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .execute_tool_call = execute,
             .publish_committed_file_handoff = publishCommittedFileHandoff,
             .propagate_history_turn = propagateHistory,
+            .commit_context_compaction = .{ .commit = commitCompaction },
             .recovery_checkpoint = if (self.enable_recovery_checkpoint) .{
                 .set = setRecoveryCheckpoint,
             } else null,
@@ -1572,6 +1576,15 @@ pub const FakeAgentRuntimeDeps = struct {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         try self.rejected_names.append(self.alloc, try self.alloc.dupe(u8, call.name));
         try self.record("rejected:{s}", .{call.name});
+    }
+
+    fn commitCompaction(raw: *anyopaque, summary: types.CompactedSummaryHistoryTurn, active_prefix: ?types.AssistantHistoryTurn, _: ?types.ContextHistoryCut) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        const owned = if (active_prefix) |prefix| try types.dupeHistoryTurn(self.alloc, .{ .assistant = prefix }) else null;
+        errdefer if (owned) |turn| types.freeHistoryTurn(self.alloc, turn);
+        try self.compaction_prefixes.ensureUnusedCapacity(self.alloc, 1);
+        try propagateHistory(raw, .{ .compacted_summary = summary });
+        self.compaction_prefixes.appendAssumeCapacity(owned);
     }
 
     fn propagateHistory(raw: *anyopaque, turn: HistoryTurn) !void {

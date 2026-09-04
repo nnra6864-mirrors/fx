@@ -721,10 +721,8 @@ const AskContext = struct {
         self.session.usage.configurePublicationSink(null);
         self.session.usage.configureCheckpointSink(null);
         if (self.writable) |*writable| {
-            if (writable.needsFinalStateReplacement(
-                self.session.usage.isDirty(),
-            )) {
-                commitAskStateReplacement(self, writable, false) catch |err| {
+            if (self.session.usage.isDirty()) {
+                flushAskSessionUsage(self, writable) catch |err| {
                     debug_trace.logf(
                         "session",
                         "failed to flush ask session usage err={s}",
@@ -878,9 +876,9 @@ const AskContext = struct {
                 self.alloc,
                 writable.state.conversation_language,
                 writable.state.history,
-                writable.state.context_history_start,
                 writable.state.permission_state,
             );
+            writable.releaseHydrationHistory(self.alloc);
             if (writable.state.usage) |usage| {
                 try self.session.usage.restore(
                     self.alloc,
@@ -986,10 +984,6 @@ const AskContext = struct {
             .max_tool_result_bytes = self.max_tool_result_bytes,
             .api_key = self.api_key,
             .agent_stream_provider = self.agentStreamProvider(),
-            .compaction_route = self.cfg.provider_set.compactionRoute(
-                self.provider,
-                self.credential_source,
-            ),
             .gateway_team = self.gateway_team,
             .credential_source = self.credential_source,
             .account_id = self.account_id,
@@ -1568,6 +1562,14 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         alloc.free(owned_prompt);
         owned_prompt = try alloc.dupe(u8, recovery_checkpoint.?.user.text);
         ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
+    } else if (ctx.writable) |*writable| {
+        if (writable.conversation_writer.turn_open) {
+            const checkpoint = writable.state.recovery_checkpoint orelse
+                return error.InvalidRecoveryCheckpoint;
+            const prompt_snapshot_committed = ctx.prompt_snapshot_committed;
+            defer ctx.prompt_snapshot_committed = prompt_snapshot_committed;
+            try propagateHistoryTurn(&ctx, checkpoint.interruptedTurn());
+        }
     }
 
     var routed_credential: ?credentials.Credential = null;
@@ -1791,7 +1793,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .provider = ctx.provider,
         .permission_mode = ctx.permission_mode,
         .history = context_history,
-        .context_history_start = ctx.session.contextHistoryStart(),
         .unversioned_history_count = ctx.session.unversionedHistoryEnd(),
         .root_user_intent_context = root_user_intent_context,
         .grants = &.{},
@@ -1940,8 +1941,6 @@ fn finalizeFreshAuthSession(ctx: *AskContext, result: *PromptRunResult) void {
             ctx.alloc,
             .{ .recovery_checkpoint_cleared = .{} },
             io_mod.milliTimestamp(),
-            .retry_expected_tail,
-            .{},
         ) catch |err| {
             debug_trace.logf(
                 "ask",
@@ -1983,10 +1982,6 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .ctx = @ptrCast(ctx),
         .agent_stream_provider = ctx.agentStreamProvider(),
         .render_assistant_text = ctx.output_mode.isTerminal(),
-        .compaction_route = ctx.cfg.provider_set.compactionRoute(
-            ctx.provider,
-            ctx.credential_source,
-        ),
         .tool_registry = ctx.toolRegistry(),
         .context_registry = ctx.deps.context_registry,
         .context_enabled = ctx.context_enabled,
@@ -2006,6 +2001,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .execute_tool_call = executeToolCallAuthorized,
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .propagate_history_turn = propagateHistoryTurn,
+        .commit_context_compaction = .{ .commit = commitContextCompaction },
         .recovery_checkpoint = if (ctx.writable != null)
             .{
                 .set = setRecoveryCheckpoint,
@@ -2114,25 +2110,10 @@ fn persistUsageCheckpoint(
         writable,
         snapshot,
     );
-    if (writable.degradedTail() != null) {
-        var current = try currentAskState(
-            ctx,
-            writable,
-            recovery_checkpoint.timestamp_ms,
-        );
-        defer current.deinit(ctx.alloc);
-        try writable.retryDegradedWithStateReplacement(
-            ctx.alloc,
-            current,
-            .{},
-        );
-    }
     _ = try writable.appendEvent(
         ctx.alloc,
         .{ .usage_checkpointed = .{ .usage = snapshot } },
         recovery_checkpoint.timestamp_ms,
-        .retry_expected_tail,
-        .{ .checkpoint_interval = 0 },
     );
     try store.finishUsageRecoveryCheckpoint(
         writable.active_id,
@@ -2871,49 +2852,56 @@ fn questionTextForAskCall(alloc: Allocator, call: ToolCall) !?[]u8 {
 
 fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    try ctx.session.appendHistoryEntry(ctx.alloc, turn);
+    var prepared = try ctx.session.prepareHistoryEntry(ctx.alloc, turn);
+    var prepared_owned = true;
+    defer if (prepared_owned) types.freeHistoryTurn(ctx.alloc, prepared);
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
-    const writable = if (ctx.writable) |*value| value else return;
+    const writable = if (ctx.writable) |*value| value else {
+        ctx.session.commitPreparedHistoryEntry(ctx.alloc, prepared);
+        prepared_owned = false;
+        return;
+    };
+    try writable.prepareHistoryTurnForCommit(ctx.alloc, &prepared);
     try subagent_resume_admission.retainExternalRootUserTurn(
         ctx.store,
         ctx.alloc,
         writable,
-        turn,
+        prepared,
         ctx.retain_external_root_user_turn,
     );
 
-    if (writable.degradedTail() != null) {
-        const now_ms = io_mod.milliTimestamp();
-        var current = try currentAskState(ctx, writable, now_ms);
-        defer current.deinit(ctx.alloc);
-        try writable.retryDegradedWithStateReplacement(
-            ctx.alloc,
-            current,
-            .{},
-        );
-    }
-
-    _ = writable.appendEvent(
+    _ = try writable.appendEvent(
         ctx.alloc,
         .{ .history_turn_committed = .{
             .conversation_language = ctx.session.languageSnapshot(),
             .total_input_tokens = writable.state.total_input_tokens,
             .total_output_tokens = writable.state.total_output_tokens,
-            .turn = turn,
+            .turn = prepared,
         } },
         io_mod.milliTimestamp(),
-        .retry_expected_tail,
-        .{},
-    ) catch |err| switch (err) {
-        error.EventFrameTooLarge => {
-            try commitAskStateReplacement(ctx, writable, true);
-            ctx.prompt_snapshot_committed = true;
-            return;
-        },
-        else => return err,
-    };
+    );
+    ctx.session.commitPreparedHistoryEntry(ctx.alloc, prepared);
+    prepared_owned = false;
     ctx.prompt_snapshot_committed = true;
+}
+
+fn commitContextCompaction(
+    raw_ctx: *anyopaque,
+    summary: types.CompactedSummaryHistoryTurn,
+    active_prefix: ?types.AssistantHistoryTurn,
+    retained_from: ?types.ContextHistoryCut,
+) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.session_write_mutex.unlock(io_mod.getIo());
+    const prepared = try session_runtime.prepareCompactedHistory(ctx.alloc, ctx.session.agent.history.items, summary, retained_from orelse .{ .turns = session_runtime.rawHistoryTurnCount(ctx.session.agent.history.items) });
+    errdefer types.freeHistoryTurnSlice(ctx.alloc, prepared);
+    if (ctx.writable) |*writable| {
+        _ = try writable.commitContextCompaction(ctx.alloc, summary, active_prefix, retained_from, io_mod.milliTimestamp());
+        if (active_prefix != null) ctx.prompt_snapshot_committed = true;
+    }
+    ctx.session.commitCompactedHistory(ctx.alloc, prepared);
 }
 
 fn setRecoveryCheckpoint(
@@ -2925,73 +2913,26 @@ fn setRecoveryCheckpoint(
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
     const writable = if (ctx.writable) |*value| value else return error.SessionPersistenceUnavailable;
     const now_ms = io_mod.milliTimestamp();
-    _ = writable.appendEvent(
+    _ = try writable.appendEvent(
         ctx.alloc,
         .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
         now_ms,
-        .retry_expected_tail,
-        .{},
-    ) catch |err| switch (err) {
-        error.EventFrameTooLarge => {
-            var current = try currentAskState(ctx, writable, now_ms);
-            defer current.deinit(ctx.alloc);
-            if (current.recovery_checkpoint) |*old| old.deinit(ctx.alloc);
-            current.recovery_checkpoint = try checkpoint.dupe(ctx.alloc);
-            _ = try writable.commitStateReplacement(
-                ctx.alloc,
-                current,
-                .compaction,
-                .retry_expected_tail,
-                .{},
-            );
-        },
-        else => return err,
-    };
+    );
 }
 
-fn currentAskState(
+fn flushAskSessionUsage(
     ctx: *AskContext,
     writable: *session_store.LoadedWritableSession,
-    now_ms: i64,
-) !session_codec.DurableSessionState {
-    var state = try writable.state.dupe(ctx.alloc);
-    errdefer state.deinit(ctx.alloc);
-    const history = try ctx.session.snapshotHistory(ctx.alloc);
-    types.freeHistoryTurnSlice(ctx.alloc, state.history);
-    state.history = history;
-    const permission_state = try ctx.session.snapshotPermissionState(ctx.alloc);
-    state.permission_state.deinit(ctx.alloc);
-    state.permission_state = permission_state;
-    state.conversation_language = ctx.session.languageSnapshot();
-    state.updated_at_ms = now_ms;
-    const usage = try ctx.session.usage.snapshot(ctx.alloc);
-    if (state.usage) |*old| old.deinit(ctx.alloc);
-    state.usage = usage;
-    return state;
-}
-
-fn commitAskStateReplacement(
-    ctx: *AskContext,
-    writable: *session_store.LoadedWritableSession,
-    clear_recovery_checkpoint: bool,
 ) !void {
     const now_ms = io_mod.milliTimestamp();
-    var state = try currentAskState(ctx, writable, now_ms);
-    defer state.deinit(ctx.alloc);
-    if (clear_recovery_checkpoint) {
-        if (state.recovery_checkpoint) |*checkpoint| checkpoint.deinit(ctx.alloc);
-        state.recovery_checkpoint = null;
-    }
-    _ = try writable.commitStateReplacement(
+    var usage = try ctx.session.usage.snapshot(ctx.alloc);
+    defer usage.deinit(ctx.alloc);
+    _ = try writable.appendEvent(
         ctx.alloc,
-        state,
-        .compaction,
-        .retry_expected_tail,
-        .{},
+        .{ .usage_checkpointed = .{ .usage = usage } },
+        now_ms,
     );
-    if (state.usage) |usage| {
-        ctx.session.usage.markClean(usage);
-    }
+    ctx.session.usage.markClean(usage);
 }
 
 fn propagateGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
@@ -7279,93 +7220,6 @@ test "saved ask allocation failures keep managed borrows owned" {
     }
 }
 
-fn exerciseCurrentAskStateAllocation(
-    ctx: *AskContext,
-    writable: *session_store.LoadedWritableSession,
-    alloc: Allocator,
-) !void {
-    const previous_alloc = ctx.alloc;
-    ctx.alloc = alloc;
-    defer ctx.alloc = previous_alloc;
-
-    var state = try currentAskState(ctx, writable, io_mod.milliTimestamp());
-    defer state.deinit(alloc);
-}
-
-test "current ask state releases partial snapshots on allocation failure" {
-    const setup_alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-
-    const home = try io_mod.dirRealpathAlloc(setup_alloc, tmp.dir, "home");
-    defer setup_alloc.free(home);
-    const workspace = try io_mod.dirRealpathAlloc(
-        setup_alloc,
-        tmp.dir,
-        "workspace",
-    );
-    defer setup_alloc.free(workspace);
-    const test_home = try TestAskHome.install(setup_alloc, home);
-    defer test_home.deinit();
-
-    var stdout_capture: TestCapture = .{};
-    defer stdout_capture.deinit(setup_alloc);
-    var stderr_capture: TestCapture = .{};
-    defer stderr_capture.deinit(setup_alloc);
-    var ctx = AskContext.init(
-        setup_alloc,
-        testConfig(),
-        testPromptRunDeps(
-            &stdout_capture,
-            &stderr_capture,
-            testPresentKeyStartup,
-        ),
-        workspace,
-    );
-    defer ctx.deinit();
-    try ctx.initializeSessionStores();
-    try ctx.session.appendAssistantHistoryTurn(
-        setup_alloc,
-        "question",
-        "answer",
-    );
-    const sequence = try ctx.session.usage.reserveInvocation();
-    try ctx.session.usage.finishObservedInvocation(
-        setup_alloc,
-        sequence,
-        1,
-        .observed_generation,
-        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        "https://ai-gateway.vercel.sh",
-        null,
-    );
-    const writable = &ctx.writable.?;
-
-    var counting = std.testing.FailingAllocator.init(setup_alloc, .{});
-    try exerciseCurrentAskStateAllocation(&ctx, writable, counting.allocator());
-
-    for (0..counting.alloc_index) |fail_index| {
-        var failing = std.testing.FailingAllocator.init(
-            setup_alloc,
-            .{ .fail_index = fail_index },
-        );
-        exerciseCurrentAskStateAllocation(
-            &ctx,
-            writable,
-            failing.allocator(),
-        ) catch |err| {
-            if (err != error.OutOfMemory) return err;
-        };
-        try std.testing.expect(failing.has_induced_failure);
-        try std.testing.expectEqual(
-            failing.allocated_bytes,
-            failing.freed_bytes,
-        );
-    }
-}
-
 test "saved ask classifies unsafe store failure by request mode" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -8732,6 +8586,89 @@ test "json run with missing API key prints diagnostic then final object" {
         "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"MissingCredentials\"}\n",
         stdout_capture.bytes.items,
     );
+}
+
+test "ordinary resumed ask preserves its user after a retained mid-turn checkpoint" {
+    const Process = struct {
+        fn run(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, _: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
+            if (job.recovery_checkpoint) |checkpoint| {
+                try std.testing.expectEqual(@as(u64, 7), checkpoint.turn_id);
+                try std.testing.expectEqualStrings("original request", job.prompt);
+            }
+            try deps.propagate_history_turn(deps.ctx, .{ .assistant = .{
+                .user = .{ .text = job.prompt },
+                .assistant = @constCast("new answer"),
+            } });
+            try testPushAssistantText(deps, "new answer");
+        }
+    };
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { prompt: [:0]const u8, continue_recovery: bool = false }{
+        .{ .prompt = "different request" },
+        .{ .prompt = "original request" },
+        .{ .prompt = "original request", .continue_recovery = true },
+    };
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(home);
+        const test_home = try TestAskHome.install(alloc, home);
+        defer test_home.deinit();
+        const session_id = "retained-open-session";
+        var store = try session_store.Store.initFromHome(alloc, home, "/tmp/fx-test");
+        defer store.deinit(alloc);
+        var state = try testAskDurableState(alloc, "/tmp/fx-test", session_id);
+        defer state.deinit(alloc);
+        const old_user = types.UserTurn{ .text = @constCast("original request") };
+        {
+            var writable = try store.startWritableSession(alloc, state);
+            defer writable.deinit(alloc);
+            _ = try writable.commitContextCompaction(alloc, .{
+                .summary = @constCast("<context_handoff>Earlier work completed.</context_handoff>"),
+                .removed_turn_count = 0,
+                .compaction_count = 1,
+            }, .{ .user = old_user, .assistant = @constCast("") }, null, 10);
+            _ = try writable.appendEvent(alloc, .{ .recovery_checkpoint_set = .{ .checkpoint = .{
+                .turn_id = 7,
+                .user = old_user,
+                .assistant_source = @constCast("old partial answer"),
+                .cause = .network_interrupted,
+                .action = .paused,
+                .authority = .{ .provider = .gateway, .model = @constCast("model") },
+                .requested_fast_mode = false,
+                .fast_mode = false,
+                .max_provider_attempts = 3,
+                .consumed_provider_attempts = 1,
+            } } }, 20);
+        }
+
+        var stdout_capture: TestCapture = .{};
+        defer stdout_capture.deinit(alloc);
+        var stderr_capture: TestCapture = .{};
+        defer stderr_capture.deinit(alloc);
+        var deps = testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeySavedStartup);
+        deps.initialize_session_stores = initializeSessionStoresDefault;
+        deps.process_queued_prompt = Process.run;
+        const args: []const [:0]const u8 = if (case.continue_recovery)
+            &.{ "--json", "--resume-id", session_id, "--continue-recovery" }
+        else
+            &.{ "--json", "--resume-id", session_id, case.prompt };
+        try std.testing.expectEqual(@as(u8, 0), try runWithDeps(alloc, args, testConfig(), deps));
+
+        var restored = try store.loadReadOnly(alloc, session_id);
+        defer restored.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, if (case.continue_recovery) 2 else 3), restored.history.len);
+        if (!case.continue_recovery) {
+            try std.testing.expect(restored.history[1] == .interrupted);
+            try std.testing.expectEqualStrings("original request", restored.history[1].interrupted.user.text);
+            try std.testing.expectEqualStrings("old partial answer", restored.history[1].interrupted.assistant.?);
+        }
+        const last = restored.history[restored.history.len - 1].assistant;
+        try std.testing.expectEqualStrings(case.prompt, last.user.text);
+        try std.testing.expectEqualStrings("new answer", last.assistant);
+        try std.testing.expect(restored.recovery_checkpoint == null);
+    }
 }
 
 test "recovery continuation checks local checkpoint before credentials" {

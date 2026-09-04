@@ -468,6 +468,16 @@ pub const Runtime = struct {
         self.cancel_requested.store(false, .seq_cst);
     }
 
+    pub fn resetForProviderChange(self: *Self) void {
+        debug_trace.logf("catalog", "model catalog reset reason=provider_changed", .{});
+        self.reset();
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        model_catalog.freeModelCatalog(self.alloc, &self.catalog);
+        self.catalog = .empty;
+        self.outcome = .{};
+    }
+
     /// Installs a catalog that was completely fetched and validated before the
     /// caller's publication boundary. Ownership transfers without allocation.
     pub fn adoptOwnedCatalog(
@@ -1511,6 +1521,31 @@ test "model cache completion hydrates an open menu and reports once" {
     try std.testing.expect(!runtime.menu.active);
     try std.testing.expectEqual(ModelCacheState.idle, runtime.state);
     if (fixture.failure()) |err| return err;
+}
+
+test "provider changes discard public catalog fallback without changing ordinary reset" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc, "/v1/models");
+    defer runtime.deinit();
+    {
+        const id = try alloc.dupe(u8, "gateway-model");
+        errdefer alloc.free(id);
+        const model_type = try alloc.dupe(u8, "language");
+        errdefer alloc.free(model_type);
+        try runtime.catalog.append(alloc, .{ .id = id, .model_type = model_type });
+    }
+    runtime.outcome = .{ .loaded = .{
+        .access = model_catalog.AccessMetadata.init(.{ .public_only = .no_credential }),
+    } };
+    runtime.state = .ready;
+
+    runtime.reset();
+    try std.testing.expectEqual(@as(usize, 1), runtime.catalog.items.len);
+    try std.testing.expect(runtime.outcome.loaded != null);
+    runtime.resetForProviderChange();
+    try std.testing.expectEqual(@as(usize, 0), runtime.catalog.items.len);
+    try std.testing.expect(runtime.outcome.loaded == null);
+    try std.testing.expectEqual(ModelCacheState.idle, runtime.state);
 }
 
 test "model cache reset replaces ready public catalog with team catalog" {

@@ -1,3 +1,5 @@
+import { CoreOutput, maxCoreMessageBytes } from "./core-output.js";
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const strictDecoder = new TextDecoder("utf-8", { fatal: true });
@@ -11,6 +13,8 @@ const maxUrlBytes = 16 * 1024;
 const maxModelCatalogBytes = 4 * 1024 * 1024;
 const maxModelCatalogEntries = 10_000;
 const streamReadsPerTaskYield = 32;
+const maxUnreadEventBytes = 1024 * 1024;
+const maxUnreadEvents = 256;
 
 function boundedString(value, name, maxBytes, required) {
   if (value === undefined && !required) return undefined;
@@ -341,6 +345,8 @@ function yieldToHostTask() {
 }
 
 function createRuntime(options) {
+  // Creating this inside a Wasm call would retain that instance through the error stack.
+  const abortReason = new DOMException("This operation was aborted", "AbortError");
   const stdin = new ByteQueue();
   const streams = new Map();
   const workspaceExecs = new Set();
@@ -352,7 +358,8 @@ function createRuntime(options) {
   let exitedResolve;
   let exitCode = null;
   let aborted = false;
-  let lineBuffer = "";
+  let coreOutput;
+  let outputError;
   const exited = new Promise((resolve) => { exitedResolve = resolve; });
   const markExited = (code) => {
     if (exitCode !== null) return;
@@ -382,7 +389,7 @@ function createRuntime(options) {
   }
 
   function emitStdout(chunk) {
-    if (options.stdout) options.stdout(chunk);
+    if (options.stdout) return options.stdout(chunk);
   }
 
   function fdWrite(fd, iovs, count, nwritten) {
@@ -392,6 +399,7 @@ function createRuntime(options) {
     for (let index = 0; index < count; index++) {
       total += view.getUint32(iovs + index * 8 + 4, true);
     }
+    if (coreOutput && total > maxCoreMessageBytes) throw new RangeError("core output message exceeds 64 MiB");
     if (fd === 1 || fd === 2) {
       const chunk = new Uint8Array(total);
       let offset = 0;
@@ -401,7 +409,13 @@ function createRuntime(options) {
         chunk.set(bytes(ptr, len), offset);
         offset += len;
       }
-      if (fd === 1) emitStdout(chunk);
+      if (fd === 1) {
+        const pending = emitStdout(chunk);
+        if (coreOutput && pending) return Promise.resolve(pending).then(() => {
+          writeU32(nwritten, total);
+          return 0;
+        });
+      }
       else if (typeof options.stderr === "function") options.stderr(chunk);
       else console.warn(decoder.decode(chunk));
     }
@@ -857,7 +871,7 @@ function createRuntime(options) {
   }
 
   function abortHostEffects() {
-    streams.forEach((state) => state.controller.abort());
+    streams.forEach((state) => state.controller.abort(abortReason));
     workspaceExecs.forEach((state) => state.abort(-3));
   }
 
@@ -867,7 +881,7 @@ function createRuntime(options) {
     args_get(ptrs, data) { if (options.traceWasi) console.error("wasi args_get"); writeVector(args, ptrs, data); return 0; },
     environ_sizes_get(count, size) { if (options.traceWasi) console.error("wasi environ_sizes_get"); writeU32(count, env.length); writeU32(size, env.reduce((n, v) => n + encoder.encode(v).length + 1, 0)); return 0; },
     environ_get(ptrs, data) { if (options.traceWasi) console.error("wasi environ_get"); writeVector(env, ptrs, data); return 0; },
-    fd_write: fdWrite,
+    fd_write: options.args?.[0] === "acp" ? new WebAssembly.Suspending(fdWrite) : fdWrite,
     fd_read: new WebAssembly.Suspending(fdRead),
     fd_close() { return 0; },
     fd_fdstat_get(fd, out) {
@@ -915,7 +929,7 @@ function createRuntime(options) {
     fx_http_stream_open: streamOpen,
     fx_http_stream_status: new WebAssembly.Suspending(streamStatus),
     fx_http_stream_next: new WebAssembly.Suspending(streamNext),
-    fx_http_stream_close(handle) { const state = streams.get(handle); state?.controller.abort(); streams.delete(handle); },
+    fx_http_stream_close(handle) { const state = streams.get(handle); state?.controller.abort(abortReason); streams.delete(handle); },
     fx_http_request: new WebAssembly.Suspending(httpRequest),
     fx_host_tool_call: new WebAssembly.Suspending(hostToolCall),
     fx_open_url: new WebAssembly.Suspending(openUrl),
@@ -947,8 +961,10 @@ function createRuntime(options) {
     wake() { stdin.wake(); },
     closeStdin() { stdin.close(); },
     abortHostEffects,
-    abort() {
+    abort(error) {
       aborted = true;
+      outputError = error;
+      coreOutput?.close();
       abortHostEffects();
       stdin.close();
       markExited(130);
@@ -956,17 +972,12 @@ function createRuntime(options) {
     markExited,
     get aborted() { return aborted; },
     get exitCode() { return exitCode; },
+    get error() { return outputError; },
     setLineHandler(handler) {
-      options.stdout = (chunk) => {
-        lineBuffer += decoder.decode(chunk, { stream: true });
-        for (;;) {
-          const newline = lineBuffer.indexOf("\n");
-          if (newline < 0) break;
-          const line = lineBuffer.slice(0, newline); lineBuffer = lineBuffer.slice(newline + 1);
-          if (line) handler(JSON.parse(line));
-        }
-      };
+      coreOutput = new CoreOutput(handler);
+      options.stdout = (chunk) => coreOutput.write(chunk);
     },
+    finishOutput() { coreOutput?.finish(); },
   };
 }
 
@@ -978,10 +989,18 @@ async function instantiate(options) {
   runtime.setInstance(instance);
   const start = WebAssembly.promising(instance.exports._start);
   start().then(
-    () => runtime.markExited(0),
+    () => {
+      runtime.setInstance(null);
+      try { runtime.finishOutput(); runtime.markExited(0); }
+      catch (error) { runtime.abort(error); }
+    },
     (error) => {
-      if (!String(error).includes("proc_exit")) console.error(error);
-      runtime.markExited(runtime.aborted ? 130 : 1);
+      runtime.setInstance(null);
+      if (options.args?.[0] === "acp" && !String(error).includes("proc_exit")) runtime.abort(error);
+      else {
+        if (!String(error).includes("proc_exit")) console.error(error);
+        runtime.markExited(runtime.aborted ? 130 : 1);
+      }
     },
   );
   return runtime;
@@ -1160,6 +1179,7 @@ export async function createFxAgent(options = {}) {
   let sessionId = null;
   let activeTurn = null;
   let closing = false;
+  const isCurrentTurn = (turn) => turn && activeTurn === turn && !turn.cancelled && !closing;
   const emit = (type, detail = {}) => {
     try { options.onEvent?.({ type, timestamp: performance.now(), ...detail }); } catch {}
   };
@@ -1176,6 +1196,10 @@ export async function createFxAgent(options = {}) {
       const attempt = activeTurn ? ++activeTurn.transportAttempts : attemptIndex + 1;
       emit("transport.start", { attempt, method, endpoint, model: options.model });
       try {
+        if (activeTurn?.cancelled) {
+          runtime.abortHostEffects();
+          throw new DOMException("Aborted", "AbortError");
+        }
         if (!hostFetch) throw new TypeError("fetch is unavailable");
         const response = await hostFetch(input, init);
         const headers = response.headers;
@@ -1211,20 +1235,30 @@ export async function createFxAgent(options = {}) {
     const turn = requestedSessionId === undefined || requestedSessionId === sessionId
       ? activeTurn
       : null;
+    if (!isCurrentTurn(turn)) return { content: "", isError: true, cancelled: true };
     const controller = new AbortController();
-    turn?.toolControllers.add(controller);
-    let content;
+    turn.toolControllers.add(controller);
+    let onAbort;
+    const aborted = new Promise((resolve) => { onAbort = () => resolve(); });
+    controller.signal.addEventListener("abort", onAbort, { once: true });
+    let content = "";
     let isError = false;
     try {
       if (!execute) throw new Error(`unknown host tool: ${String(name)}`);
-      content = hostToolContent(await execute(input, { signal: controller.signal }));
+      const execution = Promise.resolve().then(() => {
+        if (controller.signal.aborted || !isCurrentTurn(turn)) return;
+        return execute(input, { signal: controller.signal });
+      });
+      const value = await Promise.race([execution, aborted]);
+      if (!controller.signal.aborted) content = hostToolContent(value);
     } catch (error) {
       isError = true;
       content = error instanceof Error ? error.message : String(error);
     } finally {
-      turn?.toolControllers.delete(controller);
+      controller.signal.removeEventListener("abort", onAbort);
+      turn.toolControllers.delete(controller);
     }
-    return { content, isError, cancelled: controller.signal.aborted };
+    return { content, isError, cancelled: controller.signal.aborted || !isCurrentTurn(turn) };
   };
   emit("runtime.start");
   const runtimeOptions = {
@@ -1250,21 +1284,30 @@ export async function createFxAgent(options = {}) {
   });
   runtime.exited.then((code) => {
     emit("runtime.exit", { code });
-    const error = new Error(`fx-core exited with code ${code} before completing the ACP request`);
+    closing = true;
+    const error = runtime.error ?? new Error(`fx-core exited with code ${code} before completing the ACP request`);
     for (const waiter of pending.values()) waiter.reject(error);
     pending.clear();
   });
-  runtime.setLineHandler(async (message) => {
+  runtime.setLineHandler((message, size) => {
     emit("acp.receive", { message });
     if (message.method === "session/update") {
-      if (message.params.sessionId === sessionId) activeTurn?.push(message.params.update);
+      if (message.params.sessionId === sessionId) return activeTurn?.push(message.params.update, size);
       return;
     }
+    void handleControlMessage(message).catch((error) => runtime.abort(error));
+  });
+  async function handleControlMessage(message) {
     if (message.method === "session/request_permission") {
+      const turn = activeTurn;
+      if (!isCurrentTurn(turn)) return;
       emit("permission.request", { request: message.params });
+      if (!isCurrentTurn(turn)) return;
       let optionId = null;
       try { optionId = await options.onPermission?.(message.params); } catch {}
+      if (!isCurrentTurn(turn)) return;
       emit("permission.resolve", { optionId });
+      if (!isCurrentTurn(turn)) return;
       send({ jsonrpc: "2.0", id: message.id, result: optionId ? { outcome: { outcome: "selected", optionId } } : { outcome: { outcome: "cancelled" } } });
       return;
     }
@@ -1280,7 +1323,7 @@ export async function createFxAgent(options = {}) {
     }
     const waiter = pending.get(message.id); if (!waiter) return; pending.delete(message.id);
     if (message.error) waiter.reject(new Error(message.error.message)); else waiter.resolve(message.result);
-  });
+  }
   try {
     await request("initialize", {
       protocolVersion: 1,
@@ -1368,18 +1411,28 @@ export async function createFxAgent(options = {}) {
       }
       return null;
     };
+    const result = rawTurn.result.then((value) => ({
+      stopReason: value.stopReason,
+      usage: normalizeTurnUsage(value.usage),
+    }));
+    void result.catch(() => {});
     return {
       cancel() { rawTurn.cancel(); },
-      async *[Symbol.asyncIterator]() {
-        for await (const update of rawTurn) {
-          const event = eventFor(update);
-          if (event) yield event;
-        }
+      [Symbol.asyncIterator]() {
+        const iterator = (async function* () {
+          for await (const update of rawTurn) {
+            const event = eventFor(update);
+            if (event) yield event;
+          }
+        })();
+        return {
+          next(value) { return iterator.next(value); },
+          return(value) { rawTurn.cancel(); return iterator.return(value); },
+          throw(error) { rawTurn.cancel(); return iterator.throw(error); },
+          [Symbol.asyncIterator]() { return this; },
+        };
       },
-      result: rawTurn.result.then((result) => ({
-        stopReason: result.stopReason,
-        usage: normalizeTurnUsage(result.usage),
-      })),
+      result,
     };
   }
 
@@ -1399,39 +1452,93 @@ export async function createFxAgent(options = {}) {
     if (signal !== undefined && (typeof signal?.addEventListener !== "function" || typeof signal?.removeEventListener !== "function")) throw new TypeError("prompt signal must be an AbortSignal");
     const queue = [];
     const waiters = [];
+    let queuedBytes = 0;
+    let resumeOutput;
+    let iteratorTaken = false;
+    let terminalError;
+    let reportedPressure = false;
+    let discardedBytes = 0;
     const toolControllers = new Set();
     let finished = false;
     let cancelled = false;
     const turn = {
-      push(update) { const waiter = waiters.shift(); if (waiter) waiter({ value: update, done: false }); else queue.push(update); },
+      push(update, size = encoder.encode(JSON.stringify(update)).length) {
+        if (cancelled || finished) { discardedBytes += size; return; }
+        if (size > maxCoreMessageBytes) throw new RangeError("core output message exceeds 64 MiB");
+        if (queue.length && (queue.length >= maxUnreadEvents || size > maxUnreadEventBytes - queuedBytes)) {
+          const capacity = new Promise((resolveCapacity) => { resumeOutput = resolveCapacity; });
+          if (!reportedPressure) {
+            reportedPressure = true;
+            emit("output.backpressure", { bufferedBytes: queuedBytes, bufferedEvents: queue.length });
+          }
+          return capacity.then(() => turn.push(update, size));
+        }
+        const waiter = waiters.shift();
+        if (waiter) waiter.resolve({ value: update, done: false });
+        else { queue.push({ update, size }); queuedBytes += size; }
+      },
       toolControllers,
       transportAttempts: 0,
+      get cancelled() { return cancelled; },
       cancel() {
         if (finished || cancelled) return;
         cancelled = true;
+        resumeOutput?.();
+        resumeOutput = null;
         send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } });
         for (const controller of toolControllers) controller.abort();
         runtime.abortHostEffects();
       },
-      [Symbol.asyncIterator]() { return { next() { if (queue.length) return Promise.resolve({ value: queue.shift(), done: false }); if (finished) return Promise.resolve({ done: true }); return new Promise((resolve) => waiters.push(resolve)); } }; },
+      [Symbol.asyncIterator]() {
+        if (iteratorTaken) throw new Error("a turn has only one event consumer");
+        iteratorTaken = true;
+        return {
+          next() {
+            if (queue.length) {
+              const { update, size } = queue.shift();
+              queuedBytes -= size;
+              resumeOutput?.();
+              resumeOutput = null;
+              return Promise.resolve({ value: update, done: false });
+            }
+            if (terminalError) return Promise.reject(terminalError);
+            if (finished) return Promise.resolve({ done: true });
+            return new Promise((resolve, reject) => waiters.push({ resolve, reject }));
+          },
+          return() { turn.cancel(); return Promise.resolve({ done: true }); },
+        };
+      },
     };
+    if (signal?.aborted) {
+      finished = true;
+      turn.result = Promise.resolve({ stopReason: "cancelled" });
+      return turn;
+    }
     activeTurn = turn;
     const abort = () => turn.cancel();
     signal?.addEventListener("abort", abort, { once: true });
     turn.result = request("session/prompt", { sessionId, prompt })
-      .then((response) => ({ stopReason: response.stopReason, usage: response.usage }))
+      .then((response) => ({ stopReason: cancelled ? "cancelled" : response.stopReason, usage: response.usage }))
       .catch((error) => {
         if (error.message === "Cancelled") return { stopReason: "cancelled" };
+        terminalError = error;
         throw error;
       })
       .finally(() => {
         finished = true;
+        resumeOutput?.();
+        resumeOutput = null;
         signal?.removeEventListener("abort", abort);
         if (activeTurn === turn) activeTurn = null;
         toolControllers.clear();
-        waiters.splice(0).forEach((resolve) => resolve({ done: true }));
+        if (discardedBytes) emit("output.discarded", { reason: "cancelled", bytes: discardedBytes });
+        for (const waiter of waiters.splice(0)) {
+          if (terminalError) waiter.reject(terminalError);
+          else waiter.resolve({ done: true });
+        }
       });
     if (signal?.aborted) turn.cancel();
+    void turn.result.catch(() => {});
     return turn;
   }
 }

@@ -3666,7 +3666,13 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const stderrPath = join(dir, "stderr.log");
       const gateway = startFakeGateway([
         fakeGatewayFinalText("large paste resize complete"),
-      ]);
+      ], { models: [{
+        id: FAKE_GATEWAY_MODEL,
+        type: "language",
+        tags: ["tool-use"],
+        context_window: 16_000_000,
+        max_tokens: 64_000,
+      }] });
       gateways.push(gateway);
 
       session = await createResizeSession({
@@ -3676,6 +3682,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
         env: {
           AI_GATEWAY_API_KEY: "test-key",
           VERCEL_OIDC_TOKEN: undefined,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "input,worker,resize",
@@ -3712,6 +3720,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
       expect(await waitForQueuedPromptBytes(tracePath, 60_000)).toBe(
         payload.length,
       );
+      expect(await waitForSubmittedUserText(gateway, tracePath, stderrPath))
+        .toBe(payload);
       expectEmptyStderr(stderrPath);
     },
     90_000,
@@ -3726,7 +3736,13 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const stderrPath = join(dir, "stderr.log");
       const gateway = startFakeGateway([
         fakeGatewayFinalText("CPR-shaped paste resize complete"),
-      ]);
+      ], { models: [{
+        id: FAKE_GATEWAY_MODEL,
+        type: "language",
+        tags: ["tool-use"],
+        context_window: 16_000_000,
+        max_tokens: 64_000,
+      }] });
       gateways.push(gateway);
 
       session = await createResizeSession({
@@ -3736,6 +3752,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
         env: {
           AI_GATEWAY_API_KEY: "test-key",
           VERCEL_OIDC_TOKEN: undefined,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "input,worker,resize",

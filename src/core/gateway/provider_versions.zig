@@ -106,12 +106,9 @@ fn loadCache(_: ?*anyopaque, alloc: Allocator, provider: Provider) !?Cached {
 }
 
 fn readCached(alloc: Allocator, dir: std.Io.Dir, provider: Provider) !?Cached {
-    var file = dir.openFile(io_mod.getIo(), cacheFile(provider), .{
-        .follow_symlinks = false,
-        .allow_directory = false,
-        .resolve_beneath = true,
-    }) catch |err| {
+    var file = io_mod.openExistingRegularFile(dir, cacheFile(provider), .read_only) catch |err| {
         if (err == error.FileNotFound) return null;
+        if (err == error.DurablePathUnsafe) return error.InvalidProviderVersionCache;
         return err;
     };
     defer file.close(io_mod.getIo());
@@ -186,6 +183,33 @@ test "provider version cache creates its profile from a fresh home" {
     defer dir.close(std.testing.io);
     const cached = (try readCached(alloc, dir, .grok)).?;
     try std.testing.expectEqualStrings("1.0.13", cached.version.slice());
+}
+
+test "provider version cache rejects directories symlinks and hardlinks" {
+    if (comptime @import("builtin").os.tag == .windows or host_target.is_wasm) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const Kind = enum { directory, symlink, hardlink };
+    for ([_]Provider{ .codex, .grok }) |provider| {
+        for ([_]Kind{ .directory, .symlink, .hardlink }) |kind| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const name = cacheFile(provider);
+            try tmp.dir.writeFile(std.testing.io, .{
+                .sub_path = "target",
+                .data = "{\"version\":\"1.2.3\",\"checked_at_ms\":500}",
+            });
+            switch (kind) {
+                .directory => try tmp.dir.createDir(std.testing.io, name, .fromMode(0o700)),
+                .symlink => try tmp.dir.symLink(std.testing.io, "target", name, .{}),
+                .hardlink => {
+                    const name_z = try alloc.dupeZ(u8, name);
+                    defer alloc.free(name_z);
+                    try std.testing.expectEqual(@as(c_int, 0), std.c.linkat(tmp.dir.handle, "target", tmp.dir.handle, name_z, 0));
+                },
+            }
+            try std.testing.expectError(error.InvalidProviderVersionCache, readCached(alloc, tmp.dir, provider));
+        }
+    }
 }
 
 const TestState = struct {

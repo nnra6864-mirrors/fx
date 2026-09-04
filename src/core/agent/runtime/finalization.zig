@@ -40,6 +40,7 @@ pub const TurnFinalizationGuard = struct {
     lifecycle: LifecycleContext,
     state: State = .open,
     outcome: ?types.TurnPresentationOutcome = null,
+    compacted_execution: execution_memory.CompactedExecutionBoundary = .{},
     lease_allocator: Allocator = std.heap.c_allocator,
     agent_terminal_leases: std.ArrayList([]u8) = .empty,
 
@@ -159,11 +160,14 @@ pub fn finishAssistantTerminalWithExecution(
     finish_trace: *PromptFinishTrace,
     trace_outcome: []const u8,
 ) !void {
+    var projection_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer projection_arena.deinit();
+    const context_execution = try finalization.compacted_execution.project(projection_arena.allocator(), execution);
     const completed_summary = summary.finish();
     var turn: HistoryTurn = .{ .assistant = .{
         .user = .{ .text = job.prompt, .images = job.images },
         .assistant = @constCast(assistant_text),
-        .execution = execution,
+        .execution = context_execution,
     } };
     types.setHistoryTurnSummary(&turn, completed_summary);
     const finished = try types.dupeFinishedPrompt(

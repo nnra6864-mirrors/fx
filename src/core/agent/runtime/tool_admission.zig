@@ -294,7 +294,7 @@ pub const MalformedArgumentsRetryState = struct {
 
     pub fn observe(self: *MalformedArgumentsRetryState, call: ToolCall) void {
         self.current_call_count += 1;
-        if (call.argument_integrity != .malformed_json) return;
+        if (call.argument_integrity == .valid) return;
         self.current_malformed_count += 1;
     }
 
@@ -311,6 +311,19 @@ pub const MalformedArgumentsRetryState = struct {
         return self.consecutive_malformed_batches == max_consecutive_malformed_argument_batches;
     }
 };
+
+test "non-object arguments use the existing bounded invalid-argument retry budget" {
+    var state = MalformedArgumentsRetryState{};
+    const call: ToolCall = .{ .id = "bad", .name = "read_file", .arguments_json = "{}", .argument_integrity = .non_object_json };
+    for (0..3) |index| {
+        state.beginBatch();
+        state.observe(call);
+        try std.testing.expectEqual(index == 2, state.finishBatch());
+    }
+    state.beginBatch();
+    state.observe(.{ .id = "good", .name = "read_file", .arguments_json = "{}" });
+    try std.testing.expect(!state.finishBatch());
+}
 
 test "malformed arguments retry state stops consecutive all-malformed batches" {
     const malformed_read: ToolCall = .{

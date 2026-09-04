@@ -402,7 +402,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
   );
 
   test(
-    "pauses paced assistant text while a file approval is active",
+    "preserves assistant output while a file approval owns the screen",
     async () => {
       const root = createIsolatedRoot();
       const target = join(root.workspace, "pacer-gate.txt");
@@ -443,13 +443,28 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
         required: ["pacer-gate.txt", "+ must not be written"],
         timeoutMs: 5_000,
       });
+      const initialReview = normalizeVolatileStatusRows(await session.capturePaneGrid());
       await session.sendKeys("Down");
       await session.sendKeys("Up");
+      await waitForFileApproval(session, {
+        required: ["pacer-gate.txt", "+ must not be written"],
+      });
+      expect(normalizeVolatileStatusRows(await session.capturePaneGrid())).toEqual(initialReview);
 
       const stdoutBeforeDecision = Buffer.concat(
         stdoutFrames(tapePath).map((frame) => frame.payload),
-      ).toString().replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
-      expect(stdoutBeforeDecision.includes(marker)).toBe(false);
+      ).toString();
+      const approvalEnter = stdoutBeforeDecision.indexOf("\x1b[?1049h");
+      expect(approvalEnter).toBeGreaterThanOrEqual(0);
+      expect(stdoutBeforeDecision.indexOf("\x1b[?1049l")).toBe(-1);
+      const publishedBeforeApproval = stdoutBeforeDecision.slice(0, approvalEnter)
+        .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").includes(marker);
+      // Complete blocks may publish before approval and be repainted as review
+      // context. Only text not yet published must stay out of the owned screen.
+      if (!publishedBeforeApproval) {
+        expect(stdoutBeforeDecision.slice(approvalEnter)
+          .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")).not.toContain(marker);
+      }
 
       const approvalExitFrameStart = stdoutFrames(tapePath).length;
       await decide(session, 3);
@@ -458,8 +473,16 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
 
       const stdoutAfterDecision = Buffer.concat(
         stdoutFrames(tapePath).map((frame) => frame.payload),
-      ).toString().replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
-      expect(stdoutAfterDecision.split(marker)).toHaveLength(2);
+      ).toString();
+      const approvalExit = stdoutAfterDecision.indexOf("\x1b[?1049l", approvalEnter);
+      expect(approvalExit).toBeGreaterThan(approvalEnter);
+      if (!publishedBeforeApproval) {
+        expect(stdoutAfterDecision.slice(approvalEnter, approvalExit)
+          .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")).not.toContain(marker);
+      }
+      expect((await session.capturePane()).split(marker)).toHaveLength(2);
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.requests[1]!.body.split(marker)).toHaveLength(2);
       expect(existsSync(target)).toBe(false);
       expectCleanStderr(stderrPath);
     },
@@ -1710,6 +1733,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       const expectedHash = createHash("sha256").update(content).digest("hex");
       const gateway = startFakeGateway([
         chunkedWriteToolCall("maximum_write", "maximum.txt", content),
+        finalText("The maximum-size write completed successfully."),
         finalText("maximum write complete"),
       ]);
       const { session, stderrPath } = await launch(root, gateway);
@@ -1728,7 +1752,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
 
       expect(statSync(target).size).toBe(content.length);
       expect(fileHash(target)).toBe(expectedHash);
-      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.requests).toHaveLength(3);
       expectCleanStderr(stderrPath);
     },
     MAXIMUM_WRITE_TIMEOUT + 30_000,
@@ -1742,6 +1766,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       const content = "x".repeat(4 * 1024 * 1024 + 1);
       const gateway = startFakeGateway([
         chunkedWriteToolCall("oversized_write", "oversized.txt", content),
+        finalText("The oversized write was rejected before execution."),
         finalText("oversized write complete"),
       ]);
       const { session, stderrPath } = await launch(root, gateway);
@@ -1754,10 +1779,9 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
 
       expect(settled).not.toContain(APPLY_QUESTION);
       expect(existsSync(target)).toBe(false);
-      expect(gateway.requests).toHaveLength(2);
-      expect(gateway.requests[1]!.body).toContain(
-        'call_id=\\"oversized_write\\" tool=\\"write_file\\" status=failure',
-      );
+      expect(gateway.requests).toHaveLength(3);
+      expect(gateway.requests[1]!.body).toContain("Tool write_file (failure)");
+      expect(gateway.requests[2]!.body).toContain("context_handoff");
       expectCleanStderr(stderrPath);
     },
     90_000,

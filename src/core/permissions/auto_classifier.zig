@@ -1119,10 +1119,7 @@ fn writeBoundedValue(
     cap: usize,
     complete: *bool,
 ) !void {
-    const masked = try text_utils.maskSecrets(alloc, value);
-    if (masked.ptr != value.ptr) complete.* = false;
-    defer if (masked.ptr != value.ptr) alloc.free(masked);
-    var encoded = try text_utils.encodeTerminalSafe(alloc, masked, std.math.maxInt(usize));
+    var encoded = try text_utils.encodeTerminalSafe(alloc, value, std.math.maxInt(usize));
     defer encoded.deinit(alloc);
     if (encoded.bytes.len <= cap) return writer.writeAll(encoded.bytes);
 
@@ -1788,7 +1785,7 @@ test "prior tool result selection is entry bounded and keeps the newest window" 
     try std.testing.expect(selected.older_entries_omitted);
 }
 
-test "prior tool result evidence is byte bounded masked and terminal safe" {
+test "prior tool result evidence is byte bounded unmasked and terminal safe" {
     const entries = [_]PriorToolResultEntry{
         .{ .tool_call_id = "first", .tool_name = "read_file", .content = "FIRST_RESULT " ++ ("a" ** 2000) },
         .{ .tool_call_id = "last", .tool_name = "read_file", .content = "LAST_RESULT API_KEY=super-secret\x1b[31m" ++ ("z" ** 2000) },
@@ -1810,9 +1807,26 @@ test "prior tool result evidence is byte bounded masked and terminal safe" {
 
     try std.testing.expect(out.written().len <= max_prior_tool_result_evidence_bytes + 256);
     try std.testing.expect(std.mem.find(u8, out.written(), "LAST_RESULT") != null);
-    try std.testing.expect(std.mem.find(u8, out.written(), "super-secret") == null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "API_KEY=super-secret") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "[redacted]") == null);
     try std.testing.expect(std.mem.findScalar(u8, out.written(), 0x1b) == null);
     try std.testing.expect(std.mem.find(u8, out.written(), "prior_tool_result_evidence_incomplete: true") != null);
+}
+
+test "automatic review root context preserves secret-like user text" {
+    const context = try auto_classifier_context.buildCanonicalRootUserContext(
+        std.testing.allocator,
+        "Run the requested fixture with TOOL_DATA_TOKEN=literal-fixture-value.",
+        &.{},
+    );
+    defer std.testing.allocator.free(context);
+
+    try std.testing.expect(std.mem.find(
+        u8,
+        context,
+        "TOOL_DATA_TOKEN=literal-fixture-value",
+    ) != null);
+    try std.testing.expect(std.mem.find(u8, context, "[redacted]") == null);
 }
 
 test "host validation cautions an untrusted exact action copy despite reviewer clear" {
@@ -1923,11 +1937,11 @@ test "automatic review preserves the exact invalid completion cause" {
     );
 }
 
-test "automatic review does not send redacted action evidence" {
+test "automatic review sends exact unmasked secret-like action evidence" {
     const FakeTransport = struct {
         calls: usize = 0,
         saw_redaction: bool = false,
-        saw_secret: bool = false,
+        saw_exact_action: bool = false,
 
         fn send(
             raw_ctx: *anyopaque,
@@ -1941,8 +1955,9 @@ test "automatic review does not send redacted action evidence" {
             self.calls += 1;
             self.saw_redaction = self.saw_redaction or
                 std.mem.find(u8, payload, "[redacted]") != null;
-            self.saw_secret = self.saw_secret or
-                std.mem.find(u8, payload, "super-secret") != null;
+            self.saw_exact_action = self.saw_exact_action or
+                (std.mem.find(u8, payload, "TOOL_DATA_TOKEN=") != null and
+                    std.mem.find(u8, payload, "secrets.token_hex(12)") != null);
             return .{ .completion = .{ .completion = .{
                 .tool_calls = &.{.{
                     .id = "review",
@@ -1959,15 +1974,19 @@ test "automatic review does not send redacted action evidence" {
         .send_fn = FakeTransport.send,
         .build_fn = buildTestReviewPayload,
     }, null, 1000);
-    const new_content = "AI_GATEWAY_API_KEY=\"$key\"literal-secret run-sandbox\n";
-    var review = try diff_mod.FileReview.init(std.testing.allocator, "", new_content);
-    defer review.deinit(std.testing.allocator);
+    const command = "python3 -c 'import secrets; print(\"TOOL_DATA_TOKEN=\"+secrets.token_hex(12))'";
+    const arguments_json = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"action\":\"run\",\"command\":{f}}}",
+        .{std.json.fmt(command, .{})},
+    );
+    defer std.testing.allocator.free(arguments_json);
     const pending_assistant = types.ChatMessage{
         .role = .assistant,
         .tool_calls = &.{.{
             .id = "call_secret",
-            .name = "edit_file",
-            .arguments_json = "{}",
+            .name = "shell",
+            .arguments_json = arguments_json,
         }},
     };
     var outcome = try reviewer.review(std.testing.allocator, .{
@@ -1976,29 +1995,28 @@ test "automatic review does not send redacted action evidence" {
             .pending_assistant = pending_assistant,
             .target_call_id = "call_secret",
             .origin = .root,
+            .trusted_root_context = "current_request: Run the output fixture.\n",
         },
         .targets = &.{.{
             .role = "target",
-            .path = @constCast("/tmp/home/.zshrc"),
+            .path = @constCast("/tmp/workspace"),
         }},
-        .action = .{ .file_mutation = .{
-            .tool_name = "edit_file",
-            .display_path = "/tmp/home/.zshrc",
-            .preimage = .present,
-            .additions = review.additions,
-            .deletions = review.deletions,
-            .review = review,
+        .action = .{ .command = .{
+            .command = command,
+            .resolved_cwd = "/tmp/workspace",
+            .background = false,
+            .target_os = .macos,
         } },
     });
     defer outcome.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(
-        std.meta.Tag(ParseOutcome).evidence_incomplete,
+        std.meta.Tag(ParseOutcome).valid,
         std.meta.activeTag(outcome),
     );
-    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expect(!fake.saw_redaction);
-    try std.testing.expect(!fake.saw_secret);
+    try std.testing.expect(fake.saw_exact_action);
 }
 
 test "automatic review sends symbolic secret references as complete evidence" {

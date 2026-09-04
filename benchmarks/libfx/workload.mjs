@@ -2,6 +2,22 @@ export const benchmarkInstructions =
   "You are a friendly greeter. When the user says hello, greet them back warmly in one short sentence.";
 export const benchmarkPrompt = "hello world";
 
+export function sampleStats(values) {
+  if (!values.length || values.some((value) => !Number.isFinite(value) || value < 0)) {
+    throw new TypeError("benchmark samples must be nonempty, finite, and nonnegative");
+  }
+  const sorted = [...values].sort((a, b) => a - b);
+  const percentile = (fraction) => sorted[Math.ceil(sorted.length * fraction) - 1];
+  return {
+    count: sorted.length,
+    mean: sorted.reduce((sum, value) => sum + value, 0) / sorted.length,
+    p50: percentile(0.5),
+    p95: percentile(0.95),
+    ...(sorted.length >= 100 ? { p99: percentile(0.99) } : {}),
+    max: sorted.at(-1),
+  };
+}
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 export const benchmarkInstructionsBytes = encoder.encode(benchmarkInstructions).length;

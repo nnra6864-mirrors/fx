@@ -104,6 +104,10 @@ pub const Owner = struct {
     }
 
     pub fn recoverInterrupted(self: *Owner) !void {
+        var observed = try self.state_store.load(self.alloc);
+        defer observed.deinit(self.alloc);
+        if (observed.children.len == 0) return;
+
         var lock = try self.state_store.acquireLock(self.alloc);
         defer lock.release();
         var registry = try self.state_store.load(self.alloc);

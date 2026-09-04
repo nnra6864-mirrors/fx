@@ -36,6 +36,54 @@ pub const ActionableSessionPage = struct {
     }
 };
 
+pub const ActionableSessionCatalog = struct {
+    summaries: std.ArrayList(session_store.SessionSummary) = .empty,
+
+    pub fn deinit(self: *ActionableSessionCatalog, alloc: Allocator) void {
+        for (self.summaries.items) |*summary| summary.deinit(alloc);
+        self.summaries.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub fn listActionableCatalog(
+    store: session_store.Store,
+    alloc: Allocator,
+    scope: session_store.SessionListScope,
+    active_id: ?[]const u8,
+) !ActionableSessionCatalog {
+    var summaries = switch (scope) {
+        .current_workspace => try store.listForWorkspace(alloc),
+        .all_workspaces => try store.list(alloc),
+    };
+    errdefer session_summary_codec.freeSummaries(alloc, &summaries);
+    const keep = try alloc.alloc(bool, summaries.items.len);
+    defer alloc.free(keep);
+    for (summaries.items, keep) |summary, *retain| {
+        retain.* = summary.hasResumableContent();
+        if (retain.*) {
+            if (active_id) |id| {
+                retain.* = !std.mem.eql(u8, summary.id, id);
+            }
+        }
+        if (retain.*) retain.* = try isVisibleSession(store, alloc, summary.id);
+    }
+
+    var write_index: usize = 0;
+    for (summaries.items, keep, 0..) |*summary, retain, read_index| {
+        if (!retain) {
+            summary.deinit(alloc);
+            continue;
+        }
+        if (write_index != read_index) {
+            summaries.items[write_index] = summary.*;
+        }
+        write_index += 1;
+    }
+    summaries.items.len = write_index;
+    return .{ .summaries = summaries };
+}
+
 pub fn listVisiblePage(
     store: session_store.Store,
     alloc: Allocator,
@@ -141,45 +189,6 @@ pub fn listActionablePage(
     continuation: ?session_store.ResumableSessionContinuation,
     limit: usize,
 ) !ActionableSessionPage {
-    return (try listActionablePageInternal(
-        store,
-        alloc,
-        scope,
-        active_id,
-        continuation,
-        limit,
-        false,
-    )).?;
-}
-
-pub fn tryListActionableIndexPage(
-    store: session_store.Store,
-    alloc: Allocator,
-    scope: session_store.SessionListScope,
-    active_id: ?[]const u8,
-    continuation: ?session_store.ResumableSessionContinuation,
-    limit: usize,
-) !?ActionableSessionPage {
-    return listActionablePageInternal(
-        store,
-        alloc,
-        scope,
-        active_id,
-        continuation,
-        limit,
-        true,
-    );
-}
-
-fn listActionablePageInternal(
-    store: session_store.Store,
-    alloc: Allocator,
-    scope: session_store.SessionListScope,
-    active_id: ?[]const u8,
-    continuation: ?session_store.ResumableSessionContinuation,
-    limit: usize,
-    index_only: bool,
-) !?ActionableSessionPage {
     if (limit == 0 or limit > max_page_limit) return error.InvalidSessionListLimit;
 
     var result: ActionableSessionPage = .{};
@@ -198,18 +207,7 @@ fn listActionablePageInternal(
             max_page_limit - scanned,
         );
         const next = if (position) |value| value.view() else null;
-        const maybe_page = if (index_only) switch (scope) {
-            .current_workspace => try scoped.tryListResumableWorkspaceIndexPage(
-                alloc,
-                active_id,
-                next,
-            ),
-            .all_workspaces => try scoped.tryListResumableIndexPage(
-                alloc,
-                active_id,
-                next,
-            ),
-        } else switch (scope) {
+        var page = switch (scope) {
             .current_workspace => try scoped.listResumableWorkspacePage(
                 alloc,
                 active_id,
@@ -220,10 +218,6 @@ fn listActionablePageInternal(
                 active_id,
                 next,
             ),
-        };
-        var page = maybe_page orelse {
-            result.deinit(alloc);
-            return null;
         };
         defer page.deinit(alloc);
         result.has_more = page.has_more;
@@ -280,42 +274,6 @@ pub fn resumeForExternalPrompt(
     );
     errdefer loaded.deinit(alloc);
     try ensureExternalMarkerAllowed(store, alloc, loaded.active_id);
-    try ensureLoadedExternalPromptAllowed(&loaded);
-    return loaded;
-}
-
-pub fn admitResumeViewForExternalPrompt(
-    store: session_store.Store,
-    alloc: Allocator,
-    target: session_store.ResumeTarget,
-) !?session_store.ResumeViewAdmission {
-    switch (target) {
-        .id => |session_id| try ensureExternalMarkerAllowed(store, alloc, session_id),
-        .last => {},
-    }
-    var admission = (try store.admitResumeView(alloc, target)) orelse return null;
-    errdefer admission.deinit(alloc);
-    try ensureExternalPromptAllowed(store, alloc, admission.sessionId());
-    return admission;
-}
-
-pub fn resumeAdmittedForExternalPrompt(
-    store: session_store.Store,
-    alloc: Allocator,
-    admission: *session_store.ResumeViewAdmission,
-    session_id: []const u8,
-    workspace_root: []const u8,
-    options: session_store.ResumeOptions,
-) !session_store.LoadedWritableSession {
-    try ensureExternalMarkerAllowed(store, alloc, session_id);
-    var loaded = try store.resumeAdmittedForWrite(
-        alloc,
-        admission,
-        session_id,
-        workspace_root,
-        options,
-    );
-    errdefer loaded.deinit(alloc);
     try ensureLoadedExternalPromptAllowed(&loaded);
     return loaded;
 }

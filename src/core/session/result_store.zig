@@ -68,6 +68,14 @@ pub fn prepare(
                 durable_output,
             );
         }
+        return prepareExternallyBackedInlineResult(
+            alloc,
+            .{ .legacy_dir = dir },
+            tool_call_id,
+            tool_name,
+            output_bytes,
+            durable_output,
+        );
     }
     const capped = try cappedInlineOutput(alloc, tool_name, durable_output, inline_cap);
     return .{
@@ -102,6 +110,14 @@ pub fn prepareManaged(
                 durable_output,
             );
         }
+        return prepareExternallyBackedInlineResult(
+            alloc,
+            .{ .managed = managed },
+            tool_call_id,
+            tool_name,
+            output_bytes,
+            durable_output,
+        );
     }
     const capped = try cappedInlineOutput(alloc, tool_name, durable_output, inline_cap);
     return .{
@@ -110,6 +126,46 @@ pub fn prepareManaged(
             .output_bytes = output_bytes,
             .stored_output_bytes = durable_output.len,
             .truncated = capped.len < durable_output.len,
+        },
+    };
+}
+
+fn prepareExternallyBackedInlineResult(
+    alloc: Allocator,
+    target: StorageTarget,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    output_bytes: usize,
+    durable_output: []const u8,
+) !PreparedResult {
+    const handle = try makeHandle(alloc, tool_call_id, tool_name, durable_output);
+    errdefer alloc.free(handle);
+    const model_output = try alloc.dupe(u8, durable_output);
+    errdefer alloc.free(model_output);
+    const preview = try previewText(alloc, durable_output, preview_bytes);
+    errdefer alloc.free(preview);
+    switch (target) {
+        .legacy_dir => |dir| try storeLargeResultAtHandle(
+            alloc,
+            dir,
+            handle,
+            durable_output,
+        ),
+        .managed => |capability| try storeLargeResultAtHandleManaged(
+            alloc,
+            capability,
+            handle,
+            durable_output,
+        ),
+    }
+    return .{
+        .model_output = model_output,
+        .memory = .{
+            .output_handle = handle,
+            .preview = preview,
+            .output_bytes = output_bytes,
+            .stored_output_bytes = durable_output.len,
+            .truncated = false,
         },
     };
 }
@@ -392,7 +448,7 @@ fn cappedInlineOutput(alloc: Allocator, tool_name: []const u8, text: []const u8,
     return try std.mem.concat(alloc, u8, &.{ text[0..prefix_len], marker });
 }
 
-fn previewText(alloc: Allocator, text: []const u8, max_bytes: usize) ![]u8 {
+pub fn previewText(alloc: Allocator, text: []const u8, max_bytes: usize) ![]u8 {
     return try alloc.dupe(u8, text_utils.utf8PrefixByBytes(text, max_bytes));
 }
 
@@ -485,6 +541,39 @@ test "large result storage creates stable handle and bounded preview" {
     defer alloc.free(@constCast(again.memory.output_handle.?));
     defer alloc.free(@constCast(again.memory.preview.?));
     try std.testing.expectEqualStrings(prepared.memory.output_handle.?, again.memory.output_handle.?);
+}
+
+test "saved preparation externalizes small results" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+
+    const prepared = try prepare(
+        alloc,
+        dir,
+        "call-small",
+        "read_file",
+        4,
+        "done",
+        64 * 1024,
+    );
+    defer alloc.free(prepared.model_output);
+    defer if (prepared.memory.output_handle) |handle| alloc.free(@constCast(handle));
+    defer if (prepared.memory.preview) |preview| alloc.free(@constCast(preview));
+
+    const handle = prepared.memory.output_handle orelse return error.TestExpectedResultHandle;
+    const stored = try readByRange(
+        alloc,
+        dir,
+        handle,
+        0,
+        16,
+    );
+    defer alloc.free(stored);
+    try std.testing.expect(std.mem.find(u8, stored, "total_bytes=\"4\"") != null);
+    try std.testing.expect(std.mem.find(u8, stored, "\ndone\n") != null);
 }
 
 test "inline cap and stored preview keep complete codepoints" {

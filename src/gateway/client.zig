@@ -773,7 +773,7 @@ const ConnectionSetupTiming = struct {
 };
 
 const ResponseHeadTiming = struct {
-    timeout_ms: i64 = 30_000,
+    timeout_ms: i64 = 120_000,
 };
 
 test "connection setup keeps the production timeout" {
@@ -785,7 +785,7 @@ test "connection setup keeps the production timeout" {
 test "response head wait keeps the production timeout" {
     const timing = ResponseHeadTiming{};
 
-    try std.testing.expectEqual(@as(i64, 30_000), timing.timeout_ms);
+    try std.testing.expectEqual(@as(i64, 120_000), timing.timeout_ms);
 }
 
 const ConnectionSetupEpoch = struct {
@@ -2166,6 +2166,21 @@ test "connected request watch disarms timeout at response head" {
     try std.testing.expect(watch.arm_response_head() == null);
     try std.testing.expect(watch.commit_response_head() == null);
     try std.testing.expect(!watch.win_response_head_timeout());
+    try std.testing.expect(watch.finish() == null);
+}
+
+test "production response head wait accepts slow headers and still expires" {
+    var watch = ConnectedRequestWatch.init(.{});
+    try std.testing.expect(watch.arm_response_head() == null);
+    const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    const slow_headers = std.Io.Clock.Timestamp{
+        .clock = .awake,
+        .raw = now.raw.addDuration(.fromSeconds(36)),
+    };
+    try std.testing.expect(!watch.response_head_expired(slow_headers));
+    try std.testing.expect(watch.response_head_expired(watch.response_head_deadline));
+    try std.testing.expect(watch.commit_response_head() == null);
+    try std.testing.expect(!watch.response_head_expired(watch.response_head_deadline));
     try std.testing.expect(watch.finish() == null);
 }
 

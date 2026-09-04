@@ -677,8 +677,7 @@ fn makeFileEvidence(
     errdefer alloc.free(tool_name);
     const model_view_covers_full_file = if (memory) |info|
         (info.model_view_covers_full_file orelse false) and
-            !info.truncated and
-            info.output_handle == null
+            !info.truncated
     else
         false;
     return .{

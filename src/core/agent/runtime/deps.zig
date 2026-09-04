@@ -6,7 +6,6 @@ const session_codec = @import("../../session/session_codec.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
-const provider_set = @import("../../gateway/provider_set.zig");
 const types = @import("../../shared/types.zig");
 const worker_runtime = @import("../worker_runtime.zig");
 const file_mutation = @import("../../tooling/file_mutation.zig");
@@ -39,6 +38,8 @@ pub const ContextCompactionCommitEffect = struct {
     commit: *const fn (
         ctx: *anyopaque,
         summary: types.CompactedSummaryHistoryTurn,
+        active_prefix: ?types.AssistantHistoryTurn,
+        retained_from: ?types.ContextHistoryCut,
     ) anyerror!void,
 };
 
@@ -177,7 +178,6 @@ pub const DiffMarkerStyles = struct {
 pub const AgentRuntimeDeps = struct {
     ctx: *anyopaque,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
-    compaction_route: provider_set.CompactionRouteDecision = .{ .unavailable = .missing_policy },
     flush_assistant_stream_per_content_chunk: bool = false,
     render_assistant_text: bool = true,
     cooperative_transport_pulse: ?agent_stream_provider.CooperativePulse = null,

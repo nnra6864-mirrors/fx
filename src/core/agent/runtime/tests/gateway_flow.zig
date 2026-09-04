@@ -6,6 +6,7 @@ const token_estimate = @import("../../../shared/token_estimate.zig");
 const worker_runtime = @import("../../worker_runtime.zig");
 const session_runtime = @import("../../../session/session.zig");
 const session_codec = @import("../../../session/session_codec.zig");
+const session_store = @import("../../../session/session_store.zig");
 const session_usage = @import("../../../session/session_usage.zig");
 const model_capabilities = @import("../../../config/model_capabilities.zig");
 const model_provider = @import("../../../config/model_provider.zig");
@@ -20,6 +21,7 @@ const diagnostics = @import("../../../workspace/diagnostics.zig");
 const lifecycle_hooks = @import("../../../hooks/hooks.zig");
 const tool_dispatch = @import("../../../tooling/tool_dispatch.zig");
 const model_tool_schema = @import("../../../tooling/model_tool_schema.zig");
+const prompt_context = @import("../prompt_context.zig");
 
 const test_support = @import("support.zig");
 
@@ -2921,7 +2923,7 @@ test "processQueuedPrompt uses one available capability snapshot for compaction 
         ),
     }};
     const completions = [_]FakeCompletion{
-        .{ .content = "Continue from the compacted history with the recent request intact." },
+        .{ .content = "Continue from the compacted history. NEW_HISTORY_USER received NEW_HISTORY_ASSISTANT." },
         .{ .content = "Done" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
@@ -2948,7 +2950,7 @@ test "processQueuedPrompt uses one available capability snapshot for compaction 
     try expectBodyContains(&gateway, 1, "\"maxOutputTokens\":16000");
 }
 
-test "processQueuedPrompt uses the provider-local compaction model" {
+test "processQueuedPrompt compacts with the selected working model" {
     const alloc = std.testing.allocator;
     const old_user = try alloc.alloc(u8, 48_000);
     defer alloc.free(old_user);
@@ -2970,19 +2972,26 @@ test "processQueuedPrompt uses the provider-local compaction model" {
         provider: model_provider.ProviderId,
         credential_source: types.CredentialSource,
         working_model: []const u8,
-        compaction_model: []const u8,
     }{
         .{
             .provider = .codex,
             .credential_source = .chatgpt_subscription,
             .working_model = "gpt-5.6-sol",
-            .compaction_model = "gpt-5.6-luna",
         },
         .{
             .provider = .grok,
             .credential_source = .grok_subscription,
             .working_model = "grok-4.6",
-            .compaction_model = "grok-4.5",
+        },
+        .{
+            .provider = .gateway,
+            .credential_source = .ai_gateway_api_key,
+            .working_model = "zai/glm-5.2",
+        },
+        .{
+            .provider = .gateway,
+            .credential_source = .ai_gateway_api_key,
+            .working_model = "moonshotai/kimi-k3",
         },
     };
     for (cases) |case| {
@@ -2998,10 +3007,6 @@ test "processQueuedPrompt uses the provider-local compaction model" {
         defer gateway.deinit();
         var hooks = FakeAgentRuntimeDeps.init(alloc);
         hooks.available_capability_overrides = &available_overrides;
-        hooks.compaction_route = .{ .ready = .{
-            .provider = case.provider,
-            .model = case.compaction_model,
-        } };
         defer hooks.deinit();
         var fixture = PromptFixture{};
         var job = fixture.job();
@@ -3013,7 +3018,7 @@ test "processQueuedPrompt uses the provider-local compaction model" {
         try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
         try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-        try std.testing.expectEqualStrings(case.compaction_model, gateway.request_models.items[0]);
+        try std.testing.expectEqualStrings(case.working_model, gateway.request_models.items[0]);
         try std.testing.expectEqualStrings(case.working_model, gateway.request_models.items[1]);
     }
 
@@ -3026,10 +3031,11 @@ test "processQueuedPrompt uses the provider-local compaction model" {
     defer unavailable_gateway.deinit();
     var unavailable_hooks = FakeAgentRuntimeDeps.init(alloc);
     unavailable_hooks.available_capability_overrides = &unavailable_capabilities;
-    unavailable_hooks.compaction_route = .{ .unavailable = .missing_policy };
     defer unavailable_hooks.deinit();
     var unavailable_fixture = PromptFixture{};
     var unavailable_job = unavailable_fixture.job();
+    unavailable_job.provider = .codex;
+    unavailable_job.credential_source = .ai_gateway_api_key;
     unavailable_job.history = &history;
 
     try std.testing.expectError(
@@ -3141,7 +3147,7 @@ test "processQueuedPrompt semantically compacts history at eighty percent and co
     var history = [_]HistoryTurn{
         .{ .assistant = .{
             .user = .{ .text = @constCast("AUTO_HISTORY_USER_SENTINEL") },
-            .assistant = @constCast("AUTO_HISTORY_ASSISTANT_SENTINEL\n" ++ ("h" ** 200_000)),
+            .assistant = @constCast("AUTO_HISTORY_ASSISTANT_SENTINEL\n" ++ ("h" ** 150_000)),
             .execution = .{ .tool_steps = &restored_steps },
         } },
         .{ .assistant = .{
@@ -3160,24 +3166,205 @@ test "processQueuedPrompt semantically compacts history at eighty percent and co
     try std.testing.expect(std.mem.find(
         u8,
         hooks.history_turns.items[0].compacted_summary.summary,
-        "result_handle=",
-    ) != null);
-    try std.testing.expect(std.mem.find(
-        u8,
-        hooks.history_turns.items[0].compacted_summary.summary,
-        "truncated=true",
+        "Finish after the verified read",
     ) != null);
     try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
     try expectBodyContains(&gateway, 0, "AUTO_HISTORY_ASSISTANT_SENTINEL");
+    try expectBodyContains(&gateway, 0, "Result handle:");
+    try expectBodyContains(&gateway, 0, "AUTO_RESTORED_AVAILABLE_BYTES");
     try expectBodyContains(&gateway, 0, "\"toolChoice\":{\"type\":\"none\"}");
     try expectBodyContains(&gateway, 0, "\"tools\":[]");
     try expectBodyContains(&gateway, 1, "context_handoff");
+    try std.testing.expect(prompt_context.measureProviderRequest(gateway.request_bodies.items[1]).estimated_input_tokens <= 4_500);
     try expectBodyNotContains(&gateway, 1, "AUTO_HISTORY_ASSISTANT_SENTINEL");
     try expectBodyContains(&gateway, 2, "AUTO_RESULT_SENTINEL");
     try std.testing.expectEqual(
         @as(usize, 1),
         hooks.successful_effect_count.load(.seq_cst),
     );
+}
+
+test "automatic compaction rejects fixed request overhead above its total target" {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .content = "The earlier task is complete." },
+        .{ .content = "Finished." },
+    });
+    defer gateway.deinit();
+    const model = "provider/fixed-compaction-overhead";
+    const overrides = [_]ModelCapabilityOverride{.{
+        .model = model,
+        .capabilities = .{ .context_window = 45_000 },
+    }};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.available_capability_overrides = &overrides;
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.system_prompt = "fixed instruction " ** 10_000;
+    var job = fixture.job();
+    job.model = @constCast(model);
+    var history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("earlier request") },
+        .assistant = @constCast("history " ** 30_000),
+    } }};
+    job.history = &history;
+
+    try std.testing.expectError(error.ContextCapacityExceeded, runFakePrompt(&gateway, &hooks, config, job));
+    try std.testing.expectEqual(@as(usize, 0), gateway.request_bodies.items.len);
+    for (hooks.history_turns.items) |turn| try std.testing.expect(turn != .compacted_summary);
+}
+
+test "automatic compaction validates serialized handoff cost before committing" {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, &.{.{ .content = "\"" ** 10_000 }});
+    defer gateway.deinit();
+    const model = "provider/escaped-compaction-summary";
+    const overrides = [_]ModelCapabilityOverride{.{
+        .model = model,
+        .capabilities = .{ .context_window = 45_000 },
+    }};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.available_capability_overrides = &overrides;
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.model = @constCast(model);
+    var history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("earlier request") },
+        .assistant = @constCast("history " ** 19_000),
+    } }};
+    job.history = &history;
+
+    try std.testing.expectError(error.ContextCapacityExceeded, runFakePrompt(&gateway, &hooks, fixture.config(), job));
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    for (hooks.history_turns.items) |turn| try std.testing.expect(turn != .compacted_summary);
+}
+
+test "processQueuedPrompt compacts and retries one context overflow" {
+    const alloc = std.testing.allocator;
+    const model = "provider/context-overflow-recovery";
+    const available_overrides = [_]ModelCapabilityOverride{.{
+        .model = model,
+        .capabilities = .{ .context_window = 128_000, .max_output_tokens = 16_384 },
+    }};
+    const completions = [_]FakeCompletion{
+        .{
+            .status = .bad_request,
+            .err_body =
+            \\{"error":{"message":"AI_APICallError: Your input exceeds the context window of this model."}}
+            ,
+        },
+        .{ .content = "Retain the completed prior turn and continue from it." },
+        .{ .content = "CONTEXT_OVERFLOW_RECOVERED" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.available_capability_overrides = &available_overrides;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.model = @constCast(model);
+    var history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("CONTEXT_OVERFLOW_PRIOR_USER") },
+        .assistant = @constCast("CONTEXT_OVERFLOW_PRIOR_ASSISTANT"),
+    } }};
+    job.history = &history;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 0, "CONTEXT_OVERFLOW_PRIOR_ASSISTANT");
+    try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+    try expectBodyContains(&gateway, 1, "\"tools\":[]");
+    try expectBodyContains(&gateway, 2, "context_handoff");
+    try expectBodyNotContains(&gateway, 2, "CONTEXT_OVERFLOW_PRIOR_ASSISTANT");
+    try std.testing.expectEqual(@as(usize, 2), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .compacted_summary);
+    try std.testing.expect(hooks.history_turns.items[1] == .assistant);
+    try std.testing.expectEqualStrings(
+        "CONTEXT_OVERFLOW_RECOVERED",
+        hooks.finish_assistant_text.?,
+    );
+    try std.testing.expect(hooks.http_status == null);
+}
+
+test "host-managed context overflow does not compact or replay the rejected request" {
+    const alloc = std.testing.allocator;
+    const model = "provider/host-context-overflow";
+    for ([_]std.http.Status{ .bad_request, .payload_too_large }) |status| {
+        const completions = [_]FakeCompletion{
+            .{ .status = status, .err_body = "maximum context length exceeded" },
+            .{ .content = "MUST_NOT_COMPACT" },
+            .{ .content = "MUST_NOT_REPLAY" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        hooks.available_capability_overrides = &.{.{
+            .model = model,
+            .capabilities = .{ .context_window = 128_000, .max_output_tokens = 16_384 },
+        }};
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        var job = fixture.job();
+        job.model = @constCast(model);
+        job.api_key = @constCast("");
+        job.credential_source = .host_managed;
+        var history = [_]HistoryTurn{.{ .assistant = .{
+            .user = .{ .text = @constCast("prior user") },
+            .assistant = @constCast("prior assistant"),
+        } }};
+        job.history = &history;
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+        try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+        try std.testing.expectEqual(status, hooks.http_status.?);
+        try std.testing.expectEqual(types.CredentialSource.host_managed, hooks.http_credential_source.?);
+        try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items.len);
+        try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+    }
+}
+
+test "processQueuedPrompt stops after one context overflow recovery" {
+    const alloc = std.testing.allocator;
+    const model = "provider/repeated-context-overflow";
+    const overflow_body =
+        \\{"error":{"code":"context_length_exceeded","message":"maximum context length exceeded"}}
+    ;
+    const completions = [_]FakeCompletion{
+        .{ .status = .bad_request, .err_body = overflow_body },
+        .{ .content = "Compact the prior turn once." },
+        .{ .status = .bad_request, .err_body = overflow_body },
+        .{ .content = "MUST_NOT_RUN" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.available_capability_overrides = &.{.{
+        .model = model,
+        .capabilities = .{ .context_window = 128_000, .max_output_tokens = 16_384 },
+    }};
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.model = @constCast(model);
+    var history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("prior user") },
+        .assistant = @constCast("prior assistant"),
+    } }};
+    job.history = &history;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 3), gateway.index);
+    try std.testing.expectEqual(std.http.Status.bad_request, hooks.http_status.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .compacted_summary);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
 }
 
 test "cancelled automatic compaction is retried by the next prompt" {
@@ -3201,7 +3388,7 @@ test "cancelled automatic compaction is retried by the next prompt" {
     var history = [_]HistoryTurn{
         .{ .assistant = .{
             .user = .{ .text = @constCast("CANCELLED_AUTO_HISTORY_USER") },
-            .assistant = @constCast("CANCELLED_AUTO_HISTORY_ASSISTANT\n" ++ ("h" ** 200_000)),
+            .assistant = @constCast("CANCELLED_AUTO_HISTORY_ASSISTANT\n" ++ ("h" ** 150_000)),
         } },
         .{ .assistant = .{
             .user = .{ .text = @constCast("CANCELLED_AUTO_RECENT_USER") },
@@ -3261,78 +3448,238 @@ test "cancelled automatic compaction is retried by the next prompt" {
     try std.testing.expectEqualStrings("AUTOMATIC_COMPACTION_FOLLOW_UP_OK", hooks.finish_assistant_text.?);
 }
 
-test "processQueuedPrompt compacts mid-turn after tool output crosses eighty percent" {
+test "retained context automatic compaction continues with the exact recent parallel exchange" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(result_dir);
-
-    const calls = [_]ToolCall{toolCall(
-        "midturn_compact_1",
-        "read_file",
-        "{\"path\":\"large.txt\"}",
-    )};
-    const completions = [_]FakeCompletion{
-        .{ .tool_calls = &calls },
-        .{ .content = "Mid-turn compaction complete." },
+    const old_text = "OLDER_HISTORY_SENTINEL " ++ ("o" ** 52_000);
+    const result_a = "RECENT_EXACT_A\n" ++ ("a" ** 13_000);
+    const result_b = "RECENT_EXACT_B\n" ++ ("b" ** 13_000);
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("previous work") },
+        .assistant = @constCast(old_text),
+    } }};
+    const calls = [_]ToolCall{
+        toolCall("retained-a", "read_file", "{\"path\":\"a.txt\"}"),
+        toolCall("retained-b", "read_file", "{\"path\":\"b.txt\"}"),
     };
-    var gateway = FakeGateway.init(alloc, &completions);
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .tool_calls = &calls },
+        .{ .content = "Earlier work established the project facts." },
+        .{ .content = "Continued from the observed results." },
+    });
     defer gateway.deinit();
-    const model = "provider/midturn-compaction";
-    const available_overrides = [_]ModelCapabilityOverride{.{
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    const model = "provider/retained-context";
+    const old_tokens = prompt_context.estimateCompactionSourceTokens(&.{.{ .role = .assistant, .content = old_text }});
+    const recent_tokens = prompt_context.estimateCompactionSourceTokens(&.{ .{ .role = .tool, .content = result_a }, .{ .role = .tool, .content = result_b } });
+    const context_window = (old_tokens + recent_tokens / 2) * 5 / 4;
+    const capabilities = [_]ModelCapabilityOverride{.{ .model = model, .capabilities = .{ .context_window = @intCast(context_window) } }};
+    hooks.available_capability_overrides = &capabilities;
+    hooks.permission_decisions = &.{ .once, .once };
+    hooks.exec_plans = &.{ .{ .result = .{ .model_output = result_a } }, .{ .result = .{ .model_output = result_b } } };
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.tool_result_dir = result_dir;
+    var job = fixture.job();
+    job.model = @constCast(model);
+    job.history = @constCast(&history);
+    try runFakePrompt(&gateway, &hooks, config, job);
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try std.testing.expect(prompt_context.measureProviderRequest(gateway.request_bodies.items[0]).estimated_input_tokens < context_window * 4 / 5);
+    const continued_tokens = prompt_context.measureProviderRequest(gateway.request_bodies.items[2]).estimated_input_tokens;
+    try std.testing.expect(continued_tokens > context_window / 4);
+    try std.testing.expect(continued_tokens < context_window);
+    try expectBodyContains(&gateway, 1, "OLDER_HISTORY_SENTINEL");
+    try expectBodyNotContains(&gateway, 1, "RECENT_EXACT_A");
+    try expectBodyNotContains(&gateway, 1, "RECENT_EXACT_B");
+    try expectBodyContains(&gateway, 2, "context_handoff");
+    try expectBodyContains(&gateway, 2, "retained-a");
+    try expectBodyContains(&gateway, 2, "retained-b");
+    try expectBodyContains(&gateway, 2, "a" ** 13_000);
+    try expectBodyContains(&gateway, 2, "b" ** 13_000);
+    try expectBodyNotContains(&gateway, 2, "OLDER_HISTORY_SENTINEL");
+    try std.testing.expectEqual(@as(usize, 2), hooks.successful_effect_count.load(.seq_cst));
+    const completed = hooks.history_turns.items[hooks.history_turns.items.len - 1].assistant;
+    try std.testing.expectEqual(@as(usize, 1), completed.execution.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 2), completed.execution.tool_steps[0].tool_results.len);
+    try std.testing.expectEqualStrings(result_a, completed.execution.tool_steps[0].tool_results[0].output);
+    try std.testing.expectEqualStrings(result_b, completed.execution.tool_steps[0].tool_results[1].output);
+    for (gateway.request_models.items) |requested_model| try std.testing.expectEqualStrings(model, requested_model);
+}
+
+test "processQueuedPrompt does not compact away its only recent exchange" {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .tool_calls = &.{toolCall("recent-only", "read_file", "{\"path\":\"large.txt\"}")} },
+        .{ .content = "Completed from the observed result." },
+    });
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    const model = "provider/recent-only";
+    const capabilities = [_]ModelCapabilityOverride{.{ .model = model, .capabilities = .{ .context_window = 3_000 } }};
+    hooks.available_capability_overrides = &capabilities;
+    hooks.permission_decisions = &.{.once};
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "RECENT_ONLY\n" ++ ("r" ** 10_000) } }};
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.model = @constCast(model);
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 1, "r" ** 10_000);
+    try expectBodyNotContains(&gateway, 1, "context_handoff");
+    try std.testing.expectEqual(@as(usize, 1), hooks.successful_effect_count.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items[0].assistant.execution.tool_steps.len);
+}
+
+test "automatic compaction summarizes a newest exchange larger than the input window" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
+    const arguments = "{\"path\":\"large.txt\",\"content\":\"" ++ ("x" ** 40_000) ++ "\"}";
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .tool_calls = &.{toolCall("oversized-newest", "write_file", arguments)} },
+        .{ .content = "The large file was written successfully. Do not repeat the write." },
+        .{ .content = "Continued after the large write." },
+    });
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    const model = "provider/oversized-newest";
+    const capabilities = [_]ModelCapabilityOverride{.{ .model = model, .capabilities = .{ .context_window = 8_000 } }};
+    hooks.available_capability_overrides = &capabilities;
+    hooks.permission_decisions = &.{.once};
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "Write completed." } }};
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.tool_result_dir = result_dir;
+    var job = fixture.job();
+    job.model = @constCast(model);
+    try runFakePrompt(&gateway, &hooks, config, job);
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 1, "Tool write_file (success)");
+    try expectBodyContains(&gateway, 1, "oversized-newest");
+    try expectBodyContains(&gateway, 2, "context_handoff");
+    try expectBodyNotContains(&gateway, 2, "x" ** 40_000);
+    try std.testing.expectEqual(@as(usize, 1), hooks.successful_effect_count.load(.seq_cst));
+    try std.testing.expectEqualStrings("Continued after the large write.", hooks.finish_assistant_text.?);
+}
+
+test "interruption after automatic compaction retains the recent and new execution" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
+    const first_calls = [_]ToolCall{toolCall("before-checkpoint", "read_file", "{\"path\":\"first.txt\"}")};
+    const later_calls = [_]ToolCall{toolCall("after-checkpoint", "read_file", "{\"path\":\"later.txt\"}")};
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .tool_calls = &first_calls },
+        .{ .content = "The first read completed." },
+        .{ .tool_calls = &later_calls },
+        .{ .chunks = &.{"partial after checkpoint"}, .cancel_after_chunks = true },
+    });
+    defer gateway.deinit();
+    const model = "provider/compaction-interruption";
+    const overrides = [_]ModelCapabilityOverride{.{
         .model = model,
-        .capabilities = .{ .context_window = 3_000 },
+        .capabilities = .{ .context_window = 28_000 },
     }};
     var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.available_capability_overrides = &available_overrides;
     defer hooks.deinit();
-    hooks.permission_decisions = &.{.once};
-    hooks.exec_plans = &.{.{ .result = .{
-        .model_output = "MIDTURN_RESULT_SENTINEL\n" ++ ("m" ** (10 * 1024)),
-        .tool_result_memory = .{
-            .truncated = true,
-            .command_output_replay = .{ .available = .{
-                .handle = "fx-command-replay-midturn-complete.bin",
-                .framed_bytes = 12 * 1024,
-            } },
-        },
-    } }};
+    hooks.available_capability_overrides = &overrides;
+    hooks.permission_decisions = &.{ .once, .once };
+    hooks.exec_plans = &.{
+        .{ .result = .{ .model_output = "x" ** (10 * 1024) } },
+        .{ .result = .{ .model_output = "later result" } },
+    };
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.tool_result_dir = result_dir;
     var job = fixture.job();
     job.model = @constCast(model);
 
+    var history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("earlier work") },
+        .assistant = @constCast("o" ** 80_000),
+    } }};
+    job.history = &history;
+
     try runFakePrompt(&gateway, &hooks, config, job);
 
-    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
-    try expectBodyNotContains(&gateway, 0, "context_handoff");
-    try expectBodyContains(&gateway, 1, "context_handoff");
-    try expectBodyContains(&gateway, 1, "status=success");
-    try expectBodyContains(&gateway, 1, "result_handle=");
-    try expectBodyNotContains(&gateway, 1, "MIDTURN_RESULT_SENTINEL");
-    try std.testing.expectEqual(@as(usize, 1), hooks.successful_effect_count.load(.seq_cst));
     try std.testing.expectEqual(@as(usize, 2), hooks.history_turns.items.len);
     try std.testing.expect(hooks.history_turns.items[0] == .compacted_summary);
-    try std.testing.expect(hooks.history_turns.items[1] == .assistant);
-    const persisted_result = hooks.history_turns.items[1].assistant.execution.tool_steps[0].tool_results[0];
-    try std.testing.expect(persisted_result.output_handle == null);
-    const replay = persisted_result.command_output_replay orelse
-        return error.TestExpectedEqual;
-    switch (replay) {
-        .available => |descriptor| try std.testing.expectEqualStrings(
-            "fx-command-replay-midturn-complete.bin",
-            descriptor.handle,
-        ),
-        .unavailable => return error.TestExpectedEqual,
-    }
-    try std.testing.expect(std.mem.find(u8, persisted_result.output, "MIDTURN_RESULT_SENTINEL") != null);
-    try std.testing.expect(persisted_result.output.len > 10 * 1024);
-    try std.testing.expectEqualStrings("Mid-turn compaction complete.", hooks.finish_assistant_text.?);
+    const interrupted = hooks.history_turns.items[1].interrupted;
+    try std.testing.expectEqual(@as(usize, 2), interrupted.execution.tool_steps.len);
+    try std.testing.expectEqualStrings("before-checkpoint", interrupted.execution.tool_steps[0].tool_calls[0].id);
+    try std.testing.expectEqualStrings("after-checkpoint", interrupted.execution.tool_steps[1].tool_calls[0].id);
+    try std.testing.expectEqual(@as(usize, 2), interrupted.execution.files.len);
+    try std.testing.expectEqual(@as(usize, 2), hooks.successful_effect_count.load(.seq_cst));
+    try std.testing.expectEqualStrings("before-checkpoint", hooks.compaction_prefixes.items[0].?.assistant.execution.tool_steps[0].tool_calls[0].id);
 }
 
-test "processQueuedPrompt fails after an ineligible tool result cannot fit" {
+test "context overflow after automatic compaction retries with new execution" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
+    const first_calls = [_]ToolCall{toolCall("before-checkpoint", "read_file", "{\"path\":\"first.txt\"}")};
+    const later_calls = [_]ToolCall{toolCall("after-checkpoint", "read_file", "{\"path\":\"later.txt\"}")};
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .tool_calls = &first_calls },
+        .{ .content = "The first read completed." },
+        .{ .tool_calls = &later_calls },
+        .{ .status = .bad_request, .err_body = "{\"error\":{\"message\":\"input exceeds the context window\"}}" },
+        .{ .content = "The prior reads both completed." },
+        .{ .content = "Recovered after a second compaction." },
+    });
+    defer gateway.deinit();
+    const model = "provider/compaction-interruption";
+    const overrides = [_]ModelCapabilityOverride{.{
+        .model = model,
+        .capabilities = .{ .context_window = 28_000 },
+    }};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.available_capability_overrides = &overrides;
+    hooks.permission_decisions = &.{ .once, .once };
+    hooks.exec_plans = &.{
+        .{ .result = .{ .model_output = "x" ** (10 * 1024) } },
+        .{ .result = .{ .model_output = "later result" } },
+    };
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.tool_result_dir = result_dir;
+    var job = fixture.job();
+    job.model = @constCast(model);
+
+    var history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("earlier work") },
+        .assistant = @constCast("o" ** 80_000),
+    } }};
+    job.history = &history;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+    try std.testing.expectEqual(@as(usize, 6), gateway.request_bodies.items.len);
+    try std.testing.expectEqualStrings("Recovered after a second compaction.", hooks.finish_assistant_text.?);
+    const finished = hooks.history_turns.items[hooks.history_turns.items.len - 1].assistant;
+    try std.testing.expectEqual(@as(usize, 1), finished.execution.tool_steps.len);
+    try std.testing.expectEqualStrings("after-checkpoint", finished.execution.tool_steps[0].tool_calls[0].id);
+    try std.testing.expectEqual(@as(usize, 2), finished.execution.files.len);
+    try std.testing.expectEqual(@as(usize, 2), hooks.successful_effect_count.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 2), hooks.compaction_prefixes.items.len);
+    try std.testing.expectEqualStrings("before-checkpoint", hooks.compaction_prefixes.items[0].?.assistant.execution.tool_steps[0].tool_calls[0].id);
+}
+
+test "compaction preserves an incomplete handle-free result when it cannot fit" {
     const alloc = std.testing.allocator;
     const model = "provider/capacity-failure";
     const available_overrides = [_]ModelCapabilityOverride{.{
@@ -3359,11 +3706,23 @@ test "processQueuedPrompt fails after an ineligible tool result cannot fit" {
     job.model = @constCast(model);
 
     try std.testing.expectError(
-        error.ContextCapacityExceeded,
+        error.IncompleteCompactionResult,
         runFakePrompt(&gateway, &hooks, fixture.config(), job),
     );
     try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
     try std.testing.expectEqual(@as(usize, 1), hooks.successful_effect_count.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), hooks.compaction_prefixes.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finish_terminal_outcome.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .assistant);
+    const execution = hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 1), execution.tool_steps[0].tool_results.len);
+    const retained = execution.tool_steps[0].tool_results[0];
+    try std.testing.expectEqualStrings("capacity_result_1", retained.tool_call_id);
+    try std.testing.expect(retained.truncated);
+    try std.testing.expect(retained.output_handle == null);
+    try std.testing.expect(std.mem.find(u8, retained.output, "ineligible result") != null);
 }
 
 test "processQueuedPrompt resolves catalog capabilities for opaque effort" {
@@ -4880,6 +5239,58 @@ test "processQueuedPrompt masks and terminal-encodes provider diagnostics" {
         .terminal_provider_error,
         "⚠ Provider unavailable · provider_down: AI_GATEWAY_API_KEY=[redacted] bad\\x1b[31m · recovery paused after 1/1 attempts",
     );
+}
+
+fn expect_rejected_replacement_retains_preview(cancel_after_replacement: bool) !void {
+    const alloc = std.testing.allocator;
+    const accepted = "The accepted English preview.";
+    const rejected = "我会先检查锁文件和依赖清单。";
+    const completions = [_]FakeCompletion{
+        .{ .chunks = &.{accepted}, .stream_error_after_chunks = error.ReadFailed },
+        .{
+            .chunks = &.{rejected},
+            .content = rejected,
+            .cancel_after_chunks = cancel_after_replacement,
+            .stream_error_after_chunks = if (cancel_after_replacement) null else error.ReadFailed,
+        },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.max_provider_attempts = 2;
+    var job = fixture.job();
+    job.prompt = @constCast("Explain the lockfile issue in English.");
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyNotContains(&gateway, 1, accepted);
+    try expectBodyNotContains(&gateway, 1, rejected);
+    try std.testing.expectEqual(@as(usize, 1), hooks.assistant_sources.items.len);
+    try std.testing.expectEqualStrings(accepted, hooks.assistant_sources.items[0]);
+    if (cancel_after_replacement) {
+        try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
+        try std.testing.expectEqual(@as(usize, 1), hooks.interrupted_history_count);
+        try std.testing.expectEqualStrings(accepted, hooks.history_turns.items[0].interrupted.assistant orelse "");
+    } else {
+        try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
+        const checkpoint = hooks.recovery_checkpoints.items[hooks.recovery_checkpoints.items.len - 1];
+        try std.testing.expectEqualStrings(accepted, checkpoint.assistant_source);
+        try std.testing.expectEqual(@as(usize, 2), checkpoint.consumed_provider_attempts);
+        try std.testing.expect(!checkpoint.outstanding_reservation);
+    }
+}
+
+test "processQueuedPrompt cancellation retains preview during a rejected replacement" {
+    try expect_rejected_replacement_retains_preview(true);
+}
+
+test "processQueuedPrompt exhaustion retains preview during a rejected replacement" {
+    try expect_rejected_replacement_retains_preview(false);
 }
 
 test "processQueuedPrompt cancellation during provider backoff finishes interrupted" {
@@ -6495,18 +6906,81 @@ test "processQueuedPrompt uses configured tool choice only for first call" {
     try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"auto\"}");
 }
 
-test "processQueuedPrompt injects silent-tool continuation without synthetic assistant text" {
+test "processQueuedPrompt omits blank assistant messages from silent-tool continuation" {
+    const alloc = std.testing.allocator;
+    const call_one = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const call_two = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    for ([_]?[]const u8{ null, "", " ", "\t\r\n" }) |blank| {
+        const completions = [_]FakeCompletion{
+            .{ .tool_calls = &call_one },
+            .{ .tool_calls = &call_two },
+            .{ .content = blank },
+            .{ .content = "Summary" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+        try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+        try expectGatewayPromptFinalUserText(&gateway, 3, "Summarize what you just did.");
+        try expectBodyNotContains(&gateway, 3, "Done.");
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, gateway.request_bodies.items[3], .{});
+        defer parsed.deinit();
+        var assistant_count: usize = 0;
+        for (parsed.value.object.get("prompt").?.array.items) |message| {
+            if (!std.mem.eql(u8, message.object.get("role").?.string, "assistant")) continue;
+            assistant_count += 1;
+            const content = message.object.get("content").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), content.len);
+            try std.testing.expectEqualStrings("tool-call", content[0].object.get("type").?.string);
+        }
+        try std.testing.expectEqual(@as(usize, 2), assistant_count);
+        try std.testing.expectEqual(@as(usize, 2), hooks.executed_names.items.len);
+        try std.testing.expectEqual(@as(usize, 1), hooks.finalization_count);
+        try std.testing.expectEqualStrings("Summary", hooks.finish_assistant_text.?);
+    }
+}
+
+test "processQueuedPrompt preserves provider state during silent-tool continuation" {
+    const StateObserver = struct {
+        const state = "[{\"type\":\"reasoning\",\"id\":\"state_1\",\"encrypted_content\":\"opaque\",\"summary\":[]}]";
+
+        fn observe(request: agent_stream_provider.ModelRequest) !void {
+            const last = request.messages[request.messages.len - 1];
+            if (!std.mem.eql(u8, last.content orelse "", "Summarize what you just did.")) return;
+            const previous = request.messages[request.messages.len - 2];
+            try std.testing.expectEqual(types.ChatRole.assistant, previous.role);
+            try std.testing.expectEqual(@as(?[]const u8, null), previous.content);
+            try std.testing.expectEqualStrings(state, previous.provider_state_json orelse "");
+            try std.testing.expectEqual(@as(usize, 0), previous.tool_calls.len);
+            var wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+            defer wire.deinit();
+            try @import("../../../../gateway/responses_protocol.zig").writeInput(
+                &wire.writer,
+                std.testing.allocator,
+                &.{previous},
+                null,
+                .{ .tool_calls = 128, .tool_identity_bytes = 256, .tool_arguments_bytes = 4096, .provider_state_bytes = 4096 },
+            );
+            try std.testing.expectEqualStrings(state[1 .. state.len - 1], wire.written());
+        }
+    };
     const alloc = std.testing.allocator;
     const call_one = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
     const call_two = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &call_one },
         .{ .tool_calls = &call_two },
-        .{},
+        .{ .content = " \n", .provider_state_json = StateObserver.state },
         .{ .content = "Summary" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
+    gateway.observe_request = StateObserver.observe;
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
     var fixture = PromptFixture{};
@@ -6514,8 +6988,8 @@ test "processQueuedPrompt injects silent-tool continuation without synthetic ass
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
     try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
-    try expectBodyContains(&gateway, 3, "Summarize what you just did.");
-    try expectBodyNotContains(&gateway, 3, "Done.");
+    try expectGatewayPromptFinalUserText(&gateway, 3, "Summarize what you just did.");
+    try std.testing.expectEqualStrings("Summary", hooks.finish_assistant_text.?);
 }
 
 test "tool presentation groups span silent steps and split on visible assistant prose" {

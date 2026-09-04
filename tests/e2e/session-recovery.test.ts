@@ -1,9 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { spawn, type ChildProcess } from "node:child_process";
 import {
-  existsSync,
-  mkdirSync,
+  appendFileSync,
   mkdtempSync,
+  mkdirSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -12,648 +11,275 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { runFx } from "../evals/eval-helpers";
 import {
+  FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   startFakeGateway,
+  TmuxSession,
+  tmuxAvailable,
 } from "./tmux-helpers";
 
 const TIMEOUT = 30_000;
 
-function sessionFileSnapshot(sessionDir: string): Record<string, string> {
-  return Object.fromEntries(
-    readdirSync(sessionDir, { withFileTypes: true })
-      .filter((entry) => entry.isFile())
-      .sort((left, right) => left.name.localeCompare(right.name))
-      .map((entry) => [
-        entry.name,
-        readFileSync(join(sessionDir, entry.name)).toString("base64"),
-      ]),
-  );
+function createFixture(prefix: string) {
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  mkdirSync(home);
+  mkdirSync(workspace);
+  return {
+    root,
+    home: realpathSync(home),
+    workspace: realpathSync(workspace),
+  };
 }
 
-class LineClient {
-  private readonly proc: ChildProcess;
-  private buffer = "";
-  private lines: string[] = [];
-  private stderr = "";
-
-  constructor(proc: ChildProcess) {
-    this.proc = proc;
-    proc.stdout!.on("data", (chunk: Buffer) => {
-      this.buffer += chunk.toString();
-      const split = this.buffer.split("\n");
-      this.buffer = split.pop() ?? "";
-      this.lines.push(...split.filter((line) => line.trim().length > 0));
-    });
-    proc.stderr!.on("data", (chunk: Buffer) => {
-      this.stderr += chunk.toString();
-    });
-  }
-
-  send(value: object): void {
-    this.proc.stdin!.write(JSON.stringify(value) + "\n");
-  }
-
-  async read(timeoutMs = TIMEOUT): Promise<any> {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      const line = this.lines.shift();
-      if (line) return JSON.parse(line);
-      await Bun.sleep(20);
-    }
-    const stderr = this.stderr.trim();
-    throw new Error(
-      `timed out waiting for ACP response (exit=${this.proc.exitCode ?? "running"}, signal=${this.proc.signalCode ?? "none"})${stderr ? `\nstderr:\n${stderr}` : ""}`,
-    );
-  }
-
-  async readResponse(id: number, timeoutMs = TIMEOUT): Promise<any> {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      const message = await this.read(Math.max(1, deadline - Date.now()));
-      if (message.id === id) return message;
-    }
-    throw new Error(`timed out waiting for ACP response id=${id}`);
-  }
-
-  kill(): void {
-    this.proc.kill("SIGKILL");
-  }
+function gatewayEnv(
+  fixture: ReturnType<typeof createFixture>,
+  gateway: ReturnType<typeof startFakeGateway>,
+) {
+  return {
+    HOME: fixture.home,
+    AI_GATEWAY_API_KEY: "session-recovery-test-key",
+    VERCEL_OIDC_TOKEN: undefined,
+    FX_GATEWAY_BASE_URL: gateway.baseUrl,
+    FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_MODEL: FAKE_GATEWAY_MODEL,
+    FX_AUTO_UPGRADE: "0",
+  };
 }
 
-function startAcp(cwd: string, home: string, extraEnv: Record<string, string> = {}): LineClient {
-  return new LineClient(spawn(FX_BIN, ["acp"], {
-    cwd,
-    env: {
-      ...process.env,
-      HOME: home,
-      AI_GATEWAY_API_KEY: "e2e-placeholder",
-      VERCEL_OIDC_TOKEN: "",
-      NO_COLOR: "1",
-      ...extraEnv,
+async function createSavedSession(
+  fixture: ReturnType<typeof createFixture>,
+  gateway: ReturnType<typeof startFakeGateway>,
+): Promise<string> {
+  const created = await runFx(
+    ["ask", "--json", "--auto", "Create the first saved turn."],
+    {
+      cwd: fixture.workspace,
+      env: gatewayEnv(fixture, gateway),
+      timeoutMs: TIMEOUT,
     },
-    stdio: ["pipe", "pipe", "pipe"],
-  }));
+  );
+  expect(created.code).toBe(0);
+  expect(created.stderr).toBe("");
+  return JSON.parse(created.stdout).session_id;
 }
 
-async function waitForPath(path: string, timeoutMs = 3_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (existsSync(path)) return;
-    await Bun.sleep(20);
-  }
-  throw new Error(`timed out waiting for ${path}`);
-}
-
-async function createSession(cwd: string, home: string): Promise<string> {
-  const client = startAcp(cwd, home);
-  try {
-    client.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1 } });
-    expect((await client.readResponse(1)).result).toBeDefined();
-    client.send({ jsonrpc: "2.0", id: 2, method: "session/new", params: { mcpServers: [] } });
-    const response = await client.readResponse(2);
-    expect(response.result?.sessionId).toBeDefined();
-    return response.result.sessionId;
-  } finally {
-    client.kill();
-  }
-}
-
-function sessionIdsFromHome(home: string): string[] {
-  const sessionsRoot = join(home, ".fx", "sessions");
-  return readdirSync(sessionsRoot, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory() && entry.name !== "latest")
-    .map((entry) => entry.name);
+async function continueSession(
+  fixture: ReturnType<typeof createFixture>,
+  gateway: ReturnType<typeof startFakeGateway>,
+  sessionId: string,
+  latest = false,
+) {
+  return runFx(
+    [
+      "ask",
+      "--json",
+      "--auto",
+      ...(latest ? ["--resume", "last"] : ["--resume-id", sessionId]),
+      "Continue after recovery.",
+    ],
+    {
+      cwd: fixture.workspace,
+      env: gatewayEnv(fixture, gateway),
+      timeoutMs: TIMEOUT,
+    },
+  );
 }
 
 describe("session recovery", () => {
-  for (const boundary of [
-    "after_event_append",
-    "after_event_sync",
-    "after_watermark_rename",
-  ]) {
-    test(
-      `process death at ${boundary} leaves an uncommitted orphan`,
-      async () => {
-        const root = mkdtempSync(join(tmpdir(), "fx-session-pre-authority-"));
-        try {
-          const home = join(root, "home");
-          const workspace = join(root, "workspace");
-          const ready = join(root, "boundary.ready");
-          mkdirSync(home);
-          mkdirSync(workspace);
-          const workspaceRoot = realpathSync(workspace);
-
-          const first = startAcp(workspaceRoot, home, {
-            FX_E2E_SESSION_BOUNDARY: boundary,
-            FX_E2E_SESSION_BOUNDARY_READY: ready,
-          });
-          first.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1 } });
-          expect((await first.readResponse(1)).result).toBeDefined();
-          first.send({ jsonrpc: "2.0", id: 2, method: "session/new", params: { mcpServers: [] } });
-          await waitForPath(ready);
-          first.kill();
-          await Bun.sleep(100);
-
-          const listed = await runFx(["sessions", "--json"], {
-            cwd: workspaceRoot,
-            env: { HOME: home },
-          });
-          expect(JSON.parse(listed.stdout).count).toBe(0);
-
-          const doctor = await runFx(["doctor", "--json"], {
-            cwd: workspaceRoot,
-            env: { HOME: home },
-          });
-          expect(JSON.parse(doctor.stdout).checks).toEqual(
-            expect.arrayContaining([
-              expect.objectContaining({
-                detail: expect.stringContaining(
-                  "authority_less_creation_orphan",
-                ),
-              }),
-            ]),
-          );
-        } finally {
-          rmSync(root, { recursive: true, force: true });
-        }
-      },
-      60_000,
-    );
-  }
-
-  for (const boundary of [
-    "after_authority_marker_rename",
-    "after_authority_namespace_sync",
-    "after_authority_intent_remove",
-  ]) {
-    test(
-      `writable load confirms proposed authority after ${boundary}`,
-      async () => {
-        const root = mkdtempSync(join(tmpdir(), "fx-session-post-authority-"));
-        try {
-          const home = join(root, "home");
-          const workspace = join(root, "workspace");
-          const ready = join(root, "boundary.ready");
-          mkdirSync(home);
-          mkdirSync(workspace);
-          const workspaceRoot = realpathSync(workspace);
-
-          const first = startAcp(workspaceRoot, home, {
-            FX_E2E_SESSION_BOUNDARY: boundary,
-            FX_E2E_SESSION_BOUNDARY_READY: ready,
-          });
-          first.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1 } });
-          expect((await first.readResponse(1)).result).toBeDefined();
-          first.send({ jsonrpc: "2.0", id: 2, method: "session/new", params: { mcpServers: [] } });
-          await waitForPath(ready);
-          first.kill();
-          await Bun.sleep(100);
-
-          const sessionIds = sessionIdsFromHome(home);
-          expect(sessionIds).toHaveLength(1);
-          const sessionId = sessionIds[0]!;
-          expect(JSON.parse((await runFx(["sessions", "--json"], {
-            cwd: workspaceRoot,
-            env: { HOME: home },
-          })).stdout).count).toBe(0);
-
-          const resolver = startAcp(workspaceRoot, home);
-          resolver.send({ jsonrpc: "2.0", id: 3, method: "initialize", params: { protocolVersion: 1 } });
-          expect((await resolver.readResponse(3)).result).toBeDefined();
-          resolver.send({ jsonrpc: "2.0", id: 4, method: "session/load", params: { sessionId, mcpServers: [] } });
-          expect((await resolver.readResponse(4)).result).toBeDefined();
-          resolver.kill();
-
-          const detail = await runFx(["session", "--id", sessionId, "--json"], {
-            cwd: workspaceRoot,
-            env: { HOME: home },
-          });
-          expect(detail.code).toBe(0);
-          expect(JSON.parse(detail.stdout).id).toBe(sessionId);
-        } finally {
-          rmSync(root, { recursive: true, force: true });
-        }
-      },
-      60_000,
-    );
-  }
-
-  test("doctor removes only a validated noncurrent watermark", async () => {
-    const root = mkdtempSync(join(tmpdir(), "fx-session-doctor-cleanup-"));
+  test.skipIf(!tmuxAvailable())("resume picker discovers a checkpoint from an unfinished first turn", async () => {
+    const fixture = createFixture("fx-session-first-checkpoint-");
+    const gateway = startFakeGateway([
+      fakeGatewayFinalText("FIRST_TURN_SAVED"),
+      fakeGatewayFinalText("CHECKPOINT_TURN_RECOVERED"),
+    ]);
+    let tui: TmuxSession | null = null;
     try {
-      const home = join(root, "home");
-      const workspace = join(root, "workspace");
-      mkdirSync(home);
-      mkdirSync(workspace);
-      const workspaceRoot = realpathSync(workspace);
-      const sessionId = await createSession(workspaceRoot, home);
-      const sessionDir = join(home, ".fx", "sessions", sessionId);
-      const currentName = readdirSync(sessionDir).find(
-        (name) => name.startsWith("commit.") && name.endsWith(".json"),
-      )!;
-      const candidateGeneration = "ffffffffffffffffffffffffffffffff";
-      const candidateName = `commit.${candidateGeneration}.json`;
-      const candidatePath = join(sessionDir, candidateName);
-      const candidate = JSON.parse(
-        readFileSync(join(sessionDir, currentName), "utf8"),
-      );
-      candidate.log_generation = candidateGeneration;
-      writeFileSync(candidatePath, JSON.stringify(candidate) + "\n", {
-        mode: 0o600,
+      const sessionId = await createSavedSession(fixture, gateway);
+      const eventsPath = join(fixture.home, ".fx", "sessions", sessionId, "events.jsonl");
+      const checkpoint = [
+        { user: { text: "unfinished first request", images: [], work_id: null } },
+        { context_checkpoint: { covers_through_seq: 1, summary: "<context_handoff>FIRST_CHECKPOINT_FACT</context_handoff>" } },
+      ].map((event, index) => JSON.stringify({
+        schema_version: 1, seq: index + 1, timestamp_ms: Date.now(), event,
+      })).join("\n") + "\n";
+      writeFileSync(eventsPath, checkpoint, { mode: 0o600 });
+      const listed = await runFx(["sessions", "--json"], {
+        cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
       });
+      expect(listed.code).toBe(0);
+      expect(JSON.parse(listed.stdout).sessions.map((entry: { id: string }) => entry.id))
+        .toContain(sessionId);
+      expect(JSON.parse(listed.stdout).sessions[0].history_len).toBe(0);
+      expect(JSON.parse(listed.stdout).sessions[0]).not.toHaveProperty("has_checkpoint");
+      expect(readFileSync(eventsPath, "utf8")).toBe(checkpoint);
 
-      const doctor = await runFx(["doctor", "--json"], {
-        cwd: workspaceRoot,
-        env: { HOME: home },
-      });
-      expect(doctor.code).toBe(0);
-      expect(doctor.stdout).toContain("cleanup_removed=1");
-      expect(existsSync(candidatePath)).toBe(false);
+      const stderrPath = join(fixture.root, "tui.stderr");
+      tui = await TmuxSession.create({ cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), stderrPath });
+      await tui.waitForComposer(TIMEOUT);
+      await tui.sendText("/resume");
+      await tui.waitForText("Create the first saved turn.", TIMEOUT);
+      expect(readFileSync(eventsPath, "utf8")).toBe(checkpoint);
+      await tui.sendKeys("Enter");
+      await tui.waitForText("unfinished first request", TIMEOUT);
+      await tui.waitForComposer(TIMEOUT);
+      await tui.sendText("Continue after checkpoint.");
+      await tui.waitForPane(() => readFileSync(eventsPath, "utf8").includes("CHECKPOINT_TURN_RECOVERED"), TIMEOUT);
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(TIMEOUT)).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.requests[1]!.body).toContain("FIRST_CHECKPOINT_FACT");
     } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  test("session recover copies a corrupt-watermark session without changing its source", async () => {
-    const root = mkdtempSync(join(tmpdir(), "fx-session-copy-recovery-"));
-    try {
-      const home = join(root, "home");
-      const workspace = join(root, "workspace");
-      mkdirSync(home);
-      mkdirSync(workspace);
-      const workspaceRoot = realpathSync(workspace);
-      const sessionId = await createSession(workspaceRoot, home);
-
-      const writer = startAcp(workspaceRoot, home);
-      writer.send({ jsonrpc: "2.0", id: 10, method: "initialize", params: { protocolVersion: 1 } });
-      expect((await writer.readResponse(10)).result).toBeDefined();
-      writer.send({
-        jsonrpc: "2.0",
-        id: 11,
-        method: "session/load",
-        params: { sessionId, mcpServers: [] },
-      });
-      expect((await writer.readResponse(11)).result).toBeDefined();
-      writer.send({
-        jsonrpc: "2.0",
-        id: 12,
-        method: "session/set_config_option",
-        params: { sessionId, configId: "model", value: "o4-mini" },
-      });
-      expect((await writer.readResponse(12)).result).toBeDefined();
-      writer.kill();
-      await Bun.sleep(100);
-
-      const sessionDir = join(home, ".fx", "sessions", sessionId);
-      const watermarkName = readdirSync(sessionDir).find(
-        (name) => name.startsWith("commit.") && name.endsWith(".json"),
-      )!;
-      writeFileSync(join(sessionDir, watermarkName), "{}\n", { mode: 0o600 });
-      const sourceBefore = sessionFileSnapshot(sessionDir);
-
-      const doctor = await runFx(["doctor", "--json"], {
-        cwd: workspaceRoot,
-        env: { HOME: home },
-      });
-      expect(doctor.code).toBe(0);
-      expect(doctor.stdout).toContain("commit_watermark_invalid");
-      expect(doctor.stdout).toContain(`fx session recover ${sessionId}`);
-
-      const recovery = await runFx(
-        ["session", "recover", sessionId, "--json"],
-        {
-          cwd: workspaceRoot,
-          env: { HOME: home },
-        },
-      );
-      expect(recovery.code).toBe(0);
-      const recovered = JSON.parse(recovery.stdout);
-      expect(recovered.kind).toBe("session_recovery");
-      expect(recovered.source_id).toBe(sessionId);
-      expect(recovered.recovered_id).not.toBe(sessionId);
-      expect(recovered.status).toBe("recovered");
-      expect(sessionFileSnapshot(sessionDir)).toEqual(sourceBefore);
-
-      const recoveredDetail = await runFx(
-        ["session", "--id", recovered.recovered_id, "--json"],
-        {
-          cwd: workspaceRoot,
-          env: { HOME: home },
-        },
-      );
-      expect(recoveredDetail.code).toBe(0);
-      expect(JSON.parse(recoveredDetail.stdout).id).toBe(recovered.recovered_id);
-
-      const gateway = startFakeGateway([
-        fakeGatewayFinalText("RECOVERED_LAST_RESUMED"),
-      ]);
-      try {
-        const resumedLast = await runFx(
-          [
-            "ask",
-            "--json",
-            "--resume",
-            "last",
-            "continue the recovered conversation",
-          ],
-          {
-            cwd: workspaceRoot,
-            env: {
-              HOME: home,
-              AI_GATEWAY_API_KEY: "e2e-placeholder",
-              VERCEL_OIDC_TOKEN: "",
-              FX_GATEWAY_BASE_URL: gateway.baseUrl,
-              FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-            },
-          },
-        );
-        if (resumedLast.code !== 0) {
-          throw new Error(
-            `resume last failed: stdout=${JSON.stringify(resumedLast.stdout)} stderr=${JSON.stringify(resumedLast.stderr)}`,
-          );
-        }
-        expect(resumedLast.stdout).toContain("RECOVERED_LAST_RESUMED");
-        expect(gateway.requests).toHaveLength(1);
-        expect(sessionFileSnapshot(sessionDir)).toEqual(sourceBefore);
-      } finally {
-        gateway.stop();
-      }
-
-      const sourceDetail = await runFx(
-        ["session", "--id", sessionId, "--json"],
-        {
-          cwd: workspaceRoot,
-          env: { HOME: home },
-        },
-      );
-      expect(sourceDetail.code).not.toBe(0);
-      expect(JSON.parse(sourceDetail.stdout)).toEqual(
-        expect.objectContaining({
-          code: "InvalidSessionFormat",
-          error: `session ${sessionId} is corrupt; run \`fx session recover ${sessionId}\``,
-        }),
-      );
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  test("cross-workspace recovery preserves both resume-last pointers", async () => {
-    const root = mkdtempSync(join(tmpdir(), "fx-session-cross-workspace-recovery-"));
-    try {
-      const home = join(root, "home");
-      const workspaceA = join(root, "workspace-a");
-      const workspaceB = join(root, "workspace-b");
-      mkdirSync(home);
-      mkdirSync(workspaceA);
-      mkdirSync(workspaceB);
-      const workspaceARoot = realpathSync(workspaceA);
-      const workspaceBRoot = realpathSync(workspaceB);
-
-      const sourceId = await createSession(workspaceARoot, home);
-      await Bun.sleep(10);
-      const healthyAId = await createSession(workspaceARoot, home);
-      await Bun.sleep(10);
-      const newestBId = await createSession(workspaceBRoot, home);
-
-      const sourceDir = join(home, ".fx", "sessions", sourceId);
-      const watermarkName = readdirSync(sourceDir).find(
-        (name) => name.startsWith("commit.") && name.endsWith(".json"),
-      )!;
-      writeFileSync(join(sourceDir, watermarkName), "{}\n", { mode: 0o600 });
-
-      const recovery = await runFx(
-        ["session", "recover", sourceId, "--json"],
-        {
-          cwd: workspaceBRoot,
-          env: { HOME: home },
-        },
-      );
-      expect(recovery.code).toBe(0);
-      expect(JSON.parse(recovery.stdout).status).toBe("recovered");
-
-      const gateway = startFakeGateway([
-        fakeGatewayFinalText("WORKSPACE_A_RESUMED"),
-        fakeGatewayFinalText("WORKSPACE_B_RESUMED"),
-      ]);
-      const resumeEnv = {
-        HOME: home,
-        AI_GATEWAY_API_KEY: "e2e-placeholder",
-        VERCEL_OIDC_TOKEN: "",
-        FX_GATEWAY_BASE_URL: gateway.baseUrl,
-        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-      };
-      try {
-        const resumedA = await runFx(
-          ["ask", "--json", "--auto", "--resume", "last", "continue A"],
-          {
-            cwd: workspaceARoot,
-            env: resumeEnv,
-          },
-        );
-        expect(resumedA.code).toBe(0);
-        expect(JSON.parse(resumedA.stdout).session_id).toBe(healthyAId);
-        const resumedB = await runFx(
-          ["ask", "--json", "--auto", "--resume", "last", "continue B"],
-          {
-            cwd: workspaceBRoot,
-            env: resumeEnv,
-          },
-        );
-        expect(resumedB.code).toBe(0);
-        expect(JSON.parse(resumedB.stdout).session_id).toBe(newestBId);
-      } finally {
-        gateway.stop();
-      }
-    } finally {
-      rmSync(root, { recursive: true, force: true });
+      await tui?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
     }
   }, TIMEOUT);
 
-  test(
-    "process death after authority intent leaves a fenced orphan for writable resolution",
-    async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-session-recovery-"));
+  test("latest resume discovers and repairs a partial final JSONL record", async () => {
+    const fixture = createFixture("fx-session-partial-record-");
+    const gateway = startFakeGateway([
+      fakeGatewayFinalText("FIRST_TURN_SAVED"),
+      fakeGatewayFinalText("PARTIAL_RECORD_RECOVERED"),
+    ]);
+    try {
+      const sessionId = await createSavedSession(fixture, gateway);
+      const sessionDir = join(fixture.home, ".fx", "sessions", sessionId);
+      const eventsPath = join(sessionDir, "events.jsonl");
+      const committed = readFileSync(eventsPath, "utf8");
+      appendFileSync(eventsPath, '{"schema_version":1,"partial-tail"');
+
+      const listed = await runFx(["sessions", "--json"], {
+        cwd: fixture.workspace,
+        env: gatewayEnv(fixture, gateway),
+        timeoutMs: TIMEOUT,
+      });
+      expect(listed.code).toBe(0);
+      expect(listed.stderr).toBe("");
+      expect(JSON.parse(listed.stdout).sessions.map((entry: { id: string }) => entry.id))
+        .toContain(sessionId);
+      expect(readFileSync(eventsPath, "utf8")).toBe(committed + '{"schema_version":1,"partial-tail"');
+
+      const resumed = await continueSession(fixture, gateway, sessionId, true);
+      expect(resumed.code).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(JSON.parse(resumed.stdout).session_id).toBe(sessionId);
+      expect(JSON.parse(resumed.stdout).output).toBe("PARTIAL_RECORD_RECOVERED");
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.requests[1]!.body).not.toContain("partial-tail");
+
+      const repaired = readFileSync(eventsPath, "utf8");
+      expect(repaired.startsWith(committed)).toBe(true);
+      expect(repaired).not.toContain("partial-tail");
+      const files = readdirSync(sessionDir, { withFileTypes: true })
+        .filter((entry) => entry.isFile())
+        .map((entry) => entry.name)
+        .sort();
+      expect(files).toEqual([
+        "events.jsonl",
+        "permissions.json",
+        "session.json",
+        "session.lock",
+        "usage-v2.json",
+      ]);
+    } finally {
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
+  for (const partialNextRecord of [false, true]) {
+    test(`writable resume truncates an unfinished turn with partial next record=${partialNextRecord}`, async () => {
+      const fixture = createFixture("fx-session-unfinished-turn-");
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("FIRST_TURN_SAVED"),
+        fakeGatewayFinalText("UNFINISHED_TURN_RECOVERED"),
+      ]);
       try {
-        const home = join(root, "home");
-        const workspace = join(root, "workspace");
-        const ready = join(root, "boundary.ready");
-        const resolverTrace = join(root, "resolver.trace");
-        mkdirSync(home);
-        mkdirSync(workspace);
-        const workspaceRoot = realpathSync(workspace);
-
-        const first = startAcp(workspaceRoot, home, {
-          FX_E2E_SESSION_BOUNDARY: "after_authority_intent_sync",
-          FX_E2E_SESSION_BOUNDARY_READY: ready,
-        });
-        first.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1 } });
-        expect((await first.readResponse(1)).result).toBeDefined();
-        first.send({ jsonrpc: "2.0", id: 2, method: "session/new", params: { mcpServers: [] } });
-        await waitForPath(ready);
-        first.kill();
-        await Bun.sleep(100);
-
-        const sessionsRoot = join(home, ".fx", "sessions");
-        const ids = sessionIdsFromHome(home);
-        expect(ids).toHaveLength(1);
-        const sessionId = ids[0]!;
-
-        const pendingDoctor = await runFx(["doctor", "--json"], {
-          cwd: workspaceRoot,
-          env: { HOME: home },
-        });
-        expect(JSON.parse(pendingDoctor.stdout).checks).toEqual(
-          expect.arrayContaining([
-            expect.objectContaining({
-              detail: expect.stringContaining(
-                "authority_transition_pending report_only=true",
-              ),
-            }),
-          ]),
+        const sessionId = await createSavedSession(fixture, gateway);
+        const eventsPath = join(
+          fixture.home,
+          ".fx",
+          "sessions",
+          sessionId,
+          "events.jsonl",
         );
+        const committed = readFileSync(eventsPath, "utf8");
+        const lines = committed.trimEnd().split("\n");
+        const last = JSON.parse(lines[lines.length - 1]!);
+        appendFileSync(eventsPath, JSON.stringify({
+          schema_version: 1,
+          seq: last.seq + 1,
+          timestamp_ms: Date.now(),
+          event: {
+            user: {
+              text: "DANGLING_USER_MUST_NOT_REPLAY",
+              images: [],
+              work_id: null,
+            },
+          },
+        }) + "\n");
+        if (partialNextRecord) appendFileSync(eventsPath, '{"schema_version":1,"event":');
 
-        const listed = await runFx(["sessions", "--json"], {
-          cwd: workspaceRoot,
-          env: { HOME: home },
-        });
-        expect(JSON.parse(listed.stdout)).toEqual({
-          kind: "sessions",
-          count: 0,
-          sessions: [],
-          skipped_invalid: 1,
-        });
-
-        const resolver = startAcp(workspaceRoot, home, {
-          FX_TRACE_LOG: resolverTrace,
-        });
-        resolver.send({ jsonrpc: "2.0", id: 3, method: "initialize", params: { protocolVersion: 1 } });
-        expect((await resolver.readResponse(3)).result).toBeDefined();
-        resolver.send({ jsonrpc: "2.0", id: 4, method: "session/load", params: { sessionId, mcpServers: [] } });
-        const loadResponse = await resolver.readResponse(4);
-        resolver.kill();
-        expect(readFileSync(resolverTrace, "utf8")).toContain(
-          "session operation=load outcome=failed error=SessionNotFound",
+        const resumed = await continueSession(fixture, gateway, sessionId);
+        expect(resumed.code).toBe(0);
+        expect(resumed.stderr).toBe("");
+        expect(JSON.parse(resumed.stdout).output).toBe("UNFINISHED_TURN_RECOVERED");
+        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.requests[1]!.body).not.toContain(
+          "DANGLING_USER_MUST_NOT_REPLAY",
         );
-        expect(loadResponse.error?.message).toBe("Session not found");
-        expect(existsSync(join(sessionsRoot, sessionId, "authority.pending.json"))).toBe(false);
-
-        const orphanDoctor = await runFx(["doctor", "--json"], {
-          cwd: workspaceRoot,
-          env: { HOME: home },
-        });
-        expect(JSON.parse(orphanDoctor.stdout).checks).toEqual(
-          expect.arrayContaining([
-            expect.objectContaining({
-              detail: expect.stringContaining(
-                "authority_less_creation_orphan",
-              ),
-            }),
-          ]),
+        expect(readFileSync(eventsPath, "utf8")).not.toContain(
+          "DANGLING_USER_MUST_NOT_REPLAY",
         );
-
-        const detail = await runFx(["session", "--id", sessionId, "--json"], {
-          cwd: workspaceRoot,
-          env: { HOME: home },
-        });
-        expect(detail.code).not.toBe(0);
-        expect(JSON.parse(detail.stdout).error).toContain("record not found");
-        expect(detail.stderr).toBe("");
       } finally {
-        rmSync(root, { recursive: true, force: true });
+        gateway.stop();
+        rmSync(fixture.root, { recursive: true, force: true });
       }
-    },
-    60_000,
-  );
-
-  for (const boundary of [
-    "after_event_append",
-    "after_event_sync",
-    "after_commit_intent_sync",
-    "after_watermark_rename",
-    "after_target_namespace_sync",
-    "after_commit_intent_remove",
-  ]) {
-    test(
-      `model commit recovers after process death at ${boundary}`,
-      async () => {
-        const root = mkdtempSync(join(tmpdir(), "fx-session-commit-"));
-        try {
-          const home = join(root, "home");
-          const workspace = join(root, "workspace");
-          const ready = join(root, "boundary.ready");
-          mkdirSync(home);
-          mkdirSync(workspace);
-          const workspaceRoot = realpathSync(workspace);
-          const sessionId = await createSession(workspaceRoot, home);
-
-          const writer = startAcp(workspaceRoot, home, {
-            FX_E2E_SESSION_BOUNDARY: boundary,
-            FX_E2E_SESSION_BOUNDARY_READY: ready,
-          });
-          writer.send({ jsonrpc: "2.0", id: 10, method: "initialize", params: { protocolVersion: 1 } });
-          expect((await writer.readResponse(10)).result).toBeDefined();
-          writer.send({ jsonrpc: "2.0", id: 11, method: "session/load", params: { sessionId, mcpServers: [] } });
-          expect((await writer.readResponse(11)).result).toBeDefined();
-          writer.send({
-            jsonrpc: "2.0",
-            id: 12,
-            method: "session/set_config_option",
-            params: { sessionId, configId: "model", value: "o4-mini" },
-          });
-          await waitForPath(ready);
-          writer.kill();
-          await Bun.sleep(100);
-
-          const intentPath = join(
-            home,
-            ".fx",
-            "sessions",
-            sessionId,
-            "commit.pending.json",
-          );
-          if ([
-            "after_commit_intent_sync",
-            "after_watermark_rename",
-            "after_target_namespace_sync",
-          ].includes(boundary)) {
-            expect(existsSync(intentPath)).toBe(true);
-          }
-
-          const resolver = startAcp(workspaceRoot, home);
-          resolver.send({ jsonrpc: "2.0", id: 20, method: "initialize", params: { protocolVersion: 1 } });
-          expect((await resolver.readResponse(20)).result).toBeDefined();
-          resolver.send({ jsonrpc: "2.0", id: 21, method: "session/load", params: { sessionId, mcpServers: [] } });
-          const loaded = await resolver.readResponse(21);
-          expect(loaded.result).toBeDefined();
-          const loadedModel = loaded.result.configOptions.find(
-            (option: { id: string; currentValue: string }) => option.id === "model",
-          )?.currentValue;
-          if ([
-            "after_watermark_rename",
-            "after_target_namespace_sync",
-            "after_commit_intent_remove",
-          ].includes(boundary)) {
-            expect(loadedModel).toBe("o4-mini");
-          } else {
-            expect(loadedModel).not.toBe("o4-mini");
-          }
-          resolver.kill();
-
-          expect(existsSync(intentPath)).toBe(false);
-          const detail = await runFx(["session", "--id", sessionId, "--json"], {
-            cwd: workspaceRoot,
-            env: { HOME: home },
-          });
-          expect(detail.code).toBe(0);
-          expect(JSON.parse(detail.stdout).id).toBe(sessionId);
-        } finally {
-          rmSync(root, { recursive: true, force: true });
-        }
-      },
-      60_000,
-    );
+    }, TIMEOUT);
   }
+
+  test("committed-history corruption fails closed without rewriting JSONL", async () => {
+    const fixture = createFixture("fx-session-middle-corruption-");
+    const gateway = startFakeGateway([
+      fakeGatewayFinalText("FIRST_TURN_SAVED"),
+    ]);
+    try {
+      const sessionId = await createSavedSession(fixture, gateway);
+      const eventsPath = join(
+        fixture.home,
+        ".fx",
+        "sessions",
+        sessionId,
+        "events.jsonl",
+      );
+      const committed = readFileSync(eventsPath, "utf8");
+      const corrupted = `[${committed.slice(1)}`;
+      writeFileSync(eventsPath, corrupted, { mode: 0o600 });
+
+      const detail = await runFx(
+        ["session", "--id", sessionId, "--json"],
+        {
+          cwd: fixture.workspace,
+          env: { HOME: fixture.home },
+          timeoutMs: TIMEOUT,
+        },
+      );
+      expect(detail.code).toBe(1);
+      expect(detail.stderr).toBe("");
+      expect(JSON.parse(detail.stdout)).toMatchObject({
+        code: "SessionNotFound",
+      });
+      expect(readFileSync(eventsPath, "utf8")).toBe(corrupted);
+      expect(gateway.requests).toHaveLength(1);
+    } finally {
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
 });

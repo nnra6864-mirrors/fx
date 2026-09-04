@@ -4,10 +4,12 @@ const io_mod = @import("../shared/io.zig");
 const session = @import("session.zig");
 const session_codec = @import("session_codec.zig");
 const session_child_store = @import("session_child_store.zig");
+const session_event = @import("session_event.zig");
 const session_json = @import("session_json.zig");
 const session_log = @import("session_log.zig");
 const session_projection = @import("session_projection.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
+const session_replay = @import("session_replay.zig");
 const Allocator = std.mem.Allocator;
 
 const authority = @import("session_authority.zig");
@@ -18,7 +20,6 @@ const classifyAuthority = authority.classifyAuthority;
 const entryExistsRelative = authority.entryExistsRelative;
 const eventFileStat = authority.eventFileStat;
 const loadAuthorityMarkerOptional = authority.loadAuthorityMarkerOptional;
-const loadAuthorityTransitionOptional = authority.loadAuthorityTransitionOptional;
 const manifestSchemaVersion = authority.manifestSchemaVersion;
 const openSessionFile = authority.openSessionFile;
 const readOptionalSessionFile = authority.readOptionalSessionFile;
@@ -137,26 +138,6 @@ pub fn appendDoctorDiagnostic(
     });
 }
 
-fn appendDoctorGrowthDiagnostic(
-    diagnostics: *std.ArrayList(DoctorDiagnostic),
-    alloc: Allocator,
-    session_id: []const u8,
-    kind: DoctorIssueKind,
-    bytes: u64,
-    growth_bytes: u64,
-    growth_frames: u64,
-) !void {
-    const owned_id = try alloc.dupe(u8, session_id);
-    errdefer alloc.free(owned_id);
-    try diagnostics.append(alloc, .{
-        .session_id = owned_id,
-        .kind = kind,
-        .bytes = bytes,
-        .growth_bytes = growth_bytes,
-        .growth_frames = growth_frames,
-    });
-}
-
 /// Inspects one session directory and appends a diagnostic for the first
 /// integrity problem it finds, dispatching to the authority-state it detects.
 /// Owns only sequencing: the actual checks live in the three inspect* helpers
@@ -168,229 +149,58 @@ pub fn inspectDoctorSession(
     diagnostics: *std.ArrayList(DoctorDiagnostic),
     session_dir: *io_mod.VerifiedDir,
     session_id: []const u8,
-    options: DoctorInspectionOptions,
+    _: DoctorInspectionOptions,
 ) !void {
-    const transition = loadAuthorityTransitionOptional(alloc, session_dir) catch |err| {
-        try appendDoctorDiagnostic(
-            diagnostics,
-            alloc,
-            session_id,
-            if (err == error.SessionPathUnsafe) .unsafe_path else .invalid_authority_transition,
-            null,
-        );
-        return;
-    };
-    if (transition) |transition_value| {
-        var owned = transition_value;
-        defer owned.deinit(alloc);
-        try appendDoctorDiagnostic(diagnostics, alloc, session_id, .authority_transition_pending, null);
-        return;
-    }
-
-    const marker = loadAuthorityMarkerOptional(alloc, session_dir) catch |err| {
-        try appendDoctorDiagnostic(
-            diagnostics,
-            alloc,
-            session_id,
-            if (err == error.SessionPathUnsafe) .unsafe_path else .invalid_authority,
-            null,
-        );
-        return;
-    };
-    if (marker == null) {
-        return inspectAuthoritylessSession(ctx, alloc, diagnostics, session_dir, session_id);
-    }
-
-    var owned_marker = marker.?;
-    defer owned_marker.deinit(alloc);
-    if (!std.mem.eql(u8, owned_marker.session_id, session_id)) {
-        try appendDoctorDiagnostic(diagnostics, alloc, session_id, .invalid_authority, null);
-        return;
-    }
-
-    return inspectSchemaV3Session(ctx, alloc, diagnostics, session_dir, session_id, options);
-}
-
-/// Diagnoses a session that carries no authority marker: either an in-flight
-/// schema-v3 creation orphan, an oversized legacy snapshot, or a missing
-/// authority record. Terminal: appends exactly one classification and returns.
-fn inspectAuthoritylessSession(
-    ctx: StoreContext,
-    alloc: Allocator,
-    diagnostics: *std.ArrayList(DoctorDiagnostic),
-    session_dir: *io_mod.VerifiedDir,
-    session_id: []const u8,
-) !void {
-    const manifest_bytes = try readOptionalSessionFile(
-        alloc,
-        session_dir,
-        "session.json",
-        session_projection.manifest_max_bytes,
-    );
-    if (manifest_bytes) |bytes| {
-        defer alloc.free(bytes);
-        const schema_version = manifestSchemaVersion(alloc, bytes) catch {
-            try appendDoctorDiagnostic(diagnostics, alloc, session_id, .missing_authority, null);
-            return;
-        };
-        if (schema_version == 3) {
-            var manifest = session_projection.decodeManifest(alloc, bytes) catch {
-                try appendDoctorDiagnostic(diagnostics, alloc, session_id, .missing_authority, null);
-                return;
-            };
-            defer manifest.deinit(alloc);
+    if (try session_log.hasConversationMetadata(alloc, session_dir)) {
+        var root = ctx.canonical_root;
+        var state = root.loadReadOnly(alloc, session_id, .{}) catch |err| {
             try appendDoctorDiagnostic(
                 diagnostics,
                 alloc,
                 session_id,
-                if (std.mem.eql(u8, manifest.id, session_id))
-                    .authority_less_creation_orphan
+                if (err == error.SessionPathUnsafe)
+                    .unsafe_path
                 else
-                    .missing_authority,
+                    .canonical_state_invalid,
                 null,
             );
-            return;
-        }
-
-        var legacy_file = try openSessionFile(session_dir, "session.json", .read_only);
-        defer legacy_file.close(io_mod.getIo());
-        const legacy_stat = try legacy_file.stat(io_mod.getIo());
-        if (legacy_stat.size > automatic_legacy_max_bytes) {
-            try appendDoctorDiagnostic(diagnostics, alloc, session_id, .oversized_legacy_snapshot, legacy_stat.size);
-        }
-        try inspectDoctorManagedChildren(ctx, alloc, diagnostics, session_dir, session_id);
-        return;
-    }
-
-    const has_prepared_log = entryExistsRelative(session_dir, "events.jsonl") catch false;
-    try appendDoctorDiagnostic(
-        diagnostics,
-        alloc,
-        session_id,
-        if (has_prepared_log) .authority_less_creation_orphan else .missing_authority,
-        null,
-    );
-}
-
-/// Diagnoses a session that owns a valid authority marker: validates the
-/// projection manifest, event log size, commit watermark, compaction growth,
-/// stale/cleanup artifacts, managed children, and finally a canonical replay.
-/// Terminal: stops at the first disqualifying problem.
-fn inspectSchemaV3Session(
-    ctx: StoreContext,
-    alloc: Allocator,
-    diagnostics: *std.ArrayList(DoctorDiagnostic),
-    session_dir: *io_mod.VerifiedDir,
-    session_id: []const u8,
-    options: DoctorInspectionOptions,
-) !void {
-    const manifest_bytes = try readOptionalSessionFile(
-        alloc,
-        session_dir,
-        "session.json",
-        session_projection.manifest_max_bytes,
-    );
-    if (manifest_bytes == null) {
-        try appendDoctorDiagnostic(diagnostics, alloc, session_id, .projection_missing, null);
-    }
-
-    var manifest: ?session_projection.Manifest = null;
-    defer if (manifest) |*value| value.deinit(alloc);
-    if (manifest_bytes) |bytes| {
-        defer alloc.free(bytes);
-        manifest = session_projection.decodeManifest(alloc, bytes) catch {
-            try appendDoctorDiagnostic(diagnostics, alloc, session_id, .projection_invalid, null);
             return;
         };
+        state.deinit(alloc);
+        try inspectDoctorManagedChildren(
+            ctx,
+            alloc,
+            diagnostics,
+            session_dir,
+            session_id,
+        );
+        return;
     }
 
-    const event_stat = eventFileStat(session_dir, "events.jsonl") catch |err| {
+    if ((entryExistsRelative(session_dir, "authority.pending.json") catch false) or
+        (entryExistsRelative(session_dir, "commit.pending.json") catch false))
+    {
         try appendDoctorDiagnostic(
             diagnostics,
             alloc,
             session_id,
-            if (err == error.SessionPathUnsafe) .unsafe_path else .canonical_state_invalid,
+            .authority_transition_pending,
             null,
         );
         return;
-    };
-    if (event_stat.size >= 128 * 1024 * 1024) {
-        try appendDoctorDiagnostic(diagnostics, alloc, session_id, .canonical_log_large, event_stat.size);
-        return;
     }
 
-    const watermark = session_log.inspectCommitWatermark(alloc, session_dir, session_id) catch |err| {
+    var candidate = classifyReadOnlyCandidate(
+        alloc,
+        session_dir,
+        session_id,
+    ) catch |err| {
         try appendDoctorDiagnostic(
             diagnostics,
             alloc,
             session_id,
-            if (err == error.SessionPathUnsafe) .unsafe_path else .canonical_state_invalid,
-            null,
-        );
-        return;
-    };
-    switch (watermark.status) {
-        .missing, .invalid, .mismatched => {
-            try appendDoctorDiagnostic(
-                diagnostics,
-                alloc,
-                session_id,
-                switch (watermark.status) {
-                    .missing => .commit_watermark_missing,
-                    .invalid => .commit_watermark_invalid,
-                    .mismatched => .commit_watermark_mismatched,
-                    .valid => unreachable,
-                },
-                null,
-            );
-            return;
-        },
-        .valid => {},
-    }
-
-    const committed_position = watermark.position.?;
-    const has_failed_compaction = try session_log.hasValidatedCompactionTemp(alloc, session_dir, session_id);
-    if (manifest) |value| {
-        try appendCompactionGrowthIfNeeded(
-            diagnostics,
-            alloc,
-            session_id,
-            value,
-            committed_position,
-            has_failed_compaction,
-            options,
-        );
-    }
-    if (manifest) |value| {
-        if (session_projection.isManifestStale(value, event_stat)) {
-            try appendDoctorDiagnostic(diagnostics, alloc, session_id, .projection_stale, null);
-        }
-        try appendCleanupCandidateIfPresent(diagnostics, alloc, session_id, session_dir, value);
-    }
-
-    try inspectDoctorManagedChildren(ctx, alloc, diagnostics, session_dir, session_id);
-
-    const has_commit_intent = entryExistsRelative(session_dir, "commit.pending.json") catch |err| {
-        try appendDoctorDiagnostic(
-            diagnostics,
-            alloc,
-            session_id,
-            if (err == error.SessionPathUnsafe) .unsafe_path else .invalid_commit_intent,
-            null,
-        );
-        return;
-    };
-
-    var root = ctx.canonical_root;
-    var state = root.loadReadOnly(alloc, session_id, .{}) catch |err| {
-        try appendDoctorDiagnostic(
-            diagnostics,
-            alloc,
-            session_id,
-            if (has_commit_intent and err == error.SessionCommitBoundaryUnavailable)
-                .commit_intent_pending
-            else if (has_commit_intent)
-                .invalid_commit_intent
+            if (err == error.LegacySessionTooLarge)
+                .oversized_legacy_snapshot
             else if (err == error.SessionPathUnsafe)
                 .unsafe_path
             else
@@ -399,61 +209,14 @@ fn inspectSchemaV3Session(
         );
         return;
     };
-    state.deinit(alloc);
-}
-
-/// Appends a compaction diagnostic when the committed log has grown past the
-/// configured byte/frame thresholds within the manifest's current generation.
-/// No-op when the generation differs or growth is under threshold.
-fn appendCompactionGrowthIfNeeded(
-    diagnostics: *std.ArrayList(DoctorDiagnostic),
-    alloc: Allocator,
-    session_id: []const u8,
-    manifest: session_projection.Manifest,
-    committed_position: session_log.CommitPosition,
-    has_failed_compaction: bool,
-    options: DoctorInspectionOptions,
-) !void {
-    const same_generation = std.mem.eql(u8, &manifest.log_generation, &committed_position.log_generation);
-    if (!same_generation) return;
-    const growth_bytes = committed_position.through_event_log_bytes -
-        @min(committed_position.through_event_log_bytes, manifest.generation_base_bytes);
-    const growth_frames = committed_position.through_seq -
-        @min(committed_position.through_seq, manifest.generation_base_seq);
-    if (growth_bytes >= options.compaction_byte_threshold or
-        growth_frames >= options.compaction_frame_threshold)
-    {
-        try appendDoctorGrowthDiagnostic(
-            diagnostics,
-            alloc,
-            session_id,
-            if (has_failed_compaction)
-                .canonical_log_compaction_failed
-            else
-                .canonical_log_compaction_overdue,
-            committed_position.through_event_log_bytes,
-            growth_bytes,
-            growth_frames,
-        );
-    }
-}
-
-/// Appends a single cleanup-candidate diagnostic if the directory contains a
-/// compaction artifact from a generation other than the manifest's current one.
-fn appendCleanupCandidateIfPresent(
-    diagnostics: *std.ArrayList(DoctorDiagnostic),
-    alloc: Allocator,
-    session_id: []const u8,
-    session_dir: *io_mod.VerifiedDir,
-    manifest: session_projection.Manifest,
-) !void {
-    var entries = session_dir.dir.iterate();
-    while (try entries.next(io_mod.getIo())) |entry| {
-        const generation = session_log.cleanupCandidateGeneration(entry.name) orelse continue;
-        if (std.mem.eql(u8, &generation, &manifest.log_generation)) continue;
-        try appendDoctorDiagnostic(diagnostics, alloc, session_id, .cleanup_candidate, null);
-        break;
-    }
+    candidate.deinit(alloc);
+    try inspectDoctorManagedChildren(
+        ctx,
+        alloc,
+        diagnostics,
+        session_dir,
+        session_id,
+    );
 }
 
 fn inspectDoctorManagedChildren(
@@ -500,9 +263,105 @@ pub fn classifyReadOnlyCandidate(
     session_dir: *io_mod.VerifiedDir,
     session_id: []const u8,
 ) !ReadOnlyCandidate {
+    if (try session_log.hasConversationMetadata(alloc, session_dir)) {
+        return classifyConversationCandidate(alloc, session_dir, session_id);
+    }
     return switch (try classifyAuthority(alloc, session_dir, session_id)) {
         .schema_v3 => classifySchemaV3Candidate(alloc, session_dir, session_id),
         .legacy => classifyLegacyCandidate(alloc, session_dir, session_id),
+    };
+}
+
+fn classifyConversationCandidate(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+) !ReadOnlyCandidate {
+    const metadata_bytes = (try readOptionalSessionFile(
+        alloc,
+        session_dir,
+        "session.json",
+        session_codec.max_session_metadata_bytes,
+    )) orelse return error.SessionNotFound;
+    defer alloc.free(metadata_bytes);
+    var metadata = try session_codec.decodeSessionMetadata(alloc, metadata_bytes);
+    defer metadata.deinit();
+    if (!std.mem.eql(u8, metadata.value.id, session_id)) {
+        return error.InvalidSessionFormat;
+    }
+
+    const event_stat = try session_dir.dir.statFile(
+        io_mod.getIo(),
+        "events.jsonl",
+        .{ .follow_symlinks = false },
+    );
+    if (event_stat.kind != .file or event_stat.nlink != 1) {
+        return error.SessionPathUnsafe;
+    }
+    var history_len: usize = 0;
+    var has_checkpoint = false;
+    if (event_stat.size > 0) {
+        var event_file = try openSessionFile(session_dir, "events.jsonl", .read_only);
+        defer event_file.close(io_mod.getIo());
+        var offset: u64 = 0;
+        while (offset < event_stat.size) {
+            const line = session_replay.readLineAt(
+                alloc,
+                event_file,
+                offset,
+                event_stat.size,
+            ) catch |err| switch (err) {
+                error.TruncatedEventFrame => break,
+                else => return err,
+            } orelse break;
+            defer alloc.free(line.bytes);
+            var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
+            defer decoded.deinit();
+            switch (decoded.value.event) {
+                .context_checkpoint => has_checkpoint = true,
+                .turn_completed, .interrupted => history_len = std.math.add(
+                    usize,
+                    history_len,
+                    1,
+                ) catch return error.InvalidSessionFormat,
+                else => {},
+            }
+            offset = line.next_offset;
+        }
+    }
+
+    const id = try alloc.dupe(u8, metadata.value.id);
+    errdefer alloc.free(id);
+    const origin = try alloc.dupe(u8, metadata.value.origin_workspace_root);
+    errdefer alloc.free(origin);
+    const workspace = try alloc.dupe(u8, metadata.value.workspace_root);
+    errdefer alloc.free(workspace);
+    const title = if (metadata.value.title) |value| try alloc.dupe(u8, value) else null;
+    return .{
+        .summary = .{
+            .id = id,
+            .workspace_root = workspace,
+            .origin_workspace_root = origin,
+            .title = title,
+            .created_at_ms = metadata.value.created_at_ms,
+            .updated_at_ms = if (history_len == 0 and !has_checkpoint)
+                metadata.value.updated_at_ms
+            else
+                @max(
+                    metadata.value.updated_at_ms,
+                    std.math.cast(
+                        i64,
+                        @divFloor(event_stat.mtime.nanoseconds, std.time.ns_per_ms),
+                    ) orelse std.math.maxInt(i64),
+                ),
+            .conversation_language = session.ConversationLanguage.fromSlice(
+                metadata.value.conversation_language,
+            ) catch return error.InvalidSessionFormat,
+            .history_len = history_len,
+            .has_checkpoint = has_checkpoint,
+        },
+        .storage = .conversation,
+        .projection_state = .current,
     };
 }
 
@@ -716,6 +575,7 @@ pub fn logDiscovery(
     outcome: DiscoveryOutcome,
     err: ?anyerror,
 ) void {
+    if (err == null and outcome != .selected) return;
     debug_trace.logf(
         "core",
         "session discovery mode={s} cause={s} storage_format={s} projection_state={s} validated_candidate_id={s} outcome={s} error={s}",

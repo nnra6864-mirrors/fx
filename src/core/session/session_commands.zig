@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const app_permission_runtime = @import("../app/app_permission_runtime.zig");
 const app_session_runtime = @import("../app/app_session_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -1124,8 +1125,6 @@ pub fn Commands(comptime App: type) type {
             const selected = provider_runtime.model(app);
             try app.worker.syncQueuedPromptModel(std.heap.c_allocator, selected);
             if (comptime @hasDecl(App, "persistAcceptedModel")) try app.persistAcceptedModel(selected);
-            // Keep the session or workspace discriminator while updating the
-            // model shown as secondary terminal-tab context.
             app_session_runtime.Runtime(App).syncTerminalTitle(app);
 
             if (announce) {
@@ -2197,7 +2196,7 @@ test "session_commands handleModel resolves fuzzy cached model and syncs queued 
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", app.worker.synced_model.?);
     try std.testing.expectEqual(model_provider.ProviderId.codex, app.last_preference_provider.?);
     try std.testing.expectEqualStrings(
-        "workspace · anthropic/claude-sonnet-4-20250514",
+        "v" ++ build_options.app_version,
         app.terminalTitleLabelText(),
     );
     try expectTranscriptContains(&app, "● Switched to anthropic/claude-sonnet-4-20250514");
@@ -2214,7 +2213,7 @@ test "session_commands handleModel falls back to raw query when model fetch fail
     try std.testing.expectEqualStrings("custom/provider-model", app.selected_model.items);
     try std.testing.expectEqualStrings("custom/provider-model", app.worker.synced_model.?);
     try std.testing.expectEqualStrings(
-        "workspace · custom/provider-model",
+        "v" ++ build_options.app_version,
         app.terminalTitleLabelText(),
     );
 }
@@ -2750,7 +2749,7 @@ test "session_commands model picker accepts the current selected model slice" {
     try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", app.worker.synced_model.?);
     try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", app.last_preference_model.items);
     try std.testing.expectEqualStrings(
-        "workspace · anthropic/claude-opus-4.6",
+        "v" ++ build_options.app_version,
         app.terminalTitleLabelText(),
     );
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);

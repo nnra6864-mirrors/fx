@@ -103,12 +103,15 @@ fn persistInterruptedTurnWithPresentation(
     defer if (durable_active_tool_call) |call| {
         types.freeToolCall(std.heap.c_allocator, call);
     };
-    const execution = try runtime_execution_memory.buildInterruptedExecutionMemory(
+    const full_execution = try runtime_execution_memory.buildInterruptedExecutionMemory(
         std.heap.c_allocator,
         current_turn_messages,
         active_tool_call,
     );
-    defer types.freeExecutionMemory(std.heap.c_allocator, execution);
+    defer types.freeExecutionMemory(std.heap.c_allocator, full_execution);
+    var projection_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer projection_arena.deinit();
+    const execution = try finalization.compacted_execution.project(projection_arena.allocator(), full_execution);
     terminal_materializing.* = true;
 
     if (retained_candidate) |candidate| {
@@ -199,12 +202,15 @@ pub fn persistFailedPartialTurnOnce(
     if (persisted.*) return;
     if (partial_assistant.len == 0) return;
 
-    const execution = try runtime_execution_memory.buildInterruptedExecutionMemory(
+    const full_execution = try runtime_execution_memory.buildInterruptedExecutionMemory(
         std.heap.c_allocator,
         current_turn_messages,
         null,
     );
-    defer types.freeExecutionMemory(std.heap.c_allocator, execution);
+    defer types.freeExecutionMemory(std.heap.c_allocator, full_execution);
+    var projection_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer projection_arena.deinit();
+    const execution = try finalization.compacted_execution.project(projection_arena.allocator(), full_execution);
     terminal_materializing.* = true;
 
     const turn: HistoryTurn = .{ .interrupted = .{

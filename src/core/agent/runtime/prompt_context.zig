@@ -11,6 +11,8 @@ const HistoryTurn = types.HistoryTurn;
 const compaction_high_water_numerator: usize = 4;
 const compaction_ratio_denominator: usize = 5;
 const compaction_target_denominator: usize = 10;
+const compaction_recent_denominator: usize = 20;
+const compaction_soft_ceiling_denominator: usize = 4;
 const compaction_source_reduction_denominator: usize = 8;
 const compaction_generation_multiplier: usize = 4;
 
@@ -30,6 +32,7 @@ pub const CompactionPlanInput = struct {
     request_tokens: usize,
     source_tokens: usize,
     protected_tokens: usize = 0,
+    newest_exchange_tokens: usize = 0,
 };
 
 pub const CompactionPlan = struct {
@@ -73,7 +76,13 @@ pub fn planCompaction(input: CompactionPlanInput) CompactionPlan {
         @max(@as(usize, 1), target)
     else
         source_target;
-    if (input.protected_tokens >= total_target) return .{
+    const soft_ceiling = if (usable) |tokens| tokens / compaction_soft_ceiling_denominator else total_target *| 2;
+    const oversized_exchange = if (usable) |tokens|
+        input.newest_exchange_tokens > tokens / compaction_recent_denominator and input.protected_tokens > soft_ceiling
+    else
+        false;
+    const request_ceiling = if (oversized_exchange) usable.? else soft_ceiling;
+    if (input.protected_tokens >= request_ceiling) return .{
         .decision = .no_op,
         .usable_input_tokens = usable,
         .high_water_tokens = high_water,
@@ -81,7 +90,7 @@ pub fn planCompaction(input: CompactionPlanInput) CompactionPlan {
         .accepted_handoff_tokens = null,
         .generation_tokens = null,
     };
-    const accepted = total_target - input.protected_tokens;
+    const accepted = @min(total_target, request_ceiling - input.protected_tokens);
     const requested_generation = accepted *| compaction_generation_multiplier;
     const generation = if (input.capabilities.max_output_tokens) |limit|
         @min(requested_generation, @as(usize, @intCast(limit)))
@@ -95,6 +104,108 @@ pub fn planCompaction(input: CompactionPlanInput) CompactionPlan {
         .accepted_handoff_tokens = accepted,
         .generation_tokens = generation,
     };
+}
+
+pub fn recentContextTarget(capabilities: model_capabilities.Capabilities, source_tokens: usize) usize {
+    return (usableInputTokens(capabilities) orelse source_tokens) / compaction_recent_denominator;
+}
+
+pub const RetainedContext = struct {
+    cut: types.ContextHistoryCut,
+    newest_exchange_tokens: usize,
+    estimated_tokens: usize,
+};
+
+/// Selects complete execution steps. Payloads are measured, never shortened.
+pub fn selectRecentContext(history: []const HistoryTurn, target: usize, input_capacity: ?usize) RetainedContext {
+    var raw_count = session_runtime.rawHistoryTurnCount(history);
+    var selected = types.ContextHistoryCut{ .turns = raw_count };
+    var total: usize = 0;
+    var newest: usize = 0;
+    var selected_any = false;
+    var index = history.len;
+    history_scan: while (index > 0) {
+        index -= 1;
+        const turn = history[index];
+        if (turn == .compacted_summary) continue;
+        raw_count -= 1;
+        const user = switch (turn) {
+            .assistant => |entry| entry.user.text,
+            .interrupted => |entry| entry.user.text,
+            .compacted_summary => unreachable,
+        };
+        const reply = switch (turn) {
+            .assistant => |entry| entry.assistant,
+            .interrupted => |entry| entry.assistant orelse "",
+            .compacted_summary => unreachable,
+        };
+        const execution = switch (turn) {
+            .assistant => |entry| entry.execution,
+            .interrupted => |entry| entry.execution,
+            .compacted_summary => unreachable,
+        };
+        var base = textTokens(user) +| textTokens(reply) +| 8;
+        var steering_index = execution.steering.len;
+        var step_index = execution.tool_steps.len;
+        if (step_index == 0) {
+            for (execution.steering) |entry| {
+                base +|= textTokens(entry.text);
+                if (entry.assistant_prefix) |prefix| base +|= textTokens(prefix);
+            }
+            if (input_capacity) |capacity| {
+                if (!selected_any and base >= capacity) break :history_scan;
+            }
+            if (selected_any and (raw_count == 0 or total +| base > target)) break;
+            total +|= base;
+            selected = .{ .turns = raw_count };
+            if (!selected_any) newest = total;
+            selected_any = true;
+            continue;
+        }
+        while (step_index > 0) {
+            step_index -= 1;
+            var cost = base +| executionStepTokens(execution.tool_steps[step_index]);
+            var next_steering = steering_index;
+            while (next_steering > 0 and execution.steering[next_steering - 1].after_tool_step_count >= step_index) {
+                next_steering -= 1;
+                cost +|= textTokens(execution.steering[next_steering].text);
+                if (execution.steering[next_steering].assistant_prefix) |prefix| cost +|= textTokens(prefix);
+            }
+            if (input_capacity) |capacity| {
+                if (!selected_any and cost >= capacity) break :history_scan;
+            }
+            if (selected_any and ((raw_count == 0 and step_index == 0) or total +| cost > target)) return .{
+                .cut = selected,
+                .newest_exchange_tokens = newest,
+                .estimated_tokens = total,
+            };
+            total +|= cost;
+            selected = .{ .turns = raw_count, .tool_steps = step_index, .steering = next_steering };
+            if (!selected_any) newest = total;
+            selected_any = true;
+            steering_index = next_steering;
+            base = 0;
+        }
+    }
+    return .{ .cut = selected, .newest_exchange_tokens = newest, .estimated_tokens = total };
+}
+
+fn textTokens(text: []const u8) usize {
+    var estimator = token_estimate.StreamingEstimator{};
+    estimator.consume(text);
+    return @intCast(@min(estimator.estimate(), std.math.maxInt(usize)));
+}
+
+fn executionStepTokens(step: types.ToolExecutionStep) usize {
+    var total: usize = 8;
+    if (step.assistant) |text| total +|= textTokens(text);
+    for (step.tool_calls) |call| {
+        total +|= textTokens(call.id) +| textTokens(call.name) +| textTokens(call.arguments_json) +| 8;
+    }
+    for (step.tool_results) |result| {
+        total +|= textTokens(result.tool_call_id) +| textTokens(result.tool_name) +| textTokens(result.output) +| 8;
+    }
+    return total;
 }
 
 pub const CompactionHandoffError = error{
@@ -208,6 +319,14 @@ pub fn usableInputTokens(
         if (output_tokens < context_tokens) return context_tokens - output_tokens;
     }
     return context_tokens;
+}
+
+pub fn usableInputTokensForGeneration(
+    capabilities: model_capabilities.Capabilities,
+    generation_tokens: usize,
+) ?usize {
+    const context_window = capabilities.context_window orelse return null;
+    return @as(usize, @intCast(context_window)) -| generation_tokens;
 }
 
 pub const ProviderPrompt = struct {
@@ -423,6 +542,21 @@ test "provider request measurement learns the prior exact token density" {
     try std.testing.expect(calibrated.estimated_input_tokens >= current.estimated_input_tokens);
 }
 
+test "compactor input budget reserves the requested generation" {
+    try std.testing.expectEqual(
+        @as(?usize, 296_816),
+        usableInputTokensForGeneration(.{ .context_window = 500_000 }, 203_184),
+    );
+    try std.testing.expectEqual(
+        @as(?usize, 0),
+        usableInputTokensForGeneration(.{ .context_window = 500_000 }, 500_000),
+    );
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        usableInputTokensForGeneration(.{}, 1),
+    );
+}
+
 test "compaction v2 triggers automatic work at eighty percent and targets ten percent" {
     try std.testing.expectEqual(
         @as(usize, 2),
@@ -461,16 +595,89 @@ test "compaction v2 triggers automatic work at eighty percent and targets ten pe
         .source_tokens = 640,
         .protected_tokens = 20,
     });
-    try std.testing.expectEqual(@as(?usize, 60), protected_prompt.accepted_handoff_tokens);
+    try std.testing.expectEqual(@as(?usize, 80), protected_prompt.accepted_handoff_tokens);
 
     const oversized_protected_prompt = planCompaction(.{
         .trigger = .automatic,
         .capabilities = capabilities,
         .request_tokens = 640,
         .source_tokens = 640,
-        .protected_tokens = 80,
+        .protected_tokens = 200,
     });
     try std.testing.expectEqual(CompactionDecision.no_op, oversized_protected_prompt.decision);
+}
+
+test "retained context budgets preserve an oversized newest exchange" {
+    const caps = model_capabilities.Capabilities{ .context_window = 100_000 };
+    try std.testing.expectEqual(@as(usize, 5_000), recentContextTarget(caps, 0));
+    const ordinary = planCompaction(.{
+        .trigger = .automatic,
+        .capabilities = caps,
+        .request_tokens = 80_000,
+        .source_tokens = 80_000,
+        .protected_tokens = 12_000,
+        .newest_exchange_tokens = 4_000,
+    });
+    try std.testing.expectEqual(@as(?usize, 10_000), ordinary.accepted_handoff_tokens);
+    const near_ceiling = planCompaction(.{
+        .trigger = .automatic,
+        .capabilities = caps,
+        .request_tokens = 80_000,
+        .source_tokens = 80_000,
+        .protected_tokens = 20_000,
+        .newest_exchange_tokens = 4_000,
+    });
+    try std.testing.expectEqual(@as(?usize, 5_000), near_ceiling.accepted_handoff_tokens);
+    const oversized = planCompaction(.{
+        .trigger = .automatic,
+        .capabilities = caps,
+        .request_tokens = 80_000,
+        .source_tokens = 80_000,
+        .protected_tokens = 43_000,
+        .newest_exchange_tokens = 35_000,
+    });
+    try std.testing.expectEqual(@as(?usize, 10_000), oversized.accepted_handoff_tokens);
+    const impossible = planCompaction(.{
+        .trigger = .automatic,
+        .capabilities = caps,
+        .request_tokens = 110_000,
+        .source_tokens = 110_000,
+        .protected_tokens = 100_000,
+        .newest_exchange_tokens = 90_000,
+    });
+    try std.testing.expect(impossible.accepted_handoff_tokens == null);
+}
+
+test "retained context selects whole parallel tool exchanges without shortening results" {
+    const body = "large output " ** 2000;
+    const calls = [_]types.ToolCall{
+        .{ .id = "one", .name = "read_file", .arguments_json = "{}" },
+        .{ .id = "two", .name = "read_file", .arguments_json = "{}" },
+    };
+    const results = [_]types.PersistedToolResult{
+        .{ .tool_call_id = @constCast("one"), .tool_name = @constCast("read_file"), .status = .success, .output = @constCast(body), .output_bytes = body.len, .stored_output_bytes = body.len },
+        .{ .tool_call_id = @constCast("two"), .tool_name = @constCast("read_file"), .status = .success, .output = @constCast(body), .output_bytes = body.len, .stored_output_bytes = body.len },
+    };
+    const steps = [_]types.ToolExecutionStep{
+        .{ .assistant = @constCast("earlier work") },
+        .{ .tool_calls = @constCast(&calls), .tool_results = @constCast(&results) },
+    };
+    const history = [_]HistoryTurn{
+        .{ .assistant = .{ .user = .{ .text = @constCast("old request") }, .assistant = @constCast("old answer") } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("current request") }, .assistant = @constCast(""), .execution = .{ .tool_steps = @constCast(&steps) } } },
+    };
+    const selected = selectRecentContext(&history, 5000, null);
+    try std.testing.expectEqual(@as(usize, 1), selected.cut.turns);
+    try std.testing.expectEqual(@as(usize, 1), selected.cut.tool_steps);
+    try std.testing.expect(selected.newest_exchange_tokens > 5000);
+    try std.testing.expectEqualStrings(body, results[0].output);
+    try std.testing.expectEqualStrings(body, results[1].output);
+    const over_capacity = selectRecentContext(&history, 5000, 10_000);
+    try std.testing.expectEqual(@as(usize, 2), over_capacity.cut.turns);
+    try std.testing.expectEqual(@as(usize, 0), over_capacity.cut.tool_steps);
+    try std.testing.expectEqual(@as(usize, 0), over_capacity.estimated_tokens);
+    try std.testing.expectEqualStrings(body, results[0].output);
+    try std.testing.expectEqualStrings(body, results[1].output);
 }
 
 test "manual compaction shares the budget and stops after a smaller source" {

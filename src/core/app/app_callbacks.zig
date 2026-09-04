@@ -13,6 +13,7 @@ const provider_runtime = @import("provider_runtime.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
+const runtime_profile = @import("../hosts/runtime_profile.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
@@ -272,15 +273,6 @@ pub fn Bindings(comptime App: type) type {
                     app.agentStreamProvider()
                 else
                     agent_stream_provider.unavailable_provider,
-                .compaction_route = if (comptime @hasDecl(App, "compactionRoute"))
-                    app.compactionRoute()
-                else if (comptime @hasDecl(App, "providerSet") and @hasField(App, "auth"))
-                    app.providerSet().compactionRoute(
-                        provider_runtime.provider(app),
-                        app.auth.credentialSource(),
-                    )
-                else
-                    .{ .unavailable = .missing_policy },
                 .cooperative_transport_pulse = if (comptime @hasDecl(App, "cooperativeTransportPulse")) .{
                     .ctx = @ptrCast(app),
                     .run = cooperativeTransportPulse,
@@ -444,6 +436,7 @@ pub fn Bindings(comptime App: type) type {
                 .command_output_complete = workerBridgeCommandOutputComplete,
                 .diff_block = workerBridgeDiffBlock,
                 .context_compaction = workerBridgeContextCompaction,
+                .prepare_fresh_prompt = workerBridgePrepareFreshPrompt,
                 .append_history_turn = workerBridgeAppendHistoryTurn,
                 .session_grant = workerBridgeSessionGrant,
                 .error_text = workerBridgeErrorText,
@@ -887,12 +880,24 @@ pub fn Bindings(comptime App: type) type {
         fn agentCommitContextCompaction(
             ctx: *anyopaque,
             summary: types.CompactedSummaryHistoryTurn,
+            active_prefix: ?types.AssistantHistoryTurn,
+            retained_from: ?types.ContextHistoryCut,
         ) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            const turn = types.HistoryTurn{ .compacted_summary = summary };
+            if (comptime runtime_profile.allows(App, .cooperative_agent)) {
+                try app.worker.publishContextCompaction(std.heap.c_allocator, .{
+                    .summary = summary,
+                    .active_prefix = active_prefix,
+                    .retained_from = retained_from,
+                    .max_history_turns = app.session.max_history_turns,
+                }, app, workerBridgeContextCompaction);
+                return;
+            }
             try app_worker_runtime.Runtime(App).commitContextCompaction(
                 app,
-                turn,
+                summary,
+                active_prefix,
+                retained_from,
                 app.session.max_history_turns,
             );
         }
@@ -1240,9 +1245,22 @@ pub fn Bindings(comptime App: type) type {
             try app.registerAndEmitDiffBlock(payload);
         }
 
-        fn workerBridgeContextCompaction(ctx: *anyopaque, turn: types.HistoryTurn) !void {
+        fn workerBridgeContextCompaction(ctx: *anyopaque, value: worker_runtime.ContextCompaction) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            try app_session_runtime.Runtime(App).appendHistoryTurn(app, turn);
+            try app_session_runtime.Runtime(App).commitContextCompaction(app, value.summary, value.active_prefix, value.retained_from);
+        }
+
+        fn workerBridgePrepareFreshPrompt(ctx: *anyopaque, value: worker_runtime.FreshPromptPreparation) !worker_runtime.FreshPromptHistory {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            return app_session_runtime.Runtime(App).prepareFreshPrompt(app, value);
+        }
+
+        pub fn prepareFreshPrompt(app: *App, value: worker_runtime.FreshPromptPreparation) !worker_runtime.FreshPromptHistory {
+            if (comptime runtime_profile.allows(App, .cooperative_agent)) {
+                const current = app_session_runtime.Runtime(App).normalizeFreshPromptPreparation(app, value);
+                return app.worker.publishFreshPrompt(std.heap.c_allocator, current, app, workerBridgePrepareFreshPrompt);
+            }
+            return app.worker.prepareFreshPrompt(std.heap.c_allocator, value);
         }
 
         fn workerBridgeAppendHistoryTurn(ctx: *anyopaque, finished: types.FinishedPrompt) !void {
@@ -1355,6 +1373,25 @@ const FakeWorker = struct {
 const FakeSession = struct {
     max_history_turns: usize = 8,
     history_appends: usize = 0,
+    agent: struct { history: std.ArrayList(types.HistoryTurn) = .empty } = .{},
+
+    pub fn commitCompactedHistory(self: *FakeSession, alloc: std.mem.Allocator, history: []types.HistoryTurn) void {
+        self.history_appends += 1;
+        types.freeHistoryTurnSlice(alloc, history);
+    }
+
+    pub fn unversionedHistoryEnd(_: *FakeSession) usize {
+        return 0;
+    }
+
+    pub fn prepareHistoryEntry(_: *FakeSession, alloc: std.mem.Allocator, turn: types.HistoryTurn) !types.HistoryTurn {
+        return types.dupeHistoryTurn(alloc, turn);
+    }
+
+    pub fn commitPreparedHistoryEntry(self: *FakeSession, alloc: std.mem.Allocator, turn: types.HistoryTurn) void {
+        self.history_appends += 1;
+        types.freeHistoryTurn(alloc, turn);
+    }
 
     fn languageSnapshot(self: *FakeSession) types.ConversationLanguage {
         _ = self;

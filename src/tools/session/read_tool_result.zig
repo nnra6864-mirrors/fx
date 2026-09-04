@@ -443,8 +443,8 @@ test "read_tool_result pages and searches saved command replay handles" {
     }, &page_input);
     defer alloc.free(page);
     try std.testing.expect(std.mem.find(u8, page, "[stdout]") != null);
-    try std.testing.expect(std.mem.find(u8, page, "TOKEN=[redacted]") != null);
-    try std.testing.expect(std.mem.find(u8, page, "secret-value") == null);
+    try std.testing.expect(std.mem.find(u8, page, "TOKEN=secret-value") != null);
+    try std.testing.expect(std.mem.find(u8, page, "[redacted]") == null);
     try std.testing.expect(std.mem.find(u8, page, "needle tail") != null);
 
     var query_input = Input{

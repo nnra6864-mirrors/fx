@@ -1473,15 +1473,7 @@ pub fn Runtime(comptime App: type) type {
                         return;
                     }
                     if (provider_picker_rt.hasQuery(app)) {
-                        if (app.stream.active) {
-                            try app.writeDomainNotice(.{
-                                .topic = "provider",
-                                .tone = .neutral,
-                                .body = "Provider switching is unavailable until active and queued work finishes.",
-                            }, true);
-                            app.shell.render_requests.request(.footer);
-                            return;
-                        }
+                        if (try app_auth_runtime.Runtime(App).reject_provider_picker_if_busy(app)) return;
                         if (try provider_picker_rt.submit(app)) return;
                     }
                     if (completion_rt.hasModelQuery(app)) {

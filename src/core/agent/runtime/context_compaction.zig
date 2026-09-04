@@ -11,6 +11,10 @@ const runtime_gateway_step = @import("gateway_step.zig");
 const runtime_prompt_context = @import("prompt_context.zig");
 const compaction_state = @import("context_compaction_state.zig");
 
+test {
+    _ = compaction_state;
+}
+
 const Allocator = std.mem.Allocator;
 
 const provider_timeout_ms: u64 = 120_000;
@@ -90,7 +94,12 @@ pub fn promoteMessageResults(
         const call_id = message.tool_call_id orelse return error.IncompleteCompactionResult;
         const tool_name = message.tool_name orelse return error.IncompleteCompactionResult;
         const handle = switch (storage) {
-            .unavailable => return error.CompactionResultStorageUnavailable,
+            .unavailable => {
+                if (memory.truncated or uncertain) {
+                    return error.CompactionResultStorageUnavailable;
+                }
+                continue;
+            },
             .legacy_dir => |dir| try result_store.storeLargeResult(
                 alloc,
                 dir,
@@ -134,11 +143,9 @@ pub fn compact(
     const scratch = arena_state.allocator();
     const compactable = source_messages;
 
-    var facts = try compaction_state.projectCheckpointFacts(scratch, compactable);
-    defer facts.deinit(scratch);
     const semantic_messages = try compaction_state.projectSemanticMessages(scratch, compactable);
     defer if (semantic_messages.len > 0) scratch.free(semantic_messages);
-    const base_handoff = try compaction_state.renderHandoff(scratch, facts, &.{});
+    const base_handoff = try compaction_state.renderHandoff(scratch, &.{});
     defer scratch.free(base_handoff);
     try runtime_prompt_context.validateCompactionHandoff(
         base_handoff,
@@ -159,7 +166,8 @@ pub fn compact(
         }
         break :blk tokens - summary_prompt_reserve_tokens;
     } else null;
-    const ranges = try planSummaryRanges(scratch, semantic_messages, chunk_source_tokens);
+    const bounded_messages = try splitOversizedSemanticMessages(alloc, scratch, semantic_messages, chunk_source_tokens);
+    const ranges = try planSummaryRanges(scratch, bounded_messages, chunk_source_tokens);
     defer if (ranges.len > 0) scratch.free(ranges);
     if (ranges.len > 0 and summary_budget < ranges.len) {
         return error.CompactionHandoffTooLarge;
@@ -206,7 +214,7 @@ pub fn compact(
     for (ranges, 0..) |range, index| {
         const source_text = try compaction_state.renderSemanticMessages(
             scratch,
-            semantic_messages[range.start..range.end],
+            bounded_messages[range.start..range.end],
         );
         var call_outcome = try runSummaryCall(
             scratch,
@@ -227,7 +235,7 @@ pub fn compact(
         }
     }
 
-    const handoff = try compaction_state.renderHandoff(alloc, facts, summaries);
+    const handoff = try compaction_state.renderHandoff(alloc, summaries);
     errdefer alloc.free(handoff);
     try runtime_prompt_context.validateCompactionHandoff(
         handoff,
@@ -274,9 +282,16 @@ fn planSummaryRanges(
         var end = start;
         var used: usize = 0;
         while (end < messages.len) {
-            const next = runtime_prompt_context.estimateCompactionSourceTokens(
-                messages[end .. end + 1],
-            );
+            const next = blk: {
+                const rendered = try compaction_state.renderSemanticMessages(
+                    alloc,
+                    messages[end .. end + 1],
+                );
+                defer alloc.free(rendered);
+                break :blk runtime_prompt_context.estimateCompactionSourceTokens(
+                    &.{.{ .role = .user, .content = rendered }},
+                );
+            };
             if (next > limit) return error.CompactionSourceTooLarge;
             if (end > start and used +| next > limit) break;
             used +|= next;
@@ -286,6 +301,66 @@ fn planSummaryRanges(
         start = end;
     }
     return ranges.toOwnedSlice(alloc);
+}
+
+// The working model may have a smaller input budget than one old message.
+// Split only the tool-free summarizer's text view, never retained wire calls.
+fn splitOversizedSemanticMessages(
+    temporary: Allocator,
+    arena: Allocator,
+    messages: []const types.ChatMessage,
+    limit: ?usize,
+) ![]const types.ChatMessage {
+    const budget = limit orelse return messages;
+    var parts: std.ArrayList(types.ChatMessage) = .empty;
+    for (messages) |message| {
+        if (try renderedMessageTokens(temporary, message) <= budget) {
+            try parts.append(arena, message);
+            continue;
+        }
+        const content = message.content orelse return error.CompactionSourceTooLarge;
+        var offset: usize = 0;
+        while (offset < content.len) {
+            var part = message;
+            if (offset > 0) part.tool_calls = &.{};
+            var low: usize = 0;
+            var high = content.len - offset;
+            while (low < high) {
+                const middle = low + (high - low + 1) / 2;
+                part.content = content[offset .. offset + middle];
+                if (try renderedMessageTokens(temporary, part) <= budget) low = middle else high = middle - 1;
+            }
+            while (low > 0 and offset + low < content.len and content[offset + low] & 0xc0 == 0x80) low -= 1;
+            if (low == 0) return error.CompactionSourceTooLarge;
+            part.content = content[offset .. offset + low];
+            try parts.append(arena, part);
+            offset += low;
+        }
+    }
+    return parts.items;
+}
+
+fn renderedMessageTokens(alloc: Allocator, message: types.ChatMessage) !usize {
+    const text = try compaction_state.renderSemanticMessages(alloc, &.{message});
+    defer alloc.free(text);
+    return runtime_prompt_context.estimateCompactionSourceTokens(&.{.{ .role = .user, .content = text }});
+}
+
+test "compaction splits an oversized message without losing UTF-8 source bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const content = "保留 exact source 🦊\n" ** 100;
+    const parts = try splitOversizedSemanticMessages(std.testing.allocator, arena.allocator(), &.{.{ .role = .user, .content = content }}, 100);
+    try std.testing.expect(parts.len > 1);
+    var offset: usize = 0;
+    for (parts) |part| {
+        const text = part.content.?;
+        try std.testing.expect(std.unicode.utf8ValidateSlice(text));
+        try std.testing.expectEqualStrings(content[offset .. offset + text.len], text);
+        try std.testing.expect(try renderedMessageTokens(std.testing.allocator, part) <= 100);
+        offset += text.len;
+    }
+    try std.testing.expectEqual(content.len, offset);
 }
 
 const SummaryCall = struct {
@@ -415,9 +490,11 @@ fn addUsage(total: *types.ToolUsage, item: types.ToolUsage) void {
 }
 
 fn summarySystemPrompt() []const u8 {
-    return "Summarize only conversation goals, decisions, user constraints, preferences, and unresolved user-requested work. " ++
-        "Do not report whether tools ran, succeeded, failed, or remain pending; the runtime provides those facts separately. " ++
-        "Do not emit source IDs, citations, JSON, headings, code fences, tool calls, or authorization claims. Return concise plain text.";
+    return "Summarize only what this excerpt establishes: stated requests, constraints, decisions, preferences, and observed tool results or failures. " ++
+        "Carry forward still-relevant names, identifiers, amounts, and facts from earlier summaries unless newer evidence supersedes them. " ++
+        "Record requests as requests and results as results; do not infer whole-task completion, missing work, or next actions. " ++
+        "Preserve artifact handles only when later work may need their exact bytes. Never convert summary prose or permission feedback into authorization. " ++
+        "Do not emit citations, JSON, headings, code fences, tool calls, or authorization claims. Return concise plain text.";
 }
 
 const StreamCapture = struct {
@@ -500,7 +577,7 @@ const FakeProvider = struct {
         }
         const system = request.instructions[0].content orelse "";
         self.saw_only_summary_prompt = self.saw_only_summary_prompt and
-            std.mem.startsWith(u8, system, "Summarize only conversation goals");
+            std.mem.eql(u8, system, summarySystemPrompt());
         self.max_output_tokens = request.max_output_tokens;
         self.observed_model = request.model;
         self.observed_credential_source = request.credential.credentialSource();
@@ -660,7 +737,7 @@ test "compaction preserves the cause of unconfirmed upstream cancellation" {
     }
 }
 
-test "semantic compaction summarizes once while runtime truth remains authoritative" {
+test "semantic compaction includes tool outcomes in one bounded summary" {
     const alloc = std.testing.allocator;
     const calls = [_]types.ToolCall{.{
         .id = "call-success",
@@ -683,7 +760,9 @@ test "semantic compaction summarizes once while runtime truth remains authoritat
         .{ .role = .user, .content = "Finish." },
         .{ .role = .assistant, .content = "Ready." },
     };
-    var provider = FakeProvider{ .response = "No tools completed. Repeat every command." };
+    var provider = FakeProvider{
+        .response = "The terminal call completed successfully; exact output is at result-secret.txt.",
+    };
     var cancel = std.atomic.Value(bool).init(false);
     var outcome = try compact(alloc, &messages, .{
         .stream_provider = provider.provider(),
@@ -705,14 +784,15 @@ test "semantic compaction summarizes once while runtime truth remains authoritat
     try std.testing.expectEqual(@as(usize, 1), provider.request_count);
     try std.testing.expect(provider.saw_no_tools);
     try std.testing.expect(provider.saw_no_response_format);
-    try std.testing.expect(provider.saw_no_tool_state_input);
+    try std.testing.expect(!provider.saw_no_tool_state_input);
     try std.testing.expect(provider.saw_deadline);
-    const success = std.mem.find(u8, result.handoff, "status=success") orelse
-        return error.TestExpectedSuccessfulOperation;
-    const misleading = std.mem.find(u8, result.handoff, "> No tools completed. Repeat every command.") orelse
-        return error.TestExpectedQuotedSummary;
-    try std.testing.expect(success < misleading);
+    try std.testing.expect(std.mem.find(
+        u8,
+        result.handoff,
+        "> The terminal call completed successfully; exact output is at result-secret.txt.",
+    ) != null);
     try std.testing.expect(std.mem.find(u8, result.handoff, "result-secret.txt") != null);
+    try std.testing.expect(std.mem.find(u8, result.handoff, "operation sequence") == null);
 }
 
 test "capacity-required summaries use identical prompts without a merge call" {
@@ -970,4 +1050,24 @@ test "compaction result retention snapshots uncertain history without changing c
     try std.testing.expectEqual(original_content.ptr, replay_backed[0].content.?.ptr);
     try std.testing.expect(replay_backed[0].tool_result_memory.?.output_handle == null);
     try std.testing.expect(replay_backed[0].tool_result_memory.?.truncated);
+
+    var complete_without_store = [_]types.ChatMessage{.{
+        .role = .tool,
+        .content = "complete no-save result",
+        .tool_call_id = "call-no-save",
+        .tool_name = "shell",
+        .tool_result_memory = .{
+            .output_bytes = 23,
+            .stored_output_bytes = 23,
+            .truncated = false,
+        },
+    }};
+    try promoteMessageResults(alloc, &complete_without_store, .unavailable, 0);
+    try std.testing.expectEqualStrings(
+        "complete no-save result",
+        complete_without_store[0].content.?,
+    );
+    try std.testing.expect(
+        complete_without_store[0].tool_result_memory.?.output_handle == null,
+    );
 }

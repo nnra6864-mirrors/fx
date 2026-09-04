@@ -288,38 +288,6 @@ async function waitForPersistedSessionMarker(
   }, `persisted session marker ${marker}`, timeout);
 }
 
-async function waitForCommittedSessionMarker(
-  home: string,
-  marker: string,
-  timeout = TIMEOUT,
-): Promise<void> {
-  const sessionsDir = join(home, ".fx", "sessions");
-  await waitForCondition(() => {
-    if (!existsSync(sessionsDir)) return false;
-    return readdirSync(sessionsDir, { withFileTypes: true })
-      .filter((entry) => entry.name !== "latest" && entry.isDirectory())
-      .some((entry) => {
-        const sessionDir = join(sessionsDir, entry.name);
-        const eventsPath = join(sessionDir, "events.jsonl");
-        if (!existsSync(eventsPath) || !readFileSync(eventsPath, "utf8").includes(marker)) {
-          return false;
-        }
-        const watermarkName = readdirSync(sessionDir).find(
-          (name) => name.startsWith("commit.") && name.endsWith(".json"),
-        );
-        if (!watermarkName) return false;
-        try {
-          const watermark = JSON.parse(
-            readFileSync(join(sessionDir, watermarkName), "utf8"),
-          ) as { through_event_log_bytes?: number };
-          return watermark.through_event_log_bytes === statSync(eventsPath).size;
-        } catch {
-          return false;
-        }
-      });
-  }, `committed session marker ${marker}`, timeout);
-}
-
 async function waitForSessionPicker(session: TmuxSession): Promise<string> {
   return session.waitForPane(
     (pane) => {
@@ -745,6 +713,115 @@ function expectExpandedCodeColors(scrollback: string): void {
   expect(scrollback).toContain("\x1b[38;5;252mdef\x1b[39m");
   expect(scrollback).toContain("\x1b[38;5;250m\"json_ready\"\x1b[39m");
 }
+
+test.skipIf(!tmuxAvailable())(
+  "resumed compaction handoffs stay internal after legacy conversion and restart",
+  async () => {
+    const root = mkdtempSync(join(tmpdir(), "fx-resume-internal-handoff-"));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const sessionId = "internal-handoff-resume";
+    const sessionDir = join(home, ".fx", "sessions", sessionId);
+    mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+    mkdirSync(workspace);
+    const summary = "<context_handoff>\n## Authoritative continuation state\n" +
+      Array.from({ length: 507 }, (_, i) =>
+        `- operation sequence=${i + 1} call_id=INTERNAL_CALL_${i} result_handle=INTERNAL_RESULT_${i}`
+      ).join("\n") +
+      "\n## Conversation summary\nINTERNAL_SUMMARY_ONLY\n</context_handoff>";
+    writeFileSync(join(sessionDir, "session.json"), JSON.stringify({
+      schema_version: 2, id: sessionId, created_at_ms: 1, updated_at_ms: 2,
+      workspace_root: realpathSync(workspace), conversation_language: "en",
+      history_len: 3, context_history_start: 1,
+      history: [
+        { kind: "assistant", user: { text: "ARCHIVED_VISIBLE_REQUEST", images: [] }, assistant: "ARCHIVED_VISIBLE_REPLY" },
+        { kind: "compacted_summary", summary, removed_turn_count: 1, compaction_count: 1 },
+        {
+          kind: "assistant", user: { text: "RECENT_VISIBLE_REQUEST", images: [] }, assistant: "RECENT_VISIBLE_REPLY",
+          execution: {
+            schema_version: 2,
+            tool_steps: [{
+              assistant: null,
+              tool_calls: [{ id: "past-read", name: "read_file", arguments_json: '{"path":"previous.txt"}', provider_result: null }],
+              tool_results: [{
+                tool_call_id: "past-read", tool_name: "read_file", status: "success",
+                output: "VISIBLE_TOOL_RESULT", output_handle: null, preview: null,
+                output_bytes: 19, stored_output_bytes: 19, truncated: false,
+                provider_native: false, created_at_ms: 2, permission_feedback: [],
+              }],
+            }], files: [], steering: [],
+          },
+        },
+      ],
+      total_input_tokens: 0, total_output_tokens: 0,
+    }) + "\n", { mode: 0o600 });
+    const gateway = startFakeGateway([
+      fakeGatewayFinalText("FIRST_CONTINUATION_OK"),
+      fakeGatewayFinalText("SECOND_CONTINUATION_OK"),
+    ]);
+    let active: TmuxSession | null = null;
+    const expectInternal = (text: string) => {
+      for (const marker of ["context_handoff", "Authoritative continuation state", "operation sequence=", "INTERNAL_", "Recent conversation turns are preserved verbatim"]) {
+        expect(text).not.toContain(marker);
+      }
+    };
+    try {
+      for (const [index, mode] of ["startup", "picker"].entries()) {
+        const stderrPath = join(root, `${mode}.stderr`);
+        const tapePath = join(root, `${mode}.fxtape`);
+        active = await TmuxSession.create({
+          cmd: mode === "startup" ? `${FX_BIN} --resume ${sessionId}` : FX_BIN,
+          cwd: realpathSync(workspace),
+          env: { ...gatewayEnv(home, gateway), FX_RECORD: tapePath },
+          stderrPath,
+        });
+        await active.waitForComposer(TIMEOUT);
+        if (mode === "picker") {
+          await active.sendText("/resume");
+          await waitForSessionPicker(active);
+          await active.sendKeys("Enter");
+        }
+        const resumed = await waitForScrollback(active, "RECENT_VISIBLE_REPLY");
+        expect(resumed).toContain("RECENT_VISIBLE_REQUEST");
+        expect(resumed).toContain("Read previous.txt");
+        expectInternal(resumed);
+
+        await active.sendKeys("C-o");
+        await active.waitForText("┃ Full detail · ctrl o close", TIMEOUT);
+        const full = await collectFullTranscriptPages(active, 40);
+        expect(full).toContain("ARCHIVED_VISIBLE_REPLY");
+        expect(full).toContain("VISIBLE_TOOL_RESULT");
+        expectInternal(full);
+        await active.sendKeys("C-o");
+        await active.waitForComposer(TIMEOUT);
+
+        await active.sendText("Continue without using tools.");
+        const answer = index === 0 ? "FIRST_CONTINUATION_OK" : "SECOND_CONTINUATION_OK";
+        expectInternal(await waitForScrollback(active, answer));
+        await active.sendText("/quit");
+        expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+        active = null;
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        expect(gateway.requests).toHaveLength(index + 1);
+        expect(gateway.requests[index]!.body).toContain("INTERNAL_SUMMARY_ONLY");
+        expect(gateway.requests[index]!.body).toContain("INTERNAL_CALL_506");
+        const events = readFileSync(join(sessionDir, "events.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+        expect(events.filter((event) => event.event.context_checkpoint).map((event) => event.event.context_checkpoint.summary)).toEqual([summary]);
+        expect(JSON.parse(readFileSync(join(sessionDir, "session.json"), "utf8")).schema_version).toBe(4);
+        const replay = await runFx(["replay", tapePath, "--frames"], { cwd: workspace, env: { HOME: home } });
+        expect(replay.code).toBe(0);
+        expect(replay.stderr).toBe("");
+        expect(replay.stdout).toContain("RECENT_VISIBLE_REPLY");
+        expectInternal(replay.stdout);
+      }
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  180_000,
+);
 
 function expectNoRawToolReplay(scrollback: string): void {
   expect(scrollback).not.toContain("Previous tool execution");
@@ -4721,15 +4798,6 @@ test.skipIf(!tmuxAvailable())(
       expect(readFileSync(stderrPath, "utf8")).not.toContain("AnsiBandOverflow");
 
       const sessionId = sessionIdFromHome(home);
-      const resumeViewPath = join(
-        home,
-        ".fx",
-        "sessions",
-        sessionId,
-        "resume-view.bin",
-      );
-      expect(existsSync(resumeViewPath)).toBe(true);
-      const initialResumeView = readFileSync(resumeViewPath);
 
       const pickerGateway = startFakeGateway([]);
       gateways.push(pickerGateway);
@@ -4757,7 +4825,6 @@ test.skipIf(!tmuxAvailable())(
       await active.kill();
       active = null;
       expect(readFileSync(stderrPath, "utf8")).toBe("");
-      writeFileSync(resumeViewPath, initialResumeView);
 
       const invocations = [
         ["-c"],
@@ -4772,7 +4839,6 @@ test.skipIf(!tmuxAvailable())(
           index === 0 ? initialMarker : `resume follow-up ${index - 1}`;
         const followUp = `resume follow-up ${index}`;
         const tapePath = join(root, `startup-resume-${index}.fxtape`);
-        const tracePath = join(root, `startup-resume-${index}.trace.log`);
         const gateway = startFakeGateway([fakeGatewayFinalText(followUp)]);
         gateways.push(gateway);
         writeFileSync(stderrPath, "");
@@ -4782,8 +4848,6 @@ test.skipIf(!tmuxAvailable())(
           env: {
             ...gatewayEnv(home, gateway),
             FX_RECORD: tapePath,
-            FX_TRACE_LOG: tracePath,
-            FX_TRACE_SCOPES: "session",
           },
           stderrPath,
           width: args[0] === `--resume-${sessionId}` ? 42 : 100,
@@ -4801,10 +4865,6 @@ test.skipIf(!tmuxAvailable())(
         await active.kill();
         active = null;
         expect(readFileSync(stderrPath, "utf8")).toBe("");
-        const resumeTrace = readFileSync(tracePath, "utf8");
-        expect(resumeTrace).toMatch(
-          /event=resume_view_cache (?:outcome=painted freshness=exact|outcome=skipped freshness=(?:exact|older))/,
-        );
         const replay = await runFx(["replay", tapePath, "--frames"], {
           cwd: workspaceRoot,
           env: { HOME: home },
@@ -4818,9 +4878,6 @@ test.skipIf(!tmuxAvailable())(
             /Recording:|Session:|Run \/help for commands|auto ·/.test(frame),
           );
         expect(firstApplicationFrame).toContain(restoredMarker);
-        if (index === 0) {
-          writeFileSync(resumeViewPath, initialResumeView);
-        }
       }
 
       const markdownHome = join(root, "markdown-home");
@@ -5177,9 +5234,11 @@ test.skipIf(!tmuxAvailable())(
       const resumed = await waitForScrollback(active, "UPGRADE_CTRL_G_INITIAL_DONE");
       expect(resumed).toContain("UPGRADE_CTRL_G_INITIAL_DONE");
       expect(resumed).toContain(updatedNotice);
-      expect(await active.capturePaneEscapes()).toContain(
-        `\x1b[4m\x1b]8;;https://fx.sh/changelog#v${version}\x1b\\(notes)\x1b]8;;\x1b\\`,
+      const noticeEscapes = await active.capturePaneEscapes();
+      expect(noticeEscapes).toContain(
+        `(\x1b[4m\x1b]8;;https://fx.sh/changelog#v${version}\x1b\\notes\x1b[0m`,
       );
+      expect(noticeEscapes).toContain("\x1b]8;;\x1b\\)");
       expect(resumed).not.toContain("● Session resumed:");
       expect(resumed).not.toContain("● Session: resumed:");
 
@@ -5208,95 +5267,6 @@ test.skipIf(!tmuxAvailable())(
         } catch {}
         await active.kill();
       }
-      release.stop();
-      gateway.stop();
-      rmSync(root, { recursive: true, force: true });
-    }
-  },
-  UPGRADE_TIMEOUT * 2,
-);
-
-test.skipIf(!tmuxAvailable())(
-  "upgrade ctrl-g repairs an exact corrupt boundary and resumes",
-  async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-corrupt-")));
-    const home = join(root, "home");
-    const workspace = join(root, "workspace");
-    const installDir = join(root, "install");
-    const stderrPath = join(root, "stderr.log");
-    const argvLogPath = join(root, "upgrade-argv.log");
-    mkdirSync(home);
-    mkdirSync(workspace);
-    mkdirSync(installDir);
-    const workspaceRoot = realpathSync(workspace);
-    const installedFx = join(installDir, "fx");
-    copyFileSync(FX_BIN, installedFx);
-    chmodSync(installedFx, 0o755);
-
-    let active: TmuxSession | null = null;
-    const gateway = startFakeGateway([
-      fakeGatewayFinalText("UPGRADE_CORRUPT_INITIAL_DONE"),
-      fakeGatewayFinalText("UPGRADE_CORRUPT_FOLLOWUP_DONE"),
-    ]);
-    const release = startUpgradeServer(root, argvLogPath);
-
-    try {
-      writeFileSync(stderrPath, "");
-      active = await TmuxSession.create({
-        cmd: shellQuote(installedFx),
-        cwd: workspaceRoot,
-        env: {
-          ...gatewayEnv(home, gateway),
-          FX_AUTO_UPGRADE: "1",
-          FX_E2E_UPGRADE_BASE_URL: release.baseUrl,
-        },
-        stderrPath,
-        width: 110,
-        height: 32,
-      });
-      await active.waitForComposer(TIMEOUT);
-      await active.sendText("Save this turn before the corrupt upgrade boundary.");
-      await active.waitForText("UPGRADE_CORRUPT_INITIAL_DONE", TIMEOUT);
-      await active.waitForComposer(TIMEOUT);
-      await waitForCommittedSessionMarker(home, "UPGRADE_CORRUPT_INITIAL_DONE");
-      const sessionId = sessionIdFromHome(home);
-      await active.waitForText(
-        "update ready: ctrl+g to reload",
-        UPGRADE_TIMEOUT,
-      );
-
-      const sessionDir = join(home, ".fx", "sessions", sessionId);
-      const watermarkName = readdirSync(sessionDir).find(
-        (name) => name.startsWith("commit.") && name.endsWith(".json"),
-      )!;
-      writeFileSync(join(sessionDir, watermarkName), "{}\n", { mode: 0o600 });
-      const version = (await runFx(["--version"])).stdout.trim();
-      await active.sendHexBytes(["07"]);
-
-      await active.waitForText(
-        `● fx has been updated to v${version} (notes)`,
-        TIMEOUT,
-      );
-      const resumed = await waitForScrollback(
-        active,
-        "UPGRADE_CORRUPT_INITIAL_DONE",
-      );
-      expect(resumed).toContain("UPGRADE_CORRUPT_INITIAL_DONE");
-      expect(active.isPaneAlive()).toBe(true);
-      const argvLines = readFileSync(argvLogPath, "utf8").trim().split("\n");
-      expect(argvLines).toEqual([
-        `${installedFx}\tresume\t${sessionId}\t--upgrade-relaunch`,
-      ]);
-
-      await active.sendText("Continue after repaired upgrade handoff.");
-      await active.waitForText("UPGRADE_CORRUPT_FOLLOWUP_DONE", TIMEOUT);
-
-      await active.sendText("/quit");
-      expect(await active.waitForSessionEnd()).toBe(true);
-      await active.kill();
-      active = null;
-    } finally {
-      if (active) await active.kill();
       release.stop();
       gateway.stop();
       rmSync(root, { recursive: true, force: true });

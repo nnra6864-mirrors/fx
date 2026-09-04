@@ -2295,6 +2295,73 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  test("non-object tool inputs remain failed and replay-safe across a mixed batch and model switch", async () => {
+    const root = createFixtureRoot("non-object-inputs");
+    const tracePath = join(root.root, "trace.log");
+    const inputs: unknown[] = [[], "[]", "[1]", "42", "null", "true", '"text"'];
+    const badCalls = inputs.map((input, index) => ({
+      type: "tool-call", toolCallId: `invalid_${index}`, toolName: "read_file", input,
+    }));
+    const invalidSubagent = { type: "tool-call", toolCallId: "invalid_subagent", toolName: "subagent", input: "[]" };
+    const responses = [
+      fakeGatewaySse([
+        ...badCalls,
+        invalidSubagent,
+        { type: "tool-call", toolCallId: "valid_write", toolName: "write_file", input: { path: "valid.txt", content: "written once\n" } },
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+      ]),
+      fakeGatewayFinalText("Rejected invalid calls and completed the valid write."),
+      fakeGatewayFinalText("Resumed safely with another model."),
+    ];
+    const gateway = startDynamicFakeGateway(
+      () => responses.shift() ?? new Response("unexpected request", { status: 500 }),
+      { classifierDecision: "clear", models: [MODEL, DEFAULT_MODEL].map((id) => ({ id, type: "language", tags: ["tool-use"] })) },
+    );
+    try {
+      const first = await runFx(["ask", "--json", "--auto", "Run the fixture batch."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "agent,core,gateway,stream,tool" },
+        timeoutMs: 20_000,
+      });
+      expect(first.code).toBe(0);
+      const firstJson = parseAskJson(first.stdout);
+      expect(firstJson.tool_calls.filter((call) => call.name === "read_file")).toEqual(
+        badCalls.map(() => ({ name: "read_file", status: "error" })),
+      );
+      expect(firstJson.tool_calls.filter((call) => call.name === "write_file")).toEqual([{ name: "write_file", status: "success" }]);
+      expect(firstJson.tool_calls.filter((call) => call.name === "subagent")).toEqual([{ name: "subagent", status: "error" }]);
+      expect(readFileSync(join(root.workspace, "valid.txt"), "utf8")).toBe("written once\n");
+      expect(readFileSync(tracePath, "utf8")).toContain("failure=non_object_json");
+      expect(first.stderr).not.toContain("Reading");
+      expect(gateway.requests).toHaveLength(2);
+
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", firstJson.session_id, "Continue."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, join(root.root, "resume.log")), FX_MODEL: DEFAULT_MODEL },
+        timeoutMs: 20_000,
+      });
+      expect(resumed.code).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(JSON.parse(resumed.stdout).model).toBe(DEFAULT_MODEL);
+      expect(parseAskJson(resumed.stdout).tool_calls).toEqual([]);
+      expect(gateway.requests).toHaveLength(3);
+      for (const request of gateway.requests.slice(1)) {
+        const prompt = parseGatewayRequest(request.body).prompt;
+        const parts = prompt.flatMap((message) => Array.isArray(message.content) ? message.content : []);
+        for (const call of [...badCalls, invalidSubagent]) {
+          expect(parts).toContainEqual({ type: "tool-call", toolCallId: call.toolCallId, toolName: call.toolName, input: {} });
+          expect(parts).toContainEqual(expect.objectContaining({
+            type: "tool-result", toolCallId: call.toolCallId, toolName: call.toolName,
+            output: expect.objectContaining({ type: "error-text", value: expect.stringContaining("not executed") }),
+          }));
+        }
+      }
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("default ask stops a consecutive malformed argument loop", async () => {
     const root = createFixtureRoot("repeated-malformed-arguments");
     const tracePath = join(root.root, "trace.log");
@@ -2570,6 +2637,22 @@ describe("gateway stream lifecycle", () => {
       expect(gateway.requests).toHaveLength(2);
       expect(readFileSync(firstPath, "utf8")).toBe("first\n");
       expect(readFileSync(secondPath, "utf8")).toBe("second\n");
+      const nextPrompt = parseGatewayRequest(gateway.requests[1]!.body).prompt;
+      const results = nextPrompt.filter((message) => message.role === "tool");
+      expect(results).toHaveLength(1);
+      expect(results[0]!.content).toEqual([
+        expect.objectContaining({
+          type: "tool-result",
+          toolCallId: "same_batch_write_a",
+          toolName: "write_file",
+        }),
+        expect.objectContaining({
+          type: "tool-result",
+          toolCallId: "same_batch_write_b",
+          toolName: "write_file",
+        }),
+      ]);
+      expect(parseAskJson(result.stdout).output).toContain("same-batch writes complete");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -2768,13 +2851,10 @@ describe("gateway stream lifecycle", () => {
         .trim()
         .split("\n")
         .filter(Boolean)
-        .map((line) => JSON.parse(line) as { kind: string });
-      expect(appendedEvents.map((event) => event.kind)).toContain(
-        "history_turn_committed",
-      );
-      expect(appendedEvents.map((event) => event.kind)).not.toContain(
-        "state_replacement_started",
-      );
+        .map((line) => JSON.parse(line) as { event: Record<string, unknown> });
+      const appendedKinds = appendedEvents.map((event) => Object.keys(event.event)[0]);
+      expect(appendedKinds).toContain("turn_completed");
+      expect(appendedKinds).not.toContain("state_replacement_started");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -4559,17 +4639,17 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       );
       writeFileSync(
         join(root.workspace, ".fx.json"),
-        JSON.stringify({ max_tool_result_bytes: 1024 }),
+        JSON.stringify({ max_tool_result_bytes: 16 * 1024 }),
       );
-      writeFileSync(join(root.workspace, "manual-compaction-inline.txt"), "inline result\n");
+      writeFileSync(join(root.workspace, "manual-compaction-inline.txt"), `inline result\n${"retained bytes ".repeat(600)}\nRETAINED_END\n`);
       const responses = [
         fakeGatewayToolCall(callId, "read_file", {
           path: "manual-compaction-large.txt",
         }),
+        fakeGatewayFinalText("FIRST_REPLY_COMPACTION_SENTINEL"),
         fakeGatewayToolCall(inlineCallId, "read_file", {
           path: "manual-compaction-inline.txt",
         }),
-        fakeGatewayFinalText("FIRST_REPLY_COMPACTION_SENTINEL"),
         fakeGatewayFinalText("SECOND_REPLY_COMPACTION_SENTINEL"),
         fakeGatewayFinalText(
           "Continue the compacted session. Preserve FIRST_PROMPT_COMPACTION_SENTINEL and SECOND_PROMPT_COMPACTION_SENTINEL.",
@@ -4634,6 +4714,14 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           },
         );
         expect(beforeResume.code).toBe(0);
+        const sessionsRoot = join(root.home, ".fx", "sessions");
+        const sessionFiles = readdirSync(join(sessionsRoot, sessionId));
+        expect(JSON.parse(readFileSync(join(sessionsRoot, sessionId, "session.json"), "utf8")).schema_version).toBe(4);
+        expect(sessionFiles).not.toContain("checkpoint.json");
+        expect(sessionFiles).not.toContain("display.json");
+        expect(sessionFiles).not.toContain("recovery.json");
+        expect(readdirSync(sessionsRoot)).not.toContain("index.json");
+        expect(readdirSync(sessionsRoot)).not.toContain("latest.lock");
         const canonical = JSON.parse(beforeResume.stdout) as {
           history_len: number;
           history: Array<{
@@ -4655,21 +4743,21 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(canonical.history.at(-1)?.summary).toContain(
           "Continue the compacted session.",
         );
-        const inlineSummary = canonical.history.at(-1)?.summary
-          ?.split("\n")
-          .find((line) => line.includes(`call_id="${inlineCallId}"`));
-        expect(inlineSummary).toContain("result_handle=");
-        expect(inlineSummary).toContain("truncated=true");
-
         expect(gateway.requests).toHaveLength(5);
         const compactRequest = JSON.parse(gateway.requests[4].body) as {
           tools?: unknown[];
           toolChoice?: { type?: string };
           responseFormat?: unknown;
+          prompt?: Array<{ role: string; content: unknown }>;
         };
         expect(compactRequest.tools).toEqual([]);
         expect(compactRequest.toolChoice).toEqual({ type: "none" });
         expect(compactRequest.responseFormat).toBeUndefined();
+        const compactSource = JSON.stringify(compactRequest.prompt);
+        expect(compactSource).toContain(callId);
+        expect(compactSource).not.toContain(inlineCallId);
+        expect(compactSource).toContain("Result handle:");
+        expect(gateway.requests[4].headers.get("ai-language-model-id")).toBe(MODEL);
 
         const resumed = await runFx(
           [
@@ -4702,8 +4790,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         );
         const requestText = JSON.stringify(request);
         expect(requestText).toContain("context_handoff");
-        expect(requestText).toContain("manual-compaction-large.txt");
+        expect(requestText).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
+        expect(requestText).toContain("SECOND_PROMPT_COMPACTION_SENTINEL");
         expect(requestText).not.toContain(bodySentinel);
+        const toolParts = (body: string) => (JSON.parse(body).prompt as Array<{ content: unknown }>)
+          .flatMap((message) => Array.isArray(message.content) ? message.content : [])
+          .filter((part) => part.toolCallId === inlineCallId);
+        const originalParts = toolParts(gateway.requests[3].body);
+        expect(originalParts.map((part) => part.type)).toEqual(["tool-call", "tool-result"]);
+        expect(toolParts(gateway.requests[5].body)).toEqual(originalParts);
+        expect(gateway.requests.map((entry) => entry.headers.get("ai-language-model-id"))).toEqual(Array(6).fill(MODEL));
         expect(readFileSync(stderrPath, "utf8")).toBe("");
 
         const afterResume = await runFx(
@@ -4735,8 +4831,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           stderrPath: resumedStderrPath,
         });
         await tui.waitForComposer(15_000);
+        const resumedTranscript = await tui.captureFullScrollback();
+        expect(resumedTranscript).toContain("compaction restart complete");
+        expect(resumedTranscript).not.toContain("context_handoff");
+        expect(resumedTranscript).not.toContain("Recent conversation turns are preserved verbatim");
         await tui.sendText("/compact");
         await tui.waitForText("Context compacted.", 15_000);
+        expect(await tui.captureFullScrollback()).not.toContain("context_handoff");
         await tui.sendText("/quit");
         await tui.waitForSessionEnd(15_000);
         tui = null;
@@ -4750,7 +4851,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         const secondCompactText = JSON.stringify(secondCompactRequest.prompt);
         expect(secondCompactText).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
         expect(secondCompactText).toContain("SECOND_PROMPT_COMPACTION_SENTINEL");
-        expect(secondCompactText).not.toContain("context_handoff");
+        expect(secondCompactText).toContain("context_handoff");
         expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
 
         const afterSecondCompact = await runFx(
@@ -4762,13 +4863,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           history: Array<{ kind: string; summary?: string }>;
         };
         const secondSummary = secondCanonical.history.at(-1)?.summary ?? "";
-        expect(secondSummary).toContain(callId);
-        expect(secondSummary).toContain(inlineCallId);
-        const secondInlineSummary = secondSummary
-          .split("\n")
-          .find((line) => line.includes(`call_id="${inlineCallId}"`));
-        expect(secondInlineSummary).toContain("result_handle=");
-        expect(secondInlineSummary).toContain("truncated=true");
+        expect(secondSummary).toContain("Second compaction preserved the restored session.");
+        expect(secondSummary).not.toContain("operation sequence");
       } finally {
         if (tui) await tui.kill();
         gateway.stop();
@@ -4958,11 +5054,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(before).not.toContain("tool_result_handle");
         expect(after).not.toContain("tool_result_handle");
         expect(compactionRequest).toContain("Read the explicit skill before compaction.");
-        expect(compactionRequest).not.toContain(bodySentinel);
-        expect(compactionRequest).not.toContain("<skill_content");
-        expect(compactionRequest).not.toContain("tool_result_handle");
+        expect(compactionRequest).toContain(bodySentinel);
+        expect(compactionRequest).toContain("<skill_content");
+        expect(compactionRequest).toContain("Result handle:");
         expect(postCompactionRequest).toContain("context_handoff");
-        expect(postCompactionRequest).toContain("result_handle=");
         expect(postCompactionRequest).not.toContain(bodySentinel);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
@@ -5330,7 +5425,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("HTTP 413 after a local tool surfaces prompt-too-long without replaying the tool", async () => {
+  test("HTTP 413 after a local tool fails capacity without replaying the tool", async () => {
     const root = createFixtureRoot("prompt-too-long-no-tool-replay");
     const tracePath = join(root.root, "trace.log");
     const sideEffectPath = join(root.workspace, "tool-side-effect.log");
@@ -5363,12 +5458,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         tool_calls: Array<{ name: string; status: string }>;
       };
       const serializedError = JSON.stringify(output);
-
       expect(result.code).toBe(1);
       expect(output.exit_code).toBe(1);
-      expect(serializedError).toContain("HTTP 413");
-      expect(serializedError).toContain("prompt_too_long=true");
-      expect(serializedError).toContain("no local tool actions were replayed");
+      expect(serializedError).toContain("ContextCapacityExceeded");
       expect(output.tool_calls).toHaveLength(1);
       expect(output.tool_calls[0]?.name).toBe("shell");
       expect(output.tool_calls[0]?.status).toBe("success");
@@ -6929,6 +7021,149 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(gateway.requestCount()).toBe(11);
       expect(gateway.requests[10]!.body).not.toContain(partialText);
       expectOnlyLeadingSystemMessages(gateway.requests[10]!.body);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("tool call ids remain canonical in storage and portable on model switch", async () => {
+    const root = createFixtureRoot("portable-call-ids");
+    const tracePath = join(root.root, "trace.log");
+    const ids = ["functions.read_file:0", "c".repeat(256), "call_keep"];
+    writeFileSync(join(root.workspace, "fixture.txt"), "id projection fixture\n");
+    const responses = [
+      fakeGatewaySse([
+        ...ids.map((id) => ({ type: "tool-call", toolCallId: id, toolName: "read_file", input: { path: "fixture.txt" } })),
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+      ]),
+      fakeGatewayFinalText("Read the fixture."),
+    ];
+    const gateway = startDynamicFakeGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 400 }),
+      { classifierDecision: "clear", models: [MODEL, DEFAULT_MODEL].map((id) => ({ id, type: "language", tags: ["tool-use"] })) },
+    );
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "Read fixture.txt."], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
+      });
+      expect(result.code).toBe(0);
+      expect(result.signal).toBeNull();
+      const json = parseAskJson(result.stdout);
+      expect(json.tool_calls).toEqual(ids.map(() => ({ name: "read_file", status: "success" })));
+      expect(gateway.requests).toHaveLength(2);
+      const firstParts = JSON.parse(gateway.requests[1]!.body).prompt.flatMap((message: { content: unknown }) => Array.isArray(message.content) ? message.content : []);
+      const wireIds = firstParts.filter((part: { type: string }) => part.type === "tool-call").map((part: { toolCallId: string }) => part.toolCallId);
+      expect(wireIds).toHaveLength(3);
+      expect(new Set(wireIds).size).toBe(3);
+      for (const id of wireIds) {
+        expect(id).toMatch(/^[a-zA-Z0-9_-]{1,64}$/);
+        expect(toolResultOutput(gateway.requests[1]!.body, id)).toContain("id projection fixture");
+      }
+      expect(wireIds[0]).not.toBe(ids[0]);
+      expect(wireIds[1]).not.toBe(ids[1]);
+      expect(wireIds[2]).toBe(ids[2]);
+      const detail = await runFx(["session", "--id", json.session_id, "--json"], {
+        cwd: root.workspace, env: { HOME: root.home },
+      });
+      expect(detail.code).toBe(0);
+      const step = JSON.parse(detail.stdout).history[0].execution.tool_steps[0];
+      expect(step.tool_calls.map((call: { id: string }) => call.id)).toEqual(ids);
+      expect(step.tool_results.map((result: { tool_call_id: string }) => result.tool_call_id)).toEqual(ids);
+
+      responses.push(fakeGatewayFinalText("Resumed without more tools."));
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", json.session_id, "What did you read?"], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, tracePath), FX_MODEL: DEFAULT_MODEL },
+        timeoutMs: 15_000,
+      });
+      expect(resumed.code).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(JSON.parse(resumed.stdout).model).toBe(DEFAULT_MODEL);
+      expect(parseAskJson(resumed.stdout).tool_calls).toEqual([]);
+      expect(gateway.requests).toHaveLength(3);
+      for (const id of wireIds) expect(toolResultOutput(gateway.requests[2]!.body, id)).toContain("id projection fixture");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("blank current tool id is rejected before file execution", async () => {
+    const root = createFixtureRoot("blank-call-id");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() => fakeGatewayToolCall(" \t", "write_file", {
+      path: "must-not-exist.txt", content: "unexpected effect",
+    }));
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Write the fixture file."], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
+      });
+      expect(result.code).toBe(1);
+      expect(result.stdout).toContain("MalformedAuthoritativeToolIdentity");
+      expect(parseAskJson(result.stdout).tool_calls).toEqual([]);
+      expect(gateway.requests).toHaveLength(1);
+      expect(existsSync(join(root.workspace, "must-not-exist.txt"))).toBe(false);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("silent-tool continuation omits blank assistant text and keeps settled results", async () => {
+    const root = createFixtureRoot("blank-continuation");
+    const tracePath = join(root.root, "trace.log");
+    writeFileSync(join(root.workspace, "fixture.txt"), "settled evidence\n");
+    const responses = [
+      fakeGatewayToolCall("read_1", "read_file", { path: "fixture.txt" }),
+      fakeGatewayToolCall("read_2", "read_file", { path: "fixture.txt" }),
+      fakeGatewayFinalText(" \t\r\n"),
+      fakeGatewayFinalText("Finished reading the fixture."),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 400 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "Read fixture.txt twice, then summarize it."],
+        { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000 },
+      );
+      expect(result.code).toBe(0);
+      expect(result.signal).toBeNull();
+      expect(result.stderr).toBe("Reading fixture.txt\nReading fixture.txt\n");
+      const json = parseAskJson(result.stdout);
+      expect(json.output).toContain("Finished reading the fixture.");
+      expect(json.tool_calls).toEqual([
+        { name: "read_file", status: "success" },
+        { name: "read_file", status: "success" },
+      ]);
+      expect(gateway.requests).toHaveLength(4);
+      const request = JSON.parse(gateway.requests[3]!.body);
+      const assistants = request.prompt.filter((message: { role: string }) => message.role === "assistant");
+      expect(assistants).toHaveLength(2);
+      expect(assistants.map((message: { content: Array<{ type: string; toolCallId: string }> }) => message.content.map((part) => [part.type, part.toolCallId])))
+        .toEqual([[["tool-call", "read_1"]], [["tool-call", "read_2"]]]);
+      expect(request.prompt.at(-1)).toEqual({
+        role: "user",
+        content: [{ type: "text", text: "Summarize what you just did." }],
+      });
+      for (const id of ["read_1", "read_2"]) {
+        expect(toolResultOutput(gateway.requests[3]!.body, id)).toContain("settled evidence");
+      }
+      responses.push(fakeGatewayFinalText("Resume complete."));
+      const resumed = await runFx(
+        ["ask", "--json", "--auto", "--resume-id", json.session_id, "What did you just read?"],
+        { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000 },
+      );
+      expect(resumed.code).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(parseAskJson(resumed.stdout).tool_calls).toEqual([]);
+      expect(gateway.requests).toHaveLength(5);
+      expect(gateway.requests[4]!.body).toContain("Finished reading the fixture.");
+      for (const id of ["read_1", "read_2"]) {
+        expect(toolResultOutput(gateway.requests[4]!.body, id)).toContain("settled evidence");
+      }
+      expect(readFileSync(tracePath, "utf8")).toContain("injecting continuation after 2 silent tool steps");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });

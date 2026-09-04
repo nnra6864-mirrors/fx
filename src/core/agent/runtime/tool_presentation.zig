@@ -166,8 +166,8 @@ pub const ProvisionalToolStatuses = struct {
         const call_id = self.visibleId(call) orelse return;
         const summary = try std.fmt.allocPrint(
             arena,
-            "{s} failed: invalid JSON arguments",
-            .{fallbackToolDisplay(hooks.tool_registry, call.name)},
+            "{s} failed: {s}",
+            .{ fallbackToolDisplay(hooks.tool_registry, call.name), if (call.argument_integrity == .non_object_json) "non-object arguments" else "invalid JSON arguments" },
         );
         try hooks.push_tool_lifecycle(hooks.ctx, .{
             .terminal = .{
@@ -1321,11 +1321,11 @@ fn commandArtifactHandle(
 pub fn malformedToolArgumentsResult(arena: Allocator, call: ToolCall) !ToolExecutionResult {
     return .{
         .status = .failure,
-        .model_output = try tool_result_errors.malformedToolArgumentsJson(
-            arena,
-            call.name,
-        ),
-        .status_detail = "invalid JSON arguments",
+        .model_output = if (call.argument_integrity == .non_object_json)
+            try tool_result_errors.nonObjectToolArgumentsJson(arena, call.name)
+        else
+            try tool_result_errors.malformedToolArgumentsJson(arena, call.name),
+        .status_detail = if (call.argument_integrity == .non_object_json) "non-object arguments" else "invalid JSON arguments",
     };
 }
 

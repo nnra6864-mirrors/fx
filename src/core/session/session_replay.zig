@@ -194,8 +194,47 @@ pub fn replayExactPosition(
     expected_seq: u64,
     expected_bytes: u64,
 ) !ExactReplay {
-    if (expected_bytes == 0 or
-        try file.length(io_mod.getIo()) != expected_bytes)
+    return replayPosition(
+        alloc,
+        file,
+        expected_generation,
+        expected_seq,
+        expected_bytes,
+        true,
+    );
+}
+
+/// Replays an explicitly committed prefix while ignoring later bytes. This is
+/// used only by the read-only legacy importer; current sessions never need a
+/// watermark or a generation boundary.
+pub fn replayCommittedPrefix(
+    alloc: Allocator,
+    file: std.Io.File,
+    expected_generation: Identifier,
+    expected_seq: u64,
+    expected_bytes: u64,
+) !ExactReplay {
+    return replayPosition(
+        alloc,
+        file,
+        expected_generation,
+        expected_seq,
+        expected_bytes,
+        false,
+    );
+}
+
+fn replayPosition(
+    alloc: Allocator,
+    file: std.Io.File,
+    expected_generation: Identifier,
+    expected_seq: u64,
+    expected_bytes: u64,
+    require_exact_length: bool,
+) !ExactReplay {
+    const file_bytes = try file.length(io_mod.getIo());
+    if (expected_bytes == 0 or file_bytes < expected_bytes or
+        (require_exact_length and file_bytes != expected_bytes))
     {
         return failExactReplay(error.InvalidSessionFormat);
     }
@@ -435,7 +474,7 @@ test "session replay parser honors exact copied boundary" {
     const generation: Identifier = .{0x10} ** 16;
     const first_id: Identifier = .{0x20} ** 16;
     const second_id: Identifier = .{0x30} ** 16;
-    const first = try session_event.encodeFrame(alloc, .{
+    const first = try session_event.encodeLegacyFixtureFrame(alloc, .{
         .log_generation = generation,
         .seq = 1,
         .event_id = first_id,
@@ -454,7 +493,7 @@ test "session replay parser honors exact copied boundary" {
         } },
     });
     defer alloc.free(first);
-    const second = try session_event.encodeFrame(alloc, .{
+    const second = try session_event.encodeLegacyFixtureFrame(alloc, .{
         .log_generation = generation,
         .seq = 2,
         .event_id = second_id,
@@ -487,6 +526,26 @@ test "session replay parser honors exact copied boundary" {
     defer state.deinit(alloc);
     try std.testing.expectEqualStrings("replay-boundary", state.id);
     try std.testing.expect(!state.preferences.fast_mode);
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        replayExactPosition(
+            alloc,
+            file,
+            generation,
+            copied.through_seq,
+            copied.through_event_log_bytes,
+        ),
+    );
+    var imported = try replayCommittedPrefix(
+        alloc,
+        file,
+        generation,
+        copied.through_seq,
+        copied.through_event_log_bytes,
+    );
+    defer imported.deinit(alloc);
+    try std.testing.expectEqualStrings("replay-boundary", imported.state.id);
+    try std.testing.expect(!imported.state.preferences.fast_mode);
 
     const complete = CommitPosition{
         .log_generation = generation,
@@ -625,7 +684,7 @@ test "session replay parser frees line allocation on every caller path" {
     const alloc = std.testing.allocator;
     const generation: Identifier = .{0x80} ** 16;
     const event_id: Identifier = .{0x90} ** 16;
-    const frame = try session_event.encodeFrame(alloc, .{
+    const frame = try session_event.encodeLegacyFixtureFrame(alloc, .{
         .log_generation = generation,
         .seq = 1,
         .event_id = event_id,

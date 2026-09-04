@@ -2407,27 +2407,6 @@ pub fn appendRawTranscriptEntryClassified(
     return entry_id;
 }
 
-pub fn releaseStartupResumeViewEntry(
-    self: anytype,
-    alloc: Allocator,
-    entry_id: u32,
-) !bool {
-    try self.assertCanMutateTranscript();
-    const entry_index = rawEntryIndex(self, entry_id) orelse return false;
-
-    var removed = self.entries.orderedRemove(entry_index);
-    errdefer {
-        self.entries.insertAssumeCapacity(entry_index, removed);
-    }
-
-    try rebuildTranscriptCacheFromEntries(self, alloc, "startup resume view release");
-    self.recomputeCursorFromTranscript();
-    requestTranscriptPaint(self);
-
-    removed.deinit(alloc);
-    return true;
-}
-
 pub fn updateRawBytesEntry(
     self: anytype,
     alloc: Allocator,

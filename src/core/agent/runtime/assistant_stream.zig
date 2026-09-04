@@ -178,7 +178,7 @@ pub const StreamChunkContext = struct {
         const candidate = if (self.raw_text.items.len > 0) self.raw_text.items else fallback;
         if (candidate.len == 0) return self.interrupted_source.items;
         const actual = response_language.evidence(candidate).script orelse return candidate;
-        return if (actual == self.response_language_expected.?) candidate else "";
+        return if (actual == self.response_language_expected.?) candidate else self.interrupted_source.items;
     }
 
     pub fn accept_staged_response_language(self: *StreamChunkContext) !void {
@@ -1184,6 +1184,45 @@ test "recovery starts a fresh response while retaining interrupted evidence" {
     try std.testing.expectEqualStrings("2. A complete replacement.", stream_ctx.interruption_source_or(""));
     try streamAssistantChunk(&stream_ctx, "2. A complete replacement.");
     try std.testing.expectEqualStrings("2. A complete replacement.", stream_ctx.accepted_source());
+}
+
+test "interruption source retains accepted preview until a valid replacement" {
+    const alloc = std.testing.allocator;
+    const prior = "The accepted English preview.";
+    const replacement = "The valid English replacement.";
+    const rejected = "我会先检查锁文件和依赖清单。";
+    const cases = [_]struct {
+        prior: []const u8,
+        candidate: []const u8,
+        interruption: []const u8,
+        accepted: []const u8,
+    }{
+        .{ .prior = prior, .candidate = rejected, .interruption = prior, .accepted = "" },
+        .{ .prior = "", .candidate = rejected, .interruption = "", .accepted = "" },
+        .{ .prior = prior, .candidate = "", .interruption = prior, .accepted = "" },
+        .{ .prior = prior, .candidate = replacement, .interruption = replacement, .accepted = replacement },
+    };
+
+    for (cases) |case| {
+        var capture = StreamCapture{};
+        defer capture.deinit(alloc);
+        var hook_set = capture.hooks();
+        hook_set.render_assistant_text = false;
+        var stream_ctx = StreamChunkContext{
+            .hooks = &hook_set,
+            .turn_id = 1,
+            .alloc = alloc,
+            .response_language_expected = .latin,
+        };
+        defer stream_ctx.deinit();
+        try stream_ctx.restoreRecoverySource(case.prior, true);
+        try stream_ctx.beginRecoveryAttempt();
+        try streamAssistantChunk(&stream_ctx, case.candidate);
+
+        try std.testing.expectEqualStrings(case.interruption, stream_ctx.interruption_source_or(""));
+        try std.testing.expectEqualStrings(case.accepted, stream_ctx.accepted_source());
+        try std.testing.expectEqual(@as(usize, if (case.accepted.len == 0) 0 else 1), capture.source_spans.items.len);
+    }
 }
 
 test "checkpoint recovery restarts Markdown without replaying an unfinished code fence" {

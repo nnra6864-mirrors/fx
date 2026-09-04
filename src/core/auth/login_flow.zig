@@ -524,7 +524,7 @@ pub const SignInRuntime = struct {
         }
         self.deps.save(self.deps.ctx, alloc, completion) catch |err| {
             debug_trace.logf("auth", "sign-in session save failed err={s}", .{@errorName(err)});
-            self.failure = if (err == error.OutOfMemory) err else error.CredentialPersistenceFailed;
+            self.failure = signInPersistenceError(err);
             self.state = .failed;
             return;
         };
@@ -633,6 +633,10 @@ fn saveSignIn(_: ?*anyopaque, alloc: Allocator, completion: SignInCompletion) !v
     try oauth_session.saveNewSession(alloc, session);
 }
 
+fn signInPersistenceError(err: anyerror) (Allocator.Error || error{CredentialPersistenceFailed}) {
+    return if (err == error.OutOfMemory) error.OutOfMemory else error.CredentialPersistenceFailed;
+}
+
 pub fn runLogin(
     alloc: Allocator,
     transport: oauth_transport.Provider,
@@ -678,7 +682,10 @@ pub fn runLogin(
     );
     defer session.deinit(alloc);
 
-    try oauth_session.saveNewSession(alloc, session);
+    oauth_session.saveNewSession(alloc, session) catch |err| {
+        debug_trace.logf("auth", "sign-in session save failed err={s}", .{@errorName(err)});
+        return signInPersistenceError(err);
+    };
 }
 
 fn take_login_session(

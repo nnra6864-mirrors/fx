@@ -3735,6 +3735,10 @@ test "bounded provider-executed results preserve raw typed status" {
 
 test "committed file result is appended before degraded secondary publication" {
     const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
     const preview_lines = [_]diff.PreviewLine{.{
         .op = .addition,
         .new_line = 1,
@@ -3786,8 +3790,10 @@ test "committed file result is appended before degraded secondary publication" {
     };
     hooks.fail_status_finished = true;
     var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.tool_result_dir = result_dir;
 
-    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expect(hooks.last_file_request_allocators_distinct);
     const execute_index = logIndex(&hooks, "execute:write_file") orelse
@@ -3809,6 +3815,9 @@ test "committed file result is appended before degraded secondary publication" {
         "\"role\":\"user\"",
         "Summarize the committed change.",
     });
+    const persisted = hooks.history_turns.items[0].assistant.execution
+        .tool_steps[0].tool_results[0];
+    try std.testing.expect(persisted.output_handle != null);
 }
 
 test "terminal publication failure deletes retained command replay" {

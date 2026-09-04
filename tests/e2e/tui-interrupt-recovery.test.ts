@@ -319,7 +319,13 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
         join(sessionRoot, sessionIds[0]!, "events.jsonl"),
         "utf8",
       );
-      expect(countOccurrences(events, '"kind":"interrupted"')).toBe(1);
+      const interruptedEvents = events
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as { event: Record<string, unknown> })
+        .filter((record) => record.event.interrupted !== undefined);
+      expect(interruptedEvents).toHaveLength(1);
       for (const chunk of PARTIAL_CHUNKS) {
         expect(events).toContain(chunk.trim());
       }

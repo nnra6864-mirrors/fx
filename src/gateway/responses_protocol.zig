@@ -4,6 +4,7 @@ const model_provider = @import("../core/config/model_provider.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const types = @import("../core/shared/types.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
+const tool_call_ids = @import("tool_call_ids.zig");
 
 pub const ReplayLimits = struct {
     tool_calls: usize,
@@ -19,6 +20,11 @@ pub fn writeInput(
     verified_images: ?[]const image_attachments.VerifiedSnapshot,
     limits: ReplayLimits,
 ) !void {
+    for (messages) |message| {
+        if (message.role == .assistant) try validateReplayMessage(alloc, message, limits);
+    }
+    var ids = try tool_call_ids.Projection.init(alloc, messages);
+    defer ids.deinit(alloc);
     var first = true;
     for (messages, 0..) |message, message_index| {
         switch (message.role) {
@@ -45,7 +51,6 @@ pub fn writeInput(
                 try writer.writeAll("]}");
             },
             .assistant => {
-                try validateReplayMessage(message, limits);
                 if (message.provider_state_json) |state_json| {
                     var state = std.json.parseFromSlice(std.json.Value, alloc, state_json, .{}) catch
                         return error.InvalidProviderState;
@@ -66,7 +71,7 @@ pub fn writeInput(
                 for (message.tool_calls) |call| {
                     try writeComma(writer, &first);
                     try writer.writeAll("{\"type\":\"function_call\",\"call_id\":");
-                    try std.json.Stringify.value(call.id, .{}, writer);
+                    try std.json.Stringify.value(ids.resolve(call.id), .{}, writer);
                     try writer.writeAll(",\"name\":");
                     try std.json.Stringify.value(call.name, .{}, writer);
                     try writer.writeAll(",\"arguments\":");
@@ -77,7 +82,7 @@ pub fn writeInput(
             .tool => {
                 try writeComma(writer, &first);
                 try writer.writeAll("{\"type\":\"function_call_output\",\"call_id\":");
-                try std.json.Stringify.value(message.tool_call_id orelse "", .{}, writer);
+                try std.json.Stringify.value(ids.resolve(message.tool_call_id orelse ""), .{}, writer);
                 try writer.writeAll(",\"output\":");
                 try std.json.Stringify.value(message.content orelse "", .{}, writer);
                 try writer.writeByte('}');
@@ -86,7 +91,74 @@ pub fn writeInput(
     }
 }
 
-fn validateReplayMessage(message: types.ChatMessage, limits: ReplayLimits) !void {
+test "Responses request projects long call ids with matching outputs" {
+    const source_id = "c" ** 65;
+    const calls = [_]types.ToolCall{.{ .id = source_id, .name = "read_file", .arguments_json = "{}" }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .tool_call_id = source_id, .tool_name = "read_file", .content = "result" },
+    };
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try out.writer.writeByte('[');
+    try writeInput(&out.writer, std.testing.allocator, &messages, null, .{ .tool_calls = 128, .tool_identity_bytes = 256, .tool_arguments_bytes = 4096, .provider_state_bytes = 4096 });
+    try out.writer.writeByte(']');
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+    const items = parsed.value.array.items;
+    const call_id = items[0].object.get("call_id").?.string;
+    try std.testing.expect(call_id.len <= 64);
+    try std.testing.expectEqualStrings(call_id, items[1].object.get("call_id").?.string);
+    try std.testing.expectEqualStrings(source_id, calls[0].id);
+    try std.testing.expectEqualStrings("result", items[1].object.get("output").?.string);
+}
+
+test "Responses request preserves opaque tool-call identity" {
+    const state = "[{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"opaque\",\"summary\":[]}]";
+    const calls = [_]types.ToolCall{.{ .id = "signed:0", .name = "read_file", .arguments_json = "{}" }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls, .provider_state_json = state },
+        .{ .role = .tool, .tool_call_id = "signed:0", .tool_name = "read_file", .content = "result" },
+    };
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try out.writer.writeByte('[');
+    try writeInput(&out.writer, std.testing.allocator, &messages, null, .{ .tool_calls = 128, .tool_identity_bytes = 256, .tool_arguments_bytes = 4096, .provider_state_bytes = 4096 });
+    try out.writer.writeByte(']');
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+    const items = parsed.value.array.items;
+    try std.testing.expectEqualStrings("opaque", items[0].object.get("encrypted_content").?.string);
+    try std.testing.expectEqualStrings("signed:0", items[1].object.get("call_id").?.string);
+    try std.testing.expectEqualStrings("signed:0", items[2].object.get("call_id").?.string);
+    try std.testing.expectEqualStrings(state, messages[0].provider_state_json.?);
+}
+
+test "non-object provider-owned arguments retain their Responses representation" {
+    const calls = [_]types.ToolCall{.{ .id = "native", .name = "native_tool", .arguments_json = "[]", .provenance = .provider_executed, .provider_result = "native result" }};
+    const messages = [_]types.ChatMessage{.{ .role = .assistant, .tool_calls = &calls }};
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeInput(&out.writer, std.testing.allocator, &messages, null, .{ .tool_calls = 128, .tool_identity_bytes = 256, .tool_arguments_bytes = 4096, .provider_state_bytes = 4096 });
+    try std.testing.expect(std.mem.find(u8, out.written(), "\"arguments\":\"[]\"") != null);
+}
+
+test "non-object function arguments cannot enter a Responses request" {
+    for ([_][]const u8{ "[]", "42", "null", "true", "\"text\"", "{]" }) |arguments| {
+        const calls = [_]types.ToolCall{.{ .id = "call", .name = "read_file", .arguments_json = arguments }};
+        const messages = [_]types.ChatMessage{.{ .role = .assistant, .tool_calls = &calls }};
+        var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        try std.testing.expectError(error.InvalidToolArguments, writeInput(&out.writer, std.testing.allocator, &messages, null, .{
+            .tool_calls = 128,
+            .tool_identity_bytes = 256,
+            .tool_arguments_bytes = 4096,
+            .provider_state_bytes = 4096,
+        }));
+    }
+}
+
+fn validateReplayMessage(alloc: std.mem.Allocator, message: types.ChatMessage, limits: ReplayLimits) !void {
     if (message.provider_state_json) |state_json| {
         if (state_json.len > limits.provider_state_bytes) return error.ProviderStateTooLarge;
     }
@@ -99,6 +171,11 @@ fn validateReplayMessage(message: types.ChatMessage, limits: ReplayLimits) !void
         }
         if (call.arguments_json.len > limits.tool_arguments_bytes) {
             return error.ToolArgumentsTooLarge;
+        }
+        if (call.provenance != .provider_executed and
+            try types.ToolArgumentIntegrity.classifyFunctionInput(alloc, call.arguments_json) != .valid)
+        {
+            return error.InvalidToolArguments;
         }
     }
 }

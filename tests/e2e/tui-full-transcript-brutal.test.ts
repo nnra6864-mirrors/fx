@@ -138,13 +138,9 @@ function committedAssistantOccurrences(home: string, assistant: string): number 
     for (const line of readFileSync(eventsPath, "utf8").split("\n")) {
       if (line.length === 0) continue;
       const event = JSON.parse(line) as {
-        kind?: string;
-        payload?: { turn?: { assistant?: string } };
+        event?: { assistant?: { text?: string } };
       };
-      if (
-        event.kind === "history_turn_committed" &&
-        event.payload?.turn?.assistant === assistant
-      ) {
+      if (event.event?.assistant?.text === assistant) {
         count += 1;
       }
     }

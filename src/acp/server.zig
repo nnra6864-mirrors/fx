@@ -7,7 +7,6 @@ const host_target = @import("../core/hosts/target.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const sessions = @import("sessions.zig");
-const session_test_controls = @import("session_test_controls.zig");
 const prompt_handler = @import("prompt.zig");
 const prompt_test_controls = @import("prompt_test_controls.zig");
 const app_lifecycle = @import("../core/app/app_lifecycle.zig");
@@ -707,22 +706,13 @@ pub fn disableSubagentHost(state: *ServerState) void {
 fn flushActiveSessionUsage(state: *ServerState) !void {
     const active = if (state.active_session) |*session| session else return;
     const writable = if (active.writable) |*value| value else return;
-    if (!writable.needsFinalStateReplacement(
-        active.session_rt.usage.isDirty(),
-    )) return;
+    if (!active.session_rt.usage.isDirty()) return;
 
-    var current = try writable.state.dupe(state.alloc);
-    defer current.deinit(state.alloc);
-    const history = try active.session_rt.snapshotHistory(state.alloc);
-    types.freeHistoryTurnSlice(state.alloc, current.history);
-    current.history = history;
-    const permission_state = try active.session_rt.snapshotPermissionState(state.alloc);
-    current.permission_state.deinit(state.alloc);
-    current.permission_state = permission_state;
-    current.conversation_language = active.session_rt.languageSnapshot();
     const usage_snapshot = try active.session_rt.usage.snapshot(state.alloc);
-    if (current.usage) |*old| old.deinit(state.alloc);
-    current.usage = usage_snapshot;
+    defer {
+        var owned = usage_snapshot;
+        owned.deinit(state.alloc);
+    }
     const store = if (active.store) |*value|
         value
     else
@@ -732,21 +722,16 @@ fn flushActiveSessionUsage(state: *ServerState) !void {
         writable,
         usage_snapshot,
     );
-    current.updated_at_ms = recovery_checkpoint.timestamp_ms;
-    _ = try writable.commitStateReplacement(
+    _ = try writable.appendEvent(
         state.alloc,
-        current,
-        .compaction,
-        .retry_expected_tail,
-        .{},
+        .{ .usage_checkpointed = .{ .usage = usage_snapshot } },
+        recovery_checkpoint.timestamp_ms,
     );
     try store.finishUsageRecoveryCheckpoint(
         writable.active_id,
         recovery_checkpoint,
     );
-    if (current.usage) |usage| {
-        active.session_rt.usage.markClean(usage);
-    }
+    active.session_rt.usage.markClean(usage_snapshot);
 }
 
 pub fn run(alloc: Allocator, cfg: Config) !void {
@@ -770,7 +755,7 @@ pub fn runWithTransport(
         .cfg = cfg,
         .writer = writer_value,
         .web_search_runtime = web_search_runtime.Runtime.init(.{
-            .provider = cfg.provider_set.gateway.fx_search.?,
+            .provider = cfg.provider_set.gateway.fx_search,
         }),
         .terminal_client = terminal_client_runtime.Runtime.init(
             cfg.process_provider,
@@ -2092,16 +2077,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             alloc,
             session,
             value,
-            session_test_controls.logOptions(),
         ) catch |err| {
-            if (modelCommitFailureTerminatesConnection(err)) {
-                try state.writer.writeError(alloc, msg.id, .{
-                    .code = ErrorCode.internal_error,
-                    .message = "Failed to persist session model",
-                });
-                state.terminate_connection = true;
-                return;
-            }
             return state.writer.writeError(alloc, msg.id, .{
                 .code = if (err == error.InvalidDurableField)
                     ErrorCode.invalid_params
@@ -2176,10 +2152,12 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     staged_credential.?.gatewayTeam(),
                     staged_credential.?.accountId(),
                 );
+            // Provider selection is independent of earlier prompt cancellation.
+            var catalog_cancel_flag = std.atomic.Value(bool).init(false);
             const fetched = try catalog_provider.fetch(alloc, .{
                 .access = access,
                 .endpoint = state.cfg.gateway_models_path,
-                .cancel_flag = &session.cancel_flag,
+                .cancel_flag = &catalog_cancel_flag,
                 .view = .picker,
             });
             var catalog = switch (fetched) {
@@ -2216,11 +2194,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 session,
                 target,
                 selected_model,
-                session_test_controls.logOptions(),
-            ) catch |err| {
-                if (modelCommitFailureTerminatesConnection(err)) {
-                    state.terminate_connection = true;
-                }
+            ) catch {
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.internal_error,
                     .message = "Failed to persist session provider",
@@ -2297,7 +2271,6 @@ fn commitActiveSessionProvider(
     session: *ActiveSessionState,
     provider: model_provider.ProviderId,
     model: []const u8,
-    options: session_log.Options,
 ) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -2314,8 +2287,6 @@ fn commitActiveSessionProvider(
             .model = @constCast(model),
         } },
         io_mod.milliTimestamp(),
-        .rollback_before_adapter_continue,
-        options,
     );
     alloc.free(session.model);
     session.model = staged_model;
@@ -2326,7 +2297,6 @@ fn commitActiveSessionModel(
     alloc: Allocator,
     session: *ActiveSessionState,
     value: []const u8,
-    options: session_log.Options,
 ) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -2339,7 +2309,6 @@ fn commitActiveSessionModel(
         writable,
         &session.model,
         value,
-        options,
     );
 }
 
@@ -2348,7 +2317,6 @@ fn commitSessionModel(
     writable: *session_store.LoadedWritableSession,
     active_model: *[]u8,
     value: []const u8,
-    options: session_log.Options,
 ) !void {
     const staged_model = try alloc.dupe(u8, value);
     errdefer alloc.free(staged_model);
@@ -2356,16 +2324,9 @@ fn commitSessionModel(
         alloc,
         .{ .preferences_changed = .{ .model = @constCast(value) } },
         io_mod.milliTimestamp(),
-        .rollback_before_adapter_continue,
-        options,
     );
     alloc.free(active_model.*);
     active_model.* = staged_model;
-}
-
-fn modelCommitFailureTerminatesConnection(err: anyerror) bool {
-    return err == error.SessionCommitIndeterminate or
-        err == error.SessionLogCompactionIndeterminate;
 }
 
 fn handleSetMode(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
@@ -2818,22 +2779,6 @@ test "ACP legacy URL state requires consent and completion" {
     removeLegacyUrl(&state, "acp-new");
 }
 
-const AcpModelBoundaryFailure = struct {
-    target: session_log.Boundary,
-
-    fn hit(raw: ?*anyopaque, point: session_log.Boundary) !void {
-        const self: *AcpModelBoundaryFailure = @ptrCast(@alignCast(raw.?));
-        if (point == self.target) return error.InjectedBoundaryFailure;
-    }
-
-    fn options(self: *AcpModelBoundaryFailure) session_log.Options {
-        return .{ .test_controls = .{
-            .context = self,
-            .boundary_fn = hit,
-        } };
-    }
-};
-
 fn acpModelTestState(
     alloc: Allocator,
     id: []const u8,
@@ -2866,114 +2811,6 @@ fn acpModelTestState(
     };
 }
 
-test "ACP model commit rolls back before later request can succeed" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
-    const workspace = try io_mod.dirRealpathAlloc(
-        alloc,
-        tmp.dir,
-        "workspace",
-    );
-    defer alloc.free(workspace);
-
-    var store = try session_store.Store.initFromHome(alloc, home, workspace);
-    defer store.deinit(alloc);
-    var state = try acpModelTestState(alloc, "acp-model-rollback", workspace);
-    defer state.deinit(alloc);
-    var writable = try store.startWritableSession(alloc, state);
-    defer writable.deinit(alloc);
-    var active_model = try alloc.dupe(u8, "old-model");
-    defer alloc.free(active_model);
-    var failure = AcpModelBoundaryFailure{ .target = .after_event_sync };
-
-    try std.testing.expectError(
-        error.SessionPersistenceDegraded,
-        commitSessionModel(
-            alloc,
-            &writable,
-            &active_model,
-            "rejected-model",
-            failure.options(),
-        ),
-    );
-    try std.testing.expectEqualStrings("old-model", active_model);
-    try std.testing.expectEqualStrings(
-        "old-model",
-        writable.state.preferences.model,
-    );
-    try std.testing.expect(writable.degradedTail() == null);
-
-    try commitSessionModel(
-        alloc,
-        &writable,
-        &active_model,
-        "accepted-model",
-        .{},
-    );
-    try std.testing.expectEqualStrings("accepted-model", active_model);
-    try std.testing.expectEqualStrings(
-        "accepted-model",
-        writable.state.preferences.model,
-    );
-}
-
-test "ACP indeterminate model commit leaves staged runtime value unapplied" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
-    const workspace = try io_mod.dirRealpathAlloc(
-        alloc,
-        tmp.dir,
-        "workspace",
-    );
-    defer alloc.free(workspace);
-
-    var store = try session_store.Store.initFromHome(alloc, home, workspace);
-    defer store.deinit(alloc);
-    var state = try acpModelTestState(
-        alloc,
-        "acp-model-indeterminate",
-        workspace,
-    );
-    defer state.deinit(alloc);
-    var writable = try store.startWritableSession(alloc, state);
-    defer writable.deinit(alloc);
-    var active_model = try alloc.dupe(u8, "old-model");
-    defer alloc.free(active_model);
-    var failure = AcpModelBoundaryFailure{
-        .target = .after_target_namespace_sync,
-    };
-
-    const result = commitSessionModel(
-        alloc,
-        &writable,
-        &active_model,
-        "uncertain-model",
-        failure.options(),
-    );
-    try std.testing.expectError(error.SessionCommitIndeterminate, result);
-    try std.testing.expectEqualStrings("old-model", active_model);
-    try std.testing.expect(
-        modelCommitFailureTerminatesConnection(
-            error.SessionCommitIndeterminate,
-        ),
-    );
-    try std.testing.expect(
-        modelCommitFailureTerminatesConnection(
-            error.SessionLogCompactionIndeterminate,
-        ),
-    );
-}
-
 test "ACP model commits honor the active session write boundary" {
     const alloc = std.testing.allocator;
     var active: ActiveSessionState = undefined;
@@ -2995,7 +2832,6 @@ test "ACP model commits honor the active session write boundary" {
                 self.alloc,
                 self.active,
                 "new-model",
-                .{},
             ) catch |err| {
                 self.failure = err;
             };
@@ -3142,19 +2978,16 @@ test "ACP usage flush preserves snapshot ownership on allocation failure" {
 
     var counting = std.testing.FailingAllocator.init(alloc, .{});
     {
-        var current = try state.active_session.?.writable.?.state.dupe(
+        var usage = try state.active_session.?.session_rt.usage.snapshot(
             counting.allocator(),
         );
-        defer current.deinit(counting.allocator());
-        const history = try state.active_session.?.session_rt.snapshotHistory(
-            counting.allocator(),
-        );
-        defer types.freeHistoryTurnSlice(counting.allocator(), history);
+        defer usage.deinit(counting.allocator());
     }
+    try std.testing.expect(counting.alloc_index > 0);
 
     var failing = std.testing.FailingAllocator.init(
         alloc,
-        .{ .fail_index = counting.alloc_index },
+        .{ .fail_index = counting.alloc_index - 1 },
     );
     state.alloc = failing.allocator();
     try std.testing.expectError(

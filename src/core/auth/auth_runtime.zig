@@ -1373,6 +1373,13 @@ pub const GatewayCredential = struct {
     source: credentials.Source,
 };
 
+pub const ProviderCredentialSelection = union(enum) {
+    unchanged,
+    selected,
+    missing,
+    failed: credentials.LoadFailure,
+};
+
 pub const Runtime = struct {
     const Self = @This();
 
@@ -2418,37 +2425,31 @@ pub const Runtime = struct {
         self: *Self,
         alloc: Allocator,
         provider: model_provider.ProviderId,
-    ) !?bool {
-        if (self.auth_mode == .host_managed) return false;
-        return switch (provider) {
-            .codex => if (self.credentialSource() == .chatgpt_subscription)
-                false
-            else
-                self.selectSourceWithLoader(
-                    alloc,
-                    .chatgpt_subscription,
-                    self,
-                    loadRuntimeCredentialSource,
-                ),
-            .grok => if (self.credentialSource() == .grok_subscription)
-                false
-            else
-                self.selectSourceWithLoader(
-                    alloc,
-                    .grok_subscription,
-                    self,
-                    loadRuntimeCredentialSource,
-                ),
-            .gateway => if (self.credentialSource() != .chatgpt_subscription and self.credentialSource() != .grok_subscription)
-                false
-            else
-                @as(?bool, try self.reselectByPrecedenceWithDeps(
-                    alloc,
-                    self,
-                    probeCredentialSource,
-                    loadRuntimeCredentialSource,
-                )),
+        preferred: ?credentials.Source,
+    ) Allocator.Error!ProviderCredentialSelection {
+        if (self.auth_mode == .host_managed or
+            model_provider.authorizesCredential(provider, self.credentialSource())) return .unchanged;
+
+        var resolution = credentials.resolveForProvider(
+            alloc,
+            self.oauth_transport,
+            self.secret_store,
+            .stored,
+            provider,
+            preferred,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return .{ .failed = .{
+                .source = requestedSource(provider, preferred) orelse .fx_login,
+                .err = err,
+            } };
         };
+        defer if (resolution.credential) |*credential| credential.deinit(alloc);
+        if (resolution.credential) |*credential| {
+            return if (self.adoptCredential(alloc, credential)) .selected else .unchanged;
+        }
+        if (resolution.failure) |failure| return .{ .failed = failure };
+        return .missing;
     }
 
     pub fn beginPromptCredentialRefresh(self: *Self) PromptCredentialRefreshStart {
@@ -3609,6 +3610,70 @@ test "auth runtime failed selection preserves the active credential" {
     );
     try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, runtime.credentialSource().?);
     try std.testing.expectEqualStrings("active-token", runtime.apiKey().?);
+}
+
+test "provider selection preserves failure provenance and prior authority until recovery" {
+    const FailedAllocation = struct {
+        fn load(_: ?*anyopaque, _: Allocator) host.SecretStoreLoadError!?[]u8 {
+            return error.OutOfMemory;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var fixture: ApiKeySaveFixture = .{ .fail_load = true };
+    var runtime: Runtime = .{ .secret_store = fixture.secretStore() };
+    defer runtime.deinit(alloc);
+    var previous = try makeTestCredential(alloc, "previous-token", .grok_subscription, null, null);
+    defer previous.deinit(alloc);
+    _ = runtime.adoptCredential(alloc, &previous);
+
+    switch (try runtime.selectForProvider(alloc, .gateway, .stored_key)) {
+        .failed => |failure| {
+            try std.testing.expectEqual(credentials.Source.stored_key, failure.source);
+            try std.testing.expectEqual(error.StoredKeyUnreadable, failure.err);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(credentials.Source.grok_subscription, runtime.credentialSource().?);
+    try std.testing.expectEqualStrings("previous-token", runtime.selected_credential.?.token);
+
+    runtime.secret_store = host.unavailable_secret_store;
+    try std.testing.expectEqual(ProviderCredentialSelection.missing, try runtime.selectForProvider(alloc, .gateway, .stored_key));
+    try std.testing.expectEqual(credentials.Source.grok_subscription, runtime.credentialSource().?);
+    runtime.secret_store.load_fn = FailedAllocation.load;
+    try std.testing.expectError(error.OutOfMemory, runtime.selectForProvider(alloc, .gateway, .stored_key));
+    try std.testing.expectEqualStrings("previous-token", runtime.selected_credential.?.token);
+
+    fixture.fail_load = false;
+    runtime.secret_store = fixture.secretStore();
+    try std.testing.expectEqual(ProviderCredentialSelection.selected, try runtime.selectForProvider(alloc, .gateway, .stored_key));
+    try std.testing.expectEqual(credentials.Source.stored_key, runtime.credentialSource().?);
+    try std.testing.expectEqualStrings("loaded-key", runtime.selected_credential.?.token);
+}
+
+test "provider selection leaves compatible expired credentials for deferred refresh" {
+    const alloc = std.testing.allocator;
+    var fixture: ApiKeySaveFixture = .{ .fail_load = true };
+    var runtime: Runtime = .{ .secret_store = fixture.secretStore() };
+    defer runtime.deinit(alloc);
+    var credential = try makeTestCredential(alloc, "expired-token", .fx_login, "team_1", null);
+    defer credential.deinit(alloc);
+    credential.refresh_after_ms = 0;
+    _ = runtime.adoptCredential(alloc, &credential);
+
+    try std.testing.expectEqual(ProviderCredentialSelection.unchanged, try runtime.selectForProvider(alloc, .gateway, .stored_key));
+    try std.testing.expectEqual(@as(usize, 0), fixture.load_calls);
+    try std.testing.expectEqual(@as(?i64, 0), runtime.selected_credential.?.refresh_after_ms);
+}
+
+test "host-managed provider selection never reads local credentials" {
+    const alloc = std.testing.allocator;
+    var fixture: ApiKeySaveFixture = .{ .fail_load = true };
+    var runtime: Runtime = .{ .auth_mode = .host_managed, .secret_store = fixture.secretStore() };
+    defer runtime.deinit(alloc);
+    for ([_]model_provider.ProviderId{ .gateway, .codex, .grok }) |provider| {
+        try std.testing.expectEqual(ProviderCredentialSelection.unchanged, try runtime.selectForProvider(alloc, provider, .stored_key));
+    }
+    try std.testing.expectEqual(@as(usize, 0), fixture.load_calls);
 }
 
 const LogoutFixture = struct {
