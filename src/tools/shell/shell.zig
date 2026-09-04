@@ -729,6 +729,7 @@ fn callTtyRun(
     const request = terminal_contracts.ActionRequest{ .start = .{
         .cwd = cwd,
         .command = command,
+        .agent_model = ctx.agent_model,
         .shell = shell,
         .backend = .native,
         .return_when = if (input.yield_time_ms == 0) .started else .exit,

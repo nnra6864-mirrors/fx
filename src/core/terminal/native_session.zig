@@ -1866,6 +1866,7 @@ const Session = struct {
             executable,
             paths.marker_socket,
             &nonce,
+            request.agent_model,
             command_path,
         );
         defer self.alloc.free(bootstrap);
@@ -2208,6 +2209,7 @@ const Session = struct {
             executable,
             control_path,
             &nonce,
+            request.agent_model,
             command_path,
         );
         defer self.alloc.free(bootstrap);
