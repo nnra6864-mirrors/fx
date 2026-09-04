@@ -756,16 +756,16 @@ const protocolFixtureDefinitions = {
     capabilities: 3,
   },
   previous: {
-    range: { minimum: 3, current: 4 },
-    capabilities: 3,
+    range: { minimum: 4, current: 5 },
+    capabilities: 31,
   },
   signal_limited: {
     range: { minimum: 4, current: 5 },
-    capabilities: 15,
+    capabilities: 47,
   },
   current_checkpoint: {
     range: { minimum: 4, current: 5 },
-    capabilities: 31,
+    capabilities: 63,
   },
 } as const;
 
@@ -7579,7 +7579,7 @@ test("protocol fixtures advertise exact evidence and interoperate in both direct
     const paths = hostPaths(home);
     const host = startHostWithAdvertisedProtocol(
       home,
-      300,
+      2_000,
       protocolFixtureEnv(previous),
     );
     await waitFor(() => existsSync(paths.socket) && existsSync(paths.identity));
@@ -7613,7 +7613,7 @@ test("protocol fixtures advertise exact evidence and interoperate in both direct
       previous.capabilities,
       previous.range.current,
     );
-    expect(connected.revision, direction).toBe(4);
+    expect(connected.revision, direction).toBe(5);
     const started = success(await requestAction(
       connected.client,
       connected.revision!,

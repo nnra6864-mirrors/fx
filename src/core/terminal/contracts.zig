@@ -19,8 +19,8 @@ pub const max_checkpoint_payload_bytes: usize = 64 * 1024 * 1024;
 pub const max_host_frame_bytes: usize = 1024 * 1024;
 pub const max_dimension: u16 = 4096;
 
-pub const current_protocol_revision: u16 = 6;
-pub const previous_protocol_revision: u16 = 5;
+pub const current_protocol_revision: u16 = 5;
+pub const previous_protocol_revision: u16 = 4;
 pub const oldest_hello_revision: u16 = 1;
 pub const compatibility_hello_revision: u16 = previous_protocol_revision - 1;
 
@@ -564,9 +564,7 @@ pub fn required_capabilities(request: ActionRequest) u64 {
     switch (request) {
         .start => |start| {
             required |= protocol_capability_complete_process_tree_signals;
-            if (start.agent_model.len > 0) {
-                required |= protocol_capability_agent_environment;
-            }
+            required |= protocol_capability_agent_environment;
             if (start.backend == .tmux) {
                 required |= protocol_capability_tmux_recovery;
             }
