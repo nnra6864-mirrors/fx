@@ -124,6 +124,7 @@ fn append_pending_steering_after_assistant(
     within_turn_suffix: *std.ArrayList(ChatMessage),
     turn_id: u64,
     assistant_text: []const u8,
+    provider_replay: ?types.ProviderReplay,
 ) !bool {
     const boundary = try take_steering_boundary(deps, arena, turn_id, .model);
     const guidance = switch (boundary) {
@@ -134,6 +135,7 @@ fn append_pending_steering_after_assistant(
     try within_turn_suffix.append(arena, .{
         .role = .assistant,
         .content = assistant_text,
+        .provider_replay = provider_replay,
     });
     try append_steering_guidance(arena, within_turn_suffix, guidance);
     return true;
@@ -1484,7 +1486,7 @@ test "shell request projection wraps eligible flat objects without changing sour
     calls[cases.len + 2] = .{ .id = "other-executor", .name = "browser_terminal", .arguments_json = "{}" };
     const messages = [_]ChatMessage{
         .{ .role = .user, .content = "keep user message", .tool_calls = calls[0..1] },
-        .{ .role = .assistant, .content = "assistant", .tool_calls = &calls, .provider_state_json = "[]" },
+        .{ .role = .assistant, .content = "assistant", .tool_calls = &calls, .provider_replay = .{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "[]" } },
         .{ .role = .tool, .content = "keep result", .tool_call_id = "valid-action", .tool_name = "shell" },
     };
 
@@ -1493,7 +1495,7 @@ test "shell request projection wraps eligible flat objects without changing sour
     try std.testing.expectEqualStrings("keep user message", projected[0].content.?);
     try std.testing.expect(messages[0].tool_calls.ptr != projected[0].tool_calls.ptr);
     try std.testing.expectEqualStrings("assistant", projected[1].content.?);
-    try std.testing.expectEqualStrings("[]", projected[1].provider_state_json.?);
+    try std.testing.expectEqualStrings("[]", projected[1].provider_replay.?.parts_json);
     try std.testing.expectEqualStrings("keep result", projected[2].content.?);
     for (cases, 0..) |case, index| {
         try std.testing.expectEqualStrings(case.expected, projected[1].tool_calls[index].arguments_json);
@@ -2545,6 +2547,7 @@ fn materializeConfirmedProviderTools(
     config: Config,
     turn_id: u64,
     completion: types.ModelCompletion,
+    selection: model_provider.ProviderSelection,
     advertised_dynamic_tool_names: []const []const u8,
     step_ctx: TraceContext,
     within_turn_suffix: *std.ArrayList(ChatMessage),
@@ -2577,7 +2580,7 @@ fn materializeConfirmedProviderTools(
         null,
         novel_calls,
         completion.assistant_phase,
-        completion.provider_state_json,
+        try deps.agent_stream_provider.projectReplay(arena, if (completion.provider_state_json) |parts| .{ .source = selection, .parts_json = parts } else null, novel_calls, false, true),
     );
     var batch: runtime_tool_batch.StepBatchState = .{};
     reportProviderExecutedUsage(deps, novel_calls);
@@ -3250,15 +3253,6 @@ noinline fn pausedRequiredAction(
         .inspect_uncertain_tool
     else
         .continue_later;
-}
-
-noinline fn recoveryCheckpointAssistantSource(
-    arena: Allocator,
-    stop_state: *const CommonStopState,
-    attempt_source: []const u8,
-) ![]const u8 {
-    const retained = stop_state.retained_candidate orelse return attempt_source;
-    return hooks.prompt.joinVisibleSegments(arena, retained, attempt_source);
 }
 
 fn persistRecoveryCheckpoint(
@@ -4087,15 +4081,12 @@ fn prepareSkillCatalog(
     context_window: ?u32,
 ) !?skill_runtime.BoundedPromptSection {
     if (config.skill_catalog.skills.len == 0 and config.skill_catalog.diagnostics.len == 0) return null;
-    var namespace_bytes: [8]u8 = undefined;
-    std.Io.random(io_mod.getIo(), &namespace_bytes);
     var section = try skill_runtime.buildSkillPrompt(
         alloc,
         config.skill_catalog.skills,
         config.skill_catalog.diagnostics,
         config.context_limits,
         context_window,
-        std.mem.readInt(u64, &namespace_bytes, .little),
     );
     errdefer section.deinit(alloc);
     if (section.notice) |notice| try deps.pushContextNotice(notice);
@@ -5412,11 +5403,7 @@ fn processQueuedPromptLoop(
                     arena,
                     job,
                     within_turn_suffix.items,
-                    try recoveryCheckpointAssistantSource(
-                        arena,
-                        stop_state,
-                        stream_ctx.interruption_source_or(""),
-                    ),
+                    stream_ctx.interruption_source_or(""),
                     gateway_model,
                     selected_fast_mode,
                     route_fast_mode,
@@ -5450,11 +5437,7 @@ fn processQueuedPromptLoop(
                     arena,
                     job,
                     within_turn_suffix.items,
-                    try recoveryCheckpointAssistantSource(
-                        arena,
-                        stop_state,
-                        stream_ctx.interruption_source_or(""),
-                    ),
+                    stream_ctx.interruption_source_or(""),
                     gateway_model,
                     selected_fast_mode,
                     route_fast_mode,
@@ -5961,11 +5944,7 @@ fn processQueuedPromptLoop(
                         arena,
                         job,
                         within_turn_suffix.items,
-                        try recoveryCheckpointAssistantSource(
-                            arena,
-                            stop_state,
-                            stream_ctx.interruption_source_or(""),
-                        ),
+                        stream_ctx.interruption_source_or(""),
                         gateway_model,
                         selected_fast_mode,
                         route_fast_mode,
@@ -6059,11 +6038,7 @@ fn processQueuedPromptLoop(
                     arena,
                     job,
                     within_turn_suffix.items,
-                    try recoveryCheckpointAssistantSource(
-                        arena,
-                        stop_state,
-                        stream_ctx.interruption_source_or(""),
-                    ),
+                    stream_ctx.interruption_source_or(""),
                     gateway_model,
                     selected_fast_mode,
                     route_fast_mode,
@@ -6102,11 +6077,7 @@ fn processQueuedPromptLoop(
                         arena,
                         job,
                         within_turn_suffix.items,
-                        try recoveryCheckpointAssistantSource(
-                            arena,
-                            stop_state,
-                            stream_ctx.interruption_source_or(""),
-                        ),
+                        stream_ctx.interruption_source_or(""),
                         gateway_model,
                         selected_fast_mode,
                         route_fast_mode,
@@ -6370,11 +6341,7 @@ fn processQueuedPromptLoop(
                     arena,
                     job,
                     within_turn_suffix.items,
-                    try recoveryCheckpointAssistantSource(
-                        arena,
-                        stop_state,
-                        stream_ctx.interruption_source_or(""),
-                    ),
+                    stream_ctx.interruption_source_or(""),
                     gateway_model,
                     selected_fast_mode,
                     route_fast_mode,
@@ -6448,6 +6415,7 @@ fn processQueuedPromptLoop(
                     config,
                     turn_id,
                     response_completion,
+                    .{ .provider = job.provider, .model = gateway_model },
                     advertised_dynamic_tool_names,
                     step_ctx,
                     &within_turn_suffix,
@@ -6464,11 +6432,7 @@ fn processQueuedPromptLoop(
                     arena,
                     job,
                     within_turn_suffix.items,
-                    try recoveryCheckpointAssistantSource(
-                        arena,
-                        stop_state,
-                        stream_ctx.interruption_source_or(response_completion.content orelse ""),
-                    ),
+                    stream_ctx.interruption_source_or(response_completion.content orelse ""),
                     gateway_model,
                     selected_fast_mode,
                     route_fast_mode,
@@ -6560,11 +6524,7 @@ fn processQueuedPromptLoop(
                         arena,
                         job,
                         within_turn_suffix.items,
-                        try recoveryCheckpointAssistantSource(
-                            arena,
-                            stop_state,
-                            stream_ctx.interruption_source_or(""),
-                        ),
+                        stream_ctx.interruption_source_or(""),
                         gateway_model,
                         selected_fast_mode,
                         route_fast_mode,
@@ -6601,11 +6561,7 @@ fn processQueuedPromptLoop(
                             arena,
                             job,
                             within_turn_suffix.items,
-                            try recoveryCheckpointAssistantSource(
-                                arena,
-                                stop_state,
-                                stream_ctx.interruption_source_or(""),
-                            ),
+                            stream_ctx.interruption_source_or(""),
                             gateway_model,
                             selected_fast_mode,
                             route_fast_mode,
@@ -6902,11 +6858,7 @@ fn processQueuedPromptLoop(
                         arena,
                         job,
                         within_turn_suffix.items,
-                        try recoveryCheckpointAssistantSource(
-                            arena,
-                            stop_state,
-                            partial_assistant,
-                        ),
+                        partial_assistant,
                         gateway_model,
                         selected_fast_mode,
                         route_fast_mode,
@@ -6942,11 +6894,7 @@ fn processQueuedPromptLoop(
                             arena,
                             job,
                             within_turn_suffix.items,
-                            try recoveryCheckpointAssistantSource(
-                                arena,
-                                stop_state,
-                                partial_assistant,
-                            ),
+                            partial_assistant,
                             gateway_model,
                             selected_fast_mode,
                             route_fast_mode,
@@ -7125,6 +7073,11 @@ fn processQueuedPromptLoop(
         defer if (stream_result_set) stream_result.deinit(arena);
 
         var completion = streamCompletion(stream_result);
+        const provider_replay: ?types.ProviderReplay = if (completion.provider_state_json) |parts| replay: {
+            // Later requests borrow these turn-arena bytes after response cleanup.
+            stream_result.completed.completion.provider_state_json = null;
+            break :replay .{ .source = .{ .provider = job.provider, .model = gateway_model }, .parts_json = parts };
+        } else null;
         if (successful_request_cost) |request_cost| {
             if (completion.usage.input_tokens) |exact_input_tokens| {
                 request_token_calibration = .{
@@ -7197,7 +7150,7 @@ fn processQueuedPromptLoop(
             try deps.push_http_error(deps.ctx, failureHttpStatus(failure.kind), http_detail, job.credential_source);
             if (stop_state.retained_candidate != null) {
                 stop_state.terminal_materializing = true;
-                const assistant_text = try hooks.prompt.joinVisibleSegments(
+                const assistant_text = try runtime_finalization.stopTerminalText(
                     arena,
                     stop_state.retained_candidate,
                     stop_state.latest_partial,
@@ -7214,6 +7167,7 @@ fn processQueuedPromptLoop(
                     null,
                     &finish_trace,
                     "http_error",
+                    null,
                 );
                 return;
             }
@@ -7226,11 +7180,12 @@ fn processQueuedPromptLoop(
                     job,
                     within_turn_suffix.items,
                     &summary_accumulator,
-                    partial_assistant,
+                    .{ .history = partial_assistant },
                     .failed,
                     null,
                     &finish_trace,
                     "http_error",
+                    null,
                 );
                 return;
             }
@@ -7456,6 +7411,10 @@ fn processQueuedPromptLoop(
         try runtime_telemetry.traceReturnedToolCalls(arena, step_ctx, completion.tool_calls);
         try runtime_assistant_stream.emitProviderLengthNotice(deps, arena, disposition);
         const terminal_provider_completion = isTerminalProviderExecutedCompletion(completion);
+        const final_provider_replay = if (terminal_provider_completion or filtered_provider_calls.removed > 0)
+            try deps.agent_stream_provider.projectReplay(arena, provider_replay, &.{}, true, !terminal_provider_completion)
+        else
+            provider_replay;
 
         if (disposition == .length_limited and completion.tool_calls.len > 0) {
             const assistant_text = try runtime_assistant_stream.finishLengthLimitedToolCallCompletion(deps, arena, completion, stream_ctx.raw_text.items.len);
@@ -7464,7 +7423,7 @@ fn processQueuedPromptLoop(
                 completion.tool_calls.len,
             });
             if (stop_state.retained_candidate != null) {
-                const persisted_text = try hooks.prompt.joinVisibleSegments(
+                const persisted_text = try runtime_finalization.stopTerminalText(
                     arena,
                     stop_state.retained_candidate,
                     assistant_text,
@@ -7482,6 +7441,7 @@ fn processQueuedPromptLoop(
                     .length_limited,
                     &finish_trace,
                     "provider_length",
+                    null,
                 );
                 return;
             }
@@ -7519,10 +7479,11 @@ fn processQueuedPromptLoop(
                     if (completion.content) |content| content.len else 0,
                     if (completion.provider_state_json != null) "true" else "false",
                 });
-                if (completion.provider_state_json) |state| {
+                if (provider_replay) |state| {
                     try within_turn_suffix.append(arena, .{
                         .role = .assistant,
-                        .provider_state_json = state,
+                        .content = completion.content,
+                        .provider_replay = state,
                     });
                 }
                 try within_turn_suffix.append(arena, .{ .role = .user, .content = continuation_prompt });
@@ -7532,10 +7493,8 @@ fn processQueuedPromptLoop(
             const raw_final = if (has_content) partial_assistant else "Done.";
             const final_text = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, raw_final);
             const rendered = if (final_text.len > 0) final_text else "Done.";
-            const history_text = runtime_assistant_stream.historyTextForCompletedStream(
-                raw_final,
-                rendered,
-            );
+            const history_text = try arena.dupe(u8, raw_final);
+            const history_replay = if (has_content) final_provider_replay else try deps.agent_stream_provider.projectReplay(arena, final_provider_replay, &.{}, false, true);
 
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
                 try append_pending_steering_after_assistant(
@@ -7544,6 +7503,7 @@ fn processQueuedPromptLoop(
                     &within_turn_suffix,
                     turn_id,
                     history_text,
+                    history_replay,
                 ))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
@@ -7556,7 +7516,7 @@ fn processQueuedPromptLoop(
                 }
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
 
-                const persisted_text = try hooks.prompt.joinVisibleSegments(
+                const persisted_text = try runtime_finalization.stopTerminalText(
                     arena,
                     stop_state.retained_candidate,
                     history_text,
@@ -7578,10 +7538,17 @@ fn processQueuedPromptLoop(
                         null,
                     &finish_trace,
                     "assistant",
+                    .{ .role = .assistant, .content = history_text, .provider_replay = history_replay },
                 );
                 return;
             }
 
+            try within_turn_suffix.append(arena, .{
+                .role = .assistant,
+                .content = history_text,
+                .provider_replay = history_replay,
+                .standalone_response = true,
+            });
             stop_state.retained_candidate = history_text;
             stop_state.latest_partial = null;
             if (!has_content) {
@@ -7606,7 +7573,7 @@ fn processQueuedPromptLoop(
                         arena,
                         &within_turn_suffix,
                         turn_id,
-                        history_text,
+                        "",
                     )) {
                         stop_state.retained_candidate = null;
                         stop_state.latest_partial = null;
@@ -7643,7 +7610,7 @@ fn processQueuedPromptLoop(
                         job,
                         within_turn_suffix.items,
                         &summary_accumulator,
-                        history_text,
+                        .{ .history = "", .presentation = history_text },
                         .completed,
                         if (disposition == .length_limited)
                             .length_limited
@@ -7651,14 +7618,11 @@ fn processQueuedPromptLoop(
                             null,
                         &finish_trace,
                         "assistant",
+                        null,
                     );
                     return;
                 },
                 .continue_once => |context| {
-                    try within_turn_suffix.append(arena, .{
-                        .role = .assistant,
-                        .content = history_text,
-                    });
                     const synthetic = try hooks.prompt.buildContinuationMessage(
                         arena,
                         context,
@@ -7783,7 +7747,7 @@ fn processQueuedPromptLoop(
             else
                 partial_assistant,
             .tool_calls = effective_tool_calls,
-            .provider_state_json = completion.provider_state_json,
+            .provider_replay = provider_replay,
         };
 
         var preparation_batch = tool_preparation.ReadyCallBatch.init(
@@ -8015,7 +7979,10 @@ fn processQueuedPromptLoop(
             if (terminal_provider_completion) null else completion.content,
             effective_tool_calls,
             completion.assistant_phase,
-            completion.provider_state_json,
+            if (terminal_provider_completion or filtered_provider_calls.removed > 0)
+                try deps.agent_stream_provider.projectReplay(arena, provider_replay, effective_tool_calls, !terminal_provider_completion, true)
+            else
+                provider_replay,
         );
 
         const step_has_content = !terminal_provider_completion and completion.content != null and completion.content.?.len > 0;
@@ -10052,14 +10019,14 @@ fn processQueuedPromptLoop(
                         try deps.push_system_notice(deps.ctx, notice);
                     }
                 }
-                const assistant_text = if (stop_state.retained_candidate != null)
+                const assistant_text: runtime_finalization.TerminalText = .{ .history = "", .presentation = if (stop_state.retained_candidate != null)
                     try hooks.prompt.joinVisibleSegments(
                         arena,
                         stop_state.retained_candidate,
                         stop_state.latest_partial,
                     )
                 else
-                    "";
+                    null };
                 stop_state.terminal_materializing = true;
                 try finishCommonAssistantTerminal(
                     deps,
@@ -10073,6 +10040,7 @@ fn processQueuedPromptLoop(
                     null,
                     &finish_trace,
                     "tool",
+                    null,
                 );
                 debug_trace.eventf("tool", "after_tool_execution", step_ctx, "call_id={s} name={s} result_kind=finish_turn model_output_bytes={d}", .{ tool_call.id, tool_call.name, safe_tool_output.len });
                 debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind=finish_turn model_output_bytes={d}", .{ tool_call.id, tool_call.name, safe_tool_output.len });
@@ -10177,14 +10145,14 @@ fn processQueuedPromptLoop(
                 deps.ctx,
                 repeated_terminal_validation_notice,
             );
-            const assistant_text = if (stop_state.retained_candidate != null)
+            const assistant_text: runtime_finalization.TerminalText = .{ .history = "", .presentation = if (stop_state.retained_candidate != null)
                 try hooks.prompt.joinVisibleSegments(
                     arena,
                     stop_state.retained_candidate,
                     stop_state.latest_partial,
                 )
             else
-                "";
+                null };
             stop_state.terminal_materializing = true;
             try finishCommonAssistantTerminal(
                 deps,
@@ -10198,6 +10166,7 @@ fn processQueuedPromptLoop(
                 null,
                 &finish_trace,
                 "terminal_validation_retry",
+                null,
             );
             return;
         }
@@ -10234,7 +10203,8 @@ fn processQueuedPromptLoop(
                     arena,
                     &within_turn_suffix,
                     turn_id,
-                    rendered,
+                    raw_final,
+                    final_provider_replay,
                 ))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
@@ -10244,11 +10214,8 @@ fn processQueuedPromptLoop(
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
 
-                const history_text = runtime_assistant_stream.historyTextForCompletedStream(
-                    stream_ctx.raw_text.items,
-                    rendered,
-                );
-                const persisted_text = try hooks.prompt.joinVisibleSegments(
+                const history_text = try arena.dupe(u8, raw_final);
+                const persisted_text = try runtime_finalization.stopTerminalText(
                     arena,
                     stop_state.retained_candidate,
                     history_text,
@@ -10267,11 +10234,19 @@ fn processQueuedPromptLoop(
                     null,
                     &finish_trace,
                     "assistant",
+                    .{ .role = .assistant, .content = partial_assistant, .provider_replay = final_provider_replay },
                 );
                 return;
             }
 
-            stop_state.retained_candidate = rendered;
+            const retained_final = try arena.dupe(u8, raw_final);
+            try within_turn_suffix.append(arena, .{
+                .role = .assistant,
+                .content = retained_final,
+                .provider_replay = final_provider_replay,
+                .standalone_response = true,
+            });
+            stop_state.retained_candidate = retained_final;
             stop_state.latest_partial = null;
             try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
 
@@ -10318,19 +10293,16 @@ fn processQueuedPromptLoop(
                         job,
                         within_turn_suffix.items,
                         &summary_accumulator,
-                        rendered,
+                        .{ .history = "", .presentation = retained_final },
                         .completed,
                         null,
                         &finish_trace,
                         "assistant",
+                        null,
                     );
                     return;
                 },
                 .continue_once => |context| {
-                    try within_turn_suffix.append(arena, .{
-                        .role = .assistant,
-                        .content = rendered,
-                    });
                     const synthetic = try hooks.prompt.buildContinuationMessage(
                         arena,
                         context,
@@ -10383,7 +10355,7 @@ fn finishFailedTurnWithNotice(
     try deps.push_text(deps.ctx, .{ .operational = notice });
     try deps.push_text(deps.ctx, .{ .operational = "\n" });
     if (stop_state.retained_candidate != null) {
-        const assistant_text = try hooks.prompt.joinVisibleSegments(
+        const assistant_text = try runtime_finalization.stopTerminalText(
             arena,
             stop_state.retained_candidate,
             notice,
@@ -10401,6 +10373,7 @@ fn finishFailedTurnWithNotice(
             null,
             finish_trace,
             trace_outcome,
+            null,
         );
         return;
     }
@@ -10430,27 +10403,43 @@ pub fn finishCommonAssistantTerminal(
     job: QueuedPrompt,
     current_turn_messages: []const ChatMessage,
     summary_accumulator: *runtime_telemetry.TurnSummaryAccumulator,
-    assistant_text: []const u8,
+    assistant_text: runtime_finalization.TerminalText,
     outcome: types.TurnPresentationOutcome,
     disposition: ?types.ProviderCompletionDisposition,
     finish_trace: *PromptFinishTrace,
     trace_outcome: []const u8,
+    assistant_response: ?ChatMessage,
 ) !void {
     const execution_memory = try runtime_execution_memory.buildExecutionMemory(
         arena,
         current_turn_messages,
     );
+    const history_text = assistant_text.history;
+    const presentation_text = if (assistant_text.presentation) |text|
+        if (std.mem.eql(u8, history_text, text)) null else text
+    else
+        null;
+    const replay = if (assistant_response) |response| try @import("../execution_memory.zig").dupeUnchangedProviderReplay(
+        arena,
+        response.provider_replay,
+        response.content,
+        history_text,
+        response.tool_calls,
+        &.{},
+    ) else null;
     try finishCommonAssistantTerminalWithExecution(
         deps,
         finalization,
         job,
         execution_memory,
         summary_accumulator,
-        assistant_text,
+        history_text,
         outcome,
         disposition,
         finish_trace,
         trace_outcome,
+        replay,
+        presentation_text,
     );
 }
 
@@ -10465,6 +10454,8 @@ fn finishCommonAssistantTerminalWithExecution(
     disposition: ?types.ProviderCompletionDisposition,
     finish_trace: *PromptFinishTrace,
     trace_outcome: []const u8,
+    replay: ?types.ProviderReplay,
+    presentation_text: ?[]const u8,
 ) !void {
     try runtime_finalization.finishAssistantTerminalWithExecution(
         deps,
@@ -10477,6 +10468,8 @@ fn finishCommonAssistantTerminalWithExecution(
         disposition,
         finish_trace,
         trace_outcome,
+        replay,
+        presentation_text,
     );
 }
 

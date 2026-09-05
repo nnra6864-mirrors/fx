@@ -47,14 +47,14 @@ pub fn appendAssistantToolCallStep(
     content: ?[]const u8,
     tool_calls: []const ToolCall,
     assistant_phase: ?types.AssistantMessagePhase,
-    provider_state_json: ?[]const u8,
+    provider_replay: ?types.ProviderReplay,
 ) !void {
     try within_turn_suffix.append(arena, .{
         .role = .assistant,
         .content = content,
         .tool_calls = tool_calls,
         .assistant_phase = assistant_phase,
-        .provider_state_json = provider_state_json,
+        .provider_replay = provider_replay,
     });
 }
 

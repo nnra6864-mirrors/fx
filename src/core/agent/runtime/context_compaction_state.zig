@@ -80,6 +80,20 @@ pub fn renderSemanticMessages(
     return out.toOwnedSlice() catch return error.OutOfMemory;
 }
 
+test "semantic compaction excludes private provider continuation" {
+    const alloc = std.testing.allocator;
+    const messages = [_]types.ChatMessage{.{
+        .role = .assistant,
+        .content = "visible fact",
+        .provider_replay = .{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "PRIVATE_REASONING_SENTINEL" },
+    }};
+    const text = try renderSemanticMessages(alloc, &messages);
+    defer alloc.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "visible fact") != null);
+    try std.testing.expect(std.mem.find(u8, text, "PRIVATE_REASONING_SENTINEL") == null);
+    try std.testing.expectEqualStrings("PRIVATE_REASONING_SENTINEL", messages[0].provider_replay.?.parts_json);
+}
+
 fn writeToolArguments(writer: *std.Io.Writer, arguments_json: []const u8) !void {
     if (arguments_json.len <= max_tool_argument_preview_bytes) {
         return writeQuotedLines(writer, arguments_json);

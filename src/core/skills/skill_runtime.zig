@@ -2961,7 +2961,7 @@ fn buildSkillsSystemPromptSectionWithLimits(
     all_skills: []const Skill,
     limits: context_limits.Values,
 ) !BoundedPromptSection {
-    return buildSkillPrompt(alloc, all_skills, &.{}, limits, null, 0);
+    return buildSkillPrompt(alloc, all_skills, &.{}, limits, null);
 }
 
 /// Borrows skill paths until the returned section is released.
@@ -2971,7 +2971,6 @@ pub fn buildSkillPrompt(
     diagnostics: []const SkillDiagnostic,
     limits: context_limits.Values,
     context_window: ?u32,
-    namespace: u64,
 ) !BoundedPromptSection {
     var visible: std.ArrayList(Skill) = .empty;
     defer visible.deinit(alloc);
@@ -2982,7 +2981,7 @@ pub fn buildSkillPrompt(
             !try tool_result_limits.modelProjectionPreservesText(identity_scratch.allocator(), skill.path)) continue;
         try visible.append(alloc, skill);
     }
-    var section = renderSkillPrompt(alloc, visible.items, limits, context_window, namespace) catch |err| {
+    var section = renderSkillPrompt(alloc, visible.items, limits, context_window, catalog_namespace(visible.items)) catch |err| {
         if (err == error.WriteFailed) return error.OutOfMemory;
         return err;
     };
@@ -3041,6 +3040,22 @@ const SkillPromptEntry = struct {
         alloc.free(self.suffix);
     }
 };
+
+fn catalog_namespace(skills: []const Skill) u64 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("fx-skill-locations");
+    for (skills) |skill| {
+        for ([_][]const u8{ skill.name, skill.path }) |value| {
+            var length: [8]u8 = undefined;
+            std.mem.writeInt(u64, &length, @intCast(value.len), .little);
+            hash.update(&length);
+            hash.update(value);
+        }
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hash.final(&digest);
+    return std.mem.readInt(u64, digest[0..8], .little);
+}
 
 fn renderSkillPrompt(
     alloc: Allocator,
@@ -4349,21 +4364,37 @@ test "skill catalog uses model capacity and preserves explicit byte overrides" {
         const name = try std.fmt.bufPrint(&storage[index], "entry-{d}", .{index});
         skill.* = .{ .name = name, .description = "useful instructions " ** 80, .path = name, .source = .global_fx };
     }
-    var unknown = try buildSkillPrompt(alloc, &skills, &.{}, .{}, null, 1);
+    var unknown = try buildSkillPrompt(alloc, &skills, &.{}, .{}, null);
     defer unknown.deinit(alloc);
-    var large = try buildSkillPrompt(alloc, &skills, &.{}, .{}, 200_000, 1);
+    var large = try buildSkillPrompt(alloc, &skills, &.{}, .{}, 200_000);
     defer large.deinit(alloc);
     try std.testing.expect(unknown.text.len <= 8000);
     try std.testing.expect(large.text.len > unknown.text.len);
     try std.testing.expect(large.text.len <= 16000);
     var limits = context_limits.Values{};
     limits.skill_catalog_bytes = .{ .value = .{ .bytes = 1600 }, .source = .user_global };
-    var small = try buildSkillPrompt(alloc, &skills, &.{}, limits, 200_000, 1);
+    var small = try buildSkillPrompt(alloc, &skills, &.{}, limits, 200_000);
     defer small.deinit(alloc);
-    var same = try buildSkillPrompt(alloc, &skills, &.{}, limits, 1_000_000, 1);
+    var same = try buildSkillPrompt(alloc, &skills, &.{}, limits, 1_000_000);
     defer same.deinit(alloc);
     try std.testing.expectEqualStrings(small.text, same.text);
     try std.testing.expect(small.text.len <= 1600);
+}
+
+test "skill catalog locations reject a changed identity mapping" {
+    const alloc = std.testing.allocator;
+    const first = [_]Skill{.{ .name = "review", .description = "Review", .path = "/first/review", .source = .global_fx }};
+    const changed = [_]Skill{.{ .name = "review", .description = "Review", .path = "/second/review", .source = .global_fx }};
+    var before = try buildSkillPrompt(alloc, &first, &.{}, .{}, null);
+    defer before.deinit(alloc);
+    var after = try buildSkillPrompt(alloc, &changed, &.{}, .{}, null);
+    defer after.deinit(alloc);
+    const location = try std.fmt.allocPrint(alloc, "skill:{x:0>16}:0/review", .{before.locations.namespace});
+    defer alloc.free(location);
+    const resolved = try before.locations.resolve(alloc, location);
+    defer alloc.free(resolved);
+    try std.testing.expectEqualStrings("/first/review", resolved);
+    try std.testing.expectError(error.StaleSkillLocation, after.locations.resolve(alloc, location));
 }
 
 test "skill catalog does not expose sensitive descriptions or encoded locations" {
@@ -4372,7 +4403,7 @@ test "skill catalog does not expose sensitive descriptions or encoded locations"
         .{ .name = "safe", .description = "Release checks. API_KEY=description-secret", .path = "/root/safe", .source = .global_fx },
         .{ .name = "hidden", .description = "Sensitive location", .path = "/root/TOKEN=location-secret", .source = .global_fx },
     };
-    var section = try buildSkillPrompt(alloc, &skills, &.{}, .{}, 200_000, 1);
+    var section = try buildSkillPrompt(alloc, &skills, &.{}, .{}, 200_000);
     defer section.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, section.text, "- safe:") != null);
     try std.testing.expect(std.mem.find(u8, section.text, "description-secret") == null);
@@ -4385,9 +4416,11 @@ fn checkSkillPromptAllocationFailures(alloc: Allocator) !void {
         .{ .name = "first", .description = "first instruction", .path = "/root-a/first", .source = .global_fx },
         .{ .name = "second", .description = "second instruction", .path = "/root-b/second", .source = .global_fx },
     };
-    var result = try buildSkillPrompt(alloc, &skills, &.{}, .{}, null, 19);
+    var result = try buildSkillPrompt(alloc, &skills, &.{}, .{}, null);
     defer result.deinit(alloc);
-    const path = try result.locations.resolve(alloc, "skill:0000000000000013:1/second");
+    const location = try std.fmt.allocPrint(alloc, "skill:{x:0>16}:1/second", .{result.locations.namespace});
+    defer alloc.free(location);
+    const path = try result.locations.resolve(alloc, location);
     defer alloc.free(path);
     try std.testing.expectEqualStrings("/root-b/second", path);
 }
@@ -4405,7 +4438,7 @@ test "skill catalog shortens descriptions before omitting identities" {
     };
     var limits = context_limits.Values{};
     limits.skill_catalog_bytes = .{ .value = .{ .bytes = 768 }, .source = .command_line };
-    var result = try buildSkillPrompt(alloc, &skills, &.{}, limits, null, 0);
+    var result = try buildSkillPrompt(alloc, &skills, &.{}, limits, null);
     defer result.deinit(alloc);
     for ([_][]const u8{ "alpha", "beta", "gamma" }) |name| {
         try std.testing.expect(std.mem.find(u8, result.text, name) != null);

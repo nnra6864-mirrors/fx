@@ -961,7 +961,7 @@ pub const TerminalActionPresentation = union(enum) {
 
 pub const deferred_tool_result_output = "Not executed";
 pub const context_deferred_tool_result_output = "Scoped project instructions were added before execution. Review them and reissue this tool call if it is still appropriate.";
-pub const context_deferred_tool_status_label = "Not run — project instructions changed:";
+pub const context_deferred_tool_status_label = "Reading project instructions before continuing:";
 
 pub fn isContextDeferredToolResult(result: PersistedToolResult) bool {
     return result.status == .failure and
@@ -1025,6 +1025,7 @@ pub const ToolExecutionStep = struct {
     assistant: ?[]u8 = null,
     tool_calls: []ToolCall = &.{},
     tool_results: []PersistedToolResult = &.{},
+    provider_replay: ?ProviderReplay = null,
 };
 
 pub const PersistedSteering = struct {
@@ -1112,12 +1113,34 @@ pub const UserTurn = struct {
     work_id: ?[]u8 = null,
 };
 
+/// Borrows both strings; use dupeProviderReplay/freeProviderReplay for ownership.
+pub const ProviderReplay = struct {
+    pub const max_bytes: usize = 4 * 1024 * 1024;
+    source: @import("../config/model_provider.zig").ProviderSelection,
+    parts_json: []const u8,
+
+    pub fn matches(self: ProviderReplay, source: @import("../config/model_provider.zig").ProviderSelection) bool {
+        return self.source.provider == source.provider and std.mem.eql(u8, self.source.model, source.model);
+    }
+};
+
+pub fn dupeProviderReplay(alloc: std.mem.Allocator, value: ProviderReplay) !ProviderReplay {
+    const model = try alloc.dupe(u8, value.source.model);
+    errdefer alloc.free(model);
+    const parts = try alloc.dupe(u8, value.parts_json);
+    return .{ .source = .{ .provider = value.source.provider, .model = model }, .parts_json = parts };
+}
+
+pub fn freeProviderReplay(alloc: std.mem.Allocator, value: ProviderReplay) void {
+    alloc.free(value.source.model);
+    alloc.free(value.parts_json);
+}
+
 /// Provider-returned phase for stateless assistant-message replay.
 pub const AssistantMessagePhase = enum {
     commentary,
     final_answer,
 };
-
 pub const ChatMessage = struct {
     role: ChatRole,
     content: ?[]const u8 = null,
@@ -1125,15 +1148,60 @@ pub const ChatMessage = struct {
     tool_call_id: ?[]const u8 = null,
     tool_name: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
-    /// Provider-owned opaque response items needed only for stateless within-turn continuation.
-    /// The value is a validated JSON array and is never sent across provider routes.
-    provider_state_json: ?[]const u8 = null,
+    provider_replay: ?ProviderReplay = null,
     /// Borrowed phase metadata for the same current-turn continuation.
     assistant_phase: ?AssistantMessagePhase = null,
     tool_result_status: ?PersistedToolStatus = null,
     tool_result_memory: ?ToolResultMemory = null,
     permission_feedback: bool = false,
+    standalone_response: bool = false,
 };
+
+/// Returns a caller-owned shallow projection only when incompatible replay exists.
+pub fn projectProviderReplay(
+    alloc: std.mem.Allocator,
+    messages: []const ChatMessage,
+    source: @import("../config/model_provider.zig").ProviderSelection,
+) !?[]ChatMessage {
+    var projected: ?[]ChatMessage = null;
+    errdefer if (projected) |owned| alloc.free(owned);
+    for (messages, 0..) |message, index| {
+        const replay = message.provider_replay orelse continue;
+        if (replay.matches(source)) continue;
+        if (projected == null) projected = try alloc.dupe(ChatMessage, messages);
+        projected.?[index].provider_replay = null;
+        projected.?[index].assistant_phase = null;
+    }
+    return projected;
+}
+
+test "provider replay projection preserves matching origin and excludes other routes" {
+    const alloc = std.testing.allocator;
+    const source = @import("../config/model_provider.zig").ProviderSelection{ .provider = .gateway, .model = "model" };
+    const messages = [_]ChatMessage{.{ .role = .assistant, .content = "answer", .provider_replay = .{ .source = source, .parts_json = "[]" } }};
+    try std.testing.expect(try projectProviderReplay(alloc, &messages, source) == null);
+    for ([_]@import("../config/model_provider.zig").ProviderSelection{
+        .{ .provider = .codex, .model = "model" },
+        .{ .provider = .grok, .model = "model" },
+        .{ .provider = .gateway, .model = "different" },
+    }) |other| {
+        const projected = (try projectProviderReplay(alloc, &messages, other)).?;
+        defer alloc.free(projected);
+        try std.testing.expect(projected[0].provider_replay == null);
+        try std.testing.expectEqualStrings("answer", projected[0].content.?);
+        try std.testing.expect(messages[0].provider_replay != null);
+        try std.testing.expect(try projectProviderReplay(alloc, projected, other) == null);
+    }
+    try std.testing.checkAllAllocationFailures(alloc, struct {
+        fn check(a: std.mem.Allocator) !void {
+            const input = [_]ChatMessage{.{ .role = .assistant, .provider_replay = .{ .source = .{ .provider = .gateway, .model = "model" }, .parts_json = "[]" } }};
+            const projected = (try projectProviderReplay(a, &input, .{ .provider = .codex, .model = "model" })).?;
+            defer a.free(projected);
+            const copy = try dupeProviderReplay(a, input[0].provider_replay.?);
+            defer freeProviderReplay(a, copy);
+        }
+    }.check, .{});
+}
 
 pub const Usage = struct {
     input_tokens: ?u64 = null,
@@ -1798,6 +1866,7 @@ pub const AssistantHistoryTurn = struct {
     user: UserTurn,
     assistant: []u8,
     execution: ExecutionMemory = .{},
+    provider_replay: ?ProviderReplay = null,
 };
 
 pub const InterruptedTerminalReason = enum {
@@ -1884,6 +1953,8 @@ pub const SnapshotFileOwnership = struct {
 
 pub const FinishedPrompt = struct {
     turn: HistoryTurn,
+    /// Owned display-only text; never serialized as conversation history.
+    presentation_text: ?[]const u8 = null,
     summary: ?TurnSummary = null,
     terminal_projection: FinishedPromptProjection = .history_default,
     terminal_outcome: ?TurnPresentationOutcome = null,
@@ -2111,6 +2182,7 @@ pub fn freeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) void {
         .assistant => |entry| {
             freeUserTurn(alloc, entry.user);
             alloc.free(entry.assistant);
+            if (entry.provider_replay) |replay| freeProviderReplay(alloc, replay);
             freeExecutionMemory(alloc, entry.execution);
         },
         .interrupted => |entry| {
@@ -2135,6 +2207,7 @@ pub fn freeHistoryTurnSlice(alloc: std.mem.Allocator, turns: []HistoryTurn) void
 
 pub fn freeFinishedPrompt(alloc: std.mem.Allocator, finished: FinishedPrompt) void {
     freeHistoryTurn(alloc, finished.turn);
+    if (finished.presentation_text) |text| alloc.free(text);
     if (finished.snapshot_file_ownership) |ownership| ownership.release();
 }
 
@@ -2170,10 +2243,13 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
             errdefer alloc.free(assistant);
 
             const execution = try dupeExecutionMemory(alloc, entry.execution);
+            errdefer freeExecutionMemory(alloc, execution);
+            const replay = if (entry.provider_replay) |value| try dupeProviderReplay(alloc, value) else null;
             break :blk .{ .assistant = .{
                 .user = user,
                 .assistant = assistant,
                 .execution = execution,
+                .provider_replay = replay,
             } };
         },
         .interrupted => |entry| blk: {
@@ -2240,9 +2316,12 @@ pub fn freeCancelledCommandPresentation(
 
 pub fn dupeFinishedPrompt(alloc: std.mem.Allocator, finished: FinishedPrompt) !FinishedPrompt {
     const turn = try dupeHistoryTurn(alloc, finished.turn);
+    errdefer freeHistoryTurn(alloc, turn);
+    const presentation_text = if (finished.presentation_text) |text| try alloc.dupe(u8, text) else null;
     if (finished.snapshot_file_ownership) |ownership| ownership.retain();
     return .{
         .turn = turn,
+        .presentation_text = presentation_text,
         .summary = finished.summary,
         .terminal_projection = finished.terminal_projection,
         .terminal_outcome = finished.terminal_outcome,
@@ -2365,9 +2444,11 @@ fn dupeToolExecutionStep(alloc: std.mem.Allocator, step: ToolExecutionStep) !Too
     errdefer freeToolCallSlice(alloc, tool_calls);
     const tool_results = try dupePersistedToolResults(alloc, step.tool_results);
     errdefer freePersistedToolResults(alloc, tool_results);
+    const replay = if (step.provider_replay) |value| try dupeProviderReplay(alloc, value) else null;
 
     return .{
         .assistant = assistant,
+        .provider_replay = replay,
         .tool_calls = tool_calls,
         .tool_results = tool_results,
     };
@@ -2375,6 +2456,7 @@ fn dupeToolExecutionStep(alloc: std.mem.Allocator, step: ToolExecutionStep) !Too
 
 fn freeToolExecutionStep(alloc: std.mem.Allocator, step: ToolExecutionStep) void {
     if (step.assistant) |assistant| alloc.free(assistant);
+    if (step.provider_replay) |replay| freeProviderReplay(alloc, replay);
     freeToolCallSlice(alloc, step.tool_calls);
     freePersistedToolResults(alloc, step.tool_results);
 }
@@ -3067,12 +3149,34 @@ test "HistoryTurn helpers duplicate and free owned turns" {
         } },
         .terminal_projection = .assistant_text,
         .terminal_outcome = .completed,
+        .presentation_text = try alloc.dupe(u8, "Earlier reply.\nI stopped here."),
     };
     const finished_copy = try dupeFinishedPrompt(alloc, finished_original);
     try std.testing.expectEqual(FinishedPromptProjection.assistant_text, finished_copy.terminal_projection);
     try std.testing.expectEqual(@as(?TurnPresentationOutcome, .completed), finished_copy.terminal_outcome);
+    try std.testing.expectEqualStrings(finished_original.presentation_text.?, finished_copy.presentation_text.?);
+    try std.testing.expect(finished_original.presentation_text.?.ptr != finished_copy.presentation_text.?.ptr);
     freeFinishedPrompt(alloc, finished_copy);
     freeFinishedPrompt(alloc, finished_original);
+}
+
+test "finished prompt presentation allocation failures preserve ownership" {
+    const Case = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const original: FinishedPrompt = .{
+                .turn = .{ .assistant = .{
+                    .user = .{ .text = @constCast("request") },
+                    .assistant = @constCast("current"),
+                } },
+                .presentation_text = "earlier\ncurrent",
+            };
+            const copy = try dupeFinishedPrompt(alloc, original);
+            defer freeFinishedPrompt(alloc, copy);
+            try std.testing.expectEqualStrings("current", copy.turn.assistant.assistant);
+            try std.testing.expectEqualStrings("earlier\ncurrent", copy.presentation_text.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
 test "TurnSummary carries shared turn token progress" {

@@ -6805,8 +6805,8 @@ test "execution replay preserves paired deferred tools without command output" {
         app.completed_tool_outcomes.items,
     );
     try std.testing.expectEqual(@as(usize, 3), app.completed_tool_statuses.items.len);
-    try std.testing.expectEqualStrings("● Not run — project instructions changed: read_file\n", app.completed_tool_statuses.items[0]);
-    try std.testing.expectEqualStrings("● Not run — project instructions changed: run_command\n", app.completed_tool_statuses.items[1]);
+    try std.testing.expectEqualStrings("● Reading project instructions before continuing: read_file\n", app.completed_tool_statuses.items[0]);
+    try std.testing.expectEqualStrings("● Reading project instructions before continuing: run_command\n", app.completed_tool_statuses.items[1]);
     try std.testing.expectEqualStrings("● Not executed read_file\n", app.completed_tool_statuses.items[2]);
     try std.testing.expectEqual(@as(usize, 3), app.historical_tool_detail_entry_ids.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);

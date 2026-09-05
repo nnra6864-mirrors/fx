@@ -469,6 +469,7 @@ pub const Reviewer = struct {
         // attachments are untrusted and do not identify the action.
         target_pending_assistant.images = &.{};
         target_pending_assistant.content = null;
+        target_pending_assistant.provider_replay = null;
         const instructions = [_]types.ChatMessage{.{ .role = .system, .content = instruction }};
         const messages = [_]types.ChatMessage{ user_message, target_pending_assistant };
 
@@ -2288,7 +2289,8 @@ test "automatic review excludes assistant preamble and images" {
                 std.mem.find(u8, payload, "command: printf safe") != null;
             self.excluded_preamble =
                 std.mem.find(u8, payload, "OPTIONAL_PREAMBLE_PREFIX") == null and
-                std.mem.find(u8, payload, "OPTIONAL_PREAMBLE_TAIL") == null;
+                std.mem.find(u8, payload, "OPTIONAL_PREAMBLE_TAIL") == null and
+                std.mem.find(u8, payload, "PRIVATE_REPLAY_SENTINEL") == null;
             self.saw_image_path =
                 std.mem.find(u8, payload, "/tmp/untrusted.png") != null;
             return .{ .completion = .{ .completion = .{
@@ -2316,6 +2318,7 @@ test "automatic review excludes assistant preamble and images" {
             .pending_assistant = .{
                 .role = .assistant,
                 .content = long_preamble,
+                .provider_replay = .{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "PRIVATE_REPLAY_SENTINEL" },
                 .images = &.{.{
                     .id = 1,
                     .path = @constCast("/tmp/untrusted.png"),

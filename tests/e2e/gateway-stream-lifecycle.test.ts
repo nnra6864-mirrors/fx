@@ -320,6 +320,7 @@ function fixtureEnv(
 
 function parseAskJson(stdout: string): {
   output: string;
+  final_output: string;
   exit_code: number;
   error?: string;
   session_id: string;
@@ -769,7 +770,7 @@ describe("gateway stream lifecycle", () => {
       expect(gateway.requests).toHaveLength(2);
       const first = advertisedSkillLocations(gateway.requests[0]!.body, "cancel-workflow")[0]!;
       const second = advertisedSkillLocations(gateway.requests[1]!.body, "cancel-workflow")[0]!;
-      expect(first).not.toBe(second);
+      expect(first).toBe(second);
       expect(advertisedSkillPath(gateway.requests[0]!.body, first)).toBe(directory);
       expect(advertisedSkillPath(gateway.requests[1]!.body, second)).toBe(directory);
       expect(await tui.captureFullScrollback()).toContain("SKILL_RECOVERY_COMPLETE");
@@ -3023,8 +3024,21 @@ describe("gateway stream lifecycle", () => {
     );
     const firstTracePath = join(root.root, "first-trace.log");
     const resumeTracePath = join(root.root, "resume-trace.log");
+    writeFileSync(join(root.workspace, "replay.txt"), "REPLAY_TOOL_RESULT\n");
     const responses = [
-      fakeGatewayFinalText("First saved turn completed."),
+      fakeGatewaySse([
+        { type: "reasoning-start", id: "reasoning" },
+        { type: "reasoning-delta", id: "reasoning", delta: "REPLAY_PRIVATE_REASONING" },
+        { type: "reasoning-end", id: "reasoning", providerMetadata: { openai: { reasoningEncryptedContent: "REPLAY_TOOL_SIGNATURE" } } },
+        { type: "tool-call", toolCallId: "replay_read", toolName: "read_file", input: '{ "path": "replay.txt" }', providerMetadata: { openai: { itemId: "REPLAY_CALL_ITEM" } } },
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool_calls" } },
+      ]),
+      fakeGatewaySse([
+        { type: "reasoning-start", id: "final_reasoning" },
+        { type: "reasoning-end", id: "final_reasoning", providerMetadata: { openai: { reasoningEncryptedContent: "REPLAY_FINAL_SIGNATURE" } } },
+        { type: "text-delta", id: "answer", delta: "**First saved turn completed.**" },
+        { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
+      ]),
       fakeGatewayFinalText("Second saved turn completed."),
     ];
     const gateway = startGateway(() =>
@@ -3044,12 +3058,18 @@ describe("gateway stream lifecycle", () => {
         },
       );
       expect(first.code).toBe(0);
-      expect(first.stderr).toBe("");
+      expect(first.stderr).toBe("Reading replay.txt\n");
       const firstJson = parseAskJson(first.stdout) as ReturnType<typeof parseAskJson> & {
         model: string;
         session_id: string;
       };
       expect(firstJson.model).toBe(MODEL);
+      expect(firstJson.final_output).toBe("First saved turn completed.");
+      expect(first.stdout).not.toContain("REPLAY_PRIVATE_REASONING");
+      expect(first.stdout).not.toContain("REPLAY_TOOL_SIGNATURE");
+      expect(gateway.requests[1].body).toContain("REPLAY_TOOL_SIGNATURE");
+      expect(gateway.requests[1].body).toContain("REPLAY_CALL_ITEM");
+      expect(gateway.requests[1].body).toContain("REPLAY_TOOL_RESULT");
       expect(firstJson.session_id).toMatch(/^[A-Za-z0-9_-]{12}$/);
       const eventsPath = join(
         root.home,
@@ -3087,7 +3107,13 @@ describe("gateway stream lifecycle", () => {
       expect(resumedJson.model).toBe(MODEL);
       expect(resumedJson.session_id).toBe(firstJson.session_id);
       expect(resumedJson.output).toContain("Second saved turn completed.");
-      expect(gateway.requestCount()).toBe(2);
+      expect(gateway.requestCount()).toBe(3);
+      expect(gateway.requests[2].body).toContain("REPLAY_TOOL_SIGNATURE");
+      expect(gateway.requests[2].body).toContain("REPLAY_FINAL_SIGNATURE");
+      expect(gateway.requests[2].body).toContain("**First saved turn completed.**");
+      expect(gateway.requests[2].body).toContain("REPLAY_CALL_ITEM");
+      expect(gateway.requests[2].body).toContain("REPLAY_TOOL_RESULT");
+      expect(resumedJson.tool_calls).toEqual([]);
 
       const appendedEvents = readFileSync(eventsPath)
         .subarray(eventsBeforeResume)
@@ -3102,6 +3128,91 @@ describe("gateway stream lifecycle", () => {
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("saved ask replays standalone assistant replies without joining their metadata", async () => {
+    for (const withReplay of [false, true]) {
+      const root = createFixtureRoot(`standalone-replies-${withReplay}`);
+      const replies = [fakeGatewayFinalText("Seed reply."), fakeGatewayFinalText("Resumed reply.")];
+      const gateway = startGateway(() => replies.shift() ?? new Response("unexpected request", { status: 500 }));
+      try {
+        const seeded = await runFx(["ask", "--json", "--auto", "Seed a conversation."], {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, join(root.root, "seed.log")),
+          timeoutMs: 15_000,
+        });
+        expect(seeded.code).toBe(0);
+        expect(seeded.stderr).toBe("");
+        const seed = parseAskJson(seeded.stdout);
+        const path = join(root.home, ".fx", "sessions", seed.session_id, "events.jsonl");
+        const events = readFileSync(path, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+        const user = events.find((event) => event.event.user);
+        const completed = events.find((event) => event.event.turn_completed);
+        expect(user).toBeDefined();
+        expect(completed).toBeDefined();
+        const first = "Earlier original reply.";
+        const last = "Final original reply.";
+        const replay = (text: string, signature: string) => ({
+          source: { provider: "gateway", model: MODEL },
+          parts_json: JSON.stringify([
+            { type: "reasoning", text: "", providerOptions: { openai: { reasoningEncryptedContent: signature } } },
+            { type: "text", offset: 0, length: text.length },
+          ]),
+        });
+        const frames = [
+          { ...user, seq: 1 },
+          { ...user, seq: 2, event: { assistant: { text: first, provider_replay: withReplay ? replay(first, "FIRST_REPLAY_SIGNATURE") : null } } },
+          { ...user, seq: 3, event: { assistant: { text: last, provider_replay: withReplay ? replay(last, "FINAL_REPLAY_SIGNATURE") : null } } },
+          { ...completed, seq: 4 },
+        ];
+        writeFileSync(path, frames.map((frame) => JSON.stringify(frame)).join("\n") + "\n");
+        const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", seed.session_id, "Continue without tools."], {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, join(root.root, "resume.log")),
+          timeoutMs: 15_000,
+        });
+        expect(resumed.code).toBe(0);
+        expect(resumed.stderr).toBe("");
+        const result = parseAskJson(resumed.stdout);
+        expect(result.session_id).toBe(seed.session_id);
+        expect(result.final_output).toBe("Resumed reply.");
+        expect(result.tool_calls).toEqual([]);
+        expect(gateway.requests).toHaveLength(2);
+        const prompt = JSON.parse(gateway.requests[1].body).prompt as PromptMessage[];
+        const assistants = prompt.filter((message) => message.role === "assistant");
+        expect(assistants.map((message) => contentText(message.content))).toEqual([first, last]);
+        if (withReplay) {
+          expect(JSON.stringify(assistants[0])).toContain("FIRST_REPLAY_SIGNATURE");
+          expect(JSON.stringify(assistants[1])).toContain("FINAL_REPLAY_SIGNATURE");
+        }
+        expect(resumed.stdout).not.toContain("REPLAY_SIGNATURE");
+        if (tmuxAvailable()) {
+          const stderrPath = join(root.root, "tui-stderr.log");
+          const tui = await TmuxSession.create({
+            cmd: `${FX_BIN} --resume-last`,
+            cwd: root.workspace,
+            env: fixtureEnv(root, gateway, join(root.root, "tui-trace.log")),
+            stderrPath,
+            isolated: true,
+          });
+          try {
+            await tui.waitForText(last, 10_000);
+            const pane = await tui.capturePane();
+            expect(pane.split(first).length - 1).toBe(1);
+            expect(pane.split(last).length - 1).toBe(1);
+            expect(pane).not.toContain("REPLAY_SIGNATURE");
+            expect(hasEmptyComposer(pane)).toBe(true);
+            expect(readFileSync(stderrPath, "utf8")).toBe("");
+            expect(gateway.requests).toHaveLength(2);
+          } finally {
+            await tui.kill();
+          }
+        }
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
     }
   });
 
@@ -4878,6 +4989,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         const token = "PROBE_TOKEN=0123456789abcdef01234567";
         const prefix = `RETRIEVAL_MATCH ${token} `;
         const tail = "RETRIEVAL_EDGE_SENTINEL";
+        const replaySignature = "RETAINED_COMPACTION_SIGNATURE";
         writeFileSync(join(root.workspace, "source.txt"), prefix + "x".repeat(65480 - prefix.length) + tail + "x".repeat(1024) + "\n");
         writeFileSync(join(root.workspace, "small.txt"), "small follow-up\n");
         let step = 0;
@@ -4886,6 +4998,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         const gateway = startDynamicFakeGateway((body) => {
           const request = JSON.parse(body);
           if (request.tools.length === 0) {
+            expect(body).not.toContain(replaySignature);
             compactions++;
             snapshotHandle = body.match(/result-read_tool_result-[a-f0-9-]+\.txt/)?.[0] ?? "";
             expect(snapshotHandle).not.toBe("");
@@ -4911,17 +5024,21 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
               expect(page).toContain("tool result truncated");
               expect(page).not.toContain(tail);
               return fakeGatewaySse([
+                { type: "reasoning-start", id: "retained_reasoning" },
+                { type: "reasoning-end", id: "retained_reasoning", providerMetadata: { openai: { reasoningEncryptedContent: replaySignature } } },
                 { type: "tool-call", toolCallId: "retrieval-follow-up", toolName: "read_file", input: { path: "small.txt" } },
                 { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" }, ...(trigger === "automatic" ? { usage: { inputTokens: { total: 120000 }, outputTokens: { total: 10 } } } : {}) },
               ]);
             }
             case 3:
+              expect(body).toContain(replaySignature);
               if (trigger === "automatic") {
                 expect(compactions).toBe(2);
                 expect(body).toContain("context_handoff");
               }
               return fakeGatewayFinalText("RETRIEVAL_TURN_COMPLETE");
             case 4:
+              expect(body).toContain(replaySignature);
               expect(body).toContain(snapshotHandle);
               return fakeGatewayToolCall("retrieval-tail", "read_tool_result", {
                 request: { handle: snapshotHandle, start_byte: 65300, byte_count: 1024 },

@@ -816,6 +816,57 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     await expectFixtureProcessesExited(readWire(root.wireLogPath));
   }, 25_000);
 
+  for (const matchingPath of [false, true]) {
+    test.skipIf(process.platform === "win32" || !tmuxAvailable())(
+      `MCP slash add preserves scoped arguments with ${matchingPath ? "a matching" : "no matching"} local path`,
+      async () => {
+        const root = createRoot(`scoped-add-${matchingPath}`, LEGACY_FIXTURE);
+        const configPath = join(root.home, ".fx", "mcp.json");
+        writeFileSync(configPath, JSON.stringify({ mcp: {} }));
+        const packageArg = "@modelcontextprotocol/server-memory@2026.8.31";
+        if (matchingPath) {
+          const directory = join(root.workspace, "modelcontextprotocol");
+          mkdirSync(directory);
+          writeFileSync(join(directory, "server-memory@2026.8.31-extra"), "local file");
+        }
+        gateway = startFakeGateway([], {
+          models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+        });
+        tui = await TmuxSession.create({
+          isolated: true,
+          remainOnExit: true,
+          cwd: root.workspace,
+          width: 180,
+          height: 36,
+          env: {
+            ...fixtureEnv(root, gateway),
+            FX_MCP_PROTOCOL_VERSION: "2025-11-25",
+            FX_MCP_LEGACY_VERSION: "2025-11-25",
+            FX_MCP_WIRE_LOG: root.wireLogPath,
+            FX_MCP_PID_PATH: join(root.root, "literal.pid"),
+          },
+        });
+        await tui.waitForComposer(15_000);
+        await tui.sendLiteral(`/mcp add literal ${process.execPath} ${LEGACY_FIXTURE} ${packageArg}`);
+        if (matchingPath) await tui.sendKeys("Tab");
+        await tui.sendKeys("Enter");
+        await tui.waitForText("Saved MCP server 'literal'", 5_000);
+        expect(JSON.parse(readFileSync(configPath, "utf8")).mcp.literal.command)
+          .toEqual([process.execPath, LEGACY_FIXTURE, packageArg]);
+        expect(await tui.captureFullScrollback()).not.toContain("no matching files");
+        await tui.sendText("/mcp");
+        await tui.waitForPane((pane) => /^\s*literal\s+Ready\b/m.test(pane), 10_000);
+        expect(gateway.requests).toHaveLength(0);
+        await tui.sendKeys("Escape");
+        await tui.waitForPane((pane) => !/^MCP \d+\s/m.test(pane), 5_000);
+        await tui.sendText("/exit");
+        await waitForTtyAskExit(tui, 0);
+        await expectFixtureProcessesExited(readWire(root.wireLogPath));
+      },
+      30_000,
+    );
+  }
+
   test("headless project MCP traces encode hostile server names on recovery", async () => {
     const root = createRoot("workspace-trace-name", MODERN_FIXTURE, {
       mode: "crash_always",

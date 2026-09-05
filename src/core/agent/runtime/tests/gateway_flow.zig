@@ -4316,6 +4316,27 @@ test "processQueuedPrompt prepares skill metadata from the supplied inventory" {
     try expectGatewayPromptTextCount(&gateway, 0, "- release: Release the package", 1);
 }
 
+test "unchanged skill catalog keeps its request prefix across user turns" {
+    const alloc = std.testing.allocator;
+    const skills = [_]@import("../../../skills/skill_runtime.zig").Skill{.{
+        .name = "release",
+        .description = "Release the package",
+        .path = "/tmp/skills/release",
+        .source = .global_fx,
+    }};
+    var gateway = FakeGateway.init(alloc, &.{ .{ .content = "First" }, .{ .content = "Second" } });
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.skill_catalog = .{ .skills = &skills };
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expectEqualStrings(gateway.request_bodies.items[0], gateway.request_bodies.items[1]);
+}
+
 test "processQueuedPrompt reports a retained skill binding when discovery becomes empty" {
     const alloc = std.testing.allocator;
     var gateway = FakeGateway.init(alloc, &.{.{ .content = "Final" }});
@@ -7162,27 +7183,16 @@ test "processQueuedPrompt omits blank assistant messages from silent-tool contin
 
 test "processQueuedPrompt preserves provider state during silent-tool continuation" {
     const StateObserver = struct {
-        const state = "[{\"type\":\"reasoning\",\"id\":\"state_1\",\"encrypted_content\":\"opaque\",\"summary\":[]}]";
+        const state = "[{\"type\":\"reasoning\",\"text\":\"\",\"providerOptions\":{\"openai\":{\"reasoningEncryptedContent\":\"opaque\"}}}]";
 
         fn observe(request: agent_stream_provider.ModelRequest) !void {
             const last = request.messages[request.messages.len - 1];
             if (!std.mem.eql(u8, last.content orelse "", "Summarize what you just did.")) return;
             const previous = request.messages[request.messages.len - 2];
             try std.testing.expectEqual(types.ChatRole.assistant, previous.role);
-            try std.testing.expectEqual(@as(?[]const u8, null), previous.content);
-            try std.testing.expectEqualStrings(state, previous.provider_state_json orelse "");
+            try std.testing.expectEqualStrings(" \n", previous.content.?);
+            try std.testing.expectEqualStrings(state, if (previous.provider_replay) |value| value.parts_json else "");
             try std.testing.expectEqual(@as(usize, 0), previous.tool_calls.len);
-            var wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
-            defer wire.deinit();
-            try @import("../../../../gateway/responses_protocol.zig").writeInput(
-                &wire.writer,
-                std.testing.allocator,
-                &.{previous},
-                null,
-                .{ .tool_calls = 128, .tool_identity_bytes = 256, .tool_arguments_bytes = 4096, .provider_state_bytes = 4096 },
-                .{},
-            );
-            try std.testing.expectEqualStrings(state[1 .. state.len - 1], wire.written());
         }
     };
     const alloc = std.testing.allocator;
@@ -7205,7 +7215,30 @@ test "processQueuedPrompt preserves provider state during silent-tool continuati
 
     try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
     try expectGatewayPromptFinalUserText(&gateway, 3, "Summarize what you just did.");
+    try expectBodyContains(&gateway, 3, "\"reasoningEncryptedContent\":\"opaque\"");
     try std.testing.expectEqualStrings("Summary", hooks.finish_assistant_text.?);
+    const steps = hooks.history_turns.items[0].assistant.execution.tool_steps;
+    try std.testing.expectEqual(@as(usize, 3), steps.len);
+    try std.testing.expectEqualStrings(StateObserver.state, steps[2].provider_replay.?.parts_json);
+}
+
+test "completed assistant provider replay survives turn materialization" {
+    const alloc = std.testing.allocator;
+    const state = "[{\"type\":\"reasoning\",\"text\":\"Kept reasoning\"}]";
+    const completions = [_]FakeCompletion{.{ .content = "Answer", .provider_state_json = state }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+    const turn = hooks.history_turns.items[0].assistant;
+    try std.testing.expectEqualStrings("Answer", turn.assistant);
+    try std.testing.expectEqualStrings(state, turn.provider_replay.?.parts_json);
+    var messages: std.ArrayList(types.ChatMessage) = .empty;
+    defer messages.deinit(alloc);
+    try session_runtime.appendHistoryChatMessages(alloc, &messages, hooks.history_turns.items);
+    try std.testing.expectEqualStrings(state, messages.items[messages.items.len - 1].provider_replay.?.parts_json);
 }
 
 test "tool presentation groups span silent steps and split on visible assistant prose" {

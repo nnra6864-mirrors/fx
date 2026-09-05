@@ -150,6 +150,7 @@ pub const generation_usage_provider = gateway_generation_usage.provider;
 pub const agent_stream_provider = agent_stream_provider_contract.Provider{
     .stream_fn = streamAgentCompletion,
     .build_request_fn = buildAgentRequestForProvider,
+    .project_replay_fn = vercel_protocol.selectReplayParts,
 };
 
 pub const provider_bundle = provider_set.Bundle{
@@ -176,6 +177,9 @@ pub fn buildAgentRequest(
     request: agent_stream_provider_contract.RequestData,
 ) anyerror![]u8 {
     try request.validatePrompt();
+    const projected = try shared_types.projectProviderReplay(alloc, request.messages, .{ .provider = .gateway, .model = request.model });
+    defer if (projected) |messages| alloc.free(messages);
+    if (projected != null) debug_trace.logf("gateway", "provider_replay_omitted provider=gateway reason=source_mismatch", .{});
     const budget: ?vercel_protocol.BuildBudget = if (request.budget) |value|
         .{ .deadline = value.deadline, .cancel_flag = value.cancel_flag }
     else
@@ -192,7 +196,7 @@ pub fn buildAgentRequest(
     const prompt = try alloc.alloc(shared_types.ChatMessage, prompt_len);
     defer alloc.free(prompt);
     @memcpy(prompt[0..request.instructions.len], request.instructions);
-    @memcpy(prompt[request.instructions.len..], request.messages);
+    @memcpy(prompt[request.instructions.len..], projected orelse request.messages);
 
     if (request.verified_images) |images| {
         const response_format = request.response_format orelse

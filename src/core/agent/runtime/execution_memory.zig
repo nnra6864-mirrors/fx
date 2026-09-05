@@ -133,7 +133,8 @@ pub fn buildExecutionMemory(alloc: Allocator, within_turn_suffix: []const ChatMe
 
 fn startsPersistedToolStep(messages: []const ChatMessage, assistant_index: usize) bool {
     const assistant = messages[assistant_index];
-    if (assistant.role != .assistant or assistant.tool_calls.len == 0) return false;
+    if (assistant.role != .assistant) return false;
+    if (assistant.tool_calls.len == 0) return assistant.provider_replay != null or assistant.standalone_response;
     var result_index = assistant_index + 1;
     while (result_index < messages.len and messages[result_index].role == .tool) : (result_index += 1) {
         const result_call_id = messages[result_index].tool_call_id orelse continue;
@@ -155,6 +156,8 @@ pub fn retainedMessageOffset(messages: []const ChatMessage, cut: CompactedExecut
         if (startsPersistedToolStep(messages, index)) {
             if (steps == cut.tool_steps and steering == cut.steering) return prefix_start;
             steps += 1;
+            // Keep following continuation prompts, but not the completed reply.
+            if (message.tool_calls.len == 0) prefix_start = index + 1;
         } else if (message.role == .user and steeringText(message.content orelse "") != null) {
             if (steps == cut.tool_steps and steering == cut.steering) return prefix_start;
             steering += 1;
@@ -169,6 +172,34 @@ pub fn retainedMessageOffset(messages: []const ChatMessage, cut: CompactedExecut
 test "retained context keeps non-tool continuation messages at a zero cut" {
     const messages = [_]ChatMessage{.{ .role = .assistant, .content = "Current continuation text" }};
     try std.testing.expectEqual(@as(usize, 0), try retainedMessageOffset(&messages, .{}));
+}
+
+test "retained standalone cut rebuilds exactly the selected execution suffix" {
+    const alloc = std.testing.allocator;
+    const call = toolCall("retained", "read_file", "{\"path\":\"a.txt\"}");
+    for ([_]bool{ false, true }) |with_replay| {
+        const messages = [_]ChatMessage{
+            .{
+                .role = .assistant,
+                .content = if (with_replay) null else "candidate",
+                .standalone_response = !with_replay,
+                .provider_replay = if (with_replay) .{
+                    .source = .{ .provider = .gateway, .model = "test" },
+                    .parts_json = "[{\"type\":\"reasoning\",\"text\":\"private\"}]",
+                } else null,
+            },
+            .{ .role = .user, .content = "Continue the turn. fx hook context:\nverify" },
+            .{ .role = .assistant, .tool_calls = &.{call} },
+            .{ .role = .tool, .content = "result", .tool_call_id = call.id, .tool_name = call.name, .tool_result_status = .success },
+        };
+        const offset = try retainedMessageOffset(&messages, .{ .tool_steps = 1 });
+        try std.testing.expectEqual(@as(usize, 1), offset);
+        const retained = try buildExecutionMemory(alloc, messages[offset..]);
+        defer types.freeExecutionMemory(alloc, retained);
+        try std.testing.expectEqual(@as(usize, 1), retained.tool_steps.len);
+        try std.testing.expectEqualStrings(call.id, retained.tool_steps[0].tool_calls[0].id);
+        try std.testing.expect(retained.tool_steps[0].provider_replay == null);
+    }
 }
 
 fn steeringText(content: []const u8) ?[]const u8 {
@@ -228,6 +259,9 @@ pub fn buildInterruptedExecutionMemory(
             }
         }
 
+        if (item.provider_replay != null and completed_count != item.tool_calls.len) {
+            debug_trace.logf("session", "provider replay omitted reason=interrupted_incomplete_association source_calls={d} completed_calls={d}", .{ item.tool_calls.len, completed_count });
+        }
         if (completed_count > 0) {
             const calls = try alloc.alloc(ToolCall, completed_count);
             errdefer alloc.free(calls);
@@ -245,6 +279,7 @@ pub fn buildInterruptedExecutionMemory(
 
             var projected = item;
             projected.tool_calls = calls;
+            if (completed_count != item.tool_calls.len) projected.provider_replay = null;
             filtered.appendAssumeCapacity(projected);
             for (result_messages) |result| {
                 const result_call_id = result.tool_call_id orelse continue;
@@ -298,6 +333,27 @@ pub fn retainCancelledCommandReplay(
     else
         null;
     return if (replay) |value| .{ .output_replay = value } else null;
+}
+
+test "interrupted execution keeps replay only for an unchanged completed batch" {
+    const alloc = std.testing.allocator;
+    const call = toolCall("completed", "read_file", "{\"path\":\"a.txt\"}");
+    const replay: types.ProviderReplay = .{
+        .source = .{ .provider = .gateway, .model = "test" },
+        .parts_json = "[{\"type\":\"reasoning\",\"text\":\"kept\"},{\"type\":\"tool-call\",\"toolCallId\":\"completed\"}]",
+    };
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &.{call}, .provider_replay = replay },
+        .{ .role = .tool, .content = "result", .tool_call_id = call.id, .tool_name = call.name, .tool_result_status = .success },
+    };
+    const completed = try buildInterruptedExecutionMemory(alloc, &messages, null);
+    defer types.freeExecutionMemory(alloc, completed);
+    try std.testing.expectEqual(@as(usize, 1), completed.tool_steps.len);
+    try std.testing.expectEqualStrings(replay.parts_json, completed.tool_steps[0].provider_replay.?.parts_json);
+    const cancelled = try buildInterruptedExecutionMemory(alloc, &messages, call);
+    defer types.freeExecutionMemory(alloc, cancelled);
+    try std.testing.expectEqual(@as(usize, 0), cancelled.tool_steps.len);
+    try std.testing.expectEqualStrings(replay.parts_json, messages[0].provider_replay.?.parts_json);
 }
 
 test "interrupted execution preserves a compacted prefix when later calls reuse an id" {

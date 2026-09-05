@@ -2036,7 +2036,10 @@ pub fn contextHistoryRange(
             execution.files = &.{};
             execution.turn_summary = null;
             switch (turn) {
-                .assistant => |*entry| entry.assistant = @constCast(""),
+                .assistant => |*entry| {
+                    entry.assistant = @constCast("");
+                    entry.provider_replay = null;
+                },
                 .interrupted => |*entry| {
                     entry.assistant = null;
                     entry.tool_call = null;
@@ -2074,9 +2077,10 @@ pub fn prepareCompactedHistory(
 test "retained context history replacement is allocation-failure atomic" {
     const Fixture = struct {
         fn run(alloc: Allocator) !void {
+            const replay = core_types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"retained\"}]" };
             const source = [_]HistoryTurn{
                 .{ .assistant = .{ .user = .{ .text = @constCast("older request") }, .assistant = @constCast("older reply") } },
-                .{ .assistant = .{ .user = .{ .text = @constCast("recent request") }, .assistant = @constCast("recent reply") } },
+                .{ .assistant = .{ .user = .{ .text = @constCast("recent request") }, .assistant = @constCast("recent reply"), .provider_replay = replay } },
             };
             const prepared = try prepareCompactedHistory(alloc, &source, .{
                 .summary = @constCast("<context_handoff>older facts</context_handoff>"),
@@ -2086,6 +2090,7 @@ test "retained context history replacement is allocation-failure atomic" {
             defer freeHistoryTurnSlice(alloc, prepared);
             try std.testing.expectEqual(@as(usize, 2), prepared.len);
             try std.testing.expectEqualStrings("recent reply", prepared[1].assistant.assistant);
+            try std.testing.expectEqualStrings(replay.parts_json, prepared[1].assistant.provider_replay.?.parts_json);
             try std.testing.expectEqualStrings("older reply", source[0].assistant.assistant);
         }
     };
@@ -2145,71 +2150,7 @@ fn dupeImageAttachment(alloc: Allocator, src: ImageAttachment) !ImageAttachment 
     };
 }
 /// Deep-copies one history turn; caller owns the returned turn and frees with freeHistoryTurn.
-pub fn dupeHistoryTurn(alloc: Allocator, turn: HistoryTurn) !HistoryTurn {
-    switch (turn) {
-        .compacted_summary => |entry| {
-            const summary = try alloc.dupe(u8, entry.summary);
-            errdefer alloc.free(summary);
-            const root_user_messages = try core_types.dupeCompletedToolNames(
-                alloc,
-                entry.root_user_messages,
-            );
-            errdefer core_types.freeCompletedToolNames(alloc, root_user_messages);
-            const permission_feedback = try core_types.dupePermissionFeedback(
-                alloc,
-                entry.permission_feedback,
-            );
-            return .{ .compacted_summary = .{
-                .summary = summary,
-                .removed_turn_count = entry.removed_turn_count,
-                .compaction_count = entry.compaction_count,
-                .root_user_messages = root_user_messages,
-                .root_user_messages_complete = entry.root_user_messages_complete,
-                .permission_feedback = permission_feedback,
-                .permission_feedback_complete = entry.permission_feedback_complete,
-            } };
-        },
-        .assistant => |entry| {
-            const user = try dupeUserTurn(alloc, entry.user);
-            errdefer freeUserTurn(alloc, user);
-            const assistant_copy = try alloc.dupe(u8, entry.assistant);
-            errdefer alloc.free(assistant_copy);
-            const execution = try core_types.dupeExecutionMemory(alloc, entry.execution);
-            return .{ .assistant = .{
-                .user = user,
-                .assistant = assistant_copy,
-                .execution = execution,
-            } };
-        },
-        .interrupted => |entry| {
-            const user = try dupeUserTurn(alloc, entry.user);
-            errdefer freeUserTurn(alloc, user);
-            const assistant = if (entry.assistant) |text| try alloc.dupe(u8, text) else null;
-            errdefer if (assistant) |text| alloc.free(text);
-            const tool_call = if (entry.tool_call) |call| try core_types.dupeToolCall(alloc, call) else null;
-            errdefer if (tool_call) |call| core_types.freeToolCall(alloc, call);
-            const completed_tool_names = try core_types.dupeCompletedToolNames(alloc, entry.completed_tool_names);
-            errdefer core_types.freeCompletedToolNames(alloc, completed_tool_names);
-            const cancelled_command = if (entry.cancelled_command) |presentation|
-                try core_types.dupeCancelledCommandPresentation(alloc, presentation)
-            else
-                null;
-            errdefer if (cancelled_command) |presentation| {
-                core_types.freeCancelledCommandPresentation(alloc, presentation);
-            };
-            const execution = try core_types.dupeExecutionMemory(alloc, entry.execution);
-            return .{ .interrupted = .{
-                .user = user,
-                .assistant = assistant,
-                .tool_call = tool_call,
-                .completed_tool_names = completed_tool_names,
-                .execution = execution,
-                .cancelled_command = cancelled_command,
-                .terminal_reason = entry.terminal_reason,
-            } };
-        },
-    }
-}
+pub const dupeHistoryTurn = core_types.dupeHistoryTurn;
 pub fn appendAssistantTurnWithExecution(
     alloc: Allocator,
     current: []HistoryTurn,
@@ -3162,11 +3103,13 @@ pub fn appendExecutionMemoryChatMessages(
             }
             steering_index += 1;
         }
-        if (step.tool_calls.len == 0) continue;
+        if (step.tool_calls.len == 0 and step.provider_replay == null and step.assistant == null) continue;
         try messages.append(alloc, .{
             .role = .assistant,
             .content = step.assistant,
             .tool_calls = step.tool_calls,
+            .provider_replay = step.provider_replay,
+            .standalone_response = step.tool_calls.len == 0,
         });
         for (step.tool_results) |result| {
             try messages.append(alloc, .{
@@ -3240,8 +3183,8 @@ fn appendHistoryChatMessagesImpl(
             .assistant => |entry| {
                 try messages.append(alloc, .{ .role = .user, .content = entry.user.text, .images = entry.user.images });
                 try appendExecutionMemoryChatMessages(alloc, messages, entry.execution);
-                if (entry.assistant.len > 0) {
-                    try messages.append(alloc, .{ .role = .assistant, .content = entry.assistant });
+                if (entry.assistant.len > 0 or entry.provider_replay != null) {
+                    try messages.append(alloc, .{ .role = .assistant, .content = entry.assistant, .provider_replay = entry.provider_replay });
                 }
             },
             .interrupted => |entry| {

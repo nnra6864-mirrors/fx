@@ -190,7 +190,7 @@ pub fn validate_prompt_lanes(
             instruction.tool_call_id != null or
             instruction.tool_name != null or
             instruction.tool_calls.len != 0 or
-            instruction.provider_state_json != null or
+            instruction.provider_replay != null or
             instruction.tool_result_status != null or
             instruction.tool_result_memory != null or
             instruction.permission_feedback)
@@ -369,6 +369,15 @@ pub const Provider = struct {
     stream_fn: StreamFn,
     /// Optional exact provider serializer used for request-capacity decisions.
     build_request_fn: ?BuildRequestFn = null,
+    /// Pure provider-owned slicing when one reply becomes separate history units.
+    project_replay_fn: ?*const fn (Allocator, ?types.ProviderReplay, []const types.ToolCall, bool, bool) anyerror!?types.ProviderReplay = null,
+
+    /// Borrows unchanged payloads; projected payloads live in the caller's arena.
+    pub fn projectReplay(self: Provider, arena: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
+        if (replay == null) return null;
+        const project = self.project_replay_fn orelse return error.ProviderReplayProjectionUnavailable;
+        return project(arena, replay, calls, text, reasoning);
+    }
 
     pub fn stream(self: Provider, alloc: Allocator, request: ModelRequest) !Result {
         try request.data().validatePrompt();

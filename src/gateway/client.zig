@@ -6,7 +6,7 @@ const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
-const json_comparison = @import("json_comparison.zig");
+const json_comparison = @import("../core/shared/json_comparison.zig");
 const sse = @import("sse.zig");
 
 pub fn isRetryableGatewayError(err: anyerror) bool {
@@ -2253,6 +2253,215 @@ const StreamedToolInputState = enum {
     finalized,
 };
 
+const GatewayReplayBuilder = struct {
+    const max_bytes = types.ProviderReplay.max_bytes;
+    const Kind = enum { text, reasoning, tool_call };
+    const Part = struct {
+        kind: Kind,
+        id: []u8,
+        text: std.ArrayList(u8) = .empty,
+        offset: usize = 0,
+        length: usize = 0,
+        metadata: ?[]u8 = null,
+        has_provider_metadata: bool = false,
+        ended: bool = false,
+
+        fn deinit(self: *Part, alloc: std.mem.Allocator) void {
+            alloc.free(self.id);
+            self.text.deinit(alloc);
+            if (self.metadata) |value| alloc.free(value);
+        }
+    };
+
+    alloc: std.mem.Allocator,
+    parts: std.ArrayList(Part) = .empty,
+    retained_bytes: usize = 0,
+    needed: bool = false,
+
+    fn deinit(self: *GatewayReplayBuilder) void {
+        for (self.parts.items) |*part| part.deinit(self.alloc);
+        self.parts.deinit(self.alloc);
+    }
+
+    fn reserve(self: *GatewayReplayBuilder, bytes: usize) !void {
+        if (bytes > max_bytes - self.retained_bytes) return error.ProviderStateTooLarge;
+        self.retained_bytes += bytes;
+    }
+
+    fn observe(self: *GatewayReplayBuilder, root: std.json.Value, content_offset: usize) !void {
+        const event = root.object.get("type").?.string;
+        const kind: Kind = if (std.mem.startsWith(u8, event, "reasoning-"))
+            .reasoning
+        else if (std.mem.startsWith(u8, event, "text-"))
+            .text
+        else if (std.mem.startsWith(u8, event, "tool-input-") or std.mem.eql(u8, event, "tool-call"))
+            .tool_call
+        else
+            return;
+        if (kind == .reasoning and !std.mem.eql(u8, event, "reasoning-start") and
+            !std.mem.eql(u8, event, "reasoning-delta") and !std.mem.eql(u8, event, "reasoning-end")) return;
+        const id_value = root.object.get(if (std.mem.eql(u8, event, "tool-call")) "toolCallId" else "id");
+        const id: []const u8 = if (id_value) |value| if (value == .string) value.string else "" else "";
+        // Canonical admission owns rejection of malformed tool identities.
+        if (kind == .tool_call and types.ConversationIdentity.invalidReason(id) != null) return;
+        if (id.len > types.ConversationIdentity.max_bytes) return error.ProviderStateTooLarge;
+        var index: ?usize = null;
+        for (self.parts.items, 0..) |part, i| {
+            if (part.kind == kind and std.mem.eql(u8, part.id, id)) {
+                index = i;
+                break;
+            }
+        }
+        if (index == null) {
+            try self.reserve(@sizeOf(Part) + id.len);
+            const owned_id = try self.alloc.dupe(u8, id);
+            errdefer self.alloc.free(owned_id);
+            try self.parts.append(self.alloc, .{ .kind = kind, .id = owned_id, .offset = content_offset });
+            index = self.parts.items.len - 1;
+        }
+        const part = &self.parts.items[index.?];
+        if (kind == .reasoning) self.needed = true;
+        if (std.mem.endsWith(u8, event, "-delta") and kind != .tool_call) {
+            const delta = root.object.get("delta") orelse return;
+            if (delta != .string) return error.InvalidProviderState;
+            if (part.ended) return error.InvalidProviderState;
+            if (kind == .reasoning) {
+                try self.reserve(delta.string.len);
+                try part.text.appendSlice(self.alloc, delta.string);
+            } else {
+                const end = std.math.add(usize, part.offset, part.length) catch return error.ProviderStateTooLarge;
+                if (content_offset != end) return error.InvalidProviderState;
+                part.length = std.math.add(usize, part.length, delta.string.len) catch return error.ProviderStateTooLarge;
+            }
+        }
+        if (std.mem.endsWith(u8, event, "-end") or std.mem.eql(u8, event, "tool-call")) part.ended = true;
+        if (root.object.get("providerMetadata")) |metadata| {
+            if (metadata != .object) return error.InvalidProviderState;
+            for (metadata.object.values()) |options| if (options != .object) return error.InvalidProviderState;
+            for (metadata.object.keys()) |key| {
+                if (!std.mem.eql(u8, key, "gateway")) {
+                    self.needed = true;
+                    part.has_provider_metadata = true;
+                }
+            }
+            if (part.has_provider_metadata and id.len == 0) return error.InvalidProviderState;
+            const merged = try mergeReplayMetadata(self.alloc, part.metadata, metadata);
+            errdefer self.alloc.free(merged);
+            const previous_len = if (part.metadata) |previous| previous.len else 0;
+            if (merged.len > previous_len) try self.reserve(merged.len - previous_len);
+            if (merged.len < previous_len) self.retained_bytes -= previous_len - merged.len;
+            if (part.metadata) |previous| self.alloc.free(previous);
+            part.metadata = merged;
+        }
+    }
+
+    fn finish(self: *GatewayReplayBuilder, content: []const u8, calls: []const types.ToolCall) !?[]u8 {
+        if (!self.needed) return null;
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        errdefer out.deinit();
+        try out.writer.writeByte('[');
+        var emitted = false;
+        parts: for (self.parts.items, 0..) |part, index| {
+            var metadata: ?[]const u8 = part.metadata;
+            var merged_metadata: ?[]u8 = null;
+            defer if (merged_metadata) |owned| self.alloc.free(owned);
+            var canonical_call: ?types.ToolCall = null;
+            if (part.kind == .tool_call) {
+                for (calls) |call| {
+                    if (partMatchesCall(part, call)) {
+                        canonical_call = call;
+                        break;
+                    }
+                }
+                const call = canonical_call orelse {
+                    if (part.has_provider_metadata) return error.InvalidProviderState;
+                    continue;
+                };
+                for (self.parts.items[0..index]) |prior| {
+                    if (partMatchesCall(prior, call)) continue :parts;
+                }
+                for (self.parts.items[index + 1 ..]) |later| {
+                    if (!partMatchesCall(later, call)) continue;
+                    const next = later.metadata orelse continue;
+                    const parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, next, .{});
+                    defer parsed.deinit();
+                    const merged = try mergeReplayMetadata(self.alloc, metadata, parsed.value);
+                    if (merged_metadata) |owned| self.alloc.free(owned);
+                    merged_metadata = merged;
+                    metadata = merged;
+                }
+            }
+            if (emitted) try out.writer.writeByte(',');
+            switch (part.kind) {
+                .reasoning => {
+                    if (!part.ended and part.metadata != null) return error.InvalidProviderState;
+                    try out.writer.writeAll("{\"type\":\"reasoning\",\"text\":");
+                    try std.json.Stringify.value(part.text.items, .{}, &out.writer);
+                },
+                .text => {
+                    if (part.offset > content.len or part.length > content.len - part.offset) return error.InvalidProviderState;
+                    try out.writer.print("{{\"type\":\"text\",\"offset\":{d},\"length\":{d}", .{ part.offset, part.length });
+                },
+                .tool_call => {
+                    try out.writer.writeAll("{\"type\":\"tool-call\",\"toolCallId\":");
+                    try std.json.Stringify.value(canonical_call.?.id, .{}, &out.writer);
+                },
+            }
+            if (metadata) |value| {
+                try out.writer.writeAll(",\"providerOptions\":");
+                try out.writer.writeAll(value);
+            }
+            try out.writer.writeByte('}');
+            emitted = true;
+            if (out.written().len > max_bytes) return error.ProviderStateTooLarge;
+        }
+        try out.writer.writeByte(']');
+        if (out.written().len > max_bytes) return error.ProviderStateTooLarge;
+        return try out.toOwnedSlice();
+    }
+
+    fn partMatchesCall(part: Part, call: types.ToolCall) bool {
+        return part.kind == .tool_call and (std.mem.eql(u8, part.id, call.id) or
+            if (call.provisional_id) |id| std.mem.eql(u8, part.id, id) else false);
+    }
+};
+
+fn mergeReplayMetadata(alloc: std.mem.Allocator, previous: ?[]const u8, next: std.json.Value) ![]u8 {
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    var merged = if (previous) |bytes|
+        try std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{})
+    else
+        std.json.Value{ .object = .empty };
+    try mergeReplayObject(arena, &merged, next);
+    return stringifyJsonValueOwned(alloc, merged);
+}
+
+fn mergeReplayObject(alloc: std.mem.Allocator, target: *std.json.Value, next: std.json.Value) !void {
+    const Merge = struct { target: *std.json.Value, source: std.json.Value };
+    var pending: std.ArrayList(Merge) = .empty;
+    defer pending.deinit(alloc);
+    try pending.append(alloc, .{ .target = target, .source = next });
+    while (pending.pop()) |entry| {
+        if (entry.target.* != .object or entry.source != .object) {
+            entry.target.* = entry.source;
+            continue;
+        }
+        const capacity = std.math.add(usize, entry.target.object.count(), entry.source.object.count()) catch return error.ProviderStateTooLarge;
+        try entry.target.object.ensureTotalCapacity(alloc, capacity);
+        var fields = entry.source.object.iterator();
+        while (fields.next()) |field| {
+            const slot = entry.target.object.getOrPutAssumeCapacity(field.key_ptr.*);
+            if (slot.found_existing) {
+                try pending.append(alloc, .{ .target = slot.value_ptr, .source = field.value_ptr.* });
+            } else {
+                slot.value_ptr.* = field.value_ptr.*;
+            }
+        }
+    }
+}
+
 const SseStreamedToolInput = struct {
     id: std.ArrayList(u8),
     name: std.ArrayList(u8),
@@ -2535,6 +2744,7 @@ fn deinitGatewayCompletion(alloc: std.mem.Allocator, completion: *types.ModelCom
     }
     if (completion.tool_calls.len > 0) alloc.free(completion.tool_calls);
     if (completion.provider_failure_detail) |detail| alloc.free(@constCast(detail));
+    if (completion.provider_state_json) |state| alloc.free(state);
     completion.* = .{};
 }
 
@@ -3025,6 +3235,8 @@ fn consumeSseStreamTraced(
 ) !types.ModelCompletion {
     var content_buf: std.ArrayList(u8) = .empty;
     defer content_buf.deinit(alloc);
+    var replay = GatewayReplayBuilder{ .alloc = alloc };
+    defer replay.deinit();
     // Reuse event storage instead of pinning old response buffers in the caller's arena.
     var event_arena = std.heap.ArenaAllocator.init(alloc);
     defer event_arena.deinit();
@@ -3111,6 +3323,8 @@ fn consumeSseStreamTraced(
         const type_val = root.object.get("type") orelse continue;
         if (type_val != .string) continue;
         const event_type = type_val.string;
+
+        if (content_capture_limit == null) try replay.observe(root, content_buf.items.len);
 
         if (std.mem.eql(u8, event_type, "response-metadata")) {
             if (root.object.get("timestamp")) |timestamp_value| {
@@ -3506,6 +3720,9 @@ fn consumeSseStreamTraced(
     }
 
     completion.tool_calls = try materializeToolCalls(alloc, tool_accumulators.items);
+    if (finish_reason_holder == .stop or finish_reason_holder == .tool_calls) {
+        completion.provider_state_json = try replay.finish(completion.content orelse "", completion.tool_calls);
+    }
 
     completion.provider_result_identity_failure = provider_result_identity_failure;
     completion.provider_failure_cause = provider_failure_cause;
@@ -4040,6 +4257,73 @@ test "consumeSseStream traces every terminal cause" {
     try std.testing.expect(std.mem.find(u8, trace, "termination cause=cancellation") != null);
 }
 
+test "Gateway completion retains ordered continuation parts and final metadata" {
+    const alloc = std.testing.allocator;
+    const payload =
+        "data: {\"type\":\"reasoning-start\",\"id\":\"r1\",\"providerMetadata\":{\"openai\":{\"itemId\":\"reason-1\",\"reasoningEncryptedContent\":\"partial\"}}}\n\n" ++
+        "data: {\"type\":\"reasoning-delta\",\"id\":\"r1\",\"delta\":\"reasoning\"}\n\n" ++
+        "data: {\"type\":\"reasoning-end\",\"id\":\"r1\",\"providerMetadata\":{\"openai\":{\"reasoningEncryptedContent\":\"complete\"}}}\n\n" ++
+        "data: {\"type\":\"text-start\",\"id\":\"t1\"}\n\n" ++
+        "data: {\"type\":\"text-delta\",\"id\":\"t1\",\"delta\":\"visible\"}\n\n" ++
+        "data: {\"type\":\"text-end\",\"id\":\"t1\"}\n\n" ++
+        "data: {\"type\":\"tool-input-start\",\"id\":\"call-1\",\"toolName\":\"read_file\"}\n\n" ++
+        "data: {\"type\":\"tool-call\",\"toolCallId\":\"call-1\",\"toolName\":\"read_file\",\"input\":{\"path\":\"file\"},\"providerMetadata\":{\"vertex\":{\"thoughtSignature\":\"signature\"}}}\n\n" ++
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"tool-calls\"}}\n\n";
+    const Noop = struct {
+        fn discard(_: *anyopaque, _: []const u8) void {}
+    };
+    var reader = std.Io.Reader.fixed(payload);
+    var cancelled = std.atomic.Value(bool).init(false);
+    var completion = try consumeSseStream(alloc, &reader, undefined, Noop.discard, null, &cancelled);
+    defer deinitGatewayCompletion(alloc, &completion);
+    try std.testing.expectEqualStrings("visible", completion.content.?);
+    const state = completion.provider_state_json orelse return error.TestExpectedProviderReplay;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, state, .{});
+    defer parsed.deinit();
+    const parts = parsed.value.array.items;
+    try std.testing.expectEqual(@as(usize, 3), parts.len);
+    try std.testing.expectEqualStrings("reasoning", parts[0].object.get("type").?.string);
+    const metadata = parts[0].object.get("providerOptions").?.object.get("openai").?.object;
+    try std.testing.expectEqualStrings("reason-1", metadata.get("itemId").?.string);
+    try std.testing.expectEqualStrings("complete", metadata.get("reasoningEncryptedContent").?.string);
+    try std.testing.expectEqualStrings("text", parts[1].object.get("type").?.string);
+    try std.testing.expectEqualStrings("tool-call", parts[2].object.get("type").?.string);
+    try std.testing.expectEqualStrings("signature", parts[2].object.get("providerOptions").?.object.get("vertex").?.object.get("thoughtSignature").?.string);
+}
+
+test "Gateway replay assembly is allocation-safe and rejects incomplete metadata" {
+    const Check = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var replay = GatewayReplayBuilder{ .alloc = alloc };
+            defer replay.deinit();
+            for ([_][]const u8{
+                "{\"type\":\"reasoning-start\",\"id\":\"r\",\"providerMetadata\":{\"anthropic\":{\"redactedData\":\"opaque\"}}}",
+                "{\"type\":\"reasoning-delta\",\"id\":\"r\",\"delta\":\"\",\"providerMetadata\":{\"anthropic\":{\"signature\":\"signed\"}}}",
+                "{\"type\":\"reasoning-end\",\"id\":\"r\"}",
+            }) |event| {
+                const parsed = try std.json.parseFromSlice(std.json.Value, alloc, event, .{});
+                defer parsed.deinit();
+                try replay.observe(parsed.value, 0);
+            }
+            const output = (replay.finish("", &.{}) catch |err| switch (err) {
+                error.WriteFailed => return error.OutOfMemory,
+                else => return err,
+            }).?;
+            defer alloc.free(output);
+            try std.testing.expect(std.mem.find(u8, output, "opaque") != null);
+            try std.testing.expect(std.mem.find(u8, output, "signed") != null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    var replay = GatewayReplayBuilder{ .alloc = std.testing.allocator };
+    defer replay.deinit();
+    const incomplete = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"type\":\"reasoning-start\",\"id\":\"r\",\"providerMetadata\":{\"anthropic\":{\"signature\":\"partial\"}}}", .{});
+    defer incomplete.deinit();
+    try replay.observe(incomplete.value, 0);
+    try std.testing.expectError(error.InvalidProviderState, replay.finish("", &.{}));
+    try std.testing.expectError(error.ProviderStateTooLarge, replay.reserve(types.ProviderReplay.max_bytes));
+}
+
 test "consumeSseStream traces every SSE event with keyless metadata" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4144,7 +4428,7 @@ test "consumeSseStream keyless tracing handles oversized CRLF payloads" {
 
     var payload: std.ArrayList(u8) = .empty;
     defer payload.deinit(alloc);
-    try payload.appendSlice(alloc, "data: {\"type\":\"reasoning-delta\",\"delta\":\"FX_OVERSIZED_REASONING_HEAD_");
+    try payload.appendSlice(alloc, "data: {\"type\":\"reasoning-start\",\"id\":\"r1\"}\r\n\r\ndata: {\"type\":\"reasoning-delta\",\"id\":\"r1\",\"delta\":\"FX_OVERSIZED_REASONING_HEAD_");
     const reasoning_bytes = try alloc.alloc(u8, 256 * 1024);
     defer alloc.free(reasoning_bytes);
     @memset(reasoning_bytes, 'r');
@@ -4152,6 +4436,7 @@ test "consumeSseStream keyless tracing handles oversized CRLF payloads" {
     try payload.appendSlice(
         alloc,
         "FX_OVERSIZED_REASONING_TAIL\",\"providerMetadata\":{\"anthropic\":{\"signature\":\"FX_OVERSIZED_SIGNATURE\"}}}\r\n\r\n" ++
+            "data: {\"type\":\"reasoning-end\",\"id\":\"r1\"}\r\n\r\n" ++
             "data: {\"type\":\"text-delta\",\"id\":\"t1\",\"delta\":\"answer\"}\r\n\r\n" ++
             "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"usage\":{\"inputTokens\":{\"total\":1},\"outputTokens\":{\"total\":2}}}\r\n\r\n" ++
             "data: [DONE]\r\n\r\n",
@@ -4750,6 +5035,8 @@ test "consumeSseStream preserves final identity states without recency aliases" 
 
 test "consumeSseStream reconciles a changed final id with equivalent streamed input" {
     const payload =
+        "data: {\"type\":\"reasoning-start\",\"id\":\"r\"}\n\n" ++
+        "data: {\"type\":\"reasoning-end\",\"id\":\"r\"}\n\n" ++
         "data: {\"type\":\"tool-input-start\",\"id\":\"provisional_read\",\"toolName\":\"read_file\"}\n\n" ++
         "data: {\"type\":\"tool-input-delta\",\"id\":\"provisional_read\",\"delta\":\"{\\\"path\\\":\\\"README.md\\\"}\"}\n\n" ++
         "data: {\"type\":\"tool-input-end\",\"id\":\"provisional_read\"}\n\n" ++
@@ -4780,6 +5067,8 @@ test "consumeSseStream reconciles a changed final id with equivalent streamed in
     try std.testing.expectEqualStrings("read_file", completion.tool_calls[0].name);
     try std.testing.expectEqualStrings("{\"path\":\"README.md\"}", completion.tool_calls[0].arguments_json);
     try std.testing.expect(completion.provider_result_identity_failure == null);
+    try std.testing.expect(std.mem.find(u8, completion.provider_state_json.?, "\"toolCallId\":\"final_read\"") != null);
+    try std.testing.expect(std.mem.find(u8, completion.provider_state_json.?, "provisional_read") == null);
 }
 
 test "consumeSseStream reconciles interleaved changed ids by structural input" {

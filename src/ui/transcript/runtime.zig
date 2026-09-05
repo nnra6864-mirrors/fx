@@ -2585,7 +2585,7 @@ test "historical context-withheld tool detail keeps the call without result evid
         alloc,
         &metrics,
         .deferred,
-        "Not run — project instructions changed: Running cat nested/input.txt",
+        "Reading project instructions before continuing: Running cat nested/input.txt",
         true,
     );
     try runtime.attachHistoricalToolDetail(

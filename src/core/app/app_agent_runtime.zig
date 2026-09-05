@@ -886,7 +886,6 @@ pub fn Runtime(comptime App: type) type {
                     appAccessScope(app),
                 .interactive = true,
                 .permission_mode = permission_snapshot.mode,
-                .tracker = &app.change_tracker,
             }, arena, messages);
         }
 

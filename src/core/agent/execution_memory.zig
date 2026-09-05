@@ -78,6 +78,26 @@ pub fn buildNormalChatExecutionMemory(
     return buildNormalExecutionMemory(ChatMessageAdapter, alloc, messages);
 }
 
+test "completed tool exchange retains provider replay with its assistant" {
+    const alloc = std.testing.allocator;
+    const state = types.ProviderReplay{
+        .source = .{ .provider = .gateway, .model = "test/model" },
+        .parts_json = "[{\"type\":\"reasoning\",\"text\":\"\",\"providerOptions\":{\"openai\":{\"reasoningEncryptedContent\":\"opaque\"}}}]",
+    };
+    const calls = [_]ToolCall{.{ .id = "read", .name = "read_file", .arguments_json = "{ \"path\": \"file\" }" }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls, .provider_replay = state },
+        .{ .role = .tool, .tool_call_id = "read", .tool_name = "read_file", .content = "contents", .tool_result_status = .success },
+    };
+    const execution = try buildNormalChatExecutionMemory(alloc, &messages);
+    defer types.freeExecutionMemory(alloc, execution);
+    try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
+    const stored = execution.tool_steps[0].provider_replay orelse return error.TestExpectedProviderReplay;
+    try std.testing.expectEqualStrings(state.parts_json, stored.parts_json);
+    try std.testing.expectEqualStrings(state.source.model, stored.source.model);
+    try std.testing.expect(stored.parts_json.ptr != state.parts_json.ptr);
+}
+
 pub fn buildNormalMessageExecutionMemory(
     alloc: Allocator,
     messages: []const message.Message,
@@ -225,7 +245,14 @@ pub fn findToolCallById(calls: []const ToolCall, id: []const u8) ?ToolCall {
 }
 
 const ChatMessageAdapter = struct {
+    fn standalone(value: Message) bool {
+        return value.standalone_response or value.provider_replay != null;
+    }
     pub const Message = types.ChatMessage;
+
+    fn providerReplay(value: Message) ?types.ProviderReplay {
+        return value.provider_replay;
+    }
 
     fn isAssistant(value: Message) bool {
         return value.role == .assistant;
@@ -269,7 +296,14 @@ const ChatMessageAdapter = struct {
 };
 
 const MessageAdapter = struct {
+    fn standalone(_: Message) bool {
+        return false;
+    }
     pub const Message = message.Message;
+
+    fn providerReplay(_: Message) ?types.ProviderReplay {
+        return null;
+    }
 
     fn isAssistant(value: Message) bool {
         return value.role == .assistant;
@@ -336,7 +370,18 @@ fn buildNormalExecutionMemory(
     while (i < messages.len) {
         const msg = messages[i];
         const tool_calls = Adapter.toolCalls(msg);
-        if (!Adapter.isAssistant(msg) or tool_calls.len == 0) {
+        if (!Adapter.isAssistant(msg)) {
+            i += 1;
+            continue;
+        }
+        if (tool_calls.len == 0) {
+            if (Adapter.standalone(msg)) {
+                const assistant = if (Adapter.content(msg)) |content| try alloc.dupe(u8, content) else null;
+                errdefer if (assistant) |text| alloc.free(text);
+                const replay = try dupeUnchangedProviderReplay(alloc, Adapter.providerReplay(msg), Adapter.content(msg), assistant, &.{}, &.{});
+                errdefer if (replay) |value| types.freeProviderReplay(alloc, value);
+                try tool_steps.append(alloc, .{ .assistant = assistant, .provider_replay = replay });
+            }
             i += 1;
             continue;
         }
@@ -415,10 +460,13 @@ fn buildNormalExecutionMemory(
             results.items,
         );
         errdefer types.freeToolCallSlice(alloc, persisted_calls);
+        const replay = try dupeUnchangedProviderReplay(alloc, Adapter.providerReplay(msg), Adapter.content(msg), assistant, tool_calls, persisted_calls);
+        errdefer if (replay) |value| types.freeProviderReplay(alloc, value);
         const owned_results = try results.toOwnedSlice(alloc);
         errdefer types.freePersistedToolResults(alloc, owned_results);
         const step = types.ToolExecutionStep{
             .assistant = assistant,
+            .provider_replay = replay,
             .tool_calls = persisted_calls,
             .tool_results = owned_results,
         };
@@ -460,8 +508,35 @@ pub fn freeTransientToolExecutionStep(
     step: types.ToolExecutionStep,
 ) void {
     if (step.assistant) |assistant| alloc.free(assistant);
+    if (step.provider_replay) |replay| types.freeProviderReplay(alloc, replay);
     types.freeToolCallSlice(alloc, step.tool_calls);
     types.freePersistedToolResults(alloc, step.tool_results);
+}
+
+/// Caller owns the copy. Never bind signed metadata to redacted or incomplete history.
+pub fn dupeUnchangedProviderReplay(
+    alloc: Allocator,
+    replay: ?types.ProviderReplay,
+    source_text: ?[]const u8,
+    stored_text: ?[]const u8,
+    source_calls: []const ToolCall,
+    stored_calls: []const ToolCall,
+) !?types.ProviderReplay {
+    const value = replay orelse return null;
+    var unchanged = std.mem.eql(u8, source_text orelse "", stored_text orelse "") and source_calls.len == stored_calls.len;
+    if (unchanged) for (source_calls, stored_calls) |source, stored| {
+        if (!std.mem.eql(u8, source.id, stored.id) or !std.mem.eql(u8, source.name, stored.name) or
+            !try @import("../shared/json_comparison.zig").serializedEqual(alloc, source.arguments_json, stored.arguments_json))
+        {
+            unchanged = false;
+            break;
+        }
+    };
+    if (!unchanged) {
+        debug_trace.logf("session", "provider replay omitted reason=redacted_or_incomplete_association", .{});
+        return null;
+    }
+    return try types.dupeProviderReplay(alloc, value);
 }
 
 pub fn freeTransientPersistedToolResult(

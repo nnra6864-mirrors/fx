@@ -475,6 +475,8 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writeUserTurn(writer, entry.user);
             try writer.writeAll(",\"assistant\":");
             try writeDurableBytes(writer, entry.assistant);
+            try writer.writeAll(",\"provider_replay\":");
+            try std.json.Stringify.value(entry.provider_replay, .{}, writer);
             try writer.writeAll(",\"execution\":");
             try writeExecutionMemory(writer, entry.execution);
             try writer.writeByte('}');
@@ -589,17 +591,20 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
         } };
     }
     if (std.mem.eql(u8, kind, "assistant")) {
-        const object = try exactObject(value, &.{ "kind", "user", "assistant", "execution" });
+        const shape = try exactVariantObject(value, &.{ "kind", "user", "assistant", "execution" }, &.{ "kind", "user", "assistant", "execution", "provider_replay" });
+        const object = shape.object;
         const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat);
         errdefer session.freeUserTurn(alloc, user);
         const assistant = try parseRequiredDurableBytes(alloc, object, "assistant");
         errdefer alloc.free(assistant);
         const execution = try parseExecutionMemory(alloc, object.get("execution") orelse return error.InvalidSessionFormat);
         errdefer session.freeExecutionMemory(alloc, execution);
+        const replay = try parseProviderReplay(alloc, object.get("provider_replay") orelse .null);
         return .{ .assistant = .{
             .user = user,
             .assistant = assistant,
             .execution = execution,
+            .provider_replay = replay,
         } };
     }
     if (std.mem.eql(u8, kind, "background_command")) {
@@ -1284,17 +1289,13 @@ fn writeSnapshotLocator(writer: *std.Io.Writer, value: ?[]const u8) !void {
 }
 
 fn writeExecutionMemory(writer: *std.Io.Writer, execution: session.ExecutionMemory) !void {
-    const has_tool_images = images: {
-        for (execution.tool_steps) |step| {
-            for (step.tool_results) |result| if (result.tool_images.len > 0 or result.tool_image_handle != null) break :images true;
-        }
-        break :images false;
-    };
-    try writer.print("{{\"schema_version\":{d},\"tool_steps\":[", .{@as(u8, if (has_tool_images) 8 else 7)});
+    try writer.writeAll("{\"schema_version\":9,\"tool_steps\":[");
     for (execution.tool_steps, 0..) |step, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.writeAll("{\"assistant\":");
         try writeOptionalDurableBytes(writer, step.assistant);
+        try writer.writeAll(",\"provider_replay\":");
+        try std.json.Stringify.value(step.provider_replay, .{}, writer);
         try writer.writeAll(",\"tool_calls\":[");
         for (step.tool_calls, 0..) |tool_call, call_index| {
             if (call_index > 0) try writer.writeByte(',');
@@ -1692,7 +1693,7 @@ fn parseExecutionMemory(alloc: Allocator, value: std.json.Value) !session.Execut
         1...4 => try exactObject(value, &.{ "schema_version", "tool_steps", "files" }),
         5 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "turn_summary" }),
         6 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
-        7, 8 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
+        7...9 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
         else => return error.InvalidSessionFormat,
     };
     const tool_steps = try parseToolSteps(
@@ -1824,11 +1825,15 @@ fn parseToolSteps(
     var parsed_count: usize = 0;
     errdefer for (steps[0..parsed_count]) |step| {
         if (step.assistant) |assistant| alloc.free(assistant);
+        if (step.provider_replay) |replay| types.freeProviderReplay(alloc, replay);
         session.freeToolCallSlice(alloc, step.tool_calls);
         session.freePersistedToolResults(alloc, step.tool_results);
     };
     for (value.array.items, 0..) |step_value, i| {
-        const object = try exactObject(step_value, &.{ "assistant", "tool_calls", "tool_results" });
+        const object = if (schema_version >= 9)
+            try exactObject(step_value, &.{ "assistant", "tool_calls", "tool_results", "provider_replay" })
+        else
+            try exactObject(step_value, &.{ "assistant", "tool_calls", "tool_results" });
         const assistant = try parseOptionalDurableBytes(alloc, object.get("assistant") orelse return error.InvalidSessionFormat);
         errdefer if (assistant) |owned| alloc.free(owned);
         const tool_calls = try parseToolCalls(alloc, object.get("tool_calls") orelse return error.InvalidSessionFormat);
@@ -1840,14 +1845,30 @@ fn parseToolSteps(
         );
         errdefer session.freePersistedToolResults(alloc, tool_results);
         try session.repairPersistedToolArguments(alloc, tool_calls, tool_results, .schema_v3);
+        const replay = try parseProviderReplay(alloc, object.get("provider_replay") orelse .null);
         steps[i] = .{
             .assistant = assistant,
+            .provider_replay = replay,
             .tool_calls = tool_calls,
             .tool_results = tool_results,
         };
         parsed_count += 1;
     }
     return steps;
+}
+
+fn parseProviderReplay(alloc: Allocator, value: std.json.Value) !?types.ProviderReplay {
+    if (value == .null) return null;
+    const parsed = std.json.parseFromValue(types.ProviderReplay, alloc, value, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidSessionFormat,
+    };
+    defer parsed.deinit();
+    const replay = parsed.value;
+    if (types.ConversationIdentity.invalidReason(replay.source.model) != null or
+        replay.parts_json.len == 0 or replay.parts_json.len > types.ProviderReplay.max_bytes or
+        !std.unicode.utf8ValidateSlice(replay.parts_json)) return error.InvalidSessionFormat;
+    return try types.dupeProviderReplay(alloc, replay);
 }
 
 fn parseToolCalls(alloc: Allocator, value: std.json.Value) ![]session.ToolCall {
@@ -2029,7 +2050,7 @@ fn parseToolResult(
         2 => try exactVariantObject(value, v2_keys, v2_extended_keys),
         3 => .{ .object = try exactObject(value, v3_keys), .extended = true },
         4, 5, 6, 7 => .{ .object = try exactObject(value, v4_keys), .extended = true },
-        8 => .{ .object = if (value == .object and value.object.contains("tool_images"))
+        8, 9 => .{ .object = if (value == .object and value.object.contains("tool_images"))
             try exactObject(value, &(v4_keys.* ++ [_][]const u8{"tool_images"}))
         else if (value == .object and value.object.contains("tool_image_handle"))
             try exactObject(value, &(v4_keys.* ++ [_][]const u8{"tool_image_handle"}))
@@ -3261,6 +3282,7 @@ test "durable state rejects invalid metadata fields before returning" {
 
 test "execution memory codec preserves feedback and reads v1 results without it" {
     const alloc = std.testing.allocator;
+    const provider_state = types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"kept\"}]" };
     var feedback = [_][]u8{@constCast("read it after writing")};
     const presentation_lines = [_]types.CommittedFilePresentationLine{
         .{ .kind = .addition, .new_line = 1, .text = "persisted line" },
@@ -3276,6 +3298,7 @@ test "execution memory codec preserves feedback and reads v1 results without it"
         .tool_name = @constCast("write_file"),
         .status = .success,
         .output = @constCast("wrote note.txt"),
+        .tool_image_handle = @constCast("saved-tool-image"),
         .output_bytes = 15,
         .stored_output_bytes = 15,
         .permission_feedback = feedback[0..],
@@ -3299,6 +3322,7 @@ test "execution memory codec preserves feedback and reads v1 results without it"
         .command_process_presentation = .{ .exit_code = 7 },
     }};
     var steps = [_]session.ToolExecutionStep{.{
+        .provider_replay = provider_state,
         .tool_calls = calls[0..],
         .tool_results = results[0..],
     }};
@@ -3308,6 +3332,7 @@ test "execution memory codec preserves feedback and reads v1 results without it"
         .after_tool_step_count = 1,
     }};
     const turn: session.HistoryTurn = .{ .assistant = .{
+        .provider_replay = provider_state,
         .user = .{ .text = @constCast("write a note") },
         .assistant = @constCast("done"),
         .execution = .{
@@ -3326,7 +3351,7 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     var encoded: std.Io.Writer.Allocating = .init(alloc);
     defer encoded.deinit();
     try writeHistoryTurn(&encoded.writer, turn);
-    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"schema_version\":7") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"schema_version\":9") != null);
     try std.testing.expect(std.mem.find(u8, encoded.written(), "\"text\":\"focus on persistence\"") != null);
     try std.testing.expect(std.mem.find(u8, encoded.written(), "\"assistant_prefix\":\"partial assistant\"") != null);
     try std.testing.expect(std.mem.find(u8, encoded.written(), "\"after_tool_step_count\":1") != null);
@@ -3340,6 +3365,9 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     const decoded = try parseHistoryTurn(alloc, parsed.value);
     defer session.freeHistoryTurn(alloc, decoded);
     const decoded_result = decoded.assistant.execution.tool_steps[0].tool_results[0];
+    try std.testing.expectEqualStrings(provider_state.parts_json, decoded.assistant.provider_replay.?.parts_json);
+    try std.testing.expectEqualStrings(provider_state.parts_json, decoded.assistant.execution.tool_steps[0].provider_replay.?.parts_json);
+    try std.testing.expectEqualStrings("saved-tool-image", decoded_result.tool_image_handle.?);
     try std.testing.expectEqual(
         turn.assistant.execution.turn_summary,
         decoded.assistant.execution.turn_summary,
@@ -3380,6 +3408,16 @@ test "execution memory codec preserves feedback and reads v1 results without it"
         types.CommandProcessPresentation{ .exit_code = 7 },
         decoded_result.command_process_presentation.?,
     );
+
+    try std.testing.expect(parsed.value.object.swapRemove("provider_replay"));
+    const legacy_execution = parsed.value.object.getPtr("execution").?;
+    legacy_execution.object.getPtr("schema_version").?.* = .{ .integer = 8 };
+    try std.testing.expect(legacy_execution.object.getPtr("tool_steps").?.array.items[0].object.swapRemove("provider_replay"));
+    const v8_decoded = try parseHistoryTurn(alloc, parsed.value);
+    defer session.freeHistoryTurn(alloc, v8_decoded);
+    try std.testing.expect(v8_decoded.assistant.provider_replay == null);
+    try std.testing.expect(v8_decoded.assistant.execution.tool_steps[0].provider_replay == null);
+    try std.testing.expectEqualStrings("saved-tool-image", v8_decoded.assistant.execution.tool_steps[0].tool_results[0].tool_image_handle.?);
 
     const v1 =
         "{\"kind\":\"assistant\",\"user\":{\"text\":\"write a note\",\"images\":[]},\"assistant\":\"done\",\"execution\":{\"schema_version\":1,\"tool_steps\":[{\"assistant\":null,\"tool_calls\":[{\"id\":\"call_feedback\",\"name\":\"write_file\",\"arguments_json\":\"{\\\"path\\\":\\\"note.txt\\\"}\",\"provider_result\":null}],\"tool_results\":[{\"tool_call_id\":\"call_feedback\",\"tool_name\":\"write_file\",\"status\":\"success\",\"output\":\"wrote note.txt\",\"output_handle\":null,\"preview\":null,\"output_bytes\":15,\"stored_output_bytes\":15,\"truncated\":false,\"provider_native\":false,\"created_at_ms\":1}]}],\"files\":[]}}";

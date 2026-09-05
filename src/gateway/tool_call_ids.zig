@@ -21,7 +21,7 @@ pub const Projection = struct {
                 needed = needed or !portable(id);
             }
             if (message.role != .assistant) continue;
-            opaque_history = opaque_history or message.provider_state_json != null;
+            opaque_history = opaque_history or message.provider_replay != null;
             for (message.tool_calls) |call| {
                 if (call.id.len == 0) return error.InvalidToolCallId;
                 if (portable(call.id)) continue;
@@ -36,7 +36,7 @@ pub const Projection = struct {
             if (message.role == .assistant) {
                 for (message.tool_calls) |call| {
                     const entry = try self.ids.getOrPut(alloc, call.id);
-                    const protected = call.provenance == .provider_executed or message.provider_state_json != null;
+                    const protected = call.provenance == .provider_executed or message.provider_replay != null;
                     if (!entry.found_existing) entry.value_ptr.* = .{ .wire = call.id, .protected = false };
                     entry.value_ptr.protected = entry.value_ptr.protected or protected;
                 }
@@ -51,7 +51,7 @@ pub const Projection = struct {
             if (message.role != .assistant) continue;
             for (message.tool_calls) |call| {
                 if (portable(self.resolve(call.id))) continue;
-                if (call.provenance == .provider_executed or message.provider_state_json != null) continue;
+                if (call.provenance == .provider_executed or message.provider_replay != null) continue;
                 if (self.ids.get(call.id).?.protected) return error.ProtectedToolCallId;
                 var digest: [32]u8 = undefined;
                 std.crypto.hash.sha2.Sha256.hash(call.id, &digest, .{});
@@ -124,7 +124,7 @@ test "tool call id projection ignores fields not serialized for a role" {
         .content = "question",
         .tool_calls = &calls,
         .tool_call_id = "ignored:0",
-        .provider_state_json = "ignored",
+        .provider_replay = .{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "ignored" },
     }});
     defer projection.deinit(failing.allocator());
     try std.testing.expectEqual(@as(usize, 0), projection.owned.items.len);
@@ -167,7 +167,7 @@ test "tool call id projection avoids aliases reserved by portable calls" {
     try std.testing.expect(portable(second.resolve(source)));
     try std.testing.expectError(error.ProtectedToolCallId, Projection.init(alloc, &.{
         .{ .role = .assistant, .tool_calls = &calls },
-        .{ .role = .assistant, .tool_calls = colliding_calls[1..], .provider_state_json = "opaque" },
+        .{ .role = .assistant, .tool_calls = colliding_calls[1..], .provider_replay = .{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "opaque" } },
     }));
 }
 
@@ -178,7 +178,7 @@ test "tool call id projection never rewrites protected identities" {
     defer native.deinit(alloc);
     try std.testing.expectEqualStrings(call.id, native.resolve(call.id));
     call.provenance = .fx_local;
-    var projection = try Projection.init(alloc, &.{.{ .role = .assistant, .tool_calls = &.{call}, .provider_state_json = "opaque" }});
+    var projection = try Projection.init(alloc, &.{.{ .role = .assistant, .tool_calls = &.{call}, .provider_replay = .{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "opaque" } }});
     defer projection.deinit(alloc);
     try std.testing.expectEqualStrings(call.id, projection.resolve(call.id));
     const native_call = types.ToolCall{ .id = call.id, .name = "native", .arguments_json = "{}", .provenance = .provider_executed };

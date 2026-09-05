@@ -697,6 +697,12 @@ fn writeChatMessageJsonInner(
     try writer.writeAll("{\"role\":");
     try std.json.Stringify.value(roleName(message.role), .{}, writer);
 
+    if (message.role == .assistant) if (message.provider_replay) |replay| {
+        try writeReplayContent(scratch_alloc, writer, message, replay, ids, budget);
+        try writer.writeByte('}');
+        return;
+    };
+
     switch (message.role) {
         .system => {
             try writer.writeAll(",\"content\":");
@@ -764,13 +770,7 @@ fn writeChatMessageJsonInner(
             }
             for (message.tool_calls) |tool_call| {
                 if (wrote_part) try writer.writeByte(',');
-                try writer.writeAll("{\"type\":\"tool-call\",\"toolCallId\":");
-                try std.json.Stringify.value(ids.resolve(tool_call.id), .{}, writer);
-                try writer.writeAll(",\"toolName\":");
-                try std.json.Stringify.value(tool_call.name, .{}, writer);
-                try writer.writeAll(",\"input\":");
-                try writer.writeAll(tool_call.arguments_json);
-                try writer.writeByte('}');
+                try writeToolCallPart(writer, tool_call, null, ids);
                 wrote_part = true;
             }
             try writer.writeByte(']');
@@ -783,6 +783,159 @@ fn writeChatMessageJsonInner(
     }
 
     try writer.writeAll("}");
+}
+
+fn writeToolCallPart(writer: *std.Io.Writer, call: ToolCall, metadata: ?std.json.Value, ids: *const tool_call_ids.Projection) !void {
+    try writer.writeAll("{\"type\":\"tool-call\",\"toolCallId\":");
+    try std.json.Stringify.value(ids.resolve(call.id), .{}, writer);
+    try writer.writeAll(",\"toolName\":");
+    try std.json.Stringify.value(call.name, .{}, writer);
+    try writer.writeAll(",\"input\":");
+    try writer.writeAll(call.arguments_json);
+    try writeReplayMetadata(writer, metadata);
+    try writer.writeByte('}');
+}
+
+fn writeReplayMetadata(writer: *std.Io.Writer, metadata: ?std.json.Value) !void {
+    const value = metadata orelse return;
+    if (value != .object) return error.InvalidProviderState;
+    for (value.object.values()) |options| if (options != .object) return error.InvalidProviderState;
+    try writer.writeAll(",\"providerOptions\":");
+    try std.json.Stringify.value(value, .{}, writer);
+}
+
+/// Borrows unchanged replay, otherwise uses the caller's request arena. Selects
+/// metadata for the assistant unit after core splits a provider-executed reply.
+pub fn selectReplayParts(
+    arena: std.mem.Allocator,
+    replay: ?types.ProviderReplay,
+    calls: []const ToolCall,
+    include_text: bool,
+    include_reasoning: bool,
+) !?types.ProviderReplay {
+    const source = replay orelse return null;
+    if (source.source.provider != .gateway) return error.InvalidProviderState;
+    if (source.parts_json.len > types.ProviderReplay.max_bytes) return error.ProviderStateTooLarge;
+    const parsed = std.json.parseFromSlice(std.json.Value, arena, source.parts_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidProviderState,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .array) return error.InvalidProviderState;
+    var selected: std.ArrayList(std.json.Value) = .empty;
+    defer selected.deinit(arena);
+    for (parsed.value.array.items) |part| {
+        if (part != .object) return error.InvalidProviderState;
+        const kind = part.object.get("type") orelse return error.InvalidProviderState;
+        if (kind != .string) return error.InvalidProviderState;
+        const keep = if (std.mem.eql(u8, kind.string, "text")) include_text else if (std.mem.eql(u8, kind.string, "reasoning")) include_reasoning else if (std.mem.eql(u8, kind.string, "tool-call")) blk: {
+            const id = part.object.get("toolCallId") orelse return error.InvalidProviderState;
+            if (id != .string) return error.InvalidProviderState;
+            break :blk findToolCallIndex(calls, id.string) != null;
+        } else return error.InvalidProviderState;
+        if (keep) try selected.append(arena, part);
+    }
+    if (selected.items.len == 0) return null;
+    if (selected.items.len == parsed.value.array.items.len) return source;
+    var out: std.Io.Writer.Allocating = .init(arena);
+    errdefer out.deinit();
+    try std.json.Stringify.value(selected.items, .{}, &out.writer);
+    return .{ .source = source.source, .parts_json = try out.toOwnedSlice() };
+}
+
+test "split provider completion retains metadata with each canonical assistant unit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const replay = types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"reason\"},{\"type\":\"tool-call\",\"toolCallId\":\"call\",\"providerOptions\":{\"vertex\":{\"thoughtSignature\":\"signed\"}}},{\"type\":\"text\",\"offset\":0,\"length\":4,\"providerOptions\":{\"openai\":{\"itemId\":\"text\"}}}]" };
+    const calls = [_]ToolCall{.{ .id = "call", .name = "search", .arguments_json = "{}", .provenance = .provider_executed }};
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls, .provider_replay = try selectReplayParts(alloc, replay, &calls, false, true) },
+        .{ .role = .tool, .tool_call_id = "call", .tool_name = "search", .content = "result" },
+        .{ .role = .assistant, .content = "done", .provider_replay = try selectReplayParts(alloc, replay, &.{}, true, false) },
+    };
+    const body = try buildGatewayRequestBody(alloc, "[]", &messages);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    const prompt = parsed.value.object.get("prompt").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), prompt[0].object.get("content").?.array.items.len);
+    try std.testing.expectEqualStrings("signed", prompt[0].object.get("content").?.array.items[1].object.get("providerOptions").?.object.get("vertex").?.object.get("thoughtSignature").?.string);
+    try std.testing.expectEqual(@as(usize, 1), prompt[2].object.get("content").?.array.items.len);
+    try std.testing.expectEqualStrings("text", prompt[2].object.get("content").?.array.items[0].object.get("providerOptions").?.object.get("openai").?.object.get("itemId").?.string);
+}
+
+fn writeReplayContent(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    message: ChatMessage,
+    replay: types.ProviderReplay,
+    ids: *const tool_call_ids.Projection,
+    budget: ?BuildBudget,
+) !void {
+    if (replay.source.provider != .gateway) return error.InvalidProviderState;
+    if (replay.parts_json.len > types.ProviderReplay.max_bytes) return error.ProviderStateTooLarge;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, replay.parts_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidProviderState,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .array) return error.InvalidProviderState;
+    const seen_calls = try alloc.alloc(bool, message.tool_calls.len);
+    defer alloc.free(seen_calls);
+    @memset(seen_calls, false);
+    const content = message.content orelse "";
+    var text_end: usize = 0;
+    var wrote_part = false;
+    try writer.writeAll(",\"content\":[");
+    for (parsed.value.array.items) |part| {
+        if (budget) |active| try active.check();
+        if (part != .object) return error.InvalidProviderState;
+        const kind = part.object.get("type") orelse return error.InvalidProviderState;
+        if (kind != .string) return error.InvalidProviderState;
+        if (wrote_part) try writer.writeByte(',');
+        const metadata = part.object.get("providerOptions");
+        if (std.mem.eql(u8, kind.string, "reasoning")) {
+            const text_value = part.object.get("text") orelse return error.InvalidProviderState;
+            if (text_value != .string) return error.InvalidProviderState;
+            try writer.writeAll("{\"type\":\"reasoning\",\"text\":");
+            try std.json.Stringify.value(text_value.string, .{}, writer);
+            try writeReplayMetadata(writer, metadata);
+            try writer.writeByte('}');
+        } else if (std.mem.eql(u8, kind.string, "text")) {
+            const offset_value = part.object.get("offset") orelse return error.InvalidProviderState;
+            const length_value = part.object.get("length") orelse return error.InvalidProviderState;
+            if (offset_value != .integer or length_value != .integer) return error.InvalidProviderState;
+            const offset = std.math.cast(usize, offset_value.integer) orelse return error.InvalidProviderState;
+            const length = std.math.cast(usize, length_value.integer) orelse return error.InvalidProviderState;
+            if (offset != text_end or offset > content.len or length > content.len - offset) return error.InvalidProviderState;
+            text_end = offset + length;
+            try writer.writeAll("{\"type\":\"text\",\"text\":");
+            try std.json.Stringify.value(content[offset..text_end], .{}, writer);
+            try writeReplayMetadata(writer, metadata);
+            try writer.writeByte('}');
+        } else if (std.mem.eql(u8, kind.string, "tool-call")) {
+            const call_id = part.object.get("toolCallId") orelse return error.InvalidProviderState;
+            if (call_id != .string) return error.InvalidProviderState;
+            const index = findToolCallIndex(message.tool_calls, call_id.string) orelse return error.InvalidProviderState;
+            if (seen_calls[index]) return error.InvalidProviderState;
+            seen_calls[index] = true;
+            try writeToolCallPart(writer, message.tool_calls[index], metadata, ids);
+        } else return error.InvalidProviderState;
+        wrote_part = true;
+    }
+    if (text_end < content.len) {
+        if (wrote_part) try writer.writeByte(',');
+        try writer.writeAll("{\"type\":\"text\",\"text\":");
+        try std.json.Stringify.value(content[text_end..], .{}, writer);
+        try writer.writeByte('}');
+        wrote_part = true;
+    }
+    for (message.tool_calls, seen_calls) |call, seen| {
+        if (seen) continue;
+        if (wrote_part) try writer.writeByte(',');
+        try writeToolCallPart(writer, call, null, ids);
+        wrote_part = true;
+    }
+    try writer.writeByte(']');
 }
 
 pub fn formatGatewayRequestShapeSummary(alloc: std.mem.Allocator, payload: []const u8) ![]u8 {
@@ -1209,6 +1362,30 @@ test "writeChatMessageJson maps tool result status to the Vercel output variant"
     }
 }
 
+test "Gateway request replays reasoning and call metadata without changing canonical input" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{.{ .id = "call-1", .name = "read_file", .arguments_json = "{\"path\":\"file\"}" }};
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .content = "visible", .tool_calls = &calls, .provider_replay = .{
+            .source = .{ .provider = .gateway, .model = "test" },
+            .parts_json = "[{\"type\":\"reasoning\",\"text\":\"\",\"providerOptions\":{\"openai\":{\"reasoningEncryptedContent\":\"opaque\"}}},{\"type\":\"text\",\"offset\":0,\"length\":7},{\"type\":\"tool-call\",\"toolCallId\":\"call-1\",\"providerOptions\":{\"vertex\":{\"thoughtSignature\":\"signature\"}}}]",
+        } },
+        .{ .role = .tool, .tool_call_id = "call-1", .tool_name = "read_file", .content = "result" },
+    };
+    const body = try buildGatewayRequestBody(alloc, "[]", &messages);
+    defer alloc.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const parts = parsed.value.object.get("prompt").?.array.items[0].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), parts.len);
+    try std.testing.expectEqualStrings("reasoning", parts[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("opaque", parts[0].object.get("providerOptions").?.object.get("openai").?.object.get("reasoningEncryptedContent").?.string);
+    try std.testing.expectEqualStrings("visible", parts[1].object.get("text").?.string);
+    try std.testing.expectEqualStrings("read_file", parts[2].object.get("toolName").?.string);
+    try std.testing.expectEqualStrings("file", parts[2].object.get("input").?.object.get("path").?.string);
+    try std.testing.expectEqualStrings("signature", parts[2].object.get("providerOptions").?.object.get("vertex").?.object.get("thoughtSignature").?.string);
+}
+
 test "Gateway automatic caching preserves transient context and grouped tool results" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
@@ -1380,7 +1557,7 @@ test "pending review and model requests enforce the same prompt lanes" {
     const invalid = [_]ChatMessage{
         .{ .role = .user, .content = "not instructions" },
         .{ .role = .system },
-        .{ .role = .system, .content = "rules", .provider_state_json = "{}" },
+        .{ .role = .system, .content = "rules", .provider_replay = .{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "{}" } },
         .{ .role = .system, .content = "rules", .permission_feedback = true },
     };
     for (invalid) |instruction| {

@@ -4341,7 +4341,7 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "context-withheld scoped tools remain explicitly not run after resume",
+  "instruction refresh stays neutral after resume",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-deferred-tools-")));
     const home = join(root, "home");
@@ -4454,9 +4454,9 @@ test.skipIf(!tmuxAvailable())(
 
     function expectDeferredPresentation(scrollback: string): void {
       expect(scrollback).toContain("1 failed");
-      expect(scrollback).toContain("1 command not run");
+      expect(scrollback).not.toContain("command not run");
       expect(scrollback).not.toContain("1 deferred");
-      expect(scrollback).toContain(`Not run — project instructions changed: ${command}`);
+      expect(scrollback).toContain(`Reading project instructions before continuing: ${command}`);
       expect(scrollback).not.toContain("Not executed");
       expect(scrollback).not.toContain("├ terminal");
       expect(scrollback).not.toContain("└ terminal");
@@ -4512,16 +4512,16 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("C-o");
       const detail = await active.waitForPane(
         (pane) =>
-          pane.includes(`Not run — project instructions changed: ${command}`) &&
+          pane.includes(`Reading project instructions before continuing: ${command}`) &&
           pane.includes("ordinary-failure-control"),
         TIMEOUT,
       );
-      expect(countOccurrences(detail, "Not run — project instructions changed:")).toBe(1);
+      expect(countOccurrences(detail, "Reading project instructions before continuing:")).toBe(1);
       expect(detail).not.toContain("Not executed");
       expect(detail).not.toContain('{"path":"nested/input.txt"}');
       expect(detail).not.toContain(JSON.stringify({ command, cwd: "nested" }));
       expect(detail).toContain(failureCommand);
-      expect(detail).toContain("1 command not run");
+      expect(detail).not.toContain("command not run");
       expect(detail).not.toContain("1 deferred");
       expect(detail).toContain("1 failed");
       expect(readFileSync(resumeStderrPath, "utf8")).toBe("");

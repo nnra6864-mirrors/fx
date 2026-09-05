@@ -2437,6 +2437,7 @@ test "provider search finalizes when stop includes provider result and final ans
     }};
     const completions = [_]FakeCompletion{.{
         .content = "Final [source](https://example.test/source)",
+        .provider_state_json = "[{\"type\":\"reasoning\",\"text\":\"private\"},{\"type\":\"tool-call\",\"toolCallId\":\"provider_search\",\"providerOptions\":{\"test\":{\"signature\":\"call\"}}},{\"type\":\"text\",\"offset\":0,\"length\":" ++ std.fmt.comptimePrint("{d}", .{"Final [source](https://example.test/source)".len}) ++ ",\"providerOptions\":{\"test\":{\"signature\":\"text\"}}}]",
         .tool_calls = &calls,
         .finish_reason = .stop,
     }};
@@ -2476,6 +2477,10 @@ test "provider search finalizes when stop includes provider result and final ans
     try std.testing.expect(step.assistant == null);
     try std.testing.expectEqual(@as(usize, 1), step.tool_results.len);
     try std.testing.expectEqualStrings(provider_result, step.tool_results[0].output);
+    try std.testing.expect(std.mem.find(u8, step.provider_replay.?.parts_json, "private") != null);
+    try std.testing.expect(std.mem.find(u8, step.provider_replay.?.parts_json, "\"signature\":\"text\"") == null);
+    try std.testing.expect(std.mem.find(u8, turn.provider_replay.?.parts_json, "\"signature\":\"text\"") != null);
+    try std.testing.expect(std.mem.find(u8, turn.provider_replay.?.parts_json, "private") == null);
 }
 
 test "interactive authoritative identity reconciles changed provisional id" {
@@ -3185,7 +3190,7 @@ test "modern context delta defers effectful call exactly once" {
     const terminal = hooks.lifecycle_events.items[2].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.deferred, terminal.outcome.kind);
     try std.testing.expectEqualStrings(
-        "Not run — project instructions changed: write_file",
+        "Reading project instructions before continuing: write_file",
         terminal.outcome.summary,
     );
 }

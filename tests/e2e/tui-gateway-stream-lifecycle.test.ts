@@ -1384,6 +1384,31 @@ async function launchRouteRecoveryTui(
 }
 
 describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
+  test("file edits keep earlier instruction bytes stable", async () => {
+    const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+      "fx-tui-stable-verification-",
+      [
+        fakeGatewayToolCall("write_first", "write_file", { path: "first.txt", content: "first\n" }),
+        fakeGatewayToolCall("write_second", "write_file", { path: "second.txt", content: "second\n" }),
+        fakeGatewayFinalText("STABLE_VERIFICATION_DONE"),
+      ],
+    );
+    await session!.sendText("Create first.txt and second.txt with their respective contents.");
+    await session!.waitForText("STABLE_VERIFICATION_DONE", TIMEOUT);
+    await session!.waitForComposer(TIMEOUT);
+    expect(queuedGateway.requests).toHaveLength(3);
+    const instructions = queuedGateway.requests.map((request) =>
+      JSON.parse(request.body).prompt.filter((message: { role: string }) => message.role === "system")
+    );
+    expect(instructions[0].length).toBeGreaterThan(0);
+    expect(instructions[1]).toEqual(instructions[0]);
+    expect(instructions[2]).toEqual(instructions[0]);
+    expect(readFileSync(join(root!, "workspace", "first.txt"), "utf8")).toBe("first\n");
+    expect(readFileSync(join(root!, "workspace", "second.txt"), "utf8")).toBe("second\n");
+    expect(await session!.captureFullScrollback()).toContain("STABLE_VERIFICATION_DONE");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  }, TIMEOUT);
+
   test(
     "clear response language mismatch never reaches TUI scrollback",
     async () => {
@@ -4705,6 +4730,100 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     60_000,
+  );
+
+  test(
+    "instruction refresh resumes the command without a failed compact summary",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-instruction-refresh-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const nested = join(workspace, "nested");
+      const markerPath = join(nested, "executions.log");
+      const stderrPath = join(root, "stderr.log");
+      const tapePath = join(root, "session.fxtape");
+      const instruction = "NESTED_INSTRUCTION_REFRESH_SENTINEL";
+      const command = "cat AGENTS.md && printf 'executed\\n' >> executions.log";
+      const finalText = "INSTRUCTION_REFRESH_FINAL";
+      const refreshLabel = "Reading project instructions before continuing:";
+      const header = "● 2 tool calls · 2 commands";
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(nested, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(nested, "AGENTS.md"), `${instruction}\n`);
+
+      let executedBeforeRetry: boolean | undefined;
+      let executionAtFinal: string | undefined;
+      const refreshGateway = startFakeGateway([
+        fakeShellRun("before_instruction_refresh", command, { cwd: nested }),
+        () => {
+          executedBeforeRetry = existsSync(markerPath);
+          return fakeShellRun("after_instruction_refresh", command, { cwd: nested });
+        },
+        () => {
+          executionAtFinal = existsSync(markerPath)
+            ? readFileSync(markerPath, "utf8")
+            : undefined;
+          return fakeGatewayFinalText(finalText);
+        },
+      ]);
+      gateway = refreshGateway;
+      session = await TmuxSession.create({
+        cwd: workspace,
+        width: 120,
+        height: 40,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-instruction-refresh-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_PERMISSION_MODE: "auto",
+          FX_GATEWAY_BASE_URL: refreshGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: refreshGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: refreshGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_RECORD: tapePath,
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Read nested/AGENTS.md and record one execution in nested/executions.log.");
+      await session.waitForText(finalText, TIMEOUT);
+      await session.waitForText(header, TIMEOUT);
+      const compact = await session.captureFullScrollback();
+      const escapes = await session.captureFullScrollbackEscapes();
+
+      expect(refreshGateway.requests).toHaveLength(3);
+      expect(refreshGateway.requests[0]!.body).not.toContain(instruction);
+      expect(refreshGateway.requests[1]!.body).toContain(instruction);
+      expect(refreshGateway.requests[1]!.body).toContain(
+        "Scoped project instructions were added before execution.",
+      );
+      expect(executedBeforeRetry).toBe(false);
+      expect(executionAtFinal).toBe("executed\n");
+      expect(readFileSync(markerPath, "utf8")).toBe("executed\n");
+      expect(compact).toContain(`${header}\n`);
+      expect(compact).toContain(refreshLabel);
+      expect(compact).toContain(`Ran ${command}`);
+      expect(hasEmptyComposer(await session.capturePane())).toBe(true);
+      for (const output of [compact, escapes]) {
+        expect(output).not.toMatch(/command not run|project instructions changed|\bfailed\b/i);
+      }
+      expect(session.isAlive()).toBe(true);
+      expect(session.isPaneAlive()).toBe(true);
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      const recorded = Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload))
+        .toString("utf8");
+      expect(recorded).toContain(refreshLabel);
+      expect(recorded).not.toMatch(/command not run|project instructions changed/i);
+      const replay = execFileSync(FX_BIN, ["replay", tapePath], { encoding: "utf8" });
+      expect(replay).toContain(finalText);
+    },
+    TIMEOUT,
   );
 
   test(

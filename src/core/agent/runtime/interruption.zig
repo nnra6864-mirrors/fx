@@ -115,15 +115,15 @@ fn persistInterruptedTurnWithPresentation(
     terminal_materializing.* = true;
 
     if (retained_candidate) |candidate| {
-        const assistant = try lifecycle_hooks.prompt.joinVisibleSegments(
+        const assistant = try runtime_finalization.stopTerminalText(
             std.heap.c_allocator,
             candidate,
             partial_assistant,
         );
-        defer std.heap.c_allocator.free(@constCast(assistant));
+        defer if (assistant.presentation) |text| std.heap.c_allocator.free(text);
         const turn: HistoryTurn = .{ .interrupted = .{
             .user = .{ .text = job.prompt, .images = job.images },
-            .assistant = @constCast(assistant),
+            .assistant = @constCast(assistant.history),
             .tool_call = durable_active_tool_call,
             .completed_tool_names = completed_tool_names,
             .execution = execution,
@@ -134,6 +134,7 @@ fn persistInterruptedTurnWithPresentation(
             .{
                 .turn = turn,
                 .terminal_projection = .assistant_text,
+                .presentation_text = assistant.presentation,
             },
         );
 
@@ -144,7 +145,7 @@ fn persistInterruptedTurnWithPresentation(
         };
         try traceInterruptedPersistence(
             job,
-            assistant,
+            assistant.history,
             active_tool_call,
             completed_tool_names,
             trace_ctx,

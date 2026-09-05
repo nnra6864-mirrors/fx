@@ -1,5 +1,4 @@
 const std = @import("std");
-const change_tracker = @import("change_tracker.zig");
 const types = @import("../shared/types.zig");
 const context_limits = @import("../config/context_limits.zig");
 const workspace_access = @import("workspace_access.zig");
@@ -250,7 +249,6 @@ pub const TransientContextInput = struct {
     access_scope: ?workspace_access.AccessScope = null,
     interactive: bool,
     permission_mode: types.PermissionMode,
-    tracker: ?*change_tracker.ChangeTracker,
 };
 
 pub const Provider = struct {
@@ -774,8 +772,6 @@ test "context registry routes the default provider" {
     defer snapshot.deinit(alloc);
     const contribution = snapshot.contribution orelse return error.TestExpectedEqual;
 
-    var tracker: change_tracker.ChangeTracker = .{};
-    defer tracker.deinit(alloc);
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -787,7 +783,6 @@ test "context registry routes the default provider" {
         .workspace_root = "/workspace",
         .interactive = true,
         .permission_mode = .ask,
-        .tracker = &tracker,
     }, arena, &messages);
 
     try std.testing.expectEqual(@as(usize, 2), messages.items.len);

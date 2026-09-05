@@ -1,4 +1,5 @@
 const std = @import("std");
+const debug_trace = @import("../core/shared/debug_trace.zig");
 const chatgpt_oauth = @import("../core/auth/chatgpt_oauth.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const secret = @import("../core/auth/secret.zig");
@@ -36,6 +37,7 @@ const CodexLimits = struct {
 pub const agent_stream_provider = stream_provider.Provider{
     .stream_fn = streamCompletion,
     .build_request_fn = buildRequestForProvider,
+    .project_replay_fn = responses_protocol.selectReplayParts,
 };
 
 fn validateModel(model: []const u8) !void {
@@ -56,6 +58,9 @@ pub fn buildRequest(
     else
         .{};
     try budget.check();
+    const projected = try types.projectProviderReplay(alloc, request.messages, .{ .provider = .codex, .model = request.model });
+    defer if (projected) |messages| alloc.free(messages);
+    if (projected != null) debug_trace.logf("gateway", "provider_replay_omitted provider=codex reason=source_mismatch", .{});
 
     var instructions: std.Io.Writer.Allocating = .init(alloc);
     defer instructions.deinit();
@@ -75,7 +80,7 @@ pub fn buildRequest(
     try writer.writeAll(",\"store\":false,\"stream\":true,\"instructions\":");
     try std.json.Stringify.value(instructions.written(), .{}, writer);
     try writer.writeAll(",\"input\":[");
-    try writeResponsesInput(writer, std.heap.c_allocator, request.messages, request.verified_images, budget);
+    try writeResponsesInput(writer, std.heap.c_allocator, projected orelse request.messages, request.verified_images, budget);
     try writer.writeByte(']');
 
     _ = try responses_protocol.writeTools(writer, alloc, request.tools);
@@ -503,7 +508,7 @@ test "OpenAI Codex request uses Responses input and converts AI SDK tool schemas
         .{
             .role = .assistant,
             .tool_calls = &.{.{ .id = "call_1", .name = "read_file", .arguments_json = "{\"path\":\"README.md\"}" }},
-            .provider_state_json = "[{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}]",
+            .provider_replay = .{ .source = .{ .provider = .codex, .model = "gpt-5.4" }, .parts_json = "[{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}]" },
         },
         .{ .role = .tool, .tool_call_id = "call_1", .tool_name = "read_file", .content = "contents" },
     };
@@ -579,7 +584,7 @@ test "OpenAI Codex replay provider state accepts the limit and rejects one byte 
         defer std.testing.allocator.free(provider_state);
         const messages = [_]types.ChatMessage{.{
             .role = .assistant,
-            .provider_state_json = provider_state,
+            .provider_replay = .{ .source = .{ .provider = .codex, .model = "gpt-5.6-sol" }, .parts_json = provider_state },
         }};
         try expectOpenAICodexReplaySuccess(&messages);
     }
@@ -588,7 +593,7 @@ test "OpenAI Codex replay provider state accepts the limit and rejects one byte 
         defer std.testing.allocator.free(provider_state);
         const messages = [_]types.ChatMessage{.{
             .role = .assistant,
-            .provider_state_json = provider_state,
+            .provider_replay = .{ .source = .{ .provider = .codex, .model = "gpt-5.6-sol" }, .parts_json = provider_state },
         }};
         try expectOpenAICodexReplayError(error.OpenAICodexProviderStateTooLarge, &messages);
     }

@@ -15,7 +15,7 @@ pub const raw_state_chunk_bytes: usize = 4 * 1024 * 1024;
 pub const Identifier = [16]u8;
 pub const Digest = [Sha256.digest_length]u8;
 
-pub const conversation_schema_version: u8 = 1;
+pub const conversation_schema_version: u8 = 2;
 pub const max_conversation_text_bytes: usize = event_frame_max_bytes;
 pub const max_conversation_identity_bytes: usize = types.ConversationIdentity.max_bytes;
 pub const max_conversation_arguments_bytes: usize = event_frame_max_bytes;
@@ -29,6 +29,12 @@ pub const ArtifactCompleteness = enum {
 
 pub const ConversationText = struct {
     text: []const u8,
+};
+
+pub const ConversationAssistant = struct {
+    text: []const u8,
+    provider_replay: ?types.ProviderReplay = null,
+    standalone_response: bool = false,
 };
 
 pub const ConversationUser = struct {
@@ -90,7 +96,7 @@ pub const ConversationCheckpoint = struct {
 
 pub const ConversationEvent = union(enum) {
     user: ConversationUser,
-    assistant: ConversationText,
+    assistant: ConversationAssistant,
     tool_call: ConversationToolCall,
     tool_result: ConversationToolResult,
     steering: ConversationText,
@@ -135,14 +141,14 @@ pub fn validateConversationTransition(
     state: ConversationStateView,
     envelope: ConversationEnvelope,
 ) ConversationTransitionError!void {
-    if (envelope.schema_version != conversation_schema_version) {
+    if (envelope.schema_version != 1 and envelope.schema_version != conversation_schema_version) {
         return error.UnsupportedConversationSchema;
     }
     const expected_seq = std.math.add(u64, state.last_seq, 1) catch
         return error.OutOfOrderConversationEvent;
     if (envelope.seq != expected_seq) return error.OutOfOrderConversationEvent;
     if (envelope.timestamp_ms < 0) return error.InvalidConversationEvent;
-    try validateConversationEventShape(envelope.event);
+    try validateConversationEventShape(envelope.event, envelope.schema_version);
 
     switch (envelope.event) {
         .tool_call => |call| {
@@ -178,7 +184,7 @@ pub fn validateConversationTransition(
     }
 }
 
-fn validateConversationEventShape(event: ConversationEvent) ConversationTransitionError!void {
+fn validateConversationEventShape(event: ConversationEvent, schema_version: u8) ConversationTransitionError!void {
     switch (event) {
         .user => |value| {
             try validateConversationText(value.text);
@@ -196,7 +202,16 @@ fn validateConversationEventShape(event: ConversationEvent) ConversationTransiti
             }
             if (value.work_id) |work_id| try validateConversationIdentity(work_id);
         },
-        .assistant, .steering => |value| try validateConversationText(value.text),
+        .assistant => |value| {
+            if (schema_version == 1 and (value.text.len == 0 or value.provider_replay != null)) return error.InvalidConversationEvent;
+            try validateOptionalConversationText(value.text);
+            if (value.provider_replay) |replay| {
+                try validateConversationIdentity(replay.source.model);
+                if (replay.parts_json.len == 0 or replay.parts_json.len > types.ProviderReplay.max_bytes or
+                    !std.unicode.utf8ValidateSlice(replay.parts_json)) return error.InvalidConversationEvent;
+            }
+        },
+        .steering => |value| try validateConversationText(value.text),
         .tool_call => |call| {
             try validateConversationIdentity(call.call_id);
             try validateConversationIdentity(call.tool_name);
@@ -337,7 +352,7 @@ pub fn encodeConversationFrame(
     {
         return error.InvalidConversationEvent;
     }
-    try validateConversationEventShape(envelope.event);
+    try validateConversationEventShape(envelope.event, envelope.schema_version);
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     try std.json.Stringify.value(envelope, .{}, &out.writer);
@@ -361,13 +376,13 @@ pub fn decodeConversationFrame(
         else => return error.InvalidConversationFrame,
     };
     errdefer parsed.deinit();
-    if (parsed.value.schema_version != conversation_schema_version or
+    if ((parsed.value.schema_version != 1 and parsed.value.schema_version != conversation_schema_version) or
         parsed.value.seq == 0 or
         parsed.value.timestamp_ms < 0)
     {
         return error.InvalidConversationFrame;
     }
-    validateConversationEventShape(parsed.value.event) catch
+    validateConversationEventShape(parsed.value.event, parsed.value.schema_version) catch
         return error.InvalidConversationFrame;
     return parsed;
 }
@@ -390,8 +405,10 @@ pub fn appendHistoryTurnConversationEvents(
                 .work_id = entry.user.work_id,
             } });
             try appendExecutionConversationEvents(alloc, events, entry.execution);
-            if (entry.assistant.len > 0) {
-                try events.append(alloc, .{ .assistant = .{ .text = entry.assistant } });
+            const follows_standalone = entry.execution.tool_steps.len > 0 and
+                entry.execution.tool_steps[entry.execution.tool_steps.len - 1].tool_calls.len == 0;
+            if (entry.assistant.len > 0 or entry.provider_replay != null or follows_standalone) {
+                try events.append(alloc, .{ .assistant = .{ .text = entry.assistant, .provider_replay = entry.provider_replay } });
             }
             try events.append(alloc, .{ .turn_completed = .{
                 .files = entry.execution.files,
@@ -406,6 +423,11 @@ pub fn appendHistoryTurnConversationEvents(
             } });
             try appendExecutionConversationEvents(alloc, events, entry.execution);
             if (entry.tool_call) |call| {
+                if (entry.execution.tool_steps.len > 0 and
+                    entry.execution.tool_steps[entry.execution.tool_steps.len - 1].tool_calls.len == 0)
+                {
+                    try events.append(alloc, .{ .assistant = .{ .text = "" } });
+                }
                 try events.append(alloc, .{ .tool_call = .{
                     .call_id = call.id,
                     .tool_name = call.name,
@@ -469,8 +491,14 @@ fn appendExecutionConversationEvents(
         steering_index += 1;
     }
     for (execution.tool_steps, 0..) |step, step_index| {
-        if (step.assistant) |assistant| {
-            if (assistant.len > 0) try events.append(alloc, .{ .assistant = .{ .text = assistant } });
+        const assistant: []const u8 = step.assistant orelse "";
+        const follows_standalone = step_index > 0 and execution.tool_steps[step_index - 1].tool_calls.len == 0;
+        if (assistant.len > 0 or step.provider_replay != null or follows_standalone) {
+            try events.append(alloc, .{ .assistant = .{
+                .text = assistant,
+                .provider_replay = step.provider_replay,
+                .standalone_response = step.tool_calls.len == 0,
+            } });
         }
         for (step.tool_calls) |call| {
             try events.append(alloc, .{ .tool_call = .{
@@ -3198,6 +3226,22 @@ test "conversation frame round trips an external tool result reference" {
     try std.testing.expectEqualStrings("sha256:abcdef", result.artifact_ref);
     try std.testing.expectEqual(ArtifactCompleteness.partial, result.completeness);
     try std.testing.expectEqualStrings("bounded preview", result.preview.?);
+}
+
+test "conversation frame reads old records and preserves new reasoning-only assistants" {
+    const alloc = std.testing.allocator;
+    var old = try decodeConversationFrame(alloc, "{\"schema_version\":1,\"seq\":1,\"timestamp_ms\":1,\"event\":{\"assistant\":{\"text\":\"old\"}}}\n");
+    defer old.deinit();
+    try std.testing.expect(old.value.event.assistant.provider_replay == null);
+    try validateConversationTransition(.{}, old.value);
+    const replay = types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"\"}]" };
+    const encoded = try encodeConversationFrame(alloc, .{ .seq = 2, .timestamp_ms = 2, .event = .{ .assistant = .{ .text = "", .provider_replay = replay } } });
+    defer alloc.free(encoded);
+    var current = try decodeConversationFrame(alloc, encoded);
+    defer current.deinit();
+    try std.testing.expectEqual(@as(u8, 2), current.value.schema_version);
+    try std.testing.expectEqualStrings(replay.parts_json, current.value.event.assistant.provider_replay.?.parts_json);
+    try validateConversationTransition(.{ .last_seq = 1 }, current.value);
 }
 
 test "conversation frame decoder stays bounded under fuzzed bytes" {

@@ -5,7 +5,37 @@ const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const types = @import("../core/shared/types.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const tool_call_ids = @import("tool_call_ids.zig");
-const json_comparison = @import("json_comparison.zig");
+const json_comparison = @import("../core/shared/json_comparison.zig");
+
+pub fn selectReplayParts(alloc: std.mem.Allocator, replay: ?types.ProviderReplay, _: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
+    const source = replay orelse return null;
+    if (source.source.provider == .gateway) return error.InvalidProviderState;
+    if (text and reasoning) return source;
+    if (!text and !reasoning) return null;
+    if (source.parts_json.len > types.ProviderReplay.max_bytes) return error.ProviderStateTooLarge;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, source.parts_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidProviderState,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .array) return error.InvalidProviderState;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    out.writer.writeByte('[') catch return error.OutOfMemory;
+    var count: usize = 0;
+    for (parsed.value.array.items) |item| {
+        if (item != .object) return error.InvalidProviderState;
+        const kind = stringField(item.object, "type") orelse return error.InvalidProviderState;
+        const keep = if (std.mem.eql(u8, kind, "reasoning")) reasoning else if (std.mem.eql(u8, kind, "message")) text else return error.InvalidProviderState;
+        if (!keep) continue;
+        if (count > 0) out.writer.writeByte(',') catch return error.OutOfMemory;
+        std.json.Stringify.value(item, .{}, &out.writer) catch return error.OutOfMemory;
+        count += 1;
+    }
+    if (count == 0) return null;
+    out.writer.writeByte(']') catch return error.OutOfMemory;
+    return .{ .source = source.source, .parts_json = try out.toOwnedSlice() };
+}
 
 pub const ReplayLimits = struct {
     tool_calls: usize,
@@ -68,13 +98,24 @@ pub fn writeInput(
                 try writer.writeAll("]}");
             },
             .assistant => {
-                if (message.provider_state_json) |state_json| {
+                var assistant_phase = message.assistant_phase;
+                if (message.provider_replay) |replay| {
+                    const state_json = replay.parts_json;
                     var state = std.json.parseFromSlice(std.json.Value, scratch_alloc, state_json, .{}) catch
                         return error.InvalidProviderState;
                     defer state.deinit();
                     if (state.value != .array) return error.InvalidProviderState;
                     for (state.value.array.items) |item| {
                         if (item != .object) return error.InvalidProviderState;
+                        const kind = item.object.get("type") orelse return error.InvalidProviderState;
+                        if (kind != .string) return error.InvalidProviderState;
+                        if (std.mem.eql(u8, kind.string, "message")) {
+                            const phase = assistantMessagePhase(item.object) orelse return error.InvalidProviderState;
+                            if (assistant_phase) |prior| if (prior != phase) return error.InvalidProviderState;
+                            assistant_phase = phase;
+                            continue;
+                        }
+                        if (!std.mem.eql(u8, kind.string, "reasoning")) return error.InvalidProviderState;
                         try writeComma(writer, &first);
                         try std.json.Stringify.value(item, .{}, writer);
                     }
@@ -84,7 +125,7 @@ pub fn writeInput(
                     try writer.writeAll("{\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":");
                     try std.json.Stringify.value(content, .{}, writer);
                     try writer.writeAll(",\"annotations\":[]}]");
-                    if (message.assistant_phase) |phase| {
+                    if (assistant_phase) |phase| {
                         try writer.writeAll(",\"phase\":");
                         try std.json.Stringify.value(@tagName(phase), .{}, writer);
                     }
@@ -174,7 +215,7 @@ test "Responses request preserves opaque tool-call identity" {
     const state = "[{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"opaque\",\"summary\":[]}]";
     const calls = [_]types.ToolCall{.{ .id = "signed:0", .name = "read_file", .arguments_json = "{}" }};
     const messages = [_]types.ChatMessage{
-        .{ .role = .assistant, .tool_calls = &calls, .provider_state_json = state },
+        .{ .role = .assistant, .tool_calls = &calls, .provider_replay = .{ .source = .{ .provider = .codex, .model = "test" }, .parts_json = state } },
         .{ .role = .tool, .tool_call_id = "signed:0", .tool_name = "read_file", .content = "result" },
     };
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
@@ -188,7 +229,49 @@ test "Responses request preserves opaque tool-call identity" {
     try std.testing.expectEqualStrings("opaque", items[0].object.get("encrypted_content").?.string);
     try std.testing.expectEqualStrings("signed:0", items[1].object.get("call_id").?.string);
     try std.testing.expectEqualStrings("signed:0", items[2].object.get("call_id").?.string);
-    try std.testing.expectEqualStrings(state, messages[0].provider_state_json.?);
+    try std.testing.expectEqualStrings(state, messages[0].provider_replay.?.parts_json);
+}
+
+test "Responses replay retains phase through storage and projection" {
+    const alloc = std.testing.allocator;
+    const source: types.ProviderReplay = .{
+        .source = .{ .provider = .codex, .model = "test" },
+        .parts_json = "[{\"type\":\"reasoning\",\"encrypted_content\":\"cipher\"},{\"type\":\"message\",\"phase\":\"commentary\"}]",
+    };
+    const stored = try types.dupeProviderReplay(alloc, source);
+    defer types.freeProviderReplay(alloc, stored);
+    const messages = [_]types.ChatMessage{.{ .role = .assistant, .content = "original", .provider_replay = stored }};
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeByte('[');
+    try writeInput(&out.writer, alloc, &messages, null, .{ .tool_calls = 4, .tool_identity_bytes = 256, .tool_arguments_bytes = 4096, .provider_state_bytes = 4096 }, .{});
+    try out.writer.writeByte(']');
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
+    try std.testing.expectEqualStrings("cipher", parsed.value.array.items[0].object.get("encrypted_content").?.string);
+    try std.testing.expectEqualStrings("commentary", parsed.value.array.items[1].object.get("phase").?.string);
+    try std.testing.expectEqualStrings("original", parsed.value.array.items[1].object.get("content").?.array.items[0].object.get("text").?.string);
+    const phase_only = (try selectReplayParts(alloc, stored, &.{}, true, false)).?;
+    defer alloc.free(phase_only.parts_json);
+    try std.testing.expectEqualStrings("[{\"type\":\"message\",\"phase\":\"commentary\"}]", phase_only.parts_json);
+    const reasoning_only = (try selectReplayParts(alloc, stored, &.{}, false, true)).?;
+    defer alloc.free(reasoning_only.parts_json);
+    try std.testing.expectEqualStrings("[{\"type\":\"reasoning\",\"encrypted_content\":\"cipher\"}]", reasoning_only.parts_json);
+}
+
+test "Responses replay filtering cleans up allocation failures" {
+    const Probe = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const source: types.ProviderReplay = .{
+                .source = .{ .provider = .codex, .model = "test" },
+                .parts_json = "[{\"type\":\"reasoning\",\"encrypted_content\":\"cipher\"},{\"type\":\"message\",\"phase\":\"commentary\"}]",
+            };
+            const selected = (try selectReplayParts(alloc, source, &.{}, true, false)).?;
+            defer alloc.free(selected.parts_json);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
 }
 
 test "Responses request preserves assistant commentary phase" {
@@ -259,7 +342,8 @@ test "non-object function arguments cannot enter a Responses request" {
 }
 
 fn validateReplayMessage(alloc: std.mem.Allocator, message: types.ChatMessage, limits: ReplayLimits) !void {
-    if (message.provider_state_json) |state_json| {
+    if (message.provider_replay) |replay| {
+        const state_json = replay.parts_json;
         if (state_json.len > limits.provider_state_bytes) return error.ProviderStateTooLarge;
     }
     if (message.tool_calls.len > limits.tool_calls) return error.ToolCallLimitExceeded;
@@ -878,24 +962,7 @@ pub const Reducer = struct {
                 var encoded: std.Io.Writer.Allocating = .init(alloc);
                 defer encoded.deinit();
                 try std.json.Stringify.value(item, .{}, &encoded.writer);
-                const separators: usize = if (self.provider_state_count == 0) 2 else 1;
-                const encoded_size = try checkedAccumulatedSize(
-                    encoded.written().len,
-                    separators,
-                    limits.provider_state_bytes,
-                );
-                _ = try checkedAccumulatedSize(
-                    self.provider_state.written().len,
-                    encoded_size,
-                    limits.provider_state_bytes,
-                );
-                if (self.provider_state_count == 0) {
-                    try self.provider_state.writer.writeByte('[');
-                } else {
-                    try self.provider_state.writer.writeByte(',');
-                }
-                try self.provider_state.writer.writeAll(encoded.written());
-                self.provider_state_count += 1;
+                try self.appendReplayPart(encoded.written(), limits.provider_state_bytes);
             } else if (std.mem.eql(u8, item_type, "message")) {
                 self.assistant_phase.observe(assistantMessagePhase(item.object));
                 try self.finalize_text_message(alloc, output_index, item.object, callbacks, cancel_flag, content_capture_limit, limits);
@@ -963,6 +1030,15 @@ pub const Reducer = struct {
             .rate_limited
         else
             .non_retryable;
+    }
+
+    fn appendReplayPart(self: *Reducer, bytes: []const u8, limit: usize) !void {
+        const overhead: usize = if (self.provider_state_count == 0) 2 else 1;
+        const size = try checkedAccumulatedSize(bytes.len, overhead, limit);
+        _ = try checkedAccumulatedSize(self.provider_state.written().len, size, limit);
+        self.provider_state.writer.writeByte(if (self.provider_state_count == 0) '[' else ',') catch return error.OutOfMemory;
+        self.provider_state.writer.writeAll(bytes) catch return error.OutOfMemory;
+        self.provider_state_count += 1;
     }
 
     fn accept_text(
@@ -1080,6 +1156,12 @@ pub const Reducer = struct {
             null;
         if (owned_content != null) self.content = .empty;
         errdefer if (owned_content) |value| alloc.free(value);
+        if (self.assistant_phase.resolved()) |phase| {
+            try self.appendReplayPart(switch (phase) {
+                .commentary => "{\"type\":\"message\",\"phase\":\"commentary\"}",
+                .final_answer => "{\"type\":\"message\",\"phase\":\"final_answer\"}",
+            }, limits.provider_state_bytes);
+        }
         const owned_provider_state = if (self.provider_state_count > 0) state: {
             try self.provider_state.writer.writeByte(']');
             if (self.provider_state.written().len > limits.provider_state_bytes) {
@@ -1522,6 +1604,7 @@ test "Responses captures assistant commentary phase" {
         types.AssistantMessagePhase.commentary,
         completion.assistant_phase.?,
     );
+    try std.testing.expectEqualStrings("[{\"type\":\"message\",\"phase\":\"commentary\"}]", completion.provider_state_json.?);
 }
 
 test "Responses captures assistant phase from terminal output" {

@@ -626,7 +626,7 @@ pub fn normalizeAssistantTextForDisplay(alloc: Allocator, raw_text: []const u8) 
     return trimmed;
 }
 
-pub fn historyTextForCompletedStream(raw_text: []const u8, normalized_text: []const u8) []const u8 {
+pub fn textForCompletedPresentation(raw_text: []const u8, normalized_text: []const u8) []const u8 {
     var lines = std.mem.splitScalar(u8, raw_text, '\n');
     while (lines.next()) |line| {
         const trimmed = std.mem.trimStart(u8, line, " \t");
@@ -637,21 +637,21 @@ pub fn historyTextForCompletedStream(raw_text: []const u8, normalized_text: []co
     return normalized_text;
 }
 
-test "completed history preserves raw fenced code while ordinary text stays normalized" {
+test "completed presentation preserves fenced code while ordinary text stays normalized" {
     const fenced = "```\nconst hook = await resumeHook(token, { cleanup: true } as CleanupSignal);\n```";
     const tilde_fenced = "~~~zig\nconst hook = await resumeHook(token, { cleanup: true } as CleanupSignal);\n~~~";
 
     try std.testing.expectEqualStrings(
         fenced,
-        historyTextForCompletedStream(fenced, "const hook = await resumeHook(token, { cleanup: true } as CleanupSignal);"),
+        textForCompletedPresentation(fenced, "const hook = await resumeHook(token, { cleanup: true } as CleanupSignal);"),
     );
     try std.testing.expectEqualStrings(
         tilde_fenced,
-        historyTextForCompletedStream(tilde_fenced, "const hook = await resumeHook(token, { cleanup: true } as CleanupSignal);"),
+        textForCompletedPresentation(tilde_fenced, "const hook = await resumeHook(token, { cleanup: true } as CleanupSignal);"),
     );
     try std.testing.expectEqualStrings(
         "Hello",
-        historyTextForCompletedStream(" **Hello** ", "Hello"),
+        textForCompletedPresentation(" **Hello** ", "Hello"),
     );
 }
 
