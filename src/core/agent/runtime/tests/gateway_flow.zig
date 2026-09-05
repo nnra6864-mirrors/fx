@@ -5552,6 +5552,35 @@ test "processQueuedPrompt disables provider option fast after a replay safe SSE 
     try expectBodyContains(&gateway, 1, "\"providerOptions\":{\"gateway\":{\"caching\":\"auto\"}}");
 }
 
+test "processQueuedPrompt preserves fast mode after a streamed rate limit" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .finish_reason = .provider_error, .provider_failure_cause = .rate_limited, .provider_failure_detail = "rate_limit_exceeded: retry later" },
+        .{ .content = "Recovered" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    const overrides = [_]ModelCapabilityOverride{.{
+        .model = "fixture/model",
+        .capabilities = model_capabilities.resolveCapabilities("fixture/model", .{ .supports_fast_mode = true }),
+    }};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.capability_overrides = &overrides;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.model = @constCast("fixture/model");
+    var config = fixture.config();
+    config.fast_mode = true;
+    config.max_provider_attempts = 2;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+    for (0..2) |index| try expectBodyContains(&gateway, index, "\"speed\":\"fast\"");
+    try std.testing.expectEqual(@as(?types.ModelRecoveryCause, .rate_limited), hooks.route_recovery_statuses.items[0].cause);
+}
+
 test "processQueuedPrompt disables provider option fast after a replay safe HTTP failure" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{

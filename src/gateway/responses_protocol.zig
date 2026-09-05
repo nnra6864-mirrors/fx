@@ -957,8 +957,12 @@ pub const Reducer = struct {
         const text = try std.fmt.bufPrint(&buffer, "{s}: {s}", .{ bounded_code.view(), bounded_message.view() });
         const detail = types.ModelFailureDiagnostic.init(text);
         self.provider_failure_detail = try alloc.dupe(u8, detail.view());
-        self.provider_failure_cause = if (std.mem.eql(u8, code, "server_error") or
-            std.mem.eql(u8, code, "rate_limit_exceeded")) null else .non_retryable;
+        self.provider_failure_cause = if (std.mem.eql(u8, code, "server_error"))
+            null
+        else if (std.mem.eql(u8, code, "rate_limit_exceeded"))
+            .rate_limited
+        else
+            .non_retryable;
     }
 
     fn accept_text(
@@ -1219,6 +1223,9 @@ test "Responses terminal failure classification is conservative and diagnostics 
         const completion = try stream.finish();
         defer stream.freeCompletion(completion);
         try std.testing.expectEqual(case[1], completion.provider_failure_cause == .non_retryable);
+        if (std.mem.eql(u8, case[0], "rate_limit_exceeded")) {
+            try std.testing.expectEqual(@as(?types.ProviderFailureCause, .rate_limited), completion.provider_failure_cause);
+        }
         try std.testing.expect(completion.provider_failure_detail.?.len <= types.ModelFailureDiagnostic.max_bytes);
         try std.testing.expect(std.unicode.utf8ValidateSlice(completion.provider_failure_detail.?));
         try std.testing.expect(std.mem.startsWith(u8, completion.provider_failure_detail.?, case[0]));

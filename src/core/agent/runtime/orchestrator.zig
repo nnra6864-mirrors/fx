@@ -6840,6 +6840,8 @@ fn processQueuedPromptLoop(
                 const finish_reason = attempt_completion.finish_reason;
                 const cause: model_response_recovery.FailureCause = if (attempt_completion.provider_failure_cause == .gateway_stream_timeout)
                     .provider_stream_timeout
+                else if (attempt_completion.provider_failure_cause == .rate_limited)
+                    .rate_limited
                 else if (attempt_disposition == .interrupted)
                     .response_interrupted
                 else if (finish_reason.? == .content_filter)
