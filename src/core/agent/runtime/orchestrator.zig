@@ -6853,19 +6853,23 @@ fn processQueuedPromptLoop(
                 );
                 attempt_failure_diagnostic = diagnostic;
                 latest_recovery_diagnostic = diagnostic;
-                const decision = model_response_recovery.decide(.{
-                    .cause = cause,
-                    .delivery = .possibly_sent,
-                    .attempts = .{ .consumed = semantic_attempt + 1, .limit = semantic_limit },
-                    .pacing = retry_pacing,
-                    .output = if (partial_assistant.len > 0) .partial else .none,
-                    .tool = effectiveRecoveryToolEvidence(
-                        preserved_tool_evidence,
-                        attempt_completion,
-                        &stream_ctx,
-                    ),
-                    .cancelled = config.cancel_flag.load(.seq_cst),
-                });
+                const non_retryable = attempt_completion.provider_failure_cause == .non_retryable;
+                const decision = if (non_retryable)
+                    model_response_recovery.Decision{ .strategy = .stop, .required_action = .change_request }
+                else
+                    model_response_recovery.decide(.{
+                        .cause = cause,
+                        .delivery = .possibly_sent,
+                        .attempts = .{ .consumed = semantic_attempt + 1, .limit = semantic_limit },
+                        .pacing = retry_pacing,
+                        .output = if (partial_assistant.len > 0) .partial else .none,
+                        .tool = effectiveRecoveryToolEvidence(
+                            preserved_tool_evidence,
+                            attempt_completion,
+                            &stream_ctx,
+                        ),
+                        .cancelled = config.cancel_flag.load(.seq_cst),
+                    });
                 if (attempt_disposition == .provider_failure or
                     attempt_completion.provider_failure_cause == .gateway_stream_timeout)
                 {
@@ -6881,7 +6885,7 @@ fn processQueuedPromptLoop(
                         decision.reserve_provider_attempt,
                     );
                 }
-                const route_changed = disableFastRouteAfterFailure(
+                const route_changed = !non_retryable and disableFastRouteAfterFailure(
                     &route_fast_mode,
                     &gateway_model,
                     job.model,
@@ -7039,7 +7043,9 @@ fn processQueuedPromptLoop(
                     completionContentBytes(attempt_completion),
                     attempt_completion.tool_calls.len,
                 });
-                if (finish_reason == .provider_error) {
+                if (attempt_completion.provider_failure_cause == .non_retryable) {
+                    try deps.push_system_notice(deps.ctx, diagnostic.view());
+                } else if (finish_reason == .provider_error) {
                     if (replay_safe) {
                         try pushTerminalProviderFailureStatus(
                             deps,

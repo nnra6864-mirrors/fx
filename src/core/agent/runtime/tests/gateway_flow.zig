@@ -7010,6 +7010,29 @@ test "processQueuedPrompt exhaustion pauses without invoking route recovery" {
     try expectRouteStatus(&hooks, 0, .terminal_provider_error, "⚠ Provider unavailable · provider_error: route failed · recovery paused after 1/1 attempts");
 }
 
+test "processQueuedPrompt stops nonretryable provider outcomes without releasing tools" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("rejected_call", "read_file", "{\"path\":\"a.txt\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .finish_reason = .provider_error, .provider_failure_cause = .non_retryable, .provider_failure_detail = "invalid_prompt: request rejected", .tool_calls = &calls },
+        .{ .content = "must not be requested" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.max_provider_attempts = 2;
+
+    try std.testing.expectError(error.ModelError, runFakePrompt(&gateway, &hooks, config, fixture.job()));
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
+    try std.testing.expect(std.mem.find(u8, hooks.system_notices.items[0], "invalid_prompt: request rejected") != null);
+}
+
 test "processQueuedPrompt spacer newline is skipped for ask first tool" {
     const alloc = std.testing.allocator;
     const chunks = [_][]const u8{"Using tool"};
