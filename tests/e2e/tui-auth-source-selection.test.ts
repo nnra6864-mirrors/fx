@@ -4450,13 +4450,13 @@ for (const scenario of ["replace", "conflict", "invalid-index"] as const) {
 }
 
 test("native terminal outcomes preserve recovery and incomplete warnings", async () => {
-  for (const provider of ["gateway", "codex", "grok"] as const) for (const mode of ["transient", "partial", "tool", "rejected", "length", "length-with-status"]) {
+  for (const provider of ["gateway", "codex", "grok"] as const) for (const mode of ["transient", "partial", "tool", "rejected", "rejected-partial", "length", "length-with-status"]) {
     const native = provider !== "gateway";
     if (!native && mode !== "transient") continue;
     const profile = mkdtempSync(join(tmpdir(), "fx-native-outcomes-"));
     const model = native ? "fixture-model" : FAKE_GATEWAY_MODEL;
     const limited = mode.startsWith("length");
-    const rejected = mode === "rejected";
+    const rejected = mode.startsWith("rejected");
     const event = (text: string) => native
       ? { type: "response.output_text.delta", output_index: 0, content_index: 0, delta: text }
       : { type: "text-delta", id: "answer", delta: text };
@@ -4465,10 +4465,11 @@ test("native terminal outcomes preserve recovery and incomplete warnings", async
       : { type: "finish", finishReason: { unified: "stop" } };
     const events: object[] = [];
     if (mode === "partial") events.push(event("DISCARDED_PREVIEW"));
+    if (mode === "rejected-partial") events.push(event("REJECTED_PARTIAL"));
     if (limited) events.push(event("LIMITED_ANSWER"));
     if (mode === "tool" || rejected) {
       writeFileSync(join(profile, "read-me.txt"), "must not be read by the failed attempt");
-      events.push({ type: "response.output_item.added", output_index: 0, item: { type: "function_call", id: "fc_failed", call_id: "failed", name: "read_file", arguments: JSON.stringify({ path: "read-me.txt" }) } });
+      events.push({ type: "response.output_item.added", output_index: 1, item: { type: "function_call", id: "fc_failed", call_id: "failed", name: "read_file", arguments: JSON.stringify({ path: "read-me.txt" }) } });
     }
     const failure = { code: rejected ? "invalid_prompt" : "server_error", message: rejected ? "OUTCOME_REJECTED" : "OUTCOME_RETRY" };
     if (limited) events.push({ type: "response.incomplete", response: { id: "resp_limited", ...(mode === "length-with-status" ? { status: "incomplete" } : {}), output: [], incomplete_details: { reason: "max_output_tokens" } } });
@@ -4505,6 +4506,24 @@ test("native terminal outcomes preserve recovery and incomplete warnings", async
       if (rejected) {
         expect(result.stderr).toContain("invalid_prompt: OUTCOME_REJECTED");
         expect(result.stderr).not.toContain("retrying");
+        if (mode === "rejected-partial") {
+          const detail = await runFx(["session", "--json", "--id", output.session_id], { cwd: profile, env });
+          expect(detail.code).toBe(0);
+          const history = JSON.parse(detail.stdout).history;
+          expect(history).toHaveLength(1);
+          expect(history[0].kind).toBe("interrupted");
+          expect(history[0].assistant).toBe("REJECTED_PARTIAL");
+          expect(history[0].execution?.tool_steps ?? []).toEqual([]);
+          expect(history[0].tool_call).toBeNull();
+          expect(history[0].completed_tool_names).toEqual([]);
+          const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", output.session_id, "Continue from the saved partial answer without using tools."], { cwd: profile, env, timeoutMs: TIMEOUT });
+          expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
+          expect(JSON.parse(resumed.stdout).output).toBe("RECOVERED_OK");
+          expect(direct!.bodies).toHaveLength(2);
+          const input = JSON.parse(direct!.bodies[1]).input;
+          expect(JSON.stringify(input)).toContain("REJECTED_PARTIAL");
+          expect(input.filter((item: { type?: string }) => item.type === "function_call")).toEqual([]);
+        }
       } else {
         expect(output.output).toBe(limited ? "LIMITED_ANSWER" : "RECOVERED_OK");
         expect(result.stderr).toContain(limited ? "response hit provider length limit" : "OUTCOME_RETRY");

@@ -7041,9 +7041,10 @@ test "processQueuedPrompt exhaustion pauses without invoking route recovery" {
 
 test "processQueuedPrompt stops nonretryable provider outcomes without releasing tools" {
     const alloc = std.testing.allocator;
+    const chunks = [_][]const u8{"accepted partial response"};
     const calls = [_]ToolCall{toolCall("rejected_call", "read_file", "{\"path\":\"a.txt\"}")};
     const completions = [_]FakeCompletion{
-        .{ .finish_reason = .provider_error, .provider_failure_cause = .non_retryable, .provider_failure_detail = "invalid_prompt: request rejected", .tool_calls = &calls },
+        .{ .chunks = &chunks, .content = "accepted partial response", .finish_reason = .provider_error, .provider_failure_cause = .non_retryable, .provider_failure_detail = "invalid_prompt: request rejected", .tool_calls = &calls },
         .{ .content = "must not be requested" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
@@ -7060,6 +7061,11 @@ test "processQueuedPrompt stops nonretryable provider outcomes without releasing
     try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_statuses.items.len);
     try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
     try std.testing.expect(std.mem.find(u8, hooks.system_notices.items[0], "invalid_prompt: request rejected") != null);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    const interrupted = hooks.history_turns.items[0].interrupted;
+    try std.testing.expectEqualStrings("accepted partial response", interrupted.assistant.?);
+    try std.testing.expectEqual(@as(?types.InterruptedTerminalReason, .failed), interrupted.terminal_reason);
+    try std.testing.expectEqual(@as(usize, 0), interrupted.execution.tool_steps.len);
 }
 
 test "processQueuedPrompt spacer newline is skipped for ask first tool" {

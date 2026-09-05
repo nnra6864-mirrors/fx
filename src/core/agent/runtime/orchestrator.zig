@@ -7047,6 +7047,21 @@ fn processQueuedPromptLoop(
                 });
                 if (attempt_completion.provider_failure_cause == .non_retryable) {
                     try deps.push_system_notice(deps.ctx, diagnostic.view());
+                    const failed_assistant_source = stream_ctx.interruption_source_or("");
+                    if (stop_state.retained_candidate == null and
+                        std.mem.trim(u8, failed_assistant_source, " \t\r\n").len > 0)
+                    {
+                        try runtime_interruption.persistFailedPartialTurnOnce(
+                            deps,
+                            finalization,
+                            job,
+                            failed_assistant_source,
+                            &interrupted_persisted,
+                            step_ctx,
+                            within_turn_suffix.items,
+                            &stop_state.terminal_materializing,
+                        );
+                    }
                 } else if (finish_reason == .provider_error) {
                     if (replay_safe) {
                         try pushTerminalProviderFailureStatus(
