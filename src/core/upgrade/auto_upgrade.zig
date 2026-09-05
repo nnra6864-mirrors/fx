@@ -426,11 +426,14 @@ pub const AutoUpgrade = struct {
     }
 
     fn sleepInterruptible(self: *AutoUpgrade, total_ms: u64) void {
-        var remaining = total_ms;
-        while (remaining > 0 and !self.should_stop.load(.acquire)) {
-            const chunk = @min(remaining, sleep_increment_ms);
-            io_mod.sleep(chunk * @as(u64, std.time.ns_per_ms));
-            remaining -|= chunk;
+        const io = io_mod.getIo();
+        const started = std.Io.Clock.Timestamp.now(io, .awake);
+        while (!self.should_stop.load(.acquire)) {
+            const elapsed = started.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.toMilliseconds();
+            const elapsed_ms: u64 = @intCast(@max(0, elapsed));
+            if (elapsed_ms >= total_ms) return;
+            const chunk = @min(total_ms - elapsed_ms, sleep_increment_ms);
+            io.sleep(.fromMilliseconds(@intCast(chunk)), .awake) catch return;
         }
     }
 };

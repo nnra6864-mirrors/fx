@@ -5463,7 +5463,11 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText(ready, TIMEOUT);
       expect(existsSync(argvLogPath)).toBe(false);
       release.publish(c, true);
-      await active.waitForText(`upgrading to dev ${c.slice(0, 12)}`, 90_000);
+      try {
+        await active.waitForText(`upgrading to dev ${c.slice(0, 12)}`, 90_000);
+      } catch (error) {
+        throw new Error(`${error}\nUpgrade requests: ${JSON.stringify(release.requests)}\nSettings: ${readFileSync(join(home, ".fx", "settings.json"), "utf8")}`);
+      }
       expect(await active.capturePane()).not.toContain(ready);
       await active.sendHexBytes(["07"]);
       await active.waitForText("no installed upgrade is ready", TIMEOUT);
