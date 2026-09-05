@@ -2,10 +2,12 @@ const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const helpers = @import("upgrade_helpers.zig");
 const update_target = @import("update_target.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 
-const check_interval_ms: u64 = 30 * 60 * 1000;
+const stable_check_interval_ms: u64 = 30 * 60 * 1000;
+const dev_check_interval_ms: u64 = 60 * 1000;
 const initial_delay_ms: u64 = 10_000;
 const sleep_increment_ms: u64 = 50;
 
@@ -79,7 +81,9 @@ pub const AutoUpgrade = struct {
     }
 
     pub fn stop(self: *AutoUpgrade) void {
+        self.version_mutex.lockUncancelable(io_mod.getIo());
         self.should_stop.store(true, .release);
+        self.version_mutex.unlock(io_mod.getIo());
         if (self.thread) |t| {
             t.join();
             self.thread = null;
@@ -100,7 +104,13 @@ pub const AutoUpgrade = struct {
             executable_path,
         );
         self.version_mutex.lockUncancelable(io_mod.getIo());
+        if (self.getState() != .ready or self.should_stop.load(.acquire)) {
+            self.version_mutex.unlock(io_mod.getIo());
+            debug_trace.logf("auto_upgrade", "relaunch admission lost: upgrade is not ready", .{});
+            return error.NotReady;
+        }
         defer self.version_mutex.unlock(io_mod.getIo());
+        self.should_stop.store(true, .release);
         if (self.selected_channel == .dev and self.previous_revision_len > 0) {
             @memcpy(
                 request.previous_revision_buf[0..self.previous_revision_len],
@@ -161,10 +171,14 @@ pub const AutoUpgrade = struct {
     }
 
     fn setLatestVersion(self: *AutoUpgrade, version: []const u8) void {
-        const stripped = update_target.normalizeVersion(version);
-        const len: u8 = @intCast(@min(stripped.len, 32));
         self.version_mutex.lockUncancelable(io_mod.getIo());
         defer self.version_mutex.unlock(io_mod.getIo());
+        self.setLatestVersionLocked(version);
+    }
+
+    fn setLatestVersionLocked(self: *AutoUpgrade, version: []const u8) void {
+        const stripped = update_target.normalizeVersion(version);
+        const len: u8 = @intCast(@min(stripped.len, 32));
         @memcpy(self.latest_version_buf[0..len], stripped[0..len]);
         self.latest_version_len = len;
         self.markRenderDirty();
@@ -179,42 +193,99 @@ pub const AutoUpgrade = struct {
         alloc: Allocator,
         current: update_target.CurrentBuild,
     ) void {
+        var installed: ?update_target.Target = null;
+        defer if (installed) |*target| target.deinit(alloc);
         self.sleepInterruptible(initial_delay_ms);
 
         while (!self.should_stop.load(.acquire)) {
-            if (self.getState() == .ready) return;
-            self.setState(.checking);
-            self.runOnce(alloc, current);
-
-            const post_state = self.getState();
-            if (post_state == .ready) return;
-
-            if (post_state != .failed) self.setState(.waiting);
-            self.sleepInterruptible(check_interval_ms);
+            self.runOnce(alloc, current, &installed, .{});
+            if (self.selected_channel == .stable and self.getState() == .ready) return;
+            self.sleepInterruptible(if (self.selected_channel == .dev)
+                dev_check_interval_ms
+            else
+                stable_check_interval_ms);
         }
+    }
+
+    // Private effect boundaries for exercising a real cycle without network or installation.
+    const CycleDeps = struct {
+        ctx: ?*anyopaque = null,
+        fetch: *const fn (?*anyopaque, Allocator, update_target.Channel, []const u8) error{ FetchFailed, OutOfMemory }!update_target.Target = fetchDefault,
+        install: *const fn (?*anyopaque, *AutoUpgrade, Allocator, update_target.Target, []const u8) InstallError!void = installDefault,
+    };
+
+    fn fetchDefault(_: ?*anyopaque, alloc: Allocator, selected: update_target.Channel, base: []const u8) error{ FetchFailed, OutOfMemory }!update_target.Target {
+        return helpers.fetchTarget(alloc, selected, base);
+    }
+
+    fn installDefault(_: ?*anyopaque, self: *AutoUpgrade, alloc: Allocator, target: update_target.Target, base: []const u8) InstallError!void {
+        return self.downloadAndInstall(alloc, target, base);
+    }
+
+    fn beginDownload(self: *AutoUpgrade, label: []const u8) bool {
+        self.version_mutex.lockUncancelable(io_mod.getIo());
+        defer self.version_mutex.unlock(io_mod.getIo());
+        if (self.should_stop.load(.acquire)) return false;
+        self.setLatestVersionLocked(label);
+        self.setState(.downloading);
+        return true;
+    }
+
+    fn finishCycle(self: *AutoUpgrade) void {
+        self.version_mutex.lockUncancelable(io_mod.getIo());
+        defer self.version_mutex.unlock(io_mod.getIo());
+        if (self.should_stop.load(.acquire)) return;
+        if (self.getState() == .checking) self.setState(.waiting);
     }
 
     fn runOnce(
         self: *AutoUpgrade,
         alloc: Allocator,
         current: update_target.CurrentBuild,
+        installed: *?update_target.Target,
+        deps: CycleDeps,
     ) void {
-        const cdn_base = helpers.resolveCdnBase();
-        var target = helpers.fetchTarget(alloc, self.selected_channel, cdn_base) catch return;
-        defer target.deinit(alloc);
+        self.version_mutex.lockUncancelable(io_mod.getIo());
+        if (self.should_stop.load(.acquire) or
+            (self.selected_channel == .stable and self.getState() == .ready))
+        {
+            self.version_mutex.unlock(io_mod.getIo());
+            return;
+        }
+        if (self.getState() != .ready) self.setState(.checking);
+        self.version_mutex.unlock(io_mod.getIo());
+        defer self.finishCycle();
 
-        if (!target.shouldInstall(current)) return;
+        const cdn_base = helpers.resolveCdnBase();
+        var target = deps.fetch(deps.ctx, alloc, self.selected_channel, cdn_base) catch return;
+        var owns_target = true;
+        defer if (owns_target) target.deinit(alloc);
+
+        const baseline: update_target.CurrentBuild = if (installed.*) |previous| .{
+            .channel = previous.channel(),
+            .version = previous.version(),
+            .revision = previous.revision() orelse "unknown",
+        } else current;
+        if (!target.shouldInstall(baseline)) return;
 
         var label_buf: [64]u8 = undefined;
         const label = target.writeDisplayLabel(&label_buf) catch return;
-        self.setLatestVersion(label);
-        self.setState(.downloading);
+        if (!self.beginDownload(label)) return;
 
-        self.downloadAndInstall(alloc, target, cdn_base) catch {
-            self.setState(.failed);
+        deps.install(deps.ctx, self, alloc, target, cdn_base) catch |err| {
+            debug_trace.logf("auto_upgrade", "candidate {s} not installed: {s}", .{ target.artifactRef(), @errorName(err) });
+            self.version_mutex.lockUncancelable(io_mod.getIo());
+            defer self.version_mutex.unlock(io_mod.getIo());
+            if (!self.should_stop.load(.acquire)) self.setState(if (err == error.Superseded) .waiting else .failed);
             return;
         };
-        self.setState(.ready);
+        if (installed.*) |*previous| previous.deinit(alloc);
+        installed.* = target;
+        owns_target = false;
+
+        self.version_mutex.lockUncancelable(io_mod.getIo());
+        defer self.version_mutex.unlock(io_mod.getIo());
+        if (!self.should_stop.load(.acquire)) self.setState(.ready);
     }
 
     const InstallError = error{
@@ -225,7 +296,28 @@ pub const AutoUpgrade = struct {
         SelfExeNotFound,
         InstallFailed,
         Cancelled,
+        RevalidationFailed,
+        Superseded,
     };
+
+    fn revalidateCandidate(
+        self: *AutoUpgrade,
+        alloc: Allocator,
+        target: update_target.Target,
+        cdn_base: []const u8,
+        deps: CycleDeps,
+    ) InstallError!void {
+        if (self.should_stop.load(.acquire)) return error.Cancelled;
+        if (target == .dev) {
+            var latest = deps.fetch(deps.ctx, alloc, .dev, cdn_base) catch return error.RevalidationFailed;
+            defer latest.deinit(alloc);
+            if (self.should_stop.load(.acquire)) return error.Cancelled;
+            if (latest != .dev or !std.ascii.eqlIgnoreCase(latest.dev.revision, target.dev.revision)) {
+                debug_trace.logf("auto_upgrade", "discarding superseded candidate {s}; manifest now names {s}", .{ target.artifactRef(), latest.artifactRef() });
+                return error.Superseded;
+            }
+        }
+    }
 
     fn downloadAndInstall(
         self: *AutoUpgrade,
@@ -272,6 +364,8 @@ pub const AutoUpgrade = struct {
 
         var self_exe_buf: [std.fs.max_path_bytes]u8 = undefined;
         const self_exe = helpers.currentExecutablePath(&self_exe_buf) catch return error.SelfExeNotFound;
+        try self.revalidateCandidate(alloc, target, cdn_base, .{});
+        if (self.should_stop.load(.acquire)) return error.Cancelled;
         io_mod.copyFileAtomic(alloc, extracted_bin, self_exe) catch return error.InstallFailed;
     }
 
@@ -284,6 +378,230 @@ pub const AutoUpgrade = struct {
         }
     }
 };
+
+const TestCycle = struct {
+    const original_revision = "a" ** 64;
+    const revision_b = "0123456789ab" ++ "b" ** 28;
+    const revision_c = "0123456789ab" ++ "c" ** 28;
+    const revision_d = "0123456789ab" ++ "d" ** 28;
+    const current: update_target.CurrentBuild = .{
+        .channel = .dev,
+        .version = "0.3.0",
+        .revision = original_revision,
+    };
+
+    updater: AutoUpgrade = .{ .selected_channel = .dev },
+    installed: ?update_target.Target = null,
+    revision: []const u8 = revision_b,
+    stable_version: []const u8 = "0.4.0",
+    fetch_count: usize = 0,
+    install_count: usize = 0,
+    copy_count: usize = 0,
+    fetch_error: bool = false,
+    install_error: ?AutoUpgrade.InstallError = null,
+    revalidation_revision: ?[]const u8 = null,
+    revalidation_error: bool = false,
+    reload_during_fetch: bool = false,
+    reload_during_install: bool = false,
+    reload_rejected: bool = false,
+    stop_during_fetch: bool = false,
+    stop_during_install: bool = false,
+    stop_after_copy: bool = false,
+
+    fn deinit(self: *TestCycle) void {
+        if (self.installed) |*target| target.deinit(std.testing.allocator);
+    }
+
+    fn deps(self: *TestCycle) AutoUpgrade.CycleDeps {
+        return .{ .ctx = self, .fetch = fetch, .install = install };
+    }
+
+    fn cycle(self: *TestCycle) void {
+        self.updater.runOnce(std.testing.allocator, current, &self.installed, self.deps());
+    }
+
+    fn fetch(ctx: ?*anyopaque, alloc: Allocator, selected: update_target.Channel, _: []const u8) error{ FetchFailed, OutOfMemory }!update_target.Target {
+        const self: *TestCycle = @ptrCast(@alignCast(ctx.?));
+        self.fetch_count += 1;
+        if (self.reload_during_fetch) {
+            self.updater.requestRelaunch("/tmp/fx") catch return error.FetchFailed;
+        }
+        if (self.stop_during_fetch) self.updater.stop();
+        if (self.fetch_error) return error.FetchFailed;
+        if (selected == .stable) return update_target.Target.initStable(alloc, self.stable_version) catch return error.FetchFailed;
+        var manifest_buf: [160]u8 = undefined;
+        const manifest = std.fmt.bufPrint(&manifest_buf, "{{\"version\":\"0.3.0\",\"commit\":\"{s}\"}}", .{self.revision}) catch return error.FetchFailed;
+        return update_target.Target.parseDevManifest(alloc, manifest) catch return error.FetchFailed;
+    }
+
+    fn install(ctx: ?*anyopaque, updater: *AutoUpgrade, alloc: Allocator, target: update_target.Target, base: []const u8) AutoUpgrade.InstallError!void {
+        const self: *TestCycle = @ptrCast(@alignCast(ctx.?));
+        self.install_count += 1;
+        if (self.reload_during_install) {
+            updater.requestRelaunch("/tmp/fx") catch |err| {
+                self.reload_rejected = err == error.NotReady;
+            };
+        }
+        if (self.install_error) |err| return err;
+        if (self.stop_during_install) updater.stop();
+        if (self.revalidation_revision) |revision| self.revision = revision;
+        self.fetch_error = self.revalidation_error;
+        try updater.revalidateCandidate(alloc, target, base, self.deps());
+        self.copy_count += 1;
+        if (self.stop_after_copy) updater.stop();
+    }
+};
+
+test "auto upgrade dev cycles retain full installed identity through B C D and original reload revision" {
+    var fixture = TestCycle{};
+    defer fixture.deinit();
+    fixture.updater.setPreviousRevision(TestCycle.original_revision);
+
+    for ([_][]const u8{ TestCycle.revision_b, TestCycle.revision_c, TestCycle.revision_d }, 1..) |revision, count| {
+        fixture.revision = revision;
+        fixture.cycle();
+        try std.testing.expectEqual(State.ready, fixture.updater.getState());
+        try std.testing.expectEqualStrings(revision, fixture.installed.?.revision().?);
+        try std.testing.expectEqual(count, fixture.copy_count);
+        try std.testing.expect(fixture.updater.takeRenderDirty());
+        const fetch_count = fixture.fetch_count;
+        fixture.cycle();
+        try std.testing.expectEqual(count, fixture.install_count);
+        try std.testing.expectEqual(fetch_count + 1, fixture.fetch_count);
+        try std.testing.expectEqual(State.ready, fixture.updater.getState());
+        try std.testing.expect(!fixture.updater.takeRenderDirty());
+    }
+    try fixture.updater.requestRelaunch("/tmp/fx");
+    const request = fixture.updater.takeRelaunchRequest().?;
+    try std.testing.expectEqualStrings(TestCycle.original_revision, request.previousRevision().?);
+    try std.testing.expect(fixture.updater.should_stop.load(.acquire));
+}
+
+test "auto upgrade discovery failure preserves ready but failed replacement does not" {
+    var fixture = TestCycle{};
+    defer fixture.deinit();
+    fixture.cycle();
+    _ = fixture.updater.takeRenderDirty();
+    fixture.fetch_error = true;
+    fixture.cycle();
+    try std.testing.expectEqual(State.ready, fixture.updater.getState());
+    try std.testing.expect(!fixture.updater.takeRenderDirty());
+    try std.testing.expectEqual(@as(usize, 1), fixture.install_count);
+
+    fixture.fetch_error = false;
+    fixture.revision = TestCycle.revision_c;
+    for ([_]AutoUpgrade.InstallError{ error.DownloadFailed, error.ChecksumFailed, error.ExtractionFailed, error.InstallFailed }) |err| {
+        fixture.install_error = err;
+        fixture.cycle();
+        try std.testing.expectEqual(State.failed, fixture.updater.getState());
+        try std.testing.expectEqualStrings(TestCycle.revision_b, fixture.installed.?.revision().?);
+        try std.testing.expectEqual(@as(usize, 1), fixture.copy_count);
+        try std.testing.expectError(error.NotReady, fixture.updater.requestRelaunch("/tmp/fx"));
+    }
+    fixture.install_error = null;
+    fixture.cycle();
+    try std.testing.expectEqual(State.ready, fixture.updater.getState());
+    try std.testing.expectEqualStrings(TestCycle.revision_c, fixture.installed.?.revision().?);
+}
+
+test "auto upgrade revalidation discards superseded candidate and bounds each cycle" {
+    var fixture = TestCycle{};
+    defer fixture.deinit();
+    fixture.revalidation_revision = TestCycle.revision_c;
+    fixture.cycle();
+    try std.testing.expectEqual(@as(usize, 2), fixture.fetch_count);
+    try std.testing.expectEqual(@as(usize, 1), fixture.install_count);
+    try std.testing.expectEqual(@as(usize, 0), fixture.copy_count);
+    try std.testing.expect(fixture.installed == null);
+    try std.testing.expectEqual(State.waiting, fixture.updater.getState());
+    fixture.revalidation_revision = null;
+    fixture.cycle();
+    try std.testing.expectEqualStrings(TestCycle.revision_c, fixture.installed.?.revision().?);
+    try std.testing.expectEqual(State.ready, fixture.updater.getState());
+
+    fixture.revision = TestCycle.revision_d;
+    fixture.revalidation_error = true;
+    fixture.cycle();
+    try std.testing.expectEqual(State.failed, fixture.updater.getState());
+    try std.testing.expectEqual(@as(usize, 1), fixture.copy_count);
+    try std.testing.expectEqualStrings(TestCycle.revision_c, fixture.installed.?.revision().?);
+    fixture.revalidation_error = false;
+    fixture.fetch_error = false;
+    fixture.cycle();
+    try std.testing.expectEqualStrings(TestCycle.revision_d, fixture.installed.?.revision().?);
+}
+
+test "auto upgrade reload wins admission while discovery is in flight" {
+    var fixture = TestCycle{};
+    defer fixture.deinit();
+    fixture.cycle();
+    _ = fixture.updater.takeRenderDirty();
+    fixture.revision = TestCycle.revision_c;
+    fixture.reload_during_fetch = true;
+    fixture.cycle();
+    try std.testing.expectEqual(@as(usize, 1), fixture.install_count);
+    try std.testing.expectEqualStrings(TestCycle.revision_b, fixture.installed.?.revision().?);
+    try std.testing.expectEqual(State.ready, fixture.updater.getState());
+    try std.testing.expect(!fixture.updater.takeRenderDirty());
+    try std.testing.expect(fixture.updater.takeRelaunchRequest() != null);
+    try std.testing.expect(!fixture.updater.beginDownload("late candidate"));
+    const fetch_count = fixture.fetch_count;
+    fixture.cycle();
+    try std.testing.expectEqual(fetch_count, fixture.fetch_count);
+}
+
+test "auto upgrade replacement wins admission before reload" {
+    var fixture = TestCycle{};
+    defer fixture.deinit();
+    fixture.cycle();
+    fixture.revision = TestCycle.revision_c;
+    fixture.reload_during_install = true;
+    fixture.cycle();
+    try std.testing.expect(fixture.reload_rejected);
+    try std.testing.expect(fixture.updater.takeRelaunchRequest() == null);
+    try std.testing.expect(!fixture.updater.should_stop.load(.acquire));
+    try std.testing.expectEqualStrings(TestCycle.revision_c, fixture.installed.?.revision().?);
+    try fixture.updater.requestRelaunch("/tmp/fx");
+}
+
+test "auto upgrade cancellation blocks late admission copy and ready publication" {
+    var discovery = TestCycle{ .stop_during_fetch = true };
+    defer discovery.deinit();
+    discovery.cycle();
+    try std.testing.expectEqual(@as(usize, 0), discovery.install_count);
+    try std.testing.expect(discovery.installed == null);
+    try std.testing.expectEqual(State.checking, discovery.updater.getState());
+
+    var installing = TestCycle{ .stop_during_install = true };
+    defer installing.deinit();
+    installing.cycle();
+    try std.testing.expectEqual(@as(usize, 0), installing.copy_count);
+    try std.testing.expect(installing.installed == null);
+    try std.testing.expectEqual(State.downloading, installing.updater.getState());
+
+    var copied = TestCycle{ .stop_after_copy = true };
+    defer copied.deinit();
+    copied.cycle();
+    try std.testing.expectEqual(@as(usize, 1), copied.copy_count);
+    try std.testing.expectEqualStrings(TestCycle.revision_b, copied.installed.?.revision().?);
+    try std.testing.expectEqual(State.downloading, copied.updater.getState());
+    try std.testing.expectError(error.NotReady, copied.updater.requestRelaunch("/tmp/fx"));
+}
+
+test "auto upgrade stable stops discovery after ready and skips dev revalidation" {
+    var fixture = TestCycle{};
+    defer fixture.deinit();
+    fixture.updater.configure_channel(.stable);
+    fixture.cycle();
+    try std.testing.expectEqual(State.ready, fixture.updater.getState());
+    try std.testing.expectEqual(@as(usize, 1), fixture.fetch_count);
+    fixture.stable_version = "0.5.0";
+    fixture.cycle();
+    try std.testing.expectEqual(@as(usize, 1), fixture.fetch_count);
+    try std.testing.expectEqual(@as(usize, 1), fixture.copy_count);
+    try fixture.updater.requestRelaunch("/tmp/fx");
+    try std.testing.expect(fixture.updater.takeRelaunchRequest().?.previousRevision() == null);
+}
 
 test "statusLabel idle returns empty" {
     var au = AutoUpgrade{};
@@ -338,6 +656,7 @@ test "relaunch request owns its path and previous revision and is consumed once"
     var revision = [_]u8{'1'} ** 40;
     au.configure_channel(.dev);
     au.setPreviousRevision(&revision);
+    au.setState(.ready);
     try au.requestRelaunch(&path);
     path[1] = 'x';
     revision[0] = '2';
