@@ -212,6 +212,10 @@ pub const AutoUpgrade = struct {
         ctx: ?*anyopaque = null,
         fetch: *const fn (?*anyopaque, Allocator, update_target.Channel, []const u8) error{ FetchFailed, OutOfMemory }!update_target.Target = fetchDefault,
         install: *const fn (?*anyopaque, *AutoUpgrade, Allocator, update_target.Target, []const u8) InstallError!void = installDefault,
+
+        fn fetchTarget(self: CycleDeps, alloc: Allocator, selected: update_target.Channel, base: []const u8) error{ FetchFailed, OutOfMemory }!update_target.Target {
+            return self.fetch(self.ctx, alloc, selected, base);
+        }
     };
 
     fn fetchDefault(_: ?*anyopaque, alloc: Allocator, selected: update_target.Channel, base: []const u8) error{ FetchFailed, OutOfMemory }!update_target.Target {
@@ -220,6 +224,50 @@ pub const AutoUpgrade = struct {
 
     fn installDefault(_: ?*anyopaque, self: *AutoUpgrade, alloc: Allocator, target: update_target.Target, base: []const u8) InstallError!void {
         return self.downloadAndInstall(alloc, target, base);
+    }
+
+    fn waitForStop(self: *AutoUpgrade) std.Io.Cancelable!void {
+        while (!self.should_stop.load(.acquire)) {
+            try io_mod.getIo().sleep(.fromMilliseconds(sleep_increment_ms), .awake);
+        }
+    }
+
+    // The caller owns the returned target. Drain late results before the worker
+    // exits so cancellation cannot leak a target or outlive its allocator.
+    fn fetchInterruptible(
+        self: *AutoUpgrade,
+        alloc: Allocator,
+        selected: update_target.Channel,
+        base: []const u8,
+        deps: CycleDeps,
+    ) error{ FetchFailed, OutOfMemory, Cancelled }!update_target.Target {
+        if (self.should_stop.load(.acquire)) return error.Cancelled;
+        const Event = union(enum) {
+            fetched: error{ FetchFailed, OutOfMemory }!update_target.Target,
+            stopped: std.Io.Cancelable!void,
+        };
+        var buffer: [2]Event = undefined;
+        var select: std.Io.Select(Event) = .init(io_mod.getIo(), &buffer);
+        defer while (select.cancel()) |event| switch (event) {
+            .fetched => |result| {
+                var target = result catch continue;
+                target.deinit(alloc);
+            },
+            .stopped => {},
+        };
+        select.concurrent(.stopped, waitForStop, .{self}) catch return error.FetchFailed;
+        select.concurrent(.fetched, CycleDeps.fetchTarget, .{ deps, alloc, selected, base }) catch return error.FetchFailed;
+        switch (select.await() catch return error.Cancelled) {
+            .fetched => |result| {
+                var target = try result;
+                if (self.should_stop.load(.acquire)) {
+                    target.deinit(alloc);
+                    return error.Cancelled;
+                }
+                return target;
+            },
+            .stopped => return error.Cancelled,
+        }
     }
 
     fn beginDownload(self: *AutoUpgrade, label: []const u8) bool {
@@ -257,7 +305,7 @@ pub const AutoUpgrade = struct {
         defer self.finishCycle();
 
         const cdn_base = helpers.resolveCdnBase();
-        var target = deps.fetch(deps.ctx, alloc, self.selected_channel, cdn_base) catch return;
+        var target = self.fetchInterruptible(alloc, self.selected_channel, cdn_base, deps) catch return;
         var owns_target = true;
         defer if (owns_target) target.deinit(alloc);
 
@@ -266,7 +314,12 @@ pub const AutoUpgrade = struct {
             .version = previous.version(),
             .revision = previous.revision() orelse "unknown",
         } else current;
-        if (!target.shouldInstall(baseline)) return;
+        if (!target.shouldInstall(baseline)) {
+            self.version_mutex.lockUncancelable(io_mod.getIo());
+            defer self.version_mutex.unlock(io_mod.getIo());
+            if (installed.* != null and !self.should_stop.load(.acquire)) self.setState(.ready);
+            return;
+        }
 
         var label_buf: [64]u8 = undefined;
         const label = target.writeDisplayLabel(&label_buf) catch return;
@@ -309,7 +362,10 @@ pub const AutoUpgrade = struct {
     ) InstallError!void {
         if (self.should_stop.load(.acquire)) return error.Cancelled;
         if (target == .dev) {
-            var latest = deps.fetch(deps.ctx, alloc, .dev, cdn_base) catch return error.RevalidationFailed;
+            var latest = self.fetchInterruptible(alloc, .dev, cdn_base, deps) catch |err| return switch (err) {
+                error.Cancelled => error.Cancelled,
+                error.FetchFailed, error.OutOfMemory => error.RevalidationFailed,
+            };
             defer latest.deinit(alloc);
             if (self.should_stop.load(.acquire)) return error.Cancelled;
             if (latest != .dev or !std.ascii.eqlIgnoreCase(latest.dev.revision, target.dev.revision)) {
@@ -502,6 +558,157 @@ test "auto upgrade discovery failure preserves ready but failed replacement does
     fixture.cycle();
     try std.testing.expectEqual(State.ready, fixture.updater.getState());
     try std.testing.expectEqualStrings(TestCycle.revision_c, fixture.installed.?.revision().?);
+}
+
+test "auto upgrade restores installed target after failed or superseded replacement without redownload" {
+    for ([_]AutoUpgrade.InstallError{ error.DownloadFailed, error.Superseded }) |err| {
+        var fixture = TestCycle{};
+        defer fixture.deinit();
+        fixture.cycle();
+        fixture.revision = TestCycle.revision_c;
+        fixture.install_error = err;
+        fixture.cycle();
+        try std.testing.expectEqual(if (err == error.Superseded) State.waiting else State.failed, fixture.updater.getState());
+        try std.testing.expectError(error.NotReady, fixture.updater.requestRelaunch("/tmp/fx"));
+
+        fixture.revision = TestCycle.revision_b;
+        _ = fixture.updater.takeRenderDirty();
+        fixture.cycle();
+        try std.testing.expectEqual(State.ready, fixture.updater.getState());
+        try std.testing.expect(fixture.updater.takeRenderDirty());
+        try std.testing.expectEqual(@as(usize, 2), fixture.install_count);
+        try std.testing.expectEqual(@as(usize, 1), fixture.copy_count);
+        try std.testing.expectEqualStrings(TestCycle.revision_b, fixture.installed.?.revision().?);
+        fixture.cycle();
+        try std.testing.expect(!fixture.updater.takeRenderDirty());
+        try fixture.updater.requestRelaunch("/tmp/fx");
+    }
+}
+
+test "auto upgrade does not restore installed target after stop during discovery" {
+    var fixture = TestCycle{};
+    defer fixture.deinit();
+    fixture.cycle();
+    fixture.revision = TestCycle.revision_c;
+    fixture.install_error = error.DownloadFailed;
+    fixture.cycle();
+    fixture.revision = TestCycle.revision_b;
+    fixture.stop_during_fetch = true;
+    fixture.cycle();
+    try std.testing.expectEqual(State.checking, fixture.updater.getState());
+    try std.testing.expectEqual(@as(usize, 2), fixture.install_count);
+    try std.testing.expectError(error.NotReady, fixture.updater.requestRelaunch("/tmp/fx"));
+}
+
+const BlockedManifestTest = struct {
+    server: *std.Io.net.Server,
+    base: []const u8,
+    fixture: *TestCycle,
+    partial_body: bool,
+    revalidation: bool,
+    requested: std.atomic.Value(bool) = .init(false),
+    fetch_exited: std.atomic.Value(bool) = .init(false),
+    worker_exited: std.atomic.Value(bool) = .init(false),
+    peer_closed: bool = false,
+    revalidation_error: ?AutoUpgrade.InstallError = null,
+
+    fn serve(self: *BlockedManifestTest) !void {
+        const io = io_mod.getIo();
+        const stream = try self.server.accept(io);
+        defer stream.close(io);
+        var read_buf: [1024]u8 = undefined;
+        var reader = stream.reader(io, &read_buf);
+        const request = try reader.interface.takeDelimiterInclusive('\n');
+        try std.testing.expectEqualStrings("GET /dev.json HTTP/1.1\r\n", request);
+        while (true) {
+            const line = try reader.interface.takeDelimiterInclusive('\n');
+            if (std.mem.eql(u8, line, "\r\n")) break;
+        }
+        if (self.partial_body) {
+            var write_buf: [256]u8 = undefined;
+            var writer = stream.writer(io, &write_buf);
+            try writer.interface.writeAll("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\n{\r\n");
+            try writer.interface.flush();
+        }
+        self.requested.store(true, .release);
+        // Only the client can end this stall. Server cancellation is deferred
+        // until after stop has joined the updater and its latency is checked.
+        var byte: [1]u8 = undefined;
+        self.peer_closed = try reader.interface.readSliceShort(&byte) == 0;
+    }
+
+    fn fetch(ctx: ?*anyopaque, alloc: Allocator, selected: update_target.Channel, _: []const u8) error{ FetchFailed, OutOfMemory }!update_target.Target {
+        const self: *BlockedManifestTest = @ptrCast(@alignCast(ctx.?));
+        defer self.fetch_exited.store(true, .release);
+        return AutoUpgrade.fetchDefault(null, alloc, selected, self.base);
+    }
+
+    fn run(self: *BlockedManifestTest) void {
+        defer self.worker_exited.store(true, .release);
+        const deps: AutoUpgrade.CycleDeps = .{ .ctx = self, .fetch = fetch };
+        if (self.revalidation) {
+            self.fixture.updater.revalidateCandidate(std.testing.allocator, self.fixture.installed.?, self.base, deps) catch |err| {
+                self.revalidation_error = err;
+            };
+        } else {
+            self.fixture.updater.runOnce(std.testing.allocator, TestCycle.current, &self.fixture.installed, deps);
+        }
+    }
+};
+
+test "auto upgrade stop joins blocked HTTP manifest discovery and revalidation" {
+    for ([_]bool{ false, true }) |partial_body| {
+        for ([_]bool{ false, true }) |revalidation| {
+            const io = io_mod.getIo();
+            var fixture = TestCycle{};
+            defer fixture.deinit();
+            fixture.cycle();
+            _ = fixture.updater.takeRenderDirty();
+            if (revalidation) fixture.updater.setState(.downloading);
+            const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+            var server = try address.listen(io, .{ .reuse_address = true });
+            defer server.deinit(io);
+            var base_buf: [80]u8 = undefined;
+            const base = try std.fmt.bufPrint(&base_buf, "http://127.0.0.1:{d}", .{server.socket.address.getPort()});
+            var probe: BlockedManifestTest = .{
+                .server = &server,
+                .base = base,
+                .fixture = &fixture,
+                .partial_body = partial_body,
+                .revalidation = revalidation,
+            };
+            var serving = try io.concurrent(BlockedManifestTest.serve, .{&probe});
+            defer _ = serving.cancel(io) catch {};
+            fixture.updater.thread = try std.Thread.spawn(.{}, BlockedManifestTest.run, .{&probe});
+            defer fixture.updater.stop();
+            const deadline = io_mod.milliTimestamp() + 2_000;
+            while (!probe.requested.load(.acquire) and !probe.worker_exited.load(.acquire) and io_mod.milliTimestamp() < deadline) {
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            try std.testing.expect(probe.requested.load(.acquire));
+            try io.sleep(.fromMilliseconds(20), .awake);
+            try std.testing.expect(!probe.fetch_exited.load(.acquire));
+            try std.testing.expect(!probe.worker_exited.load(.acquire));
+            const started = io_mod.milliTimestamp();
+            if (!revalidation) try fixture.updater.requestRelaunch("/tmp/fx");
+            fixture.updater.stop();
+            try std.testing.expect(io_mod.milliTimestamp() - started < 1_000);
+            try std.testing.expect(probe.fetch_exited.load(.acquire));
+            try std.testing.expect(probe.worker_exited.load(.acquire));
+            try std.testing.expect(fixture.updater.thread == null);
+            try serving.await(io);
+            try std.testing.expect(probe.peer_closed);
+            try std.testing.expectEqualStrings(TestCycle.revision_b, fixture.installed.?.revision().?);
+            if (revalidation) {
+                try std.testing.expectEqual(error.Cancelled, probe.revalidation_error.?);
+                try std.testing.expectEqual(State.downloading, fixture.updater.getState());
+            } else {
+                try std.testing.expectEqual(State.ready, fixture.updater.getState());
+                try std.testing.expect(!fixture.updater.takeRenderDirty());
+                try std.testing.expect(fixture.updater.takeRelaunchRequest() != null);
+            }
+        }
+    }
 }
 
 test "auto upgrade revalidation discards superseded candidate and bounds each cycle" {

@@ -78,6 +78,7 @@ function startUpgradeServer(
 ): {
   baseUrl: string;
   publish: (revision: string, hold?: boolean) => void;
+  holdManifest: () => void;
   requests: string[];
   release: () => void;
   stop: () => void;
@@ -111,6 +112,7 @@ exec ${shellQuote(FX_BIN)} "$@"
   let heldRevision: string | undefined;
   let releaseHeld: (() => void) | undefined;
   let held: Promise<void> | undefined;
+  let manifestHeld = false;
   function publish(next: string, hold = false) {
     revision = next;
     const marked = script.replace("#!/bin/sh\n", `#!/bin/sh\n# release ${next}\n`)
@@ -137,6 +139,7 @@ exec ${shellQuote(FX_BIN)} "$@"
       requests.push(path);
       if (path === "/latest.txt") return new Response("v9.9.9\n");
       if (path === "/dev.json") {
+        if (manifestHeld) await held;
         return Response.json({ version: "9.9.9", commit: revision });
       }
       if (path === stableArchiveRoute) return new Response(archive);
@@ -153,8 +156,12 @@ exec ${shellQuote(FX_BIN)} "$@"
   return {
     baseUrl: `http://127.0.0.1:${server.port}`,
     publish,
+    holdManifest: () => {
+      manifestHeld = true;
+      held = new Promise<void>((resolve) => { releaseHeld = resolve; });
+    },
     requests,
-    release: () => { releaseHeld?.(); heldRevision = undefined; },
+    release: () => { releaseHeld?.(); heldRevision = undefined; manifestHeld = false; },
     stop: () => { releaseHeld?.(); server.stop(true); },
   };
 }
@@ -5472,12 +5479,24 @@ test.skipIf(!tmuxAvailable())(
         expect(release.requests.filter((path) => path === `/dev/${revision}/fx-${platform}.tar.gz`)).toHaveLength(1);
       }
       expect(existsSync(argvLogPath)).toBe(false);
+      const manifestCount = release.requests.filter((path) => path === "/dev.json").length;
+      release.holdManifest();
+      const pollDeadline = Date.now() + 90_000;
+      while (release.requests.filter((path) => path === "/dev.json").length === manifestCount && Date.now() < pollDeadline) {
+        await Bun.sleep(100);
+      }
+      expect(release.requests.filter((path) => path === "/dev.json").length).toBeGreaterThan(manifestCount);
+      const reloadStarted = Date.now();
       await active.sendHexBytes(["07"]);
-      await active.waitForText("fx has been updated", TIMEOUT);
+      await active.waitForText("fx has been updated", 10_000);
+      expect(Date.now() - reloadStarted).toBeLessThan(10_000);
+      release.release();
       await active.waitForComposer(TIMEOUT);
       expect(readFileSync(`${argvLogPath}.revision`, "utf8").trim()).toBe(d);
       const argv = readFileSync(argvLogPath, "utf8").trim().split("\t");
       expect(argv.slice(0, 4)).toEqual([installedFx, "resume", sessionId, "--upgrade-relaunch"]);
+      expect(argv[4]).toMatch(/^[0-9a-f]{7,64}$/);
+      expect([b, c, d]).not.toContain(argv[4]);
       expect(await active.captureFullScrollback()).toContain("DEV_REFRESH_INITIAL");
       await active.sendText("Continue the same conversation.");
       await active.waitForText("DEV_REFRESH_RESUMED", TIMEOUT);
@@ -5492,7 +5511,7 @@ test.skipIf(!tmuxAvailable())(
       rmSync(root, { recursive: true, force: true });
     }
   },
-  240_000,
+  330_000,
 );
 
 test.skipIf(!tmuxAvailable())(
