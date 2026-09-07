@@ -4,6 +4,7 @@ const std_builtin = @import("builtin");
 const command_admission = @import("../core/permissions/command_admission.zig");
 const auth_runtime = @import("../core/auth/auth_runtime.zig");
 const credentials = @import("../core/auth/credentials.zig");
+const secret = @import("../core/auth/secret.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
@@ -314,7 +315,7 @@ const AcpContext = struct {
         const session = if (self.state.active_session) |*active| active else unreachable;
         const provider_capabilities = self.state.cfg.provider_set.select(session.provider).capabilities;
         if (provider_capabilities.fx_search) {
-            self.state.web_search_runtime.configure(.{
+            self.state.web_search_runtime.configure(self.alloc, .{
                 .api_key = session.api_key,
                 .credential_source = session.credential_source,
                 .gateway_team = self.state.gateway_team,
@@ -890,7 +891,12 @@ pub fn runSubagentChild(
     };
     const session_id = active.session_id;
     const captured_mode = active.mode;
+    var host_snapshot = ChildHostSnapshot.capture(alloc, state, active) catch {
+        state.subagent_authority_mutex.unlock(io_mod.getIo());
+        return error.OutOfMemory;
+    };
     state.subagent_authority_mutex.unlock(io_mod.getIo());
+    defer host_snapshot.deinit(alloc);
     var ctx = AcpContext{
         .alloc = alloc,
         .state = state,
@@ -912,9 +918,11 @@ pub fn runSubagentChild(
     defer child_projection.deinit(alloc);
     var skill_catalog = state.skills.acquireCatalog();
     defer skill_catalog.deinit();
+    var tool_context = ctx.toolContext();
+    host_snapshot.applyCredential(&tool_context);
     return subagent_agent_adapter.run(.{
         .host = subagent_host,
-        .tool_context = ctx.toolContext(),
+        .tool_context = tool_context,
         .provider_set = state.cfg.provider_set,
         .system_prompt = state.cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = state.cfg.prompt_policy.modelPromptOverlay(admission.model),
@@ -924,10 +932,56 @@ pub fn runSubagentChild(
         .custom_tool_guidance = child_projection.custom_guidance,
         .context_registry = state.cfg.context_registry,
         .context_enabled = state.context_enabled,
-        .project_context = state.context_snapshot.modelVisibleBytes(),
+        .project_context = host_snapshot.project_context,
         .lifecycle_view = state.lifecycle_view,
     }, turn, message, admission, cancel);
 }
+
+/// Parent state a subagent child keeps reading after its own thread starts.
+/// The child can outlive the parent's cancelled turn, and the next prompt may
+/// replace the project context or rotate the credential, so the child owns
+/// copies taken under `subagent_authority_mutex`. The parent swaps those fields
+/// under the same lock before freeing the previous values.
+const ChildHostSnapshot = struct {
+    project_context: []u8,
+    api_key: []u8,
+    gateway_team: ?[]u8,
+    account_id: ?[]u8,
+
+    fn capture(
+        alloc: Allocator,
+        state: *const server.ServerState,
+        active: *const server.ActiveSessionState,
+    ) Allocator.Error!ChildHostSnapshot {
+        const project_context = try alloc.dupe(u8, state.context_snapshot.modelVisibleBytes());
+        errdefer alloc.free(project_context);
+        const api_key = try alloc.dupe(u8, active.api_key);
+        errdefer secret.zeroAndFree(alloc, api_key);
+        const gateway_team = if (state.gateway_team) |team| try alloc.dupe(u8, team) else null;
+        errdefer if (gateway_team) |team| alloc.free(team);
+        const account_id = if (active.account_id) |id| try alloc.dupe(u8, id) else null;
+        return .{
+            .project_context = project_context,
+            .api_key = api_key,
+            .gateway_team = gateway_team,
+            .account_id = account_id,
+        };
+    }
+
+    fn applyCredential(self: *const ChildHostSnapshot, tool_context: *tool_runtime.Context) void {
+        tool_context.api_key = self.api_key;
+        tool_context.gateway_team = self.gateway_team;
+        tool_context.account_id = self.account_id;
+    }
+
+    fn deinit(self: *ChildHostSnapshot, alloc: Allocator) void {
+        alloc.free(self.project_context);
+        secret.zeroAndFree(alloc, self.api_key);
+        if (self.gateway_team) |team| alloc.free(team);
+        if (self.account_id) |id| alloc.free(id);
+        self.* = undefined;
+    }
+};
 
 fn refreshProjectContext(
     state: *server.ServerState,
@@ -936,10 +990,12 @@ fn refreshProjectContext(
     omissions: []const context_contract.ContextOmissionInput,
     omission_summary: ?context_contract.ContextOmissionSummary,
 ) context_contract.ProviderError!void {
-    state.context_snapshot.deinit(alloc);
-    if (!state.context_enabled) return;
+    if (!state.context_enabled) {
+        replaceProjectContextSnapshot(state, alloc, .{});
+        return;
+    }
 
-    state.context_snapshot = state.cfg.context_registry.gatherDefaultSnapshot(alloc, .{
+    const next = state.cfg.context_registry.gatherDefaultSnapshot(alloc, .{
         .workspace_root = state.workspace_root,
         .access_scope = state.workspace_access.scope(state.workspace_root),
         .targets = targets,
@@ -948,8 +1004,25 @@ fn refreshProjectContext(
         .context_limits = state.context_limits,
     }) catch |err| {
         debug_trace.logf("context", "acp gather failed err={s}", .{@errorName(err)});
+        replaceProjectContextSnapshot(state, alloc, .{});
         return err;
     };
+    replaceProjectContextSnapshot(state, alloc, next);
+}
+
+/// Swaps the parent snapshot under the lock subagent children hold while they
+/// copy it (`ChildHostSnapshot.capture`), then frees the previous bytes once no
+/// child can still see them.
+fn replaceProjectContextSnapshot(
+    state: *server.ServerState,
+    alloc: Allocator,
+    next: context_contract.GatheredContextSnapshot,
+) void {
+    state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+    var previous = state.context_snapshot;
+    state.context_snapshot = next;
+    state.subagent_authority_mutex.unlock(io_mod.getIo());
+    previous.deinit(alloc);
 }
 
 const AgentConfigSections = struct {
@@ -4013,6 +4086,35 @@ test "ACP refreshes typed registry context and propagates enabled gathering erro
     try std.testing.expect(state.context_snapshot.contribution == null);
 }
 
+test "ACP subagent child owns its parent snapshot across later refreshes" {
+    const alloc = std.testing.allocator;
+    AcpContextRegistryFixture.reset();
+
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    const active = &state.active_session.?;
+    try refreshProjectContext(&state, alloc, &.{}, &.{}, null);
+
+    var snapshot = try ChildHostSnapshot.capture(alloc, &state, active);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqualStrings("ACP registry context 1", snapshot.project_context);
+    try std.testing.expect(snapshot.project_context.ptr != state.context_snapshot.modelVisibleBytes().ptr);
+    try std.testing.expectEqualStrings(active.api_key, snapshot.api_key);
+    try std.testing.expect(snapshot.api_key.ptr != active.api_key.ptr);
+    try std.testing.expect(snapshot.gateway_team == null);
+    try std.testing.expect(snapshot.account_id == null);
+
+    // A later prompt replaces the parent snapshot while the child still runs.
+    try refreshProjectContext(&state, alloc, &.{}, &.{}, null);
+    try std.testing.expectEqualStrings("ACP registry context 2", state.context_snapshot.modelVisibleBytes());
+    try std.testing.expectEqualStrings("ACP registry context 1", snapshot.project_context);
+
+    state.context_enabled = false;
+    try refreshProjectContext(&state, alloc, &.{}, &.{}, null);
+    try std.testing.expectEqualStrings("", state.context_snapshot.modelVisibleBytes());
+    try std.testing.expectEqualStrings("ACP registry context 1", snapshot.project_context);
+}
+
 test "ACP prompt propagates context provider errors before pending prompt state" {
     const alloc = std.testing.allocator;
     var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
@@ -4236,11 +4338,12 @@ test "ACP prompt projection configures web search then blocks native execution" 
     var provider = state.web_search_runtime.provider orelse return error.TestExpectedEqual;
     provider.context = @ptrCast(&provider_state);
     provider.execute_fn = FailingWebSearchProvider.execute;
+    state.web_search_runtime.deinit();
     state.web_search_runtime = web_search_runtime.Runtime.init(.{
         .provider = provider,
     });
 
-    state.web_search_runtime.configure(.{
+    state.web_search_runtime.configure(alloc, .{
         .api_key = "stale-key",
         .worker_model = "stale-model",
         .gateway_retry_count = 99,
