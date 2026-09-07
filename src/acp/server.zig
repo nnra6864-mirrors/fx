@@ -297,7 +297,6 @@ pub const ServerState = struct {
 
     pub fn deinit(self: *ServerState) void {
         reapActivePrompt(self, true);
-        self.managed_executions.deinit();
         self.terminal_client.deinit();
         closeActiveSession(self) catch |err| {
             debug_trace.logf(
@@ -306,6 +305,7 @@ pub const ServerState = struct {
                 .{@errorName(err)},
             );
         };
+        self.managed_executions.deinit();
         self.workspace_access.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
         if (self.api_key.len > 0) secret.zeroAndFree(self.alloc, self.api_key);
@@ -586,6 +586,7 @@ fn closeActiveSession(state: *ServerState) !void {
 
 fn destroyActiveSession(state: *ServerState) void {
     const active = if (state.active_session) |*session| session else return;
+    state.managed_executions.resetSession();
     state.alloc.free(active.session_id);
     state.alloc.free(active.model);
     types.freePermissionGrantSlice(state.alloc, active.session_grants);

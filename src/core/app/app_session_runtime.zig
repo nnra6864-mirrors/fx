@@ -1400,6 +1400,9 @@ pub fn Runtime(comptime App: type) type {
         ) void {
             clearCachedSessionTitle(app);
             app.worker.discardEvents(std.heap.c_allocator);
+            if (comptime @hasField(App, "managed_executions")) {
+                app.managed_executions.resetSession();
+            }
 
             if (comptime @hasField(App, "subagents") and
                 @hasDecl(@TypeOf(app.subagents), "clearProjection"))

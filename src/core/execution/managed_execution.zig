@@ -11,6 +11,7 @@ const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const session_child_store = @import("../session/session_child_store.zig");
+const session_helpers = @import("session_helpers.zig");
 
 const Allocator = std.mem.Allocator;
 const max_entries = contract.max_live_entries + contract.max_tombstones;
@@ -426,8 +427,11 @@ const Entry = struct {
             .captured => |*value| value,
             .tty, .tombstone => return,
         };
+        var helper_lease = session_helpers.Lease{ .owner = &self.runtime.helpers };
+        defer _ = helper_lease.finish(false);
         const started_ms = io_mod.milliTimestamp();
         const routed = execution_router.executePreparedRoute(.{
+            .helper_lease = &helper_lease,
             .max_command_output_bytes = self.max_output_bytes,
             .cancel_flag = &self.cancel,
             .force_cancel_flag = &self.force_cancel,
@@ -441,14 +445,18 @@ const Entry = struct {
             .timeout_started_ms = started_ms,
             .command_artifact_dir = self.command_artifact_dir,
         }, self.arena.allocator(), captured.route) catch |err| {
+            const cleanup = helper_lease.finish(false);
             const zio = io_mod.getIo();
             self.mutex.lockUncancelable(zio);
             self.finalizeReplayLocked();
-            self.error_name = @errorName(err);
+            self.error_name = if (cleanup == .incomplete)
+                std.fmt.allocPrint(self.arena.allocator(), "{s}: SessionHelperCleanupIncomplete", .{@errorName(err)}) catch "SessionHelperCleanupIncomplete"
+            else
+                @errorName(err);
             debug_trace.logf(
                 "core",
-                "managed execution became lost boundary=worker_route execution_id={s} err={s}",
-                .{ self.execution_id, @errorName(err) },
+                "managed execution became lost boundary=worker_route execution_id={s} err={s} cleanup={s}",
+                .{ self.execution_id, @errorName(err), @tagName(cleanup) },
             );
             self.state = state_for_worker_error(err);
             self.barrier.output_drained = true;
@@ -459,6 +467,17 @@ const Entry = struct {
         const status = statusFromResult(self.execution_id, routed.result);
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);
+        var cleanup: session_helpers.CleanupOutcome = .clean;
+        if (self.cancel.load(.seq_cst)) {
+            // Cancellation is latched. Retire outside the publication lock;
+            // no later observation can turn this rejected lease into retention.
+            self.mutex.unlock(zio);
+            cleanup = helper_lease.finish(false);
+            self.mutex.lockUncancelable(zio);
+        } else {
+            cleanup = helper_lease.finish(true);
+        }
+        if (cleanup == .incomplete) self.error_name = "SessionHelperCleanupIncomplete";
         self.finalizeReplayLocked();
         self.result = routed.result;
         var next = contract.transition(
@@ -500,11 +519,13 @@ pub const Runtime = struct {
     shutting_down: bool = false,
     replay_store: command_replay_store.EphemeralStore,
     pending_admissions: usize = 0,
+    helpers: session_helpers.Owner,
 
     pub fn init(alloc: Allocator) Runtime {
         return .{
             .alloc = alloc,
             .replay_store = command_replay_store.EphemeralStore.init(alloc),
+            .helpers = session_helpers.Owner.init(alloc),
         };
     }
 
@@ -519,8 +540,12 @@ pub const Runtime = struct {
             self.joinEntry(entry);
             entry.deinit();
         }
-        self.replay_store.deinit();
         self.mutex.unlock(zio);
+        if (self.helpers.clear() == .incomplete) {
+            debug_trace.logf("core", "session helper shutdown finished with incomplete cleanup", .{});
+            std.Io.File.stderr().writeStreamingAll(zio, "fx: could not verify cleanup of session helpers\n") catch {};
+        }
+        self.replay_store.deinit();
         self.* = undefined;
     }
 
@@ -578,19 +603,18 @@ pub const Runtime = struct {
         while (true) {
             entry.mutex.lockUncancelable(zio);
             const terminal = entry.isTerminal();
+            const cancelled = !terminal and if (input.cancel_flag) |flag| flag.load(.seq_cst) else false;
+            if (cancelled) entry.cancel.store(true, .seq_cst);
             entry.mutex.unlock(zio);
             if (terminal) break;
-            if (input.cancel_flag) |flag| {
-                if (flag.load(.seq_cst)) {
-                    entry.cancel.store(true, .seq_cst);
-                    self.joinEntry(entry);
-                    const prepared = try self.prepareSnapshot(
-                        alloc,
-                        entry.execution_id,
-                    );
-                    published = true;
-                    return prepared;
-                }
+            if (cancelled) {
+                self.joinEntry(entry);
+                const prepared = try self.prepareSnapshot(
+                    alloc,
+                    entry.execution_id,
+                );
+                published = true;
+                return prepared;
             }
             const elapsed = io_mod.milliTimestamp() - started_ms;
             if (elapsed >= input.yield_time_ms) break;
@@ -1105,6 +1129,14 @@ pub const Runtime = struct {
         for (live[0..live_len]) |entry| self.joinEntry(entry);
     }
 
+    /// Ends process-scoped work before replacing the active conversation.
+    /// The caller has already quiesced tool dispatch and snapshot consumers.
+    pub fn resetSession(self: *Runtime) void {
+        const alloc = self.alloc;
+        self.deinit();
+        self.* = Runtime.init(alloc);
+    }
+
     const AdmissionResult = struct {
         entry: *Entry,
         created: bool,
@@ -1266,7 +1298,9 @@ pub const Runtime = struct {
 
     fn cancelUnpublished(self: *Runtime, execution_id: []const u8) void {
         const entry = self.acquireEntry(execution_id) orelse return;
-        entry.cancel.store(true, .seq_cst);
+        entry.mutex.lockUncancelable(io_mod.getIo());
+        if (!entry.isTerminal()) entry.cancel.store(true, .seq_cst);
+        entry.mutex.unlock(io_mod.getIo());
         entry.start_gate.set(io_mod.getIo());
         self.joinEntry(entry);
         self.markDelete(entry);
@@ -1726,6 +1760,95 @@ test "captured stop returns lost when its worker cannot settle" {
     try std.testing.expect(settled_before_release);
     try std.testing.expect(stop_lost.load(.seq_cst));
     try std.testing.expect(!stop_failed.load(.seq_cst));
+}
+
+test "captured stop exposes incomplete helper cleanup before runtime deinit" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    var input = StartCapturedInput{
+        .execution_id = "managed-stop-cleanup-incomplete",
+        .command = "printf 'managed-cleanup-ready\\n'; exec /bin/sleep 30",
+        .cwd = "/tmp",
+        .environment = .{ .clean = "/bin/bash" },
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = null,
+        .command_artifact_dir = null,
+        .yield_time_ms = 0,
+    };
+    input.authority = testAuthority(input);
+    var started = try runtime.startCaptured(alloc, input);
+    defer started.deinit(alloc);
+    try std.testing.expectEqual(SnapshotState.running, started.snapshot.state);
+    var observed_ready = std.mem.find(u8, started.snapshot.output_delta, "managed-cleanup-ready") != null;
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+
+    var injected = false;
+    const deadline_ms = io_mod.milliTimestamp() + 5_000;
+    while (!injected and io_mod.milliTimestamp() < deadline_ms) {
+        var running = try runtime.wait(alloc, input.execution_id, 20, null);
+        defer running.deinit(alloc);
+        try std.testing.expectEqual(SnapshotState.running, running.snapshot.state);
+        observed_ready = observed_ready or std.mem.find(u8, running.snapshot.output_delta, "managed-cleanup-ready") != null;
+        try runtime.commitDelivery(running.snapshot.execution_id, running.reservation_id);
+        if (!observed_ready) continue;
+
+        runtime.helpers.mutex.lockUncancelable(io);
+        defer runtime.helpers.mutex.unlock(io);
+        for (runtime.helpers.slots) |slot| {
+            switch (slot) {
+                .reserved => |scope| {
+                    const ledger = scope.mapping.state;
+                    if (ledger.rootPid() == null) continue;
+                    // This runtime has one command. Inject a sticky scan failure
+                    // only after its target has a committed ownership record.
+                    @atomicStore(u32, &ledger.failed, 1, .release);
+                    injected = true;
+                    break;
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(injected);
+
+    {
+        var requested = try runtime.stop(alloc, input.execution_id, true);
+        defer requested.deinit(alloc);
+        // The test-only 100 ms stop ceiling may precede scope retirement.
+        // Any settled stop must already expose the cleanup failure.
+        const name = requested.snapshot.error_name orelse return error.TestExpectedCleanupFailure;
+        if (!std.mem.eql(u8, name, "StopSettlementTimedOut")) {
+            try std.testing.expectEqualStrings("SessionHelperCleanupIncomplete", name);
+        } else {
+            try std.testing.expectEqual(SnapshotState.lost, requested.snapshot.state);
+            try std.testing.expect(requested.snapshot.output_incomplete);
+        }
+        try runtime.commitDelivery(requested.snapshot.execution_id, requested.reservation_id);
+    }
+
+    var stopped = try runtime.wait(alloc, input.execution_id, 10_000, null);
+    defer stopped.deinit(alloc);
+    try std.testing.expectEqualStrings("SessionHelperCleanupIncomplete", stopped.snapshot.error_name orelse return error.TestExpectedCleanupFailure);
+    {
+        const entry = runtime.acquireEntry(input.execution_id) orelse return error.ExecutionNotFound;
+        defer runtime.releaseEntry(entry);
+        entry.mutex.lockUncancelable(io);
+        defer entry.mutex.unlock(io);
+        if (entry.result) |result| {
+            // Cleanup uncertainty must not replace the actual target outcome.
+            try std.testing.expectEqualDeep(
+                SnapshotState{ .stopped = statusFromResult(input.execution_id, result) },
+                stopped.snapshot.state,
+            );
+        } else {
+            try std.testing.expectEqual(SnapshotState.lost, stopped.snapshot.state);
+        }
+    }
+    try runtime.commitDelivery(stopped.snapshot.execution_id, stopped.reservation_id);
 }
 
 test "generated captured execution identities do not depend on provider call ids" {

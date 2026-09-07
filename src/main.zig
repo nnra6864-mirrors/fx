@@ -4241,6 +4241,9 @@ test {
     _ = @import("core/execution/managed_execution_contract.zig");
     _ = @import("core/execution/managed_execution.zig");
     _ = @import("core/execution/process_tree.zig");
+    _ = @import("core/execution/command_runner.zig");
+    _ = @import("core/execution/session_helpers.zig");
+    _ = @import("core/execution/scope_memory.zig");
     _ = @import("core/config/prompt_policy.zig");
     _ = @import("core/workspace/record_tape.zig");
     _ = @import("core/session/session.zig");
