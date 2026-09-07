@@ -4134,6 +4134,7 @@ test {
     _ = @import("core/config/model_provider.zig");
     _ = provider_runtime;
     _ = @import("acp/prompt.zig");
+    _ = acp_server;
     _ = @import("core/output/activity_status.zig");
     _ = @import("core/agent/agent_runtime.zig");
     _ = @import("core/agent/execution_memory.zig");

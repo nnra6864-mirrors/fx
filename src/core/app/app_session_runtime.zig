@@ -1341,7 +1341,7 @@ pub fn Runtime(comptime App: type) type {
             app.session_persistence.pending_live_session_policy = decision.pending_policy;
             switch (decision.action) {
                 .apply_pending => |policy| {
-                    applyIdleLiveSessionTransition(app, policy);
+                    try applyIdleLiveSessionTransition(app, policy);
                     try installFreshLiveSession(app);
                 },
                 .none => {},
@@ -1378,7 +1378,7 @@ pub fn Runtime(comptime App: type) type {
         ) !void {
             beginLiveSessionCancellation(app);
             app.worker.waitUntilIdle();
-            applyIdleLiveSessionTransition(app, background_policy);
+            try applyIdleLiveSessionTransition(app, background_policy);
         }
 
         fn beginLiveSessionCancellation(app: *App) void {
@@ -1397,12 +1397,12 @@ pub fn Runtime(comptime App: type) type {
         fn applyIdleLiveSessionTransition(
             app: *App,
             background_policy: BackgroundSessionPolicy,
-        ) void {
+        ) !void {
+            if (comptime @hasField(App, "managed_executions")) {
+                try app.managed_executions.resetSession();
+            }
             clearCachedSessionTitle(app);
             app.worker.discardEvents(std.heap.c_allocator);
-            if (comptime @hasField(App, "managed_executions")) {
-                app.managed_executions.resetSession();
-            }
 
             if (comptime @hasField(App, "subagents") and
                 @hasDecl(@TypeOf(app.subagents), "clearProjection"))

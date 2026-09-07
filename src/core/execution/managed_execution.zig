@@ -530,6 +530,10 @@ pub const Runtime = struct {
     }
 
     pub fn deinit(self: *Runtime) void {
+        _ = self.deinitWithOutcome();
+    }
+
+    fn deinitWithOutcome(self: *Runtime) session_helpers.CleanupOutcome {
         self.shutdown();
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);
@@ -541,12 +545,14 @@ pub const Runtime = struct {
             entry.deinit();
         }
         self.mutex.unlock(zio);
-        if (self.helpers.clear() == .incomplete) {
+        const outcome = self.helpers.clear();
+        if (outcome == .incomplete) {
             debug_trace.logf("core", "session helper shutdown finished with incomplete cleanup", .{});
             std.Io.File.stderr().writeStreamingAll(zio, "fx: could not verify cleanup of session helpers\n") catch {};
         }
         self.replay_store.deinit();
         self.* = undefined;
+        return outcome;
     }
 
     pub fn generatedId(self: *Runtime, buffer: []u8) ![]const u8 {
@@ -1131,10 +1137,17 @@ pub const Runtime = struct {
 
     /// Ends process-scoped work before replacing the active conversation.
     /// The caller has already quiesced tool dispatch and snapshot consumers.
-    pub fn resetSession(self: *Runtime) void {
+    pub fn resetSession(self: *Runtime) error{SessionHelperCleanupIncomplete}!void {
         const alloc = self.alloc;
-        self.deinit();
+        const next_generated_id = self.next_generated_id;
+        const next_reservation_id = self.next_reservation_id;
+        const outcome = self.deinitWithOutcome();
         self.* = Runtime.init(alloc);
+        // A failed transition leaves old handles in the conversation. Neither
+        // execution handles nor delivery reservations may alias new work.
+        self.next_generated_id = next_generated_id;
+        self.next_reservation_id = next_reservation_id;
+        if (outcome == .incomplete) return error.SessionHelperCleanupIncomplete;
     }
 
     const AdmissionResult = struct {
@@ -1849,6 +1862,94 @@ test "captured stop exposes incomplete helper cleanup before runtime deinit" {
         }
     }
     try runtime.commitDelivery(stopped.snapshot.execution_id, stopped.reservation_id);
+}
+
+test "session reset exposes retained helper cleanup failure and preserves handle watermarks" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const process_tree = @import("process_tree.zig");
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    var first_id_buffer: [64]u8 = undefined;
+    const first_id = try runtime.generatedId(&first_id_buffer);
+    var input = StartCapturedInput{
+        .execution_id = first_id,
+        .command = "/bin/sleep 30 </dev/null >/dev/null 2>&1 & helper=$!; sleep 0.2; printf '%s\\n' \"$helper\"",
+        .cwd = "/tmp",
+        .environment = .{ .clean = "/bin/bash" },
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = null,
+        .command_artifact_dir = null,
+        .yield_time_ms = 5_000,
+    };
+    input.authority = testAuthority(input);
+    var completed = try runtime.startCaptured(alloc, input);
+    defer completed.deinit(alloc);
+    try std.testing.expectEqualDeep(SnapshotState{ .completed = .{ .exit_code = 0 } }, completed.snapshot.state);
+    try std.testing.expect(completed.snapshot.error_name == null);
+    const helper_pid = try std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, completed.snapshot.output_delta, " \r\n"), 10);
+    try std.testing.expect(try process_tree.processIsAlive(alloc, helper_pid));
+    try runtime.commitDelivery(completed.snapshot.execution_id, completed.reservation_id);
+
+    var injected = false;
+    {
+        runtime.helpers.mutex.lockUncancelable(io);
+        defer runtime.helpers.mutex.unlock(io);
+        for (runtime.helpers.slots) |slot| {
+            switch (slot) {
+                .retained => |scope| {
+                    // The launching command has completed. Only later session
+                    // retirement, not command stop, may expose this failure.
+                    const ledger = scope.mapping.state;
+                    try std.testing.expect(ledger.rootPid() != null);
+                    const committed = @atomicLoad(u32, &ledger.committed, .acquire);
+                    var helper_recorded = false;
+                    for (ledger.records[0..committed]) |record| {
+                        if (record.pid == helper_pid) helper_recorded = true;
+                    }
+                    try std.testing.expect(helper_recorded);
+                    @atomicStore(u32, &ledger.failed, 1, .release);
+                    injected = true;
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(injected);
+    const next_generated_id = runtime.next_generated_id;
+    const next_reservation_id = runtime.next_reservation_id;
+    try std.testing.expectError(error.SessionHelperCleanupIncomplete, runtime.resetSession());
+    try std.testing.expect(!try process_tree.processIsAlive(alloc, helper_pid));
+    try std.testing.expectEqual(next_generated_id, runtime.next_generated_id);
+    try std.testing.expectEqual(next_reservation_id, runtime.next_reservation_id);
+    try std.testing.expect(!runtime.shutting_down);
+    try std.testing.expectEqual(session_helpers.CleanupOutcome.clean, runtime.helpers.cleanup);
+    for (runtime.helpers.slots) |slot| try std.testing.expect(slot == .empty);
+    try std.testing.expectEqualDeep(SnapshotState{ .completed = .{ .exit_code = 0 } }, completed.snapshot.state);
+    try std.testing.expect(completed.snapshot.error_name == null);
+
+    var second_id_buffer: [64]u8 = undefined;
+    const second_id = try runtime.generatedId(&second_id_buffer);
+    try std.testing.expect(!std.mem.eql(u8, first_id, second_id));
+    input.execution_id = second_id;
+    input.command = "printf after-reset";
+    input.authority = testAuthority(input);
+    var next = try runtime.startCaptured(alloc, input);
+    defer next.deinit(alloc);
+    try std.testing.expectEqualDeep(SnapshotState{ .completed = .{ .exit_code = 0 } }, next.snapshot.state);
+    try std.testing.expectEqualStrings("after-reset", next.snapshot.output_delta);
+    try std.testing.expect(next.reservation_id >= next_reservation_id);
+    try std.testing.expectError(error.UnknownReservation, runtime.commitReservation(completed.reservation_id));
+    try std.testing.expectError(error.ExecutionNotFound, runtime.wait(alloc, first_id, 0, null));
+    try runtime.commitDelivery(next.snapshot.execution_id, next.reservation_id);
+
+    const clean_generated_id = runtime.next_generated_id;
+    const clean_reservation_id = runtime.next_reservation_id;
+    try runtime.resetSession();
+    try std.testing.expectEqual(clean_generated_id, runtime.next_generated_id);
+    try std.testing.expectEqual(clean_reservation_id, runtime.next_reservation_id);
 }
 
 test "generated captured execution identities do not depend on provider call ids" {

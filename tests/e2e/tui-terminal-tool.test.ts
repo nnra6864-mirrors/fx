@@ -8,6 +8,7 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -27,37 +28,32 @@ const sessions: TmuxSession[] = [];
 const roots: string[] = [];
 const homes: string[] = [];
 const gateways: Array<ReturnType<typeof startFakeGateway>> = [];
-const helperPidPaths: string[] = [];
-const helperFaultCleanups: Array<{
+const helperCleanups: Array<{
+  pidPath: string;
+  scriptPath: string;
   helper?: HelperProcessIdentity;
   supervisor?: HelperProcessIdentity;
 }> = [];
 
 afterEach(async () => {
-  const faults = helperFaultCleanups.splice(0);
+  const cleanups = helperCleanups.splice(0);
   // Rescue only after the test has recorded its outcome, never to satisfy /quit.
-  for (const fault of faults) {
+  for (const cleanup of cleanups) {
     try {
-      if (fault.supervisor) signalHelperProcess(fault.supervisor, "SIGCONT", true);
+      if (cleanup.supervisor) signalHelperProcess(cleanup.supervisor, "SIGCONT", true);
     } catch (error) {
       console.error("Supervisor teardown resume failed:", error);
     }
   }
   for (const session of sessions.splice(0)) await session.kill();
-  for (const fault of faults) {
+  for (const cleanup of cleanups) {
     try {
-      if (fault.helper) signalHelperProcess(fault.helper, "SIGKILL");
+      // An early assertion can fail before the test reads the helper PID.
+      const identity = cleanup.helper ?? captureSessionHelper(cleanup);
+      if (identity) signalHelperProcess(identity, "SIGKILL");
     } catch (error) {
       console.error("Session helper teardown failed:", error);
     }
-  }
-  for (const path of helperPidPaths.splice(0)) {
-    if (!existsSync(path)) continue;
-    const pid = Number(readFileSync(path, "utf8"));
-    if (!Number.isSafeInteger(pid) || pid <= 0) continue;
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {}
   }
   for (const home of homes.splice(0)) await cleanupTerminalHost(home);
   for (const gateway of gateways.splice(0)) gateway.stop();
@@ -341,7 +337,8 @@ test.skipIf(!tmuxAvailable())(
 function createSessionHelper(fixture: ReturnType<typeof createFixture>) {
   const scriptPath = join(fixture.workspace, "helper.py");
   const pidPath = join(fixture.workspace, "helper.pid");
-  helperPidPaths.push(pidPath);
+  const cleanup: (typeof helperCleanups)[number] = { pidPath, scriptPath };
+  helperCleanups.push(cleanup);
   writeFileSync(scriptPath, `import os
 import pathlib
 import signal
@@ -393,6 +390,7 @@ else:
 `);
   return {
     pidPath,
+    cleanup,
     command: (mode: "start" | "probe" | "hold") =>
       `python3 ${JSON.stringify(scriptPath)} ${mode}`,
   };
@@ -401,6 +399,8 @@ else:
 function helperPid(path: string): number {
   const pid = Number(readFileSync(path, "utf8"));
   expect(Number.isSafeInteger(pid) && pid > 0).toBe(true);
+  const cleanup = helperCleanups.find((entry) => entry.pidPath === path);
+  if (cleanup && !cleanup.helper) cleanup.helper = captureSessionHelper(cleanup);
   return pid;
 }
 
@@ -411,13 +411,11 @@ async function expectHelperExited(pid: number, pidPath: string): Promise<void> {
       process.kill(pid, 0);
     } catch (error) {
       expect((error as NodeJS.ErrnoException).code).toBe("ESRCH");
-      const index = helperPidPaths.indexOf(pidPath);
-      if (index !== -1) helperPidPaths.splice(index, 1);
       return;
     }
     await Bun.sleep(25);
   }
-  throw new Error(`Session helper ${pid} survived cleanup`);
+  throw new Error(`Session helper ${pid} (${pidPath}) survived cleanup`);
 }
 
 type HelperProcessIdentity = {
@@ -426,6 +424,7 @@ type HelperProcessIdentity = {
   start: string;
   state: string;
   command: string;
+  supervisorRootPid?: number;
 };
 
 function helperProcessSnapshot(pid?: number): HelperProcessIdentity[] {
@@ -461,12 +460,48 @@ function helperProcessSnapshot(pid?: number): HelperProcessIdentity[] {
   });
 }
 
+function captureSessionHelper(
+  cleanup: (typeof helperCleanups)[number],
+): HelperProcessIdentity | undefined {
+  if (!existsSync(cleanup.pidPath)) return undefined;
+  const pid = Number(readFileSync(cleanup.pidPath, "utf8"));
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    throw new Error(`Invalid session helper PID in ${cleanup.pidPath}`);
+  }
+  const identity = helperProcessSnapshot(pid)[0];
+  if (!identity || identity.state.includes("Z")) return undefined;
+  // Prove this fixture's serve process before adopting a PID-file candidate.
+  const command = /^(?:\S*\/)?[Pp]ython(?:\d+(?:\.\d+)*)? (.+) serve$/.exec(identity.command);
+  if (command?.[1] !== cleanup.scriptPath) {
+    throw new Error(`Refusing unowned session helper PID ${pid} from ${cleanup.pidPath}`);
+  }
+  return identity;
+}
+
 function sameHelperProcess(identity: HelperProcessIdentity): HelperProcessIdentity | undefined {
   const current = helperProcessSnapshot(identity.pid)[0];
   return current?.pid === identity.pid && current.start === identity.start &&
       current.command === identity.command
     ? current
     : undefined;
+}
+
+function isHelperSupervisor(identity: HelperProcessIdentity, rootPid: number): boolean {
+  if (identity.ppid !== rootPid) return false;
+  const privateCommand = " __fx_helper_session__ ";
+  if (!identity.command.startsWith(`${FX_BIN}${privateCommand}`) &&
+      !(process.platform === "linux" &&
+        identity.command.startsWith(`/proc/self/exe${privateCommand}`))) return false;
+  if (process.platform !== "linux") return true;
+  // argv[0] is spoofable; procfs must identify this checkout's actual executable.
+  try {
+    const actual = statSync(`/proc/${identity.pid}/exe`, { bigint: true });
+    const expected = statSync(FX_BIN, { bigint: true });
+    return actual.dev === expected.dev && actual.ino === expected.ino;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 function signalHelperProcess(
@@ -478,6 +513,8 @@ function signalHelperProcess(
   const current = sameHelperProcess(identity);
   if (!current || current.state.includes("Z") ||
       (stoppedOnly && !current.state.includes("T"))) return false;
+  if (identity.supervisorRootPid !== undefined &&
+      !isHelperSupervisor(current, identity.supervisorRootPid)) return false;
   process.kill(current.pid, signal);
   return true;
 }
@@ -501,10 +538,7 @@ for (const signal of ["SIGKILL", "SIGSTOP"] as const) {
     async () => {
       const fixture = createFixture(`fx-shell-supervisor-${signal.toLowerCase()}-`);
       const helper = createSessionHelper(fixture);
-      // These faults use captured identities, not the legacy PID-file teardown.
-      helperPidPaths.splice(helperPidPaths.indexOf(helper.pidPath), 1);
-      const cleanup: (typeof helperFaultCleanups)[number] = {};
-      helperFaultCleanups.push(cleanup);
+      const { cleanup } = helper;
       const fxPidPath = join(fixture.workspace, "fx.pid");
       const wrapperPath = join(fixture.workspace, "launch-fx.sh");
       writeFileSync(wrapperPath, 'printf "%s" "$$" > "$1"\nexec "$2"\n');
@@ -518,9 +552,9 @@ for (const signal of ["SIGKILL", "SIGSTOP"] as const) {
           },
         }),
         () => {
-          const identity = helperProcessSnapshot(helperPid(helper.pidPath))[0];
+          helperPid(helper.pidPath);
+          const identity = cleanup.helper;
           expect(identity?.command).toEndWith(`${join(fixture.workspace, "helper.py")} serve`);
-          cleanup.helper = identity;
           return fakeGatewayFinalText("SESSION_HELPER_FAULT_BOUNDARY");
         },
         fakeGatewayToolCall("shell_after_supervisor_fault", "shell", {
@@ -556,11 +590,10 @@ for (const signal of ["SIGKILL", "SIGSTOP"] as const) {
       expect(fx).toBeDefined();
       expect(fx.command).toBe(FX_BIN);
       const supervisors = helperProcessSnapshot().filter((candidate) =>
-        candidate.ppid === fx.pid &&
-        candidate.command.startsWith(`${FX_BIN} __fx_helper_session__ `)
+        isHelperSupervisor(candidate, fx.pid)
       );
       expect(supervisors).toHaveLength(1);
-      const supervisor = supervisors[0]!;
+      const supervisor = { ...supervisors[0]!, supervisorRootPid: fx.pid };
       cleanup.supervisor = supervisor;
       expect(supervisor.pid).not.toBe(pid);
       expect(supervisor.pid).not.toBe(fx.pid);

@@ -2485,7 +2485,7 @@ const ProcessObserver = struct {
         if (self.completion) |completion| {
             const outcome = completion.observe() orelse return null;
             return switch (outcome) {
-                .target => |status| status,
+                .target => |status| project_observed_status(status, "helper_completion", @tagName(status)),
                 .supervisor_failure => .indeterminate,
             };
         }
@@ -2530,6 +2530,14 @@ const ProcessObserver = struct {
     fn statusFromTerm(
         term: std.process.Child.Term,
     ) command_contract.CommandStatus {
+        return project_observed_status(commandStatusFromTerm(term), "child_term", @tagName(std.meta.activeTag(term)));
+    }
+
+    fn project_observed_status(
+        status: command_contract.CommandStatus,
+        boundary: []const u8,
+        term_tag: []const u8,
+    ) command_contract.CommandStatus {
         if (io_mod.getenv("FX_COMMAND_TEST_INDETERMINATE_AFTER_EXIT") != null) {
             debug_trace.logf(
                 "core",
@@ -2538,12 +2546,11 @@ const ProcessObserver = struct {
             );
             return .indeterminate;
         }
-        const status = commandStatusFromTerm(term);
         switch (status) {
             .indeterminate => debug_trace.logf(
                 "core",
-                "command termination became indeterminate boundary=child_term term={s}",
-                .{@tagName(std.meta.activeTag(term))},
+                "command termination became indeterminate boundary={s} term={s}",
+                .{ boundary, term_tag },
             ),
             .exit_code, .signal, .finished => {},
         }

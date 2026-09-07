@@ -891,12 +891,16 @@ pub const Tracker = struct {
             }
             return false;
         };
-        if (!couldBelongByStart(
+        const parent_unique_id = snapshot.parent_unique_id orelse return false;
+        const owned_parent = self.containsMacOSUniqueId(parent_unique_id);
+        // Committed ancestry proves shared ownership even when short BSD info
+        // cannot supply a timestamp. Keep the prefilter for witness discovery
+        // and the ordinary tracker's existing admission semantics.
+        if ((self.shared == null or !owned_parent) and !couldBelongByStart(
             self.rootStartedAt(),
             snapshot.started_at_us,
         )) return false;
-        const parent_unique_id = snapshot.parent_unique_id orelse return false;
-        if (!self.containsMacOSUniqueId(parent_unique_id)) {
+        if (!owned_parent) {
             const has_witness = Effects.hasWitness(self, pid) catch |err| {
                 if (self.shared != null and err == error.ProcessIdentityUnavailable and
                     !self.hasTrackedProcess(pid, snapshot.identity)) return false;
@@ -1857,6 +1861,54 @@ test "lineage candidate inspection errors preserve known root and member failure
     try std.testing.expectEqual(@as(usize, 2), try state.count());
 }
 
+test "shared lineage admits short snapshots by committed parent identity only" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const Short = struct {
+        fn capture(_: *Tracker, pid: std.posix.pid_t) !ProcessSnapshot {
+            var unique = std.mem.zeroes(Darwin.ProcUniqueIdentifierInfo);
+            unique.p_uniqueid = @intCast(pid);
+            unique.p_puniqueid = switch (pid) {
+                101 => 1,
+                103 => 2,
+                else => 999,
+            };
+            var info = std.mem.zeroes(Darwin.ProcBsdShortInfo);
+            info.pbsi_pid = @intCast(pid);
+            // The owned parent has exited; the PID alone proves no ancestry.
+            info.pbsi_ppid = 1;
+            return darwinShortSnapshot(pid, unique, info, unique);
+        }
+        fn hasWitness(_: *Tracker, _: std.posix.pid_t) !bool {
+            return error.UnexpectedWitnessInspection;
+        }
+    };
+    var state = testMembership();
+    try state.append(testProcess(101, 1));
+    try state.append(testProcess(102, 2));
+    var tracker = try Tracker.initShared(std.testing.allocator, &state);
+    defer tracker.deinit();
+    try std.testing.expectEqual(@as(?u64, 100), tracker.rootStartedAt());
+    try std.testing.expectEqual(null, (try Short.capture(&tracker, 103)).started_at_us);
+    try std.testing.expect(try tracker.trackLineageProcessWith(103, Short));
+    try std.testing.expect(tracker.hasTrackedProcess(103, .{ .macos_unique_id = 103 }));
+    try std.testing.expect(!try tracker.trackLineageProcessWith(103, Short));
+    // A reused root PID is a distinct descendant instance, not the old root.
+    try std.testing.expect(try tracker.trackLineageProcessWith(101, Short));
+    try std.testing.expect(tracker.hasTrackedProcess(101, .{ .macos_unique_id = 1 }));
+    try std.testing.expect(tracker.hasTrackedProcess(101, .{ .macos_unique_id = 101 }));
+    try std.testing.expect(!try tracker.trackLineageProcessWith(104, Short));
+    try std.testing.expect(!tracker.hasTrackedProcess(104, null));
+    try std.testing.expectEqual(@as(usize, 4), try state.count());
+    try std.testing.expect(state.isComplete());
+
+    var ordinary = try Tracker.init(std.testing.allocator);
+    defer ordinary.deinit();
+    ordinary.root = testProcess(102, 2);
+    ordinary.macos_root_started_at_us = 100;
+    try std.testing.expect(!try ordinary.trackLineageProcessWith(103, Short));
+    try std.testing.expectEqual(@as(usize, 0), ordinary.processCount());
+}
+
 test "lineage witness discovery ignores unowned and recycled candidates only" {
     const Unavailable = struct {
         fn capture(_: *Tracker, pid: std.posix.pid_t) !ProcessSnapshot {
@@ -1879,6 +1931,16 @@ test "lineage witness discovery ignores unowned and recycled candidates only" {
             return true;
         }
     };
+    const Filtered = struct {
+        fn capture(tracker: *Tracker, pid: std.posix.pid_t) !ProcessSnapshot {
+            var snapshot = try Unavailable.capture(tracker, pid);
+            snapshot.started_at_us = if (pid == 106) null else 99;
+            return snapshot;
+        }
+        fn hasWitness(_: *Tracker, _: std.posix.pid_t) !bool {
+            return error.UnexpectedWitnessInspection;
+        }
+    };
     var state = testMembership();
     try state.append(testProcess(101, 101));
     try state.append(testProcess(102, 102));
@@ -1887,6 +1949,10 @@ test "lineage witness discovery ignores unowned and recycled candidates only" {
     defer tracker.deinit();
     try std.testing.expect(!try tracker.trackLineageProcessWith(103, Unavailable));
     try std.testing.expect(!try tracker.trackLineageProcessWith(104, Unavailable));
+    for ([_]std.posix.pid_t{ 106, 107 }) |pid| {
+        try std.testing.expect(!try tracker.trackLineageProcessWith(pid, Filtered));
+        try std.testing.expect(!tracker.hasTrackedProcess(pid, null));
+    }
     for ([_]std.posix.pid_t{ 101, 102 }) |pid| {
         try std.testing.expectError(error.ProcessIdentityUnavailable, tracker.trackLineageProcessWith(pid, Unavailable));
     }
