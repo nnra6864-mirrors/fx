@@ -1,6 +1,7 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
+const secret = @import("../auth/secret.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
@@ -59,7 +60,7 @@ const OwnedInputs = struct {
 
     fn dupe(alloc: Allocator, inputs: Inputs) Allocator.Error!OwnedInputs {
         const api_key = try alloc.dupe(u8, inputs.api_key);
-        errdefer alloc.free(api_key);
+        errdefer secret.zeroAndFree(alloc, api_key);
         const gateway_team = if (inputs.gateway_team) |team| try alloc.dupe(u8, team) else null;
         errdefer if (gateway_team) |team| alloc.free(team);
         const worker_model = try alloc.dupe(u8, inputs.worker_model);
@@ -78,7 +79,7 @@ const OwnedInputs = struct {
     }
 
     fn deinit(self: *OwnedInputs, alloc: Allocator) void {
-        alloc.free(self.api_key);
+        secret.zeroAndFree(alloc, self.api_key);
         if (self.gateway_team) |team| alloc.free(team);
         alloc.free(self.worker_model);
         alloc.free(self.gateway_chat_url);

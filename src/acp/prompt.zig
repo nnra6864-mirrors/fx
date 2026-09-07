@@ -154,6 +154,9 @@ const AcpContext = struct {
     /// session/set_mode changes never mutate a running turn.
     captured_mode: ?[]const u8 = null,
     captured_permission_mode: ?PermissionMode = null,
+    /// Set for subagent children: owned copies of the host credential so the
+    /// tool context never reads live session fields from the child thread.
+    captured_host: ?*const ChildHostSnapshot = null,
     current_prompt_input: ?*ParsedPromptInput = null,
 
     fn deinitPublishedToolCalls(self: *AcpContext) void {
@@ -314,11 +317,15 @@ const AcpContext = struct {
     fn toolContext(self: *AcpContext) tool_runtime.Context {
         const session = if (self.state.active_session) |*active| active else unreachable;
         const provider_capabilities = self.state.cfg.provider_set.select(session.provider).capabilities;
+        const api_key: []const u8 = if (self.captured_host) |captured| captured.api_key else session.api_key;
+        const credential_source = if (self.captured_host) |captured| captured.credential_source else session.credential_source;
+        const gateway_team: ?[]const u8 = if (self.captured_host) |captured| captured.gateway_team else self.state.gateway_team;
+        const account_id: ?[]const u8 = if (self.captured_host) |captured| captured.account_id else session.account_id;
         if (provider_capabilities.fx_search) {
             self.state.web_search_runtime.configure(self.alloc, .{
-                .api_key = session.api_key,
-                .credential_source = session.credential_source,
-                .gateway_team = self.state.gateway_team,
+                .api_key = api_key,
+                .credential_source = credential_source,
+                .gateway_team = gateway_team,
                 .worker_model = session.model,
                 .gateway_retry_count = self.state.cfg.gateway_retry_count,
                 .gateway_chat_url = self.state.cfg.gateway_chat_url,
@@ -336,15 +343,15 @@ const AcpContext = struct {
             .max_read_file_line_len = self.state.cfg.max_read_file_line_len,
             .max_command_output_bytes = self.state.cfg.max_command_output_bytes,
             .max_tool_result_bytes = session.max_tool_result_bytes,
-            .api_key = session.api_key,
+            .api_key = api_key,
             .agent_stream_provider = server.streamProviderFor(self.state, session.provider),
-            .credential_source = session.credential_source,
-            .account_id = session.account_id,
+            .credential_source = credential_source,
+            .account_id = account_id,
             .provider = session.provider,
             .provider_capabilities = provider_capabilities,
             .oauth_transport = self.state.cfg.gateway_provider.oauth_transport,
             .secret_store = self.state.cfg.secret_store,
-            .gateway_team = self.state.gateway_team,
+            .gateway_team = gateway_team,
             .model = session.model,
             .gateway_retry_count = self.state.cfg.gateway_retry_count,
             .gateway_chat_url = self.state.cfg.gateway_chat_url,
@@ -903,6 +910,7 @@ pub fn runSubagentChild(
         .session_id = session_id,
         .captured_mode = captured_mode,
         .captured_permission_mode = admission.permission_mode,
+        .captured_host = &host_snapshot,
     };
     defer ctx.deinitPublishedToolCalls();
     var child_projection = state.cfg.mode_registry.buildModelToolProjection(
@@ -918,11 +926,9 @@ pub fn runSubagentChild(
     defer child_projection.deinit(alloc);
     var skill_catalog = state.skills.acquireCatalog();
     defer skill_catalog.deinit();
-    var tool_context = ctx.toolContext();
-    host_snapshot.applyCredential(&tool_context);
     return subagent_agent_adapter.run(.{
         .host = subagent_host,
-        .tool_context = tool_context,
+        .tool_context = ctx.toolContext(),
         .provider_set = state.cfg.provider_set,
         .system_prompt = state.cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = state.cfg.prompt_policy.modelPromptOverlay(admission.model),
@@ -941,10 +947,13 @@ pub fn runSubagentChild(
 /// The child can outlive the parent's cancelled turn, and the next prompt may
 /// replace the project context or rotate the credential, so the child owns
 /// copies taken under `subagent_authority_mutex`. The parent swaps those fields
-/// under the same lock before freeing the previous values.
+/// under the same lock before freeing the previous values. `AcpContext`
+/// consumes the snapshot through `captured_host` when building the child tool
+/// context.
 const ChildHostSnapshot = struct {
     project_context: []u8,
     api_key: []u8,
+    credential_source: ?types.CredentialSource,
     gateway_team: ?[]u8,
     account_id: ?[]u8,
 
@@ -963,15 +972,10 @@ const ChildHostSnapshot = struct {
         return .{
             .project_context = project_context,
             .api_key = api_key,
+            .credential_source = active.credential_source,
             .gateway_team = gateway_team,
             .account_id = account_id,
         };
-    }
-
-    fn applyCredential(self: *const ChildHostSnapshot, tool_context: *tool_runtime.Context) void {
-        tool_context.api_key = self.api_key;
-        tool_context.gateway_team = self.gateway_team;
-        tool_context.account_id = self.account_id;
     }
 
     fn deinit(self: *ChildHostSnapshot, alloc: Allocator) void {
@@ -4101,8 +4105,19 @@ test "ACP subagent child owns its parent snapshot across later refreshes" {
     try std.testing.expect(snapshot.project_context.ptr != state.context_snapshot.modelVisibleBytes().ptr);
     try std.testing.expectEqualStrings(active.api_key, snapshot.api_key);
     try std.testing.expect(snapshot.api_key.ptr != active.api_key.ptr);
+    try std.testing.expectEqual(active.credential_source, snapshot.credential_source);
     try std.testing.expect(snapshot.gateway_team == null);
     try std.testing.expect(snapshot.account_id == null);
+
+    var child_ctx = AcpContext{
+        .alloc = alloc,
+        .state = &state,
+        .session_id = active.session_id,
+        .captured_host = &snapshot,
+    };
+    const child_tool_context = child_ctx.toolContext();
+    try std.testing.expect(child_tool_context.api_key.ptr == snapshot.api_key.ptr);
+    try std.testing.expectEqual(snapshot.credential_source, child_tool_context.credential_source);
 
     // A later prompt replaces the parent snapshot while the child still runs.
     try refreshProjectContext(&state, alloc, &.{}, &.{}, null);

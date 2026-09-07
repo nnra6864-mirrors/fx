@@ -356,13 +356,12 @@ fn credentialReadyAt(
 }
 
 fn adoptServerCredential(state: *ServerState, credential: *credentials.Credential) void {
-    const previous_api_key = state.api_key;
-    const previous_gateway_team = state.gateway_team;
-    const previous_account_id = state.account_id;
-
     // Subagent children copy these fields under the same lock; swap first and
     // free the previous values only after no child can still observe them.
     state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+    const previous_api_key = state.api_key;
+    const previous_gateway_team = state.gateway_team;
+    const previous_account_id = state.account_id;
     state.api_key = credential.token;
     state.credential_source = credential.source;
     state.credential_refresh_after_ms = credential.refresh_after_ms;
