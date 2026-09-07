@@ -279,6 +279,45 @@ function expectLegacyRequest(request: { body: string; headers: Headers }) {
 }
 
 describe("session recovery", () => {
+  for (const damagedTail of [false, true]) {
+    test(`corrupt usage recovers a usable copy with incomplete accounting, damaged tail=${damagedTail}`, async () => {
+      const fixture = createFixture("fx-session-usage-copy-");
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("ACCOUNTING_RECOVERY_SAVED"),
+        fakeGatewayFinalText("ACCOUNTING_RECOVERY_CONTINUED"),
+      ]);
+      try {
+        const id = await createSavedSession(fixture, gateway);
+        const source = join(fixture.home, ".fx", "sessions", id);
+        const committed = readFileSync(join(source, "events.jsonl"));
+        writeFileSync(join(source, "usage-v2.json"), "{broken usage", { mode: 0o600 });
+        if (damagedTail) appendFileSync(join(source, "events.jsonl"), "{broken tail");
+        const before = savedFileHashes(source);
+        const result = await runFx(["session", "recover", id, "--json"], {
+          cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
+        });
+        expect(result.code).toBe(0);
+        expect(result.stderr).toBe("");
+        const recovered = JSON.parse(result.stdout);
+        expect(recovered).toMatchObject({ status: "recovered", usage_incomplete: true, source_id: id });
+        expect(recovered.recovered_id).not.toBe(id);
+        expect(savedFileHashes(source)).toEqual(before);
+        const copy = join(fixture.home, ".fx", "sessions", recovered.recovered_id);
+        expect(readFileSync(join(copy, "events.jsonl"))).toEqual(committed);
+        expect(JSON.parse(readFileSync(join(copy, "usage-v2.json"), "utf8")).snapshot.billing).toBe("incomplete");
+        const continued = await continueSession(fixture, gateway, recovered.recovered_id);
+        expect(continued.code).toBe(0);
+        expect(continued.stderr).toBe("");
+        expect(gateway.requests.at(-1)!.body).toContain("ACCOUNTING_RECOVERY_SAVED");
+        expect(JSON.parse(readFileSync(join(copy, "usage-v2.json"), "utf8")).snapshot.billing).toBe("incomplete");
+        expect(savedFileHashes(source)).toEqual(before);
+      } finally {
+        gateway.stop();
+        rmSync(fixture.root, { recursive: true, force: true });
+      }
+    }, TIMEOUT);
+  }
+
   test("healthy current conversation needs no recovery or migration", async () => {
     const fixture = createFixture("fx-session-current-healthy-");
     const gateway = startFakeGateway([fakeGatewayFinalText("SAVED_HEALTHY")]);

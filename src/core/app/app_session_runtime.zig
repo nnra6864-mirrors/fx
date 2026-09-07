@@ -21,6 +21,7 @@ const provider_runtime = @import("provider_runtime.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const core_input_runtime = @import("../input/runtime.zig");
+const composer_history = @import("../input/composer_history.zig");
 const io_mod = @import("../shared/io.zig");
 const list_window = @import("../shared/list_window.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -2168,6 +2169,7 @@ pub fn Runtime(comptime App: type) type {
                 value
             else
                 return error.SessionPersistenceUnavailable;
+            try loaded.ensure_writable();
             const recovery_checkpoint = try store.prepareUsageRecoveryCheckpoint(
                 app.alloc,
                 loaded,
@@ -2469,6 +2471,7 @@ pub fn Runtime(comptime App: type) type {
                 } },
                 io_mod.milliTimestamp(),
             ) catch |err| {
+                if (err == error.ConversationAppendIndeterminate or err == error.StaleConversationWriter) return err;
                 return switch (mode) {
                     .strict => err,
                     .visual_epoch => blk: {
@@ -2754,7 +2757,7 @@ pub fn Runtime(comptime App: type) type {
             closeWritableSession(app);
         }
 
-        pub fn finalizePersistenceWithResumeHandoff(app: *App) ?ResumeHandoff {
+        pub fn finalizePersistenceWithResumeHandoff(app: *App) !?ResumeHandoff {
             if (app.session_persistence.writable) |*loaded| {
                 if (loaded.log.isParked()) {
                     app.session_persistence.resume_handoff_intent = .none;
@@ -2795,6 +2798,14 @@ pub fn Runtime(comptime App: type) type {
             }
             defer app.worker.releaseTurnStartHold();
 
+            app.session.usage.cancelReconciliation();
+            app.session.usage.finishProfilePublicationsBeforeShutdown();
+            app.session.usage.checkpoint_mutex.lockUncancelable(io_mod.getIo());
+            const checkpoint_sink = app.session.usage.checkpoint_sink;
+            app.session.usage.checkpoint_sink = null;
+            app.session.usage.checkpoint_mutex.unlock(io_mod.getIo());
+            defer if (app.session_persistence.writable != null) app.session.usage.configureCheckpointSink(checkpoint_sink);
+            try prepareResumeHandoff(app);
             const loaded = &app.session_persistence.writable.?;
             loaded.log.park();
             debug_trace.logf(
@@ -2809,25 +2820,61 @@ pub fn Runtime(comptime App: type) type {
                 &app.metrics,
                 footer_rows,
             );
-            loaded.log.unpark() catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "unpark after suspend failed session={s} err={s}",
-                    .{ loaded.active_id, @errorName(err) },
-                );
+            refresh_parked_session(app) catch |err| {
+                debug_trace.logf("session", "unpark after suspend failed err={s}", .{@errorName(err)});
                 abandonParkedWritableSession(app);
                 app.worker.requestStop();
                 app.should_exit = true;
                 try lifecycle_result;
-                return;
+                return err;
             };
 
             debug_trace.logf(
                 "session",
                 "unparked writer lock after suspend session={s}",
-                .{loaded.active_id},
+                .{app.session_persistence.writable.?.active_id},
             );
+            startResumedSessionReconciliation(app);
             try lifecycle_result;
+        }
+
+        fn refresh_parked_session(app: *App) !void {
+            const parked = if (app.session_persistence.writable) |*value| value else return error.SessionPersistenceUnavailable;
+            if (!parked.log.isParked()) return error.SessionBusy;
+            const id = try app.alloc.dupe(u8, parked.active_id);
+            defer app.alloc.free(id);
+            var fresh = try loadResumeTargetForWrite(app, .{ .id = id }, .{});
+            var fresh_owned = true;
+            defer if (fresh_owned) fresh.deinit(app.alloc);
+            var display = try readNativeResumeDisplay(app, &fresh);
+            defer display.deinit(app.alloc);
+            const previous_next_image_id = app.next_image_id;
+            // The parked snapshot cannot settle state after another writer ran.
+            parked.deinit(app.alloc);
+            app.session_persistence.writable = fresh;
+            fresh_owned = false;
+            errdefer {
+                app.session_persistence.writable.?.deinit(app.alloc);
+                app.session_persistence.writable = null;
+            }
+            const active = &app.session_persistence.writable.?;
+            try hydrateResumedSession(app, active.state, display.title, .session);
+            var rebase_images = false;
+            for (app.pending_images.items) |image| {
+                if (image.id < app.next_image_id) rebase_images = true;
+            }
+            app.next_image_id = @max(app.next_image_id, previous_next_image_id);
+            if (rebase_images) {
+                app.next_image_id = try composer_history.rebase_active_images(
+                    app.alloc,
+                    &app.input_runtime.edit_state,
+                    &app.input_runtime.entities,
+                    &app.pending_images,
+                    app.next_image_id,
+                );
+            }
+            active.releaseHydrationHistory(app.alloc);
+            configureWebFetchArtifacts(app, active);
         }
 
         fn tryBeginIdleSessionPark(app: *App) bool {
@@ -4155,10 +4202,12 @@ pub fn Runtime(comptime App: type) type {
 
         fn closeWritableSession(app: *App) void {
             app.session_persistence.resume_handoff_intent = .none;
-            _ = closeWritableSessionWithResumeHandoff(app);
+            _ = closeWritableSessionWithResumeHandoff(app) catch |err| {
+                debug_trace.logf("session", "final persistence settlement failed err={s}", .{@errorName(err)});
+            };
         }
 
-        fn closeWritableSessionWithResumeHandoff(app: *App) ?ResumeHandoff {
+        fn closeWritableSessionWithResumeHandoff(app: *App) !?ResumeHandoff {
             const handoff_intent = app.session_persistence.resume_handoff_intent;
             app.session_persistence.resume_handoff_intent = .none;
             if (comptime @hasField(@TypeOf(app.session), "usage")) {
@@ -4169,58 +4218,24 @@ pub fn Runtime(comptime App: type) type {
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             discardAnyPendingCancelledCommand(app, "writable_session_close");
-            const loaded = if (app.session_persistence.writable) |*value|
-                value
-            else
+            const loaded = if (app.session_persistence.writable) |*value| value else return null;
+            defer {
+                if (comptime @hasDecl(@TypeOf(app.session), "clearWebFetchArtifacts")) app.session.clearWebFetchArtifacts();
+                disableSubagentHost(app);
+                loaded.deinit(app.alloc);
+                app.session_persistence.writable = null;
+            }
+            try settleDurableState(app, loaded);
+            if (!shouldCreateResumeHandoff(.{
+                .intent = handoff_intent,
+                .has_writable_session = true,
+                .is_pristine = session_store.isPristineStartedSession(loaded),
+            })) return null;
+            const session_id = app.alloc.dupe(u8, loaded.active_id) catch |err| {
+                debug_trace.logf("session", "resume handoff unavailable session={s} err={s}", .{ loaded.active_id, @errorName(err) });
                 return null;
-            var resume_boundary_valid = false;
-            if (handoff_intent != .none) {
-                var settlement_failed = false;
-                settleDurableState(app, loaded) catch |err| {
-                    settlement_failed = true;
-                    debug_trace.logf(
-                        "session",
-                        "resume handoff boundary invalid session={s} err={s}",
-                        .{ loaded.active_id, @errorName(err) },
-                    );
-                };
-                resume_boundary_valid = !settlement_failed;
-            } else {
-                settleDurableState(app, loaded) catch |err| {
-                    debug_trace.logf(
-                        "session",
-                        "final persistence settlement failed session={s} err={s}",
-                        .{ loaded.active_id, @errorName(err) },
-                    );
-                };
-            }
-            const should_create_handoff = resume_boundary_valid and
-                shouldCreateResumeHandoff(.{
-                    .intent = handoff_intent,
-                    .has_writable_session = true,
-                    .is_pristine = session_store.isPristineStartedSession(loaded),
-                });
-            const handoff: ?ResumeHandoff = if (should_create_handoff) blk: {
-                const session_id = app.alloc.dupe(u8, loaded.active_id) catch |err| {
-                    debug_trace.logf(
-                        "session",
-                        "resume handoff unavailable session={s} err={s}",
-                        .{ loaded.active_id, @errorName(err) },
-                    );
-                    break :blk null;
-                };
-                break :blk .{ .session_id = session_id };
-            } else null;
-            if (comptime @hasDecl(
-                @TypeOf(app.session),
-                "clearWebFetchArtifacts",
-            )) {
-                app.session.clearWebFetchArtifacts();
-            }
-            disableSubagentHost(app);
-            loaded.deinit(app.alloc);
-            app.session_persistence.writable = null;
-            return handoff;
+            };
+            return .{ .session_id = session_id };
         }
 
         fn configureWebFetchArtifacts(
@@ -4337,6 +4352,7 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             loaded: *session_store.LoadedWritableSession,
         ) !void {
+            try loaded.ensure_writable();
             const usage_dirty = if (comptime @hasField(@TypeOf(app.session), "usage"))
                 app.session.usage.isDirty()
             else
@@ -5753,7 +5769,7 @@ test "resume handoff suppresses missing and pristine writable sessions" {
     defer app.deinit();
 
     Runtime(TestApp).requestResumeHandoff(&app);
-    try std.testing.expect(Runtime(TestApp).finalizePersistenceWithResumeHandoff(&app) == null);
+    try std.testing.expect((try Runtime(TestApp).finalizePersistenceWithResumeHandoff(&app)) == null);
     try std.testing.expectEqual(
         ResumeHandoffIntent.none,
         app.session_persistence.resume_handoff_intent,
@@ -5764,7 +5780,7 @@ test "resume handoff suppresses missing and pristine writable sessions" {
     try Runtime(TestApp).beginFreshPersistedSession(&app);
     Runtime(TestApp).requestResumeHandoff(&app);
 
-    try std.testing.expect(Runtime(TestApp).finalizePersistenceWithResumeHandoff(&app) == null);
+    try std.testing.expect((try Runtime(TestApp).finalizePersistenceWithResumeHandoff(&app)) == null);
     try std.testing.expect(app.session_persistence.writable == null);
 }
 
@@ -5791,7 +5807,7 @@ test "upgrade resume handoff owns a validated pristine session" {
     defer alloc.free(expected_id);
     Runtime(TestApp).requestUpgradeResumeHandoff(&app);
 
-    var handoff = Runtime(TestApp).finalizePersistenceWithResumeHandoff(&app) orelse
+    var handoff = (try Runtime(TestApp).finalizePersistenceWithResumeHandoff(&app)) orelse
         return error.TestExpectedResumeHandoff;
     defer handoff.deinit(alloc);
 
@@ -5824,7 +5840,7 @@ test "resume handoff owns the exact non-pristine session id" {
     defer alloc.free(expected_id);
     Runtime(TestApp).requestResumeHandoff(&app);
 
-    var handoff = Runtime(TestApp).finalizePersistenceWithResumeHandoff(&app) orelse
+    var handoff = (try Runtime(TestApp).finalizePersistenceWithResumeHandoff(&app)) orelse
         return error.TestExpectedResumeHandoff;
     defer handoff.deinit(alloc);
 
@@ -5864,7 +5880,7 @@ test "resume handoff requires no derived cache write" {
     if (std.c.chmod(session_dir_z.ptr, 0o500) != 0) return error.TestChmodFailed;
     defer _ = std.c.chmod(session_dir_z.ptr, 0o700);
     Runtime(TestApp).requestResumeHandoff(&app);
-    var handoff = Runtime(TestApp).closeWritableSessionWithResumeHandoff(&app) orelse
+    var handoff = (try Runtime(TestApp).closeWritableSessionWithResumeHandoff(&app)) orelse
         return error.TestExpectedResumeHandoff;
     defer handoff.deinit(alloc);
 
@@ -5893,7 +5909,7 @@ test "resume handoff suppresses session id allocation failure" {
     Runtime(TestApp).requestResumeHandoff(&app);
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
     app.alloc = failing.allocator();
-    const handoff = Runtime(TestApp).finalizePersistenceWithResumeHandoff(&app);
+    const handoff = try Runtime(TestApp).finalizePersistenceWithResumeHandoff(&app);
     app.alloc = alloc;
 
     try std.testing.expect(failing.has_induced_failure);
@@ -7273,6 +7289,61 @@ test "interactive session resume uses the live transition and shared restore pat
         subagent_tool_host.RecoveryState.complete,
         host.recoveryState(),
     );
+}
+
+test "parked session reload preserves other writer history and the local draft" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer alloc.free(paths.home);
+    defer alloc.free(paths.workspace);
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    try Runtime(TestApp).appendHistoryTurn(&app, .{ .assistant = .{
+        .user = .{ .text = @constCast("original") },
+        .assistant = @constCast("original answer"),
+    } });
+    Runtime(TestApp).enableSessionStores(&app);
+    const host = app.session_persistence.subagent_host;
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "local unfinished draft");
+    app.next_image_id = 17;
+    const id = try alloc.dupe(u8, app.session_persistence.writable.?.active_id);
+    defer alloc.free(id);
+    app.session_persistence.writable.?.log.park();
+    {
+        var other = try Runtime(TestApp).loadResumeTargetForWrite(&app, .{ .id = id }, .{});
+        defer other.deinit(alloc);
+        _ = try other.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = session_runtime.ConversationLanguage.literal("en"),
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("other writer") },
+                .assistant = @constCast("other committed answer"),
+            } },
+        } }, io_mod.milliTimestamp());
+    }
+    try Runtime(TestApp).refresh_parked_session(&app);
+    try std.testing.expectEqual(@as(usize, 2), app.session.historyLen());
+    try std.testing.expectEqualStrings("other committed answer", app.session.agent.history.items[1].assistant.assistant);
+    try std.testing.expectEqualStrings("local unfinished draft", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 17), app.next_image_id);
+    try std.testing.expect(app.session_persistence.subagent_host == host);
+    try Runtime(TestApp).appendHistoryTurn(&app, .{ .assistant = .{
+        .user = .{ .text = @constCast("continued") },
+        .assistant = @constCast("continued answer"),
+    } });
+    Runtime(TestApp).finalizePersistence(&app);
+    var cold = try app.session_persistence.store.?.loadReadOnly(alloc, id);
+    defer cold.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), cold.history.len);
+    try std.testing.expectEqualStrings("other committed answer", cold.history[1].assistant.assistant);
 }
 
 test "interactive session resume preserves the current writer when the target is unavailable" {

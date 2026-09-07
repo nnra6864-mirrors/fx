@@ -1235,13 +1235,15 @@ pub const SessionRecoverySnapshot = struct {
         self: SessionRecoverySnapshot,
         alloc: Allocator,
     ) ![]u8 {
+        const usage_warning = if (self.result.usage_incomplete) "warning: historical usage is incomplete because the source accounting data is corrupt\n" else "";
         if (self.result.status == .indeterminate) {
             return std.fmt.allocPrint(
                 alloc,
-                "[session recovery] could not confirm target {s}\nsource: {s} (unchanged)\nresolve: fx --resume {s}\ninspect: fx doctor\n",
+                "[session recovery] could not confirm target {s}\nsource: {s} (unchanged)\n{s}resolve: fx --resume {s}\ninspect: fx doctor\n",
                 .{
                     self.result.recovered_session_id,
                     self.result.source_session_id,
+                    usage_warning,
                     self.result.recovered_session_id,
                 },
             );
@@ -1249,22 +1251,24 @@ pub const SessionRecoverySnapshot = struct {
         if (self.result.status == .recovered_with_unverified_artifacts) {
             return std.fmt.allocPrint(
                 alloc,
-                "[session recovery] copied {s} to {s}\nhistory_turns: {d}\nwarning: legacy command artifacts could not be authenticated\nresume: fx --resume {s}\n",
+                "[session recovery] copied {s} to {s}\nhistory_turns: {d}\nwarning: legacy command artifacts could not be authenticated\n{s}resume: fx --resume {s}\n",
                 .{
                     self.result.source_session_id,
                     self.result.recovered_session_id,
                     self.result.history_len,
+                    usage_warning,
                     self.result.recovered_session_id,
                 },
             );
         }
         return std.fmt.allocPrint(
             alloc,
-            "[session recovery] copied {s} to {s}\nhistory_turns: {d}\nresume: fx --resume {s}\n",
+            "[session recovery] copied {s} to {s}\nhistory_turns: {d}\n{s}resume: fx --resume {s}\n",
             .{
                 self.result.source_session_id,
                 self.result.recovered_session_id,
                 self.result.history_len,
+                usage_warning,
                 self.result.recovered_session_id,
             },
         );
@@ -1297,9 +1301,11 @@ pub const SessionRecoverySnapshot = struct {
             &out.writer,
         );
         try out.writer.print(
-            ",\"history_turns\":{d}}}",
+            ",\"history_turns\":{d}",
             .{self.result.history_len},
         );
+        if (self.result.usage_incomplete) try out.writer.writeAll(",\"usage_incomplete\":true");
+        try out.writer.writeByte('}');
         return try out.toOwnedSlice();
     }
 };
@@ -2649,6 +2655,21 @@ test "core session migration snapshot text and json stay stable" {
         "{\"kind\":\"session_migration\",\"id\":\"session.v3\",\"status\":\"migrated\",\"source_schema_version\":2,\"source_bytes\":4096}",
         json,
     );
+}
+
+test "core session recovery reports incomplete accounting in text and JSON" {
+    const snapshot: SessionRecoverySnapshot = .{ .result = .{
+        .source_session_id = @constCast("source"),
+        .recovered_session_id = @constCast("copy"),
+        .history_len = 1,
+        .usage_incomplete = true,
+    } };
+    const text = try snapshot.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "historical usage is incomplete") != null);
+    const json = try snapshot.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.find(u8, json, "\"usage_incomplete\":true") != null);
 }
 
 test "core session recovery snapshot text and json stay stable" {

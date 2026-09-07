@@ -3344,11 +3344,14 @@ pub const Store = struct {
         };
         defer if (metadata) |*current| current.deinit();
         var current_boundary: ?session_log.ConversationRecoveryBoundary = null;
+        var usage_incomplete = false;
         var recovered = recovery_state: {
             if (metadata) |current| {
                 if (!std.mem.eql(u8, current.value.id, session_id)) return error.SessionRecoveryBoundaryInvalid;
                 if (current.value.subagent_child) return error.SessionNotFound;
-                current_boundary = try session_log.find_conversation_recovery_boundary(alloc, &source.dir);
+                const recovery = try session_log.classify_conversation_recovery(alloc, &source.dir, session_id);
+                current_boundary = recovery.boundary;
+                usage_incomplete = recovery.usage_incomplete;
                 break :recovery_state try session_log.load_conversation_recovery_state(alloc, &source.dir, session_id, current_boundary.?);
             }
             const authority = try classifyAuthority(
@@ -3573,6 +3576,7 @@ pub const Store = struct {
                 .source_session_id = source_id,
                 .recovered_session_id = recovered_id,
                 .history_len = recovered.history.len,
+                .usage_incomplete = usage_incomplete,
                 .status = .indeterminate,
             };
         }
@@ -3589,6 +3593,7 @@ pub const Store = struct {
                 .source_session_id = source_id,
                 .recovered_session_id = recovered_id,
                 .history_len = recovered.history.len,
+                .usage_incomplete = usage_incomplete,
                 .status = .indeterminate,
             };
         };
@@ -3598,6 +3603,7 @@ pub const Store = struct {
                 .source_session_id = source_id,
                 .recovered_session_id = recovered_id,
                 .history_len = recovered.history.len,
+                .usage_incomplete = usage_incomplete,
                 .status = .indeterminate,
             };
         }
@@ -3606,6 +3612,7 @@ pub const Store = struct {
             .source_session_id = source_id,
             .recovered_session_id = recovered_id,
             .history_len = recovered.history.len,
+            .usage_incomplete = usage_incomplete,
             .status = if (contains_unverified_artifacts)
                 .recovered_with_unverified_artifacts
             else

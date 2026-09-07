@@ -316,11 +316,15 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         app.startModelCacheWarmup();
     }
 
+    var terminal_input_closed = false;
     app.run() catch |err| {
         app.releaseTerminal();
-        if (err == error.TerminalInputClosed) return .returned;
-        reportUnexpectedInteractiveError(deps, err);
-        return err;
+        if (err == error.TerminalInputClosed) {
+            terminal_input_closed = true;
+        } else {
+            reportUnexpectedInteractiveError(deps, err);
+            return err;
+        }
     };
     const relaunch_request: ?auto_upgrade.RelaunchRequest = if (comptime cooperative)
         null
@@ -342,7 +346,19 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
     const handoff_value = if (comptime cooperative) blk: {
         app.deinit();
         break :blk null;
-    } else app.deinitWithResumeHandoff();
+    } else app.deinitWithResumeHandoff() catch |err| {
+        var buffer: [256]u8 = undefined;
+        const message = std.fmt.bufPrint(&buffer, "fx: session save failed during shutdown: {s}. Unsaved work may be missing.\n", .{@errorName(err)}) catch "fx: session save failed during shutdown.\n";
+        writeStderr(deps, message);
+        return .{ .exit = 1 };
+    };
+    if (terminal_input_closed) {
+        if (handoff_value) |value| {
+            var handoff = value;
+            handoff.deinit(alloc);
+        }
+        return .returned;
+    }
     if (relaunch_request) |request| {
         if (handoff_value) |value| {
             var handoff = value;
@@ -623,6 +639,7 @@ const TestCapture = struct {
     record_stderr_event: bool = false,
     record_stdout_event: bool = false,
     resume_handoff_id: ?[]const u8 = null,
+    shutdown_error: ?anyerror = null,
     raise_sigint_during_deinit: bool = false,
     upgrade_relaunch_path: ?[]const u8 = null,
     upgrade_previous_revision: ?[]const u8 = null,
@@ -756,7 +773,11 @@ const TestApp = struct {
         self.* = undefined;
     }
 
-    fn deinitWithResumeHandoff(self: *TestApp) ?app_session_runtime.ResumeHandoff {
+    fn deinitWithResumeHandoff(self: *TestApp) !?app_session_runtime.ResumeHandoff {
+        if (active_capture.?.shutdown_error) |err| {
+            self.deinit();
+            return err;
+        }
         const handoff: ?app_session_runtime.ResumeHandoff = if (active_capture.?.resume_handoff_id) |id| blk: {
             const session_id = std.testing.allocator.dupe(u8, id) catch {
                 self.deinit();
@@ -1100,6 +1121,19 @@ test "app entry reports unexpected init errors once and preserves identity" {
     try expectEvents(&.{ "init:none", "stderr-attempt" });
 }
 
+test "app entry reports shutdown save failure after cleanup without a resume hint" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.shutdown_error = error.InputOutput;
+    capture.resume_handoff_id = "session-123";
+    const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
+    try std.testing.expectEqual(RunOutcome{ .exit = 1 }, outcome);
+    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "session save failed during shutdown: InputOutput") != null);
+    try std.testing.expectEqualStrings("", capture.stdout.written());
+    try expectEvents(&.{ "init:none", "mcp-discovery", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "deinit" });
+}
+
 test "app entry releases terminal before reporting worker start errors" {
     const alloc = std.testing.allocator;
     var capture = TestCapture.init(.{ .interactive = .{} });
@@ -1201,6 +1235,19 @@ test "app entry treats terminal input closure as abnormal cleanup without stderr
         "terminal-release",
         "deinit",
     });
+}
+
+test "app entry reports shutdown save failure after terminal input closes" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.run_error = error.TerminalInputClosed;
+    capture.shutdown_error = error.InputOutput;
+    capture.resume_handoff_id = "session-123";
+    const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
+    try std.testing.expectEqual(RunOutcome{ .exit = 1 }, outcome);
+    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "session save failed during shutdown") != null);
+    try std.testing.expectEqualStrings("", capture.stdout.written());
 }
 
 test "app entry preserves run errors when fatal formatting fails" {

@@ -112,6 +112,97 @@ pub fn load(
     return snapshot;
 }
 
+const RecoveryLoad = struct {
+    snapshot: ?session_usage.Snapshot,
+    incomplete: bool = false,
+};
+
+/// Recovery owns the returned snapshot. Unsafe files and foreign identities are
+/// not corrupt accounting and must not authorize a lossy recovery copy.
+pub fn load_for_recovery(alloc: Allocator, session_dir: *io_mod.VerifiedDir, session_id: []const u8) !RecoveryLoad {
+    var captured = try capture(alloc, session_dir);
+    defer captured.deinit(alloc);
+    const bytes = switch (captured) {
+        .missing => return .{ .snapshot = null },
+        .invalid => |reason| {
+            if (std.mem.eql(u8, reason, "empty") or std.mem.eql(u8, reason, "oversized")) return incomplete_recovery_usage(alloc);
+            return error.InvalidUsageSidecar;
+        },
+        .encoded => |value| value,
+    };
+    var envelope = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return incomplete_recovery_usage(alloc);
+    };
+    defer envelope.deinit();
+    if (envelope.value == .object) {
+        if (envelope.value.object.get("session_id")) |id| {
+            if (id == .string and id.string.len != 0 and !std.mem.eql(u8, id.string, session_id)) return error.UsageSidecarSessionMismatch;
+        }
+        if (envelope.value.object.get("schema_version")) |version| {
+            if (version == .integer and version.integer != 1) return error.UnsupportedUsageSidecar;
+        }
+    }
+    var decoded = decode(alloc, bytes) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return incomplete_recovery_usage(alloc);
+    };
+    if (!std.mem.eql(u8, decoded.session_id, session_id)) {
+        decoded.deinit(alloc);
+        return error.UsageSidecarSessionMismatch;
+    }
+    alloc.free(decoded.session_id);
+    return .{ .snapshot = decoded.snapshot };
+}
+
+fn incomplete_recovery_usage(alloc: Allocator) !RecoveryLoad {
+    var usage = session_usage.Usage.initLegacy();
+    defer usage.deinit(alloc);
+    usage.billing = .incomplete;
+    var snapshot = try usage.snapshot(alloc);
+    errdefer snapshot.deinit(alloc);
+    try session_usage.appendIncidentOwned(alloc, &snapshot, .{
+        .occurred_at_ms = @max(io_mod.milliTimestamp(), 0),
+        .completeness = .incomplete,
+    });
+    return .{ .snapshot = snapshot, .incomplete = true };
+}
+
+test "usage recovery preserves valid snapshots and marks corrupt accounting incomplete" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
+    const missing = try load_for_recovery(alloc, &dir, "session");
+    try std.testing.expect(missing.snapshot == null and !missing.incomplete);
+    var usage = session_usage.Usage.initFresh();
+    defer usage.deinit(alloc);
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    try write(alloc, &dir, "session", snapshot);
+    var valid = try load_for_recovery(alloc, &dir, "session");
+    defer valid.snapshot.?.deinit(alloc);
+    try std.testing.expect(!valid.incomplete);
+    try std.testing.expectEqual(session_usage.Availability.complete, valid.snapshot.?.billing);
+    try io_mod.durableReplaceVerified(alloc, &dir, sidecar_file, "{broken");
+    try std.testing.expectError(error.InvalidUsageSidecar, load(alloc, &dir, "session"));
+    var recovered = try load_for_recovery(alloc, &dir, "session");
+    defer recovered.snapshot.?.deinit(alloc);
+    try std.testing.expect(recovered.incomplete);
+    try std.testing.expectEqual(session_usage.Availability.incomplete, recovered.snapshot.?.billing);
+    try std.testing.expect(!recovered.snapshot.?.api_duration_complete);
+    try session_usage.validateSnapshot(recovered.snapshot.?);
+    var retained = try capture(alloc, &dir);
+    defer retained.deinit(alloc);
+    try std.testing.expectEqualStrings("{broken", retained.encoded);
+    try write(alloc, &dir, "foreign", snapshot);
+    try std.testing.expectError(error.UsageSidecarSessionMismatch, load_for_recovery(alloc, &dir, "session"));
+    const file = try dir.dir.openFile(std.testing.io, sidecar_file, .{ .mode = .read_write });
+    defer file.close(std.testing.io);
+    try file.setPermissions(std.testing.io, .fromMode(0o644));
+    try std.testing.expectError(error.InvalidUsageSidecar, load_for_recovery(alloc, &dir, "session"));
+}
+
 pub fn capture(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,

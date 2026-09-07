@@ -109,7 +109,9 @@ Repeated continuation reuses validated summaries of unchanged older sessions ins
 
 Older sessions that saved Vercel connection settings can be opened through `-r`, `/resume`, `-c`, or an exact ID. Migration preserves their model settings and keeps unfinished responses as interrupted history, without replaying old requests or restoring saved credential references.
 
-If a saved conversation is damaged, run `fx session recover <id>` to copy its validated prefix into a new session. Recovery preserves checkpoint boundaries and referenced result files, leaves the original unchanged, and prints the new session ID. Records after the damaged boundary are not included, and recovery does not rerun commands. Healthy conversations can be resumed without recovery.
+If a saved conversation is damaged, run `fx session recover <id>` to copy its validated prefix into a new session. Recovery preserves checkpoint boundaries and referenced result files, leaves the original unchanged, and prints the new session ID. Records after the damaged boundary are not included, and recovery does not rerun commands. If only usage accounting is corrupt, recovery keeps the conversation and marks historical usage as incomplete in the copy; the original accounting file remains unchanged. Healthy conversations can be resumed without recovery.
+
+After an idle session is suspended with Ctrl+Z, foregrounding it reloads saved changes from other writers before accepting another turn. Quitting reports a failed history or usage save with a warning and a nonzero exit status instead of printing the normal resume hint.
 
 New sessions appear in resume selection only after their initial files are ready. Incomplete creation folders left by older builds do not block healthy conversations from resuming with `-c`; those folders remain available for diagnosis and are not deleted.
 
@@ -120,6 +122,8 @@ Run `/feedback` to open the feedback form at `fx.sh/feedback`. It does not creat
 Run `/trace` to create a private Markdown diagnostic with logs, session context, runtime state, permissions, and recent activity. On macOS, fx copies the `.md` file to the clipboard; on other platforms, it saves the file and prints its path. Review and redact the trace before sharing it.
 
 fx automatically summarizes a long session into a fresh context window when the active model request reaches 80% of its usable input capacity, then continues the same turn. Run `/compact` to create the same durable handoff immediately and wait for your next prompt. Manual compaction refreshes the selected login when needed; Ctrl+C cancels preparation. If authentication fails, the chat stays open and unchanged so you can reconnect and retry `/compact`.
+
+A failed checkpoint write is rolled back before fx reports it as rejected, so reopening does not apply that checkpoint. If rollback itself fails, fx reports `ConversationAppendIndeterminate` and refuses further writes through that session handle; the saved outcome must be checked on reopening.
 
 Compaction handoffs remain internal context for the model. Resuming a session and opening its full transcript show the conversation and tool activity, not internal summaries or operation ledgers.
 

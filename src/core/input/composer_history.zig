@@ -330,6 +330,29 @@ const Snapshot = struct {
     }
 };
 
+/// Rebinds a live draft to a refreshed session. Snapshot filenames carry image
+/// identity, so verified replacements must exist before releasing old ownership.
+pub fn rebase_active_images(alloc: Allocator, edit: *editor_state.State, entities: *registered_entities.State, images: *ImageBlocks, first_image_id: usize) !usize {
+    if (images.items.len == 0) return first_image_id;
+    var original = try Snapshot.initCopy(alloc, edit.input.items, entities.pasted_blocks.items, images.items, entities.image_tokens.items, entities.skill_tokens.items);
+    defer original.deinit(alloc);
+    var prepared = try original.prepareRecall(alloc, first_image_id);
+    defer prepared.deinit(alloc);
+    const next_id = try std.math.add(usize, first_image_id, images.items.len);
+    const cursor = image_attachments.projectOffsetThroughPlaceholderRewrite(original.image_tokens.items, prepared.image_tokens.items, original.text.items.len, edit.cursor) orelse return error.InvalidPromptHistorySnapshot;
+    const anchor = if (edit.selection_anchor) |offset| image_attachments.projectOffsetThroughPlaceholderRewrite(original.image_tokens.items, prepared.image_tokens.items, original.text.items.len, offset) orelse return error.InvalidPromptHistorySnapshot else null;
+    edit.swapInput(&prepared.text);
+    edit.cursor = cursor;
+    edit.selection_anchor = anchor;
+    entities.replace(alloc, &prepared.pasted_blocks, &prepared.image_tokens, &prepared.skill_tokens);
+    for (images.items) |image| image_attachments.discardImageAttachment(alloc, image);
+    images.deinit(alloc);
+    images.* = prepared.images;
+    prepared.images = .empty;
+    prepared.owns_image_snapshots = false;
+    return next_id;
+}
+
 pub const State = struct {
     entries: std.ArrayList(Snapshot) = .empty,
     draft: ?Snapshot = null,
@@ -606,6 +629,48 @@ fn replaceActiveComposer(
     active.picker.model_completion_window_start = 0;
     active.picker.resetFilePickerIndex();
     active.input_limit_rejection.* = input_limit_rejection.clear();
+}
+
+test "rebasing draft image IDs preserves text selection and snapshot ownership" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io_mod = @import("../shared/io.zig");
+    const file = try tmp.dir.createFile(std.testing.io, "pending.png", .{});
+    try file.writeStreamingAll(std.testing.io, "\x89PNG\r\n\x1a\nimage");
+    file.close(std.testing.io);
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "pending.png");
+    defer alloc.free(path);
+    const directory = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(directory);
+    var edit: editor_state.State = .{};
+    defer edit.deinit(alloc);
+    var entities: registered_entities.State = .{};
+    defer entities.deinit(alloc);
+    var images: ImageBlocks = .empty;
+    defer {
+        for (images.items) |image| image_attachments.discardImageAttachment(alloc, image);
+        images.deinit(alloc);
+    }
+    try edit.setText(alloc, "look [Image #1] end");
+    edit.selection_anchor = 0;
+    try entities.image_tokens.append(alloc, .{ .id = 1, .span = .{ .raw_start = 5, .raw_end = 15 } });
+    try images.append(alloc, .{
+        .id = 1,
+        .path = try alloc.dupe(u8, path),
+        .media_type = try alloc.dupe(u8, "image/png"),
+    });
+    try image_attachments.captureImageSnapshot(alloc, &images.items[0], directory);
+    try std.testing.expectEqual(@as(usize, 13), try rebase_active_images(alloc, &edit, &entities, &images, 12));
+    try std.testing.expectEqualStrings("look [Image #12] end", edit.input.items);
+    try std.testing.expectEqual(edit.input.items.len, edit.cursor);
+    try std.testing.expectEqual(@as(?usize, 0), edit.selection_anchor);
+    try std.testing.expectEqual(@as(usize, 12), images.items[0].id);
+    try std.testing.expect(std.mem.startsWith(u8, std.fs.path.basename(images.items[0].snapshot_path.?), "image-12-"));
+    var verified = try image_attachments.loadVerifiedSnapshot(alloc, images.items[0], .{});
+    defer verified.deinit(alloc);
+    try std.testing.expectEqualStrings("\x89PNG\r\n\x1a\nimage", verified.bytes);
+    try std.testing.expectEqual(@as(usize, 12), entities.image_tokens.items[0].id);
 }
 
 test "navigation target follows bounded older and newer history laws" {

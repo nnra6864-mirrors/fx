@@ -809,11 +809,11 @@ const App = struct {
     }
 
     pub fn deinit(self: *App) void {
-        _ = self.deinitImpl(false);
+        _ = self.deinitImpl(false) catch {};
     }
 
     /// Returns an owned handoff only after all interactive state is torn down.
-    pub fn deinitWithResumeHandoff(self: *App) ?app_session_runtime.ResumeHandoff {
+    pub fn deinitWithResumeHandoff(self: *App) !?app_session_runtime.ResumeHandoff {
         return self.deinitImpl(true);
     }
 
@@ -829,7 +829,7 @@ const App = struct {
         return ui_render.formatResumeHandoff(buffer, session_id, terminal_cols);
     }
 
-    fn deinitImpl(self: *App, capture_resume_handoff: bool) ?app_session_runtime.ResumeHandoff {
+    fn deinitImpl(self: *App, capture_resume_handoff: bool) !?app_session_runtime.ResumeHandoff {
         self.auth.stopProviderPreparation();
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
@@ -843,7 +843,9 @@ const App = struct {
 
         self.releaseTerminal();
         if (self.worker_thread) |thread| thread.join();
+        var persistence_error: ?anyerror = null;
         WorkerAppRuntime.settleFinishedPromptsForShutdown(self) catch |err| {
+            persistence_error = err;
             debug_trace.logf("session", "shutdown finished prompt persistence failed err={s}", .{@errorName(err)});
         };
         self.terminal_client.deinit();
@@ -851,8 +853,11 @@ const App = struct {
         self.model_cache.deinit();
         self.usage_dashboard.deinit();
         InputSubmitRuntime.clearPendingSubmission(self, "shutdown");
-        const resume_handoff = if (capture_resume_handoff)
-            SessionAppRuntime.finalizePersistenceWithResumeHandoff(self)
+        const resume_handoff = if (capture_resume_handoff and persistence_error == null)
+            SessionAppRuntime.finalizePersistenceWithResumeHandoff(self) catch |err| failed: {
+                persistence_error = err;
+                break :failed null;
+            }
         else blk: {
             SessionAppRuntime.finalizePersistence(self);
             break :blk null;
@@ -892,6 +897,7 @@ const App = struct {
         WorkspaceAppRuntime.deinit(self);
         self.workspace_identity.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
+        if (persistence_error) |err| return err;
         return resume_handoff;
     }
 
