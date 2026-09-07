@@ -21,7 +21,7 @@ export async function GET(request) {
   const url = new URL(request.url);
   const backend = url.searchParams.get("backend") ?? "auto";
   const scenario = url.searchParams.get("scenario") ?? "host";
-  if (!["host", "mcp", "error", "known-error", "cancel", "resume"].includes(scenario)) {
+  if (!["host", "mcp", "error", "known-error", "cancel", "resume", "startup"].includes(scenario)) {
     return Response.json({ error: "Unknown scenario" }, { status: 400 });
   }
   let agent;
@@ -119,6 +119,9 @@ export async function GET(request) {
       } } : {}),
     };
     agent = await createFxAgent(options);
+    if (scenario === "startup") {
+      return Response.json({ ok: true, probe, checkpointBytes: (await agent.checkpoint()).bytes.length });
+    }
     const turn = agent.prompt("Look up key alpha and repeat its value.", { requestId, signal: controller.signal });
     let text = "";
     const drain = (async () => {

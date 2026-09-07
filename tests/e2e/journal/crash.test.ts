@@ -1,5 +1,5 @@
 // Imported by session-recovery.test.ts; inherits that PGSO owner's classification.
-// Opt-in red witnesses. Only the freshly built checkout binary is used.
+// Only the freshly built checkout binary is used.
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -30,7 +30,7 @@ function journalEntries(bytes: Buffer) {
   return entries;
 }
 
-describe.skipIf(process.env.FX_JOURNAL_RED !== "1")("journal witness native ask", () => {
+describe("journal witness native ask", () => {
   test.skipIf(!tmuxAvailable())("interactive creation persists history for a second process", async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-journal-interactive-")));
     const home = join(root, "home");
@@ -143,7 +143,7 @@ describe.skipIf(process.env.FX_JOURNAL_RED !== "1")("journal witness native ask"
 
 // No timeout races decide the crash point: the external shell publishes the
 // effect, then waits at a gate while the test kills its exact owning fx process.
-describe.skipIf(process.env.FX_JOURNAL_RED !== "1")("journal witness native crash", () => {
+describe("journal witness native crash", () => {
   for (const surface of ["ask", "tui"] as const) {
   test.skipIf(surface === "tui" && !tmuxAvailable())(`${surface} preserves the selected call after effect but before result`, async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-journal-native-")));
@@ -154,7 +154,7 @@ describe.skipIf(process.env.FX_JOURNAL_RED !== "1")("journal witness native cras
     const release = join(workspace, "release");
     const settled = join(workspace, "external-settled");
     const callId = "JOURNAL_ORIGINAL_SELECTED_CALL";
-    const command = "printf '%s' $$ > external-pid; printf once > external-effect; while [ ! -f release ]; do sleep 0.01; done; printf settled > external-settled";
+    const command = "printf '%s' $$ > external-pid; printf once >> external-effect; while [ ! -f release ]; do sleep 0.01; done; printf settled > external-settled";
     const gateway = startFakeGateway([
       fakeShellRun(callId, command, { profile: "clean" }),
       fakeGatewayFinalText("UNEXPECTED_AUTOMATIC_MODEL_REPLAY"),

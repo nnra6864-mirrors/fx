@@ -492,6 +492,7 @@ pub const Runtime = struct {
         const selected = switch (self.state.pending()) {
             .tool => |position| if (position.turn == turn) position.step else return null,
             .ending => |index| if (index == turn) self.state.stepCount(turn) - 1 else return null,
+            .model => |index| if (index == turn and self.state.canFinishProviderResponse(turn)) self.state.stepCount(turn) - 1 else return null,
             else => return null,
         };
         return selected;
@@ -1136,6 +1137,53 @@ const TestSink = struct {
 };
 
 const test_input: types.UserTurn = .{ .text = @constCast("Make a durable change") };
+
+test "journal witness provider terminal response closes after its saved result and respects later reservations" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |reserve_next| {
+        var state: journal.State = .{};
+        defer state.deinit(alloc);
+        var sink: TestSink = .{};
+        var runtime = sink.runtime(&state, "provider-terminal");
+        _ = try runtime.begin(test_input, "model", 1, false);
+        var key = try runtime.generation();
+        defer key.deinit(alloc);
+        const call: types.ToolCall = .{
+            .id = "provider-call",
+            .name = "lookup",
+            .arguments_json = "{}",
+            .provider_result = "{\"content\":\"stored\"}",
+            .provenance = .provider_executed,
+        };
+        _ = try runtime.recordDecision(.{ .content = "provider answer", .finish_reason = .stop, .tool_calls = &.{call} }, &.{call}, &.{.blocked}, key, false, null, null);
+        const result = try std.json.parseFromSlice(Value, alloc, "{\"ok\":true,\"stopReason\":\"stop\"}", .{});
+        defer result.deinit();
+        const history: types.HistoryTurn = .{ .assistant = .{ .user = test_input, .assistant = @constCast("provider answer") } };
+        try std.testing.expectError(error.InvalidJournalTransition, runtime.finish(result.value, history));
+        try runtime.recordResult(0, 0, .{
+            .tool_call_id = @constCast("provider-call"),
+            .tool_name = @constCast("lookup"),
+            .status = .success,
+            .output = @constCast("stored"),
+            .output_bytes = 6,
+            .stored_output_bytes = 6,
+            .provider_native = true,
+        });
+        try std.testing.expectEqual(@as(?usize, 0), runtime.recoveryStep());
+        if (reserve_next) {
+            var next = try runtime.generation();
+            defer next.deinit(alloc);
+            const context = try testExecutionContext(&runtime, 1, true, &.{});
+            defer alloc.free(context);
+            try runtime.reserveRequest(next, context);
+            try std.testing.expect(runtime.recoveryStep() == null);
+            try std.testing.expectError(error.InvalidJournalTransition, runtime.finish(result.value, history));
+        } else {
+            try runtime.finish(result.value, history);
+            try std.testing.expect(state.pending() == .idle);
+        }
+    }
+}
 
 test "journal witness context compaction preserves transcript and request mappings through checkpoint" {
     const alloc = std.testing.allocator;

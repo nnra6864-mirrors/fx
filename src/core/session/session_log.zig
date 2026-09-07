@@ -960,11 +960,29 @@ pub const ConversationRecoveryBoundary = struct {
     turn_open: bool = false,
 };
 
+fn find_conversation_recovery_boundary(alloc: Allocator, dir: *io_mod.VerifiedDir) !ConversationRecoveryBoundary {
+    const scan = try scan_conversation_recovery(alloc, dir);
+    if (scan.complete) return error.SessionRecoveryNotNeeded;
+    return scan.boundary;
+}
+
+const ConversationRecovery = struct {
+    boundary: ConversationRecoveryBoundary,
+    usage_incomplete: bool,
+};
+
+pub fn classify_conversation_recovery(alloc: Allocator, dir: *io_mod.VerifiedDir, session_id: []const u8) !ConversationRecovery {
+    const scan = try scan_conversation_recovery(alloc, dir);
+    const usage_incomplete = try session_usage_sidecar.has_recoverable_corruption(alloc, dir, session_id);
+    if (scan.complete and !usage_incomplete) return error.SessionRecoveryNotNeeded;
+    return .{ .boundary = scan.boundary, .usage_incomplete = usage_incomplete };
+}
+
 /// Reads only. The existing transition validator remains the record authority.
-pub fn find_conversation_recovery_boundary(
+fn scan_conversation_recovery(
     alloc: Allocator,
     dir: *io_mod.VerifiedDir,
-) !ConversationRecoveryBoundary {
+) !struct { boundary: ConversationRecoveryBoundary, complete: bool } {
     var history_buffer: [8192]u8 = undefined;
     var reader = try ConversationHistoryReader.init(alloc, dir, &history_buffer);
     defer reader.deinit();
@@ -1036,10 +1054,10 @@ pub fn find_conversation_recovery_boundary(
             };
         }
     }
-    if (offset == length and boundary.bytes == length) return error.SessionRecoveryNotNeeded;
-    if (boundary.bytes == 0) return error.SessionRecoveryBoundaryInvalid;
+    const complete = offset == length and boundary.bytes == length;
+    if (!complete and boundary.bytes == 0) return error.SessionRecoveryBoundaryInvalid;
     debug_trace.logf("session", "event=conversation_recovery_boundary source_bytes={d} retained_bytes={d} through_seq={d}", .{ length, boundary.bytes, boundary.seq });
-    return boundary;
+    return .{ .boundary = boundary, .complete = complete };
 }
 
 /// Caller owns the returned complete archive, with a checkpointed open turn

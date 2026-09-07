@@ -106,6 +106,47 @@ fn loadCaptured(alloc: Allocator, captured: Captured, session_id: []const u8) !?
     return snapshot;
 }
 
+/// Classifies accounting-only recovery without changing normal resume behavior.
+/// Unsafe storage and recognized foreign formats do not authorize a lossy copy.
+pub fn has_recoverable_corruption(alloc: Allocator, session_dir: *io_mod.VerifiedDir, session_id: []const u8) !bool {
+    var captured = try capture(alloc, session_dir);
+    defer captured.deinit(alloc);
+    switch (captured) {
+        .missing => return false,
+        .invalid => |reason| {
+            if (std.mem.eql(u8, reason, "empty") or std.mem.eql(u8, reason, "oversized")) return true;
+            return error.InvalidUsageSidecar;
+        },
+        .encoded => {},
+    }
+    var snapshot = loadCaptured(alloc, captured, session_id) catch |err| {
+        if (err == error.OutOfMemory or err == error.UsageSidecarSessionMismatch) return err;
+        var envelope = std.json.parseFromSlice(std.json.Value, alloc, captured.encoded, .{}) catch |parse_err| {
+            if (parse_err == error.OutOfMemory) return parse_err;
+            return true;
+        };
+        defer envelope.deinit();
+        if (envelope.value == .object) {
+            if (envelope.value.object.get("session_id")) |id| {
+                if (id == .string and id.string.len != 0 and !std.mem.eql(u8, id.string, session_id)) return error.UsageSidecarSessionMismatch;
+            }
+            if (envelope.value.object.get("schema_version")) |version| {
+                if (version == .integer and version.integer != 1) return error.UnsupportedUsageSidecar;
+            }
+            if (envelope.value.object.get("snapshot")) |value| {
+                if (value == .object) {
+                    if (value.object.get("schema_version")) |version| {
+                        if (version == .integer and (version.integer < 0 or !session_usage.supports_snapshot_schema(@intCast(version.integer)))) return error.UnsupportedUsageSidecar;
+                    }
+                }
+            }
+        }
+        return true;
+    };
+    defer if (snapshot) |*value| value.deinit(alloc);
+    return false;
+}
+
 /// A conversation remains usable when its accounting snapshot is damaged.
 /// File access and private-path failures still prevent admission.
 pub fn loadConversation(
@@ -392,6 +433,47 @@ fn openTestVerifiedDir(dir: std.Io.Dir) !io_mod.VerifiedDir {
             .{ .iterate = true, .follow_symlinks = false },
         ),
     };
+}
+
+test "recovery copy classifies accounting without changing normal resume" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = try openTestVerifiedDir(tmp.dir);
+    defer dir.close();
+    try std.testing.expect(!try has_recoverable_corruption(alloc, &dir, "session"));
+    var usage = session_usage.Usage.initFresh();
+    defer usage.deinit(alloc);
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    try write(alloc, &dir, "session", snapshot);
+    try std.testing.expect(!try has_recoverable_corruption(alloc, &dir, "session"));
+    try io_mod.durableReplaceVerified(alloc, &dir, sidecar_file, "{broken");
+    try std.testing.expect(try has_recoverable_corruption(alloc, &dir, "session"));
+    var resumed = try loadConversation(alloc, &dir, "session", 10);
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqual(session_usage.Availability.incomplete, resumed.billing);
+    var retained = try capture(alloc, &dir);
+    defer retained.deinit(alloc);
+    try std.testing.expectEqualStrings("{broken", retained.encoded);
+    try write(alloc, &dir, "foreign", snapshot);
+    try std.testing.expectError(error.UsageSidecarSessionMismatch, has_recoverable_corruption(alloc, &dir, "session"));
+    const valid_bytes = try encode(alloc, "session", snapshot);
+    defer alloc.free(valid_bytes);
+    var future = try std.json.parseFromSlice(std.json.Value, alloc, valid_bytes, .{});
+    defer future.deinit();
+    future.value.object.getPtr("snapshot").?.object.getPtr("schema_version").?.* = .{ .integer = 4 };
+    var future_bytes: std.Io.Writer.Allocating = .init(alloc);
+    defer future_bytes.deinit();
+    try std.json.Stringify.value(future.value, .{}, &future_bytes.writer);
+    try io_mod.durableReplaceVerified(alloc, &dir, sidecar_file, future_bytes.written());
+    try std.testing.expectError(error.UnsupportedUsageSidecar, has_recoverable_corruption(alloc, &dir, "session"));
+    try io_mod.durableReplaceVerified(alloc, &dir, sidecar_file, "{\"schema_version\":2,\"session_id\":\"session\",\"snapshot\":{}}");
+    try std.testing.expectError(error.UnsupportedUsageSidecar, has_recoverable_corruption(alloc, &dir, "session"));
+    const file = try dir.dir.openFile(std.testing.io, sidecar_file, .{ .mode = .read_write });
+    defer file.close(std.testing.io);
+    try file.setPermissions(std.testing.io, .fromMode(0o644));
+    try std.testing.expectError(error.InvalidUsageSidecar, has_recoverable_corruption(alloc, &dir, "session"));
 }
 
 test "conversation accounting recovery refuses unsafe storage" {

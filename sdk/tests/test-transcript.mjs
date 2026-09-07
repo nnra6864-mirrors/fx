@@ -36,6 +36,21 @@ const checkpoint = (seq, entries) => entry(seq, "checkpoint", { lastIncludedSeq:
 const rejected = (fn) => assert.throws(fn, JournalConflict);
 
 {
+  const providerCall = { ...call("provider"), provenance: "provider_executed", provider_result: '{"content":"stored"}' };
+  const providerStep = step(2, [providerCall], { final: false, completion: { content: "Provider answer", finish_reason: "stop" } });
+  const p = createProjection([start(), providerStep]);
+  rejected(() => p.preview(end(3)));
+  p.apply(result(3, "provider"));
+  const completed = p.preview(end(4)).projection.transcript();
+  assert.equal(completed.messages.length, 2);
+  assert.equal(completed.messages[1].parts.filter((part) => part.type === "text").length, 1);
+  p.apply(entry(4, "model_step", {
+    phase: "request", turnId: "turn-1", messageId: "next-message", generationId: "next-generation", executionContext: {},
+  }));
+  rejected(() => p.preview(end(5)));
+}
+
+{
   const entries = [start(), step(2), end(3)];
   const context = entry(4, "model_step", {
     phase: "context", turnId: null, afterTurnCount: 1,

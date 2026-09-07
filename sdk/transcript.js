@@ -134,6 +134,7 @@ function validateTurn(state, body) {
 }
 
 function applyBody(state, body, changed) {
+  if (state.pending && body.kind !== "tool_result" && body.kind !== "turn_end") state.pending.providerTerminal = false;
   switch (body.kind) {
     case "turn_start": {
       if (state.pending !== null) throw new PendingTurnError();
@@ -205,6 +206,10 @@ function applyBody(state, body, changed) {
         parts.push({ type: "tool_call", callId: call.callId, name: call.name, input, status: "pending" });
         return { callId: call.callId, name: call.name, input };
       });
+      state.pending.providerTerminal = body.completion.finish_reason === "stop" &&
+        typeof body.completion.content === "string" && body.completion.content.length > 0 &&
+        body.calls.length > 0 && body.calls.every((call) => call.provenance === "provider_executed" &&
+          typeof call.provider_result === "string" && call.provider_result.length > 0);
       const stepUsage = usage(body.completion.usage);
       state.usage = addUsage(state.usage, stepUsage);
       state.pending.usage = addUsage(state.pending.usage, stepUsage);
@@ -240,7 +245,7 @@ function applyBody(state, body, changed) {
       boolean(result.ok, "turn result ok");
       const firstUnresolved = pendingCall(state);
       if (result.ok) {
-        requireValue(state.pending.final && !firstUnresolved, "Successful turn end requires a final model step");
+        requireValue((state.pending.final || state.pending.providerTerminal) && !firstUnresolved, "Successful turn end requires a final model response");
         requireValue(stopReasons.has(result.stopReason), "Invalid turn stop reason");
         requireValue(result.pendingTool == null, "Successful turn cannot have a pending tool");
       } else {

@@ -175,6 +175,17 @@ pub const State = struct {
             .{ .model = turn_index };
     }
 
+    /// Provider-owned tools can arrive with their results and the final answer
+    /// in one response. Only the last acknowledged result can close that path;
+    /// a later reservation or context record means execution has moved on.
+    pub fn canFinishProviderResponse(self: *const State, turn_index: usize) bool {
+        if (turn_index >= self.turns.items.len or self.records.items.len == 0) return false;
+        const turn = self.turns.items[turn_index];
+        if (turn.steps.items.len == 0 or self.requestForCurrentStep(turn_index) != null) return false;
+        if (self.records.items[self.records.items.len - 1].entry.kind != .tool_result) return false;
+        return hasProviderTerminalResponse(self.modelStep(turn_index, turn.steps.items.len - 1));
+    }
+
     /// All allocation and transition validation precedes the durability callback.
     /// Failure fences this instance; only recreation can establish the new cursor.
     pub fn append(self: *State, alloc: Allocator, sink: Sink, kind: Kind, bytes: []const u8) !void {
@@ -333,7 +344,7 @@ pub const State = struct {
                 const result = try object(body, "result");
                 const ok = try boolean(result, "ok");
                 if (ok) {
-                    if (position != .ending) return error.InvalidJournalTransition;
+                    if (position != .ending and (position != .model or !self.canFinishProviderResponse(turn_index))) return error.InvalidJournalTransition;
                     _ = try string(result, "stopReason");
                 } else {
                     _ = try string(result, "reason");
@@ -477,6 +488,22 @@ pub fn isContext(body: Value) bool {
     if (body != .object) return false;
     const phase = body.object.get("phase") orelse return false;
     return phase == .string and std.mem.eql(u8, phase.string, "context");
+}
+
+pub fn hasProviderTerminalResponse(body: Value) bool {
+    const completion = object(body, "completion") catch return false;
+    const reason = string(completion, "finish_reason") catch return false;
+    if (!std.mem.eql(u8, reason, "stop")) return false;
+    const content = string(completion, "content") catch return false;
+    if (content.len == 0) return false;
+    const calls = array(body, "calls") catch return false;
+    if (calls.len == 0) return false;
+    for (calls) |call| {
+        const provenance = string(call, "provenance") catch return false;
+        if (!std.mem.eql(u8, provenance, "provider_executed")) return false;
+        _ = string(call, "provider_result") catch return false;
+    }
+    return true;
 }
 
 test "journal witness capacity reserves terminal and checkpoint bytes and sequence" {

@@ -1113,105 +1113,34 @@ pub const Persistence = struct {
     }
 };
 
-test "parking waits for an in-flight usage checkpoint before releasing the writer" {
+test "open session keeps exclusive writer ownership until close" {
     const alloc = std.testing.allocator;
-    const ParkApp = struct {
-        alloc: Allocator,
-        session: session_runtime.SessionRuntime = .{ .max_history_turns = 8, .usage = session_usage.Usage.initFresh() },
-        session_persistence: Persistence = .{},
-        worker: worker_runtime.WorkerRuntime = .{},
-        pacer: @import("../../ui/assistant/pacer.zig").AssistantPacer = .{},
-        stream: struct { active: bool = false } = .{},
-    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    var app = ParkApp{ .alloc = alloc };
-    defer app.session.deinit(alloc);
-    defer app.worker.deinit(std.heap.c_allocator);
-    defer app.pacer.deinit(alloc);
-    defer app.session_persistence.deinit(alloc);
-    app.session_persistence.store = try session_store.Store.initFromHome(alloc, root, root);
-    app.session_persistence.writable = try app.session_persistence.store.?.startWritableSession(alloc, .{
-        .id = @constCast("park-checkpoint"),
-        .origin_workspace_root = @constCast(root),
-        .workspace_root = @constCast(root),
-        .created_at_ms = 1,
-        .updated_at_ms = 1,
-        .conversation_language = .literal("en"),
-        .history = &.{},
-        .total_input_tokens = 0,
-        .total_output_tokens = 0,
-        .preferences = .{ .model = @constCast("test/model"), .effort = .auto, .fast_mode = false },
-    });
-    try app.pacer.enqueue(alloc, "pending presentation");
-    try std.testing.expect(!Runtime(ParkApp).tryBeginIdleSessionPark(&app));
-    app.pacer.clear(alloc);
-    try std.testing.expect(Runtime(ParkApp).tryBeginIdleSessionPark(&app));
-    app.worker.releaseTurnStartHold();
-    const Probe = struct {
-        app: *ParkApp,
-        entered: std.Io.Event = .unset,
-        park_started: std.Io.Event = .unset,
-        park_done: std.atomic.Value(bool) = .init(false),
-        checkpoint_ok: bool = false,
-        park_failure: ?anyerror = null,
-        calls: usize = 0,
-
-        fn persist(raw: *anyopaque, snapshot: session_usage.Snapshot) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.calls += 1;
-            self.entered.set(std.testing.io);
-            self.park_started.waitUncancelable(std.testing.io);
-            const deadline = io_mod.milliTimestamp() + 250;
-            while (!self.park_done.load(.seq_cst) and io_mod.milliTimestamp() < deadline) {
-                io_mod.sleep(std.time.ns_per_ms);
-            }
-            if (self.park_done.load(.seq_cst)) return error.WriterReleasedBeforeCheckpoint;
-            if (!self.app.session_persistence.write_mutex.tryLock()) return error.WriterHeldWhileAwaitingCheckpoint;
-            defer self.app.session_persistence.write_mutex.unlock(std.testing.io);
-            _ = try self.app.session_persistence.writable.?.appendEvent(self.app.alloc, .{ .usage_checkpointed = .{ .usage = snapshot } }, 2);
-        }
-
-        fn checkpoint(self: *@This()) void {
-            self.checkpoint_ok = self.app.session.usage.persistCheckpoint();
-        }
-
-        fn park(self: *@This()) void {
-            self.park_started.set(std.testing.io);
-            defer self.park_done.store(true, .seq_cst);
-            Runtime(ParkApp).parkIdleWritableSession(self.app) catch |err| {
-                self.park_failure = err;
-            };
-        }
-    };
-    var probe = Probe{ .app = &app };
-    app.session.usage.configureCheckpointSink(.{ .context = &probe, .allocator = alloc, .persist = Probe.persist });
-    const checkpoint_thread = try std.Thread.spawn(.{}, Probe.checkpoint, .{&probe});
-    var checkpoint_joined = false;
-    defer if (!checkpoint_joined) {
-        probe.park_done.store(true, .seq_cst);
-        probe.park_started.set(std.testing.io);
-        checkpoint_thread.join();
-    };
-    const deadline = io_mod.milliTimestamp() + 3000;
-    while (!probe.entered.isSet()) {
-        if (io_mod.milliTimestamp() >= deadline) return error.CheckpointNotStarted;
-        io_mod.sleep(std.time.ns_per_ms);
-    }
-    const park_thread = try std.Thread.spawn(.{}, Probe.park, .{&probe});
-    park_thread.join();
-    checkpoint_thread.join();
-    checkpoint_joined = true;
-    if (probe.park_failure) |err| return err;
-    try std.testing.expect(probe.checkpoint_ok);
-    try std.testing.expect(app.session_persistence.writable.?.log.isParked());
-    try std.testing.expect(app.session.usage.persistCheckpoint());
-    try std.testing.expectEqual(@as(usize, 1), probe.calls);
-    var resumed = try app.session_persistence.store.?.resumeForWrite(alloc, "park-checkpoint");
-    defer resumed.deinit(alloc);
-    try std.testing.expectEqual(session_usage.Availability.complete, resumed.state.usage.?.billing);
+    const paths = try testPaths(alloc, &tmp);
+    defer alloc.free(paths.home);
+    defer alloc.free(paths.workspace);
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    try Runtime(TestApp).appendHistoryTurn(&app, .{ .assistant = .{
+        .user = .{ .text = @constCast("original") },
+        .assistant = @constCast("original answer"),
+    } });
+    const id = try alloc.dupe(u8, app.session_persistence.writable.?.active_id);
+    defer alloc.free(id);
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "local unfinished draft");
+    try std.testing.expectError(error.SessionBusy, Runtime(TestApp).loadResumeTargetForWrite(&app, .{ .id = id }, .{ .session_lock_deadline_ms = 1 }));
+    try std.testing.expectEqualStrings("local unfinished draft", app.input_runtime.edit_state.input.items);
+    Runtime(TestApp).finalizePersistence(&app);
+    var next = try Runtime(TestApp).loadResumeTargetForWrite(&app, .{ .id = id }, .{});
+    defer next.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), next.state.history.len);
+    try std.testing.expectEqualStrings("original answer", next.state.history[0].assistant.assistant);
 }
 
 test "persistence in-place initialization preserves empty ownership" {
@@ -2918,13 +2847,6 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn finalizePersistence(app: *App) void {
-            if (app.session_persistence.writable) |*loaded| {
-                if (loaded.log.isParked()) {
-                    app.session_persistence.resume_handoff_intent = .none;
-                    abandonParkedWritableSession(app);
-                    return;
-                }
-            }
             closeWritableSession(app);
         }
 
@@ -2946,13 +2868,6 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn finalizePersistenceWithResumeHandoff(app: *App) ?ResumeHandoff {
-            if (app.session_persistence.writable) |*loaded| {
-                if (loaded.log.isParked()) {
-                    app.session_persistence.resume_handoff_intent = .none;
-                    abandonParkedWritableSession(app);
-                    return null;
-                }
-            }
             return closeWritableSessionWithResumeHandoff(app);
         }
 
@@ -2975,107 +2890,12 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn suspendToJobControl(app: *App, footer_rows: u16) !void {
-            if (!shell_runtime.supports_resize_signal) return;
-            if (!tryBeginIdleSessionPark(app)) {
-                return app_lifecycle.suspendToJobControl(
-                    &app.terminal,
-                    &app.shell,
-                    &app.metrics,
-                    footer_rows,
-                );
-            }
-            defer app.worker.releaseTurnStartHold();
-
-            const session_id = try app.alloc.dupe(u8, app.session_persistence.writable.?.active_id);
-            defer app.alloc.free(session_id);
-            try parkIdleWritableSession(app);
-            debug_trace.logf(
-                "session",
-                "parked writer lock for suspend session={s}",
-                .{session_id},
-            );
-
-            const lifecycle_result = app_lifecycle.suspendToJobControl(
+            return app_lifecycle.suspendToJobControl(
                 &app.terminal,
                 &app.shell,
                 &app.metrics,
                 footer_rows,
             );
-            abandonParkedWritableSession(app);
-            var loaded = loadResumeTargetForWrite(app, .{ .id = session_id }, .{
-                .session_lock_deadline_ms = 0,
-            }) catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "unpark after suspend failed session={s} err={s}",
-                    .{ session_id, @errorName(err) },
-                );
-                app.worker.requestStop();
-                app.should_exit = true;
-                try lifecycle_result;
-                return err;
-            };
-            try installResumedSession(app, &loaded, .session);
-            app.permission_engine.clear(app.alloc);
-            requestSubagentBackgroundRecovery(app);
-            startResumedSessionReconciliation(app);
-            try app.finishLiveSessionResume();
-            debug_trace.logf(
-                "session",
-                "unparked writer lock after suspend session={s}",
-                .{session_id},
-            );
-            try lifecycle_result;
-        }
-
-        /// The caller holds idle turn admission and has no running child work.
-        fn parkIdleWritableSession(app: *App) !void {
-            disableSubagentHost(app);
-            app.session.usage.cancelReconciliation();
-            app.session.usage.finishProfilePublicationsBeforeShutdown();
-            app.session.usage.configureCheckpointSink(null);
-            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
-            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-            const loaded = &app.session_persistence.writable.?;
-            try settleDurableState(app, loaded);
-            loaded.log.park();
-        }
-
-        fn tryBeginIdleSessionPark(app: *App) bool {
-            if (app.session_persistence.writable == null or app.stream.active or app.pacer.hasPending()) {
-                return false;
-            }
-            if (!app.worker.tryHoldTurnStart()) return false;
-            if (app.session_persistence.subagent_host) |host| {
-                if (host.managed.hasRunningWork()) {
-                    app.worker.releaseTurnStartHold();
-                    return false;
-                }
-            }
-            return true;
-        }
-
-        /// Tear down a parked writable without converging or checkpointing.
-        fn abandonParkedWritableSession(app: *App) void {
-            discardAnyPendingCancelledCommand(app, "writable_session_abandon");
-            const loaded = if (app.session_persistence.writable) |*value|
-                value
-            else
-                return;
-            if (comptime @hasDecl(
-                @TypeOf(app.session),
-                "clearWebFetchArtifacts",
-            )) {
-                app.session.clearWebFetchArtifacts();
-            }
-            disableSubagentHost(app);
-            debug_trace.logf(
-                "session",
-                "abandon parked writable session={s}",
-                .{loaded.active_id},
-            );
-            loaded.deinit(app.alloc);
-            app.session_persistence.writable = null;
         }
 
         pub fn deinitPersistence(app: *App) void {

@@ -2798,6 +2798,10 @@ fn isUnversionedSnapshot(value: std.json.Value) bool {
     return value == .object and value.object.count() == 18;
 }
 
+pub fn supports_snapshot_schema(schema_version: u64) bool {
+    return schema_version == 2 or schema_version == 3;
+}
+
 fn parseSnapshotFields(alloc: Allocator, value: std.json.Value) !Snapshot {
     if (value != .object) {
         return error.InvalidUsageSnapshot;
@@ -2808,7 +2812,7 @@ fn parseSnapshotFields(alloc: Allocator, value: std.json.Value) !Snapshot {
     else
         try parseNonNegativeInteger(value.object.get("schema_version"));
     if (!legacy) {
-        if (value.object.count() != 23 or (schema_version != 2 and schema_version != 3)) {
+        if (value.object.count() != 23 or !supports_snapshot_schema(schema_version)) {
             return error.InvalidUsageSnapshot;
         }
     }
