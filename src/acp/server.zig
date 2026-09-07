@@ -1558,31 +1558,7 @@ fn appendJournalEntry(raw: *anyopaque, entry: execution_journal.Entry) !void {
     if (durable != .bool or !durable.bool) return error.PersistenceUncertain;
 }
 
-fn writeJournalStatus(writer: *std.Io.Writer, alloc: Allocator, journal: *const execution_journal.State) !void {
-    try journal.ensureAvailable();
-    const pending = journal.pending();
-    try writer.print("{{\"idle\":{s},\"lastSeq\":{d}", .{ if (pending == .idle) "true" else "false", journal.last_seq });
-    const turn = switch (pending) {
-        .idle => {
-            try writer.writeByte('}');
-            return;
-        },
-        .model, .ending => |index| index,
-        .tool => |position| position.turn,
-    };
-    const start = journal.start(turn);
-    try writer.writeAll(",\"pendingTurn\":{\"turnId\":");
-    try writeJsonStr(try execution_journal.string(start, "turnId"), writer);
-    try writer.writeAll(",\"requestId\":");
-    try writeJsonStr(try execution_journal.string(start, "requestId"), writer);
-    try writer.print(",\"lastSeq\":{d},\"awaiting\":", .{journal.last_seq});
-    if (pending == .tool) {
-        var selected = (try journal_runtime.pendingTool(alloc, journal)).?;
-        defer selected.deinit();
-        try std.json.Stringify.value(.{ .tool = selected.tool }, .{}, writer);
-    } else try writer.writeAll("\"model\"");
-    try writer.writeAll("}}");
-}
+const writeJournalStatus = journal_runtime.writeStatus;
 
 const journal_direct_restore_bytes: usize = 4 * 1024 * 1024;
 const journal_restore_chunk_bytes: usize = 64 * 1024;

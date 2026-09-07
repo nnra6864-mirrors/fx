@@ -771,7 +771,7 @@ fn loadConversationRecoveryCheckpoint(
     };
 }
 
-fn loadConversationStateIfPresent(
+pub fn loadConversationStateIfPresent(
     alloc: Allocator,
     dir: *io_mod.VerifiedDir,
     expected_session_id: []const u8,
@@ -909,6 +909,48 @@ pub fn hasConversationMetadata(
     const bytes = (try readConversationMetadataBytes(alloc, dir)) orelse return false;
     defer alloc.free(bytes);
     return isConversationMetadata(alloc, bytes);
+}
+
+/// Reads a complete legacy conversation for journal conversion without opening
+/// a writer or repairing any bytes. The caller owns the returned state.
+pub fn loadCompletedConversationForJournal(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+) !session_codec.DurableSessionState {
+    var file = try openManagedFile(dir, events_file, .read_only);
+    defer file.close(io_mod.getIo());
+    var cursor = ConversationWriter{ .alloc = alloc, .file = file };
+    defer {
+        cursor.clearPendingToolCalls();
+        cursor.pending_tool_calls.deinit(alloc);
+    }
+    const length = try file.length(io_mod.getIo());
+    var offset: u64 = 0;
+    while (offset < length) {
+        const line = (try session_replay.readLineAt(alloc, file, offset, length)) orelse
+            return error.InvalidConversationFrame;
+        defer alloc.free(line.bytes);
+        var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
+        defer decoded.deinit();
+        try session_event.validateConversationTransition(.{
+            .last_seq = cursor.last_seq,
+            .latest_checkpoint_coverage = cursor.latest_checkpoint_coverage,
+            .pending_tool_calls = cursor.pending_tool_calls.items,
+        }, decoded.value);
+        try cursor.applyReplayedEvent(decoded.value.seq, decoded.value.event);
+        offset = line.next_offset;
+    }
+    if (cursor.turn_open or cursor.pending_tool_calls.items.len != 0) return error.PendingTurnError;
+    var state = (try loadConversationStateIfPresent(alloc, dir, session_id)) orelse
+        return error.InvalidSessionMetadata;
+    errdefer state.deinit(alloc);
+    if (state.recovery_checkpoint != null) return error.PendingTurnError;
+    const archive = try loadConversationArchive(alloc, dir);
+    session.freeHistoryTurnSlice(alloc, state.history);
+    state.history = archive;
+    state.context_history_start = latestConversationCheckpointIndex(archive);
+    return state;
 }
 
 pub const ConversationRecoveryBoundary = struct {
@@ -1211,6 +1253,8 @@ fn openConversationWritableSession(
     alloc: Allocator,
     writable: *WritableSessionDir,
 ) !LoadedWritableSession {
+    const owned_log = try alloc.create(WritableSessionDir);
+    errdefer alloc.destroy(owned_log);
     var event_file = try openManagedFile(&writable.dir, events_file, .read_write);
     var replay_scan: ConversationReplayScan = .{};
     var conversation_writer = ConversationWriter.initWithReplayScan(alloc, event_file, &replay_scan) catch |err| {
@@ -1252,11 +1296,12 @@ fn openConversationWritableSession(
         .through_event_id = randomIdentifier(),
         .through_event_log_bytes = conversation_writer.committed_bytes,
     };
+    owned_log.* = writable.*;
     const result = LoadedWritableSession{
         .active_id = active_id,
         .state = state,
-        .conversation_writer = conversation_writer,
-        .log = writable.*,
+        .writer = .{ .conversation = conversation_writer },
+        .log = owned_log,
         .position = position,
     };
     writable.* = undefined;
@@ -2473,6 +2518,14 @@ pub const WritableSessionDir = struct {
 };
 
 pub const LoadedWritableSession = struct {
+    const Writer = union(enum) {
+        conversation: ConversationWriter,
+        journal: struct {
+            owner: *@import("execution_journal_store.zig").Session,
+            execution: @import("execution_journal.zig").State,
+        },
+    };
+
     pub const ExternalPromptOrigin = enum {
         root,
         persistent_child,
@@ -2480,8 +2533,8 @@ pub const LoadedWritableSession = struct {
 
     active_id: []u8,
     state: session_codec.DurableSessionState,
-    conversation_writer: ConversationWriter,
-    log: WritableSessionDir,
+    writer: Writer,
+    log: *WritableSessionDir,
     freshly_started: bool = false,
     child_capability: ?*session_child_store.SessionChildCapability = null,
     position: CommitPosition,
@@ -2495,19 +2548,75 @@ pub const LoadedWritableSession = struct {
 
     pub fn requireWritable(self: *const LoadedWritableSession) !void {
         if (self.log.isParked()) return error.SessionWriterParked;
-        if (self.conversation_writer.failure) |err| return err;
+        switch (self.writer) {
+            .conversation => |writer| if (writer.failure) |err| return err,
+            .journal => |*writer| {
+                try writer.execution.ensureAvailable();
+                try writer.owner.writer.append_journal.ensure_available();
+            },
+        }
+    }
+
+    pub fn hasPendingTurn(self: *const LoadedWritableSession) bool {
+        return switch (self.writer) {
+            .conversation => |writer| writer.turn_open,
+            .journal => |*writer| writer.execution.pending() != .idle,
+        };
+    }
+
+    pub fn journalState(self: *LoadedWritableSession) ?*@import("execution_journal.zig").State {
+        return switch (self.writer) {
+            .conversation => null,
+            .journal => |*writer| &writer.execution,
+        };
+    }
+
+    pub fn journalSink(self: *LoadedWritableSession) ?@import("execution_journal.zig").Sink {
+        if (self.writer != .journal) return null;
+        return .{ .context = self, .append_fn = appendJournalEntry };
+    }
+
+    fn appendJournalEntry(raw: *anyopaque, entry: @import("execution_journal_codec.zig").Entry) !void {
+        const self: *LoadedWritableSession = @ptrCast(@alignCast(raw));
+        if (self.writer != .journal) return error.JournalWriterRequired;
+        // State deliberately fences itself while this callback is in flight.
+        // The native store validates the held lock and physical append cursor.
+        const sink = self.writer.journal.owner.sink();
+        try sink.append_fn(sink.context, entry);
+        var digest: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&digest, &entry.hash);
+        self.position.through_seq = entry.seq;
+        self.position.through_event_id = digest[0..16].*;
+        self.position.through_event_log_bytes = self.writer.journal.owner.writer.append_journal.cursor.committed_bytes;
+    }
+
+    pub fn markCommitFailed(self: *LoadedWritableSession) void {
+        switch (self.writer) {
+            .conversation => |*writer| if (writer.failure == null) {
+                writer.failure = error.SessionCommitFailed;
+            },
+            .journal => |*writer| {
+                writer.execution.blocked = true;
+                writer.owner.writer.append_journal.blocked = true;
+            },
+        }
     }
 
     fn recordWriteFailure(self: *LoadedWritableSession, err: anyerror) anyerror {
         if (err == error.DurableReplacePostRenameFailed) {
-            self.conversation_writer.failure = error.SessionPersistenceUncertain;
+            switch (self.writer) {
+                .conversation => |*writer| writer.failure = error.SessionPersistenceUncertain,
+                .journal => |*writer| {
+                    writer.execution.blocked = true;
+                    writer.owner.writer.append_journal.blocked = true;
+                },
+            }
             return error.SessionPersistenceUncertain;
         }
         return err;
     }
 
     pub fn deinit(self: *LoadedWritableSession, alloc: Allocator) void {
-        self.conversation_writer.deinit();
         if (self.child_capability) |capability| {
             capability.deinit();
             alloc.destroy(capability);
@@ -2518,7 +2627,17 @@ pub const LoadedWritableSession = struct {
         }
         alloc.free(self.active_id);
         self.state.deinit(alloc);
-        self.log.deinit(alloc);
+        switch (self.writer) {
+            .conversation => |*writer| {
+                writer.deinit();
+                self.log.deinit(alloc);
+                alloc.destroy(self.log);
+            },
+            .journal => |*writer| {
+                writer.execution.deinit(alloc);
+                writer.owner.deinit();
+            },
+        }
         self.* = undefined;
     }
 
@@ -2549,6 +2668,7 @@ pub const LoadedWritableSession = struct {
         turn: *session.HistoryTurn,
     ) !void {
         try self.requireWritable();
+        if (self.writer == .journal) return;
         try externalizeConversationTurnResults(
             alloc,
             turn,
@@ -2562,6 +2682,13 @@ pub const LoadedWritableSession = struct {
         title: []const u8,
     ) !bool {
         try self.requireWritable();
+        if (self.writer == .journal) {
+            var metadata = try self.writer.journal.owner.readMetadata();
+            defer metadata.deinit();
+            metadata.value.title = title;
+            try self.writer.journal.owner.replaceMetadata(metadata.value);
+            return true;
+        }
         const bytes = try readManagedFileAlloc(
             alloc,
             &self.log.dir,
@@ -2599,6 +2726,11 @@ pub const LoadedWritableSession = struct {
         self: *LoadedWritableSession,
         alloc: Allocator,
     ) !?[]u8 {
+        if (self.writer == .journal) {
+            var metadata = try self.writer.journal.owner.readMetadata();
+            defer metadata.deinit();
+            return if (metadata.value.title) |title| try alloc.dupe(u8, title) else null;
+        }
         const bytes = try readManagedFileAlloc(
             alloc,
             &self.log.dir,
@@ -2622,7 +2754,7 @@ pub const LoadedWritableSession = struct {
     ) !CommitPosition {
         try self.requireWritable();
         const result = switch (event) {
-            .history_turn_committed => self.appendConversationHistoryEvent(
+            .history_turn_committed => if (self.writer == .journal) self.appendJournalHistoryEvent(alloc, event.history_turn_committed, timestamp_ms) else self.appendConversationHistoryEvent(
                 alloc,
                 event,
                 timestamp_ms,
@@ -2637,7 +2769,7 @@ pub const LoadedWritableSession = struct {
                 event,
                 timestamp_ms,
             ),
-            .recovery_checkpoint_set, .recovery_checkpoint_cleared => self.appendConversationRecoveryEvent(
+            .recovery_checkpoint_set, .recovery_checkpoint_cleared => if (self.writer == .journal) error.JournalControlRequired else self.appendConversationRecoveryEvent(
                 alloc,
                 event,
                 timestamp_ms,
@@ -2655,13 +2787,27 @@ pub const LoadedWritableSession = struct {
         timestamp_ms: i64,
     ) !CommitPosition {
         try self.requireWritable();
+        if (self.writer == .journal) {
+            if (active_prefix != null) return error.JournalActiveCompactionRequired;
+            const runtime = @import("../agent/runtime/journal_runtime.zig");
+            const execution = &self.writer.journal.execution;
+            const current = try runtime.restoreHistory(alloc, execution);
+            defer session.freeHistoryTurnSlice(alloc, current);
+            const cut = retained_from orelse types.ContextHistoryCut{ .turns = session.rawHistoryTurnCount(current) };
+            const prepared = try session.prepareCompactedHistory(alloc, current, summary, cut);
+            defer session.freeHistoryTurnSlice(alloc, prepared);
+            try runtime.recordCompaction(alloc, execution, self.journalSink().?, summary, cut);
+            self.state.updated_at_ms = timestamp_ms;
+            self.freshly_started = false;
+            return self.position;
+        }
         var prepared: ?session.HistoryTurn = if (active_prefix) |prefix|
             try session.dupeHistoryTurn(alloc, .{ .assistant = prefix })
         else
             null;
         defer if (prepared) |turn| session.freeHistoryTurn(alloc, turn);
         if (prepared) |*turn| try self.prepareHistoryTurnForCommit(alloc, turn);
-        try self.conversation_writer.appendContextCompaction(
+        try self.writer.conversation.appendContextCompaction(
             alloc,
             timestamp_ms,
             summary,
@@ -2669,8 +2815,53 @@ pub const LoadedWritableSession = struct {
             retained_from,
         );
         if (prepared) |turn| self.writeFirstConversationTitle(alloc, turn);
-        if (self.conversation_writer.failure) |err| return err;
+        if (self.writer.conversation.failure) |err| return err;
         return self.finishConversationCommit(alloc, timestamp_ms);
+    }
+
+    fn appendJournalHistoryEvent(self: *LoadedWritableSession, alloc: Allocator, payload: session_event.HistoryTurnCommitted, timestamp_ms: i64) !CommitPosition {
+        const execution = &self.writer.journal.execution;
+        if (execution.pending() != .idle or execution.turns.items.len == 0) return error.JournalControlRequired;
+        const outcome = execution.outcome(execution.turns.items.len - 1) orelse return error.JournalControlRequired;
+        const saved = outcome.object.get("history") orelse return error.InvalidJournalRecord;
+        const expected = try std.json.Stringify.valueAlloc(alloc, saved, .{});
+        defer alloc.free(expected);
+        var actual: std.Io.Writer.Allocating = .init(alloc);
+        defer actual.deinit();
+        try session_codec.writeHistoryTurn(&actual.writer, payload.turn);
+        if (!std.mem.eql(u8, expected, actual.written())) return error.JournalConflict;
+        const work_id = if (payload.work_id) |id| try alloc.dupe(u8, id) else null;
+        errdefer if (work_id) |id| alloc.free(id);
+        var proposed = self.state;
+        proposed.conversation_language = payload.conversation_language;
+        proposed.updated_at_ms = timestamp_ms;
+        try self.writeMetadata(alloc, proposed);
+        self.state.conversation_language = proposed.conversation_language;
+        self.state.updated_at_ms = timestamp_ms;
+        self.state.total_input_tokens = payload.total_input_tokens;
+        self.state.total_output_tokens = payload.total_output_tokens;
+        if (work_id) |id| {
+            if (self.state.last_subagent_work_id) |old| alloc.free(old);
+            self.state.last_subagent_work_id = id;
+        }
+        self.writeFirstConversationTitle(alloc, payload.turn);
+        self.freshly_started = false;
+        try self.requireWritable();
+        return self.position;
+    }
+
+    fn writeMetadata(self: *LoadedWritableSession, alloc: Allocator, state: session_codec.DurableSessionState) !void {
+        if (self.writer == .conversation) return writeConversationMetadata(alloc, &self.log.dir, state);
+        var metadata = try self.writer.journal.owner.readMetadata();
+        defer metadata.deinit();
+        metadata.value.workspace_root = state.workspace_root;
+        metadata.value.updated_at_ms = state.updated_at_ms;
+        metadata.value.conversation_language = state.conversation_language.view();
+        metadata.value.provider = @tagName(state.preferences.provider);
+        metadata.value.model = state.preferences.model;
+        metadata.value.effort = state.preferences.effort.label();
+        metadata.value.fast_mode = state.preferences.fast_mode;
+        try self.writer.journal.owner.replaceMetadata(metadata.value);
     }
 
     fn appendConversationHistoryEvent(
@@ -2688,13 +2879,13 @@ pub const LoadedWritableSession = struct {
         else
             null;
         errdefer if (work_id) |value| alloc.free(value);
-        try self.conversation_writer.appendHistoryTurn(
+        try self.writer.conversation.appendHistoryTurn(
             alloc,
             timestamp_ms,
             payload.turn,
         );
         self.writeFirstConversationTitle(alloc, payload.turn);
-        if (self.conversation_writer.failure) |err| return err;
+        if (self.writer.conversation.failure) |err| return err;
         if (work_id) |value| {
             if (self.state.last_subagent_work_id) |old| alloc.free(old);
             self.state.last_subagent_work_id = value;
@@ -2707,12 +2898,12 @@ pub const LoadedWritableSession = struct {
         const position = self.finishConversationCommit(alloc, timestamp_ms);
         if (language_changed) {
             writeConversationMetadata(alloc, &self.log.dir, self.state) catch |err| {
-                self.conversation_writer.failure = error.SessionPersistenceUncertain;
+                self.writer.conversation.failure = error.SessionPersistenceUncertain;
                 debug_trace.logf("session", "history committed but language metadata failed session={s} err={s}", .{ self.active_id, @errorName(err) });
                 return error.SessionPersistenceUncertain;
             };
         }
-        if (self.conversation_writer.failure) |err| return err;
+        if (self.writer.conversation.failure) |err| return err;
         return position;
     }
 
@@ -2732,7 +2923,7 @@ pub const LoadedWritableSession = struct {
 
     fn finishConversationCommit(self: *LoadedWritableSession, alloc: Allocator, timestamp_ms: i64) CommitPosition {
         if (self.state.recovery_checkpoint != null) {
-            writeConversationRecoveryState(alloc, &self.log.dir, null, self.conversation_writer.last_seq) catch |err| {
+            writeConversationRecoveryState(alloc, &self.log.dir, null, self.writer.conversation.last_seq) catch |err| {
                 debug_trace.logf(
                     "session",
                     "event=committed_turn_recovery_cleanup_failed session={s} err={s}",
@@ -2745,9 +2936,9 @@ pub const LoadedWritableSession = struct {
         self.state.updated_at_ms = timestamp_ms;
         self.position = .{
             .log_generation = self.position.log_generation,
-            .through_seq = self.conversation_writer.last_seq,
+            .through_seq = self.writer.conversation.last_seq,
             .through_event_id = randomIdentifier(),
-            .through_event_log_bytes = self.conversation_writer.committed_bytes,
+            .through_event_log_bytes = self.writer.conversation.committed_bytes,
         };
         self.freshly_started = false;
         return self.position;
@@ -2775,7 +2966,7 @@ pub const LoadedWritableSession = struct {
                 proposed.preferences = preferences;
                 proposed.updated_at_ms = timestamp_ms;
                 try session_codec.validateState(proposed);
-                try writeConversationMetadata(alloc, &self.log.dir, proposed);
+                try self.writeMetadata(alloc, proposed);
                 self.state.preferences.deinit(alloc);
                 self.state.preferences = preferences;
             },
@@ -2797,7 +2988,7 @@ pub const LoadedWritableSession = struct {
                 proposed.workspace_root = workspace_root;
                 proposed.updated_at_ms = timestamp_ms;
                 try session_codec.validateState(proposed);
-                try writeConversationMetadata(alloc, &self.log.dir, proposed);
+                try self.writeMetadata(alloc, proposed);
                 alloc.free(self.state.workspace_root);
                 self.state.workspace_root = workspace_root;
             },
@@ -2850,13 +3041,13 @@ pub const LoadedWritableSession = struct {
                     alloc,
                     &self.log.dir,
                     checkpoint,
-                    self.conversation_writer.last_seq,
+                    self.writer.conversation.last_seq,
                 );
                 if (self.state.recovery_checkpoint) |*prior| prior.deinit(alloc);
                 self.state.recovery_checkpoint = checkpoint;
             },
             .recovery_checkpoint_cleared => {
-                try writeConversationRecoveryState(alloc, &self.log.dir, null, self.conversation_writer.last_seq);
+                try writeConversationRecoveryState(alloc, &self.log.dir, null, self.writer.conversation.last_seq);
                 if (self.state.recovery_checkpoint) |*prior| prior.deinit(alloc);
                 self.state.recovery_checkpoint = null;
             },
@@ -2889,6 +3080,90 @@ pub const LoadedWritableSession = struct {
         self.freshly_started = false;
     }
 };
+
+/// Consumes owner and execution_state only on success. The directory address
+/// remains stable inside owner when the loaded session moves into a runtime.
+pub fn openJournalWritableSession(
+    alloc: Allocator,
+    owner: *@import("execution_journal_store.zig").Session,
+    execution_state: *@import("execution_journal.zig").State,
+) !LoadedWritableSession {
+    var metadata = try owner.readMetadata();
+    defer metadata.deinit();
+    var state = try projectJournalState(alloc, execution_state, metadata.value, .model);
+    errdefer state.deinit(alloc);
+    try loadJournalControls(alloc, &owner.locked.dir, &state);
+    const active_id = try alloc.dupe(u8, state.id);
+    errdefer alloc.free(active_id);
+    var digest: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&digest, &execution_state.last_hash);
+    const result = LoadedWritableSession{
+        .active_id = active_id,
+        .state = state,
+        .writer = .{ .journal = .{ .owner = owner, .execution = execution_state.* } },
+        .log = &owner.locked,
+        .position = .{
+            .log_generation = randomIdentifier(),
+            .through_seq = execution_state.last_seq,
+            .through_event_id = digest[0..16].*,
+            .through_event_log_bytes = owner.writer.append_journal.cursor.committed_bytes,
+        },
+    };
+    execution_state.* = .{};
+    return result;
+}
+
+pub fn loadJournalControls(alloc: Allocator, dir: *io_mod.VerifiedDir, state: *session_codec.DurableSessionState) !void {
+    if (try entryExists(dir, session_usage_sidecar.sidecar_file)) {
+        var usage = try session_usage_sidecar.loadConversation(alloc, dir, state.id, state.updated_at_ms);
+        if (state.usage) |*old| old.deinit(alloc);
+        state.usage = usage;
+        usage = undefined;
+    }
+    if (try entryExists(dir, permission_state_file)) {
+        var permissions = try loadConversationPermissionState(alloc, dir);
+        state.permission_state.deinit(alloc);
+        state.permission_state = permissions;
+        permissions = undefined;
+    }
+}
+
+/// Reconstructs either the active model window or the full visible archive.
+/// Execution control remains in execution_state, never in a legacy checkpoint.
+pub fn projectJournalState(
+    alloc: Allocator,
+    execution_state: *const @import("execution_journal.zig").State,
+    metadata: session_codec.SessionMetadata,
+    view: enum { model, archive },
+) !session_codec.DurableSessionState {
+    const base = execution_state.nativeBase() orelse return error.InvalidJournalGenesis;
+    var state = try @import("execution_journal_genesis.zig").decodeBase(alloc, base);
+    errdefer state.deinit(alloc);
+    try session_codec.validateSessionMetadata(metadata);
+    if (!std.mem.eql(u8, state.id, metadata.id) or
+        !std.mem.eql(u8, state.origin_workspace_root, metadata.origin_workspace_root) or
+        state.created_at_ms != metadata.created_at_ms or state.subagent_child != metadata.subagent_child) return error.JournalConflict;
+    const runtime = @import("../agent/runtime/journal_runtime.zig");
+    const history = switch (view) {
+        .model => try runtime.restoreHistory(alloc, execution_state),
+        .archive => try runtime.restoreArchiveHistory(alloc, execution_state),
+    };
+    session.freeHistoryTurnSlice(alloc, state.history);
+    state.history = history;
+    state.context_history_start = if (view == .model) 0 else latestConversationCheckpointIndex(history);
+    const workspace = try alloc.dupe(u8, metadata.workspace_root);
+    alloc.free(state.workspace_root);
+    state.workspace_root = workspace;
+    const model = try alloc.dupe(u8, metadata.model);
+    alloc.free(state.preferences.model);
+    state.preferences.model = model;
+    state.preferences.provider = model_provider.parse(metadata.provider) orelse return error.InvalidSessionMetadata;
+    state.preferences.effort = types.ReasoningEffort.parse(metadata.effort) orelse return error.InvalidSessionMetadata;
+    state.preferences.fast_mode = metadata.fast_mode;
+    state.updated_at_ms = metadata.updated_at_ms;
+    state.conversation_language = session.ConversationLanguage.fromSlice(metadata.conversation_language) catch return error.InvalidSessionMetadata;
+    return state;
+}
 
 /// Consumes a validated legacy snapshot and its locked directory, then writes
 /// the current conversation representation directly. The legacy metadata stays
@@ -2953,6 +3228,8 @@ fn importLegacySnapshotStateWithOps(
     source_generation: ?Identifier,
     metadata_ops: io_mod.DurableOps,
 ) !LoadedWritableSession {
+    const owned_log = try alloc.create(WritableSessionDir);
+    errdefer alloc.destroy(owned_log);
     try recoverInterruptedLegacyImport(alloc, writable);
     var migrated_permissions = if (state.permission_state.version != session_permission_state.schema_version)
         try session_permission_state.migrateV1ToV2(alloc, state.permission_state)
@@ -3116,11 +3393,12 @@ fn importLegacySnapshotStateWithOps(
         .through_event_id = randomIdentifier(),
         .through_event_log_bytes = conversation_writer.committed_bytes,
     };
+    owned_log.* = writable.*;
     const result = LoadedWritableSession{
         .active_id = active_id,
         .state = converted,
-        .conversation_writer = conversation_writer,
-        .log = writable.*,
+        .writer = .{ .conversation = conversation_writer },
+        .log = owned_log,
         .position = position,
         .migration_source_schema_version = source_schema_version,
         .migration_source_bytes = source_bytes,
@@ -3324,7 +3602,7 @@ pub const Root = struct {
         );
         writable_owned = false;
         errdefer loaded.deinit(alloc);
-        try loaded.conversation_writer.file.sync(io_mod.getIo());
+        try loaded.writer.conversation.file.sync(io_mod.getIo());
         try io_mod.syncVerifiedDir(loaded.log.dir.dir);
         publishSessionDirectory(sessions.dir, staging_name, initial_state.id) catch |err| {
             if (err == error.PathAlreadyExists) return error.SessionAlreadyExists;
@@ -3422,7 +3700,7 @@ pub const Root = struct {
         return session_replay.readSubagentChildIdentity(alloc, log_file);
     }
 
-    fn openWritableSessionDir(
+    pub fn openWritableSessionDir(
         self: *Root,
         alloc: Allocator,
         session_id: []const u8,
@@ -3673,6 +3951,8 @@ fn createNativeSession(
     initial_state: session_codec.DurableSessionState,
     _: Options,
 ) !LoadedWritableSession {
+    const owned_log = try alloc.create(WritableSessionDir);
+    errdefer alloc.destroy(owned_log);
     var synthesized_usage: ?session_usage.Snapshot = null;
     if (initial_state.usage == null) {
         var fresh_usage = session_usage.Usage.initFresh();
@@ -3726,11 +4006,12 @@ fn createNativeSession(
         .through_event_id = randomIdentifier(),
         .through_event_log_bytes = conversation_writer.committed_bytes,
     };
+    owned_log.* = writable.*;
     const result = LoadedWritableSession{
         .active_id = active_id,
         .state = state,
-        .conversation_writer = conversation_writer,
-        .log = writable.*,
+        .writer = .{ .conversation = conversation_writer },
+        .log = owned_log,
         .freshly_started = true,
         .position = position,
     };
@@ -4824,7 +5105,7 @@ test "conversation writer appends without duplicating live history" {
     );
 
     try std.testing.expectEqual(@as(usize, 0), loaded.state.history.len);
-    try std.testing.expectEqual(@as(u64, 3), loaded.conversation_writer.last_seq);
+    try std.testing.expectEqual(@as(u64, 3), loaded.writer.conversation.last_seq);
     var count: usize = 0;
     var iterator = loaded.log.dir.dir.iterate();
     while (try iterator.next(std.testing.io)) |_| count += 1;
@@ -5129,7 +5410,7 @@ test "cache-free writable resume continues the conversation sequence" {
     {
         var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
         defer resumed.deinit(alloc);
-        try std.testing.expectEqual(@as(u64, 3), resumed.conversation_writer.last_seq);
+        try std.testing.expectEqual(@as(u64, 3), resumed.writer.conversation.last_seq);
         _ = try resumed.appendEvent(alloc, .{ .history_turn_committed = .{
             .conversation_language = .literal("en"),
             .total_input_tokens = 2,
@@ -5157,7 +5438,7 @@ test "cache-free metadata changes rewrite metadata without conversation records"
     {
         var loaded = try temp.root.startConversationSession(alloc, initial, .{});
         defer loaded.deinit(alloc);
-        committed_bytes = loaded.conversation_writer.committed_bytes;
+        committed_bytes = loaded.writer.conversation.committed_bytes;
         _ = try loaded.appendEvent(alloc, .{ .preferences_changed = .{
             .model = @constCast("updated/model"),
             .fast_mode = true,
@@ -5169,7 +5450,7 @@ test "cache-free metadata changes rewrite metadata without conversation records"
         try std.testing.expectEqualStrings("renamed session", title);
         try std.testing.expectEqual(
             committed_bytes,
-            loaded.conversation_writer.committed_bytes,
+            loaded.writer.conversation.committed_bytes,
         );
     }
 
@@ -5194,13 +5475,13 @@ test "cache-free usage checkpoints stay outside conversation history" {
     {
         var loaded = try temp.root.startConversationSession(alloc, initial, .{});
         defer loaded.deinit(alloc);
-        committed_bytes = loaded.conversation_writer.committed_bytes;
+        committed_bytes = loaded.writer.conversation.committed_bytes;
         _ = try loaded.appendEvent(alloc, .{
             .usage_checkpointed = .{ .usage = snapshot },
         }, 20);
         try std.testing.expectEqual(
             committed_bytes,
-            loaded.conversation_writer.committed_bytes,
+            loaded.writer.conversation.committed_bytes,
         );
         try std.testing.expect(loaded.freshly_started);
     }
@@ -5277,7 +5558,7 @@ test "committed conversation supersedes recovery after interrupted cleanup" {
         }, 20);
         // Model a process death after the durable conversation append but
         // before recovery cleanup by using the writer at that boundary.
-        try loaded.conversation_writer.appendHistoryTurn(alloc, 30, .{ .assistant = .{
+        try loaded.writer.conversation.appendHistoryTurn(alloc, 30, .{ .assistant = .{
             .user = checkpoint.user,
             .assistant = @constCast("finished answer"),
         } });
@@ -5331,7 +5612,7 @@ test "mid-turn checkpoint resumes only its suffix while preserving archived tool
                     } },
                 } }, 30);
             } else {
-                const writer = &loaded.conversation_writer;
+                const writer = &loaded.writer.conversation;
                 const partial_suffix = try session_event.encodeConversationFrame(alloc, .{
                     .seq = writer.last_seq + 1,
                     .timestamp_ms = 30,
@@ -5375,7 +5656,7 @@ test "mid-turn checkpoint resumes only its suffix while preserving archived tool
             if (turn != .compacted_summary) raw_turns += 1;
         }
         try std.testing.expectEqual(@as(usize, 1), raw_turns);
-        const bytes = try resumed.conversation_writer.readAllForTest(alloc);
+        const bytes = try resumed.writer.conversation.readAllForTest(alloc);
         defer alloc.free(bytes);
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\"user\":{"));
     }
@@ -5508,7 +5789,7 @@ test "mid-turn checkpoint retains a bound recovery suffix across writable resume
     {
         var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
         defer resumed.deinit(alloc);
-        try std.testing.expect(resumed.conversation_writer.turn_open);
+        try std.testing.expect(resumed.writer.conversation.turn_open);
         try std.testing.expectEqual(@as(usize, 1), resumed.state.history.len);
         try std.testing.expectEqualStrings("remaining draft", resumed.state.recovery_checkpoint.?.assistant_source);
         try std.testing.expectEqualStrings("exact-open-work", resumed.state.recovery_checkpoint.?.user.work_id orelse return error.MissingRecoveryWorkId);
@@ -5524,7 +5805,7 @@ test "mid-turn checkpoint retains a bound recovery suffix across writable resume
     }
     var completed = try temp.root.resumeForWrite(alloc, initial.id, .{});
     defer completed.deinit(alloc);
-    try std.testing.expect(!completed.conversation_writer.turn_open);
+    try std.testing.expect(!completed.writer.conversation.turn_open);
     try std.testing.expectEqual(@as(usize, 2), completed.state.history.len);
     try std.testing.expect(completed.state.recovery_checkpoint == null);
     try std.testing.expectEqualStrings("remaining answer", completed.state.history[1].assistant.assistant);

@@ -2,6 +2,9 @@ const std = @import("std");
 const std_builtin = @import("builtin");
 const command_admission = @import("../permissions/command_admission.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
+const journal_runtime = @import("../agent/runtime/journal_runtime.zig");
+const execution_journal = @import("../session/execution_journal.zig");
+const journal_codec = @import("../session/execution_journal_codec.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
 const app_runtime_setup = @import("../app/app_runtime_setup.zig");
@@ -856,12 +859,12 @@ const AskContext = struct {
                 self.alloc,
                 target,
                 self.workspace_root,
-                .{ .seed_preferences = seed_preferences },
+                .{ .seed_preferences = seed_preferences, .execution_journal = true },
             )
         else blk: {
             var state = try freshAskState(self, seed_preferences);
             defer state.deinit(self.alloc);
-            break :blk try store.startWritableSession(self.alloc, state);
+            break :blk try store.startJournalSession(self.alloc, state, .{});
         };
         var writable_owned = true;
         errdefer if (writable_owned) writable.deinit(self.alloc);
@@ -1547,9 +1550,45 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
     }
 
+    var journal: ?journal_runtime.Runtime = null;
+    var journal_nonce: [16]u8 = undefined;
+    io_mod.getIo().random(&journal_nonce);
+    const journal_creation = std.fmt.bytesToHex(journal_nonce, .lower);
+    var journal_user: ?types.UserTurn = null;
+    defer if (journal_user) |user| types.freeUserTurn(alloc, user);
+    if (ctx.writable) |*writable| {
+        if (writable.journalState()) |records| {
+            journal = .{
+                .state = records,
+                .sink = .{ .context = &ctx, .append_fn = appendJournalEntry },
+                .alloc = ctx.alloc,
+                .namespace = writable.active_id,
+                .creation_id = &journal_creation,
+                .request_id = &journal_creation,
+                .resuming = options.continue_recovery,
+            };
+            if (options.continue_recovery) {
+                const turn = switch (records.pending()) {
+                    .idle => return failPromptRunResult(error.NoPendingRecovery),
+                    .model, .ending => |index| index,
+                    .tool => |position| position.turn,
+                };
+                journal.?.turn = turn;
+                journal.?.request_id = try execution_journal.string(records.start(turn), "requestId");
+                journal_user = try journal.?.user(alloc);
+                const resumed_prompt = try alloc.dupe(u8, journal_user.?.text);
+                alloc.free(owned_prompt);
+                owned_prompt = resumed_prompt;
+                ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
+            } else if (records.pending() != .idle) return error.PendingTurnError;
+        }
+    }
+
     var recovery_checkpoint: ?session_codec.RecoveryCheckpoint = null;
     defer if (recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
-    if (options.continue_recovery) {
+    if (journal != null) {
+        // The journal owns pending execution; do not create a second checkpoint.
+    } else if (options.continue_recovery) {
         const writable = if (ctx.writable) |*value| value else return failPromptRunResult(error.RecoverySessionUnavailable);
         const checkpoint = writable.state.recovery_checkpoint orelse
             return failPromptRunResult(error.NoPendingRecovery);
@@ -1558,7 +1597,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         owned_prompt = try alloc.dupe(u8, recovery_checkpoint.?.user.text);
         ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
     } else if (ctx.writable) |*writable| {
-        if (writable.conversation_writer.turn_open) {
+        if (writable.hasPendingTurn()) {
             const checkpoint = writable.state.recovery_checkpoint orelse
                 return error.InvalidRecoveryCheckpoint;
             const prompt_snapshot_committed = ctx.prompt_snapshot_committed;
@@ -1635,16 +1674,18 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
 
     const current_images = try types.dupeImageAttachmentSlice(
         alloc,
-        if (recovery_checkpoint) |checkpoint|
+        if (journal_user) |user|
+            user.images
+        else if (recovery_checkpoint) |checkpoint|
             checkpoint.user.images
         else
             options.images,
     );
     defer types.freeImageAttachmentSlice(alloc, current_images);
-    defer if (recovery_checkpoint == null and options.save_session and !ctx.prompt_snapshot_committed) {
+    defer if (journal_user == null and recovery_checkpoint == null and options.save_session and !ctx.prompt_snapshot_committed) {
         image_attachments.deleteUnreferencedImageSnapshots(current_images, restored_image_catalog);
     };
-    if (recovery_checkpoint == null and current_images.len > 0) {
+    if (journal_user == null and recovery_checkpoint == null and current_images.len > 0) {
         try ctx.checkCancellation();
         _ = std.math.add(
             usize,
@@ -1752,7 +1793,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         ctx.session.agent.history.items,
     );
     defer alloc.free(root_user_intent_context);
-    ctx.active_turn_id = if (recovery_checkpoint) |checkpoint|
+    ctx.active_turn_id = if (journal_user != null)
+        try journal.?.runtimeTurnId()
+    else if (recovery_checkpoint) |checkpoint|
         checkpoint.turn_id
     else
         debug_trace.nextTurnId();
@@ -1779,12 +1822,16 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .recovery_checkpoint = recovery_checkpoint,
     };
 
-    const deps = agentRuntimeDeps(&ctx);
+    var deps = agentRuntimeDeps(&ctx);
+    if (journal) |*runtime| {
+        deps.journal = runtime;
+        deps.recovery_checkpoint = null;
+    }
     const semantic_presentation = if (ctx.presenter) |value| value.semanticSink() else null;
     try ctx.checkCancellation();
     const current_prompt_is_root_authority = if (ctx.writable) |writable|
         writable.external_prompt_origin == .persistent_child and
-            recovery_checkpoint == null
+            recovery_checkpoint == null and journal_user == null
     else
         false;
     options.deps.process_queued_prompt(&ctx.session.agent, &deps, semantic_presentation, ctx.lifecycleContext(), .{
@@ -2871,6 +2918,18 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
     ctx.session.commitPreparedHistoryEntry(ctx.alloc, prepared);
     prepared_owned = false;
     ctx.prompt_snapshot_committed = true;
+}
+
+fn appendJournalEntry(raw_ctx: *anyopaque, entry: journal_codec.Entry) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.session_write_mutex.unlock(io_mod.getIo());
+    const writable = if (ctx.writable) |*value| value else return error.SessionPersistenceUnavailable;
+    const sink = writable.journalSink() orelse return error.JournalWriterRequired;
+    // An uncertain append may reference captured input artifacts. Retain them
+    // until a fresh owner has read the authoritative journal.
+    ctx.prompt_snapshot_committed = true;
+    try sink.append_fn(sink.context, entry);
 }
 
 fn commitContextCompaction(

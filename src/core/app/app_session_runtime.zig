@@ -25,6 +25,8 @@ const io_mod = @import("../shared/io.zig");
 const list_window = @import("../shared/list_window.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const session_runtime = @import("../session/session.zig");
+const journal_runtime = @import("../agent/runtime/journal_runtime.zig");
+const execution_journal = @import("../session/execution_journal.zig");
 const session_catalog = @import("../session/session_catalog.zig");
 const session_codec = @import("../session/session_codec.zig");
 const js_host_session_store = @import("../session/js_host_session_store.zig");
@@ -1372,9 +1374,10 @@ pub fn Runtime(comptime App: type) type {
 
             var state = try freshState(app, preferences);
             defer state.deinit(app.alloc);
-            app.session_persistence.writable = store.startWritableSession(
+            app.session_persistence.writable = store.startJournalSession(
                 app.alloc,
                 state,
+                .{},
             ) catch |err| {
                 try warnNonDurable(app, "session creation failed", err);
                 return;
@@ -1795,6 +1798,7 @@ pub fn Runtime(comptime App: type) type {
                 .{
                     .seed_preferences = app.session_persistence.workspace_preferences,
                     .log = log_options,
+                    .execution_journal = true,
                 },
             );
         }
@@ -2342,11 +2346,47 @@ pub fn Runtime(comptime App: type) type {
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             const loaded = if (app.session_persistence.writable) |*value| value else return null;
+            if (loaded.journalState()) |records| {
+                const index = switch (records.pending()) {
+                    .idle => return null,
+                    .model, .ending => |turn| turn,
+                    .tool => |position| position.turn,
+                };
+                const runtime: journal_runtime.Runtime = .{
+                    .state = records,
+                    .sink = loaded.journalSink().?,
+                    .alloc = alloc,
+                    .namespace = loaded.active_id,
+                    .creation_id = "queue",
+                    .request_id = try execution_journal.string(records.start(index), "requestId"),
+                    .turn = index,
+                };
+                const user = try runtime.user(alloc);
+                defer types.freeUserTurn(alloc, user);
+                // This is only the existing queue's input carrier. Execution
+                // restores authority and budgets from the journal itself.
+                const carrier: session_codec.RecoveryCheckpoint = .{
+                    .turn_id = try runtime.runtimeTurnId(),
+                    .user = user,
+                    .assistant_source = @constCast(""),
+                    .cause = .suspended,
+                    .action = .paused,
+                    .authority = .{ .provider = loaded.state.preferences.provider, .model = @constCast(try runtime.model()) },
+                    .requested_fast_mode = loaded.state.preferences.fast_mode,
+                    .fast_mode = loaded.state.preferences.fast_mode,
+                    .max_provider_attempts = 1,
+                    .consumed_provider_attempts = 0,
+                };
+                return try carrier.dupe(alloc);
+            }
             const checkpoint = loaded.state.recovery_checkpoint orelse return null;
             return try checkpoint.dupe(alloc);
         }
 
         pub fn continuePausedRecovery(app: *App) !bool {
+            const hold = comptime @hasField(App, "worker") and @hasDecl(@TypeOf(app.worker), "tryHoldTurnStart");
+            if (hold and !app.worker.tryHoldTurnStart()) return error.RecoveryBusy;
+            defer if (hold) app.worker.releaseTurnStartHold();
             var checkpoint = (try snapshotRecoveryCheckpoint(
                 app,
                 std.heap.c_allocator,
@@ -2361,7 +2401,8 @@ pub fn Runtime(comptime App: type) type {
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             const loaded = if (app.session_persistence.writable) |*value| value else return null;
-            if (!loaded.conversation_writer.turn_open) return null;
+            if (!loaded.hasPendingTurn()) return null;
+            if (loaded.journalState() != null) return error.PendingTurnError;
             const value = loaded.state.recovery_checkpoint orelse return error.InvalidRecoveryCheckpoint;
             return try value.dupe(alloc);
         }
@@ -2372,7 +2413,7 @@ pub fn Runtime(comptime App: type) type {
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             if (app.session_persistence.writable) |*loaded| {
-                if (!loaded.conversation_writer.turn_open and current.prior_turn != null) {
+                if (!loaded.hasPendingTurn() and current.prior_turn != null) {
                     debug_trace.logf("session", "event=fresh_prompt_prior_already_finished turn_id={d}; skipping interrupted closure", .{request.turn_id});
                     current.prior_turn = null;
                 }
@@ -2900,9 +2941,7 @@ pub fn Runtime(comptime App: type) type {
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             if (app.session_persistence.writable) |*loaded| {
                 // A missing finished turn cannot be followed by another saved turn.
-                if (loaded.conversation_writer.failure == null) {
-                    loaded.conversation_writer.failure = error.SessionCommitFailed;
-                }
+                loaded.markCommitFailed();
             }
         }
 
@@ -3551,6 +3590,24 @@ pub fn Runtime(comptime App: type) type {
             sink: anytype,
             state: session_codec.DurableSessionState,
         ) !void {
+            if (comptime runtime_profile.allows(App, .durable_sessions)) {
+                if (app.session_persistence.writable) |*loaded| {
+                    if (loaded.journalState()) |records| {
+                        const pending = (try journal_runtime.pendingHistory(app.alloc, records)) orelse return;
+                        defer types.freeHistoryTurn(app.alloc, pending);
+                        try replayHistoryToSink(app, sink, &.{pending});
+                        try sink.appendNotice(.{
+                            .topic = "recovery",
+                            .tone = .warning,
+                            .body = if (records.pending() == .tool)
+                                "Turn paused with an unconfirmed tool result. Inspect the tool effect before continuing."
+                            else
+                                "Turn paused. Run /continue to resume the preserved turn.",
+                        });
+                        return;
+                    }
+                }
+            }
             const checkpoint = state.recovery_checkpoint orelse return;
             var has_prior_turns = false;
             for (state.history) |turn| switch (turn) {
@@ -8354,7 +8411,7 @@ test "fresh TUI prompt preparation preserves equal user text as distinct turns" 
     });
     defer prepared.deinit(std.heap.c_allocator);
     try std.testing.expectEqual(@as(usize, 2), prepared.history.len);
-    try std.testing.expect(!app.session_persistence.writable.?.conversation_writer.turn_open);
+    try std.testing.expect(!app.session_persistence.writable.?.writer.conversation.turn_open);
     try std.testing.expect(app.session_persistence.writable.?.state.recovery_checkpoint == null);
     try std.testing.expectEqual(@as(usize, 2), app.session.historyLen());
     try Runtime(TestApp).appendHistoryTurn(&app, .{ .assistant = .{
@@ -8399,7 +8456,7 @@ test "context checkpoint persists before releasing summarized model memory" {
         .removed_turn_count = 2,
         .compaction_count = 1,
     };
-    const writer = &app.session_persistence.writable.?.conversation_writer;
+    const writer = &app.session_persistence.writable.?.writer.conversation;
     const saved_seq = writer.last_seq;
     const saved_bytes = writer.committed_bytes;
     writer.last_seq = std.math.maxInt(u64);
@@ -9941,7 +9998,7 @@ test "uncertain finished history preserves snapshot files and rejects later writ
             return error.InputOutput;
         }
     };
-    app.session_persistence.writable.?.conversation_writer.test_sync_ops = .{ .sync_file = Fault.sync };
+    app.session_persistence.writable.?.writer.conversation.test_sync_ops = .{ .sync_file = Fault.sync };
     var ownership = SnapshotOwnershipProbe{};
     const turn = try session_runtime.makeAssistantTurn(alloc, "request", "answer");
     defer session_runtime.freeHistoryTurn(alloc, turn);

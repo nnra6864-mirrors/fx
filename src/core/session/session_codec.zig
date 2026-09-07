@@ -414,7 +414,7 @@ pub fn decodeRecoveryCheckpoint(
     };
 }
 
-fn validateSessionMetadata(metadata: SessionMetadata) !void {
+pub fn validateSessionMetadata(metadata: SessionMetadata) !void {
     if (metadata.schema_version != session_metadata_schema_version) {
         return error.UnsupportedSessionSchema;
     }

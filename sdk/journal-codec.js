@@ -206,7 +206,12 @@ function versionedBody(bytes, kind) {
   const { body, versions } = parseJson(text);
   function validate(record, expectedKind) {
     if (!record || typeof record !== "object" || Array.isArray(record)) throw new JournalConflict("Journal body must be an object");
-    if (versions.get(record) !== "1") throw new JournalConflict("Unsupported journal version");
+    if (versions.get(record) === "1") {
+      if (Object.hasOwn(record, "nativeBase")) throw new JournalConflict("Native history requires checkpoint version two");
+    } else if (versions.get(record) === "2" && expectedKind === "checkpoint") {
+      const base = record.nativeBase;
+      if (!base || versions.get(base) !== "1" || typeof base.id !== "string" || typeof base.stateJson !== "string" || typeof base.contextJson !== "string") throw new JournalConflict("Invalid native journal base");
+    } else throw new JournalConflict("Unsupported journal version");
     if (!kinds.has(record.kind) || record.kind !== expectedKind) throw new JournalConflict("Journal body kind does not match its envelope");
   }
   validate(body, kind);

@@ -69,7 +69,7 @@ test "child compaction preserves work identity and permits final commit" {
         .assistant = @constCast("child done"),
     } }, 10, 5, 3);
     try std.testing.expect(turn.committed);
-    const bytes = try writable.conversation_writer.readAllForTest(alloc);
+    const bytes = try writable.writer.conversation.readAllForTest(alloc);
     defer alloc.free(bytes);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "child request"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "work-checkpoint"));
@@ -130,7 +130,7 @@ test "child recovery admission distinguishes work identity from repeated prompt 
             defer if (recovery) |*checkpoint| checkpoint.deinit(alloc);
             try std.testing.expectEqual(same_work, recovery != null);
             try std.testing.expect(!turn.committed);
-            try std.testing.expectEqual(same_work, writable.conversation_writer.turn_open);
+            try std.testing.expectEqual(same_work, writable.writer.conversation.turn_open);
             try turn.commit(work_id, .{ .assistant = .{
                 .user = .{ .text = @constCast("same prompt") },
                 .assistant = @constCast("new answer"),
@@ -284,7 +284,7 @@ pub const TurnContext = struct {
         alloc: Allocator,
     ) CommitError!?session_codec.RecoveryCheckpoint {
         const checkpoint = self.loaded.state.recovery_checkpoint orelse return null;
-        if (self.loaded.conversation_writer.turn_open) {
+        if (self.loaded.hasPendingTurn()) {
             const prior_work_id = checkpoint.user.work_id orelse return error.InvalidWorkId;
             const work_id = self.active_work_id orelse return error.InvalidWorkId;
             if (!std.mem.eql(u8, prior_work_id, work_id)) {

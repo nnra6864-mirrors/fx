@@ -107,7 +107,11 @@ fx session resume --id <id>
 
 Repeated continuation reuses validated summaries of unchanged older sessions instead of replaying their histories during selection. The first scan, or a scan after those session files change, can take longer. Opening the resume picker preserves these cached summaries.
 
-Older sessions that saved Vercel connection settings can be opened through `-r`, `/resume`, `-c`, or an exact ID. Migration preserves their model settings and keeps unfinished responses as interrupted history, without replaying old requests or restoring saved credential references.
+Saved CLI and interactive sessions use an execution journal. Eligible completed older sessions convert under the exclusive session lock before accepting a new turn. Conversion preserves their history, settings, permissions, and required artifacts, and archives the original files. Older executables reject the converted format. Legacy sessions with pending work or conflicting recovery data remain inspectable; conversion refuses to guess whether that work completed.
+
+Reopening an unfinished journal session leaves it paused. Use `/continue`, or `fx ask --resume-id <id> --continue-recovery`, to continue the recorded turn. A saved final answer can finish without another model request. A selected tool whose outcome is unconfirmed remains blocked instead of running again.
+
+The native journal transition is still under development. Automatic compaction within an active turn, planned restart/upgrade handoff, and native ACP/subagent integration remain incomplete in this branch.
 
 If a saved conversation is damaged, run `fx session recover <id>` to copy its validated prefix into a new session. Recovery preserves checkpoint boundaries and referenced result files, leaves the original unchanged, and prints the new session ID. Records after the damaged boundary are not included, and recovery does not rerun commands. Healthy conversations can be resumed without recovery. Paused requests retain their captured images across errors and restarts. Continuing uses those saved images even if the original files move or change; missing or corrupted saved images produce a recovery error.
 

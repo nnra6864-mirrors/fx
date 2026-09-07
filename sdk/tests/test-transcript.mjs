@@ -35,6 +35,29 @@ const end = (seq, value = { ok: true, stopReason: "stop" }) => entry(seq, "turn_
 const checkpoint = (seq, entries) => entry(seq, "checkpoint", { lastIncludedSeq: seq - 1, records: entries.map((item) => decodeEntry(item).body) });
 const rejected = (fn) => assert.throws(fn, JournalConflict);
 
+{
+  const entries = [start(), step(2), end(3)];
+  const context = entry(4, "model_step", {
+    phase: "context", turnId: null, afterTurnCount: 1,
+    summary: { kind: "compacted_summary", summary: "Saved context summary", removed_turn_count: 1, compaction_count: 1 },
+    retainedFrom: { turns: 1, tool_steps: 0, steering: 0 },
+  });
+  const p = createProjection(entries);
+  const before = p.transcript();
+  const preview = p.preview(context);
+  assert.deepEqual(preview.delta, { messages: [] });
+  assert.deepEqual(preview.completedDrafts, []);
+  assert.deepEqual(p.transcript(), before);
+  assert.deepEqual(p.apply(context), { delta: { messages: [] }, completedDrafts: [] });
+  assert.deepEqual(p.transcript(), before);
+  assert.deepEqual(readCheckpoint(checkpoint(5, [...entries, context]).bytes), before);
+  rejected(() => createProjection([...entries, entry(4, "model_step", { ...decodeEntry(context).body, afterTurnCount: 2 })]));
+  rejected(() => createProjection([...entries, entry(4, "model_step", { ...decodeEntry(context).body, retainedFrom: { turns: -1, tool_steps: 0, steering: 0 } })]));
+  rejected(() => createProjection([...entries, entry(4, "model_step", { ...decodeEntry(context).body, summary: { kind: "compacted_summary" } })]));
+  const pending = createProjection([start(), step(2, [call("pending")])]);
+  rejected(() => pending.preview(entry(3, "model_step", { ...decodeEntry(context).body, turnId: "turn-1" })));
+}
+
 // Request reservations acknowledge budget/authority without inventing a saved
 // response. Retrying retires only its prior generation, including on replay.
 {

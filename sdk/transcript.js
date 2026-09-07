@@ -107,7 +107,7 @@ function emptyState() {
   return {
     lastSeq: 0, seen: new Map(), records: [], requests: new Map(),
     turnIds: new Set(), messageIds: new Set(), callIds: new Set(), generationIds: new Set(),
-    model: "", usage: {}, messages: [], pending: null,
+    model: "", usage: {}, messages: [], pending: null, nativeBase: null,
   };
 }
 
@@ -142,6 +142,7 @@ function applyBody(state, body, changed) {
       if (state.requests.has(body.requestId)) throw new RequestConflict();
       requireValue(!state.turnIds.has(body.turnId), "Duplicate turn identity");
       requireValue(!state.messageIds.has(body.userMessageId), "Duplicate message identity");
+      if (state.nativeBase) requireValue(body.namespace === state.nativeBase.id, "Native journal namespace changed");
       const input = object(parseJournalJson(body.inputJson), "UserTurn");
       const parts = userParts(input);
       state.model = body.model;
@@ -156,6 +157,18 @@ function applyBody(state, body, changed) {
       break;
     }
     case "model_step": {
+      if (body.phase === "context") {
+        requireValue(body.afterTurnCount === state.requests.size, "Context replacement has the wrong turn boundary");
+        requireValue(body.turnId === (state.pending?.turnId ?? null), "Context replacement has the wrong pending turn");
+        requireValue(!state.pending || (!pendingCall(state) && !state.pending.final), "Context replacement precedes the selected decision's completion");
+        requireValue(!("completion" in body) && !("calls" in body) && !("generationId" in body), "Context replacement cannot select work");
+        requireValue(object(body.summary, "context summary").kind === "compacted_summary", "Invalid context summary");
+        projectLegacyPayload({ history: [body.summary], usage: {} }, 2, 1);
+        const cut = object(body.retainedFrom, "context boundary");
+        requireValue(Object.keys(cut).length === 3, "Invalid context boundary");
+        for (const name of ["turns", "tool_steps", "steering"]) legacyInteger(cut[name], name);
+        break;
+      }
       validateTurn(state, body);
       requireValue(!pendingCall(state) && !state.pending.final, "Model step precedes the prior decision's completion");
       string(body.messageId, "messageId");
@@ -267,8 +280,32 @@ function checkpointState(body, seq, prior) {
   if (prior.lastSeq) {
     requireValue(prior.pending === null, "Checkpoint cannot replace a pending turn");
     requireValue(equal(prior.records, body.records), "Checkpoint rewrites retained journal history");
+    requireValue(equal(prior.nativeBase, body.nativeBase ?? null), "Checkpoint rewrites native history");
   }
   const state = emptyState();
+  if (body.nativeBase) {
+    const base = object(body.nativeBase, "native history base");
+    requireValue(Object.keys(base).length === 4 && base.v === 1, "Unknown native history base");
+    const original = object(parseJournalJson(string(base.stateJson, "native state JSON")), "native state");
+    requireValue(original.id === string(base.id, "native session id") && !Object.hasOwn(original, "recovery_checkpoint"), "Native history has unresolved or mismatched state");
+    const context = object(parseJournalJson(string(base.contextJson, "native context JSON")), "native context");
+    requireValue(context.id === base.id && context.context_history_start === 0 && !Object.hasOwn(context, "recovery_checkpoint"), "Invalid native model context");
+    legacyArray(context.history, "native model history");
+    const history = legacyArray(original.history, "native history");
+    legacyInteger(original.context_history_start, "native context boundary");
+    requireValue(original.context_history_start <= history.length, "Invalid native context boundary");
+    const projected = projectLegacyPayload({ history, usage: {
+      input_tokens: original.total_input_tokens, output_tokens: original.total_output_tokens,
+    } }, 2, 16384);
+    state.model = string(object(original.preferences, "native preferences").model, "native model");
+    state.usage = { ...projected.usage };
+    state.messages = projected.messages.slice();
+    for (const message of state.messages) {
+      state.messageIds.add(message.id);
+      state.turnIds.add(message.turnId);
+    }
+    state.nativeBase = base;
+  }
   for (const record of body.records) applyBody(state, record, []);
   requireValue(state.pending === null, "Checkpoint contains a pending turn");
   state.lastSeq = seq;
@@ -278,7 +315,7 @@ function checkpointState(body, seq, prior) {
 
 function changeFor(state, entry) {
   const decoded = decodeEntry(entry);
-  const retiresGeneration = decoded.kind === "model_step" && (decoded.body.phase !== "request" || decoded.body.supersedesGenerationId != null);
+  const retiresGeneration = decoded.kind === "model_step" && decoded.body.phase !== "context" && (decoded.body.phase !== "request" || decoded.body.supersedesGenerationId != null);
   const completedDrafts = retiresGeneration ? freeze([{
     turnId: string(decoded.body.turnId, "turnId"),
     messageId: string(decoded.body.messageId, "messageId"),

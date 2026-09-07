@@ -838,7 +838,7 @@ pub fn handlePrompt(
         };
         recovery_checkpoint = try checkpoint.dupe(alloc);
     } else if (session.writable) |*writable| {
-        if (writable.conversation_writer.turn_open) {
+        if (writable.hasPendingTurn()) {
             const checkpoint = writable.state.recovery_checkpoint orelse
                 return error.InvalidRecoveryCheckpoint;
             try persistAcpHistoryTurn(alloc, session, checkpoint.interruptedTurn(), null);

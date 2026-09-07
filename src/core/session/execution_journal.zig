@@ -64,6 +64,8 @@ const Turn = struct {
 
 pub const State = struct {
     limits: Limits = .{},
+    native_base_json: ?[]u8 = null,
+    native_base: ?std.json.Parsed(Value) = null,
     records: std.ArrayList(codec.OwnedEntry) = .empty,
     turns: std.ArrayList(Turn) = .empty,
     requests: std.StringHashMapUnmanaged(usize) = .empty,
@@ -73,6 +75,8 @@ pub const State = struct {
     blocked: bool = false,
 
     pub fn deinit(self: *State, alloc: Allocator) void {
+        if (self.native_base) |base| base.deinit();
+        if (self.native_base_json) |bytes| alloc.free(bytes);
         for (self.turns.items) |*turn| {
             for (turn.steps.items) |*step| step.results.deinit(alloc);
             turn.steps.deinit(alloc);
@@ -110,6 +114,10 @@ pub const State = struct {
     /// A completed request is found before any host age policy is applied.
     pub fn request(self: *const State, id: []const u8) ?usize {
         return self.requests.get(id);
+    }
+
+    pub fn nativeBase(self: *const State) ?Value {
+        return if (self.native_base) |base| base.value else null;
     }
 
     pub fn start(self: *const State, turn: usize) Value {
@@ -226,6 +234,7 @@ pub const State = struct {
                 const turn_id = try string(body, "turnId");
                 _ = try string(body, "userMessageId");
                 const namespace = try string(body, "namespace");
+                if (self.nativeBase()) |base| if (!std.mem.eql(u8, namespace, try string(base, "id"))) return error.JournalConflict;
                 if (self.turns.items.len != 0 and !std.mem.eql(u8, namespace, try string(self.start(0), "namespace"))) return error.JournalConflict;
                 _ = try string(body, "model");
                 _ = try string(body, "runtimeTurnId");
@@ -240,6 +249,20 @@ pub const State = struct {
                 try self.requests.ensureUnusedCapacity(alloc, 1);
             },
             .model_step => {
+                if (isContext(body)) {
+                    const pending_state = self.pending();
+                    if (pending_state != .idle and pending_state != .model) return error.InvalidJournalTransition;
+                    const count = try field(body, "afterTurnCount", .integer);
+                    if (count.integer < 0 or @as(u64, @intCast(count.integer)) != self.turns.items.len) return error.JournalConflict;
+                    const turn_id = body.object.get("turnId") orelse return error.InvalidJournalRecord;
+                    if (pending_state == .model) {
+                        try self.checkTurn(body, pending_state.model);
+                    } else if (turn_id != .null) return error.JournalConflict;
+                    _ = try object(body, "summary");
+                    _ = try object(body, "retainedFrom");
+                    if (body.object.contains("completion") or body.object.contains("calls") or body.object.contains("generationId")) return error.InvalidJournalRecord;
+                    return;
+                }
                 const turn_index = switch (self.pending()) {
                     .model => |index| index,
                     else => return error.InvalidJournalTransition,
@@ -340,7 +363,7 @@ pub const State = struct {
                 self.requests.putAssumeCapacity(owned.payload.value.object.get("requestId").?.string, self.turns.items.len);
                 self.turns.appendAssumeCapacity(.{ .start = index });
             },
-            .model_step => {
+            .model_step => if (!isContext(owned.payload.value)) {
                 const turn = &self.turns.items[position.model];
                 turn.last_context = index;
                 if (isRequest(owned.payload.value) catch unreachable) {
@@ -366,7 +389,12 @@ pub const State = struct {
         if (self.pending() != .idle) return error.PendingTurnError;
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
-        try out.writer.print("{{\"v\":1,\"kind\":\"checkpoint\",\"lastIncludedSeq\":{d},\"records\":[", .{self.last_seq});
+        try out.writer.print("{{\"v\":{d},\"kind\":\"checkpoint\",\"lastIncludedSeq\":{d}", .{ if (self.native_base_json != null) @as(u8, 2) else 1, self.last_seq });
+        if (self.native_base_json) |base| {
+            try out.writer.writeAll(",\"nativeBase\":");
+            try out.writer.writeAll(base);
+        }
+        try out.writer.writeAll(",\"records\":[");
         for (self.records.items, 0..) |record, index| {
             if (index != 0) try out.writer.writeByte(',');
             try out.writer.writeAll(record.entry.bytes);
@@ -388,8 +416,15 @@ pub const State = struct {
         if (covered.integer < 0 or @as(u64, @intCast(covered.integer)) != owned.entry.seq - 1) return error.JournalConflict;
         if (self.last_seq != 0 and self.last_seq + 1 != owned.entry.seq) return error.JournalConflict;
         const records = try array(body, "records");
+        const base = body.object.get("nativeBase");
         if (records.len > @as(u64, @intCast(covered.integer))) return error.JournalConflict;
         if (self.last_seq != 0) {
+            if ((base == null) != (self.native_base_json == null)) return error.JournalConflict;
+            if (base) |value| {
+                const incoming = try std.json.Stringify.valueAlloc(alloc, value, .{});
+                defer alloc.free(incoming);
+                if (!std.mem.eql(u8, incoming, self.native_base_json.?)) return error.JournalConflict;
+            }
             if (records.len != self.records.items.len) return error.JournalConflict;
             for (records, self.records.items) |record, current| {
                 const expected = try std.json.Stringify.valueAlloc(alloc, current.payload.value, .{});
@@ -401,6 +436,13 @@ pub const State = struct {
         }
         var replacement: State = .{ .limits = self.limits };
         errdefer replacement.deinit(alloc);
+        if (base) |value| {
+            const bytes = try std.json.Stringify.valueAlloc(alloc, value, .{});
+            replacement.native_base_json = bytes;
+            if (bytes.len + checkpoint_header_reserve > replacement.limits.bytes) return error.JournalCapacityExceeded;
+            replacement.native_base = try std.json.parseFromSlice(Value, alloc, bytes, .{ .allocate = .alloc_always });
+            replacement.retained_bytes = bytes.len;
+        }
         for (records) |record| {
             const kind = std.meta.stringToEnum(Kind, try string(record, "kind")) orelse return error.InvalidJournalRecord;
             if (kind == .checkpoint) return error.InvalidJournalRecord;
@@ -427,7 +469,14 @@ pub fn isRequest(body: Value) !bool {
     if (phase != .string) return error.InvalidJournalRecord;
     if (std.mem.eql(u8, phase.string, "request")) return true;
     if (std.mem.eql(u8, phase.string, "decision")) return false;
+    if (std.mem.eql(u8, phase.string, "context")) return false;
     return error.InvalidJournalRecord;
+}
+
+pub fn isContext(body: Value) bool {
+    if (body != .object) return false;
+    const phase = body.object.get("phase") orelse return false;
+    return phase == .string and std.mem.eql(u8, phase.string, "context");
 }
 
 test "journal witness capacity reserves terminal and checkpoint bytes and sequence" {

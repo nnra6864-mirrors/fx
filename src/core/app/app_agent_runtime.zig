@@ -1,5 +1,7 @@
 const std = @import("std");
 const agent_runtime = @import("../agent/agent_runtime.zig");
+const journal_runtime = @import("../agent/runtime/journal_runtime.zig");
+const execution_journal = @import("../session/execution_journal.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const runtime_context_compaction = @import("../agent/runtime/context_compaction.zig");
 const runtime_prompt_context = @import("../agent/runtime/prompt_context.zig");
@@ -1031,7 +1033,37 @@ pub fn Runtime(comptime App: type) type {
                 else
                     null;
 
-            const deps = app_callbacks.Bindings(App).agentRuntimeDeps(app);
+            var deps = app_callbacks.Bindings(App).agentRuntimeDeps(app);
+            var native_journal: ?journal_runtime.Runtime = null;
+            var nonce: [16]u8 = undefined;
+            io_mod.getIo().random(&nonce);
+            const creation = std.fmt.bytesToHex(nonce, .lower);
+            var journal_sink = NativeJournalSink{ .app = app, .turn_id = job.turn_id, .images = job.images };
+            if (app.session_persistence.writable) |*loaded| {
+                if (loaded.journalState()) |records| {
+                    native_journal = .{
+                        .state = records,
+                        .sink = .{ .context = &journal_sink, .append_fn = NativeJournalSink.append },
+                        .alloc = app.alloc,
+                        .namespace = loaded.active_id,
+                        .creation_id = &creation,
+                        .request_id = &creation,
+                        .resuming = job.recovery_checkpoint != null,
+                    };
+                    if (native_journal.?.resuming) {
+                        const index = switch (records.pending()) {
+                            .idle => return error.NoPendingRecovery,
+                            .model, .ending => |turn| turn,
+                            .tool => |position| position.turn,
+                        };
+                        native_journal.?.turn = index;
+                        native_journal.?.request_id = try execution_journal.string(records.start(index), "requestId");
+                        if (try native_journal.?.runtimeTurnId() != job.turn_id) return error.JournalConflict;
+                    }
+                    deps.journal = &native_journal.?;
+                    deps.recovery_checkpoint = null;
+                }
+            }
             const semantic_presentation = app_callbacks.Bindings(App).semanticPresentationSink(app);
             const config = buildQueuedPromptConfig(
                 app,
@@ -1043,9 +1075,27 @@ pub fn Runtime(comptime App: type) type {
                 &tool_projection,
                 session_child_capability,
             );
-            const process_result = agent_runtime.processAgentPrompt(&app.session.agent, &deps, semantic_presentation, lifecycleContext(app), config, job);
+            var execution_job = job;
+            if (native_journal != null) execution_job.recovery_checkpoint = null;
+            const process_result = agent_runtime.processAgentPrompt(&app.session.agent, &deps, semantic_presentation, lifecycleContext(app), config, execution_job);
             try process_result;
         }
+
+        const NativeJournalSink = struct {
+            app: *App,
+            turn_id: u64,
+            images: []const types.ImageAttachment,
+
+            fn append(raw: *anyopaque, entry: execution_journal.Entry) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+                defer self.app.session_persistence.write_mutex.unlock(io_mod.getIo());
+                const loaded = if (self.app.session_persistence.writable) |*value| value else return error.SessionPersistenceUnavailable;
+                const sink = loaded.journalSink() orelse return error.JournalWriterRequired;
+                self.app.worker.preservePromptSnapshots(self.turn_id, self.images);
+                try sink.append_fn(sink.context, entry);
+            }
+        };
 
         pub fn processContextCompaction(
             app: *App,
@@ -2625,7 +2675,7 @@ test "queued fresh prompt closes only a still-paused turn before provider execut
         fn stream(raw: ?*anyopaque, _: Allocator, request: agent_stream_provider.ModelRequest) !agent_stream_provider.Result {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             _ = self.requests.fetchAdd(1, .seq_cst);
-            try std.testing.expect(!self.app.session_persistence.writable.?.conversation_writer.turn_open);
+            try std.testing.expect(!self.app.session_persistence.writable.?.writer.conversation.turn_open);
             try request.admission.admit();
             request.delivery.markPossiblySent();
             return .{ .completed = .{ .completion = .{ .content = "new answer", .finish_reason = .stop } } };
@@ -2736,7 +2786,7 @@ test "queued fresh prompt closes only a still-paused turn before provider execut
                 if (event != .prepare_fresh_prompt) continue;
                 try std.testing.expectEqual(@as(usize, 0), probe.requests.load(.seq_cst));
                 try std.testing.expect(!probe.returned.load(.acquire));
-                try std.testing.expectEqual(outcome != .finished_before_prepare, app.session_persistence.writable.?.conversation_writer.turn_open);
+                try std.testing.expectEqual(outcome != .finished_before_prepare, app.session_persistence.writable.?.writer.conversation.turn_open);
                 const current = app_session_runtime.Runtime(FakeApp).normalizeFreshPromptPreparation(&app, event.prepare_fresh_prompt);
                 app.worker.resolveFreshPrompt(queue_alloc, current, &probe, Probe.prepare);
                 observed = true;
@@ -2749,7 +2799,7 @@ test "queued fresh prompt closes only a still-paused turn before provider execut
         if (outcome == .preflight_oom) {
             try std.testing.expectEqual(error.OutOfMemory, probe.failure.?);
             try std.testing.expectEqual(@as(usize, 0), probe.requests.load(.seq_cst));
-            try std.testing.expect(!app.session_persistence.writable.?.conversation_writer.turn_open);
+            try std.testing.expect(!app.session_persistence.writable.?.writer.conversation.turn_open);
             continue;
         }
         if (probe.failure) |err| return err;
@@ -3229,7 +3279,7 @@ test "app agent runtime settles queued snapshot ownership when prompt admission 
                 .total_output_tokens = 0,
                 .preferences = .{ .model = @constCast("test-model"), .effort = .auto, .fast_mode = false },
             });
-            app.session_persistence.writable.?.conversation_writer.failure = error.SessionCommitFailed;
+            app.session_persistence.writable.?.writer.conversation.failure = error.SessionCommitFailed;
         }
 
         var job = try makeQueuedPrompt(alloc);
@@ -3245,7 +3295,7 @@ test "app agent runtime settles queued snapshot ownership when prompt admission 
         if (admission == .uncertain_checkpoint) {
             app.worker.active_turn_id = 41;
             app.worker.preservePromptSnapshots(41, job.images);
-            app.session_persistence.writable.?.conversation_writer.failure = error.SessionPersistenceUncertain;
+            app.session_persistence.writable.?.writer.conversation.failure = error.SessionPersistenceUncertain;
         }
         try std.testing.expectError(
             switch (admission) {

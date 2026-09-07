@@ -148,7 +148,19 @@ fn parse_owned(
 
     if (payload.value != .object) return error.InvalidJson;
     const version = payload.value.object.get("v") orelse return error.InvalidVersion;
-    if (version != .integer or version.integer != 1) return error.InvalidVersion;
+    if (version != .integer) return error.InvalidVersion;
+    if (version.integer == 1) {
+        if (payload.value.object.contains("nativeBase")) return error.InvalidVersion;
+    } else if (version.integer == 2 and kind == .checkpoint) {
+        const base = payload.value.object.get("nativeBase") orelse return error.InvalidVersion;
+        if (base != .object) return error.InvalidVersion;
+        const base_version = base.object.get("v") orelse return error.InvalidVersion;
+        if (base_version != .integer or base_version.integer != 1) return error.InvalidVersion;
+        const state = base.object.get("stateJson") orelse return error.InvalidVersion;
+        const id = base.object.get("id") orelse return error.InvalidVersion;
+        const context = base.object.get("contextJson") orelse return error.InvalidVersion;
+        if (state != .string or id != .string or context != .string) return error.InvalidVersion;
+    } else return error.InvalidVersion;
     const payload_kind = payload.value.object.get("kind") orelse return error.InvalidKind;
     if (payload_kind != .string or !std.mem.eql(u8, payload_kind.string, @tagName(kind))) {
         return error.InvalidKind;

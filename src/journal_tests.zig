@@ -4,4 +4,6 @@ test {
     _ = @import("core/agent/runtime/tests/journal_crash_flow.zig");
     _ = @import("acp/server.zig");
     _ = @import("acp/prompt.zig");
+    _ = @import("core/session/execution_journal_store.zig");
+    _ = @import("core/session/execution_journal_genesis.zig");
 }

@@ -8,6 +8,7 @@ const text_utils = @import("../../shared/text_utils.zig");
 const session = @import("../../session/session.zig");
 const execution_memory = @import("execution_memory.zig");
 const entry_codec = @import("../../session/execution_journal_codec.zig");
+const genesis = @import("../../session/execution_journal_genesis.zig");
 const tool_contracts = @import("tool_contracts.zig");
 
 const Allocator = std.mem.Allocator;
@@ -218,7 +219,7 @@ pub const Runtime = struct {
         if (resume_pending) return error.InvalidJournalTransition;
         if (self.state.pending() != .idle) return error.PendingTurnError;
         const namespace = if (self.state.turns.items.len == 0)
-            self.namespace
+            if (self.state.nativeBase()) |base| try journal.string(base, "id") else self.namespace
         else
             try journal.string(self.state.start(0), "namespace");
         const turn_id = try std.fmt.allocPrint(self.alloc, "{s}:turn:{d}", .{ namespace, self.state.turns.items.len + 1 });
@@ -506,32 +507,7 @@ pub const Runtime = struct {
     }
 
     fn executionThrough(self: *const Runtime, alloc: Allocator, count: usize, allow_partial: bool) !OwnedExecution {
-        const turn = self.turn orelse return error.InvalidJournalTransition;
-        var arena: std.heap.ArenaAllocator = .init(alloc);
-        errdefer arena.deinit();
-        const a = arena.allocator();
-        const steps = try a.alloc(types.ToolExecutionStep, count);
-        for (steps, 0..) |*destination, index| {
-            var decision = try self.recordedDecision(alloc, index);
-            defer decision.deinit();
-            var result_count: usize = 0;
-            while (result_count < decision.calls.len and self.state.toolResult(turn, index, result_count) != null) : (result_count += 1) {}
-            if (result_count != decision.calls.len and (!allow_partial or index + 1 != count)) return error.InvalidJournalTransition;
-            const results = try a.alloc(types.PersistedToolResult, result_count);
-            for (results, 0..) |*result, call_index| {
-                var recorded = (try self.recordedResult(alloc, index, call_index)) orelse return error.InvalidJournalTransition;
-                defer recorded.deinit();
-                const copy = try types.dupePersistedToolResults(a, &.{recorded.result});
-                result.* = copy[0];
-            }
-            destination.* = .{
-                .assistant = if (decision.completion.content) |text| try a.dupe(u8, text) else null,
-                .tool_calls = try types.dupeToolCallSlice(a, decision.calls),
-                .tool_results = results,
-                .provider_replay = if (decision.provider_replay) |replay| try types.dupeProviderReplay(a, replay) else null,
-            };
-        }
-        return .{ .arena = arena, .execution = .{ .tool_steps = steps } };
+        return readExecutionThrough(alloc, self.state, self.turn orelse return error.InvalidJournalTransition, count, allow_partial);
     }
 
     /// Ends pending work without model/tool I/O. The returned turn is allocated
@@ -550,29 +526,8 @@ pub const Runtime = struct {
         var arena: std.heap.ArenaAllocator = .init(self.alloc);
         defer arena.deinit();
         const alloc = arena.allocator();
-        const original_user = try self.user(alloc);
-        var full = try self.executionThrough(self.alloc, self.state.stepCount(turn), true);
-        defer full.deinit();
-        var active: ?types.ToolCall = null;
-        var assistant: ?[]u8 = null;
-        if (pending == .tool) {
-            const position = pending.tool;
-            const latest = full.execution.tool_steps[position.step];
-            active = latest.tool_calls[position.call];
-            // The normal interrupted projection keeps a group's assistant with
-            // its settled results. With no results, keep that text on the turn.
-            if (latest.tool_results.len == 0) assistant = latest.assistant;
-        }
-        var messages: std.ArrayList(types.ChatMessage) = .empty;
-        try session.appendExecutionMemoryChatMessages(alloc, &messages, full.execution);
-        const settled = try execution_memory.buildInterruptedExecutionMemory(alloc, messages.items, active);
-        const history: types.HistoryTurn = .{ .interrupted = .{
-            .user = original_user,
-            .assistant = assistant,
-            .tool_call = active,
-            .execution = settled,
-            .terminal_reason = .cancelled,
-        } };
+        const owned_history = (try pendingHistory(self.alloc, self.state)).?;
+        errdefer types.freeHistoryTurn(self.alloc, owned_history);
         var pending_tool = try pendingTool(self.alloc, self.state);
         defer if (pending_tool) |*owned| owned.deinit();
         var writer: std.Io.Writer.Allocating = .init(alloc);
@@ -587,8 +542,6 @@ pub const Runtime = struct {
         }
         try writer.writer.writeByte('}');
         const result = try std.json.parseFromSliceLeaky(Value, alloc, writer.written(), .{});
-        const owned_history = try types.dupeHistoryTurn(self.alloc, history);
-        errdefer types.freeHistoryTurn(self.alloc, owned_history);
         try self.finish(result, owned_history);
         return owned_history;
     }
@@ -640,6 +593,100 @@ pub const Runtime = struct {
         return calls[call_index];
     }
 };
+
+fn readExecutionThrough(alloc: Allocator, state: *const journal.State, turn: usize, count: usize, allow_partial: bool) !OwnedExecution {
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const steps = try a.alloc(types.ToolExecutionStep, count);
+    for (steps, 0..) |*destination, index| {
+        var decision = try decodeDecision(alloc, state.modelStep(turn, index));
+        defer decision.deinit();
+        var result_count: usize = 0;
+        while (result_count < decision.calls.len and state.toolResult(turn, index, result_count) != null) : (result_count += 1) {}
+        if (result_count != decision.calls.len and (!allow_partial or index + 1 != count)) return error.InvalidJournalTransition;
+        const results = try a.alloc(types.PersistedToolResult, result_count);
+        for (results, 0..) |*result, call_index| {
+            const calls = try journal.array(state.modelStep(turn, index), "calls");
+            var recorded = try decodeResult(alloc, state.toolResult(turn, index, call_index).?, calls[call_index]);
+            defer recorded.deinit();
+            const copy = try types.dupePersistedToolResults(a, &.{recorded.result});
+            result.* = copy[0];
+        }
+        destination.* = .{
+            .assistant = if (decision.completion.content) |text| try a.dupe(u8, text) else null,
+            .tool_calls = try types.dupeToolCallSlice(a, decision.calls),
+            .tool_results = results,
+            .provider_replay = if (decision.provider_replay) |replay| try types.dupeProviderReplay(a, replay) else null,
+        };
+    }
+    return .{ .arena = arena, .execution = .{ .tool_steps = steps } };
+}
+
+pub fn writeStatus(writer: *std.Io.Writer, alloc: Allocator, state: *const journal.State) !void {
+    try state.ensureAvailable();
+    const pending = state.pending();
+    try writer.print("{{\"idle\":{s},\"lastSeq\":{d}", .{ if (pending == .idle) "true" else "false", state.last_seq });
+    const turn = switch (pending) {
+        .idle => {
+            try writer.writeByte('}');
+            return;
+        },
+        .model, .ending => |index| index,
+        .tool => |position| position.turn,
+    };
+    const start = state.start(turn);
+    try writer.writeAll(",\"pendingTurn\":{\"turnId\":");
+    try std.json.Stringify.value(try journal.string(start, "turnId"), .{}, writer);
+    try writer.writeAll(",\"requestId\":");
+    try std.json.Stringify.value(try journal.string(start, "requestId"), .{}, writer);
+    try writer.print(",\"lastSeq\":{d},\"awaiting\":", .{state.last_seq});
+    if (pending == .tool) {
+        var selected = (try pendingTool(alloc, state)).?;
+        defer selected.deinit();
+        try std.json.Stringify.value(.{ .tool = selected.tool }, .{}, writer);
+    } else try writer.writeAll("\"model\"");
+    try writer.writeAll("}}");
+}
+
+/// Builds a read-only unfinished-turn view. No entry is appended and no tool
+/// or provider is called. The caller owns the returned history representation.
+pub fn pendingHistory(outer_alloc: Allocator, state: *const journal.State) !?types.HistoryTurn {
+    try state.ensureAvailable();
+    const pending = state.pending();
+    const turn = switch (pending) {
+        .idle => return null,
+        .model, .ending => |index| index,
+        .tool => |position| position.turn,
+    };
+    var arena: std.heap.ArenaAllocator = .init(outer_alloc);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const original_user = try decodeUser(alloc, state.start(turn));
+    var full = try readExecutionThrough(outer_alloc, state, turn, state.stepCount(turn), true);
+    defer full.deinit();
+    var active: ?types.ToolCall = null;
+    var assistant: ?[]u8 = null;
+    if (pending == .tool) {
+        const position = pending.tool;
+        const latest = full.execution.tool_steps[position.step];
+        active = latest.tool_calls[position.call];
+        // The normal interrupted projection keeps a group's assistant with
+        // its settled results. With no results, keep that text on the turn.
+        if (latest.tool_results.len == 0) assistant = latest.assistant;
+    }
+    var messages: std.ArrayList(types.ChatMessage) = .empty;
+    try session.appendExecutionMemoryChatMessages(alloc, &messages, full.execution);
+    const settled = try execution_memory.buildInterruptedExecutionMemory(alloc, messages.items, active);
+    const history: types.HistoryTurn = .{ .interrupted = .{
+        .user = original_user,
+        .assistant = assistant,
+        .tool_call = active,
+        .execution = settled,
+        .terminal_reason = .cancelled,
+    } };
+    return try types.dupeHistoryTurn(outer_alloc, history);
+}
 
 fn decodeUser(alloc: Allocator, start: Value) !types.UserTurn {
     const bytes = try journal.string(start, "inputJson");
@@ -713,13 +760,94 @@ fn decodeResult(alloc: Allocator, body: Value, call: Value) !OwnedResult {
 /// Purely rebuilds the core's canonical terminal history. Caller owns the slice
 /// and every turn, freed with types.freeHistoryTurnSlice.
 pub fn restoreHistory(alloc: Allocator, state: *const journal.State) ![]types.HistoryTurn {
+    return restoreHistoryView(alloc, state, .model);
+}
+
+/// Restores the full native transcript, including history excluded from the
+/// active model window. It shares the same acknowledged terminal records.
+pub fn restoreArchiveHistory(alloc: Allocator, state: *const journal.State) ![]types.HistoryTurn {
+    return restoreHistoryView(alloc, state, .archive);
+}
+
+/// A context replacement is an incremental model-state record. It does not
+/// create a conversation turn or discard the acknowledged transcript.
+pub fn recordCompaction(
+    alloc: Allocator,
+    state: *journal.State,
+    sink: journal.Sink,
+    summary: types.CompactedSummaryHistoryTurn,
+    retained_from: types.ContextHistoryCut,
+) !void {
+    try state.ensureAvailable();
+    const turn_id = switch (state.pending()) {
+        .idle => null,
+        .model => |index| try journal.string(state.start(index), "turnId"),
+        else => return error.InvalidJournalTransition,
+    };
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    defer writer.deinit();
+    try writer.writer.writeAll("{\"v\":1,\"kind\":\"model_step\",\"phase\":\"context\",\"turnId\":");
+    try json(&writer.writer, turn_id);
+    try writer.writer.print(",\"afterTurnCount\":{d},\"summary\":", .{state.turns.items.len});
+    try session_codec.writeHistoryTurn(&writer.writer, .{ .compacted_summary = summary });
+    try writer.writer.writeAll(",\"retainedFrom\":");
+    try json(&writer.writer, retained_from);
+    try writer.writer.writeByte('}');
+    try state.preflight(.{ .append_bytes = writer.written().len, .append_records = 1, .terminal_bytes = max_model_record_bytes });
+    try state.append(alloc, sink, .model_step, writer.written());
+}
+
+fn contextCut(body: Value) !types.ContextHistoryCut {
+    const value = try journal.object(body, "retainedFrom");
+    if (value.object.count() != 3) return error.InvalidJournalRecord;
+    var cut: types.ContextHistoryCut = .{};
+    inline for (.{ "turns", "tool_steps", "steering" }) |name| {
+        const number = (try journal.field(value, name, .integer)).integer;
+        @field(cut, name) = std.math.cast(usize, number) orelse return error.InvalidJournalRecord;
+    }
+    return cut;
+}
+
+fn restoreHistoryView(alloc: Allocator, state: *const journal.State, view: enum { model, archive }) ![]types.HistoryTurn {
     var history: std.ArrayList(types.HistoryTurn) = .empty;
     errdefer {
         for (history.items) |turn| types.freeHistoryTurn(alloc, turn);
         history.deinit(alloc);
     }
-    for (state.turns.items, 0..) |_, index| {
-        const outcome = state.outcome(index) orelse continue;
+    if (state.nativeBase()) |base| {
+        var decoded = switch (view) {
+            .model => try genesis.decodeContext(alloc, base),
+            .archive => try genesis.decodeBase(alloc, base),
+        };
+        defer decoded.deinit(alloc);
+        try history.appendSlice(alloc, decoded.history);
+        alloc.free(decoded.history);
+        decoded.history = &.{};
+    }
+    var turn_index: usize = 0;
+    for (state.records.items) |record| {
+        const body = record.payload.value;
+        if (record.entry.kind == .model_step and journal.isContext(body)) {
+            const summary = try session_codec.parseHistoryTurn(alloc, try journal.object(body, "summary"));
+            var summary_owned = true;
+            defer if (summary_owned) types.freeHistoryTurn(alloc, summary);
+            if (summary != .compacted_summary) return error.InvalidJournalRecord;
+            const cut = try contextCut(body);
+            if (view == .model) {
+                const next = try session.prepareCompactedHistory(alloc, history.items, summary.compacted_summary, cut);
+                for (history.items) |turn| types.freeHistoryTurn(alloc, turn);
+                history.deinit(alloc);
+                history = .fromOwnedSlice(next);
+            } else {
+                try history.append(alloc, summary);
+                summary_owned = false;
+            }
+            continue;
+        }
+        if (record.entry.kind != .turn_end) continue;
+        const index = turn_index;
+        turn_index += 1;
+        const outcome = body;
         const value = outcome.object.get("history") orelse return error.InvalidJournalRecord;
         if (value == .null) continue;
         var turn = try session_codec.parseHistoryTurn(alloc, value);
@@ -820,7 +948,12 @@ pub fn validateIncoming(alloc: Allocator, state: *const journal.State, body: Val
             if (!std.mem.eql(u8, &hash, try journal.string(body, "inputHash"))) return error.JournalConflict;
         },
         .model_step => {
-            if (try journal.isRequest(body)) {
+            if (journal.isContext(body)) {
+                const summary = try session_codec.parseHistoryTurn(alloc, try journal.object(body, "summary"));
+                defer types.freeHistoryTurn(alloc, summary);
+                if (summary != .compacted_summary) return error.InvalidJournalRecord;
+                _ = try contextCut(body);
+            } else if (try journal.isRequest(body)) {
                 try validateExecutionContext(alloc, try journal.object(body, "executionContext"), true, &.{});
             } else {
                 var decision = try decodeDecision(alloc, body);
@@ -842,6 +975,10 @@ pub fn validateIncoming(alloc: Allocator, state: *const journal.State, body: Val
             // prefix before replacing the retained checkpoint.
             _ = try journal.array(body, "records");
             _ = try journal.field(body, "lastIncludedSeq", .integer);
+            if (body.object.get("nativeBase")) |base| {
+                var decoded = try genesis.decodeBase(alloc, base);
+                decoded.deinit(alloc);
+            }
         },
     }
 }
@@ -999,6 +1136,59 @@ const TestSink = struct {
 };
 
 const test_input: types.UserTurn = .{ .text = @constCast("Make a durable change") };
+
+test "journal witness context compaction preserves transcript and request mappings through checkpoint" {
+    const alloc = std.testing.allocator;
+    var state: journal.State = .{};
+    defer state.deinit(alloc);
+    var sink: TestSink = .{};
+    const result = try std.json.parseFromSlice(Value, alloc, "{\"ok\":true,\"stopReason\":\"stop\"}", .{});
+    defer result.deinit();
+    for ([_][]const u8{ "first", "second" }, 0..) |id, index| {
+        var runtime = sink.runtime(&state, id);
+        const user: types.UserTurn = .{ .text = @constCast(id) };
+        _ = try runtime.begin(user, "model", index + 1, false);
+        var key = try runtime.generation();
+        defer key.deinit(alloc);
+        _ = try runtime.recordDecision(.{ .content = id }, &.{}, &.{}, key, true, null, null);
+        try runtime.finish(result.value, .{ .assistant = .{ .user = user, .assistant = @constCast(id) } });
+    }
+    const callback: journal.Sink = .{ .context = &sink, .append_fn = TestSink.append };
+    try recordCompaction(alloc, &state, callback, .{
+        .summary = @constCast("older context summary"),
+        .removed_turn_count = 1,
+        .compaction_count = 1,
+    }, .{ .turns = 1 });
+    const model_history = try restoreHistory(alloc, &state);
+    defer types.freeHistoryTurnSlice(alloc, model_history);
+    try std.testing.expectEqual(@as(usize, 2), model_history.len);
+    try std.testing.expectEqualStrings("older context summary", model_history[0].compacted_summary.summary);
+    try std.testing.expectEqualStrings("second", model_history[1].assistant.assistant);
+    const archive = try restoreArchiveHistory(alloc, &state);
+    defer types.freeHistoryTurnSlice(alloc, archive);
+    try std.testing.expectEqual(@as(usize, 3), archive.len);
+    try std.testing.expectEqualStrings("first", archive[0].assistant.assistant);
+    try std.testing.expectEqualStrings("second", archive[1].assistant.assistant);
+    var checkpoint = try state.checkpoint(alloc, callback);
+    defer checkpoint.deinit(alloc);
+    var restored: journal.State = .{};
+    defer restored.deinit(alloc);
+    var validator: TestValidator = .{ .alloc = alloc };
+    try restoreTestEntry(&restored, &validator, checkpoint.entry);
+    try std.testing.expectEqual(@as(usize, 2), restored.requests.count());
+    const replay = try restoreHistory(alloc, &restored);
+    defer types.freeHistoryTurnSlice(alloc, replay);
+    try std.testing.expectEqualStrings("older context summary", replay[0].compacted_summary.summary);
+    try std.testing.expectEqualStrings("second", replay[1].assistant.assistant);
+    sink.fail = true;
+    try std.testing.expectError(error.PersistenceUncertain, recordCompaction(alloc, &state, callback, .{
+        .summary = @constCast("uncertain replacement"),
+        .removed_turn_count = 1,
+        .compaction_count = 2,
+    }, .{ .turns = 1 }));
+    try std.testing.expect(state.blocked);
+    try std.testing.expectEqual(checkpoint.entry.seq, state.last_seq);
+}
 
 const TestValidator = struct {
     alloc: Allocator,
