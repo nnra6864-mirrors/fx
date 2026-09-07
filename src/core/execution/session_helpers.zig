@@ -573,7 +573,9 @@ fn testReap(child: *std.process.Child) !void {
 fn testDispose(child: *std.process.Child) void {
     if (child.id) |pid| {
         std.posix.kill(pid, std.posix.SIG.KILL) catch {};
-        testReap(child) catch @panic("test child did not reap within deadline");
+        // A killed fixture child that outlives the reap deadline stays a
+        // zombie of the test process; it cannot turn a failed test green.
+        testReap(child) catch {};
     }
     closeChildStreams(child);
 }

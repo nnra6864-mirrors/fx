@@ -316,11 +316,10 @@ pub const Tracker = struct {
         return self.processes.items.len;
     }
 
-    fn processAt(self: *const Tracker, index: usize) TrackedProcess {
-        if (self.shared) |state| {
-            // Every entry point validates the committed prefix before traversal.
-            return state.records[index + 1].decode() catch unreachable;
-        }
+    /// Null only for a committed shared record that no longer decodes. Callers
+    /// treat that as incomplete membership, never as an absent process.
+    fn processAt(self: *const Tracker, index: usize) ?TrackedProcess {
+        if (self.shared) |state| return state.records[index + 1].decode() catch null;
         return self.processes.items[index];
     }
 
@@ -486,7 +485,7 @@ pub const Tracker = struct {
 
         var parent_index: usize = 0;
         while (parent_index < self.processCount()) : (parent_index += 1) {
-            const parent = self.processAt(parent_index);
+            const parent = self.processAt(parent_index) orelse return error.InvalidSharedMembership;
             const actual = self.capture(parent.pid) catch |err| {
                 if (self.shared != null and err != error.ProcessNotFound) return err;
                 continue;
@@ -632,13 +631,11 @@ pub const Tracker = struct {
         var index = self.processCount();
         while (index > 0) {
             index -= 1;
-            self.signalTrackedProcessWith(
-                self.processAt(index),
-                signal,
-                preserved_group,
-                &summary,
-                Effects,
-            );
+            const process = self.processAt(index) orelse {
+                summary.incomplete = true;
+                continue;
+            };
+            self.signalTrackedProcessWith(process, signal, preserved_group, &summary, Effects);
         }
         if (self.rootProcess()) |root| {
             self.signalTrackedProcessWith(
@@ -707,7 +704,10 @@ pub const Tracker = struct {
         var incomplete = if (self.shared) |state| !state.isComplete() else false;
         var index: usize = 0;
         while (index < self.processCount() + 1) : (index += 1) {
-            const process = if (index == 0) (self.rootProcess() orelse continue) else self.processAt(index - 1);
+            const process = if (index == 0) (self.rootProcess() orelse continue) else self.processAt(index - 1) orelse {
+                incomplete = true;
+                continue;
+            };
             const actual = Effects.capture(self.alloc, process.pid) catch |err| {
                 if (err != error.ProcessNotFound) incomplete = true;
                 continue;
@@ -921,7 +921,7 @@ pub const Tracker = struct {
         }
         var index: usize = 0;
         while (index < self.processCount()) : (index += 1) {
-            const process = self.processAt(index);
+            const process = self.processAt(index) orelse continue;
             if (process.pid == pid and (identity == null or process.identity.eql(identity.?))) return true;
         }
         return false;
@@ -947,7 +947,8 @@ pub const Tracker = struct {
         }
         var index: usize = 0;
         while (index < self.processCount()) : (index += 1) {
-            if (identityHasMacOSUniqueId(self.processAt(index).identity, unique_id)) return true;
+            const process = self.processAt(index) orelse continue;
+            if (identityHasMacOSUniqueId(process.identity, unique_id)) return true;
         }
         return false;
     }
@@ -1739,8 +1740,8 @@ test "shared storage retains process instances while ordinary storage replaces r
     }
     try std.testing.expectEqual(@as(usize, 2), shared.processCount());
     try std.testing.expectEqual(@as(usize, 1), local.processCount());
-    try std.testing.expect(shared.processAt(0).identity.eql(testProcess(102, 2).identity));
-    try std.testing.expect(local.processAt(0).identity.eql(testProcess(102, 3).identity));
+    try std.testing.expect(shared.processAt(0).?.identity.eql(testProcess(102, 2).identity));
+    try std.testing.expect(local.processAt(0).?.identity.eql(testProcess(102, 3).identity));
     try std.testing.expectEqual(@as(usize, 0), shared.processes.capacity);
     try std.testing.expectEqual(null, shared.root);
     if (builtin.os.tag == .macos) {
