@@ -154,8 +154,9 @@ const AcpContext = struct {
     /// session/set_mode changes never mutate a running turn.
     captured_mode: ?[]const u8 = null,
     captured_permission_mode: ?PermissionMode = null,
-    /// Set for subagent children: owned copies of the host credential so the
-    /// tool context never reads live session fields from the child thread.
+    /// Set for subagent children: owned copies of the host credential. The
+    /// child tool context takes its credential fields from here instead of the
+    /// live session, and leaves the parent-owned web search configuration alone.
     captured_host: ?*const ChildHostSnapshot = null,
     current_prompt_input: ?*ParsedPromptInput = null,
 
@@ -321,7 +322,10 @@ const AcpContext = struct {
         const credential_source = if (self.captured_host) |captured| captured.credential_source else session.credential_source;
         const gateway_team: ?[]const u8 = if (self.captured_host) |captured| captured.gateway_team else self.state.gateway_team;
         const account_id: ?[]const u8 = if (self.captured_host) |captured| captured.account_id else session.account_id;
-        if (provider_capabilities.fx_search) {
+        // The parent configures the shared web search runtime on its own
+        // thread from the live session; children search with that
+        // configuration rather than racing it with a stale copy.
+        if (provider_capabilities.fx_search and self.captured_host == null) {
             self.state.web_search_runtime.configure(self.alloc, .{
                 .api_key = api_key,
                 .credential_source = credential_source,
@@ -4115,9 +4119,12 @@ test "ACP subagent child owns its parent snapshot across later refreshes" {
         .session_id = active.session_id,
         .captured_host = &snapshot,
     };
+    try std.testing.expect(state.web_search_runtime.owned == null);
     const child_tool_context = child_ctx.toolContext();
     try std.testing.expect(child_tool_context.api_key.ptr == snapshot.api_key.ptr);
     try std.testing.expectEqual(snapshot.credential_source, child_tool_context.credential_source);
+    // The child must not reconfigure the parent-owned web search runtime.
+    try std.testing.expect(state.web_search_runtime.owned == null);
 
     // A later prompt replaces the parent snapshot while the child still runs.
     try refreshProjectContext(&state, alloc, &.{}, &.{}, null);
