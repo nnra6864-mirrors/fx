@@ -116,6 +116,8 @@ pub const StartupState = struct {
     workspace_root: []u8 = &.{},
     workspace_access: workspace_access.WorkspaceAccess = .{},
     credential: ?credentials.Credential = null,
+    credential_load_failure: ?credentials.LoadFailure = null,
+    auth_mode: credentials.AuthMode = .local,
     credential_source_preference: ?credentials.Source = null,
     credential_onboarding_skipped: bool = false,
     stored_key_status: credentials.StoredKeyReadStatus = .not_attempted,
@@ -185,6 +187,7 @@ pub const StartupState = struct {
     }
 
     pub fn modelCatalogAccess(self: *const StartupState) credentials.CatalogAccess {
+        if (self.auth_mode == .host_managed) return .host_managed;
         const access = credentials.catalogAccessAt(self.credential, io_mod.milliTimestamp());
         return if (self.credential_source_preference == null)
             access
@@ -256,6 +259,7 @@ pub const BootstrapConfig = struct {
     default_model: []const u8,
     default_agent_step_limit: usize,
     secret_store: host.SecretStore,
+    auth_mode: credentials.AuthMode = .local,
     resize_handler: ResizeHandler,
     fx_version: []const u8 = "",
 };
@@ -267,13 +271,31 @@ pub fn loadStartupState(
     default_model: []const u8,
     default_agent_step_limit: usize,
 ) !StartupState {
+    return loadStartupStateWithAuthMode(
+        alloc,
+        transport,
+        secret_store,
+        default_model,
+        default_agent_step_limit,
+        .local,
+    );
+}
+
+pub fn loadStartupStateWithAuthMode(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    secret_store: host.SecretStore,
+    default_model: []const u8,
+    default_agent_step_limit: usize,
+    auth_mode: credentials.AuthMode,
+) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, transport, secret_store, workspace_root, default_model, default_agent_step_limit, null, .refresh_if_needed);
+    return loadStartupStateFromOwnedWorkspace(alloc, transport, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .refresh_if_needed);
 }
 
 pub fn loadStartupStateWithoutCredentials(alloc: Allocator, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, workspace_root, default_model, default_agent_step_limit, null, null);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, workspace_root, default_model, default_agent_step_limit, .local, null, null);
 }
 
 pub fn loadEmbeddedStartupState(
@@ -291,6 +313,7 @@ pub fn loadEmbeddedStartupState(
         owned_workspace_root,
         default_model,
         default_agent_step_limit,
+        .local,
         home_dir,
         null,
     );
@@ -326,8 +349,24 @@ pub fn loadCatalogStartupState(
     default_model: []const u8,
     default_agent_step_limit: usize,
 ) !StartupState {
+    return loadCatalogStartupStateWithAuthMode(
+        alloc,
+        secret_store,
+        default_model,
+        default_agent_step_limit,
+        .local,
+    );
+}
+
+pub fn loadCatalogStartupStateWithAuthMode(
+    alloc: Allocator,
+    secret_store: host.SecretStore,
+    default_model: []const u8,
+    default_agent_step_limit: usize,
+    auth_mode: credentials.AuthMode,
+) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, null, .stored);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .stored);
 }
 
 pub fn loadStartupStatus(
@@ -335,6 +374,22 @@ pub fn loadStartupStatus(
     secret_store: host.SecretStore,
     default_model: []const u8,
     default_agent_step_limit: usize,
+) !StartupStatus {
+    return loadStartupStatusWithAuthMode(
+        alloc,
+        secret_store,
+        default_model,
+        default_agent_step_limit,
+        .local,
+    );
+}
+
+pub fn loadStartupStatusWithAuthMode(
+    alloc: Allocator,
+    secret_store: host.SecretStore,
+    default_model: []const u8,
+    default_agent_step_limit: usize,
+    auth_mode: credentials.AuthMode,
 ) !StartupStatus {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
     errdefer alloc.free(workspace_root);
@@ -348,12 +403,20 @@ pub fn loadStartupStatus(
     const selected_model = try loadStartupStatusModel(alloc, configured_selection.model, null);
     errdefer if (selected_model.owned) |model| alloc.free(model);
 
-    var auth_status = try auth_runtime.loadStatusSnapshotForProvider(
-        alloc,
-        secret_store,
-        configured_selection.provider,
-        settings.credential_source,
-    );
+    var auth_status = if (auth_mode == .host_managed)
+        auth_runtime.StatusSnapshot{
+            .active_source = .host_managed,
+            .gateway_connected = true,
+            .chatgpt_connected = true,
+            .grok_connected = true,
+        }
+    else
+        try auth_runtime.loadStatusSnapshotForProvider(
+            alloc,
+            secret_store,
+            configured_selection.provider,
+            settings.credential_source,
+        );
     errdefer auth_status.deinit(alloc);
 
     const result = StartupStatus{
@@ -388,7 +451,7 @@ pub fn applyWorkspaceLaunch(
 
 fn loadStartupStateForWorkspace(alloc: Allocator, workspace_root: []const u8, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
     const owned_workspace_root = try alloc.dupe(u8, workspace_root);
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, default_agent_step_limit, null, null);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, default_agent_step_limit, .local, null, null);
 }
 
 const CredentialLoadMode = credentials.LoadMode;
@@ -400,10 +463,14 @@ fn loadStartupStateFromOwnedWorkspace(
     owned_workspace_root: []u8,
     default_model: []const u8,
     default_agent_step_limit: usize,
+    auth_mode: credentials.AuthMode,
     profile_home: ?[]const u8,
     credential_mode: ?CredentialLoadMode,
 ) !StartupState {
-    var state = StartupState{ .agent_step_limit = default_agent_step_limit };
+    var state = StartupState{
+        .agent_step_limit = default_agent_step_limit,
+        .auth_mode = auth_mode,
+    };
     errdefer state.deinit(alloc);
 
     state.workspace_root = owned_workspace_root;
@@ -434,18 +501,21 @@ fn loadStartupStateFromOwnedWorkspace(
     state.prompt_history_enabled = settings.prompt_history_enabled orelse true;
     state.prompt_history_store_allowed = detailed.prompt_history_store_allowed;
     state.credential_source_preference = settings.credential_source;
-    if (credential_mode) |mode| {
-        const resolution = try credentials.resolveForProvider(
-            alloc,
-            transport,
-            secret_store,
-            mode,
-            state.provider,
-            settings.credential_source,
-        );
-        state.credential = resolution.credential;
-        state.stored_key_status = resolution.stored_key_status;
-        state.fx_login_status = resolution.fx_login_status;
+    if (auth_mode == .local) {
+        if (credential_mode) |mode| {
+            const resolution = try credentials.resolveForProvider(
+                alloc,
+                transport,
+                secret_store,
+                mode,
+                state.provider,
+                settings.credential_source,
+            );
+            state.credential = resolution.credential;
+            state.credential_load_failure = resolution.failure;
+            state.stored_key_status = resolution.stored_key_status;
+            state.fx_login_status = resolution.fx_login_status;
+        }
     }
     state.permission_mode = loadPermissionMode(settings.permission_mode);
     state.yolo_acknowledged = settings.yolo_acknowledged orelse false;
@@ -520,15 +590,16 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
     cfg.shell.layout = minimalLayout();
     try cfg.shell.initBacking(cfg.alloc);
 
-    var state = try loadCatalogStartupState(
+    var state = try loadCatalogStartupStateWithAuthMode(
         cfg.alloc,
         cfg.secret_store,
         cfg.default_model,
         cfg.default_agent_step_limit,
+        cfg.auth_mode,
     );
     errdefer state.deinit(cfg.alloc);
 
-    state.credential_onboarding_skipped = credentialOnboardingDisabled();
+    state.credential_onboarding_skipped = cfg.auth_mode == .host_managed or credentialOnboardingDisabled();
 
     errdefer shutdownInteractiveShell(
         cfg.terminal,
@@ -900,21 +971,12 @@ pub fn closeFullTranscript(
         "close_full_transcript restore={s}",
         .{@tagName(primary_restore)},
     );
-    const primary_recovery = if (primary_restore == .changed_resized)
-        try shell.prepareRestoredPrimaryTranscriptRecovery(alloc)
-    else
-        null;
-    defer if (primary_recovery) |bytes| alloc.free(bytes);
     if (terminal.fullTranscriptScreenActive()) {
         try leaveFullTranscriptScreen(terminal, shell, metrics);
     }
     try setFullTranscriptProjection(alloc, shell, .inline_mode);
     switch (primary_restore) {
         .changed => {},
-        .changed_resized => if (primary_recovery) |bytes| {
-            try writeLifecycleTerminalBytes(shell, metrics, bytes);
-            shell.repaintRestoredPrimaryTranscriptAfterResize();
-        },
         .exact => shell.retainRestoredPrimaryTranscript(),
         .resized => shell.repaintRestoredPrimaryTranscriptAfterResize(),
     }
@@ -1593,9 +1655,10 @@ test "full transcript transitions own terminal and projection together" {
     try closeFullTranscript(alloc, &terminal, &shell, &metrics);
     try std.testing.expect(shell.transcript_band_dirty);
     try std.testing.expect(shell.render_requests.hasReason(.transcript));
-    try std.testing.expect(!shell.terminal_reset_pending);
+    try std.testing.expect(shell.terminal_reset_pending);
     try std.testing.expectEqual(@as(?i32, null), shell.resize_history_row_delta);
     shell.layout.cols -= 1;
+    shell.terminal_reset_pending = false;
     shell.transcript_band_dirty = false;
     shell.render_requests.clearReason(.transcript);
 
@@ -1909,6 +1972,28 @@ test "loadStartupState applies core env overrides" {
     try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, state.credential.?.source);
     try std.testing.expectEqual(PermissionMode.auto, state.permission_mode);
     try std.testing.expectEqual(@as(usize, 37), state.agent_step_limit);
+}
+
+test "host-managed startup skips every local credential source" {
+    var env = try TestEnv.install(std.testing.allocator, &.{
+        .{ .key = "AI_GATEWAY_API_KEY", .value = "must-not-load" },
+    });
+    defer env.deinit();
+
+    var state = try loadStartupStateWithAuthMode(
+        std.testing.allocator,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        "default-model",
+        12,
+        .host_managed,
+    );
+    defer state.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(credentials.AuthMode.host_managed, state.auth_mode);
+    try std.testing.expect(state.credential == null);
+    try std.testing.expect(state.apiKey() == null);
+    try std.testing.expectEqual(credentials.CatalogAccess.host_managed, state.modelCatalogAccess());
 }
 
 test "loadStartupState defaults fast mode on only for the compiled Gateway default and requires bound explicit preferences" {

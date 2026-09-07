@@ -165,8 +165,8 @@ pub const ProvisionalToolStatuses = struct {
         const call_id = self.visibleId(call) orelse return;
         const summary = try std.fmt.allocPrint(
             arena,
-            "{s} failed: invalid JSON arguments",
-            .{fallbackToolDisplay(hooks.tool_registry, call.name)},
+            "{s} failed: {s}",
+            .{ fallbackToolDisplay(hooks.tool_registry, call.name), if (call.argument_integrity == .non_object_json) "non-object arguments" else "invalid JSON arguments" },
         );
         try hooks.push_tool_lifecycle(hooks.ctx, .{
             .terminal = .{
@@ -739,13 +739,13 @@ pub noinline fn startToolVisibleLifecycle(
     const activity_kind = activityKindForCall(arena, hooks.tool_registry, call);
     if (activity_kind == .ask) return false;
     const redacted_arguments = try text_utils.maskSecrets(arena, call.arguments_json);
-    const activity_line = try hooks.describe_tool_action(
+    const activity_line = if (call.argument_integrity == .valid) try hooks.describe_tool_action(
         hooks.ctx,
         arena,
         call,
         display_target,
         advertised_dynamic_tool_names,
-    );
+    ) else null;
     try hooks.push_tool_lifecycle(hooks.ctx, .{ .authoritative_started = .{
         .id = .{ .turn_id = turn_id, .call_id = call.id },
         .presentation_group_id = presentation_group_id,
@@ -755,10 +755,12 @@ pub noinline fn startToolVisibleLifecycle(
         .arguments_json = redacted_arguments,
         .place_after_current_transcript = false,
     } });
-    try hooks.push_tool_lifecycle(hooks.ctx, .{ .progress = .{
-        .id = .{ .turn_id = turn_id, .call_id = call.id },
-        .text = activity_line,
-    } });
+    if (activity_line) |line| {
+        try hooks.push_tool_lifecycle(hooks.ctx, .{ .progress = .{
+            .id = .{ .turn_id = turn_id, .call_id = call.id },
+            .text = line,
+        } });
+    }
     return true;
 }
 
@@ -1012,7 +1014,7 @@ pub fn finishExecutedToolStatus(
                 arena,
                 call,
                 display_target,
-                "Failed",
+                try tooling_presentation.subagentFailureLabel(arena, call, safe_result),
                 advertised_dynamic_tool_names,
             );
             if (std.mem.eql(u8, call.name, "shell")) {
@@ -1204,6 +1206,11 @@ fn failureStatusDetail(
     safe_result: []const u8,
     advertised_dynamic_tool_names: []const []const u8,
 ) !?[]const u8 {
+    switch (call.argument_integrity) {
+        .malformed_json => return "invalid JSON arguments",
+        .non_object_json => return "non-object arguments",
+        .valid => {},
+    }
     if (result.status_detail) |detail| {
         if (!std.mem.eql(u8, detail, "preflight failed")) return detail;
 
@@ -1320,11 +1327,11 @@ fn commandArtifactHandle(
 pub fn malformedToolArgumentsResult(arena: Allocator, call: ToolCall) !ToolExecutionResult {
     return .{
         .status = .failure,
-        .model_output = try tool_result_errors.malformedToolArgumentsJson(
-            arena,
-            call.name,
-        ),
-        .status_detail = "invalid JSON arguments",
+        .model_output = if (call.argument_integrity == .non_object_json)
+            try tool_result_errors.nonObjectToolArgumentsJson(arena, call.name)
+        else
+            try tool_result_errors.malformedToolArgumentsJson(arena, call.name),
+        .status_detail = if (call.argument_integrity == .non_object_json) "non-object arguments" else "invalid JSON arguments",
     };
 }
 
@@ -1468,7 +1475,7 @@ const ProvisionalStatusTestCapture = struct {
     }
 
     fn noopAppendRuntimeContext(_: *anyopaque, _: Allocator, _: *std.ArrayList(types.ChatMessage)) !void {}
-    fn noopRequestPermission(_: *anyopaque, _: Allocator, _: ToolCall, _: permission_auto_classifier.ReviewTurnContext, _: types.PermissionMode, _: []const types.PermissionGrant, _: ?runtime_tool_contracts.LiveToolAuthority, _: ?runtime_tool_contracts.LivePermissionRevalidation, _: []const []const u8) !command_admission.PermissionOutcome {
+    fn noopRequestPermission(_: *anyopaque, _: Allocator, _: ToolCall, _: permission_auto_classifier.ReviewTurnContext, _: types.PermissionMode, _: []const types.PermissionGrant, _: ?runtime_tool_contracts.LiveToolAuthority, _: ?runtime_tool_contracts.LivePermissionRevalidation, _: []const []const u8, _: ?[]const u8) !command_admission.PermissionOutcome {
         return .{ .decision = .once, .execution_authority = .ordinary };
     }
     fn describeToolAction(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, _: []const []const u8) ![]const u8 {
@@ -2016,6 +2023,91 @@ test "admitted provisional settlement consumes visible identity exactly once" {
     }
 }
 
+test "malformed final settlement retains diagnostics and consumes identity once" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |streamed| {
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+        defer capture.deinit();
+        const hooks = capture.hooks();
+        var statuses = ProvisionalToolStatuses{};
+        defer statuses.deinit(alloc);
+        if (streamed) _ = try statuses.record(alloc, "streamed_id");
+        const call: ToolCall = .{
+            .id = "final_id",
+            .name = "shell",
+            .arguments_json = "{}",
+            .argument_integrity = .malformed_json,
+            .provisional_id = if (streamed) "streamed_id" else null,
+        };
+        const result: ToolExecutionResult = .{ .status = .failure, .model_output = "safe diagnostic" };
+        const memory: types.ToolResultMemory = .{ .output_bytes = 15, .stored_output_bytes = 15 };
+        capture.fail_terminal = true;
+        try std.testing.expectError(error.TestTerminalPublicationFailure, statuses.finishExecutedCall(
+            &hooks,
+            alloc,
+            arena,
+            1,
+            call,
+            false,
+            null,
+            result,
+            result.model_output,
+            memory,
+            null,
+            &.{},
+        ));
+        try std.testing.expect(!statuses.hasTerminal(call.id));
+        if (streamed) try std.testing.expect(statuses.has("streamed_id"));
+        capture.fail_terminal = false;
+        try std.testing.expect(try statuses.finishExecutedCall(
+            &hooks,
+            alloc,
+            arena,
+            1,
+            call,
+            false,
+            null,
+            result,
+            result.model_output,
+            memory,
+            null,
+            &.{},
+        ));
+        try std.testing.expect(!try statuses.finishExecutedCall(
+            &hooks,
+            alloc,
+            arena,
+            1,
+            call,
+            false,
+            null,
+            result,
+            result.model_output,
+            memory,
+            null,
+            &.{},
+        ));
+        try std.testing.expectEqual(@as(usize, 0), statuses.tracked.items.len);
+        var terminal_count: usize = 0;
+        for (capture.events.items) |event| switch (event) {
+            .terminal => |terminal| {
+                terminal_count += 1;
+                try std.testing.expectEqualStrings(if (streamed) "streamed_id" else "final_id", terminal.id.call_id);
+                try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
+                try std.testing.expectEqualStrings("Failed shell: invalid JSON arguments", terminal.outcome.summary);
+                try std.testing.expectEqualStrings(result.model_output, terminal.result.?);
+                try std.testing.expectEqual(@as(usize, 15), terminal.result_memory.?.output_bytes);
+            },
+            .progress => return error.TestUnexpectedResult,
+            else => {},
+        };
+        try std.testing.expectEqual(@as(usize, 1), terminal_count);
+    }
+}
+
 test "failed admitted settlement keeps identity when terminal publication fails" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -2045,6 +2137,22 @@ fn checkProvisionalLifecycleAllocationFailures(alloc: Allocator) !void {
 
     try statuses.publish(&hooks, alloc, 1, "read_1", "read_file", activityKind(hooks.tool_registry, "read_file"), eligibleActionLabel("read_file"), null);
     try std.testing.expect(statuses.has("read_1"));
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    try std.testing.expect(try statuses.finishExecutedCall(
+        &hooks,
+        alloc,
+        arena_state.allocator(),
+        1,
+        .{ .id = "read_1", .name = "read_file", .arguments_json = "{}", .argument_integrity = .malformed_json },
+        false,
+        null,
+        .{ .status = .failure, .model_output = "diagnostic" },
+        "diagnostic",
+        .{},
+        null,
+        &.{},
+    ));
 }
 
 test "provisional lifecycle cleans up every copied-id allocation failure" {

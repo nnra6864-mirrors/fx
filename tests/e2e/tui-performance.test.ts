@@ -826,19 +826,17 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       }
 
       for (let cycle = 0; cycle < WARMUPS + SAMPLES; cycle += 1) {
-        session.sendKeysImmediate(["C-u"]);
+        await session.sendKeys("C-u");
         await session.waitForComposer(TIMEOUT);
-        await session.sendLiteralText("/login");
         const open = await measureAction(
           fixture.tapePath,
-          () => session!.sendKeysImmediate(["Enter"]),
-          () => session!.waitForText("Connections", TIMEOUT),
-          "Connections",
+          () => session!.sendLiteralImmediate("/login "),
+          () => session!.waitForPane(
+            (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
+            TIMEOUT,
+          ),
+          "vercel",
         );
-        session.sendKeysImmediate(["Escape"]);
-        await session.waitForComposer(TIMEOUT);
-        session.sendKeysImmediate(["C-u"]);
-        await session.waitForComposer(TIMEOUT);
         if (cycle >= WARMUPS) appendMeasured(samples.loginOpen, open);
       }
 
@@ -969,8 +967,8 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       await session.waitForComposer(TIMEOUT);
       const resourcesBefore = await waitForResourceStability(pid);
       expect(resourcesBefore.threads - preFeatureResources.threads).toBeLessThanOrEqual(2);
-      // Three terminal routes plus the shared command-replay logs and commands routes.
-      expect(resourcesBefore.descriptors - preFeatureResources.descriptors).toBeLessThanOrEqual(5);
+      // Three terminal routes plus command-replay logs, commands, and tool-results routes.
+      expect(resourcesBefore.descriptors - preFeatureResources.descriptors).toBeLessThanOrEqual(6);
       expect(resourcesBefore.rssKib - preFeatureResources.rssKib).toBeLessThan(16 * 1024);
 
       const peakResources = await peakResourcesWhile(pid, async () => {
@@ -1110,8 +1108,11 @@ test.skipIf(!LIVE_ENABLED || !tmuxAvailable())(
 
       session.sendKeysImmediate(["C-u"]);
       await session.waitForComposer(TIMEOUT);
-      await session.sendText("/login");
-      await session.waitForText("Connections", TIMEOUT);
+      await session.sendLiteralText("/login ");
+      await session.waitForPane(
+        (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
+        TIMEOUT,
+      );
       session.sendKeysImmediate(["Escape"]);
       await session.waitForComposer(TIMEOUT);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");

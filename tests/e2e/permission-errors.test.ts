@@ -206,7 +206,15 @@ describe("generic permission typed errors", () => {
         });
         const json = parseFxJson(result);
         expect(result.stderr).toBe('Running touch "./denied-marker.txt"\n');
-        expect(json.tool_calls).toContainEqual({ name: "shell", status: "error" });
+        expect(json.tool_calls).toContainEqual({
+          name: "shell",
+          status: "error",
+          action: "run",
+          error: {
+            category: "rejected",
+            code: "rejected",
+          },
+        });
         expect(existsSync(marker)).toBe(false);
         expect(gateway.requests).toHaveLength(2);
 

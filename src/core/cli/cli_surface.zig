@@ -162,6 +162,7 @@ pub const Config = struct {
     version: []const u8 = "",
     revision: []const u8 = "",
     build_channel: update_target.Channel = .stable,
+    auth_mode: credentials.AuthMode = .local,
     command_catalog: CommandCatalog,
     default_model: []const u8,
     default_agent_step_limit: usize,
@@ -304,6 +305,9 @@ const WriteFn = *const fn (?*anyopaque, []const u8) anyerror!void;
 const LoadStartupStateFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupState;
 const LoadStartupStateWithoutCredentialsFn = *const fn (Allocator, []const u8, usize) anyerror!app_lifecycle.StartupState;
 const LoadStartupStatusFn = *const fn (Allocator, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupStatus;
+const LoadStartupStateWithAuthModeFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupState;
+const LoadCatalogStartupStateWithAuthModeFn = *const fn (Allocator, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupState;
+const LoadStartupStatusWithAuthModeFn = *const fn (Allocator, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupStatus;
 const GetenvFn = *const fn (?*anyopaque, []const u8) ?[]const u8;
 const EnvironMapFn = *const fn (?*anyopaque) ?*const std.process.Environ.Map;
 const SelfExePathFn = *const fn (?*anyopaque, Allocator) anyerror![]u8;
@@ -320,6 +324,9 @@ const RunDeps = struct {
     load_startup_state: LoadStartupStateFn = app_lifecycle.loadStartupState,
     load_startup_state_without_credentials: LoadStartupStateWithoutCredentialsFn = app_lifecycle.loadStartupStateWithoutCredentials,
     load_startup_status: LoadStartupStatusFn = app_lifecycle.loadStartupStatus,
+    load_startup_state_with_auth_mode: LoadStartupStateWithAuthModeFn = app_lifecycle.loadStartupStateWithAuthMode,
+    load_catalog_startup_state_with_auth_mode: LoadCatalogStartupStateWithAuthModeFn = app_lifecycle.loadCatalogStartupStateWithAuthMode,
+    load_startup_status_with_auth_mode: LoadStartupStatusWithAuthModeFn = app_lifecycle.loadStartupStatusWithAuthMode,
     getenv: GetenvFn = getenvDefault,
     environ_map: EnvironMapFn = environMapDefault,
     self_exe_path: SelfExePathFn = selfExePathDefault,
@@ -660,7 +667,61 @@ fn writeProviderActivationError(
     try writeStderr(deps, message);
 }
 
+fn writeHostManagedAuthResult(deps: RunDeps) !void {
+    try writeStdout(deps, credentials.host_managed_auth_message);
+    try writeStdout(deps, "\n");
+}
+
 fn activateProviderSelection(
+    alloc: Allocator,
+    cfg: Config,
+    deps: RunDeps,
+    target: model_provider.ProviderId,
+    caller: ProviderActivationCaller,
+    exact_source: ?credentials.Source,
+) !bool {
+    return activateProviderSelectionFallible(alloc, cfg, deps, target, caller, exact_source) catch |err| {
+        switch (err) {
+            error.CredentialStorageUnavailable,
+            error.CredentialTemporarilyUnavailable,
+            error.CredentialRefreshPersistenceUncertain,
+            error.CredentialAuthorityChanged,
+            => {},
+            else => return err,
+        }
+        const detail = try auth_runtime.preparationFailureText(alloc, target, err);
+        defer alloc.free(detail);
+        try writeProviderActivationError(alloc, deps, caller, detail);
+        return false;
+    };
+}
+
+fn runProviderLogin(alloc: Allocator, cfg: Config, provider: model_provider.ProviderId) !void {
+    switch (provider) {
+        .gateway => try login_flow.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
+        .codex => try chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
+        .grok => try grok_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
+    }
+}
+
+fn writeProviderLoginFailure(alloc: Allocator, deps: RunDeps, provider: model_provider.ProviderId, caller: ProviderActivationCaller, err: anyerror) !void {
+    debug_trace.logf("auth", "provider sign-in failed provider={t} err={s}", .{ provider, @errorName(err) });
+    const failure = auth_runtime.classifyCredentialFailure(provider_catalog.find(provider).login_source, err);
+    if (failure.reason == .invalid_storage or failure.reason == .persistence_uncertain) {
+        const detail = try auth_runtime.preparationFailureText(alloc, provider, err);
+        defer alloc.free(detail);
+        try writeProviderActivationError(alloc, deps, caller, detail);
+        return;
+    }
+    try writeProviderActivationError(alloc, deps, caller, switch (err) {
+        error.ClientIdMissing => "missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first",
+        error.AccessDenied, error.ChatGptAuthorizationFailed, error.GrokAuthorizationFailed => "authorization denied",
+        error.ExpiredToken, error.LoginTimedOut, error.ChatGptLoginTimedOut, error.GrokLoginTimedOut => "authorization expired; run fx login again",
+        else => "failed to sign in",
+    });
+}
+
+fn activateProviderSelectionFallible(
     alloc: Allocator,
     cfg: Config,
     deps: RunDeps,
@@ -678,17 +739,22 @@ fn activateProviderSelection(
     defer settings.deinit(alloc);
 
     const preferred_source = exact_source orelse settings.credential_source;
-    var prepared_credential = try auth_runtime.prepareCredential(
-        alloc,
-        cfg.gateway_provider.oauth_transport,
-        cfg.secret_store,
-        target,
-        preferred_source,
-    );
+    var prepared_credential = if (cfg.auth_mode == .host_managed)
+        null
+    else
+        try auth_runtime.prepareCredential(
+            alloc,
+            cfg.gateway_provider.oauth_transport,
+            cfg.secret_store,
+            target,
+            preferred_source,
+        );
     defer if (prepared_credential) |*credential| credential.deinit(alloc);
 
     const already_selected = (settings.provider orelse .gateway) == target;
-    if (caller == .provider_command and already_selected and prepared_credential != null) {
+    if (caller == .provider_command and already_selected and
+        (cfg.auth_mode == .host_managed or prepared_credential != null))
+    {
         try writeStdout(deps, switch (target) {
             .gateway => "Gateway is already selected.\n",
             .codex => "Codex is already selected.\n",
@@ -698,28 +764,12 @@ fn activateProviderSelection(
     }
 
     var performed_login: ?model_provider.ProviderId = null;
-    if (prepared_credential == null and target == .codex and caller == .provider_command) {
-        chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener) catch |err| {
-            debug_trace.logf("auth", "provider selection Codex login failed err={s}", .{@errorName(err)});
-            try writeProviderActivationError(alloc, deps, caller, "Codex login failed");
+    if (cfg.auth_mode == .local and prepared_credential == null and provider_catalog.find(target).subscription and caller == .provider_command) {
+        runProviderLogin(alloc, cfg, target) catch |err| {
+            try writeProviderLoginFailure(alloc, deps, target, caller, err);
             return false;
         };
-        performed_login = .codex;
-        prepared_credential = try auth_runtime.prepareCredential(
-            alloc,
-            cfg.gateway_provider.oauth_transport,
-            cfg.secret_store,
-            target,
-            preferred_source,
-        );
-    }
-    if (prepared_credential == null and target == .grok and caller == .provider_command) {
-        grok_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener) catch |err| {
-            debug_trace.logf("auth", "provider selection Grok login failed err={s}", .{@errorName(err)});
-            try writeProviderActivationError(alloc, deps, caller, "Grok login failed");
-            return false;
-        };
-        performed_login = .grok;
+        performed_login = target;
         prepared_credential = try auth_runtime.prepareCredential(
             alloc,
             cfg.gateway_provider.oauth_transport,
@@ -729,7 +779,11 @@ fn activateProviderSelection(
         );
     }
 
-    const credential = if (prepared_credential) |*value| value else {
+    const credential = if (cfg.auth_mode == .host_managed)
+        null
+    else if (prepared_credential) |*value|
+        value
+    else {
         try writeProviderActivationError(
             alloc,
             deps,
@@ -751,10 +805,13 @@ fn activateProviderSelection(
         return false;
     };
     const fetch_result = model_catalog.fetchWithPublicFallback(catalog_provider, alloc, .{
-        .access = credentials.catalogAccessAt(
-            credential.*,
-            io_mod.milliTimestamp(),
-        ).withExplicitAuthority(),
+        .access = if (cfg.auth_mode == .host_managed)
+            .host_managed
+        else
+            credentials.catalogAccessAt(
+                credential.?.*,
+                io_mod.milliTimestamp(),
+            ).withExplicitAuthority(),
         .endpoint = cfg.models_path,
         .view = .picker,
     });
@@ -903,6 +960,7 @@ fn runNonInteractiveWithDeps(
                 return .handled_failure;
             };
             try cfg.acp_runner.run(alloc, .{
+                .auth_mode = cfg.auth_mode,
                 .default_model = cfg.default_model,
                 .default_agent_step_limit = cfg.default_agent_step_limit,
                 .gateway_retry_count = cfg.gateway_retry_count,
@@ -938,70 +996,29 @@ fn runNonInteractiveWithDeps(
                 try writeStderr(deps, "usage: fx login [vercel|codex|grok]\n");
                 return .handled_failure;
             };
+            if (cfg.auth_mode == .host_managed) {
+                try writeHostManagedAuthResult(deps);
+                return .handled_success;
+            }
             // Preserve the original `fx login` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
-            switch (login_provider) {
-                .gateway => {
-                    login_flow.runLogin(
-                        alloc,
-                        cfg.gateway_provider.oauth_transport,
-                        cfg.url_opener,
-                    ) catch |err| {
-                        const message = switch (err) {
-                            error.ClientIdMissing => "fx login: missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first\n",
-                            error.AccessDenied => "fx login: authorization denied\n",
-                            error.ExpiredToken, error.LoginTimedOut => "fx login: authorization expired; run fx login again\n",
-                            else => "fx login: failed to sign in\n",
-                        };
-                        try writeStderr(deps, message);
-                        return .handled_failure;
-                    };
-                    if (!try activateProviderSelection(
-                        alloc,
-                        cfg,
-                        deps,
-                        .gateway,
-                        .provider_login,
-                        .fx_login,
-                    )) return .handled_failure;
-                    try writeStdout(deps, "Signed in to Vercel.\n");
-                    try writeStdout(deps, "AI Gateway access may still require billing or API setup for the selected account.\n");
-                },
-                .codex => {
-                    chatgpt_oauth.runLogin(
-                        alloc,
-                        cfg.gateway_provider.oauth_transport,
-                        cfg.url_opener,
-                    ) catch |err| {
-                        const message = switch (err) {
-                            error.ChatGptLoginTimedOut => "fx login: Codex authorization expired; run fx login codex again\n",
-                            error.ChatGptAuthorizationFailed => "fx login: Codex authorization denied\n",
-                            else => "fx login: failed to sign in with Codex\n",
-                        };
-                        try writeStderr(deps, message);
-                        return .handled_failure;
-                    };
-                    if (!try activateProviderSelection(alloc, cfg, deps, .codex, .provider_login, null)) {
-                        return .handled_failure;
-                    }
-                    try writeStdout(deps, "Signed in with Codex.\n");
-                },
-                .grok => {
-                    grok_oauth.runLogin(
-                        alloc,
-                        cfg.gateway_provider.oauth_transport,
-                        cfg.url_opener,
-                    ) catch |err| {
-                        debug_trace.logf("auth", "Grok login failed err={s}", .{@errorName(err)});
-                        try writeStderr(deps, "fx login: failed to sign in with Grok\n");
-                        return .handled_failure;
-                    };
-                    if (!try activateProviderSelection(alloc, cfg, deps, .grok, .provider_login, null)) {
-                        return .handled_failure;
-                    }
-                    try writeStdout(deps, "Signed in with Grok.\n");
-                },
-            }
+            runProviderLogin(alloc, cfg, login_provider) catch |err| {
+                try writeProviderLoginFailure(alloc, deps, login_provider, .provider_login, err);
+                return .handled_failure;
+            };
+            if (!try activateProviderSelection(
+                alloc,
+                cfg,
+                deps,
+                login_provider,
+                .provider_login,
+                if (login_provider == .gateway) .fx_login else null,
+            )) return .handled_failure;
+            try writeStdout(deps, switch (login_provider) {
+                .gateway => "Signed in to Vercel.\nAI Gateway access may still require billing or API setup for the selected account.\n",
+                .codex => "Signed in with Codex.\n",
+                .grok => "Signed in with Grok.\n",
+            });
             return .handled_success;
         },
         .logout => |rest| {
@@ -1009,6 +1026,10 @@ fn runNonInteractiveWithDeps(
                 try writeStderr(deps, "usage: fx logout [vercel|codex|grok]\n");
                 return .handled_failure;
             };
+            if (cfg.auth_mode == .host_managed) {
+                try writeHostManagedAuthResult(deps);
+                return .handled_success;
+            }
             // Preserve the original `fx logout` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
             if (login_provider == .codex) {
@@ -1098,6 +1119,10 @@ fn runNonInteractiveWithDeps(
                 try writeStderr(deps, "usage: fx teams\n");
                 return .handled_failure;
             }
+            if (cfg.auth_mode == .host_managed) {
+                try writeHostManagedAuthResult(deps);
+                return .handled_success;
+            }
             var validation_context = CliTeamValidationContext{ .alloc = alloc, .cfg = &cfg };
             login_flow.runTeams(
                 alloc,
@@ -1148,6 +1173,10 @@ fn runNonInteractiveWithDeps(
                 try writeTopLevelUsage(cfg.command_catalog, deps, .setup);
                 return .handled_failure;
             }
+            if (cfg.auth_mode == .host_managed) {
+                try writeHostManagedAuthResult(deps);
+                return .handled_success;
+            }
             return if (try runPasteSetup(alloc, cfg.secret_store, deps)) .handled_success else .handled_failure;
         },
         .status => |rest| {
@@ -1155,12 +1184,21 @@ fn runNonInteractiveWithDeps(
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .status, "status", err, rest);
                 return .handled_failure;
             };
-            var startup = try deps.load_startup_status(
-                alloc,
-                cfg.secret_store,
-                cfg.default_model,
-                cfg.default_agent_step_limit,
-            );
+            var startup = if (cfg.auth_mode == .host_managed)
+                try deps.load_startup_status_with_auth_mode(
+                    alloc,
+                    cfg.secret_store,
+                    cfg.default_model,
+                    cfg.default_agent_step_limit,
+                    cfg.auth_mode,
+                )
+            else
+                try deps.load_startup_status(
+                    alloc,
+                    cfg.secret_store,
+                    cfg.default_model,
+                    cfg.default_agent_step_limit,
+                );
             defer startup.deinit(alloc);
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
             var mcp_inspection = try cfg.inspect_mcp_local_config(
@@ -1216,13 +1254,22 @@ fn runNonInteractiveWithDeps(
                 return .handled_failure;
             };
 
-            var startup = try deps.load_startup_state(
-                alloc,
-                cfg.gateway_provider.oauth_transport,
-                cfg.secret_store,
-                cfg.default_model,
-                cfg.default_agent_step_limit,
-            );
+            var startup = if (cfg.auth_mode == .host_managed)
+                try deps.load_catalog_startup_state_with_auth_mode(
+                    alloc,
+                    cfg.secret_store,
+                    cfg.default_model,
+                    cfg.default_agent_step_limit,
+                    cfg.auth_mode,
+                )
+            else
+                try deps.load_startup_state(
+                    alloc,
+                    cfg.gateway_provider.oauth_transport,
+                    cfg.secret_store,
+                    cfg.default_model,
+                    cfg.default_agent_step_limit,
+                );
             defer startup.deinit(alloc);
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
 
@@ -1574,13 +1621,23 @@ fn runNonInteractiveWithDeps(
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .credits, "credits", err, rest);
                 return .handled_failure;
             };
-            var startup = try deps.load_startup_state(
-                alloc,
-                cfg.gateway_provider.oauth_transport,
-                cfg.secret_store,
-                cfg.default_model,
-                cfg.default_agent_step_limit,
-            );
+            var startup = if (cfg.auth_mode == .host_managed)
+                try deps.load_startup_state_with_auth_mode(
+                    alloc,
+                    cfg.gateway_provider.oauth_transport,
+                    cfg.secret_store,
+                    cfg.default_model,
+                    cfg.default_agent_step_limit,
+                    cfg.auth_mode,
+                )
+            else
+                try deps.load_startup_state(
+                    alloc,
+                    cfg.gateway_provider.oauth_transport,
+                    cfg.secret_store,
+                    cfg.default_model,
+                    cfg.default_agent_step_limit,
+                );
             defer startup.deinit(alloc);
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
 
@@ -1588,7 +1645,12 @@ fn runNonInteractiveWithDeps(
                 gateway_provider.unavailable_credits_provider;
             var snapshot = credits.fetch(alloc, .{
                 .credential = startup.apiKey(),
-                .credential_source = if (startup.credential) |credential| credential.source else null,
+                .credential_source = if (startup.auth_mode == .host_managed)
+                    .host_managed
+                else if (startup.credential) |credential|
+                    credential.source
+                else
+                    null,
                 .tenant = startup.gatewayTeam(),
             });
             defer snapshot.deinit(alloc);
@@ -2160,8 +2222,10 @@ fn runTopLevelMcp(
     deps: RunDeps,
 ) !RunResult {
     if (rest.len == 0) {
-        try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
-        return .handled_failure;
+        const help = try command_specs.renderTopLevelCommandHelp(alloc, cfg.command_catalog, .mcp);
+        defer alloc.free(help);
+        try writeStdout(deps, help);
+        return .handled_success;
     }
     const operation = rest[0];
     if (std.mem.eql(u8, operation, "add")) {
@@ -2299,7 +2363,7 @@ fn runTopLevelMcp(
     }
     if (std.mem.eql(u8, operation, "auth")) {
         if (rest.len != 2 or rest[1].len == 0) {
-            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
+            try writeStderr(deps, "usage: fx " ++ command_specs.mcp_auth_usage ++ "\n");
             return .handled_failure;
         }
         var loaded = loadMcpCommandRuntime(alloc, cfg, deps) catch |err| {
@@ -2312,7 +2376,7 @@ fn runTopLevelMcp(
             try writeMcpOperationFailure(alloc, deps, "auth", error.McpServerNotFound);
             return .handled_failure;
         };
-        var opener = cfg.url_opener;
+        var opener = McpCliAuthorization{ .opener = cfg.url_opener, .deps = deps };
         var result = runtime.authenticateServer(
             rest[1],
             &opener,
@@ -2455,13 +2519,26 @@ fn writeMcpTrustSuccess(
     try writeStdout(deps, out.written());
 }
 
+const McpCliAuthorization = struct {
+    opener: host.UrlOpener,
+    deps: RunDeps,
+};
+
 fn openTopLevelMcpUrl(
     raw: ?*anyopaque,
     alloc: Allocator,
     url: []const u8,
 ) anyerror!bool {
-    const opener: *const host.UrlOpener = @ptrCast(@alignCast(raw.?));
-    return opener.open(alloc, url);
+    const presentation: *const McpCliAuthorization = @ptrCast(@alignCast(raw.?));
+    var encoded_url = try text_utils.encodeTerminalSafe(alloc, url, std.math.maxInt(usize));
+    defer encoded_url.deinit(alloc);
+    try writeStdout(presentation.deps, "Open this URL to authenticate the MCP server:\n");
+    try writeStdout(presentation.deps, encoded_url.bytes);
+    try writeStdout(presentation.deps, "\n\nWaiting for browser authorization...\n");
+    if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) {
+        _ = try presentation.opener.open(alloc, url);
+    }
+    return true;
 }
 
 fn writeMcpProfileMutationSuccess(
@@ -2834,7 +2911,7 @@ fn writeLookupFailure(
         error.SessionRecoveryRequiresCurrentSchema => {
             try writeStderr(
                 deps,
-                "fx session: recovery only applies to current schema-v3 sessions; migrate legacy sessions first\n",
+                "fx session: recovery supports conversation logs and schema-v3 event logs; migrate snapshot sessions first\n",
             );
         },
         error.SessionRecoveryUnsupportedSchema => {
@@ -2965,7 +3042,7 @@ fn lookupFailureMessage(err: anyerror) ?[]const u8 {
         error.LegacySessionMigrationFailed, error.LegacySessionChanged => "migration did not complete; the original session remains authoritative",
         error.LegacySessionMigrationIndeterminate => "migration outcome is indeterminate and will be resolved by the next exact writable load",
         error.SessionRecoveryNotNeeded => "recovery was refused because the session has a valid commit boundary; resume it normally",
-        error.SessionRecoveryRequiresCurrentSchema => "recovery only applies to current schema-v3 sessions; migrate legacy sessions first",
+        error.SessionRecoveryRequiresCurrentSchema => "recovery supports conversation logs and schema-v3 event logs; migrate snapshot sessions first",
         error.SessionRecoveryUnsupportedSchema => "recovery is unavailable for this unsupported session version",
         error.SessionRecoveryBoundaryInvalid => "no exact trustworthy recovery boundary was found; the source was left unchanged",
         error.SessionRecoveryIndeterminate => "the recovery copy could not be confirmed; the source was left unchanged",
@@ -3085,6 +3162,7 @@ test "session recovery boundary failures keep stable text and json guidance" {
 
 fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
     return .{
+        .auth_mode = cfg.auth_mode,
         .command_usage = command_specs.topLevelUsage(cfg.command_catalog, .ask),
         .default_model = cfg.default_model,
         .default_agent_step_limit = cfg.default_agent_step_limit,

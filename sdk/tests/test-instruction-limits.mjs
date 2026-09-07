@@ -24,7 +24,7 @@ const options = {
   ...(backend === "wasm"
     ? { wasm: await readFile(resolve(scriptDir, "../../zig-out/bin/fx-core.wasm")) }
     : {}),
-  env: { AI_GATEWAY_API_KEY: "instruction-limit-test-key" },
+  apiKey: "instruction-limit-test-key",
 };
 
 const agent = await createFxAgent({ ...options, instructions: exactInstructions });
@@ -33,6 +33,7 @@ await agent.close();
 let runtimeCreations = 0;
 await assert.rejects(
   createSharedAgent({
+    apiKey: "instruction-limit-test-key",
     instructions: `${exactInstructions}x`,
     runtimeFactory() {
       runtimeCreations += 1;

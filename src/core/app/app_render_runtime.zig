@@ -1,7 +1,6 @@
 const std = @import("std");
 const question_prompt = @import("../agent/question_prompt.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
-const input_queue_runtime = @import("input_queue_runtime.zig");
 const app_commands = @import("app_commands.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
@@ -11,6 +10,7 @@ const managed_execution = @import("../execution/managed_execution.zig");
 const terminal_ui_projection = @import("../terminal/ui_projection.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
+const provider_picker_runtime = @import("provider_picker_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const picker_state = @import("../input/picker_state.zig");
 const core_input_runtime = @import("../input/runtime.zig");
@@ -134,20 +134,16 @@ const RenderReconciliation = union(enum) {
     frame_result: FrameAttemptResult,
 };
 
-const QueuedCardProjection = struct {
-    cards: []render_input.QueuedPromptCard = &.{},
-    steering_messages: [][]u8 = &.{},
-    steering_waits_for_tool: bool = false,
-    ordinary_count: usize = 0,
-    paused: bool = false,
-    row_count: u16 = 0,
-    editor_active: bool = false,
+const SteeringProjection = struct {
+    messages: [][]u8 = &.{},
+    pending_feedback: [][]u8 = &.{},
+    waits_for_tool: bool = false,
 
-    fn deinit(self: *QueuedCardProjection, alloc: std.mem.Allocator) void {
-        for (self.cards) |card| alloc.free(card.bytes);
-        if (self.cards.len > 0) alloc.free(self.cards);
-        for (self.steering_messages) |message| alloc.free(message);
-        if (self.steering_messages.len > 0) alloc.free(self.steering_messages);
+    fn deinit(self: *SteeringProjection, alloc: std.mem.Allocator) void {
+        for (self.messages) |message| alloc.free(message);
+        if (self.messages.len > 0) alloc.free(self.messages);
+        for (self.pending_feedback) |message| alloc.free(message);
+        if (self.pending_feedback.len > 0) alloc.free(self.pending_feedback);
         self.* = .{};
     }
 };
@@ -168,6 +164,27 @@ const PendingCardPaintContext = struct {
     bytes: []const u8,
     row: u16,
     max_rows: u16,
+
+    fn init(
+        card: PendingCardProjection,
+        band: render_engine.paint_plan.FrameBand,
+        canonical_cursor_row: ?u16,
+        activity_visible: bool,
+    ) ?PendingCardPaintContext {
+        if (band.isEmpty()) return null;
+        const row = if (canonical_cursor_row) |base|
+            @max(base +| card.leading_advance_rows, band.top)
+        else
+            band.top;
+        if (row > band.bottom) return null;
+        const blank_rows: u16 = @intFromBool(activity_visible and band.bottom > row);
+        const bottom = band.bottom - blank_rows;
+        const max_rows = @min(card.paint_row_count, bottom - row + 1);
+        if (max_rows == 0) return null;
+        var lines = std.mem.splitScalar(u8, card.bytes, '\n');
+        for (0..card.paint_row_count - max_rows) |_| _ = lines.next();
+        return .{ .bytes = lines.rest(), .row = row, .max_rows = max_rows };
+    }
 
     fn paint(
         raw: *anyopaque,
@@ -207,7 +224,7 @@ fn buildPendingCardProjection(
     const pending = app.submission.pending orelse return null;
     switch (pending.phase) {
         .awaiting_frame, .awaiting_adoption => {},
-        .adopted, .queued => return null,
+        .adopted, .awaiting_auth, .queued => return null,
     }
 
     const spans = pending.draft.skill_display_spans;
@@ -267,6 +284,64 @@ fn buildPendingCardProjection(
     };
 }
 
+fn pendingPromptActivityVisible(app: anytype) bool {
+    if (comptime !@hasField(@TypeOf(app.*), "submission")) return false;
+    const pending = app.submission.pending orelse return false;
+    return pending.phase != .awaiting_auth;
+}
+
+fn buildPendingSteeringCardProjection(
+    alloc: std.mem.Allocator,
+    shell: *const transcript_runtime.TranscriptRuntime,
+    steering: SteeringProjection,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !?PendingCardProjection {
+    const queued_count = if (steering.waits_for_tool) 0 else steering.messages.len;
+    var index = steering.pending_feedback.len + queued_count;
+    if (index == 0) return null;
+
+    var card_bytes: std.ArrayList(u8) = .empty;
+    defer card_bytes.deinit(alloc);
+    var row_count: u16 = 0;
+    const row_limit = @max(shell.layout.content_bottom, 1);
+    while (index > 0 and row_count < row_limit) {
+        index -= 1;
+        const message = if (index < steering.pending_feedback.len)
+            steering.pending_feedback[index]
+        else
+            steering.messages[index - steering.pending_feedback.len];
+        const gap: u16 = @intFromBool(card_bytes.items.len > 0);
+        const remaining_rows = row_limit - row_count -| gap;
+        if (remaining_rows == 0) break;
+        const card = try user_message_card.buildUserPromptCardTailForTerminalPresentationInterruptible(
+            alloc,
+            message,
+            &.{},
+            shell.layout.cols,
+            &.{},
+            remaining_rows,
+            checkpoint,
+        );
+        defer alloc.free(card);
+        if (card.len == 0) continue;
+        if (gap > 0) try card_bytes.insert(alloc, 0, '\n');
+        try card_bytes.insertSlice(alloc, 0, card);
+        row_count += @as(u16, @intCast(std.mem.count(u8, card, "\n"))) + gap;
+    }
+    if (row_count == 0) return null;
+    const leading_rows = pendingCardLeadingAdvanceRows(
+        @min(@max(shell.cursor_row, 1), shell.layout.content_bottom),
+        shell.cursor_col,
+        shell.layout.content_bottom,
+    );
+    return .{
+        .bytes = try pendingCardTerminalWireBytes(alloc, card_bytes.items),
+        .row_count = row_count +| leading_rows,
+        .paint_row_count = row_count,
+        .leading_advance_rows = leading_rows,
+    };
+}
+
 fn pendingCardTerminalWireBytes(
     alloc: std.mem.Allocator,
     logical: []const u8,
@@ -317,107 +392,19 @@ fn previewWithPendingCard(
     return next;
 }
 
-// Steering text stays visible while ordinary queued prompts remain collapsed
-// until review opens. Every slice in the result is owned for one render frame.
-fn buildQueuedCardProjection(comptime App: type, app: *App) !QueuedCardProjection {
-    var projection: QueuedCardProjection = .{};
+// Every steering slice in the result is owned for one render frame.
+fn buildSteeringProjection(comptime App: type, app: *App) !SteeringProjection {
+    var projection: SteeringProjection = .{};
     errdefer projection.deinit(app.alloc);
-    if (comptime @hasDecl(@TypeOf(app.worker), "snapshotQueuePresentation")) {
-        var snapshot = try app.worker.snapshotQueuePresentation(app.alloc);
+    if (comptime @hasDecl(@TypeOf(app.worker), "snapshotSteeringPresentation")) {
+        var snapshot = try app.worker.snapshotSteeringPresentation(app.alloc);
         defer snapshot.deinit(app.alloc);
-        projection.ordinary_count = snapshot.ordinary_count;
-        projection.paused = snapshot.paused;
-        projection.steering_waits_for_tool = snapshot.steering_waits_for_tool;
-        projection.steering_messages = snapshot.steering_messages;
-        snapshot.steering_messages = &.{};
-    } else {
-        const queue_preview = app.worker.queuePreview();
-        const steering_count = if (comptime @hasField(@TypeOf(queue_preview), "steering_count"))
-            queue_preview.steering_count
-        else
-            0;
-        projection.ordinary_count = queue_preview.count -| steering_count;
-        projection.paused = if (comptime @hasField(@TypeOf(queue_preview), "paused"))
-            queue_preview.paused
-        else
-            false;
+        projection.waits_for_tool = snapshot.waits_for_tool;
+        projection.messages = snapshot.messages;
+        snapshot.messages = &.{};
+        projection.pending_feedback = snapshot.pending_feedback;
+        snapshot.pending_feedback = &.{};
     }
-    if (comptime !@hasField(App, "queued_prompt_review")) return projection;
-    const review_entries = app.queued_prompt_review.entries;
-    if (!app.queued_prompt_review.visible or
-        !app.queued_prompt_review.active() or
-        review_entries.len == 0) return projection;
-    const draft_count = review_entries.len;
-
-    const measurement = try input_queue_runtime.measureVisibleReviewRows(
-        app.alloc,
-        &app.queued_prompt_review,
-        .{
-            .input = app.input_runtime.edit_state.input.items,
-            .cursor = app.input_runtime.edit_state.cursor,
-            .terminal_cols = app.shell.layout.cols,
-            .images = app.pending_images.items,
-            .pasted_blocks = app.input_runtime.entities.pasted_blocks.items,
-            .image_tokens = app.input_runtime.entities.image_tokens.items,
-            .skill_tokens = app.input_runtime.entities.skill_tokens.items,
-        },
-    );
-
-    const cards = try app.alloc.alloc(render_input.QueuedPromptCard, draft_count);
-    var built: usize = 0;
-    errdefer {
-        for (cards[0..built]) |card| app.alloc.free(card.bytes);
-        app.alloc.free(cards);
-    }
-
-    while (built < draft_count) : (built += 1) {
-        const draft = review_entries[built].draft;
-        const editing = app.queued_prompt_review.selected_index != null and
-            app.queued_prompt_review.selected_index.? == built;
-        if (editing) {
-            cards[built] = .{
-                .bytes = try app.alloc.dupe(u8, ""),
-                .editing = true,
-            };
-            continue;
-        }
-
-        const review_input = draft.reviewInput();
-        const review_skill_spans = draft.reviewSkillDisplaySpans();
-        var skill_tokens: []registered_entities.SkillTokenSpan = if (review_skill_spans.len > 0)
-            try app.alloc.alloc(registered_entities.SkillTokenSpan, review_skill_spans.len)
-        else
-            &.{};
-        defer if (skill_tokens.len > 0) app.alloc.free(skill_tokens);
-        for (review_skill_spans, 0..) |span, i| {
-            skill_tokens[i] = .{
-                .raw_start = span.raw_start,
-                .raw_end = span.raw_end,
-                .name = span.name,
-                .path = span.path,
-                .display_source = span.display_source,
-                .owns_trailing_separator = span.owns_trailing_separator,
-            };
-        }
-
-        const bytes = try input_presentation.composeQueuedPromptCard(
-            app.alloc,
-            .{
-                .input = review_input,
-                .cursor = 0,
-                .terminal_cols = app.shell.layout.cols,
-                .images = draft.images,
-                .pasted_blocks = review_entries[built].pasted_blocks.items,
-                .image_tokens = review_entries[built].image_tokens.items,
-                .skill_tokens = skill_tokens,
-            },
-        );
-        cards[built] = .{ .bytes = bytes };
-    }
-
-    projection.cards = cards;
-    projection.row_count = measurement.card_rows;
-    projection.editor_active = measurement.editor_active;
     return projection;
 }
 
@@ -533,6 +520,7 @@ pub fn Runtime(comptime App: type) type {
         var effort_picker_values_buf: [types.ReasoningEffort.max_options + 1]types.ReasoningEffort = undefined;
         var effort_picker_labels_buf: [types.ReasoningEffort.max_options + 1][]const u8 = undefined;
         var fast_picker_labels_buf: [2][]const u8 = undefined;
+        var provider_picker_column: provider_picker_runtime.ColumnBuffer = .{};
         var file_completions_buf: [input_completion_runtime.file_picker_completion_cap]file_index.SearchResult = undefined;
         var file_match_spans_buf: [input_completion_runtime.file_picker_completion_cap * file_index.max_path_len]file_index.MatchSpan = undefined;
         var file_path_storage_buf: [input_completion_runtime.file_picker_path_storage_cap]u8 = undefined;
@@ -540,7 +528,7 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             upgrade_status_buf: *[64]u8,
             shimmer_pos: i16,
-            queued_cards: *const QueuedCardProjection,
+            steering: *const SteeringProjection,
         ) render_input.RenderContext {
             const model_query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state);
             const pending_model = if (app.input_runtime.picker.hasPendingModelPickerSelection()) app.input_runtime.picker.model_picker_pending_model.items else null;
@@ -583,7 +571,47 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
 
-            const file_query = if (model_query == null) app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) else null;
+            const provider_query = if (model_query == null)
+                app.input_runtime.picker.activeProviderPickerQuery(&app.input_runtime.edit_state)
+            else
+                null;
+            var provider_stage: picker_state.ProviderPickerStage = .provider;
+            var provider_picker_items: []const []const u8 = &.{};
+            var provider_picker_annotations: []const []const u8 = &.{};
+            var provider_picker_index: usize = 0;
+            var provider_picker_window_start: usize = 0;
+            var provider_picker_anchor: usize = 0;
+            if (provider_query) |picker_query| {
+                provider_stage = picker_query.stage;
+                provider_picker_anchor = picker_query.token_start;
+                const count = provider_picker_runtime.Runtime(App).columnOptions(app, picker_query, &provider_picker_column);
+                provider_picker_items = provider_picker_column.labels[0..count];
+                provider_picker_annotations = provider_picker_column.annotations[0..count];
+                switch (picker_query.stage) {
+                    .provider => {
+                        provider_picker_index = app.input_runtime.picker.provider_column_index;
+                        provider_picker_window_start = app.input_runtime.picker.provider_column_window_start;
+                    },
+                    .method => {
+                        provider_picker_index = app.input_runtime.picker.method_column_index;
+                        provider_picker_window_start = app.input_runtime.picker.method_column_window_start;
+                    },
+                    .team => {
+                        provider_picker_index = app.input_runtime.picker.team_column_index;
+                        provider_picker_window_start = app.input_runtime.picker.team_column_window_start;
+                    },
+                    .key_source => {
+                        provider_picker_index = app.input_runtime.picker.key_source_column_index;
+                        provider_picker_window_start = app.input_runtime.picker.key_source_column_window_start;
+                    },
+                    .api_key => {},
+                }
+            }
+
+            const file_query = if (model_query == null and provider_query == null)
+                app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state)
+            else
+                null;
             var file_items: []const file_index.SearchResult = &.{};
             var file_anchor: usize = 0;
             var file_selection_index: usize = 0;
@@ -632,6 +660,25 @@ pub fn Runtime(comptime App: type) type {
             const settings_snapshot = app_commands.settingsCatalogSnapshot(app);
             const now_ms = io_mod.milliTimestamp();
             var visible_stream = app.stream;
+            if (visible_stream.active) {
+                const cancel_requested = if (comptime @hasField(App, "worker"))
+                    if (comptime @hasDecl(@TypeOf(app.worker), "isCancelRequested"))
+                        app.worker.isCancelRequested()
+                    else
+                        false
+                else
+                    false;
+                if (cancel_requested) {
+                    const stops_turn = if (comptime @hasDecl(
+                        @TypeOf(app.worker),
+                        "cancellationStopsTurn",
+                    ))
+                        app.worker.cancellationStopsTurn()
+                    else
+                        true;
+                    if (stops_turn) visible_stream.active = false;
+                }
+            }
             if (!visible_stream.active) {
                 if (app.pacer.completedAssistantPresentationTokenProgress()) |progress| {
                     visible_stream.token_progress = progress;
@@ -641,6 +688,7 @@ pub fn Runtime(comptime App: type) type {
             return .{
                 .slash_registry = app.slashRegistry(),
                 .stream = visible_stream,
+                .pending_prompt_activity = pendingPromptActivityVisible(app),
                 .completed_assistant_presentation_tail = app.pacer.hasCompletedAssistantPresentationTail(),
                 .writing_response = app.pacer.hasPending(),
                 .has_api_key = app.auth.credentialSource() != null,
@@ -650,24 +698,8 @@ pub fn Runtime(comptime App: type) type {
                     app.permission_engine.mode
                 else
                     .ask,
-                .queued_count = if (queued_cards.cards.len > 0)
-                    queued_cards.cards.len
-                else
-                    queued_cards.ordinary_count + queued_cards.steering_messages.len,
-                .steering_messages = queued_cards.steering_messages,
-                .steering_waits_for_tool = queued_cards.steering_waits_for_tool,
-                .queued_paused = queued_cards.paused,
-                .queued_cancel_all_available = if (comptime @hasField(App, "queued_prompt_review"))
-                    app.queued_prompt_review.active() and
-                        app.queued_prompt_review.reason.? == .post_cancel and
-                        !app.queued_prompt_review.visible and
-                        app.input_runtime.edit_state.input.items.len == 0 and
-                        app.pending_images.items.len == 0
-                else
-                    false,
-                .queued_prompt_cards = queued_cards.cards,
-                .queued_prompt_card_rows = queued_cards.row_count,
-                .queued_editor_active = queued_cards.editor_active,
+                .steering_messages = steering.messages,
+                .steering_waits_for_tool = steering.waits_for_tool,
                 .fast_indicator_active = fast_indicator_active,
                 .effort = visible_effort,
                 .model_supports_effort = model_supports_effort,
@@ -682,6 +714,13 @@ pub fn Runtime(comptime App: type) type {
                 .model_completion_index = picker_index,
                 .model_completion_window_start = picker_window_start,
                 .model_completion_anchor = picker_anchor,
+                .provider_query_active = provider_query != null,
+                .provider_picker_stage = provider_stage,
+                .provider_picker_completions = provider_picker_items,
+                .provider_picker_annotations = provider_picker_annotations,
+                .provider_picker_completion_index = provider_picker_index,
+                .provider_picker_completion_window_start = provider_picker_window_start,
+                .provider_picker_completion_anchor = provider_picker_anchor,
                 .file_query_active = file_query != null,
                 .file_completions = file_items,
                 .file_completion_index = file_selection_index,
@@ -948,6 +987,11 @@ pub fn Runtime(comptime App: type) type {
                 render_request.animation_interval_ms,
                 result.animation_visible,
             );
+            if (comptime @hasDecl(App, "startPromptCredentialPrewarm")) {
+                if (snapshot.reasons.contains(.first_frame)) {
+                    App.startPromptCredentialPrewarm(app);
+                }
+            }
             if (comptime @hasDecl(App, "notePendingFrameCommitted")) {
                 if (result.pending_prompt_presented) {
                     App.notePendingFrameCommitted(app);
@@ -989,9 +1033,6 @@ pub fn Runtime(comptime App: type) type {
                     render_requests.animation_next_deadline_ms,
                 },
             );
-            if (comptime @hasDecl(App, "persistResumeViewAfterFrame")) {
-                app.persistResumeViewAfterFrame();
-            }
         }
 
         fn attemptRequestedFrame(
@@ -1149,8 +1190,8 @@ pub fn Runtime(comptime App: type) type {
             const presentation_shell: *transcript_runtime.TranscriptRuntime = &app.shell;
             const render_requests = activeRenderRequests(app);
             var upgrade_status_buf: [64]u8 = undefined;
-            var queued_cards = try buildQueuedCardProjection(App, app);
-            defer queued_cards.deinit(app.alloc);
+            var steering = try buildSteeringProjection(App, app);
+            defer steering.deinit(app.alloc);
             const shimmer_pos = if (snapshot.animation_candidate) |candidate|
                 candidate.phase
             else
@@ -1159,10 +1200,10 @@ pub fn Runtime(comptime App: type) type {
                 app,
                 &upgrade_status_buf,
                 shimmer_pos,
-                &queued_cards,
+                &steering,
             );
             var footer_ctx = main_footer_ctx;
-            const render_reconciliation = switch (try reconcileBeforeFrameRender(app, render_input.queuedBannerRows(footer_ctx))) {
+            const render_reconciliation = switch (try reconcileBeforeFrameRender(app, render_input.steeringBannerRows(footer_ctx, app.shell.layout.cols))) {
                 .inline_render => |inline_render| inline_render,
                 .file_approval_screen => return renderApprovalScreen(app),
                 .frame_result => |result| return result,
@@ -1176,6 +1217,10 @@ pub fn Runtime(comptime App: type) type {
                 try buildPendingCardProjection(App, app, presentation_shell, checkpoint)
             else
                 null;
+            const pending_submission_card = pending_card != null;
+            if (pending_card == null and !render_reconciliation.alternate_screen_owns_rendering) {
+                pending_card = try buildPendingSteeringCardProjection(app.alloc, presentation_shell, steering, checkpoint);
+            }
             defer if (pending_card) |*card| card.deinit(app.alloc);
 
             var attempt_invalidations = snapshot.invalidations;
@@ -1299,14 +1344,29 @@ pub fn Runtime(comptime App: type) type {
                     measurement.frameLayoutMeasurement()
                 else
                     footerMeasurementFromRows(footer_frame.paint.footer);
-                const frame_activity = if (footer_measurement) |*measurement|
+                var frame_activity = if (footer_measurement) |*measurement|
                     frameActivityStateFromMeasurement(presentation_shell, measurement)
                 else
                     activityStateFromPlacement(footer_frame.paint.activity);
+                if (pending_card != null and frame_activity == .thinking) {
+                    // The pending tail already includes the transcript cursor's blank row.
+                    frame_activity.thinking.gap_above_activity = render_engine.transcript_blocks.blockGapRowsBetween(
+                        .user_turn,
+                        .assistant_turn,
+                    ) -| 1;
+                }
                 const target_activity_projection: activity_runtime.ActivityProjection = if (footer_measurement) |*measurement|
                     measurement.activity_projection
                 else
                     .{ .turn_thinking = .{ .label = footer_frame.label() } };
+                const prompt_turn_reservation = promptTurnReservation(
+                    app,
+                    presentation_shell,
+                    canonical_transcript_preview,
+                    pending_card,
+                    if (footer_measurement) |*measurement| measurement else null,
+                    frame_activity,
+                );
                 var fixed_point_ctx = FixedPointTranscriptContext(App){
                     .app = app,
                     .presentation_shell = presentation_shell,
@@ -1339,6 +1399,7 @@ pub fn Runtime(comptime App: type) type {
                         .footer = neutral_footer,
                         .transcript = transcript_preview,
                         .activity = frame_activity,
+                        .prompt_turn = prompt_turn_reservation,
                         .body_mode = .transcript,
                         .prior = active_committed_layout,
                     },
@@ -1350,7 +1411,7 @@ pub fn Runtime(comptime App: type) type {
                 scroll_plan = fixed_point.scroll_plan;
                 debug_trace.logf(
                     "frame_layout",
-                    "layout_id={x} solved_frame_height={d} footer_height={d} footer_top={d} owned_top={d} owned_bottom={d} scroll_rows={d}",
+                    "layout_id={x} solved_frame_height={d} footer_height={d} footer_top={d} owned_top={d} owned_bottom={d} prompt_turn_transcript_rows={d} prompt_turn_active={s} scroll_rows={d}",
                     .{
                         solved.layout_id,
                         solved.solved_frame_height,
@@ -1358,6 +1419,8 @@ pub fn Runtime(comptime App: type) type {
                         solved.footer_area.top,
                         solved.owned_top,
                         solved.owned_band.bottom,
+                        prompt_turn_reservation.transcript_rows,
+                        if (prompt_turn_reservation.active()) "true" else "false",
                         scroll_plan.terminal_scroll_rows,
                     },
                 );
@@ -1430,7 +1493,7 @@ pub fn Runtime(comptime App: type) type {
                     else
                         footer_frame.paint.preserve_scrollback,
                     .reset_terminal = shouldResetPhysicalTerminal(
-                        false,
+                        render_reconciliation.alternate_screen_owns_rendering,
                         app.shell.terminal_reset_pending,
                     ),
                 });
@@ -1565,14 +1628,15 @@ pub fn Runtime(comptime App: type) type {
                     .paint => .paint,
                     .retain_committed => |retained| .{ .retain = retained },
                 } else .paint;
-            var pending_paint_ctx: ?PendingCardPaintContext = if (pending_card) |card| .{
-                .bytes = card.bytes,
-                .row = (if (prepared_transcript) |*prepared|
-                    prepared.cursor.cursor_row
-                else
-                    presentation_shell.cursor_row) +| card.leading_advance_rows,
-                .max_rows = card.paint_row_count,
-            } else null;
+            var pending_paint_ctx = if (pending_card) |card|
+                PendingCardPaintContext.init(
+                    card,
+                    footer_frame.paint.transcript_band,
+                    if (prepared_transcript) |*prepared| prepared.cursor.cursor_row else null,
+                    !footer_frame.paint.activity_band.isEmpty(),
+                )
+            else
+                null;
             if (pending_paint_ctx) |paint_ctx| switch (transcript_body) {
                 .paint => {},
                 .retain => |retained_source| {
@@ -1616,7 +1680,9 @@ pub fn Runtime(comptime App: type) type {
             try build_checkpoint.poll(checkpoint);
             if (footer_frame.paint.reset_terminal) {
                 if (comptime @hasField(App, "terminal")) {
-                    app.terminal.clearTmuxScreenAndHistory(app.alloc);
+                    if (app.terminal.alternate_screen_owner == .none) {
+                        app.terminal.clearTmuxScreenAndHistory(app.alloc);
+                    }
                 }
             }
             var frame_shell = SurfaceFrameShell.init(
@@ -1727,7 +1793,7 @@ pub fn Runtime(comptime App: type) type {
                 .animation_visible = frame_ctx.activity_result.painted,
                 .yolo_warning_visible = !render_reconciliation.alternate_screen_owns_rendering and
                     footer_frame.composed.danger_status_visible,
-                .pending_prompt_presented = pending_card != null,
+                .pending_prompt_presented = pending_submission_card and pending_paint_ctx != null,
             };
         }
 
@@ -2227,6 +2293,44 @@ fn validatePreparedTranscriptFitsPlan(
     }
 }
 
+fn promptTurnReservation(
+    app: anytype,
+    shell: *const transcript_runtime.TranscriptRuntime,
+    canonical_preview: render_engine.frame_layout.TranscriptFlowPreview,
+    pending_card: ?PendingCardProjection,
+    footer_measurement: ?*const surface_frame.SurfaceFooterMeasurement,
+    frame_activity: render_engine.frame_layout.ActivityState,
+) render_engine.frame_layout.PromptTurnReservation {
+    if (frame_activity != .none) return .{};
+    const measurement = footer_measurement orelse return .{};
+    if (!measurement.input_visible or
+        measurement.show_picker or
+        measurement.picker_rows > 0 or
+        measurement.banner_active or
+        measurement.footer_gap_active or
+        app.stream.active or
+        shell.fullTranscriptActive()) return .{};
+    if (comptime @hasField(@TypeOf(app.*), "skills")) {
+        if (comptime @hasDecl(@TypeOf(app.skills), "menuVisible")) {
+            if (app.skills.menuVisible()) return .{};
+        }
+    }
+
+    const future_activity = render_engine.frame_layout.ActivityState.thinkingAfterUserTurn();
+    const pending_submission_active = if (comptime @hasField(@TypeOf(app.*), "submission"))
+        app.submission.pending != null
+    else
+        false;
+    if (pending_card != null or pending_submission_active) {
+        const canonical_rows = if (pending_card) |card|
+            canonical_preview.natural_visual_rows +| (card.row_count -| 1)
+        else
+            canonical_preview.natural_visual_rows;
+        return .{ .transcript_rows = canonical_rows, .activity = future_activity };
+    }
+    return .{};
+}
+
 fn footerMeasurementFromRows(rows: render_engine.footer_layout.FooterRows) render_engine.frame_layout.FooterMeasurement {
     return .{
         .natural_rows = rows.total_rows,
@@ -2437,6 +2541,52 @@ test "pending prompt projection waits for a paintable terminal width" {
     try std.testing.expect(projection.paint_row_count > 0);
 }
 
+test "pending steering cards preserve feedback order and tool waiting placement" {
+    const alloc = std.testing.allocator;
+    var shell = transcript_runtime.TranscriptRuntime{
+        .layout = .{
+            .cols = 40,
+            .rows = 12,
+            .content_bottom = 8,
+            .divider_top_row = 9,
+            .input_row = 10,
+            .divider_bottom_row = 11,
+            .hint_row = 12,
+        },
+        .cursor_row = 3,
+        .cursor_col = 1,
+    };
+    defer shell.deinit(alloc);
+    var feedback = [_][]u8{@constCast("accepted earlier")};
+    var queued = [_][]u8{@constCast("accepted later")};
+    var steering = SteeringProjection{ .messages = &queued, .pending_feedback = &feedback };
+    var card = (try buildPendingSteeringCardProjection(alloc, &shell, steering, null)).?;
+    defer card.deinit(alloc);
+    const first = std.mem.find(u8, card.bytes, "accepted earlier").?;
+    const second = std.mem.find(u8, card.bytes, "accepted later").?;
+    try std.testing.expect(first < second);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, card.bytes, "┃"));
+    try std.testing.expect(std.mem.find(u8, card.bytes, "┋") == null);
+
+    steering.waits_for_tool = true;
+    var waiting = (try buildPendingSteeringCardProjection(alloc, &shell, steering, null)).?;
+    defer waiting.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, waiting.bytes, "accepted earlier") != null);
+    try std.testing.expect(std.mem.find(u8, waiting.bytes, "accepted later") == null);
+    steering.pending_feedback = &.{};
+    try std.testing.expect((try buildPendingSteeringCardProjection(alloc, &shell, steering, null)) == null);
+
+    steering.waits_for_tool = false;
+    shell.layout.content_bottom = 1;
+    var clipped = (try buildPendingSteeringCardProjection(alloc, &shell, steering, null)).?;
+    defer clipped.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 1), clipped.paint_row_count);
+    for ([_]u16{ 1, 2 }) |cols| {
+        shell.layout.cols = cols;
+        try std.testing.expect((try buildPendingSteeringCardProjection(alloc, &shell, steering, null)) == null);
+    }
+}
+
 test "pending prompt uses the canonical user turn boundary" {
     try std.testing.expectEqual(
         @as(u16, 2),
@@ -2454,6 +2604,55 @@ test "pending prompt uses the canonical user turn boundary" {
         @as(u16, 1),
         pendingCardLeadingAdvanceRows(19, 47, 20),
     );
+}
+
+test "pending prompt painting fits the solved transcript band" {
+    const card: PendingCardProjection = .{
+        .bytes = @constCast("first\r\nsecond\r\nlast"),
+        .paint_row_count = 3,
+        .row_count = 5,
+        .leading_advance_rows = 2,
+    };
+    const clipped = PendingCardPaintContext.init(card, .{
+        .top = 1,
+        .bottom = 3,
+        .owner = .transcript,
+    }, null, true).?;
+    try std.testing.expectEqual(@as(u16, 1), clipped.row);
+    try std.testing.expectEqual(@as(u16, 2), clipped.max_rows);
+    try std.testing.expectEqualStrings("second\r\nlast", clipped.bytes);
+
+    const tiny = PendingCardPaintContext.init(card, .{
+        .top = 1,
+        .bottom = 1,
+        .owner = .transcript,
+    }, null, false).?;
+    try std.testing.expectEqual(@as(u16, 1), tiny.max_rows);
+    try std.testing.expectEqualStrings("last", tiny.bytes);
+    try std.testing.expect(PendingCardPaintContext.init(
+        card,
+        .empty(.transcript),
+        null,
+        true,
+    ) == null);
+
+    const following = PendingCardPaintContext.init(card, .{
+        .top = 1,
+        .bottom = 8,
+        .owner = .transcript,
+    }, 3, true).?;
+    try std.testing.expectEqual(@as(u16, 5), following.row);
+    try std.testing.expectEqual(@as(u16, 3), following.max_rows);
+    try std.testing.expectEqualStrings(card.bytes, following.bytes);
+
+    const last_row = PendingCardPaintContext.init(card, .{
+        .top = 1,
+        .bottom = 8,
+        .owner = .transcript,
+    }, 6, true).?;
+    try std.testing.expectEqual(@as(u16, 8), last_row.row);
+    try std.testing.expectEqual(@as(u16, 1), last_row.max_rows);
+    try std.testing.expectEqualStrings("last", last_row.bytes);
 }
 
 test "assistant tail writability changes remain traceable" {
@@ -2641,13 +2840,13 @@ test "core.app_render_runtime rejects prepared transcript outside final plan ban
 }
 
 noinline fn shouldResetPhysicalTerminal(
-    child_view_active: bool,
+    alternate_screen_active: bool,
     main_reset_pending: bool,
 ) bool {
-    return !child_view_active and main_reset_pending;
+    return !alternate_screen_active and main_reset_pending;
 }
 
-test "core.app_render_runtime child presentation cannot reset primary scrollback" {
+test "core.app_render_runtime alternate presentation cannot reset primary scrollback" {
     try std.testing.expect(!shouldResetPhysicalTerminal(true, true));
     try std.testing.expect(!shouldResetPhysicalTerminal(true, false));
     try std.testing.expect(!shouldResetPhysicalTerminal(false, false));
@@ -3096,11 +3295,15 @@ test "core.app_render_runtime animation retry stays ahead of a newer fact" {
 
 const CoordinatorTestWorker = struct {
     submitted_permission: ?types.ToolPermissionDecision = null,
-    queued_count: usize = 0,
-    paused: bool = false,
+    cancel_requested: bool = false,
+    cancel_continues_turn: bool = false,
 
-    pub fn queuePreview(self: *@This()) worker_runtime.QueuePreview {
-        return .{ .count = self.queued_count, .paused = self.paused };
+    pub fn isCancelRequested(self: *const @This()) bool {
+        return self.cancel_requested;
+    }
+
+    pub fn cancellationStopsTurn(self: *const @This()) bool {
+        return self.cancel_requested and !self.cancel_continues_turn;
     }
 
     pub fn submitPermissionResponse(
@@ -3186,7 +3389,6 @@ const CoordinatorTestApp = struct {
     shell: transcript_runtime.TranscriptRuntime,
     metrics: types.Metrics = .{},
     input_runtime: core_input_runtime.Runtime = .{},
-    queued_prompt_review: input_queue_runtime.State = .{},
     terminal_input_runtime: ui_input.Runtime = .{},
     approval_prompt: approval_prompt.ApprovalPrompt = .{},
     approval_screen: interaction_state.ApprovalScreenState = .{},
@@ -3220,7 +3422,6 @@ const CoordinatorTestApp = struct {
 
     fn deinit(self: *CoordinatorTestApp) void {
         self.shell.deinit(self.alloc);
-        self.queued_prompt_review.deinit(self.alloc);
         self.input_runtime.deinit(self.alloc);
         self.terminal_input_runtime.deinit(self.alloc);
         self.approval_prompt.deinit(self.alloc);
@@ -3257,7 +3458,6 @@ const CoordinatorTestApp = struct {
 
     pub fn resolvedModelCapabilities(self: *CoordinatorTestApp, model: []const u8) model_capabilities.Capabilities {
         var fallback = model_capabilities.Capabilities{
-            .prompt_caching = true,
             .context_window = 1_000_000,
         };
         if (self.intrinsic_fast_model) |intrinsic_model| {
@@ -3282,19 +3482,6 @@ const CoordinatorTestApp = struct {
         return false;
     }
 };
-
-fn makeCoordinatorReviewEntry(
-    alloc: std.mem.Allocator,
-    turn_id: u64,
-    text: []const u8,
-) !input_queue_runtime.ReviewEntry {
-    return .{ .draft = .{
-        .turn_id = turn_id,
-        .prompt = try alloc.dupe(u8, text),
-        .images = &.{},
-        .skill_display_spans = &.{},
-    } };
-}
 
 fn initCoordinatorProjectionTestApp(
     alloc: std.mem.Allocator,
@@ -3344,12 +3531,12 @@ test "core.app_render_runtime keeps final token progress during paced response t
     defer app.deinit();
 
     var upgrade_status_buf: [64]u8 = undefined;
-    const queued_cards: QueuedCardProjection = .{};
+    const steering: SteeringProjection = .{};
     const ctx = Runtime(CoordinatorTestApp).footerContext(
         &app,
         &upgrade_status_buf,
         0,
-        &queued_cards,
+        &steering,
     );
 
     try std.testing.expectEqual(progress, ctx.stream.token_progress);
@@ -3368,6 +3555,66 @@ test "core.app_render_runtime keeps final token progress during paced response t
     }
 }
 
+test "core.app_render_runtime hides loading after active tool cancellation" {
+    const alloc = std.testing.allocator;
+    var app = CoordinatorTestApp{
+        .alloc = alloc,
+        .shell = .{},
+        .stream = .{ .active = true },
+    };
+    defer app.deinit();
+    app.worker.cancel_requested = true;
+    _ = try app.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = .{ .turn_id = 1, .call_id = "command" },
+        .reconciles_provisional_call_id = null,
+        .tool_name = "run_command",
+        .activity_kind = .command,
+    } });
+
+    var upgrade_status_buf: [64]u8 = undefined;
+    const steering: SteeringProjection = .{};
+    const ctx = Runtime(CoordinatorTestApp).footerContext(
+        &app,
+        &upgrade_status_buf,
+        0,
+        &steering,
+    );
+
+    try std.testing.expect(!ctx.stream.active);
+    var activity_buf: [128]u8 = undefined;
+    try std.testing.expect(
+        render_input.frameOwnedActivityProjection(
+            &activity_buf,
+            &app.shell,
+            ctx,
+            null,
+        ) == .none,
+    );
+}
+
+test "core.app_render_runtime keeps loading while cancellation continues the turn" {
+    const alloc = std.testing.allocator;
+    var app = CoordinatorTestApp{
+        .alloc = alloc,
+        .shell = .{},
+        .stream = .{ .active = true },
+    };
+    defer app.deinit();
+    app.worker.cancel_requested = true;
+    app.worker.cancel_continues_turn = true;
+
+    var upgrade_status_buf: [64]u8 = undefined;
+    const steering: SteeringProjection = .{};
+    const ctx = Runtime(CoordinatorTestApp).footerContext(
+        &app,
+        &upgrade_status_buf,
+        0,
+        &steering,
+    );
+
+    try std.testing.expect(ctx.stream.active);
+}
+
 test "core.app_render_runtime keeps configured controls visible while model capabilities load" {
     const alloc = std.testing.allocator;
     var app = CoordinatorTestApp{
@@ -3381,23 +3628,20 @@ test "core.app_render_runtime keeps configured controls visible while model capa
     try app.selected_model.appendSlice(alloc, "anthropic/claude-opus-4.8");
 
     var upgrade_status_buf: [64]u8 = undefined;
-    const queued_cards: QueuedCardProjection = .{};
+    const steering: SteeringProjection = .{};
     const ctx = Runtime(CoordinatorTestApp).footerContext(
         &app,
         &upgrade_status_buf,
         0,
-        &queued_cards,
+        &steering,
     );
 
     var hint_buf: [128]u8 = undefined;
     const line = ui_render.buildHintLine(
-        ctx.stream.active,
         false,
         ctx.has_api_key,
         ctx.model,
         ctx.permission_mode,
-        ctx.queued_count,
-        null,
         ctx.fast_indicator_active,
         ctx.effort,
         ctx.model_supports_effort,
@@ -3439,12 +3683,12 @@ test "core.app_render_runtime keeps Kimi fast indicator stable across catalog hy
             try app.selected_model.appendSlice(std.testing.allocator, case.model);
 
             var upgrade_status_buf: [64]u8 = undefined;
-            const queued_cards: QueuedCardProjection = .{};
+            const steering: SteeringProjection = .{};
             const ctx = Runtime(CoordinatorTestApp).footerContext(
                 &app,
                 &upgrade_status_buf,
                 0,
-                &queued_cards,
+                &steering,
             );
 
             try std.testing.expectEqual(case.expected_indicator, ctx.fast_indicator_active);
@@ -3463,12 +3707,12 @@ test "core.app_render_runtime keeps a bound fast preference stable after catalog
     try app.selected_model.appendSlice(std.testing.allocator, "anthropic/claude-fable-5");
 
     var upgrade_status_buf: [64]u8 = undefined;
-    const queued_cards: QueuedCardProjection = .{};
+    const steering: SteeringProjection = .{};
     const ctx = Runtime(CoordinatorTestApp).footerContext(
         &app,
         &upgrade_status_buf,
         0,
-        &queued_cards,
+        &steering,
     );
 
     try std.testing.expect(ctx.fast_indicator_active);
@@ -3492,12 +3736,12 @@ test "core.app_render_runtime projects only the visible inline completion suffix
     try app.input_runtime.textReplacementState().replace(alloc, "explain $man");
 
     var upgrade_status_buf: [64]u8 = undefined;
-    const queued_cards: QueuedCardProjection = .{};
+    const steering: SteeringProjection = .{};
     const ctx = Runtime(CoordinatorTestApp).footerContext(
         &app,
         &upgrade_status_buf,
         0,
-        &queued_cards,
+        &steering,
     );
 
     try std.testing.expectEqualStrings("aged-menu", ctx.inline_completion_suffix);
@@ -3516,12 +3760,12 @@ test "core.app_render_runtime projects an inline slash completion suffix after t
     try app.input_runtime.textReplacementState().replace(alloc, "explain /he");
 
     var upgrade_status_buf: [64]u8 = undefined;
-    const queued_cards: QueuedCardProjection = .{};
+    const steering: SteeringProjection = .{};
     const ctx = Runtime(CoordinatorTestApp).footerContext(
         &app,
         &upgrade_status_buf,
         0,
-        &queued_cards,
+        &steering,
     );
 
     try std.testing.expectEqualStrings("/help", ctx.slash_registry.commands[0].command);
@@ -3549,12 +3793,9 @@ test "core.app_render_runtime projects Opus 4.8 one million token context to foo
     var buf: [128]u8 = undefined;
     const line = ui_render.buildHintLine(
         false,
-        false,
         true,
         "anthropic/claude-opus-4.8",
         .ask,
-        0,
-        null,
         false,
         .auto,
         true,
@@ -4171,80 +4412,6 @@ test "core.app_render_runtime inline menus survive the VT size and resize matrix
     defer alloc.free(terminal_bytes);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, terminal_bytes, "\x1b[?1049h"));
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, terminal_bytes, "\x1b[?1049l"));
-}
-
-test "core.app_render_runtime width-changed queued editor keeps mention navigation and render aligned" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var file = try tmp.dir.createFile(std.testing.io, "skills-queue-width.log", .{ .read = true });
-    defer file.close(io_mod.getIo());
-
-    const skills = [_]skill_runtime.Skill{
-        .{ .name = "one", .description = "", .path = "/tmp/one", .source = .global_fx },
-        .{ .name = "two", .description = "", .path = "/tmp/two", .source = .global_fx },
-        .{ .name = "three", .description = "", .path = "/tmp/three", .source = .global_fx },
-        .{ .name = "four", .description = "", .path = "/tmp/four", .source = .global_fx },
-        .{ .name = "five", .description = "", .path = "/tmp/five", .source = .global_fx },
-        .{ .name = "six", .description = "", .path = "/tmp/six", .source = .global_fx },
-        .{ .name = "seven", .description = "", .path = "/tmp/seven", .source = .global_fx },
-    };
-    var app = CoordinatorTestApp{
-        .alloc = alloc,
-        .shell = .{
-            .stdout_file = file,
-            .layout = .{
-                .rows = 24,
-                .cols = 40,
-                .content_bottom = 20,
-                .divider_top_row = 21,
-                .input_row = 22,
-                .divider_bottom_row = 23,
-                .hint_row = 24,
-            },
-            .owned_top_row = 1,
-            .viewport_top_row = 1,
-        },
-    };
-    defer app.deinit();
-    try app.selected_model.appendSlice(alloc, "test-model");
-    app.skills.items = @constCast(&skills);
-    app.skills.openMenuWithQuery(.dollar, .{ .start = 0, .end = 1 }, "");
-    try app.input_runtime.textReplacementState().replace(alloc, "$" ++ "x" ** 59);
-
-    const entries = try alloc.alloc(input_queue_runtime.ReviewEntry, 2);
-    entries[0] = try makeCoordinatorReviewEntry(alloc, 1, "stored");
-    entries[1] = try makeCoordinatorReviewEntry(alloc, 2, "selected");
-    app.queued_prompt_review = .{
-        .entries = entries,
-        .selected_index = 1,
-        .reason = .manual,
-        .visible = true,
-    };
-    app.worker.queued_count = 2;
-
-    try app.shell.initBacking(alloc);
-    try app.shell.enableShadowVt(alloc);
-    try app.shell.writeTranscript(alloc, &app.metrics, "queue width transcript\n", true);
-    app.shell.render_requests.request(.footer);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
-
-    app.shell.layout.cols = 12;
-    const completion = input_completion_runtime.CompletionRuntime(CoordinatorTestApp);
-    try completion.routeModifiedHistory(&app, .down, 1);
-    try completion.routeModifiedHistory(&app, .down, 1);
-    try completion.routeModifiedHistory(&app, .down, 1);
-    try std.testing.expectEqual(@as(usize, 3), app.skills.menu.selected_index);
-    try std.testing.expectEqual(@as(usize, 1), app.skills.menu.window_start);
-
-    app.shell.render_requests.request(.resize);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
-
-    try std.testing.expectEqual(@as(u16, 12), app.shell.shadow_vt.?.cols);
-    try std.testing.expectEqual(@as(usize, 3), app.skills.menu.selected_index);
-    try std.testing.expectEqual(@as(usize, 1), app.skills.menu.window_start);
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "four"));
-    try std.testing.expect(!app.terminal.catalogMenuScreenActive());
 }
 
 test "core.app_render_runtime active setup hub stays on the inline transcript surface" {
@@ -5078,7 +5245,7 @@ test "core.app_render_runtime full transcript defers repaint until its page is r
     ));
 }
 
-test "core.app_render_runtime changed resized full transcript close preserves primary history without full replay" {
+test "core.app_render_runtime full transcript resize defers history reset until primary restoration" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5132,21 +5299,34 @@ test "core.app_render_runtime changed resized full transcript close preserves pr
         .hint_row = 18,
     };
     try app.shell.requestTerminalResetAfterResize(&app.metrics, null);
+    var read_offset = try file.length(io_mod.getIo());
     try app.shell.writeTranscript(
         alloc,
         &app.metrics,
         "new output while review is open\n",
         true,
     );
+    for (0..100_000) |_| {
+        try app.shell.prewarmFullTranscriptPage(null, null);
+        _ = try app.shell.pollFullTranscriptPageLoad();
+        if (app.shell.fullTranscriptPreparedForOpen()) break;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    try std.testing.expect(app.shell.fullTranscriptPreparedForOpen());
+    app.shell.render_requests.request(.transcript);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    const resize_bytes = try readCoordinatorFrameBytes(alloc, file, &read_offset);
+    defer alloc.free(resize_bytes);
+    try std.testing.expect(app.terminal.fullTranscriptScreenActive());
+    try std.testing.expect(resize_bytes.len > 0);
+    try std.testing.expect(std.mem.find(u8, resize_bytes, "\x1b[3J") == null);
 
-    var read_offset = try file.length(io_mod.getIo());
     try app_lifecycle.closeFullTranscript(app.alloc, &app.terminal, &app.shell, &app.metrics);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
     const close_bytes = try readCoordinatorFrameBytes(alloc, file, &read_offset);
     defer alloc.free(close_bytes);
 
-    try std.testing.expect(std.mem.find(u8, close_bytes, "\x1b[3J") == null);
+    try std.testing.expect(std.mem.find(u8, close_bytes, "\x1b[3J") != null);
     try std.testing.expect(close_bytes.len < 16 * 1024);
     try std.testing.expect(try coordinatorGridContains(
         app.shell.shadow_vt.?.*,

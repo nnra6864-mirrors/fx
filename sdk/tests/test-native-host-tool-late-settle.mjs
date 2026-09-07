@@ -57,7 +57,11 @@ async function exerciseLateSettlement(closeBeforeSettle) {
     agent = await createFxAgent({
       backend: "native",
       nativeAddon: resolve(scriptDir, "../../zig-out/lib/libfx.node"),
-      fetch,
+      fetch(input, init) {
+        const url = init.method === "GET" ? `http://127.0.0.1:${server.address().port}/models` : input;
+        assert.equal(new URL(url).origin, `http://127.0.0.1:${server.address().port}`);
+        return fetch(url, init);
+      },
       onEvent(event) { events.push(event); },
       tools: [{
         name: "late",
@@ -69,11 +73,9 @@ async function exerciseLateSettlement(closeBeforeSettle) {
           return new Promise((resolveTool) => { toolResolve = resolveTool; });
         },
       }],
-      env: {
-        AI_GATEWAY_API_KEY: "late-tool-key",
-        FX_GATEWAY_CHAT_URL: `http://127.0.0.1:${server.address().port}/chat`,
-        FX_MODEL: "late-tool/model",
-      },
+      apiKey: "late-tool-key",
+      gatewayChatUrl: `http://127.0.0.1:${server.address().port}/chat`,
+      model: "late-tool/model",
     });
 
     const controller = new AbortController();

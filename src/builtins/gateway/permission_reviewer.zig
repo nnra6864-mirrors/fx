@@ -11,6 +11,7 @@ const vercel_protocol = @import("../../gateway/vercel_protocol.zig");
 const Allocator = std.mem.Allocator;
 
 const single_transport_attempt: usize = 1;
+const reviewer_model = "openai/gpt-5.6-luna";
 
 const StreamFn = *const fn (
     *anyopaque,
@@ -29,7 +30,7 @@ const StreamFn = *const fn (
 var default_stream_ctx: u8 = 0;
 
 const GatewayConfig = struct {
-    api_key: []const u8,
+    api_key: ?[]const u8,
     credential_source: ?types.CredentialSource = null,
     team: ?[]const u8 = null,
     chat_url: []const u8,
@@ -49,7 +50,7 @@ fn reviewGateway(
     request: permission_auto_classifier.ReviewRequest,
 ) anyerror!permission_auto_classifier.ParseOutcome {
     return reviewGatewayConfig(.{
-        .api_key = input.credential,
+        .api_key = if (input.credential_source == .host_managed) null else input.credential,
         .credential_source = input.credential_source,
         .team = input.tenant,
         .chat_url = input.endpoint,
@@ -65,7 +66,7 @@ fn reviewGatewayConfig(
     request: permission_auto_classifier.ReviewRequest,
 ) !permission_auto_classifier.ParseOutcome {
     var local = config;
-    return permission_auto_classifier.Reviewer.withTransport(
+    return permission_auto_classifier.Reviewer.withTransportModel(
         .{
             .context = @ptrCast(&local),
             .send_fn = sendGatewayReview,
@@ -73,6 +74,7 @@ fn reviewGatewayConfig(
         },
         local.cancel_flag,
         permission_auto_classifier.Reviewer.default_timeout_ms,
+        reviewer_model,
     ).review(alloc, request);
 }
 
@@ -81,6 +83,7 @@ fn buildGatewayReview(
     alloc: Allocator,
     _: []const u8,
     tools_json: []const u8,
+    instructions: []const types.ChatMessage,
     messages: []const types.ChatMessage,
     target_call_id: []const u8,
     deadline: std.Io.Clock.Timestamp,
@@ -89,6 +92,7 @@ fn buildGatewayReview(
     return vercel_protocol.buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
         alloc,
         tools_json,
+        instructions,
         messages,
         target_call_id,
         .{},
@@ -123,7 +127,7 @@ fn sendGatewayReview(
         .{ model, single_transport_attempt },
     );
     if (cancel_flag.load(.seq_cst)) return .cancelled;
-    if (config.api_key.len == 0 or config.chat_url.len == 0) {
+    if ((config.api_key == null and config.credential_source != .host_managed) or config.chat_url.len == 0) {
         debug_trace.logf("permission", "event=auto_review_transport result=permanent_failure reason=missing_gateway_config", .{});
         return .permanent_failure;
     }
@@ -140,7 +144,7 @@ fn sendGatewayReview(
     var stream = config.stream_fn(
         config.stream_ctx,
         alloc,
-        config.api_key,
+        config.api_key orelse "",
         config.team,
         model,
         single_transport_attempt,
@@ -182,11 +186,18 @@ fn sendGatewayReview(
         return .permanent_failure;
     };
     if (stream.status == .ok and std.meta.activeTag(usage_outcome) == .deferred) if (config.usage) |ledger| {
-        ledger.startDeferredReconciliation(
-            config.usage_allocator,
-            usage_outcome.deferred,
-            config.api_key,
-        );
+        if (config.api_key) |api_key| {
+            ledger.startDeferredReconciliation(
+                config.usage_allocator,
+                usage_outcome.deferred,
+                api_key,
+            );
+        } else if (config.credential_source == .host_managed) {
+            ledger.startHostManagedDeferredReconciliation(
+                config.usage_allocator,
+                usage_outcome.deferred,
+            );
+        }
     };
 
     if (cancel_flag.load(.seq_cst)) {
@@ -310,7 +321,7 @@ fn streamGatewayReviewer(
     return gateway_client.streamGatewayRequiredToolCompletionBounded(
         alloc,
         .{
-            .api_key = api_key,
+            .api_key = if (api_key.len > 0) api_key else null,
             .team = team,
             .model = model,
             .retry_count = retry_count,
@@ -359,7 +370,7 @@ const FakeStream = struct {
         const self: *FakeStream = @ptrCast(@alignCast(raw_ctx));
         if (self.calls < self.deadlines.len) self.deadlines[self.calls] = deadline;
         self.saw_single_attempt_only = self.saw_single_attempt_only and retry_count == 1;
-        self.saw_expected_model_only = self.saw_expected_model_only and std.mem.eql(u8, model, "moonshotai/kimi-k3");
+        self.saw_expected_model_only = self.saw_expected_model_only and std.mem.eql(u8, model, reviewer_model);
         self.saw_required_tool_payload = self.saw_required_tool_payload and
             std.mem.find(u8, payload, "permission_decision") != null;
         const outcome = self.outcomes[@min(self.calls, self.outcomes.len - 1)];

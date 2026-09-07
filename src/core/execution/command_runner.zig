@@ -49,6 +49,7 @@ const command_artifact_stdout_suffix = ".stdout.log";
 const command_artifact_stderr_suffix = ".stderr.log";
 const pending_output_flush_bytes: usize = 4096;
 const command_output_poll_ms: i64 = 100;
+pub const termination_settle_timeout_ms: i64 = 5_000;
 const supports_foreground_session = builtin.link_libc and
     std.process.can_spawn and
     std.process.can_replace and
@@ -1018,13 +1019,16 @@ fn finishCollectedProcess(
     output_incomplete: bool,
     duration_ms: u64,
     source: TerminationSource,
+    preserve_cancelled_status: bool,
 ) !CollectedProcess {
     switch (source) {
         .timed_out => return error.TimeoutExpired,
         .natural => {},
         .cancelled => {
-            if (output.totalBytes() == 0) return error.Cancelled;
-            if (output.artifact == null) {
+            if (!preserve_cancelled_status and output.totalBytes() == 0) {
+                return error.Cancelled;
+            }
+            if (output.totalBytes() != 0 and output.artifact == null) {
                 output.startArtifact() catch |err| {
                     debug_trace.logf("core", "cancelled command artifact promotion failed err={s}", .{@errorName(err)});
                     return error.Cancelled;
@@ -1116,6 +1120,7 @@ fn executeProcessWithInput(
         collected.output_incomplete,
         duration_ms,
         collected.source,
+        cfg.force_cancel_flag != null,
     );
 }
 
@@ -1248,6 +1253,7 @@ fn executeProcessWithDetachedSession(
         collected.output_incomplete,
         duration_ms,
         collected.source,
+        cfg.force_cancel_flag != null,
     );
 }
 
@@ -1396,6 +1402,7 @@ fn executeProcessWithScriptUnisolated(
         collected.output_incomplete,
         duration_ms,
         collected.source,
+        cfg.force_cancel_flag != null,
     );
 }
 
@@ -1820,7 +1827,7 @@ fn commandStatusFromTerm(term: std.process.Child.Term) command_contract.CommandS
     return switch (term) {
         .exited => |code| .{ .exit_code = @intCast(code) },
         .signal => |sig| .{ .signal = @intFromEnum(sig) },
-        else => .finished,
+        .stopped, .unknown => .indeterminate,
     };
 }
 
@@ -2297,7 +2304,16 @@ const ProcessObserver = struct {
             );
             return .indeterminate;
         }
-        return commandStatusFromTerm(term);
+        const status = commandStatusFromTerm(term);
+        switch (status) {
+            .indeterminate => debug_trace.logf(
+                "core",
+                "command termination became indeterminate boundary=child_term term={s}",
+                .{@tagName(std.meta.activeTag(term))},
+            ),
+            .exit_code, .signal, .finished => {},
+        }
+        return status;
     }
 
     fn indeterminateStatus(
@@ -2305,7 +2321,7 @@ const ProcessObserver = struct {
     ) command_contract.CommandStatus {
         debug_trace.logf(
             "core",
-            "command termination became indeterminate err={s}",
+            "command termination became indeterminate boundary=process_wait err={s}",
             .{@errorName(err)},
         );
         return .indeterminate;
@@ -2349,6 +2365,17 @@ const ProcessObserver = struct {
         self.waiter.awaitDiscard();
     }
 };
+
+fn termination_settle_expired(
+    signal_started_ms: ?i64,
+    force_kill_sent: bool,
+    now_ms: i64,
+) bool {
+    const started_ms = signal_started_ms orelse return false;
+    return force_kill_sent and
+        now_ms >= started_ms and
+        now_ms - started_ms >= termination_settle_timeout_ms;
+}
 
 fn collectOutput(
     arena: Allocator,
@@ -2410,6 +2437,28 @@ fn collectOutput(
                     }
                 }
             }
+        }
+
+        const now_ms = io_mod.milliTimestamp();
+        if (termination_settle_expired(
+            signal_started_ms,
+            force_kill_sent,
+            now_ms,
+        )) {
+            debug_trace.logf(
+                "core",
+                "command termination settlement expired boundary=post_force source={s} wait_ready={s}",
+                .{
+                    @tagName(source.*),
+                    if (observer.waiter.isReady()) "true" else "false",
+                },
+            );
+            recordOutputDrainFailure(
+                &output_incomplete,
+                "termination_settle_deadline",
+                error.Timeout,
+            );
+            break;
         }
 
         if (streams_finished) {
@@ -2824,7 +2873,11 @@ test "format output covers stdout stderr empty signal and unknown statuses" {
 
     const none = try formatOutput(std.testing.allocator, "cmd", "/tmp", .{ .unknown = 9 }, "", "", null);
     defer std.testing.allocator.free(none.output);
-    try std.testing.expectEqualStrings("process finished\n(no output)\n", none.output);
+    try std.testing.expect(std.mem.find(
+        u8,
+        none.output,
+        "termination_indeterminate=true\n",
+    ) != null);
 
     const signaled = try formatOutput(std.testing.allocator, "cmd", "/tmp", .{ .signal = .TERM }, "", "", null);
     defer std.testing.allocator.free(signaled.output);
@@ -4263,6 +4316,24 @@ test "termination result follows the delivered signal source" {
     try std.testing.expectEqual(
         TerminationSource.cancelled,
         reconcileForegroundTerminationSource(.cancelled, 1700, 2000),
+    );
+}
+
+test "forced termination settlement expires only after its deadline" {
+    try std.testing.expect(!termination_settle_expired(null, true, 10_000));
+    try std.testing.expect(!termination_settle_expired(5_000, false, 10_000));
+    try std.testing.expect(!termination_settle_expired(5_000, true, 9_999));
+    try std.testing.expect(termination_settle_expired(5_000, true, 10_000));
+}
+
+test "nonterminal child terms remain indeterminate" {
+    try std.testing.expectEqual(
+        command_contract.CommandStatus.indeterminate,
+        commandStatusFromTerm(.{ .unknown = 0 }),
+    );
+    try std.testing.expectEqual(
+        command_contract.CommandStatus.indeterminate,
+        commandStatusFromTerm(.{ .stopped = std.posix.SIG.STOP }),
     );
 }
 

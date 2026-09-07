@@ -40,16 +40,15 @@ pub fn review(
     request: permission_auto_classifier.ReviewRequest,
     adapter: Adapter,
 ) !permission_auto_classifier.ParseOutcome {
-    if (input.credential.len == 0) {
-        return .{ .invalid = .provider_context_missing };
+    if (reviewInputFailure(input, adapter.require_account)) |reason| {
+        return .{ .invalid = reason };
     }
-    if (adapter.require_account and input.account_id == null) {
-        return .{ .invalid = .provider_context_missing };
+    if (input.credential_source != .host_managed) {
+        adapter.validate_fn(alloc, input) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return .{ .invalid = .provider_failed };
+        };
     }
-    adapter.validate_fn(alloc, input) catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        return .{ .invalid = .provider_failed };
-    };
     var runtime = Runtime{ .input = input, .adapter = adapter };
     return permission_auto_classifier.Reviewer.withTransportModel(
         .{
@@ -63,11 +62,22 @@ pub fn review(
     ).review(alloc, request);
 }
 
+fn reviewInputFailure(
+    input: permission_auto_classifier.ProviderInput,
+    require_account: bool,
+) ?permission_auto_classifier.InvalidReason {
+    if (input.credential_source == .host_managed) return null;
+    if (input.credential.len == 0) return .provider_context_missing;
+    if (require_account and input.account_id == null) return .provider_context_missing;
+    return null;
+}
+
 fn buildReviewPayload(
     raw: *anyopaque,
     alloc: Allocator,
     model: []const u8,
     _: []const u8,
+    instructions: []const types.ChatMessage,
     messages: []const types.ChatMessage,
     target_call_id: []const u8,
     deadline: std.Io.Clock.Timestamp,
@@ -84,6 +94,7 @@ fn buildReviewPayload(
     defer alloc.free(expanded);
     return runtime.adapter.build_fn(alloc, .{
         .model = model,
+        .instructions = instructions,
         .messages = expanded,
         .tools = .{ .additional_functions = &.{permission_auto_classifier.function_schema} },
         .tool_choice = .required,
@@ -96,6 +107,7 @@ fn buildReviewPayload(
 pub fn buildPayloadForTest(
     alloc: Allocator,
     model: []const u8,
+    instructions: []const types.ChatMessage,
     messages: []const types.ChatMessage,
     target_call_id: []const u8,
     deadline: std.Io.Clock.Timestamp,
@@ -117,6 +129,7 @@ pub fn buildPayloadForTest(
         alloc,
         model,
         "",
+        instructions,
         messages,
         target_call_id,
         deadline,
@@ -125,6 +138,52 @@ pub fn buildPayloadForTest(
 }
 
 fn validateUnavailable(_: Allocator, _: permission_auto_classifier.ProviderInput) !void {}
+
+test "host-managed permission review accepts absent local credential metadata" {
+    try std.testing.expect(reviewInputFailure(.{
+        .credential_source = .host_managed,
+    }, true) == null);
+}
+
+test "permission review separates instructions from tool conversation" {
+    const Capture = struct {
+        fn build(alloc: Allocator, request: stream_provider.RequestData) ![]u8 {
+            try std.testing.expectEqual(@as(usize, 1), request.instructions.len);
+            try std.testing.expectEqual(types.ChatRole.system, request.instructions[0].role);
+            try std.testing.expectEqualStrings("Review only install.", request.instructions[0].content.?);
+            try std.testing.expectEqual(@as(usize, 3), request.messages.len);
+            for (request.messages) |message| try std.testing.expect(message.role != .system);
+            return alloc.dupe(u8, "payload");
+        }
+    };
+
+    var cancel = std.atomic.Value(bool).init(false);
+    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+        .clock = .awake,
+        .raw = .fromSeconds(1),
+    });
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "Review only install." }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "Install dependencies." },
+        .{ .role = .assistant, .tool_calls = &.{.{
+            .id = "install",
+            .name = "run_command",
+            .arguments_json = "{\"command\":\"pnpm install\"}",
+        }} },
+    };
+    const payload = try buildPayloadForTest(
+        std.testing.allocator,
+        "gpt-review",
+        &instructions,
+        &messages,
+        "install",
+        deadline,
+        &cancel,
+        Capture.build,
+    );
+    defer std.testing.allocator.free(payload);
+    try std.testing.expectEqualStrings("payload", payload);
+}
 
 const OwnedResult = struct {
     result: stream_provider.Result,
@@ -175,12 +234,15 @@ fn sendReview(
     };
     var callback_context: u8 = 0;
     var result = runtime.adapter.send_fn(alloc, .{
-        .credential = .{
-            .secret = runtime.input.credential,
-            .source = runtime.adapter.source,
-            .account_id = runtime.input.account_id,
-            .tenant = runtime.input.tenant,
-        },
+        .credential = if (runtime.input.credential_source == .host_managed)
+            .host_managed
+        else
+            .{ .direct = .{
+                .secret_bytes = runtime.input.credential,
+                .source = runtime.adapter.source,
+                .account_id = runtime.input.account_id,
+                .tenant_context = runtime.input.tenant,
+            } },
         .model = model,
         .retry_count = 1,
         .messages = &.{},

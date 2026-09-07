@@ -61,11 +61,9 @@ try {
     ...(backend === "wasm" ? { wasm: await readFile(wasmPath) } : {}),
     fetch,
     onEvent(event) { sdkEvents.push(event); },
-    env: {
-      AI_GATEWAY_API_KEY: "host-tool-key",
-      FX_GATEWAY_CHAT_URL: `http://127.0.0.1:${port}/chat`,
-      FX_MODEL: "host/tool-model",
-    },
+    apiKey: "host-tool-key",
+    gatewayChatUrl: `http://127.0.0.1:${port}/chat`,
+    model: "host/tool-model",
     tools: [{
       name: "lookup",
       description: "Look up a value by key.",

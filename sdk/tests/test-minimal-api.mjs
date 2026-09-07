@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 import { createFxAgent } from "../node.js";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
+let requestedAuthorization;
+let requestedModel;
 const server = createServer((request, response) => {
   request.resume();
   request.on("end", () => {
@@ -14,6 +16,8 @@ const server = createServer((request, response) => {
       response.end(JSON.stringify({ object: "list", data: [{ id: "minimal/model", type: "language" }] }));
       return;
     }
+    requestedAuthorization = request.headers.authorization;
+    requestedModel = request.headers["ai-language-model-id"];
     response.writeHead(200, { "content-type": "text/event-stream" });
     response.end([
       'data: {"type":"reasoning-delta","delta":"think"}',
@@ -33,11 +37,9 @@ try {
     backend: "native",
     nativeAddon: resolve(scriptDir, "../../zig-out/lib/libfx.node"),
     fetch,
-    env: {
-      AI_GATEWAY_API_KEY: "minimal-key",
-      FX_GATEWAY_CHAT_URL: `http://127.0.0.1:${port}/chat`,
-      FX_MODEL: "minimal/model",
-    },
+    apiKey: "minimal-key",
+    gatewayChatUrl: `http://127.0.0.1:${port}/chat`,
+    model: "minimal/model",
   });
   assert.deepEqual(Object.keys(agent).sort(), ["checkpoint", "close", "prompt"]);
   const turn = agent.prompt("hello");
@@ -53,6 +55,8 @@ try {
     stopReason: "end_turn",
     usage: { inputTokens: 1, outputTokens: 1 },
   });
+  assert.equal(requestedAuthorization, "Bearer minimal-key");
+  assert.equal(requestedModel, "minimal/model");
   const checkpoint = await agent.checkpoint();
   assert.ok(checkpoint instanceof Uint8Array);
   assert.equal(await agent.close(), undefined);

@@ -35,7 +35,7 @@ if (!child) {
     backend,
     nativeAddon,
     ...(wasm ? { wasm } : {}),
-    env: { AI_GATEWAY_API_KEY: "bootstrap-test-key" },
+    apiKey: "bootstrap-test-key",
   };
   const attempts = backend === "native" ? 65 : 1;
 

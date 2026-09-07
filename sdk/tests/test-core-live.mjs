@@ -11,6 +11,7 @@ const wasmPath = resolve(process.argv[2] || defaultWasm);
 const backend = process.env.LIBFX_LIVE_BACKEND || "wasm";
 const nativeAddon = resolve(scriptDir, "../../zig-out/lib/libfx.node");
 const apiKey = process.env.AI_GATEWAY_API_KEY || process.env.FX_API_KEY;
+const model = process.env.FX_MODEL || "google/gemini-2.5-flash-lite";
 
 if (!supportsJspi()) {
   console.error("Node JSPI is disabled. Run with: node --experimental-wasm-jspi sdk/scripts/test-core-live.mjs");
@@ -71,7 +72,7 @@ const tracedFetch = async (url, init) => {
 };
 
 const agent = await Promise.race([
-  createFxAgent({ backend, nativeAddon, wasm: await readFile(wasmPath), fetch: tracedFetch, env: { AI_GATEWAY_API_KEY: apiKey } }),
+  createFxAgent({ backend, nativeAddon, wasm: await readFile(wasmPath), fetch: tracedFetch, apiKey, model }),
   new Promise((_, reject) => setTimeout(() => reject(new Error("timed out waiting for fx-core initialize")), 5000)),
 ]);
 

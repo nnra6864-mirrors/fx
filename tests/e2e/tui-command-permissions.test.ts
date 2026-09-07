@@ -21,7 +21,6 @@ import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   canonicalSubagentIdForStore,
-  classifierEvidenceFromRequest,
   fakeGatewayPermissionDecision,
   heldFakeGatewayFinalText,
   isVolatileTokenStatusRow,
@@ -138,16 +137,6 @@ function permissionDecision(
   toolCallId = "permission_decision_1",
 ) {
   return fakeGatewayPermissionDecision(decision, toolCallId, "deterministic test decision");
-}
-
-function classifierTrustContext(body: string): string {
-  const evidence = classifierEvidenceFromRequest(body);
-  const startMarker = "review_origin: ";
-  const endMarker = "Normalized action evidence";
-  const start = evidence.indexOf(startMarker);
-  const end = evidence.indexOf(endMarker, start);
-  if (start < 0 || end < 0) throw new Error("classifier trust context missing");
-  return evidence.slice(start, end);
 }
 
 function subagentCreateCall(
@@ -816,7 +805,7 @@ function normalizeVolatileStatusRows(grid: string[]): string[] {
     /^• Streaming \([^)]*\)$/.test(line) ||
       isVolatileTokenStatusRow(line)
       ? "<status>"
-      : line.replace(/\s+YOLO enabled: fx permission checks disabled$/, "")
+      : line.replace(/\s+Full access enabled: fx permission checks disabled$/, "")
   );
 }
 
@@ -824,8 +813,8 @@ test("volatile token status rows normalize before transcript grid comparison", (
   expect(normalizeVolatileStatusRows(["  (↑10 ↓5)"])).toEqual(["<status>"]);
   expect(normalizeVolatileStatusRows(["  0s (↑10 ↓5)"])).toEqual(["<status>"]);
   expect(normalizeVolatileStatusRows([
-    "YOLO · gpt-5                 YOLO enabled: fx permission checks disabled",
-  ])).toEqual(["YOLO · gpt-5"]);
+    "full access · gpt-5                 Full access enabled: fx permission checks disabled",
+  ])).toEqual(["full access · gpt-5"]);
 });
 
 describe("effect-aware command permissions", () => {
@@ -918,7 +907,7 @@ describe("effect-aware command permissions", () => {
         ],
         { cwd: root.workspace, env: gatewayEnv(root, cliResumeGateway) },
       );
-      expect(cliResume.code).toBe(0);
+      expect(cliResume.code, cliResume.stdout + cliResume.stderr).toBe(0);
       expect(cliResume.stderr).toBe("");
       expect(cliResumeGateway.requests).toHaveLength(1);
       expectGroupedContinuationRequest(cliResumeGateway.requests[0]!.body, feedback);
@@ -1280,6 +1269,60 @@ describe("effect-aware command permissions", () => {
       expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
     },
     90_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI reprojects completed command summaries after widening",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "command-summary-width-stderr.log");
+      const command =
+        "printf ok && printf '%s' alpha-beta-gamma-delta-epsilon-zeta-eta-theta-iota-kappa-lambda-mu-nu-xi-omicron-pi-rho-sigma-tau-upsilon-phi-chi-psi-omega >/dev/null";
+      const workspaceCommand =
+        `printf '%s' ${"absolute-path-prefix-".repeat(7)} ${root.workspace}/file >/dev/null`;
+      const gateway = startFakeGateway([
+        toolCall(command, {}, "command_summary_width"),
+        finalText("COMMAND_SUMMARY_WIDTH_COMPLETE"),
+        toolCall(workspaceCommand, {}, "workspace_command_summary_width"),
+        finalText("WORKSPACE_COMMAND_SUMMARY_WIDTH_COMPLETE"),
+      ]);
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          FX_PERMISSION_MODE: "yolo",
+        }),
+        stderrPath,
+        width: 100,
+        height: 32,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("Run the prepared command.");
+      await activeSession.waitForText("COMMAND_SUMMARY_WIDTH_COMPLETE", TIMEOUT);
+
+      const narrow = await activeSession.captureFullScrollback();
+      const narrowRow = narrow.split("\n").find((line) => line.includes("└ Ran printf ok"));
+      expect(narrowRow).toBeDefined();
+      expect(narrowRow).toEndWith("…");
+      expect(narrowRow).not.toContain("omega >/dev/null");
+
+      await activeSession.resizeWindow(240, 32);
+      const wide = await activeSession.captureFullScrollback();
+      const wideRow = wide.split("\n").find((line) => line.includes("└ Ran printf ok"));
+      expect(wideRow).toBe(`└ Ran ${command}`);
+
+      await activeSession.sendText("Run the next prepared command.");
+      await activeSession.waitForText("WORKSPACE_COMMAND_SUMMARY_WIDTH_COMPLETE", TIMEOUT);
+      const workspaceWide = await activeSession.captureFullScrollback();
+      const workspaceRow = workspaceWide.split("\n").find((line) =>
+        line.includes("└ Ran printf '%s' absolute-path-prefix-"),
+      );
+      expect(workspaceRow).toContain(" ./file >/dev/null");
+      expect(workspaceRow).not.toContain(root.workspace);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
   );
 
   test.skipIf(!tmuxAvailable())(
@@ -2354,7 +2397,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI auto mode keeps tools active across unavailable reviews",
+    "TUI auto mode keeps tools active after one unavailable review",
     async () => {
       const root = createIsolatedRoot();
       const marker = join(root.workspace, "classifier-fallback-approved.txt");
@@ -2367,12 +2410,13 @@ describe("effect-aware command permissions", () => {
           (body) => {
             expect(body).not.toContain('"tools":[]');
             expect(body).not.toContain('"toolChoice":{"type":"none"}');
+            expect(body).toContain("turn_review_budget_exhausted");
             return toolCall(command, {}, "invalid_review_4");
           },
           finalText("Reviewer unavailable handled normally."),
         ],
         {
-          classifierResponses: Array.from({ length: 4 }, () => finalText("invalid")),
+          classifierResponses: [finalText("invalid")],
         },
       );
       const tracePath = join(root.root, "trace.log");
@@ -2402,11 +2446,13 @@ describe("effect-aware command permissions", () => {
       expect(pane).not.toContain(COMMAND_APPROVAL_PROMPT);
       expect(existsSync(marker)).toBe(false);
       expect(gateway.requests).toHaveLength(5);
-      expect(gateway.classifierRequests).toHaveLength(4);
+      expect(gateway.classifierRequests).toHaveLength(1);
       const trace = readFileSync(tracePath, "utf8");
       expect(
         trace.match(/decision=unavailable fallback_reason=completion_text/g),
-      ).toHaveLength(4);
+      ).toHaveLength(1);
+      expect(trace.match(/event=auto_review_budget_exhausted/g)).toHaveLength(3);
+      expect(trace).not.toContain("event=turn_permission_denial_preserved");
       expect(trace).not.toContain("event=automatic_recovery_exhausted");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
@@ -3131,8 +3177,19 @@ describe("effect-aware command permissions", () => {
       );
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.classifierRequests).toHaveLength(1);
+      const classifierPrompt = JSON.parse(
+        gateway.classifierRequests[0]!.body,
+      ).prompt as Array<{ role: string }>;
+      const firstConversationIndex = classifierPrompt.findIndex(
+        (message) => message.role !== "system",
+      );
+      expect(classifierPrompt[0]?.role).toBe("system");
+      expect(firstConversationIndex).toBeGreaterThan(0);
+      expect(
+        classifierPrompt.slice(firstConversationIndex).map((message) => message.role),
+      ).not.toContain("system");
       expect(gateway.classifierRequests[0]!.headers.get("ai-language-model-id")).toBe(
-        "moonshotai/kimi-k3",
+        "openai/gpt-5.6-luna",
       );
       expect(JSON.parse(gateway.classifierRequests[0]!.body)).not.toHaveProperty(
         "providerOptions.gateway.speed",

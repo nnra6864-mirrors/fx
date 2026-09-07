@@ -15,7 +15,7 @@ pub const ParsedCommand = union(enum) {
     help,
     login,
     logout: []const u8,
-    setup,
+    provider,
     status,
     image: []const u8,
     images: []const u8,
@@ -54,7 +54,7 @@ pub const CommandHandlers = struct {
     show_help: *const fn (ctx: *anyopaque) anyerror!void,
     login: *const fn (ctx: *anyopaque) anyerror!void,
     logout: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
-    setup: *const fn (ctx: *anyopaque) anyerror!void,
+    provider: *const fn (ctx: *anyopaque) anyerror!void,
     show_status: *const fn (ctx: *anyopaque) anyerror!void,
     attach_image: *const fn (ctx: *anyopaque, path: []const u8) anyerror!void,
     manage_images: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
@@ -99,7 +99,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .help => .help,
         .login => .login,
         .logout => .{ .logout = payload },
-        .setup => .setup,
+        .provider => .provider,
         .status => .status,
         .images => .{ .images = payload },
         .image => .{ .image = payload },
@@ -152,7 +152,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .help => try handlers.show_help(handlers.ctx),
         .login => try handlers.login(handlers.ctx),
         .logout => |rest| try handlers.logout(handlers.ctx, rest),
-        .setup => try handlers.setup(handlers.ctx),
+        .provider => try handlers.provider(handlers.ctx),
         .status => try handlers.show_status(handlers.ctx),
         .image => |path| try handlers.attach_image(handlers.ctx, path),
         .images => |rest| try handlers.manage_images(handlers.ctx, rest),
@@ -205,7 +205,7 @@ test "parse rejects removed plural model command" {
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/models"));
 }
 
-test "parse leaves provider selection to setup" {
+test "provider arguments belong to the inline picker, not the router" {
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/provider codex"));
 }
 
@@ -468,7 +468,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .show_help = unexpectedNoPayload,
         .login = unexpectedNoPayload,
         .logout = unexpectedPayload,
-        .setup = unexpectedNoPayload,
+        .provider = unexpectedNoPayload,
         .show_status = unexpectedNoPayload,
         .attach_image = unexpectedPayload,
         .manage_images = unexpectedPayload,

@@ -53,11 +53,9 @@ const options = (backend, checkpoint) => ({
   ...(backend === "wasm" ? { wasm } : {}),
   ...(checkpoint ? { checkpoint } : {}),
   fetch,
-  env: {
-    AI_GATEWAY_API_KEY: "checkpoint-key",
-    FX_GATEWAY_CHAT_URL: `http://127.0.0.1:${port}/chat`,
-    FX_MODEL: "checkpoint/model",
-  },
+  apiKey: "checkpoint-key",
+  gatewayChatUrl: `http://127.0.0.1:${port}/chat`,
+  model: "checkpoint/model",
 });
 
 let source;

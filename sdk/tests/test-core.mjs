@@ -15,12 +15,17 @@ if (!supportsJspi()) {
 const encoded = new TextEncoder();
 let fetchCalls = 0;
 let requestedSessionId;
+let requestedAuthorization;
+let requestedModel;
 const mockFetch = async (url, init) => {
   if (init.method === "GET") {
     return Response.json({ object: "list", data: [{ id: "sdk/core-model", type: "language" }] });
   }
   fetchCalls += 1;
-  requestedSessionId = new Headers(init.headers).get("x-session-id");
+  const headers = new Headers(init.headers);
+  requestedSessionId = headers.get("x-session-id");
+  requestedAuthorization = headers.get("authorization");
+  requestedModel = headers.get("ai-language-model-id");
   const payload = JSON.parse(new TextDecoder().decode(init.body));
   assert.ok(Array.isArray(payload.prompt) || Array.isArray(payload.messages));
   return new Response(new ReadableStream({
@@ -38,10 +43,8 @@ const agent = await createFxAgent({
   backend: "wasm",
   wasm: await readFile(wasmPath),
   fetch: mockFetch,
-  env: {
-    AI_GATEWAY_API_KEY: "sdk-test-key",
-    FX_MODEL: "sdk/core-model",
-  },
+  apiKey: "sdk-test-key",
+  model: "sdk/core-model",
 });
 assert.deepEqual(Object.keys(agent).sort(), ["checkpoint", "close", "prompt"]);
 
@@ -60,6 +63,8 @@ assert.deepEqual(await turn.result, {
 });
 assert.equal(fetchCalls, 1);
 assert.ok(requestedSessionId);
+assert.equal(requestedAuthorization, "Bearer sdk-test-key");
+assert.equal(requestedModel, "sdk/core-model");
 assert.ok((await agent.checkpoint()).length > 48);
 assert.equal(await agent.close(), undefined);
 console.log("core SDK passed: minimal prompt, stream, usage, checkpoint, and close");
