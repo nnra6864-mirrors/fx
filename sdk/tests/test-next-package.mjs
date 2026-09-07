@@ -74,7 +74,7 @@ async function exercise(server, stage) {
   const unauthorized = await fetch(`${server.url}/api/fx`);
   assert.equal(unauthorized.status, 401);
   for (const backend of ["native", "auto"]) {
-    for (const scenario of ["host", "mcp", "error", "cancel", "resume"]) {
+    for (const scenario of ["host", "mcp", "error", "known-error", "cancel", "resume"]) {
       const response = await fetch(`${server.url}/api/fx?backend=${backend}&scenario=${scenario}`, {
         headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(60_000),
       });
@@ -107,7 +107,7 @@ try {
   const manifest = JSON.parse(await readFile(resolve(app, "package.json"), "utf8"));
   manifest.dependencies.libfx = "file:./libfx.tgz";
   await writeFile(resolve(app, "package.json"), JSON.stringify(manifest, null, 2));
-  await run(process.env.PNPM_BIN || "pnpm", ["install", "--no-frozen-lockfile", "--ignore-scripts"], app, "install");
+  await run(process.env.PNPM_BIN || "pnpm", ["install", "--ignore-workspace", "--no-frozen-lockfile", "--ignore-scripts"], app, "install");
   const require = createRequire(resolve(app, "package.json"));
   await run(process.execPath, [
     fileURLToPath(new URL("./test-node-tracing.mjs", import.meta.url)),

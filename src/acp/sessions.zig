@@ -805,6 +805,7 @@ fn sendPendingRecoveryUpdate(
     if (recovery.assistant_source.len > 0) {
         try sendAgentHistoryChunk(state, alloc, session_id, recovery.assistant_source);
     }
+    const control_only = recovery.cause == .suspended or recovery.cause == .tool_state_uncertain;
     const attempt = recovery.consumed_provider_attempts +| @intFromBool(recovery.outstanding_reservation);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -812,16 +813,20 @@ fn sendPendingRecoveryUpdate(
     try writeJsonStr(session_id, &out.writer);
     try out.writer.writeAll(",\"update\":");
     try acp_types.writeModelRecoveryInfoUpdate(&out.writer, .{
-        .kind = .terminal_provider_error,
-        .failed_attempt = attempt,
-        .attempt_limit = recovery.max_provider_attempts,
+        .kind = switch (recovery.cause) {
+            .suspended => .suspended,
+            .tool_state_uncertain => .tool_state_uncertain,
+            else => .terminal_provider_error,
+        },
+        .failed_attempt = if (control_only) 0 else attempt,
+        .attempt_limit = if (control_only) 0 else recovery.max_provider_attempts,
         .cause = recovery.cause,
         .action = .paused,
-        .required_action = if (recovery.tool_state == .uncertain)
+        .required_action = if (recovery.tool_state == .uncertain or recovery.cause == .tool_state_uncertain)
             .inspect_uncertain_tool
         else
             .continue_later,
-        .diagnostic = types.ModelFailureDiagnostic.forCause(recovery.cause),
+        .diagnostic = if (control_only) null else types.ModelFailureDiagnostic.forCause(recovery.cause),
     }, true);
     try out.writer.writeByte('}');
     try state.writer.writeNotification(

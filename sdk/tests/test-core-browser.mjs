@@ -181,12 +181,12 @@ try {
     expect(modelChunks.filter((chunk) => chunk.trim()).length >= 2, "browser stream was buffered");
     expect(result.fetchCalls === 1, `expected one prompt fetch, got ${result.fetchCalls}`);
     expect(result.model === "sdk/chrome-model", `unexpected model ${result.model}`);
-    expect(JSON.stringify(result.api) === JSON.stringify(["checkpoint", "close", "prompt"]), `unexpected public API ${JSON.stringify(result.api)}`);
+    expect(JSON.stringify(result.api) === JSON.stringify(["abandon", "checkpoint", "close", "prompt", "resume", "status", "suspend"]), `unexpected public API ${JSON.stringify(result.api)}`);
   });
   await runCase("stalled cancellation", "transport=stall&autorun=wait&cancel-after=50", (result) => {
     expect(result.stopReason === "cancelled", `unexpected stop reason ${result.stopReason}`);
     expect(result.fetchAborted, "browser fetch did not receive abort");
-    expect(JSON.stringify(result.api) === JSON.stringify(["checkpoint", "close", "prompt"]), `unexpected public API ${JSON.stringify(result.api)}`);
+    expect(JSON.stringify(result.api) === JSON.stringify(["abandon", "checkpoint", "close", "prompt", "resume", "status", "suspend"]), `unexpected public API ${JSON.stringify(result.api)}`);
   });
   await runCase("host tool and skill", "transport=mock&autorun=use%20the%20tool&host-tool=1&host-skill=1&model=sdk%2Fchrome-model", (result) => {
     expect(result.stopReason === "end_turn", `unexpected stop reason ${result.stopReason}`);

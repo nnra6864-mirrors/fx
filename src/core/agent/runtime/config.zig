@@ -31,6 +31,11 @@ pub const Config = struct {
     /// Interactive hosts may request a durable "try later" pause separately
     /// from cancellation. Headless hosts leave this null.
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,
+    /// Host-owned, level-triggered safe-boundary suspension. Never passed to a
+    /// provider or tool as cancellation. The current model response and selected
+    /// tool group settle normally; final text may finish. Clear before explicit
+    /// checkpoint resume. Requires a durable recovery_checkpoint effect to pause.
+    suspend_flag: ?*std.atomic.Value(bool) = null,
     gateway_chat_url: []const u8,
     advertised_tool_names: []const []const u8 = &.{},
     advertised_functions: []const model_tool_schema.FunctionSchema = &.{},

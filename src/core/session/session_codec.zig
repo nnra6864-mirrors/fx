@@ -1307,6 +1307,38 @@ pub fn parseRecoveryCheckpoint(alloc: Allocator, value: std.json.Value) !Recover
     };
 }
 
+test "suspension checkpoint causes round trip without reclassifying system resume" {
+    const alloc = std.testing.allocator;
+    for ([_]types.ModelRecoveryCause{ .suspended, .tool_state_uncertain, .system_resumed }) |cause| {
+        const original = RecoveryCheckpoint{
+            .turn_id = 1,
+            .user = .{ .text = @constCast("saved request") },
+            .assistant_source = @constCast(""),
+            .cause = cause,
+            .action = .paused,
+            .tool_state = if (cause == .tool_state_uncertain) .uncertain else .none,
+            .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+            .requested_fast_mode = false,
+            .fast_mode = false,
+            .max_provider_attempts = 10,
+            .consumed_provider_attempts = 1,
+        };
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try writeRecoveryCheckpoint(&out.writer, original);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+        defer parsed.deinit();
+        var restored = try parseRecoveryCheckpoint(alloc, parsed.value);
+        defer restored.deinit(alloc);
+        try std.testing.expectEqual(cause, restored.cause);
+        try std.testing.expectEqual(original.action, restored.action);
+        try std.testing.expectEqual(original.tool_state, restored.tool_state);
+        try std.testing.expectEqual(original.consumed_provider_attempts, restored.consumed_provider_attempts);
+        try std.testing.expectEqual(original.version, restored.version);
+        try std.testing.expect(!restored.outstanding_reservation);
+    }
+}
+
 test "legacy route checkpoints retain history without resumable authority" {
     const alloc = std.testing.allocator;
     const routes = [_][]const u8{
@@ -1416,7 +1448,7 @@ fn parseTurnAuthority(alloc: Allocator, value: std.json.Value) !TurnAuthority {
     };
 }
 
-fn writeUserTurn(writer: *std.Io.Writer, user: session.UserTurn) !void {
+pub fn writeUserTurn(writer: *std.Io.Writer, user: session.UserTurn) !void {
     try writer.writeAll("{\"text\":");
     try writeDurableBytes(writer, user.text);
     try writer.writeAll(",\"images\":[");
@@ -1525,7 +1557,7 @@ fn writeToolCall(writer: *std.Io.Writer, tool_call: session.ToolCall) !void {
     try writer.writeByte('}');
 }
 
-fn writePersistedToolResult(writer: *std.Io.Writer, result: session.PersistedToolResult) !void {
+pub fn writePersistedToolResult(writer: *std.Io.Writer, result: session.PersistedToolResult) !void {
     try writer.writeAll("{\"tool_call_id\":");
     try writeDurableBytes(writer, result.tool_call_id);
     try writer.writeAll(",\"tool_name\":");
@@ -1768,7 +1800,7 @@ fn writeFileEvidence(writer: *std.Io.Writer, file: session.FileEvidence) !void {
     try writer.writeByte('}');
 }
 
-fn parseUserTurn(alloc: Allocator, value: std.json.Value) !session.UserTurn {
+pub fn parseUserTurn(alloc: Allocator, value: std.json.Value) !session.UserTurn {
     const source = try requireObject(value);
     const object = if (source.count() == 2)
         try exactObject(value, &.{ "text", "images" })
@@ -2125,7 +2157,7 @@ fn parseToolResults(
     return results;
 }
 
-fn parseToolResult(
+pub fn parseToolResult(
     alloc: Allocator,
     value: std.json.Value,
     schema_version: u64,

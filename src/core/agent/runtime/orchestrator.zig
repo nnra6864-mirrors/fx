@@ -53,11 +53,14 @@ const runtime_assistant_stream = @import("assistant_stream.zig");
 const runtime_tool_presentation = @import("tool_presentation.zig");
 const runtime_execution_memory = @import("execution_memory.zig");
 const runtime_agent = @import("agent.zig");
+const runtime_journal = @import("journal_runtime.zig");
+const execution_journal = @import("../../session/execution_journal.zig");
 const runtime_tool_admission = @import("tool_admission.zig");
 const runtime_interruption = @import("interruption.zig");
 const runtime_parallel_execution = @import("parallel_execution.zig");
 const runtime_tool_batch = @import("tool_batch.zig");
 const model_response_recovery = @import("model_response_recovery.zig");
+const suspension = @import("suspension.zig");
 const response_language = @import("response_language.zig");
 const tool_mcp_runtime = @import("../../tooling/tool_mcp_runtime.zig");
 
@@ -3242,6 +3245,9 @@ pub const CommonStopState = struct {
     latest_partial: ?[]const u8 = null,
     dispatched: bool = false,
     terminal_materializing: bool = false,
+    /// Sticky through callback failures so generic error finalization cannot
+    /// replace unknown tool effects with ordinary history.
+    tool_effects_uncertain: bool = false,
 };
 
 fn semanticAttemptLimit(max_provider_attempts: usize) usize {
@@ -3466,6 +3472,7 @@ noinline fn effectiveRecoveryToolEvidence(
     stream_ctx: *const runtime_assistant_stream.StreamChunkContext,
 ) model_response_recovery.ToolEvidence {
     const observed = recoveryToolEvidence(completion, stream_ctx);
+    if (preserved == .uncertain) return .uncertain;
     return if (observed == .none) preserved else observed;
 }
 
@@ -3474,6 +3481,8 @@ fn restoredRecoveryCause(
 ) model_response_recovery.FailureCause {
     return switch (cause) {
         .network_interrupted => .transport_interrupted,
+        .suspended => .suspended,
+        .tool_state_uncertain => .tool_state_uncertain,
         .response_interrupted => .response_interrupted,
         .provider_stream_timeout => .provider_stream_timeout,
         .provider_unavailable => .provider_unavailable,
@@ -3498,11 +3507,14 @@ fn restoredRecoveryToolEvidence(
 fn restoredRecoveryStrategy(
     checkpoint: session_codec.RecoveryCheckpoint,
 ) ?model_response_recovery.Strategy {
-    if (checkpoint.cause == .request_limit_reached) return null;
+    // A safe-boundary continuation restores execution, not a failed response.
+    // Uncertainty is rejected before this point and must never select a retry.
+    if (checkpoint.cause == .suspended or checkpoint.cause == .tool_state_uncertain or
+        checkpoint.cause == .request_limit_reached) return null;
     return switch (checkpoint.tool_state) {
         .proven_unexecuted => .regenerate_tool,
         .confirmed => .continue_after_confirmed_tool,
-        .uncertain => .reconcile_tool,
+        .uncertain => .pause,
         .none => if (checkpoint.assistant_source.len > 0)
             .continue_response
         else
@@ -3638,6 +3650,8 @@ fn checkpointCause(
 ) types.ModelRecoveryCause {
     return switch (cause) {
         .transport_interrupted => .network_interrupted,
+        .suspended => .suspended,
+        .tool_state_uncertain => .tool_state_uncertain,
         .response_interrupted => .response_interrupted,
         .provider_stream_timeout => .provider_stream_timeout,
         .provider_unavailable => .provider_unavailable,
@@ -3758,6 +3772,324 @@ fn persistRecoveryCheckpoint(
             @tagName(strategy orelse .retry_request),
         },
     );
+}
+
+const ParallelFailureEvidence = struct {
+    execution: *runtime_parallel_execution.ParallelHookExecContext,
+    uncertain: std.atomic.Value(bool) = .init(false),
+
+    fn execute(raw: *anyopaque, alloc: Allocator, call: ToolCall, index: usize) !ToolExecutionResult {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return runtime_parallel_execution.parallelHookExecute(self.execution, alloc, call, index) catch |err| {
+            // The runner can collapse an entered Cancelled exception into a
+            // cancelled slot without invoking its error formatter.
+            self.uncertain.store(true, .seq_cst);
+            return err;
+        };
+    }
+
+    fn format(raw: *anyopaque, alloc: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.uncertain.store(true, .seq_cst);
+        return runtime_parallel_execution.parallelHookFormatError(self.execution, alloc, tool_name, err);
+    }
+};
+
+/// A missing or nonterminal result cannot establish a safe checkpoint boundary.
+fn execution_tool_evidence(execution: types.ExecutionMemory) suspension.ToolEvidence {
+    var evidence: suspension.ToolEvidence = .none;
+    for (execution.tool_steps) |step| {
+        if (step.tool_calls.len != step.tool_results.len) return .uncertain;
+        for (step.tool_calls) |call| {
+            var matches: usize = 0;
+            for (step.tool_results) |result| {
+                if (!std.mem.eql(u8, call.id, result.tool_call_id) or
+                    !std.mem.eql(u8, call.name, result.tool_name)) continue;
+                if (result.status != .success and result.status != .failure) return .uncertain;
+                matches += 1;
+            }
+            if (matches != 1) return .uncertain;
+            evidence = .confirmed;
+        }
+    }
+    return evidence;
+}
+
+/// Only called outside active provider/tool execution. No flag is consumed:
+/// the host clears it when explicitly resuming the acknowledged checkpoint.
+fn suspend_at_safe_boundary(
+    deps: *const AgentRuntimeDeps,
+    finalization: *TurnFinalizationGuard,
+    stream_ctx: *runtime_assistant_stream.StreamChunkContext,
+    arena: Allocator,
+    config: Config,
+    job: QueuedPrompt,
+    messages: []const ChatMessage,
+    assistant_source: []const u8,
+    fast_mode: bool,
+    attempt_limit: usize,
+    consumed_attempts: usize,
+    tool_evidence: suspension.ToolEvidence,
+    trace_ctx: TraceContext,
+    finish_trace: *PromptFinishTrace,
+) !bool {
+    const requested = if (config.suspend_flag) |flag| flag.load(.seq_cst) else false;
+    if (!requested and tool_evidence != .uncertain) return false;
+    if (deps.journal) |journal| {
+        try journal.state.ensureAvailable();
+        try finishRecoveryPaused(deps, finalization, stream_ctx, arena, finish_trace, if (tool_evidence == .uncertain) .tool_state_uncertain else .suspended, consumed_attempts, attempt_limit, pausedRequiredAction(tool_evidence), null);
+        return true;
+    }
+    const execution = runtime_execution_memory.buildExecutionMemory(arena, messages) catch
+        return error.SuspensionCheckpointUncertain;
+    const observed = execution_tool_evidence(execution);
+    const boundary_tool_evidence: suspension.ToolEvidence = if (tool_evidence == .uncertain or observed == .uncertain)
+        .uncertain
+    else if (observed == .none)
+        tool_evidence
+    else
+        observed;
+    var evidence = suspension.Evidence{
+        .requested = true,
+        .boundary = .before_model,
+        .tool = boundary_tool_evidence,
+        .checkpoint = if (deps.recovery_checkpoint != null) .needed else .unavailable,
+    };
+    if (suspension.decide(evidence) != .persist_checkpoint) return error.SuspensionCheckpointUnavailable;
+    const cause: model_response_recovery.FailureCause = if (boundary_tool_evidence == .uncertain)
+        .tool_state_uncertain
+    else
+        .suspended;
+    persistRecoveryCheckpoint(
+        deps,
+        finalization,
+        arena,
+        job,
+        messages,
+        assistant_source,
+        job.model,
+        config.fast_mode,
+        fast_mode,
+        attempt_limit,
+        consumed_attempts,
+        false,
+        cause,
+        .pause,
+        boundary_tool_evidence,
+        trace_ctx,
+    ) catch |err| {
+        debug_trace.logf("agent", "suspension checkpoint acknowledgement uncertain err={s}", .{@errorName(err)});
+        return error.SuspensionCheckpointUncertain;
+    };
+    evidence.checkpoint = .durable;
+    if (suspension.decide(evidence) != .paused) return error.SuspensionCheckpointUncertain;
+    finishRecoveryPaused(
+        deps,
+        finalization,
+        stream_ctx,
+        arena,
+        finish_trace,
+        cause,
+        consumed_attempts,
+        attempt_limit,
+        pausedRequiredAction(boundary_tool_evidence),
+        null,
+    ) catch return error.SuspensionHandoffFailed;
+    return true;
+}
+
+/// One selected group's terminal boundary. Every early finish/cancel path must
+/// preserve executor uncertainty, independently of the host's suspend request.
+const ToolGroupBoundary = struct {
+    deps: *const AgentRuntimeDeps,
+    finalization: *TurnFinalizationGuard,
+    stream_ctx: *runtime_assistant_stream.StreamChunkContext,
+    arena: Allocator,
+    config: Config,
+    job: QueuedPrompt,
+    messages: *std.ArrayList(ChatMessage),
+    fast_mode: bool,
+    attempt_limit: usize,
+    consumed_attempts: usize,
+    tool_evidence: *model_response_recovery.ToolEvidence,
+    trace_ctx: TraceContext,
+    finish_trace: *PromptFinishTrace,
+
+    fn pause_before_finish(self: ToolGroupBoundary, pending_calls: bool) !bool {
+        const requested = if (self.config.suspend_flag) |flag| flag.load(.seq_cst) else false;
+        return suspend_at_safe_boundary(
+            self.deps,
+            self.finalization,
+            self.stream_ctx,
+            self.arena,
+            self.config,
+            self.job,
+            self.messages.items,
+            "",
+            self.fast_mode,
+            self.attempt_limit,
+            self.consumed_attempts,
+            if (pending_calls and requested) .uncertain else self.tool_evidence.*,
+            self.trace_ctx,
+            self.finish_trace,
+        );
+    }
+
+    fn pause_if_uncertain(self: ToolGroupBoundary) !bool {
+        if (self.tool_evidence.* != .uncertain) return false;
+        return self.pause_before_finish(false);
+    }
+};
+
+fn beginJournalGeneration(deps: *const AgentRuntimeDeps, key: *?runtime_journal.GenerationKey, context: JournalContext) !void {
+    const journal = deps.journal orelse return;
+    if (key.*) |*previous| previous.deinit(journal.alloc);
+    key.* = null;
+    key.* = try journal.generation();
+    const bytes = try context.encode(journal.alloc);
+    defer journal.alloc.free(bytes);
+    const append_bytes = std.math.add(usize, bytes.len, runtime_journal.max_model_record_bytes + 2048) catch return error.JournalCapacityExceeded;
+    try journal.preflightOperation(append_bytes, 2, 2 * runtime_journal.max_model_record_bytes);
+    try journal.reserveRequest(key.*.?, bytes);
+    if (deps.journal_generation) |emit| try emit(deps.ctx, key.*.?);
+}
+
+/// Encodes the accepted decision at the existing loop's execution boundary.
+/// Completed decisions and results stay in the journal; recovery context only
+/// carries the provider budget and authority required by the existing guards.
+const JournalDecisionBoundary = struct {
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    key: ?runtime_journal.GenerationKey,
+    recorded_step: ?usize,
+    completion: types.ModelCompletion,
+    provider_replay: ?types.ProviderReplay,
+    context: JournalContext,
+
+    fn acknowledge(self: *JournalDecisionBoundary, calls: []const ToolCall, final: bool) !?usize {
+        const journal = self.deps.journal orelse return null;
+        if (self.recorded_step) |step| return step;
+        const replay = try self.arena.alloc(execution_journal.Replay, calls.len);
+        for (calls, replay) |call, *policy| {
+            policy.* = if (self.deps.tool_registry.lookup(call.name)) |tool| tool.journal_replay else .blocked;
+        }
+        const context = try self.context.encode(self.arena);
+        defer self.arena.free(context);
+        self.recorded_step = try journal.recordDecision(self.completion, calls, replay, self.key orelse return error.InvalidJournalTransition, final, context, self.provider_replay);
+        return self.recorded_step;
+    }
+};
+
+const JournalContext = struct {
+    job: QueuedPrompt,
+    route_model: []const u8,
+    requested_fast_mode: bool,
+    fast_mode: bool,
+    attempt_limit: usize,
+    consumed_attempts: usize,
+    outstanding_reservation: bool = false,
+    assistant_source: []const u8 = "",
+    preparations: []const PreparedToolCall = &.{},
+
+    fn encode(self: JournalContext, alloc: Allocator) ![]u8 {
+        var context: std.Io.Writer.Allocating = .init(alloc);
+        defer context.deinit();
+        try context.writer.writeAll("{\"recovery\":");
+        try session_codec.writeRecoveryCheckpoint(&context.writer, .{
+            .turn_id = self.job.turn_id,
+            .user = .{ .text = self.job.prompt, .images = self.job.images },
+            .assistant_source = @constCast(self.assistant_source),
+            .cause = .suspended,
+            .action = .paused,
+            .authority = .{
+                .provider = self.job.provider,
+                .model = @constCast(self.route_model),
+                .credential_source = self.job.credential_source,
+                .credential_identity = if (self.job.credential_source) |source| credential_authority.derive(source, self.job.account_id) else null,
+            },
+            .requested_fast_mode = self.requested_fast_mode,
+            .fast_mode = self.fast_mode,
+            .max_provider_attempts = self.attempt_limit,
+            .consumed_provider_attempts = self.consumed_attempts,
+            .outstanding_reservation = self.outstanding_reservation,
+        });
+        try context.writer.writeAll(",\"preparations\":[");
+        for (self.preparations, 0..) |prepared, index| {
+            if (index != 0) try context.writer.writeByte(',');
+            try std.json.Stringify.value(captureJournalPreparation(prepared), .{}, &context.writer);
+        }
+        try context.writer.writeAll("]}");
+        return context.toOwnedSlice();
+    }
+};
+
+const JournalPreparation = runtime_journal.Preparation;
+
+fn captureJournalPreparation(call: PreparedToolCall) JournalPreparation {
+    return switch (call) {
+        .ready => .{ .state = .ready },
+        .provider_executed => .{ .state = .provider_executed },
+        .blocked => |blocked| .{ .state = .blocked, .blockKind = blocked.kind, .modelOutput = blocked.model_output },
+    };
+}
+
+fn restoreJournalPreparation(preparation: JournalPreparation, arena: Allocator, call: ToolCall) !PreparedToolCall {
+    try preparation.validate(call);
+    const owned = try types.dupeToolCall(arena, call);
+    return switch (preparation.state) {
+        .ready => .{ .ready = owned },
+        .provider_executed => .{ .provider_executed = owned },
+        .blocked => .{ .blocked = .{ .call = owned, .kind = preparation.blockKind.?, .model_output = try arena.dupe(u8, preparation.modelOutput.?) } },
+    };
+}
+
+/// Drain only actual results appended by the existing tool loop. The first
+/// unacknowledged result must be durable before any later call can be entered.
+fn acknowledgeJournalResults(deps: *const AgentRuntimeDeps, arena: Allocator, step: ?usize, messages: []const ChatMessage) !void {
+    const journal = deps.journal orelse return;
+    const step_index = step orelse return error.InvalidJournalTransition;
+    while (journal.state.pending() == .tool) {
+        const pending = journal.state.pending().tool;
+        if (pending.step != step_index) return error.InvalidJournalTransition;
+        const body = journal.state.modelStep(pending.turn, pending.step);
+        const calls = try execution_journal.array(body, "calls");
+        const call = calls[pending.call];
+        const id = try execution_journal.string(call, "providerId");
+        const name = try execution_journal.string(call, "name");
+        const message = for (messages) |candidate| {
+            if (candidate.role == .tool and candidate.tool_call_id != null and std.mem.eql(u8, candidate.tool_call_id.?, id)) break candidate;
+        } else return;
+        const status = message.tool_result_status orelse .success;
+        const result = try @import("../execution_memory.zig").makePersistedToolResult(arena, id, name, status, message.content orelse "", message.tool_result_memory);
+        defer @import("../execution_memory.zig").freeTransientPersistedToolResult(arena, result);
+        try journal.recordResult(step_index, pending.call, result);
+    }
+}
+
+fn restoreJournalToolResult(deps: *const AgentRuntimeDeps, arena: Allocator, step: usize, call_index: usize, call: ToolCall, messages: *std.ArrayList(ChatMessage), names: *std.ArrayList([]u8), batch: *runtime_tool_batch.StepBatchState) !bool {
+    const journal = deps.journal orelse return false;
+    var saved = (try journal.recordedResult(arena, step, call_index)) orelse return false;
+    defer saved.deinit();
+    const results = try types.dupePersistedToolResults(arena, &.{saved.result});
+    const result = results[0];
+    try runtime_tool_batch.appendToolResultContent(arena, messages, names, batch, call, result.output, .{
+        .tool_images = result.tool_images,
+        .tool_image_handle = result.tool_image_handle,
+        .output_handle = result.output_handle,
+        .preview = result.preview,
+        .output_bytes = result.output_bytes,
+        .stored_output_bytes = result.stored_output_bytes,
+        .truncated = result.truncated,
+        .committed_file_presentation = result.committed_file_presentation,
+        .command_output_replay = result.command_output_replay,
+        .command_process_presentation = result.command_process_presentation,
+        .terminal_action_presentation = result.terminal_action_presentation,
+    }, .{
+        .increment_error = result.status != .success,
+        .record_completion = true,
+        .status = result.status,
+    });
+    return true;
 }
 
 fn streamSucceeded(result: runtime_gateway_step.StreamResult) bool {
@@ -4231,6 +4563,8 @@ fn auto_retry_status(
             .system_resumed => .system_resumed,
             .authentication => .authentication,
             .request_limit_reached => .request_limit_reached,
+            // Control-only checkpoints never select or authorize a retry.
+            .suspended, .tool_state_uncertain => unreachable,
             .content_filter => null,
         },
         .action = switch (strategy) {
@@ -4339,17 +4673,22 @@ fn finishRecoveryPaused(
         finalization.turn_id,
         &.{},
     );
+    const control_only = cause == .suspended or cause == .tool_state_uncertain;
     try pushRouteRecoveryStatus(deps, .{
-        .kind = .terminal_provider_error,
-        .failed_attempt = consumed_attempts,
-        .attempt_limit = attempt_limit,
+        .kind = switch (cause) {
+            .suspended => .suspended,
+            .tool_state_uncertain => .tool_state_uncertain,
+            else => .terminal_provider_error,
+        },
+        .failed_attempt = if (control_only) 0 else consumed_attempts,
+        .attempt_limit = if (control_only) 0 else attempt_limit,
         .cause = checkpointCause(cause),
         .action = .paused,
         .required_action = required_action,
-        .diagnostic = diagnostic orelse defaultRecoveryDiagnostic(cause),
+        .diagnostic = if (control_only) null else diagnostic orelse defaultRecoveryDiagnostic(cause),
     });
     try finalization.finish(.paused, null, null);
-    finish_trace.finish("recovery_paused");
+    finish_trace.finish(if (control_only) @tagName(cause) else "recovery_paused");
 }
 
 fn pushUnsafeNoRetryStatus(
@@ -4483,6 +4822,11 @@ pub fn processAgentPrompt(
     if (effective_job.turn_id == 0) {
         effective_job.turn_id = debug_trace.nextTurnId();
     }
+    if (deps.journal) |journal| {
+        const selected = try journal.begin(.{ .text = effective_job.prompt, .images = effective_job.images }, effective_job.model, effective_job.turn_id, journal.resuming);
+        if (selected == .completed) return error.RequestAlreadyCompleted;
+        effective_job.turn_id = try journal.runtimeTurnId();
+    }
     var effective_config = config;
     if (effective_config.origin == .subagent and effective_config.subagent_id == 0) {
         effective_config.subagent_id = debug_trace.nextSubagentId();
@@ -4503,6 +4847,17 @@ pub fn processAgentPrompt(
     defer finalization.deinit();
 
     processQueuedPromptInner(deps, semantic_presentation, effective_lifecycle, effective_config, effective_job, &finalization, agent) catch |err| {
+        if (deps.journal) |journal| {
+            if (journal.state.blocked) return error.PersistenceUncertain;
+            if (err == error.JournalCapacityExceeded) {
+                if (finalization.state == .open) try finalization.finish(.paused, null, null);
+                return err;
+            }
+            if (err == error.RecoveryRequired or journal.state.pending() == .tool) {
+                if (finalization.state == .open) try finalization.finish(.paused, null, null);
+                return error.RecoveryRequired;
+            }
+        }
         if (finalization.state == .open) {
             finalization.finish(.failed, null, null) catch |finalization_err| return finalization_err;
         }
@@ -4693,6 +5048,15 @@ fn processQueuedPromptInner(
 
     var within_turn_suffix: std.ArrayList(ChatMessage) = .empty;
     defer within_turn_suffix.deinit(arena);
+    var journal_prefix: ?runtime_journal.OwnedExecution = null;
+    defer if (journal_prefix) |*prefix| prefix.deinit();
+    if (deps.journal) |journal| {
+        if (journal.resuming) {
+            if (try journal.latestContext()) |context| job.recovery_checkpoint = try session_codec.parseRecoveryCheckpoint(arena, try execution_journal.object(context, "recovery"));
+            journal_prefix = try journal.prefixExecution(arena);
+            try session_runtime.appendExecutionMemoryChatMessages(arena, &within_turn_suffix, journal_prefix.?.execution);
+        }
+    }
     if (job.recovery_checkpoint) |checkpoint| {
         for (checkpoint.user.images) |attachment| {
             var verified = image_attachments.loadVerifiedSnapshot(
@@ -4705,11 +5069,17 @@ fn processQueuedPromptInner(
             };
             verified.deinit(std.heap.c_allocator);
         }
-        try session_runtime.appendExecutionMemoryChatMessages(
-            arena,
-            &within_turn_suffix,
-            checkpoint.execution,
-        );
+    }
+    if (deps.journal == null) {
+        if (job.recovery_checkpoint) |checkpoint| {
+            if (checkpoint.cause == .tool_state_uncertain or checkpoint.tool_state == .uncertain or
+                execution_tool_evidence(checkpoint.execution) == .uncertain) return error.RecoveryEffectsUncertain;
+            try session_runtime.appendExecutionMemoryChatMessages(
+                arena,
+                &within_turn_suffix,
+                checkpoint.execution,
+            );
+        }
     }
 
     // The overlay arena is reset for every model step so refreshed env,
@@ -4940,6 +5310,26 @@ fn processQueuedPromptInner(
         &stop_state,
         agent,
     ) catch |err| {
+        // A failed handoff is not a finished turn. In particular a lost durable
+        // ack must not overwrite the possibly committed checkpoint with history.
+        switch (err) {
+            error.SuspensionCheckpointUnavailable,
+            error.SuspensionCheckpointUncertain,
+            error.SuspensionHandoffFailed,
+            error.RecoveryEffectsUncertain,
+            error.RecoveryCommittedToolReplay,
+            => return err,
+            else => {},
+        }
+        if (stop_state.tool_effects_uncertain) return error.RecoveryEffectsUncertain;
+        if (config.suspend_flag) |flag| {
+            if (flag.load(.seq_cst)) {
+                // Settlement itself failed (for example a result commit). There
+                // is no acknowledged safe boundary; do not synthesize history.
+                debug_trace.logf("agent", "suspension settlement uncertain err={s}", .{@errorName(err)});
+                return error.SuspensionCheckpointUncertain;
+            }
+        }
         if (stop_state.retained_candidate != null and
             !stop_state.terminal_materializing and
             finalization.state == .open)
@@ -5867,6 +6257,7 @@ fn processQueuedPromptLoop(
     else
         .none;
     var restore_recovery_source = job.recovery_checkpoint != null;
+    var journal_recovery_step = if (deps.journal) |journal| if (journal.resuming) journal.recoveryStep() else null else null;
     var step: usize = 0;
     agent_steps_loop: while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
         current_step_index = step + 1;
@@ -5992,6 +6383,12 @@ fn processQueuedPromptLoop(
         for (advertised_dynamic_tools, 0..) |tool, index| advertised_dynamic_tool_names[index] = tool.name;
         var stream_result: runtime_gateway_step.StreamResult = undefined;
         var stream_result_set = false;
+        var journal_generation: ?runtime_journal.GenerationKey = null;
+        defer if (journal_generation) |*key| key.deinit(deps.journal.?.alloc);
+        var restored_journal_decision: ?runtime_journal.OwnedDecision = null;
+        defer if (restored_journal_decision) |*decision| decision.deinit();
+        var restored_journal_step: ?usize = null;
+        var restored_journal_call: ?usize = null;
         var gateway_model: []const u8 = job.model;
         var successful_gateway_model: []const u8 = "";
         var successful_request_cost: ?runtime_prompt_context.RequestCost = null;
@@ -6032,12 +6429,40 @@ fn processQueuedPromptLoop(
         }
 
         while (true) {
+            if (journal_recovery_step) |saved_step| {
+                restored_journal_decision = try deps.journal.?.recordedDecision(arena, saved_step);
+                if (deps.journal.?.state.pending() == .tool) restored_journal_call = deps.journal.?.state.pending().tool.call;
+                var saved_completion = restored_journal_decision.?.completion;
+                if (restored_journal_decision.?.provider_replay) |replay| saved_completion.provider_state_json = replay.parts_json;
+                stream_result = .{ .completed = .{ .completion = saved_completion, .ownership = .borrowed } };
+                stream_result_set = true;
+                restored_journal_step = saved_step;
+                journal_recovery_step = null;
+                successful_gateway_model = job.model;
+                break;
+            }
             if (reset_stream_for_next_attempt) {
                 try stream_ctx.beginRecoveryAttempt();
                 reset_stream_for_next_attempt = false;
             }
 
             gateway_model = job.model;
+            if (try suspend_at_safe_boundary(
+                deps,
+                finalization,
+                &stream_ctx,
+                arena,
+                config,
+                job,
+                within_turn_suffix.items,
+                stream_ctx.interruption_source_or(""),
+                route_fast_mode,
+                semantic_limit,
+                semantic_attempt,
+                preserved_tool_evidence,
+                step_ctx,
+                &finish_trace,
+            )) return;
             if (recoveryPauseRequested(config)) {
                 recovery_strategy = .pause;
                 try persistRecoveryCheckpoint(
@@ -6501,6 +6926,24 @@ fn processQueuedPromptLoop(
             if (context_overflow_recovery == .pending) {
                 return error.ContextCapacityExceeded;
             }
+            // Preflight callbacks may have requested suspension since the loop
+            // boundary was sampled. Do not reserve or admit a new request then.
+            if (try suspend_at_safe_boundary(
+                deps,
+                finalization,
+                &stream_ctx,
+                arena,
+                config,
+                job,
+                within_turn_suffix.items,
+                stream_ctx.interruption_source_or(""),
+                route_fast_mode,
+                semantic_limit,
+                semantic_attempt,
+                preserved_tool_evidence,
+                step_ctx,
+                &finish_trace,
+            )) return;
             summary_accumulator.prepareTokenRequest();
             runtime_assistant_stream.pushTokenProgressUpdate(&stream_ctx, .changed) catch |progress_err| {
                 debug_trace.logf("agent", "token progress publication failed source=gateway_prepare err={s}", .{@errorName(progress_err)});
@@ -6574,6 +7017,17 @@ fn processQueuedPromptLoop(
                 .cancel_flag = config.cancel_flag,
                 .provider_attempt_owner = .agent,
             };
+            const journal_request_context = JournalContext{
+                .job = job,
+                .route_model = gateway_model,
+                .requested_fast_mode = selected_fast_mode,
+                .fast_mode = route_fast_mode,
+                .attempt_limit = semantic_limit,
+                .consumed_attempts = semantic_attempt,
+                .outstanding_reservation = true,
+                .assistant_source = stream_ctx.interruption_source_or(""),
+            };
+            try beginJournalGeneration(deps, &journal_generation, journal_request_context);
             stream_result = runtime_gateway_step.streamModelCompletion(
                 deps.agent_stream_provider,
                 arena,
@@ -6959,6 +7413,7 @@ fn processQueuedPromptLoop(
                     model_request.credential.direct.secret_bytes = active_api_key;
                     model_request.delivery = &replay_delivery;
                     model_request.attempt_evidence = &replay_evidence;
+                    try beginJournalGeneration(deps, &journal_generation, journal_request_context);
                     stream_result = try runtime_gateway_step.streamModelCompletion(
                         deps.agent_stream_provider,
                         arena,
@@ -7772,6 +8227,20 @@ fn processQueuedPromptLoop(
             }
         }
         const tool_admission = types.authoritativeToolAdmission(completion);
+        if (if (deps.journal == null) job.recovery_checkpoint else null) |checkpoint| {
+            // The checkpoint is execution evidence, never a queue to execute
+            // again. Reused local IDs (even with changed arguments) fail closed.
+            for (completion.tool_calls) |call| {
+                if (call.provenance != .fx_local) continue;
+                for (checkpoint.execution.tool_steps) |saved_step| {
+                    for (saved_step.tool_calls) |saved_call| {
+                        if (std.mem.eql(u8, call.id, saved_call.id)) {
+                            return error.RecoveryCommittedToolReplay;
+                        }
+                    }
+                }
+            }
+        }
         const filtered_provider_calls: FilteredProviderCalls = if (tool_admission == .admitted) try filterMaterializedProviderCalls(
             arena,
             within_turn_suffix.items,
@@ -8093,6 +8562,22 @@ fn processQueuedPromptLoop(
             try deps.agent_stream_provider.projectReplay(arena, provider_replay, &.{}, true, !terminal_provider_completion)
         else
             provider_replay;
+        var journal_decision = JournalDecisionBoundary{
+            .deps = deps,
+            .arena = arena,
+            .key = journal_generation,
+            .recorded_step = restored_journal_step,
+            .completion = completion,
+            .provider_replay = provider_replay,
+            .context = .{
+                .job = job,
+                .route_model = gateway_model,
+                .requested_fast_mode = selected_fast_mode,
+                .fast_mode = route_fast_mode,
+                .attempt_limit = semantic_limit,
+                .consumed_attempts = semantic_attempt + 1,
+            },
+        };
 
         if (disposition == .length_limited and completion.tool_calls.len > 0) {
             const assistant_text = try runtime_assistant_stream.finishLengthLimitedToolCallCompletion(deps, arena, completion, stream_ctx.raw_text.items.len);
@@ -8150,6 +8635,7 @@ fn processQueuedPromptLoop(
                 !has_content;
 
             if (needs_continuation) {
+                _ = try journal_decision.acknowledge(&.{}, false);
                 continuation_injected = true;
                 const continuation_prompt = "Summarize what you just did.";
                 debug_trace.logf("agent", "injecting continuation after {d} silent tool steps omitted_assistant_bytes={d} preserved_provider_state={s}", .{
@@ -8189,6 +8675,8 @@ fn processQueuedPromptLoop(
             }
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
+                journal_decision.provider_replay = history_replay;
+                _ = try journal_decision.acknowledge(&.{}, true);
                 if (!has_content) {
                     try deps.push_text(deps.ctx, .{ .operational = rendered });
                 }
@@ -8280,6 +8768,8 @@ fn processQueuedPromptLoop(
             stop_state.dispatched = true;
             switch (stop_outcome) {
                 .allow => {
+                    journal_decision.provider_replay = history_replay;
+                    _ = try journal_decision.acknowledge(&.{}, true);
                     stop_state.terminal_materializing = true;
                     try finishCommonAssistantTerminal(
                         deps,
@@ -8301,6 +8791,7 @@ fn processQueuedPromptLoop(
                     return;
                 },
                 .continue_once => |context| {
+                    _ = try journal_decision.acknowledge(&.{}, false);
                     const synthetic = try hooks.prompt.buildContinuationMessage(
                         arena,
                         context,
@@ -8318,7 +8809,18 @@ fn processQueuedPromptLoop(
             PreparedToolCall,
             completion.tool_calls.len,
         );
+        const restored_preparations = if (restored_journal_decision) |decision| preparations: {
+            const context = try std.json.parseFromSlice(std.json.Value, arena, decision.execution_context_json orelse return error.InvalidJournalRecord, .{});
+            const saved = try execution_journal.array(context.value, "preparations");
+            if (saved.len != completion.tool_calls.len) return error.InvalidJournalRecord;
+            break :preparations saved;
+        } else null;
         for (completion.tool_calls, 0..) |tool_call, tool_call_index| {
+            if (restored_preparations) |saved| {
+                const preparation = try std.json.parseFromValue(JournalPreparation, arena, saved[tool_call_index], .{});
+                prepared_tool_calls[tool_call_index] = try restoreJournalPreparation(preparation.value, arena, tool_call);
+                continue;
+            }
             if (successful_vision_mode == .required and
                 !std.mem.eql(u8, tool_call.name, "vision"))
             {
@@ -8418,6 +8920,8 @@ fn processQueuedPromptLoop(
         for (prepared_tool_calls, 0..) |prepared_call, i| {
             effective_tool_calls[i] = prepared_call.call();
         }
+        journal_decision.context.preparations = prepared_tool_calls;
+        const journal_step = try journal_decision.acknowledge(effective_tool_calls, false);
         const pending_assistant: ChatMessage = .{
             .role = .assistant,
             .content = if (terminal_provider_completion or partial_assistant.len == 0)
@@ -8661,6 +9165,7 @@ fn processQueuedPromptLoop(
             else
                 provider_replay,
         );
+        const journal_result_start = within_turn_suffix.items.len;
 
         const step_has_content = !terminal_provider_completion and completion.content != null and completion.content.?.len > 0;
         if (step_has_content) {
@@ -8673,6 +9178,21 @@ fn processQueuedPromptLoop(
         }
 
         var step_batch = runtime_tool_batch.StepBatchState{};
+        const tool_boundary = ToolGroupBoundary{
+            .deps = deps,
+            .finalization = finalization,
+            .stream_ctx = &stream_ctx,
+            .arena = arena,
+            .config = config,
+            .job = job,
+            .messages = &within_turn_suffix,
+            .fast_mode = route_fast_mode,
+            .attempt_limit = semantic_limit,
+            .consumed_attempts = semantic_attempt,
+            .tool_evidence = &preserved_tool_evidence,
+            .trace_ctx = step_ctx,
+            .finish_trace = &finish_trace,
+        };
         terminal_validation_retry.beginBatch();
         shell_execution_failure_retry.beginBatch();
         malformed_arguments_retry.beginBatch();
@@ -8685,6 +9205,10 @@ fn processQueuedPromptLoop(
         for (prepared_tool_calls, 0..) |prepared_tool_call, tool_call_index| {
             if (tool_call_index < parallel_skip_until) continue;
             var tool_call = prepared_tool_call.call();
+            if (deps.journal != null) {
+                try acknowledgeJournalResults(deps, arena, journal_step, within_turn_suffix.items[journal_result_start..]);
+                if (try restoreJournalToolResult(deps, arena, journal_step.?, tool_call_index, tool_call, &within_turn_suffix, &completed_tool_names, &step_batch)) continue;
+            }
             const root_live_permission_mode = snapshotRootPermissionMode(deps);
             const root_action_permission_mode = permissionModeForAction(
                 job.permission_mode,
@@ -8692,7 +9216,7 @@ fn processQueuedPromptLoop(
                 null,
             );
 
-            const parallel_group = if (successful_vision_mode != .required and
+            const parallel_group = if (deps.journal == null and successful_vision_mode != .required and
                 !context_delta and
                 deps.live_tool_authority == null)
                 runtime_parallel_execution.leadingParallelGroup(
@@ -8766,6 +9290,7 @@ fn processQueuedPromptLoop(
                         .ready => {},
                     }
                     if (config.cancel_flag.load(.seq_cst)) {
+                        if (try tool_boundary.pause_if_uncertain()) return;
                         runtime_telemetry.traceCancelObserved(step_ctx, true);
                         try finishPendingParallelCancelled(
                             deps,
@@ -8827,6 +9352,7 @@ fn processQueuedPromptLoop(
                     if (precomputed != null) continue;
                     var parallel_call = unbound_call;
                     if (config.cancel_flag.load(.seq_cst)) {
+                        if (try tool_boundary.pause_if_uncertain()) return;
                         runtime_telemetry.traceCancelObserved(step_ctx, true);
                         try finishPendingParallelCancelled(
                             deps,
@@ -8848,6 +9374,7 @@ fn processQueuedPromptLoop(
                     }
                     parallel_skill_preparations[group_index] = prepareSkillCall(deps, arena, parallel_call, if (skills.catalog) |catalog| &catalog.locations else null) catch |err| {
                         if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
+                        if (try tool_boundary.pause_if_uncertain()) return;
                         runtime_telemetry.traceCancelObserved(step_ctx, true);
                         try finishPendingParallelCancelled(
                             deps,
@@ -8914,6 +9441,7 @@ fn processQueuedPromptLoop(
                             break :blk null;
                         };
                     if (maybe_parallel_permission == null or config.cancel_flag.load(.seq_cst)) {
+                        if (try tool_boundary.pause_if_uncertain()) return;
                         runtime_telemetry.traceCancelObserved(step_ctx, true);
                         try finishPendingParallelCancelled(
                             deps,
@@ -9005,6 +9533,7 @@ fn processQueuedPromptLoop(
                 var parallel_run: ?runtime_parallel_execution.ParallelRunResult = null;
                 if (executable_calls.items.len > 0) {
                     if (config.cancel_flag.load(.seq_cst)) {
+                        if (try tool_boundary.pause_if_uncertain()) return;
                         runtime_telemetry.traceCancelObserved(step_ctx, true);
                         try finishPendingParallelCancelled(
                             deps,
@@ -9084,20 +9613,25 @@ fn processQueuedPromptLoop(
                         .max_tool_result_bytes = config.max_tool_result_bytes,
                         .classification_complete = executable_classification_complete.items,
                     };
+                    var failure_evidence = ParallelFailureEvidence{ .execution = &parallel_exec_ctx };
+                    defer if (failure_evidence.uncertain.load(.seq_cst)) {
+                        preserved_tool_evidence = .uncertain;
+                        stop_state.tool_effects_uncertain = true;
+                    };
                     if (comptime host_target.is_wasm) {
                         parallel_run = try runtime_parallel_execution.runSequentialCalls(arena, executable_calls.items, .{
-                            .exec_ctx = &parallel_exec_ctx,
-                            .execute = runtime_parallel_execution.parallelHookExecute,
-                            .format_ctx = &parallel_exec_ctx,
-                            .format_error = runtime_parallel_execution.parallelHookFormatError,
+                            .exec_ctx = &failure_evidence,
+                            .execute = ParallelFailureEvidence.execute,
+                            .format_ctx = &failure_evidence,
+                            .format_error = ParallelFailureEvidence.format,
                             .cancel_flag = config.cancel_flag,
                         });
                     } else {
                         parallel_run = try runtime_parallel_execution.runParallelCalls(arena, executable_calls.items, .{
-                            .exec_ctx = &parallel_exec_ctx,
-                            .execute = runtime_parallel_execution.parallelHookExecute,
-                            .format_ctx = &parallel_exec_ctx,
-                            .format_error = runtime_parallel_execution.parallelHookFormatError,
+                            .exec_ctx = &failure_evidence,
+                            .execute = ParallelFailureEvidence.execute,
+                            .format_ctx = &failure_evidence,
+                            .format_error = ParallelFailureEvidence.format,
                             .cancel_flag = config.cancel_flag,
                         });
                     }
@@ -9150,6 +9684,7 @@ fn processQueuedPromptLoop(
                     },
                 );
                 if (config.cancel_flag.load(.seq_cst)) {
+                    if (try tool_boundary.pause_if_uncertain()) return;
                     runtime_telemetry.traceCancelObserved(step_ctx, true);
                     try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
                     try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, cancelled_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
@@ -9264,6 +9799,7 @@ fn processQueuedPromptLoop(
                 unreachable;
             }
             if (config.cancel_flag.load(.seq_cst)) {
+                if (try tool_boundary.pause_if_uncertain()) return;
                 runtime_telemetry.traceCancelObserved(step_ctx, true);
                 try finishPendingCancelledCalls(
                     deps,
@@ -9614,6 +10150,7 @@ fn processQueuedPromptLoop(
             }
             var skill_preparation = prepareSkillCall(deps, arena, tool_call, if (skills.catalog) |catalog| &catalog.locations else null) catch |err| {
                 if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
+                if (try tool_boundary.pause_if_uncertain()) return;
                 runtime_telemetry.traceCancelObserved(step_ctx, true);
                 try finishPendingCancelledCalls(
                     deps,
@@ -9917,6 +10454,7 @@ fn processQueuedPromptLoop(
                     break :blk null;
                 };
             if (maybe_permission == null or config.cancel_flag.load(.seq_cst)) {
+                if (try tool_boundary.pause_if_uncertain()) return;
                 runtime_telemetry.traceCancelObserved(step_ctx, true);
                 if (!status_started and (is_file_mutation or defer_auto_command_lifecycle)) {
                     status_started = try runtime_tool_presentation.startToolVisibleLifecycle(
@@ -10009,6 +10547,7 @@ fn processQueuedPromptLoop(
                     break :blk null;
                 };
                 if (maybe_revalidated == null or config.cancel_flag.load(.seq_cst)) {
+                    if (try tool_boundary.pause_if_uncertain()) return;
                     runtime_telemetry.traceCancelObserved(step_ctx, true);
                     if (!status_started and (is_file_mutation or defer_auto_command_lifecycle)) {
                         status_started = try runtime_tool_presentation.startToolVisibleLifecycle(
@@ -10301,6 +10840,7 @@ fn processQueuedPromptLoop(
             }
 
             if (config.cancel_flag.load(.seq_cst)) {
+                if (try tool_boundary.pause_if_uncertain()) return;
                 runtime_telemetry.traceCancelObserved(step_ctx, true);
                 _ = try stream_ctx.provisional_statuses.finishDeniedCall(
                     deps,
@@ -10358,12 +10898,25 @@ fn processQueuedPromptLoop(
             }
             const execution_lifecycle_id = types.ToolLifecycleId{ .turn_id = turn_id, .call_id = execution_call.id };
             const execution_is_command = runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, tool_call) == .command;
+            const journal_context = if (deps.journal) |journal| context: {
+                const recovering = restored_journal_call == tool_call_index;
+                if (recovering) {
+                    const recorded = restored_journal_decision.?;
+                    const current_policy = if (deps.tool_registry.lookup(tool_call.name)) |tool| tool.journal_replay else .blocked;
+                    if (recorded.replay[tool_call_index] != .safe or current_policy != .safe) return error.RecoveryRequired;
+                }
+                const text_reserve = std.math.mul(usize, config.max_tool_result_bytes, 24) catch return error.JournalCapacityExceeded;
+                const result_reserve = std.math.add(usize, @import("../../images/image_data.zig").max_result_frame_bytes + 128 * 1024, text_reserve) catch return error.JournalCapacityExceeded;
+                try journal.preflightOperation(result_reserve, 1, result_reserve);
+                break :context try journal.context(journal_step.?, tool_call_index, recovering);
+            } else null;
             var execution_error: ?anyerror = null;
             var execution = deps.execute_tool_call(deps.ctx, .{
                 .skill_locations = if (skills.catalog) |catalog| &catalog.locations else null,
                 .call_allocator = call_allocator,
                 .result_allocator = arena,
                 .call = execution_call,
+                .journal_context = journal_context,
                 .authority = execution_authority,
                 .credential = activeCredentialLease(active_api_key, job),
                 .permission_mode = action_permission_mode,
@@ -10389,15 +10942,21 @@ fn processQueuedPromptLoop(
                     false,
                 .lifecycle_id = execution_lifecycle_id,
             }) catch |err| blk: {
+                // Entry into an executor followed by an exception establishes
+                // no durable outcome. This includes Cancelled: a host may have
+                // run the tool and lost its result while cancellation arrived.
+                preserved_tool_evidence = .uncertain;
+                stop_state.tool_effects_uncertain = true;
+                if (deps.journal != null) return error.RecoveryRequired;
                 if (err == error.OutOfMemory) return error.OutOfMemory;
-                if (err == error.Cancelled and config.cancel_flag.load(.seq_cst)) {
+                execution_error = err;
+                if (config.cancel_flag.load(.seq_cst)) {
                     break :blk ToolExecutionResult{
                         .status = .failure,
                         .cancelled = true,
-                        .model_output = "command cancelled\n",
+                        .model_output = "Tool outcome unknown after cancellation.\n",
                     };
                 }
-                execution_error = err;
                 break :blk ToolExecutionResult{ .status = .failure, .model_output = try deps.format_tool_execution_error(deps.ctx, arena, tool_call.name, err) };
             };
             var result_commit_pending = execution.result_commit != null;
@@ -10450,6 +11009,9 @@ fn processQueuedPromptLoop(
                     try deps.push_command_output_complete(deps.ctx, execution_lifecycle_id);
                 }
                 try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
+                // Settle local presentation/ownership first, but never commit
+                // interrupted history for an entered tool with no known result.
+                if (try tool_boundary.pause_if_uncertain()) return;
                 const persist_error = if (execution_is_command)
                     runtime_interruption.persistInterruptedCommandTurnOnce(
                         deps,
@@ -10689,6 +11251,10 @@ fn processQueuedPromptLoop(
                         try deps.push_system_notice(deps.ctx, notice);
                     }
                 }
+                // MCP input-required and other tool-driven finishes cannot
+                // clear an earlier unknown effect, even with no suspend flag.
+                if (deps.journal != null) try acknowledgeJournalResults(deps, arena, journal_step, within_turn_suffix.items[journal_result_start..]);
+                if (try tool_boundary.pause_before_finish(tool_call_index + 1 < effective_tool_calls.len)) return;
                 const assistant_text: runtime_finalization.TerminalText = .{ .history = "", .presentation = if (stop_state.retained_candidate != null)
                     try hooks.prompt.joinVisibleSegments(
                         arena,
@@ -10773,6 +11339,7 @@ fn processQueuedPromptLoop(
             &step_batch,
             &within_turn_suffix,
         );
+        if (deps.journal != null) try acknowledgeJournalResults(deps, arena, journal_step, within_turn_suffix.items[journal_result_start..]);
         if (successful_vision_route == .text_only and settled_vision_ids.items.len > 0) {
             const transition = try runtime_vision_contracts.transition_pending_images(
                 arena,
@@ -10788,6 +11355,10 @@ fn processQueuedPromptLoop(
             &within_turn_suffix,
             &step_batch,
         );
+        // The entire selected batch (including parallel calls, blocked calls,
+        // and result commits) is now settled. Preserve it before another model
+        // request or the step-limit finish-history path can run.
+        if (try tool_boundary.pause_before_finish(false)) return;
         if (malformed_arguments_retry.finishBatch()) {
             debug_trace.eventf(
                 "agent",

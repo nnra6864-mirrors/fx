@@ -7,6 +7,7 @@ const execution_memory = @import("execution_memory.zig");
 const lifecycle_runtime = @import("lifecycle.zig");
 const telemetry = @import("telemetry.zig");
 const worker_runtime = @import("../worker_runtime.zig");
+const execution_journal = @import("../../session/execution_journal.zig");
 
 const Allocator = std.mem.Allocator;
 const AgentRuntimeDeps = deps_mod.AgentRuntimeDeps;
@@ -124,6 +125,16 @@ pub const TurnFinalizationGuard = struct {
 
         self.cleanup_agent_terminal_leases();
 
+        if (self.deps.journal) |journal| {
+            if (outcome != .paused) {
+                finishJournal(journal, outcome, disposition, if (finished_prompt) |finished| finished.turn else null) catch |err| {
+                    self.state = .fatal;
+                    if (finished_prompt) |finished| types.freeFinishedPrompt(std.heap.c_allocator, finished);
+                    return err;
+                };
+            }
+        }
+
         self.deps.finalize_turn(self.deps.ctx, self.turn_id, outcome, disposition) catch |err| {
             self.state = .fatal;
             if (finished_prompt) |finished| {
@@ -147,6 +158,48 @@ pub const TurnFinalizationGuard = struct {
         }
     }
 };
+
+fn finishJournal(journal: *@import("journal_runtime.zig").Runtime, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition, history: ?HistoryTurn) !void {
+    var arena: std.heap.ArenaAllocator = .init(journal.alloc);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    const position = journal.state.pending();
+    if (outcome == .completed) {
+        var usage: types.Usage = .{};
+        for (0..journal.state.stepCount(journal.turn.?)) |step| {
+            const completion = try execution_journal.object(journal.state.modelStep(journal.turn.?, step), "completion");
+            const parsed = try std.json.parseFromValue(types.Usage, alloc, try execution_journal.object(completion, "usage"), .{});
+            inline for (@typeInfo(types.Usage).@"struct".fields) |field| {
+                if (@field(parsed.value, field.name)) |count| @field(usage, field.name) = try std.math.add(u64, @field(usage, field.name) orelse 0, count);
+            }
+        }
+        try std.json.Stringify.value(.{
+            .ok = true,
+            .stopReason = if (disposition == .length_limited) "length" else "stop",
+            .usage = usage,
+        }, .{}, &writer.writer);
+    } else {
+        try writer.writer.writeAll("{\"ok\":false,\"reason\":");
+        try std.json.Stringify.value(if (outcome == .interrupted) "cancelled" else "provider_error", .{}, &writer.writer);
+        try writer.writer.writeAll(",\"retryable\":false,\"message\":");
+        try std.json.Stringify.value(if (outcome == .interrupted) "The turn was cancelled." else "The turn could not complete.", .{}, &writer.writer);
+        if (position == .tool) {
+            const selected = position.tool;
+            const call = (try execution_journal.array(journal.state.modelStep(selected.turn, selected.step), "calls"))[selected.call];
+            const input = try std.json.parseFromSlice(std.json.Value, alloc, try execution_journal.string(call, "argumentsJson"), .{});
+            try writer.writer.writeAll(",\"pendingTool\":");
+            try std.json.Stringify.value(.{
+                .callId = try execution_journal.string(call, "callId"),
+                .name = try execution_journal.string(call, "name"),
+                .input = input.value,
+            }, .{}, &writer.writer);
+        }
+        try writer.writer.writeByte('}');
+    }
+    const result = try std.json.parseFromSlice(std.json.Value, alloc, writer.written(), .{});
+    try journal.finish(result.value, history);
+}
 
 pub const TerminalText = struct {
     history: []const u8,

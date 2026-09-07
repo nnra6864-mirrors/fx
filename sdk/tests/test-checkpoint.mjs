@@ -5,6 +5,7 @@ import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createFxAgent } from "../node.js";
+import { createJournalStore } from "./fixtures/journal-store.mjs";
 
 const sourceBackend = process.argv[2] || "native";
 const targetBackend = process.argv[3] || "wasm";
@@ -12,6 +13,7 @@ const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const addon = resolve(scriptDir, "../../zig-out/lib/libfx.node");
 const wasm = await readFile(resolve(scriptDir, "../../zig-out/bin/fx-core.wasm"));
 let modelRequests = 0;
+const store = createJournalStore();
 
 const server = createServer((request, response) => {
   let body = "";
@@ -51,7 +53,7 @@ const options = (backend, checkpoint) => ({
   backend,
   nativeAddon: addon,
   ...(backend === "wasm" ? { wasm } : {}),
-  ...(checkpoint ? { checkpoint } : {}),
+  ...store.options(checkpoint ? [checkpoint] : []),
   fetch,
   apiKey: "checkpoint-key",
   gatewayChatUrl: `http://127.0.0.1:${port}/chat`,
@@ -62,22 +64,23 @@ let source;
 let target;
 try {
   source = await createFxAgent(options(sourceBackend));
-  const first = source.prompt("store this context");
+  const first = source.prompt("store this context", { requestId: "store-context" });
   for await (const _ of first) {}
-  assert.equal((await first.result).stopReason, "end_turn");
+  assert.equal((await first.result).stopReason, "stop");
   const checkpoint = await source.checkpoint();
-  assert.ok(checkpoint instanceof Uint8Array && checkpoint.length > 48);
+  assert.ok(checkpoint.kind === "checkpoint" && checkpoint.bytes instanceof Uint8Array && checkpoint.bytes.length > 48);
+  assert.equal(store.read().at(-1).hash, checkpoint.hash);
   assert.equal(await source.close(), undefined);
   source = null;
 
   target = await createFxAgent(options(targetBackend, checkpoint));
-  const second = target.prompt("continue");
+  const second = target.prompt("continue", { requestId: "continue-context" });
   let text = "";
   for await (const update of second) {
     if (update.type === "text_delta") text += update.delta;
   }
   assert.equal(text.trim(), "restored");
-  assert.equal((await second.result).stopReason, "end_turn");
+  assert.equal((await second.result).stopReason, "stop");
   assert.equal(await target.close(), undefined);
   target = null;
   assert.equal(modelRequests, 2);
@@ -87,4 +90,5 @@ try {
   await target?.close().catch(() => {});
   server.closeAllConnections();
   await new Promise((resolveClose) => server.close(resolveClose));
+  store.close();
 }

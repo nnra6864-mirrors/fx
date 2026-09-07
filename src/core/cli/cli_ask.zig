@@ -3203,13 +3203,15 @@ fn pushContextNotice(raw_ctx: *anyopaque, text: []const u8) !void {
 fn pushRouteRecoveryStatus(raw_ctx: *anyopaque, status: types.RouteRecoveryStatus) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     ctx.last_recovery_status = status;
-    const terminal = status.kind == .terminal_provider_error;
+    const terminal = status.is_paused();
     const json_progress = switch (status.kind) {
         .auto_retry,
         .auto_recovered,
         .manual_retry_without_fast,
         .manual_recovered_without_fast,
         .terminal_provider_error,
+        .suspended,
+        .tool_state_uncertain,
         => true,
         .unsafe_assistant_output,
         .unsafe_tool_start,

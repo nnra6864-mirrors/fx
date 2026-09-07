@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import "./journal/crash.test";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
