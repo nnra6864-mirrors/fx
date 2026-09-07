@@ -132,6 +132,15 @@ pub const TurnFinalizationGuard = struct {
                     if (finished_prompt) |finished| types.freeFinishedPrompt(std.heap.c_allocator, finished);
                     return err;
                 };
+                if (finished_prompt) |finished| {
+                    self.deps.propagate_history_turn(self.deps.ctx, finished.turn) catch |err| {
+                        debug_trace.logf("agent", "journal terminal cache update failed turn_id={d} seq={d} err={s}", .{ self.turn_id, journal.state.last_seq, @errorName(err) });
+                        journal.state.blocked = true;
+                        self.state = .fatal;
+                        types.freeFinishedPrompt(std.heap.c_allocator, finished);
+                        return err;
+                    };
+                }
             }
         }
 
@@ -255,9 +264,11 @@ pub fn finishAssistantTerminalWithExecution(
     );
 
     var propagation_error: ?anyerror = null;
-    deps.propagate_history_turn(deps.ctx, turn) catch |err| {
-        propagation_error = err;
-    };
+    if (deps.journal == null) {
+        deps.propagate_history_turn(deps.ctx, turn) catch |err| {
+            propagation_error = err;
+        };
+    }
     try finalization.finish(outcome, disposition, finished);
     finish_trace.finish(trace_outcome);
     if (propagation_error) |err| return err;

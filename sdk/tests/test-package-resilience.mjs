@@ -618,6 +618,8 @@ async function installedWorkerMain() {
   };
   const runCancellationWorkflow = async () => {
     const marker = nextMarker("cancel");
+    const journalPath = `cancel-${marker}.jsonl`;
+    const persist = (entry) => appendFileSync(journalPath, JSON.stringify({ ...entry, bytes: Buffer.from(entry.bytes).toString("base64") }) + "\n", { flush: true });
     provider.markerModes.set(marker, "cancel");
     provider.uniqueMarkers += 1;
     let startResolve;
@@ -643,6 +645,7 @@ async function installedWorkerMain() {
     try {
       agent = await esm.createFxAgent({
         ...baseOptions("native", [waitTool]),
+        onEntry: persist,
         onEvent(event) { runtimeEvents.push(event); },
       });
       const pending = consumeTurn(agent.prompt(`CALL ${marker}`, { requestId: `call-${marker}`, signal: controller.signal }));
@@ -661,6 +664,17 @@ async function installedWorkerMain() {
       assert.equal(status.pendingTurn.awaiting.tool.name, "wait");
       assert.equal(provider.markerRequestCounts.get(marker), 1, "cancelled unknown effect must not reach another provider step");
       await agent.abandon();
+      await assert.rejects(consumeTurn(agent.prompt(`RECOVER ${marker}`, { requestId: `still-fenced-${marker}` })), esm.RecoveryRequired);
+      await agent.close();
+      agent = null;
+      const journal = (await readFile(journalPath, "utf8")).trim().split("\n").map((line) => {
+        const entry = JSON.parse(line);
+        return { ...entry, bytes: new Uint8Array(Buffer.from(entry.bytes, "base64")) };
+      });
+      agent = await esm.createFxAgent({
+        ...baseOptions("native", [waitTool]), journal, onEntry: persist,
+        onEvent(event) { runtimeEvents.push(event); },
+      });
       const recovery = await withTimeout(consumeTurn(agent.prompt(`RECOVER ${marker}`, { requestId: `recover-${marker}` })), 10_000, `cancel recovery ${marker}`);
       assert.equal(recovery.text, `recovered:${marker}`);
       const checkpointBeforeLate = await agent.checkpoint();

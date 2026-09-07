@@ -140,9 +140,11 @@ fn persistInterruptedTurnWithPresentation(
 
         persisted.* = true;
         var propagation_error: ?anyerror = null;
-        hooks.propagate_history_turn(hooks.ctx, turn) catch |err| {
-            propagation_error = err;
-        };
+        if (hooks.journal == null) {
+            hooks.propagate_history_turn(hooks.ctx, turn) catch |err| {
+                propagation_error = err;
+            };
+        }
         try traceInterruptedPersistence(
             job,
             assistant.history,
@@ -173,9 +175,11 @@ fn persistInterruptedTurnWithPresentation(
     } };
 
     var propagation_error: ?anyerror = null;
-    hooks.propagate_history_turn(hooks.ctx, turn) catch |err| {
-        propagation_error = err;
-    };
+    if (hooks.journal == null) {
+        hooks.propagate_history_turn(hooks.ctx, turn) catch |err| {
+            propagation_error = err;
+        };
+    }
     try traceInterruptedPersistence(
         job,
         partial_assistant,
@@ -230,9 +234,11 @@ pub fn persistFailedPartialTurnOnce(
 
     persisted.* = true;
     var propagation_error: ?anyerror = null;
-    hooks.propagate_history_turn(hooks.ctx, turn) catch |err| {
-        propagation_error = err;
-    };
+    if (hooks.journal == null) {
+        hooks.propagate_history_turn(hooks.ctx, turn) catch |err| {
+            propagation_error = err;
+        };
+    }
     debug_trace.eventf(
         "gateway",
         "stream_failure_history_persisted",

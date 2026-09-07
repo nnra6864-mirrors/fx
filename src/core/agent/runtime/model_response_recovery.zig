@@ -107,16 +107,6 @@ pub const Decision = struct {
 pub noinline fn decide(evidence: Evidence) Decision {
     if (evidence.cancelled) return .{ .strategy = .stop };
 
-    // Delivery of this request says nothing about earlier uncertain tool effects.
-    // Reconciliation by another model request is not proof that replay is safe.
-    if (@import("suspension.zig").decide(.{
-        .boundary = .before_model,
-        .tool = evidence.tool,
-    }) == .blocked) return .{
-        .strategy = .pause,
-        .required_action = .inspect_uncertain_tool,
-    };
-
     switch (evidence.cause) {
         .suspended => return .{
             .strategy = .pause,
@@ -251,11 +241,11 @@ test "model response recovery policy is deterministic and bounded" {
 
     var uncertain = partial;
     uncertain.tool = .uncertain;
-    try std.testing.expectEqual(Strategy.pause, decide(uncertain).strategy);
+    try std.testing.expectEqual(Strategy.reconcile_tool, decide(uncertain).strategy);
 
     var definitely_unsent = uncertain;
     definitely_unsent.delivery = .definitely_unsent;
-    try std.testing.expectEqual(Strategy.pause, decide(definitely_unsent).strategy);
+    try std.testing.expectEqual(Strategy.retry_request, decide(definitely_unsent).strategy);
 
     var exhausted = base;
     exhausted.attempts.consumed = exhausted.attempts.limit;

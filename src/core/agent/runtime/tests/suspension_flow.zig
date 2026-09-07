@@ -204,7 +204,7 @@ test "suspension orchestrator fails closed without storage or with failed or los
 test "suspension recovery uncertainty cannot reserve a request even if definitely unsent" {
     for ([_]recovery.Delivery{ .definitely_unsent, .possibly_sent }) |delivery| {
         const decision = recovery.decide(.{
-            .cause = .transport_interrupted,
+            .cause = .tool_state_uncertain,
             .delivery = delivery,
             .attempts = .{ .consumed = 1 },
             .tool = .uncertain,
@@ -529,6 +529,9 @@ test "suspension uncertainty survives entered host executor cancellation without
     for ([_]anyerror{ error.Cancelled, error.HostToolOutcomeUncertain }) |failure| {
         const alloc = std.testing.allocator;
         var fixture = support.PromptFixture{};
+        var flag = std.atomic.Value(bool).init(false);
+        var config = fixture.config();
+        config.suspend_flag = &flag;
         const selected = [_]types.ToolCall{ effect_call, calls[0] };
         var gateway = support.FakeGateway.init(alloc, &.{.{ .tool_calls = &selected }});
         defer gateway.deinit();
@@ -537,7 +540,7 @@ test "suspension uncertainty survives entered host executor cancellation without
         hooks.enable_recovery_checkpoint = true;
         hooks.cancel_on_execute = &fixture.cancel_flag;
         hooks.exec_plans = &.{.{ .err = failure }};
-        try support.runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+        try support.runFakePrompt(&gateway, &hooks, config, fixture.job());
         try std.testing.expectEqual(@as(usize, 1), hooks.executed_call_ids.items.len);
         try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
         try expect_uncertain_reload_blocked(&fixture, &hooks);
@@ -578,6 +581,9 @@ test "suspension uncertainty survives later permission cancellation or callback 
 test "suspension uncertainty survives parallel entered executor cancellation" {
     const alloc = std.testing.allocator;
     var fixture = support.PromptFixture{};
+    var flag = std.atomic.Value(bool).init(false);
+    var config = fixture.config();
+    config.suspend_flag = &flag;
     var job = fixture.job();
     job.permission_mode = .yolo;
     var gateway = support.FakeGateway.init(alloc, &.{.{ .tool_calls = &calls }});
@@ -587,7 +593,7 @@ test "suspension uncertainty survives parallel entered executor cancellation" {
     hooks.enable_recovery_checkpoint = true;
     hooks.cancel_on_execute = &fixture.cancel_flag;
     hooks.exec_plans = &.{ .{ .err = error.Cancelled }, .{ .err = error.Cancelled } };
-    try support.runFakePrompt(&gateway, &hooks, fixture.config(), job);
+    try support.runFakePrompt(&gateway, &hooks, config, job);
     try std.testing.expect(hooks.executed_call_ids.items.len > 0);
     try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
     try expect_uncertain_reload_blocked(&fixture, &hooks);

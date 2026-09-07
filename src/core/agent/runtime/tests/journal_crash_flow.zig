@@ -36,7 +36,8 @@ const Witness = struct {
     durable: std.ArrayList(entry_codec.OwnedEntry) = .empty,
     before_tools: [2]?journal.State = .{ null, null },
     after_effect: [2]?journal.State = .{ null, null },
-    before_history: ?journal.State = null,
+    before_end: ?journal.State = null,
+    fail_history: bool = false,
     call_ids: [2]?[]u8 = .{ null, null },
     recovering_calls: [2]?bool = .{ null, null },
     entries: usize = 0,
@@ -54,7 +55,7 @@ const Witness = struct {
         const alloc = std.testing.allocator;
         for (&self.before_tools) |*cut| if (cut.*) |*state| state.deinit(alloc);
         for (&self.after_effect) |*cut| if (cut.*) |*state| state.deinit(alloc);
-        if (self.before_history) |*state| state.deinit(alloc);
+        if (self.before_end) |*state| state.deinit(alloc);
         for (self.call_ids) |id| if (id) |owned| alloc.free(owned);
         for (self.durable.items) |*entry| entry.deinit(alloc);
         self.durable.deinit(alloc);
@@ -65,6 +66,7 @@ const Witness = struct {
     fn append(raw: *anyopaque, entry: journal.Entry) !void {
         const self: *Witness = @ptrCast(@alignCast(raw));
         const alloc = std.testing.allocator;
+        if (entry.kind == .turn_end and self.before_end == null) self.before_end = try self.capture();
         const previous = if (self.durable.items.len == 0) 0 else self.durable.getLast().entry.seq;
         if (entry.seq != previous + 1) return error.UnexpectedJournalSequence;
         var copy = try entry_codec.decode(alloc, entry.seq, @tagName(entry.kind), entry.bytes, &entry.hash);
@@ -131,7 +133,9 @@ const Witness = struct {
     fn history(raw: *anyopaque, turn: types.HistoryTurn) !void {
         const hooks: *support.FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         const self: *Witness = @fieldParentPtr("hooks", hooks);
-        if (self.before_history == null) self.before_history = try self.capture();
+        try std.testing.expectEqual(journal.Kind.turn_end, self.durable.getLast().entry.kind);
+        try std.testing.expect(self.state.pending() == .idle);
+        if (self.fail_history) return error.TestHistoryProjectionFailed;
         try self.hooks.deps().propagate_history_turn(raw, turn);
     }
 
@@ -391,14 +395,14 @@ test "journal witness J05 death before effect transaction can execute the record
     try recover_safe_cut(false);
 }
 
-test "journal witness J07 final model output survives death before history commit" {
+test "journal witness J07 final model output survives death before turn end acknowledgement" {
     var fixture = support.PromptFixture{};
     var witness = Witness.init();
     defer witness.deinit();
     var gateway = support.FakeGateway.init(std.testing.allocator, &.{.{ .content = "DURABLE_FINAL_MODEL_ANSWER" }});
     defer gateway.deinit();
     try witness.run(&gateway, &fixture, null);
-    const cut = witness.before_history orelse return error.NoDurableFinalModelBoundary;
+    const cut = witness.before_end orelse return error.NoDurableFinalModelBoundary;
     try std.testing.expect(cut.pending() == .ending);
     const completion = try journal.object(cut.modelStep(0, cut.stepCount(0) - 1), "completion");
     try std.testing.expectEqualStrings("DURABLE_FINAL_MODEL_ANSWER", (try journal.field(completion, "content", .string)).string);
@@ -411,6 +415,32 @@ test "journal witness J07 final model output survives death before history commi
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, restored.hooks.finalized_outcome.?);
     try std.testing.expectEqualStrings("DURABLE_FINAL_MODEL_ANSWER", restored.hooks.history_assistant_text orelse return error.MissingRestoredFinalHistory);
     try std.testing.expectEqual(journal.Kind.turn_end, restored.durable.getLast().entry.kind);
+}
+
+test "journal witness failed terminal projection preserves the acknowledged result and fences the owner" {
+    var fixture = support.PromptFixture{};
+    var witness = Witness.init();
+    defer witness.deinit();
+    witness.fail_history = true;
+    var gateway = support.FakeGateway.init(std.testing.allocator, &.{.{ .content = "acknowledged result" }});
+    defer gateway.deinit();
+    try std.testing.expectError(error.TestHistoryProjectionFailed, witness.run(&gateway, &fixture, null));
+    try std.testing.expect(witness.state.blocked);
+    try std.testing.expectEqual(journal.Kind.turn_end, witness.durable.getLast().entry.kind);
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try std.testing.expectError(error.PersistenceUncertain, witness.run(&gateway, &fixture, null));
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    var committed = (try witness.capture()).?;
+    defer committed.deinit(std.testing.allocator);
+    var reopened = Witness.init();
+    defer reopened.deinit();
+    var no_provider = support.FakeGateway.init(std.testing.allocator, &.{});
+    defer no_provider.deinit();
+    try std.testing.expectError(error.RequestAlreadyCompleted, reopened.run(&no_provider, &fixture, &committed));
+    try std.testing.expect(reopened.state.pending() == .idle);
+    const result = try journal.object(reopened.state.outcome(0).?, "result");
+    try std.testing.expect(try journal.boolean(result, "ok"));
+    try std.testing.expectEqual(@as(usize, 0), no_provider.request_bodies.items.len);
 }
 
 test "journal witness control unknown tool effects cannot resume by removing the guard" {

@@ -3797,7 +3797,7 @@ const ParallelFailureEvidence = struct {
 };
 
 fn toolFailureUncertain(failure: anyerror, all_failures_uncertain: bool) bool {
-    return all_failures_uncertain or failure == error.HostToolOutcomeUncertain or failure == error.Cancelled;
+    return all_failures_uncertain or failure == error.HostToolOutcomeUncertain;
 }
 
 /// A missing or nonterminal result cannot establish a safe checkpoint boundary.
@@ -3835,11 +3835,12 @@ fn suspend_at_safe_boundary(
     attempt_limit: usize,
     consumed_attempts: usize,
     tool_evidence: suspension.ToolEvidence,
+    effects_uncertain: bool,
     trace_ctx: TraceContext,
     finish_trace: *PromptFinishTrace,
 ) !bool {
     const requested = if (config.suspend_flag) |flag| flag.load(.seq_cst) else false;
-    if (!requested and tool_evidence != .uncertain) return false;
+    if (!requested and !effects_uncertain) return false;
     if (deps.journal) |journal| {
         try journal.state.ensureAvailable();
         try finishRecoveryPaused(deps, finalization, stream_ctx, arena, finish_trace, if (tool_evidence == .uncertain) .tool_state_uncertain else .suspended, consumed_attempts, attempt_limit, pausedRequiredAction(tool_evidence), null);
@@ -3917,6 +3918,7 @@ const ToolGroupBoundary = struct {
     attempt_limit: usize,
     consumed_attempts: usize,
     tool_evidence: *model_response_recovery.ToolEvidence,
+    effects_uncertain: *const bool,
     trace_ctx: TraceContext,
     finish_trace: *PromptFinishTrace,
 
@@ -3935,13 +3937,14 @@ const ToolGroupBoundary = struct {
             self.attempt_limit,
             self.consumed_attempts,
             if (pending_calls and requested) .uncertain else self.tool_evidence.*,
+            self.effects_uncertain.*,
             self.trace_ctx,
             self.finish_trace,
         );
     }
 
     fn pause_if_uncertain(self: ToolGroupBoundary) !bool {
-        if (self.tool_evidence.* != .uncertain) return false;
+        if (!self.effects_uncertain.*) return false;
         return self.pause_before_finish(false);
     }
 };
@@ -4853,7 +4856,7 @@ pub fn processAgentPrompt(
 
     processQueuedPromptInner(deps, semantic_presentation, effective_lifecycle, effective_config, effective_job, &finalization, agent) catch |err| {
         if (deps.journal) |journal| {
-            if (journal.state.blocked) return error.PersistenceUncertain;
+            if (journal.state.blocked) return err;
             if (err == error.JournalCapacityExceeded) {
                 if (finalization.state == .open) try finalization.finish(.paused, null, null);
                 return err;
@@ -6466,6 +6469,7 @@ fn processQueuedPromptLoop(
                 semantic_limit,
                 semantic_attempt,
                 preserved_tool_evidence,
+                stop_state.tool_effects_uncertain,
                 step_ctx,
                 &finish_trace,
             )) return;
@@ -6947,6 +6951,7 @@ fn processQueuedPromptLoop(
                 semantic_limit,
                 semantic_attempt,
                 preserved_tool_evidence,
+                stop_state.tool_effects_uncertain,
                 step_ctx,
                 &finish_trace,
             )) return;
@@ -8622,7 +8627,7 @@ fn processQueuedPromptLoop(
                 .execution = try finalization.compacted_execution.project(arena, finish_execution),
             } };
             types.setHistoryTurnSummary(&turn, completed_summary);
-            try deps.propagate_history_turn(deps.ctx, turn);
+            if (deps.journal == null) try deps.propagate_history_turn(deps.ctx, turn);
             try finalization.finish(.failed, .length_limited, .{
                 .turn = try types.dupeHistoryTurn(std.heap.c_allocator, turn),
                 .summary = completed_summary,
@@ -9196,6 +9201,7 @@ fn processQueuedPromptLoop(
             .attempt_limit = semantic_limit,
             .consumed_attempts = semantic_attempt,
             .tool_evidence = &preserved_tool_evidence,
+            .effects_uncertain = &stop_state.tool_effects_uncertain,
             .trace_ctx = step_ctx,
             .finish_trace = &finish_trace,
         };
@@ -11640,7 +11646,7 @@ fn finishFailedTurnWithNotice(
         .execution = try finalization.compacted_execution.project(arena, execution_memory),
     } };
     types.setHistoryTurnSummary(&turn, completed_summary);
-    try deps.propagate_history_turn(deps.ctx, turn);
+    if (deps.journal == null) try deps.propagate_history_turn(deps.ctx, turn);
     try finalization.finish(.failed, null, .{
         .turn = try types.dupeHistoryTurn(std.heap.c_allocator, turn),
         .summary = completed_summary,
