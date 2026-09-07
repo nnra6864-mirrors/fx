@@ -69,16 +69,15 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
-test.skipIf(!tmuxAvailable())("foreground resume refreshes a suspended writer after another process commits", async () => {
-  const root = mkdtempSync(join(tmpdir(), "fx-parked-writer-"));
+test.skipIf(!tmuxAvailable())("suspended sessions retain exclusive writer ownership until close", async () => {
+  const root = mkdtempSync(join(tmpdir(), "fx-single-writer-"));
   const home = join(root, "home"), workspace = join(root, "workspace");
   mkdirSync(home); mkdirSync(workspace);
-  const trace = join(root, "trace.log"), exitPath = join(root, "exit");
+  const exitPath = join(root, "exit");
   const gateway = startFakeGateway([
-    fakeGatewayFinalText("ORIGINAL_HANDOFF_FACT"),
-    fakeGatewayFinalText("OTHER_WRITER_HANDOFF_FACT"),
+    fakeGatewayFinalText("ORIGINAL_SAVED_FACT"),
     fakeGatewayFinalText("FOREGROUND_WRITER_FINISHED"),
-    fakeGatewayFinalText("COLD_HANDOFF_FINISHED"),
+    fakeGatewayFinalText("COLD_RESUME_FINISHED"),
   ]);
   const env = gatewayEnv(home, gateway);
   let tui: TmuxSession | undefined;
@@ -87,29 +86,30 @@ test.skipIf(!tmuxAvailable())("foreground resume refreshes a suspended writer af
     expect(seed.code).toBe(0);
     const id = JSON.parse(seed.stdout).session_id;
     const events = join(home, ".fx", "sessions", id, "events.jsonl");
+    const accepted = readFileSync(events);
     tui = await TmuxSession.create({
       cmd: "/bin/bash --noprofile --norc -i", cwd: workspace, isolated: true,
-      width: 110, height: 36,
-      env: { ...env, PS1: "HANDOFF_SHELL> ", FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "session" },
+      width: 110, height: 36, env: { ...env, PS1: "SESSION_SHELL> " },
     });
-    await tui.waitForText("HANDOFF_SHELL>", TIMEOUT);
+    await tui.waitForText("SESSION_SHELL>", TIMEOUT);
     await tui.sendText(`${shellQuote(FX_BIN)} --resume ${shellQuote(id)}`);
-    await tui.waitForText("ORIGINAL_HANDOFF_FACT", TIMEOUT);
+    await tui.waitForText("ORIGINAL_SAVED_FACT", TIMEOUT);
     await tui.waitForStableComposer(TIMEOUT);
+    await tui.sendLiteral("DRAFT_SURVIVES_SUSPENSION");
+    await tui.waitForText("DRAFT_SURVIVES_SUSPENSION", TIMEOUT);
     await tui.sendKeys("C-z");
-    await tui.waitForPane(() => existsSync(trace) && readFileSync(trace, "utf8").includes("parked writer lock for suspend"), TIMEOUT);
     await tui.waitForText("Stopped", TIMEOUT);
-    const other = await runFx(["ask", "--json", "--resume-id", id, "Save another fact."], { cwd: workspace, env });
-    expect(other.code).toBe(0);
-    const accepted = readFileSync(events);
-    expect(accepted.toString()).toContain("OTHER_WRITER_HANDOFF_FACT");
+    const other = await runFx(["ask", "--json", "--resume-id", id, "Must not run while the writer is suspended."], { cwd: workspace, env });
+    expect(other.code).toBe(1);
+    expect(JSON.parse(other.stdout).error).toBe("SessionBusy");
+    expect(gateway.requests).toHaveLength(1);
+    expect(readFileSync(events)).toEqual(accepted);
     await tui.sendText(`fg; printf '%s' "$?" > ${shellQuote(exitPath)}`);
-    await tui.waitForPane(() => readFileSync(trace, "utf8").includes("unparked writer lock after suspend"), TIMEOUT);
-    await tui.waitForStableComposer(TIMEOUT);
-    await tui.sendText("Continue after foregrounding.");
+    await tui.waitForPane(pane => (pane.split("\n").filter(line => /^\s*┃/.test(line)).at(-1) ?? "").includes("DRAFT_SURVIVES_SUSPENSION"), TIMEOUT);
+    await tui.sendKeys("Enter");
     await tui.waitForText("FOREGROUND_WRITER_FINISHED", TIMEOUT);
     await tui.waitForStableComposer(TIMEOUT);
-    expect(gateway.requests.at(-1)!.body).toContain("OTHER_WRITER_HANDOFF_FACT");
+    expect(gateway.requests.at(-1)!.body).toContain("DRAFT_SURVIVES_SUSPENSION");
     await tui.sendText("/quit");
     await tui.waitForPane(() => existsSync(exitPath), TIMEOUT);
     expect(readFileSync(exitPath, "utf8")).toBe("0");
@@ -117,7 +117,8 @@ test.skipIf(!tmuxAvailable())("foreground resume refreshes a suspended writer af
     const cold = await runFx(["ask", "--json", "--resume-id", id, "Check the complete saved history."], { cwd: workspace, env });
     expect(cold.code).toBe(0);
     expect(cold.stderr).toBe("");
-    expect(gateway.requests.at(-1)!.body).toContain("OTHER_WRITER_HANDOFF_FACT");
+    expect(gateway.requests.at(-1)!.body).toContain("ORIGINAL_SAVED_FACT");
+    expect(gateway.requests.at(-1)!.body).toContain("FOREGROUND_WRITER_FINISHED");
   } finally {
     await tui?.kill(); gateway.stop(); rmSync(root, { recursive: true, force: true });
   }

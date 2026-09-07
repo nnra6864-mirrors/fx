@@ -172,7 +172,8 @@ test "usage recovery preserves valid snapshots and marks corrupt accounting inco
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
+    var dir = try openTestVerifiedDir(tmp.dir);
+    defer dir.close();
     const missing = try load_for_recovery(alloc, &dir, "session");
     try std.testing.expect(missing.snapshot == null and !missing.incomplete);
     var usage = session_usage.Usage.initFresh();

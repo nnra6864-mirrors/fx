@@ -21,7 +21,6 @@ const provider_runtime = @import("provider_runtime.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const core_input_runtime = @import("../input/runtime.zig");
-const composer_history = @import("../input/composer_history.zig");
 const io_mod = @import("../shared/io.zig");
 const list_window = @import("../shared/list_window.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -2747,24 +2746,10 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn finalizePersistence(app: *App) void {
-            if (app.session_persistence.writable) |*loaded| {
-                if (loaded.log.isParked()) {
-                    app.session_persistence.resume_handoff_intent = .none;
-                    abandonParkedWritableSession(app);
-                    return;
-                }
-            }
             closeWritableSession(app);
         }
 
         pub fn finalizePersistenceWithResumeHandoff(app: *App) !?ResumeHandoff {
-            if (app.session_persistence.writable) |*loaded| {
-                if (loaded.log.isParked()) {
-                    app.session_persistence.resume_handoff_intent = .none;
-                    abandonParkedWritableSession(app);
-                    return null;
-                }
-            }
             return closeWritableSessionWithResumeHandoff(app);
         }
 
@@ -2787,124 +2772,12 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn suspendToJobControl(app: *App, footer_rows: u16) !void {
-            if (!shell_runtime.supports_resize_signal) return;
-            if (!tryBeginIdleSessionPark(app)) {
-                return app_lifecycle.suspendToJobControl(
-                    &app.terminal,
-                    &app.shell,
-                    &app.metrics,
-                    footer_rows,
-                );
-            }
-            defer app.worker.releaseTurnStartHold();
-
-            app.session.usage.cancelReconciliation();
-            app.session.usage.finishProfilePublicationsBeforeShutdown();
-            app.session.usage.checkpoint_mutex.lockUncancelable(io_mod.getIo());
-            const checkpoint_sink = app.session.usage.checkpoint_sink;
-            app.session.usage.checkpoint_sink = null;
-            app.session.usage.checkpoint_mutex.unlock(io_mod.getIo());
-            defer if (app.session_persistence.writable != null) app.session.usage.configureCheckpointSink(checkpoint_sink);
-            try prepareResumeHandoff(app);
-            const loaded = &app.session_persistence.writable.?;
-            loaded.log.park();
-            debug_trace.logf(
-                "session",
-                "parked writer lock for suspend session={s}",
-                .{loaded.active_id},
-            );
-
-            const lifecycle_result = app_lifecycle.suspendToJobControl(
+            return app_lifecycle.suspendToJobControl(
                 &app.terminal,
                 &app.shell,
                 &app.metrics,
                 footer_rows,
             );
-            refresh_parked_session(app) catch |err| {
-                debug_trace.logf("session", "unpark after suspend failed err={s}", .{@errorName(err)});
-                abandonParkedWritableSession(app);
-                app.worker.requestStop();
-                app.should_exit = true;
-                try lifecycle_result;
-                return err;
-            };
-
-            debug_trace.logf(
-                "session",
-                "unparked writer lock after suspend session={s}",
-                .{app.session_persistence.writable.?.active_id},
-            );
-            startResumedSessionReconciliation(app);
-            try lifecycle_result;
-        }
-
-        fn refresh_parked_session(app: *App) !void {
-            const parked = if (app.session_persistence.writable) |*value| value else return error.SessionPersistenceUnavailable;
-            if (!parked.log.isParked()) return error.SessionBusy;
-            const id = try app.alloc.dupe(u8, parked.active_id);
-            defer app.alloc.free(id);
-            var fresh = try loadResumeTargetForWrite(app, .{ .id = id }, .{});
-            var fresh_owned = true;
-            defer if (fresh_owned) fresh.deinit(app.alloc);
-            var display = try readNativeResumeDisplay(app, &fresh);
-            defer display.deinit(app.alloc);
-            const previous_next_image_id = app.next_image_id;
-            // The parked snapshot cannot settle state after another writer ran.
-            parked.deinit(app.alloc);
-            app.session_persistence.writable = fresh;
-            fresh_owned = false;
-            errdefer {
-                app.session_persistence.writable.?.deinit(app.alloc);
-                app.session_persistence.writable = null;
-            }
-            const active = &app.session_persistence.writable.?;
-            try hydrateResumedSession(app, active.state, display.title, .session);
-            var rebase_images = false;
-            for (app.pending_images.items) |image| {
-                if (image.id < app.next_image_id) rebase_images = true;
-            }
-            app.next_image_id = @max(app.next_image_id, previous_next_image_id);
-            if (rebase_images) {
-                app.next_image_id = try composer_history.rebase_active_images(
-                    app.alloc,
-                    &app.input_runtime.edit_state,
-                    &app.input_runtime.entities,
-                    &app.pending_images,
-                    app.next_image_id,
-                );
-            }
-            active.releaseHydrationHistory(app.alloc);
-            configureWebFetchArtifacts(app, active);
-        }
-
-        fn tryBeginIdleSessionPark(app: *App) bool {
-            if (app.session_persistence.writable == null or app.stream.active) {
-                return false;
-            }
-            return app.worker.tryHoldTurnStart();
-        }
-
-        /// Tear down a parked writable without converging or checkpointing.
-        fn abandonParkedWritableSession(app: *App) void {
-            discardAnyPendingCancelledCommand(app, "writable_session_abandon");
-            const loaded = if (app.session_persistence.writable) |*value|
-                value
-            else
-                return;
-            if (comptime @hasDecl(
-                @TypeOf(app.session),
-                "clearWebFetchArtifacts",
-            )) {
-                app.session.clearWebFetchArtifacts();
-            }
-            disableSubagentHost(app);
-            debug_trace.logf(
-                "session",
-                "abandon parked writable session={s}",
-                .{loaded.active_id},
-            );
-            loaded.deinit(app.alloc);
-            app.session_persistence.writable = null;
         }
 
         pub fn deinitPersistence(app: *App) void {
@@ -7291,7 +7164,7 @@ test "interactive session resume uses the live transition and shared restore pat
     );
 }
 
-test "parked session reload preserves other writer history and the local draft" {
+test "open session keeps exclusive writer ownership until close" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7309,41 +7182,16 @@ test "parked session reload preserves other writer history and the local draft" 
         .user = .{ .text = @constCast("original") },
         .assistant = @constCast("original answer"),
     } });
-    Runtime(TestApp).enableSessionStores(&app);
-    const host = app.session_persistence.subagent_host;
-    try app.input_runtime.edit_state.input.appendSlice(alloc, "local unfinished draft");
-    app.next_image_id = 17;
     const id = try alloc.dupe(u8, app.session_persistence.writable.?.active_id);
     defer alloc.free(id);
-    app.session_persistence.writable.?.log.park();
-    {
-        var other = try Runtime(TestApp).loadResumeTargetForWrite(&app, .{ .id = id }, .{});
-        defer other.deinit(alloc);
-        _ = try other.appendEvent(alloc, .{ .history_turn_committed = .{
-            .conversation_language = session_runtime.ConversationLanguage.literal("en"),
-            .total_input_tokens = 0,
-            .total_output_tokens = 0,
-            .turn = .{ .assistant = .{
-                .user = .{ .text = @constCast("other writer") },
-                .assistant = @constCast("other committed answer"),
-            } },
-        } }, io_mod.milliTimestamp());
-    }
-    try Runtime(TestApp).refresh_parked_session(&app);
-    try std.testing.expectEqual(@as(usize, 2), app.session.historyLen());
-    try std.testing.expectEqualStrings("other committed answer", app.session.agent.history.items[1].assistant.assistant);
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "local unfinished draft");
+    try std.testing.expectError(error.SessionBusy, Runtime(TestApp).loadResumeTargetForWrite(&app, .{ .id = id }, .{ .session_lock_deadline_ms = 1 }));
     try std.testing.expectEqualStrings("local unfinished draft", app.input_runtime.edit_state.input.items);
-    try std.testing.expectEqual(@as(usize, 17), app.next_image_id);
-    try std.testing.expect(app.session_persistence.subagent_host == host);
-    try Runtime(TestApp).appendHistoryTurn(&app, .{ .assistant = .{
-        .user = .{ .text = @constCast("continued") },
-        .assistant = @constCast("continued answer"),
-    } });
     Runtime(TestApp).finalizePersistence(&app);
-    var cold = try app.session_persistence.store.?.loadReadOnly(alloc, id);
-    defer cold.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 3), cold.history.len);
-    try std.testing.expectEqualStrings("other committed answer", cold.history[1].assistant.assistant);
+    var next = try Runtime(TestApp).loadResumeTargetForWrite(&app, .{ .id = id }, .{});
+    defer next.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), next.state.history.len);
+    try std.testing.expectEqualStrings("original answer", next.state.history[0].assistant.assistant);
 }
 
 test "interactive session resume preserves the current writer when the target is unavailable" {

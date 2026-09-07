@@ -111,7 +111,7 @@ Older sessions that saved Vercel connection settings can be opened through `-r`,
 
 If a saved conversation is damaged, run `fx session recover <id>` to copy its validated prefix into a new session. Recovery preserves checkpoint boundaries and referenced result files, leaves the original unchanged, and prints the new session ID. Records after the damaged boundary are not included, and recovery does not rerun commands. If only usage accounting is corrupt, recovery keeps the conversation and marks historical usage as incomplete in the copy; the original accounting file remains unchanged. Healthy conversations can be resumed without recovery.
 
-After an idle session is suspended with Ctrl+Z, foregrounding it reloads saved changes from other writers before accepting another turn. Quitting reports a failed history or usage save with a warning and a nonzero exit status instead of printing the normal resume hint.
+A saved session has one writer until that session closes. Suspending it with Ctrl+Z keeps its lock, so another process trying to resume the same session gets `SessionBusy`. Foregrounding preserves the current conversation and draft without reloading them. Quitting reports a failed history or usage save with a warning and a nonzero exit status instead of printing the normal resume hint.
 
 New sessions appear in resume selection only after their initial files are ready. Incomplete creation folders left by older builds do not block healthy conversations from resuming with `-c`; those folders remain available for diagnosis and are not deleted.
 

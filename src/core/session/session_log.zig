@@ -2482,25 +2482,16 @@ pub const WritableSessionDir = struct {
         self.* = undefined;
     }
 
-    pub fn isParked(self: *const WritableSessionDir) bool {
+    fn isParked(self: *const WritableSessionDir) bool {
         return self.writer_lock == null;
     }
 
-    /// Release `session.lock` while keeping the session directory open for a
-    /// later `unpark` in the same process (idle job-control suspend).
+    /// Release ownership before handing the session to another runtime. The
+    /// existing writable must not mutate storage after releasing its lock.
     pub fn park(self: *WritableSessionDir) void {
         const lock = &(self.writer_lock orelse return);
         lock.release();
         self.writer_lock = null;
-    }
-
-    /// Reacquire `session.lock` after `park`. Fails with `SessionBusy` when
-    /// another process already owns the writer lock.
-    pub fn unpark(self: *WritableSessionDir) !void {
-        if (self.writer_lock != null) return;
-        self.writer_lock = acquireLock(&self.dir, session_lock_file, true) catch |err| {
-            return mapSessionLockError(err);
-        };
     }
 
     pub fn eventLogLengthForTest(self: *WritableSessionDir) !u64 {
@@ -3625,14 +3616,6 @@ fn entryExists(dir: *io_mod.VerifiedDir, name: []const u8) !bool {
     if (stat.kind != .file and stat.kind != .directory) return error.SessionPathUnsafe;
     if (stat.kind == .file and stat.nlink != 1) return error.SessionPathUnsafe;
     return true;
-}
-
-fn acquireLock(
-    dir: *io_mod.VerifiedDir,
-    name: []const u8,
-    create: bool,
-) !io_mod.TimedAdvisoryLock {
-    return acquireLockWithDeadline(dir, name, create, lock_deadline_ms);
 }
 
 fn acquireLockWithDeadline(
