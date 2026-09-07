@@ -3776,6 +3776,7 @@ fn persistRecoveryCheckpoint(
 
 const ParallelFailureEvidence = struct {
     execution: *runtime_parallel_execution.ParallelHookExecContext,
+    all_failures_uncertain: bool,
     uncertain: std.atomic.Value(bool) = .init(false),
 
     fn execute(raw: *anyopaque, alloc: Allocator, call: ToolCall, index: usize) !ToolExecutionResult {
@@ -3783,17 +3784,21 @@ const ParallelFailureEvidence = struct {
         return runtime_parallel_execution.parallelHookExecute(self.execution, alloc, call, index) catch |err| {
             // The runner can collapse an entered Cancelled exception into a
             // cancelled slot without invoking its error formatter.
-            self.uncertain.store(true, .seq_cst);
+            if (toolFailureUncertain(err, self.all_failures_uncertain)) self.uncertain.store(true, .seq_cst);
             return err;
         };
     }
 
     fn format(raw: *anyopaque, alloc: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        self.uncertain.store(true, .seq_cst);
+        if (toolFailureUncertain(err, self.all_failures_uncertain)) self.uncertain.store(true, .seq_cst);
         return runtime_parallel_execution.parallelHookFormatError(self.execution, alloc, tool_name, err);
     }
 };
+
+fn toolFailureUncertain(failure: anyerror, all_failures_uncertain: bool) bool {
+    return all_failures_uncertain or failure == error.HostToolOutcomeUncertain or failure == error.Cancelled;
+}
 
 /// A missing or nonterminal result cannot establish a safe checkpoint boundary.
 fn execution_tool_evidence(execution: types.ExecutionMemory) suspension.ToolEvidence {
@@ -5073,6 +5078,7 @@ fn processQueuedPromptInner(
     if (deps.journal == null) {
         if (job.recovery_checkpoint) |checkpoint| {
             if (checkpoint.cause == .tool_state_uncertain or checkpoint.tool_state == .uncertain or
+                (checkpoint.cause == .suspended and checkpoint.outstanding_reservation) or
                 execution_tool_evidence(checkpoint.execution) == .uncertain) return error.RecoveryEffectsUncertain;
             try session_runtime.appendExecutionMemoryChatMessages(
                 arena,
@@ -9613,7 +9619,10 @@ fn processQueuedPromptLoop(
                         .max_tool_result_bytes = config.max_tool_result_bytes,
                         .classification_complete = executable_classification_complete.items,
                     };
-                    var failure_evidence = ParallelFailureEvidence{ .execution = &parallel_exec_ctx };
+                    var failure_evidence = ParallelFailureEvidence{
+                        .execution = &parallel_exec_ctx,
+                        .all_failures_uncertain = deps.journal != null or config.suspend_flag != null,
+                    };
                     defer if (failure_evidence.uncertain.load(.seq_cst)) {
                         preserved_tool_evidence = .uncertain;
                         stop_state.tool_effects_uncertain = true;
@@ -10945,8 +10954,10 @@ fn processQueuedPromptLoop(
                 // Entry into an executor followed by an exception establishes
                 // no durable outcome. This includes Cancelled: a host may have
                 // run the tool and lost its result while cancellation arrived.
-                preserved_tool_evidence = .uncertain;
-                stop_state.tool_effects_uncertain = true;
+                if (toolFailureUncertain(err, deps.journal != null or config.suspend_flag != null)) {
+                    preserved_tool_evidence = .uncertain;
+                    stop_state.tool_effects_uncertain = true;
+                }
                 if (deps.journal != null) return error.RecoveryRequired;
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 execution_error = err;

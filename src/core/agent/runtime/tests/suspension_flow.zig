@@ -226,7 +226,12 @@ test "suspension orchestrator rejects uncertain restored effects before provider
         .cause = .network_interrupted,
         .action = .paused,
         .tool_state = .uncertain,
-        .authority = .{ .provider = job.provider, .model = job.model },
+        .authority = .{
+            .provider = job.provider,
+            .model = job.model,
+            .credential_source = job.credential_source,
+            .credential_identity = @import("../../../auth/credential_authority.zig").derive(job.credential_source.?, job.account_id),
+        },
         .requested_fast_mode = false,
         .fast_mode = false,
         .max_provider_attempts = 10,
