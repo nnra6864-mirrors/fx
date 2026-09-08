@@ -317,6 +317,10 @@ pub fn inspectSource(alloc: Allocator, locked: *session_log.WritableSessionDir, 
         else => return error.UnsupportedSessionSchema,
     };
     if (!std.mem.eql(u8, state.id, locked.session_id) or state.recovery_checkpoint != null) return error.JournalSourceConflict;
+    if (version < 4) {
+        const discarded = try session_log.discardEmptyLegacyFileEvidence(a, state.history);
+        if (discarded > 0) @import("../shared/debug_trace.zig").logf("session", "legacy file evidence omitted empty_paths={d} session={s}", .{ discarded, locked.session_id });
+    }
     const permission_state = @import("../permissions/session_permission_state.zig");
     if (state.permission_state.version == 1) {
         const migrated = try permission_state.migrateV1ToV2(a, state.permission_state);

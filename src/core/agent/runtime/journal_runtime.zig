@@ -376,6 +376,21 @@ pub const Runtime = struct {
         try self.state.preflight(.{ .append_bytes = append_bytes, .append_records = append_records, .terminal_bytes = terminal });
     }
 
+    /// Keep the configured limit as a ceiling while reserving both the result
+    /// record and a terminal record before entering the executor.
+    pub fn admitToolResultLimit(self: *const Runtime, configured: usize) !usize {
+        const overhead = @import("../../images/image_data.zig").max_result_frame_bytes + 128 * 1024;
+        const terminal = try self.terminalBytes();
+        const available = try self.state.appendCapacity(1, terminal);
+        const half = available / 2;
+        if (half <= overhead) return error.JournalCapacityExceeded;
+        const limit = @min(configured, (half - overhead) / 24);
+        if (limit < @min(configured, @import("../../tooling/tool_result_limits.zig").min_configured_tool_result_bytes)) return error.JournalCapacityExceeded;
+        const result = overhead + limit * 24;
+        try self.state.preflight(.{ .append_bytes = result, .append_records = 1, .terminal_bytes = terminal + result });
+        return limit;
+    }
+
     pub fn generation(self: *Runtime) !GenerationKey {
         try self.state.ensureAvailable();
         const turn = self.turn orelse return error.InvalidJournalTransition;

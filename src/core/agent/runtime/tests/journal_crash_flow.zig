@@ -49,6 +49,8 @@ const Witness = struct {
     expected_calls: []const types.ToolCall = &calls,
     cancel_after_effect: ?*std.atomic.Value(bool) = null,
     abandon_cancelled: bool = false,
+    configured_result_limit: ?usize = null,
+    admitted_result_limit: usize = 0,
 
     fn init() Witness {
         return .{ .hooks = support.FakeAgentRuntimeDeps.init(std.testing.allocator) };
@@ -119,6 +121,7 @@ const Witness = struct {
             } else self.call_ids[index] = try std.testing.allocator.dupe(u8, context.callId);
         }
         self.entries += 1;
+        self.admitted_result_limit = request.max_tool_result_bytes;
         if (self.before_tools[index] == null) self.before_tools[index] = try self.capture();
         // Simulated atomic external effect + receipt, checked against the
         // original durable identity, tool name, and exact input on every call.
@@ -163,6 +166,7 @@ const Witness = struct {
         var agent: agent_mod.Agent = .{};
         defer agent.deinit(std.testing.allocator);
         var config = fixture.config();
+        if (self.configured_result_limit) |limit| config.max_tool_result_bytes = limit;
         config.journal_cancel_policy = if (self.abandon_cancelled) .abandon else .preserve;
         try orchestrator.processAgentPrompt(
             &agent,
@@ -343,6 +347,22 @@ test "journal witness native cancellation abandons an unknown effect without inv
     }
 }
 
+test "journal witness high result ceilings admit a bounded executor without changing small results" {
+    var fixture = support.PromptFixture{};
+    var witness = Witness.init();
+    defer witness.deinit();
+    witness.configured_result_limit = 2 * 1024 * 1024;
+    var gateway = support.FakeGateway.init(std.testing.allocator, &.{ .{ .tool_calls = calls[0..1] }, .{ .content = "finished" } });
+    defer gateway.deinit();
+    try witness.run(&gateway, &fixture, null);
+    try std.testing.expect(witness.admitted_result_limit >= 1024);
+    try std.testing.expect(witness.admitted_result_limit < witness.configured_result_limit.?);
+    try std.testing.expectEqual(@as(usize, 1), witness.entries);
+    try std.testing.expectEqual(@as(usize, 1), witness.effects);
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expect(std.mem.find(u8, gateway.request_bodies.items[1], "receipt:journal-call-a") != null);
+}
+
 test "journal witness capacity rejects admission before model and tool effects" {
     var fixture = support.PromptFixture{};
     var witness = Witness.init();
@@ -362,7 +382,7 @@ test "journal witness capacity stops before tool entry and preserves abandonment
     var fixture = support.PromptFixture{};
     var witness = Witness.init();
     defer witness.deinit();
-    witness.state.limits.bytes = 18 * 1024 * 1024;
+    witness.state.limits.bytes = 16 * 1024 * 1024 + 192 * 1024;
     var gateway = support.FakeGateway.init(alloc, &.{.{ .tool_calls = calls[0..1] }});
     defer gateway.deinit();
     try std.testing.expectError(error.JournalCapacityExceeded, witness.run(&gateway, &fixture, null));

@@ -871,9 +871,10 @@ test.skipIf(!tmuxAvailable())(
         expect(gateway.requests).toHaveLength(index + 1);
         expect(gateway.requests[index]!.body).toContain("INTERNAL_SUMMARY_ONLY");
         expect(gateway.requests[index]!.body).toContain("INTERNAL_CALL_506");
-        const events = readFileSync(join(sessionDir, "events.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
-        expect(events.filter((event) => event.event.context_checkpoint).map((event) => event.event.context_checkpoint.summary)).toEqual([summary]);
-        expect(JSON.parse(readFileSync(join(sessionDir, "session.json"), "utf8")).schema_version).toBe(4);
+        const entries = decodeNativeJournal(readFileSync(join(sessionDir, "execution.journal")));
+        const base = JSON.parse(Buffer.from(entries[0]!.bytes).toString("utf8")).nativeBase;
+        expect(JSON.parse(base.contextJson).history.filter((turn: { kind: string }) => turn.kind === "compacted_summary").map((turn: { summary: string }) => turn.summary)).toEqual([summary]);
+        expect(JSON.parse(readFileSync(join(sessionDir, "session.json"), "utf8")).schema_version).toBe(5);
         const replay = await runFx(["replay", tapePath, "--frames"], { cwd: workspace, env: { HOME: home } });
         expect(replay.code).toBe(0);
         expect(replay.stderr).toBe("");
@@ -3263,7 +3264,7 @@ test.skipIf(!tmuxAvailable())(
             previousEnd = start + text.length;
           }
           const events = readFileSync(
-            join(home, ".fx", "sessions", sessionIdFromHome(home), "events.jsonl"), "utf8",
+            join(home, ".fx", "sessions", sessionIdFromHome(home), "execution.journal"), "utf8",
           );
           expect(events).toContain("ROW28 ALPHA28_abcdefghijklmnopqrstuvwxyz0123456789");
 

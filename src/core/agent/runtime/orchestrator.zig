@@ -11025,6 +11025,7 @@ fn processQueuedPromptLoop(
             }
             const execution_lifecycle_id = types.ToolLifecycleId{ .turn_id = turn_id, .call_id = execution_call.id };
             const execution_is_command = runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, tool_call) == .command;
+            var execution_config = config;
             const journal_context = if (deps.journal) |journal| context: {
                 const recovering = restored_journal_call == tool_call_index;
                 if (recovering) {
@@ -11032,9 +11033,8 @@ fn processQueuedPromptLoop(
                     const current_policy = if (deps.tool_registry.lookup(tool_call.name)) |tool| tool.journal_replay else .blocked;
                     if (recorded.replay[tool_call_index] != .safe or current_policy != .safe) return error.RecoveryRequired;
                 }
-                const text_reserve = std.math.mul(usize, config.max_tool_result_bytes, 24) catch return error.JournalCapacityExceeded;
-                const result_reserve = std.math.add(usize, @import("../../images/image_data.zig").max_result_frame_bytes + 128 * 1024, text_reserve) catch return error.JournalCapacityExceeded;
-                try journal.preflightOperation(result_reserve, 1, result_reserve);
+                execution_config.max_tool_result_bytes = try journal.admitToolResultLimit(config.max_tool_result_bytes);
+                if (execution_config.max_tool_result_bytes != config.max_tool_result_bytes) debug_trace.logf("journal", "tool result budget narrowed configured={d} admitted={d}", .{ config.max_tool_result_bytes, execution_config.max_tool_result_bytes });
                 break :context try journal.context(journal_step.?, tool_call_index, recovering);
             } else null;
             var execution_error: ?anyerror = null;
@@ -11055,7 +11055,7 @@ fn processQueuedPromptLoop(
                 .session_grants = execution_grants,
                 .live_authority = if (live_authority) |resolved| resolved.authority else null,
                 .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
-                .max_tool_result_bytes = config.max_tool_result_bytes,
+                .max_tool_result_bytes = execution_config.max_tool_result_bytes,
                 .expected_mcp_runtime_generation = expected_mcp_runtime_generation,
                 .expected_mcp_binding = for (advertised_dynamic_tools) |tool| {
                     if (std.mem.eql(u8, tool.name, execution_call.name)) break tool.mcp_binding;
@@ -11129,7 +11129,7 @@ fn processQueuedPromptLoop(
                     &stream_ctx.provisional_statuses,
                     stream_ctx.alloc,
                     arena,
-                    config,
+                    execution_config,
                     turn_id,
                     effective_tool_calls[tool_call_index + 1 ..],
                     advertised_dynamic_tool_names,
@@ -11209,7 +11209,7 @@ fn processQueuedPromptLoop(
             if (execution.committed_file_handoff != null) {
                 var prepared = try runtime_execution_memory.prepareToolModelOutput(
                     arena,
-                    config,
+                    execution_config,
                     tool_call,
                     execution.model_output,
                 );
@@ -11272,7 +11272,7 @@ fn processQueuedPromptLoop(
             };
             var prepared = try runtime_execution_memory.prepareToolExecutionOutput(
                 arena,
-                config,
+                execution_config,
                 tool_call,
                 execution,
                 execution.command_replay_capture,
@@ -11281,7 +11281,7 @@ fn processQueuedPromptLoop(
                 &prepared.memory,
                 execution.tool_result_memory,
             );
-            try runtime_execution_memory.retainToolImages(arena, config, tool_call, &prepared);
+            try runtime_execution_memory.retainToolImages(arena, execution_config, tool_call, &prepared);
             runtime_execution_memory.finalizeCommandReplay(
                 arena,
                 tool_call,

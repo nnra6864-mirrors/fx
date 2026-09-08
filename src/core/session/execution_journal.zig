@@ -109,17 +109,21 @@ pub const State = struct {
     }
 
     pub fn preflight(self: *const State, reservation: Reservation) !void {
+        if (reservation.append_bytes > try self.appendCapacity(reservation.append_records, reservation.terminal_bytes)) return error.JournalCapacityExceeded;
+    }
+
+    pub fn appendCapacity(self: *const State, append_records: usize, terminal_bytes: usize) !usize {
         try self.ensureAvailable();
         try self.validateLimits();
-        const new_records = std.math.add(usize, reservation.append_records, 1) catch return error.JournalCapacityExceeded;
+        const new_records = std.math.add(usize, append_records, 1) catch return error.JournalCapacityExceeded;
         const count = std.math.add(usize, self.records.items.len, new_records) catch return error.JournalCapacityExceeded;
         if (count > self.limits.records or new_records > max_sequence -| self.last_seq or
             self.last_seq + new_records >= max_sequence) return error.JournalCapacityExceeded;
-        var bytes = std.math.add(usize, self.retained_bytes, reservation.append_bytes) catch return error.JournalCapacityExceeded;
-        bytes = std.math.add(usize, bytes, reservation.terminal_bytes) catch return error.JournalCapacityExceeded;
+        var bytes = std.math.add(usize, self.retained_bytes, terminal_bytes) catch return error.JournalCapacityExceeded;
         bytes = std.math.add(usize, bytes, count) catch return error.JournalCapacityExceeded;
         bytes = std.math.add(usize, bytes, checkpoint_header_reserve) catch return error.JournalCapacityExceeded;
         if (bytes > self.limits.bytes) return error.JournalCapacityExceeded;
+        return self.limits.bytes - bytes;
     }
 
     fn validateLimits(self: *const State) !void {

@@ -162,6 +162,8 @@ compacting model context does not replace the saved conversation.
 
 Automatic compaction records the retained model context before continuing. A
 recreated owner restores that boundary and keeps the complete saved tool history.
+Before execution, the core can lower the model-facing tool output limit to keep
+enough journal space for the result and completion or abandonment of the turn.
 
 Tool permission feedback projects as user messages with stable call-scoped IDs.
 

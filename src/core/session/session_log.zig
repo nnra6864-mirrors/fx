@@ -3227,7 +3227,7 @@ pub fn importLegacySnapshotState(
     );
 }
 
-fn discardEmptyLegacyFileEvidence(alloc: Allocator, history: []session.HistoryTurn) !usize {
+pub fn discardEmptyLegacyFileEvidence(alloc: Allocator, history: []session.HistoryTurn) !usize {
     var discarded: usize = 0;
     for (history) |*turn| {
         const execution = switch (turn.*) {
