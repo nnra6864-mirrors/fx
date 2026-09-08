@@ -67,10 +67,17 @@ pub fn writeInline(
     var in_underscore_italic: bool = false;
     var in_strike: bool = false;
     var link_admission_suppressed_until: usize = 0;
-    const closers = CloserIndex.build(text);
+    var closers = CloserLookahead.init(text);
 
     while (i < text.len) {
         const c = text[i];
+        const styles: StyleState = .{
+            .bold = in_bold,
+            .italic = in_italic,
+            .underscore_bold = in_underscore_bold,
+            .underscore_italic = in_underscore_italic,
+            .strike = in_strike,
+        };
 
         if (c == '`') {
             if (codeSpanAt(text, i)) |span| {
@@ -183,7 +190,7 @@ pub fn writeInline(
                 try out.appendSlice(alloc, ansi.strike_close);
                 in_strike = false;
             } else {
-                if (i + 2 >= text.len or tu.isSpace(text[i + 2]) or !closers.hasAtOrAfter(.tilde2, i + 2)) {
+                if (i + 2 >= text.len or tu.isSpace(text[i + 2]) or !closers.hasCloser(text, .tilde2, i + 2, styles, link_admission_suppressed_until)) {
                     try out.append(alloc, c);
                     i += 1;
                     continue;
@@ -206,7 +213,7 @@ pub fn writeInline(
                 in_bold = false;
                 if (in_underscore_bold) try out.appendSlice(alloc, ansi.bold_open);
             } else {
-                if (i + 2 >= text.len or tu.isSpace(text[i + 2]) or !closers.hasAtOrAfter(.star2, i + 2)) {
+                if (i + 2 >= text.len or tu.isSpace(text[i + 2]) or !closers.hasCloser(text, .star2, i + 2, styles, link_admission_suppressed_until)) {
                     try out.append(alloc, c);
                     i += 1;
                     continue;
@@ -229,7 +236,7 @@ pub fn writeInline(
                 in_underscore_bold = false;
                 if (in_bold) try out.appendSlice(alloc, ansi.bold_open);
             } else {
-                if (!tu.isValidUnderscoreOpen(text, i, 2) or !closers.hasAtOrAfter(.under2, i + 2)) {
+                if (!tu.isValidUnderscoreOpen(text, i, 2) or !closers.hasCloser(text, .under2, i + 2, styles, link_admission_suppressed_until)) {
                     try out.append(alloc, c);
                     i += 1;
                     continue;
@@ -252,7 +259,7 @@ pub fn writeInline(
                 in_underscore_italic = false;
                 if (in_italic) try out.appendSlice(alloc, ansi.italic_open);
             } else {
-                if (!tu.isValidUnderscoreOpen(text, i, 1) or !closers.hasAtOrAfter(.under1, i + 1)) {
+                if (!tu.isValidUnderscoreOpen(text, i, 1) or !closers.hasCloser(text, .under1, i + 1, styles, link_admission_suppressed_until)) {
                     try out.append(alloc, c);
                     i += 1;
                     continue;
@@ -275,7 +282,7 @@ pub fn writeInline(
                 in_italic = false;
                 if (in_underscore_italic) try out.appendSlice(alloc, ansi.italic_open);
             } else {
-                if (i + 1 >= text.len or tu.isSpace(text[i + 1]) or !closers.hasAtOrAfter(.star1, i + 1)) {
+                if (i + 1 >= text.len or tu.isSpace(text[i + 1]) or !closers.hasCloser(text, .star1, i + 1, styles, link_admission_suppressed_until)) {
                     try out.append(alloc, c);
                     i += 1;
                     continue;
@@ -298,17 +305,49 @@ pub fn writeInline(
     if (in_strike) try out.appendSlice(alloc, ansi.strike_close);
 }
 
+/// Emphasis styles active in the inline renderer at one position. Bare URL
+/// boundaries depend on these, so lookahead must carry them.
+const StyleState = struct {
+    bold: bool = false,
+    italic: bool = false,
+    underscore_bold: bool = false,
+    underscore_italic: bool = false,
+    strike: bool = false,
+};
+
+const DelimiterKind = enum { star1, star2, tilde2, under1, under2 };
+
+/// True when the delimiter run at `i` would close `kind` in the renderer:
+/// a star or tilde run of sufficient length not preceded by a space, or a
+/// valid underscore close.
+fn isCloserAt(text: []const u8, i: usize, kind: DelimiterKind) bool {
+    const c = text[i];
+    switch (kind) {
+        .star1, .star2, .tilde2 => {
+            const marker: u8 = if (kind == .tilde2) '~' else '*';
+            if (c != marker or i == 0 or tu.isSpace(text[i - 1])) return false;
+            if (kind == .star1) return true;
+            return i + 1 < text.len and text[i + 1] == marker;
+        },
+        .under1 => return c == '_' and tu.isValidUnderscoreClose(text, i, 1),
+        .under2 => return c == '_' and tu.isValidUnderscoreClose(text, i, 2),
+    }
+}
+
 /// Walks the constructs the inline renderer consumes whole, so delimiter
 /// lookahead never counts a marker inside an escape, code span, image, link,
 /// autolink, or bare URL. Mirrors the renderer's malformed-link suppression.
 const ConsumedSpans = struct {
     suppressed_until: usize = 0,
+    /// Styles assumed active during the walk; they decide where a bare URL
+    /// ends. Null consumes URLs at their full extent.
+    styles: ?StyleState = null,
 
     const Consumed = union(enum) {
         /// Opaque construct; nothing inside can act as a delimiter.
         skip: usize,
-        /// Bare URL at its full extent. An active style would terminate the
-        /// URL at a delimiter inside it, so those bytes are still candidate
+        /// Bare URL. With no style context an active style could still end
+        /// the URL at a delimiter inside it, so those bytes remain candidate
         /// closers, but they are never code or link syntax.
         bare_url: usize,
     };
@@ -341,7 +380,13 @@ const ConsumedSpans = struct {
             self.suppress(angleAutolinkCandidateEnd(text, i));
         }
         if (i >= self.suppressed_until) {
-            if (parseBareUrl(text, i, false, false, false, false, false)) |link| return .{ .bare_url = link.end };
+            if (self.styles) |styles| {
+                if (parseBareUrl(text, i, styles.bold, styles.italic, styles.underscore_bold, styles.underscore_italic, styles.strike)) |link| {
+                    return .{ .skip = link.end };
+                }
+            } else if (parseBareUrl(text, i, false, false, false, false, false)) |link| {
+                return .{ .bare_url = link.end };
+            }
         }
         return null;
     }
@@ -351,12 +396,68 @@ const ConsumedSpans = struct {
     }
 };
 
+/// Answers "does a closer for this opener exist later on the line" without
+/// rescanning the line for every unmatched opener.
+///
+/// Lines without a bare URL use a one-pass index of the last valid closer per
+/// delimiter, which is exact because every other consumed construct is
+/// independent of emphasis state. Lines with a bare URL walk from the opener
+/// with the renderer's actual styles, since an active style ends a URL early
+/// and changes what follows; a per-line byte budget bounds that walk and
+/// falls back to the index when exhausted.
+const CloserLookahead = struct {
+    index: CloserIndex,
+    has_bare_url: bool,
+    walk_budget: usize = 256 * 1024,
+
+    fn init(text: []const u8) CloserLookahead {
+        return .{
+            .index = CloserIndex.build(text),
+            .has_bare_url = std.mem.find(u8, text, "://") != null,
+        };
+    }
+
+    fn hasCloser(
+        self: *CloserLookahead,
+        text: []const u8,
+        kind: DelimiterKind,
+        start: usize,
+        styles: StyleState,
+        suppressed_until: usize,
+    ) bool {
+        if (!self.has_bare_url or self.walk_budget == 0) return self.index.hasAtOrAfter(kind, start);
+
+        var walk_styles = styles;
+        switch (kind) {
+            .star1 => walk_styles.italic = true,
+            .star2 => walk_styles.bold = true,
+            .tilde2 => walk_styles.strike = true,
+            .under1 => walk_styles.underscore_italic = true,
+            .under2 => walk_styles.underscore_bold = true,
+        }
+        var consumed: ConsumedSpans = .{ .suppressed_until = suppressed_until, .styles = walk_styles };
+        var i = start;
+        while (i < text.len) {
+            if (self.walk_budget == 0) return self.index.hasAtOrAfter(kind, i);
+            const step_start = i;
+            defer self.walk_budget -|= i - step_start;
+            if (consumed.endAt(text, i)) |span| {
+                i = switch (span) {
+                    .skip, .bare_url => |next| next,
+                };
+                continue;
+            }
+            if (isCloserAt(text, i, kind)) return true;
+            i += 1;
+        }
+        return false;
+    }
+};
+
 /// Last position of a valid closing run for each emphasis delimiter, built in
 /// one pass per line so every opener check is constant time. An opener at `i`
 /// has a closer when the last valid closer sits at or after the opener's end.
 const CloserIndex = struct {
-    const Kind = enum { star1, star2, tilde2, under1, under2 };
-
     last: [5]?usize = .{ null, null, null, null, null },
 
     fn build(text: []const u8) CloserIndex {
@@ -404,11 +505,11 @@ const CloserIndex = struct {
         return i + 1;
     }
 
-    fn set(self: *CloserIndex, kind: Kind, pos: usize) void {
+    fn set(self: *CloserIndex, kind: DelimiterKind, pos: usize) void {
         self.last[@intFromEnum(kind)] = pos;
     }
 
-    fn hasAtOrAfter(self: CloserIndex, kind: Kind, start: usize) bool {
+    fn hasAtOrAfter(self: CloserIndex, kind: DelimiterKind, start: usize) bool {
         const pos = self.last[@intFromEnum(kind)] orelse return false;
         return pos >= start;
     }

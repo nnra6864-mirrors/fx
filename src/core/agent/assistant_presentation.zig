@@ -1042,6 +1042,18 @@ test "bare URL punctuation never hides emphasis that follows the URL" {
     try std.testing.expect(std.mem.startsWith(u8, second, "\x1b[3m"));
     try std.testing.expect(std.mem.indexOf(u8, second, ";https://example.com/a\x1b\\") != null);
     try std.testing.expect(std.mem.endsWith(u8, second, "\x1b[23mb* tail"));
+
+    // After an active style ends the URL early, the rest of the line is
+    // ordinary markup again: a code span, a bold pair, and another code span.
+    out.clearRetainingCapacity();
+    try processor.push(alloc, "*https://example.com/a*`some code` **bold** `x`\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, out.items, "\x1b[3m"));
+    try std.testing.expect(std.mem.indexOf(u8, out.items, ";https://example.com/a\x1b\\") != null);
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        out.items,
+        "\x1b[23m\x1b[38;5;245msome code\x1b[39m \x1b[1mbold\x1b[22m \x1b[38;5;245mx\x1b[39m\n",
+    ));
 }
 
 test "bare URLs leave closing emphasis delimiters for the inline scanner" {
@@ -3339,13 +3351,27 @@ test "long line of unmatched openers renders in linear time" {
     try line.append(alloc, '\n');
 
     const io_mod = @import("../shared/io.zig");
-    const started = io_mod.nanoTimestamp();
+    var started = io_mod.nanoTimestamp();
     try processor.push(alloc, line.items, &out);
-    const elapsed_ms = @divTrunc(io_mod.nanoTimestamp() - started, std.time.ns_per_ms);
+    var elapsed_ms = @divTrunc(io_mod.nanoTimestamp() - started, std.time.ns_per_ms);
 
     try std.testing.expectEqualStrings(line.items, out.items);
     // The quadratic lookahead took hundreds of milliseconds for this input.
     try std.testing.expect(elapsed_ms < 200);
+
+    // A bare URL switches lookahead to the exact walk, whose per-line budget
+    // keeps a long malformed line bounded as well.
+    out.clearRetainingCapacity();
+    line.clearRetainingCapacity();
+    for (0..20_000) |_| try line.appendSlice(alloc, "*a https://example.com/b _c ~~d ");
+    try line.append(alloc, '\n');
+    started = io_mod.nanoTimestamp();
+    try processor.push(alloc, line.items, &out);
+    elapsed_ms = @divTrunc(io_mod.nanoTimestamp() - started, std.time.ns_per_ms);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[3m") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[1m") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[9m") == null);
+    try std.testing.expect(elapsed_ms < 500);
 }
 
 test "heading with unmatched strong marker keeps it literal" {
