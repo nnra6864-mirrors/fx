@@ -3380,6 +3380,19 @@ test "long line of unmatched openers renders in linear time" {
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[1m") == null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[9m") == null);
     try std.testing.expect(elapsed_ms < 500);
+
+    // A long trailing marker run after a URL must not be rescanned per byte.
+    out.clearRetainingCapacity();
+    line.clearRetainingCapacity();
+    try line.appendSlice(alloc, "https://example.com ");
+    try line.appendNTimes(alloc, '*', 64 * 1024);
+    try line.append(alloc, '\n');
+    started = io_mod.nanoTimestamp();
+    try processor.push(alloc, line.items, &out);
+    elapsed_ms = @divTrunc(io_mod.nanoTimestamp() - started, std.time.ns_per_ms);
+    try std.testing.expect(std.mem.endsWith(u8, out.items, line.items["https://example.com".len..]));
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[1m") == null);
+    try std.testing.expect(elapsed_ms < 200);
 }
 
 test "heading with unmatched strong marker keeps it literal" {

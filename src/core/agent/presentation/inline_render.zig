@@ -445,7 +445,13 @@ const CloserLookahead = struct {
             .under1, .under2 => null,
         };
         if (run_marker) |marker| {
-            while (i < text.len and text[i] == marker) : (i += 1) {}
+            // The skip is walk work too: charge it to the budget and give up
+            // on a run longer than what remains so a long trailing run is
+            // not rescanned once per byte.
+            const skip_limit = @min(text.len, i + self.walk_budget);
+            while (i < skip_limit and text[i] == marker) : (i += 1) {}
+            self.walk_budget -|= i - start;
+            if (i < text.len and text[i] == marker) return self.index.hasAtOrAfter(kind, start);
         }
         while (i < text.len) {
             if (self.walk_budget == 0) return self.index.hasAtOrAfter(kind, i);
