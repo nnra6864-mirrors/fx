@@ -241,23 +241,6 @@ fn nextImageIdForResume(
     return (try image_attachments.calculate_next_image_id(restored_catalog)).next_id;
 }
 
-fn nextImageIdForJournal(alloc: Allocator, records: *const execution_journal.State, initial: usize) !usize {
-    var next = initial;
-    if (records.nativeBase()) |base| {
-        var original = try @import("../session/execution_journal_genesis.zig").decodeBase(alloc, base);
-        defer original.deinit(alloc);
-        next = @max(next, try nextImageIdForResume(alloc, original.history, null));
-    }
-    // Admitted inputs retain their identities even when a failed turn has no
-    // model-history entry or the active input was paused before a response.
-    for (0..records.turns.items.len) |index| {
-        const user = try journal_runtime.readUser(alloc, records, index);
-        defer types.freeUserTurn(alloc, user);
-        next = @max(next, (try image_attachments.calculate_next_image_id(user.images)).next_id);
-    }
-    return next;
-}
-
 pub const SessionPickerScope = session_catalog.Scope;
 
 pub const HistoryAppendOutcome = enum {
@@ -1773,7 +1756,7 @@ pub fn Runtime(comptime App: type) type {
             const active = &app.session_persistence.writable.?;
             try hydrateResumedSession(app, active.state, display.title, notice);
             if (comptime @hasField(App, "next_image_id")) {
-                if (active.journalState()) |records| app.next_image_id = try nextImageIdForJournal(app.alloc, records, app.next_image_id);
+                if (active.journalState()) |records| app.next_image_id = try journal_runtime.nextImageId(app.alloc, records, app.next_image_id);
             }
             active.releaseHydrationHistory(app.alloc);
             enableSessionStores(app);
@@ -5670,13 +5653,13 @@ test "cold journal resume reserves image identities from failed turns without hi
     };
     var images = [_]types.ImageAttachment{.{ .id = 41, .path = @constCast("/not-read.png"), .media_type = @constCast("image/png") }};
     _ = try runtime.begin(.{ .text = @constCast("image input"), .images = &images }, "model", 1, false);
-    try std.testing.expectEqual(@as(usize, 42), try nextImageIdForJournal(alloc, &records, 1));
+    try std.testing.expectEqual(@as(usize, 42), try journal_runtime.nextImageId(alloc, &records, 1));
     var result = try std.json.parseFromSlice(std.json.Value, alloc, "{\"ok\":false,\"reason\":\"provider_error\",\"retryable\":false,\"message\":\"rejected\"}", .{});
     defer result.deinit();
     try runtime.finish(result.value, null);
     try std.testing.expect(records.pending() == .idle);
-    try std.testing.expectEqual(@as(usize, 42), try nextImageIdForJournal(alloc, &records, 1));
-    try std.testing.expectEqual(@as(usize, 100), try nextImageIdForJournal(alloc, &records, 100));
+    try std.testing.expectEqual(@as(usize, 42), try journal_runtime.nextImageId(alloc, &records, 1));
+    try std.testing.expectEqual(@as(usize, 100), try journal_runtime.nextImageId(alloc, &records, 100));
     images[0].id = 99;
     var genesis = try @import("../session/execution_journal_genesis.zig").encode(alloc, .{
         .id = @constCast("imported"),
@@ -5695,7 +5678,7 @@ test "cold journal resume reserves image identities from failed turns without hi
     defer imported.deinit(alloc);
     try imported.restore(alloc, genesis.entry.seq, "checkpoint", genesis.entry.bytes, &genesis.entry.hash);
     // The current model view may have compacted every imported image away.
-    try std.testing.expectEqual(@as(usize, 100), try nextImageIdForJournal(alloc, &imported, 1));
+    try std.testing.expectEqual(@as(usize, 100), try journal_runtime.nextImageId(alloc, &imported, 1));
 }
 
 test "cold resume image id rebase rejects overflow before admission" {

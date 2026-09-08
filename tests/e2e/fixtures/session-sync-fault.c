@@ -50,7 +50,12 @@ static int injected_sync(int fd) {
         ssize_t got = pread(fd, tail, count, state.st_size - count);
         if (got < 0) return real_sync(fd);
         tail[got] = 0;
-        if (!strstr(tail, match)) return real_sync(fd);
+        size_t match_bytes = strlen(match);
+        int found = 0;
+        for (size_t offset = 0; offset + match_bytes <= (size_t)got; offset++) {
+            if (!memcmp(tail + offset, match, match_bytes)) { found = 1; break; }
+        }
+        if (!found) return real_sync(fd);
     }
     int hit = atomic_fetch_add(&fired, 1) + 1;
     int log = open(record, O_WRONLY | O_CREAT | O_APPEND, 0600);

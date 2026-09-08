@@ -159,6 +159,7 @@ const AcpContext = struct {
     captured_permission_mode: ?PermissionMode = null,
     current_prompt_input: ?*ParsedPromptInput = null,
     journal: ?*journal_runtime.Runtime = null,
+    completed_recovery_reported: bool = false,
 
     fn deinitPublishedToolCalls(self: *AcpContext) void {
         var keys = self.published_tool_calls.keyIterator();
@@ -202,6 +203,7 @@ const AcpContext = struct {
         self: *AcpContext,
         status: types.RouteRecoveryStatus,
     ) !void {
+        self.completed_recovery_reported = self.completed_recovery_reported or status.isRecovered();
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
         try acp_types.writeModelRecoveryInfoUpdate(
@@ -683,6 +685,7 @@ pub fn handlePrompt(
         },
     };
 
+    const native_journal = if (session.writable) |*loaded| loaded.journalState() else null;
     var journal_params: ?std.json.Parsed(std.json.Value) = null;
     defer if (journal_params) |*parsed| parsed.deinit();
     if (state.host_journal) {
@@ -724,6 +727,17 @@ pub fn handlePrompt(
     var prompt_input = parsePromptInputWithFirstImageId(alloc, params, next_image_id) catch |err|
         return promptInputFailure(err);
     defer prompt_input.deinit(alloc);
+    if (prompt_input.pending_images.len > 0) {
+        const records = native_journal orelse if (state.host_journal) &session.session_rt.execution_journal else null;
+        if (records) |value| {
+            const reserved_next = try journal_runtime.nextImageId(alloc, value, next_image_id);
+            if (reserved_next != next_image_id) {
+                const replacement = try parsePromptInputWithFirstImageId(alloc, params, reserved_next);
+                prompt_input.deinit(alloc);
+                prompt_input = replacement;
+            }
+        }
+    }
     if (prompt_input.pending_images.len > 0) {
         if (comptime host_target.is_wasm) return promptInputFailure(error.UnsupportedPromptImage);
         var temporary_snapshot_dir: ?[]u8 = null;
@@ -782,35 +796,62 @@ pub fn handlePrompt(
     var journal_creation: acp_types.MessageIdBuffer = undefined;
     var journal_user: ?types.UserTurn = null;
     defer if (journal_user) |user| types.freeUserTurn(alloc, user);
-    if (state.host_journal) {
-        const request_id = try execution_journal.string(journal_params.?.value, "requestId");
-        const records = &session.session_rt.execution_journal;
+    if (state.host_journal or native_journal != null) {
+        const records = native_journal orelse &session.session_rt.execution_journal;
+        try records.ensureAvailable();
+        const creation_id = acp_types.generateMessageId(&journal_creation);
+        const pending_index: ?usize = if (!prompt_input.continue_recovery) null else if (state.host_journal) pending: {
+            const id = try execution_journal.string(journal_params.?.value, "requestId");
+            const index = records.request(id) orelse return error.PendingTurnError;
+            if (records.outcome(index) != null) return error.PendingTurnError;
+            break :pending index;
+        } else switch (records.pending()) {
+            .idle => return error.NoPendingRecovery,
+            .model, .ending => |index| index,
+            .tool => |position| position.turn,
+        };
+        if (!state.host_journal and !prompt_input.continue_recovery and records.pending() != .idle) return error.PendingTurnError;
+        const request_id = if (state.host_journal)
+            try execution_journal.string(journal_params.?.value, "requestId")
+        else if (pending_index) |index|
+            try execution_journal.string(records.start(index), "requestId")
+        else
+            creation_id;
         journal = .{
             .state = records,
-            .sink = server.journalSink(state),
+            .sink = if (native_journal != null) server.nativeJournalSink(session) else server.journalSink(state),
             .alloc = state.alloc,
             .namespace = session.session_id,
-            .creation_id = acp_types.generateMessageId(&journal_creation),
+            .creation_id = creation_id,
             .request_id = request_id,
             .resuming = prompt_input.continue_recovery,
         };
-        if (prompt_input.continue_recovery) {
-            const index = records.request(request_id) orelse return error.PendingTurnError;
-            if (records.outcome(index) != null) return error.PendingTurnError;
+        if (pending_index) |index| {
+            if (!std.mem.eql(u8, request_id, try execution_journal.string(records.start(index), "requestId"))) return error.PendingTurnError;
             journal.turn = index;
             journal_user = try journal.user(alloc);
+            if (native_journal != null) {
+                var input_history = [_]HistoryTurn{.{ .assistant = .{ .user = journal_user.?, .assistant = @constCast("") } }};
+                try session_store.resolveSessionSnapshotLocators(alloc, &input_history, null, session.store.?.sessions_dir, session.session_id);
+            }
         }
         ctx.journal = &journal;
         session.session_rt.journal_execution_started = true;
     }
 
+    const journal_before = if (ctx.journal) |runtime| runtime.state.last_seq else 0;
+    defer if (ctx.journal) |runtime| {
+        // Acknowledged input owns its snapshots even when execution fails.
+        // An uncertain start may also have reached storage before its error.
+        if (runtime.state.last_seq != journal_before or runtime.state.isBlocked()) prompt_input.retainImageSnapshots();
+    };
     var recovery_checkpoint: ?session_codec.RecoveryCheckpoint = null;
     defer if (recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
     if (state.cfg.minimal_kernel and session.recovery_blocked) return .{ .rpc_error = .{
         .code = ErrorCode.invalid_request,
         .message = "Checkpoint acknowledgement uncertain; reconcile durable storage before restoring a fresh agent",
     } };
-    if (state.host_journal) {
+    if (ctx.journal != null) {
         // Restored execution is owned by the journal; no legacy checkpoint path.
     } else if (state.cfg.minimal_kernel and prompt_input.continue_recovery) {
         const checkpoint = session.session_rt.agent.recovery_checkpoint orelse return .{ .rpc_error = .{
@@ -901,7 +942,7 @@ pub fn handlePrompt(
         .grants = session.session_grants,
         .context_snapshot = context_snapshot,
         .recovery_checkpoint = recovery_checkpoint,
-        .recovery_source_already_presented = recovery_checkpoint != null,
+        .recovery_source_already_presented = recovery_checkpoint != null or (native_journal != null and prompt_input.continue_recovery),
     };
 
     session.session_rt.usage.configureCheckpointSink(
@@ -946,6 +987,7 @@ pub fn handlePrompt(
         .advertised_functions = tool_projection.advertised_functions,
         .custom_tool_guidance = tool_projection.custom_guidance,
     }, current_prompt_is_root_authority);
+    agent_config.journal_cancel_policy = if (native_journal != null) .abandon else .preserve;
     agent_config.session_child_capability = if (session.writable) |*writable|
         writable.childCapability() catch null
     else
@@ -973,6 +1015,23 @@ pub fn handlePrompt(
         }
     };
     prompt_input.retainImageSnapshots();
+    if (native_journal) |records| {
+        if (prompt_input.continue_recovery and !ctx.completed_recovery_reported) {
+            if (records.outcome(journal.turn.?)) |outcome| {
+                if (try execution_journal.boolean(try execution_journal.object(outcome, "result"), "ok")) {
+                    if (try journal.latestContext()) |context| {
+                        var metadata = try journal_runtime.parseRecoveryMetadata(alloc, context);
+                        defer metadata.deinit(alloc);
+                        try ctx.sendModelRecoveryStatus(.{
+                            .kind = .auto_recovered,
+                            .succeeded_attempt = metadata.consumed_provider_attempts,
+                            .attempt_limit = metadata.max_provider_attempts,
+                        });
+                    }
+                }
+            }
+        }
+    }
     try sessions.sendActiveSessionInfoUpdate(state, alloc);
     try sessions.sendActiveSessionUsageUpdate(state, alloc);
 
@@ -1470,7 +1529,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
     return .{
         .ctx = @ptrCast(ctx),
         .journal = ctx.journal,
-        .journal_generation = if (ctx.journal != null) pushJournalGeneration else null,
+        .journal_generation = if (ctx.state.host_journal) pushJournalGeneration else null,
         .agent_stream_provider = server.streamProviderFor(ctx.state, ctx.state.active_session.?.provider),
         .flush_assistant_stream_per_content_chunk = host_target.is_wasm,
         .render_assistant_text = false,
@@ -1497,7 +1556,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .publish_deferred_tool_completion = publishDeferredToolCompletion,
         .propagate_history_turn = propagateHistoryTurn,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
-        .recovery_checkpoint = if (!ctx.state.host_journal and (session.writable != null or (ctx.state.cfg.minimal_kernel and ctx.state.host_checkpoint)))
+        .recovery_checkpoint = if (ctx.journal == null and (session.writable != null or (ctx.state.cfg.minimal_kernel and ctx.state.host_checkpoint)))
             .{
                 .set = setRecoveryCheckpoint,
             }
@@ -2190,11 +2249,7 @@ fn commitContextCompaction(
     const prepared = try session_runtime.prepareCompactedHistory(ctx.alloc, session.session_rt.agent.history.items, summary, model_cut);
     var prepared_owned = true;
     defer if (prepared_owned) types.freeHistoryTurnSlice(ctx.alloc, prepared);
-    if (ctx.journal) |journal| {
-        if (active_prefix) |prefix| {
-            try journal_runtime.recordActiveCompaction(ctx.alloc, journal.state, journal.sink, summary, cut, prefix);
-        } else try journal_runtime.recordCompaction(ctx.alloc, journal.state, journal.sink, summary, cut);
-    } else if (session.writable) |*writable| {
+    if (session.writable) |*writable| {
         _ = writable.commitContextCompaction(ctx.alloc, summary, active_prefix, retained_from, io_mod.milliTimestamp()) catch |err| {
             if (err == error.SessionPersistenceUncertain and active_prefix != null) {
                 if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
@@ -2204,6 +2259,10 @@ fn commitContextCompaction(
         if (active_prefix != null) {
             if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
         }
+    } else if (ctx.journal) |journal| {
+        if (active_prefix) |prefix| {
+            try journal_runtime.recordActiveCompaction(ctx.alloc, journal.state, journal.sink, summary, cut, prefix);
+        } else try journal_runtime.recordCompaction(ctx.alloc, journal.state, journal.sink, summary, cut);
     }
     if (comptime host_target.is_wasm) if (!ctx.state.host_journal) {
         if (session.wasm_state) |*base| {

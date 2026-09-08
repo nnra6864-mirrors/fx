@@ -151,7 +151,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       const seeded = await runFx(["ask", "--json", "Save the first fact."], { cwd: workspace, env, timeoutMs: TIMEOUT });
       expect(seeded.code).toBe(0); expect(seeded.stderr).toBe("");
       const id = JSON.parse(seeded.stdout).session_id;
-      const eventPath = join(home, ".fx", "sessions", id, "events.jsonl");
+      const eventPath = join(home, ".fx", "sessions", id, "execution.journal");
       const saved = readFileSync(eventPath);
       const stderrPath = join(root, "stderr.log"), tracePath = join(root, "trace.log");
       const arm = join(root, "armed"), receipt = join(root, "injected.txt");

@@ -1518,6 +1518,27 @@ fn journalSession(state: *ServerState) !*ActiveSessionState {
     return active;
 }
 
+pub fn nativeJournalSink(active: *ActiveSessionState) execution_journal.Sink {
+    return .{ .context = active, .append_fn = appendNativeJournalEntry, .guard = .{ .enter = enterNativeJournal, .leave = leaveNativeJournal } };
+}
+
+fn enterNativeJournal(raw: *anyopaque) void {
+    const active: *ActiveSessionState = @ptrCast(@alignCast(raw));
+    active.session_write_mutex.lockUncancelable(io_mod.getIo());
+}
+
+fn leaveNativeJournal(raw: *anyopaque) void {
+    const active: *ActiveSessionState = @ptrCast(@alignCast(raw));
+    active.session_write_mutex.unlock(io_mod.getIo());
+}
+
+fn appendNativeJournalEntry(raw: *anyopaque, entry: execution_journal.Entry) !void {
+    const active: *ActiveSessionState = @ptrCast(@alignCast(raw));
+    const writable = if (active.writable) |*value| value else return error.SessionPersistenceUnavailable;
+    const sink = writable.journalSink() orelse return error.SessionPersistenceUnavailable;
+    try sink.append_fn(sink.context, entry);
+}
+
 pub fn journalSink(state: *ServerState) execution_journal.Sink {
     return .{ .context = state, .append_fn = appendJournalEntry };
 }

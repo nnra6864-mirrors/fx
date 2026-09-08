@@ -881,6 +881,8 @@ describe("legacy session recovery", () => {
       await tui.sendText("/resume");
       await tui.waitForText("Create the first saved turn.", TIMEOUT);
       expect(readFileSync(eventsPath, "utf8")).toBe(checkpoint);
+      await tui.sendLiteralText("Create the first saved turn.");
+      await tui.waitForPane(pane => /Sessions\s+1\b/.test(pane) && pane.includes("Create the first saved turn."), TIMEOUT);
       await tui.sendKeys("Enter");
       await tui.waitForPane(() => existsSync(tracePath) && readFileSync(tracePath, "utf8").includes("picker resume failed err=PendingTurnError"), TIMEOUT);
       expect(savedFileHashes(join(fixture.home, ".fx", "sessions", sessionId))).toEqual(before);

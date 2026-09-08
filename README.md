@@ -113,7 +113,7 @@ Journaled tool groups run sequentially so each result is durable before the next
 
 Reopening an unfinished journal session leaves it paused. Use `/continue`, or `fx ask --resume-id <id> --continue-recovery`, to continue the recorded turn. A saved final answer can finish without another model request. A selected tool whose outcome is unconfirmed remains blocked instead of running again.
 
-Automatic compaction within an active turn is journaled before continuing; recovery preserves the compacted model context and full saved transcript. Planned restart/upgrade handoff and native ACP/subagent integration remain incomplete in this branch.
+Automatic compaction within an active turn is journaled before continuing; recovery preserves the compacted model context and full saved transcript. Native ACP uses the same journal for new sessions, loading, tool execution, and explicit recovery. Planned restart/upgrade handoff and persistent subagent journal integration remain incomplete in this branch.
 
 Once a native request is admitted, its journal retains the request and terminal outcome even if authentication fails before a response. `--resume last` skips completed requests that produced no conversation history. An unfinished turn cannot be replaced by a different prompt; `/new` starts a separate session while preserving the paused one.
 

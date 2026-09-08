@@ -845,6 +845,25 @@ pub fn pendingHistory(outer_alloc: Allocator, state: *const journal.State) !?typ
     return try types.dupeHistoryTurn(outer_alloc, history);
 }
 
+pub fn nextImageId(alloc: Allocator, records: *const journal.State, initial: usize) !usize {
+    var next = initial;
+    if (records.nativeBase()) |base| {
+        var original = try genesis.decodeBase(alloc, base);
+        defer original.deinit(alloc);
+        const catalog = try session.collect_image_catalog(alloc, original.history, &.{});
+        defer types.freeImageAttachmentSlice(alloc, catalog);
+        next = @max(next, (try @import("../../images/image_attachments.zig").calculate_next_image_id(catalog)).next_id);
+    }
+    // Admitted inputs retain their identities even when a failed turn has no
+    // model-history entry or the active input was paused before a response.
+    for (0..records.turns.items.len) |index| {
+        const user = try readUser(alloc, records, index);
+        defer types.freeUserTurn(alloc, user);
+        next = @max(next, (try @import("../../images/image_attachments.zig").calculate_next_image_id(user.images)).next_id);
+    }
+    return next;
+}
+
 /// Returns the owned original input for an acknowledged turn.
 pub fn readUser(alloc: Allocator, state: *const journal.State, turn: usize) !types.UserTurn {
     if (turn >= state.turns.items.len) return error.InvalidJournalTransition;
