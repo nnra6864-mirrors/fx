@@ -36,6 +36,57 @@ const checkpoint = (seq, entries) => entry(seq, "checkpoint", { lastIncludedSeq:
 const rejected = (fn) => assert.throws(fn, JournalConflict);
 
 {
+  const feedback = entry(3, "tool_result", {
+    ...decodeEntry(result(3, "first")).body,
+    persisted: { permission_feedback: ["Keep the existing file", "Run the second command"] },
+  });
+  const entries = [start(), step(2, [call("first"), call("second")]), feedback];
+  const p = createProjection(entries);
+  assert.deepEqual(p.transcript().messages.slice(2).map(message => [message.id, message.role, message.parts[0].text]), [
+    ["first:feedback:1", "user", "Keep the existing file"],
+    ["first:feedback:2", "user", "Run the second command"],
+  ]);
+  assert.deepEqual(p.apply(feedback).delta, { messages: [] });
+  for (const next of [result(4, "second"), step(5), end(6)]) { p.apply(next); entries.push(next); }
+  assert.deepEqual(createProjection([checkpoint(7, entries)]).transcript(), p.transcript());
+  const invalid = entry(3, "tool_result", { ...decodeEntry(feedback).body, persisted: { permission_feedback: [42] } });
+  rejected(() => createProjection(entries.slice(0, 2)).apply(invalid));
+}
+
+{
+  const p = createProjection([start(), step(2)]);
+  const guidance = entry(3, "model_step", {
+    phase: "context", change: "steering", turnId: "turn-1", afterTurnCount: 1, afterStepCount: 1,
+    prefix: null, retiredDraft: null, guidance: [{ id: "turn-1:steering:1", text: "New requirement" }],
+  });
+  const before = p.transcript();
+  const candidate = p.preview(guidance);
+  assert.deepEqual(p.transcript(), before);
+  assert.deepEqual(candidate.completedDrafts, []);
+  assert.equal(candidate.delta.messages[0].id, "turn-1:steering:1");
+  p.apply(guidance);
+  assert.deepEqual(p.apply(guidance).delta, { messages: [] });
+  rejected(() => p.preview(end(4)));
+  const reservation = entry(4, "model_step", {
+    phase: "request", turnId: "turn-1", messageId: "next", generationId: "generation-next", executionContext: {},
+  });
+  p.apply(reservation);
+  const more = entry(5, "model_step", {
+    phase: "context", change: "steering", turnId: "turn-1", afterTurnCount: 1, afterStepCount: 1,
+    prefix: { id: "turn-1:steering:2:assistant", text: "Interrupted thought" },
+    retiredDraft: { turnId: "turn-1", messageId: "next", generationId: "generation-next" },
+    guidance: [{ id: "turn-1:steering:2", text: "Keep going" }],
+  });
+  assert.deepEqual(p.apply(more).completedDrafts, [{ turnId: "turn-1", messageId: "next", generationId: "generation-next" }]);
+  assert.deepEqual(p.transcript().messages.map(message => message.role), ["user", "assistant", "user", "assistant", "user"]);
+  assert.equal(p.transcript().messages[1].status, "complete");
+  const badId = entry(6, "model_step", { ...decodeEntry(more).body, guidance: [{ id: "turn-1:steering:2", text: "Duplicate" }] });
+  rejected(() => p.preview(badId));
+  const badBoundary = entry(6, "model_step", { ...decodeEntry(more).body, afterStepCount: 0 });
+  rejected(() => p.preview(badBoundary));
+}
+
+{
   const providerCall = { ...call("provider"), provenance: "provider_executed", provider_result: '{"content":"stored"}' };
   const providerStep = step(2, [providerCall], { final: false, completion: { content: "Provider answer", finish_reason: "stop" } });
   const p = createProjection([start(), providerStep]);

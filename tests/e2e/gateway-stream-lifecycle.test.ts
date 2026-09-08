@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { decodeNativeJournal } from "./journal/storage";
 import { createServer, type Socket } from "node:net";
 import {
   chmodSync,
@@ -3151,9 +3152,10 @@ describe("gateway stream lifecycle", () => {
         ".fx",
         "sessions",
         firstJson.session_id,
-        "events.jsonl",
+        "execution.journal",
       );
-      const eventsBeforeResume = readFileSync(eventsPath).byteLength;
+      const savedJournal = readFileSync(eventsPath);
+      const entriesBeforeResume = decodeNativeJournal(savedJournal).length;
 
       const resumed = await runFx(
         [
@@ -3190,16 +3192,11 @@ describe("gateway stream lifecycle", () => {
       expect(gateway.requests[2].body).toContain("REPLAY_TOOL_RESULT");
       expect(resumedJson.tool_calls).toEqual([]);
 
-      const appendedEvents = readFileSync(eventsPath)
-        .subarray(eventsBeforeResume)
-        .toString("utf8")
-        .trim()
-        .split("\n")
-        .filter(Boolean)
-        .map((line) => JSON.parse(line) as { event: Record<string, unknown> });
-      const appendedKinds = appendedEvents.map((event) => Object.keys(event.event)[0]);
-      expect(appendedKinds).toContain("turn_completed");
-      expect(appendedKinds).not.toContain("state_replacement_started");
+      const resumedJournal = readFileSync(eventsPath);
+      expect(resumedJournal.subarray(0, savedJournal.length)).toEqual(savedJournal);
+      const appendedKinds = decodeNativeJournal(resumedJournal).slice(entriesBeforeResume).map(entry => entry.kind);
+      expect(appendedKinds).toContain("turn_end");
+      expect(appendedKinds).not.toContain("checkpoint");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -3336,7 +3333,7 @@ describe("gateway stream lifecycle", () => {
         ".fx",
         "sessions",
         firstJson.session_id,
-        "events.jsonl",
+        "execution.journal",
       );
 
       expect(first.code).toBe(0);
@@ -4022,7 +4019,7 @@ describe("gateway stream lifecycle", () => {
       });
       expect(json.tool_calls.filter((call) => call.name === "read_tool_result")).toHaveLength(2);
       expect(existsSync(join(sessionRoot, "tool-results", canonicalHandle))).toBe(true);
-      const sessionEvents = readFileSync(join(sessionRoot, "events.jsonl"), "utf8");
+      const sessionEvents = readFileSync(join(sessionRoot, "execution.journal"), "utf8");
       expect(sessionEvents).toContain(suffixlessHandle);
       expect(sessionEvents).toContain(canonicalHandle);
       expect(sessionEvents).toContain(needle);

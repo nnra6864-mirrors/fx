@@ -155,6 +155,24 @@ pub const OwnedExecution = struct {
     arena: std.heap.ArenaAllocator,
     execution: types.ExecutionMemory,
 
+    /// Active-turn replay retains steering markers; historical transcript
+    /// projection intentionally renders those same inputs as plain user text.
+    pub fn appendPromptMessages(self: *OwnedExecution, alloc: Allocator, messages: *std.ArrayList(types.ChatMessage)) !void {
+        const start = messages.items.len;
+        var view = self.execution;
+        if (view.steering.len != 0) {
+            const a = self.arena.allocator();
+            view.steering = try a.dupe(types.PersistedSteering, view.steering);
+            for (view.steering) |*item| item.text = try execution_memory.steeringMessage(a, item.text);
+        }
+        try session.appendExecutionMemoryChatMessages(alloc, messages, view);
+        // These are live model decisions, not already-materialized history
+        // steps. Preserve the flags used by the original agent loop.
+        for (messages.items[start..]) |*message| {
+            if (message.role == .assistant and message.tool_calls.len == 0) message.standalone_response = false;
+        }
+    }
+
     pub fn deinit(self: *OwnedExecution) void {
         self.arena.deinit();
         self.* = undefined;
@@ -256,6 +274,47 @@ pub const Runtime = struct {
         return decodeUser(alloc, try self.startBody());
     }
 
+    /// Records accepted guidance before the next provider request. Message IDs
+    /// belong to the turn and survive checkpoints and owner recreation.
+    pub fn recordSteering(self: *Runtime, guidance: []const []const u8, prefix: ?[]const u8) !void {
+        if (guidance.len == 0) return;
+        try self.state.ensureAvailable();
+        const turn = self.turn orelse return error.InvalidJournalTransition;
+        const turn_id = try journal.string(try self.startBody(), "turnId");
+        const offset = try steeringCount(self.state, turn_id);
+        const first_id = try steeringId(self.alloc, turn_id, offset + 1);
+        defer self.alloc.free(first_id);
+        const prefix_id = try std.fmt.allocPrint(self.alloc, "{s}:assistant", .{first_id});
+        defer self.alloc.free(prefix_id);
+        var writer: std.Io.Writer.Allocating = .init(self.alloc);
+        defer writer.deinit();
+        try writer.writer.writeAll("{\"v\":1,\"kind\":\"model_step\",\"phase\":\"context\",\"change\":\"steering\",\"turnId\":");
+        try json(&writer.writer, turn_id);
+        try writer.writer.print(",\"afterTurnCount\":{d},\"afterStepCount\":{d},\"prefix\":", .{ self.state.turns.items.len, self.state.stepCount(turn) });
+        if (prefix) |text| {
+            try json(&writer.writer, .{ .id = prefix_id, .text = text });
+        } else try writer.writer.writeAll("null");
+        try writer.writer.writeAll(",\"retiredDraft\":");
+        if (self.state.requestForCurrentStep(turn)) |request| {
+            try json(&writer.writer, .{
+                .turnId = turn_id,
+                .messageId = try journal.string(request, "messageId"),
+                .generationId = try journal.string(request, "generationId"),
+            });
+        } else try writer.writer.writeAll("null");
+        try writer.writer.writeAll(",\"guidance\":[");
+        for (guidance, 0..) |text, index| {
+            if (index > 0) try writer.writer.writeByte(',');
+            const id = try steeringId(self.alloc, turn_id, offset + index + 1);
+            defer self.alloc.free(id);
+            try json(&writer.writer, .{ .id = id, .text = text });
+        }
+        try writer.writer.writeAll("]}");
+        if (writer.written().len > max_model_record_bytes) return error.JournalCapacityExceeded;
+        try self.preflightOperation(writer.written().len, 1, writer.written().len * 2);
+        try self.state.append(self.alloc, self.sink, .model_step, writer.written());
+    }
+
     pub fn model(self: *const Runtime) ![]const u8 {
         return journal.string(try self.startBody(), "model");
     }
@@ -276,7 +335,7 @@ pub const Runtime = struct {
         var full = try self.executionThrough(self.alloc, self.state.stepCount(turn), true);
         defer full.deinit();
         var messages: std.ArrayList(types.ChatMessage) = .empty;
-        try session.appendExecutionMemoryChatMessages(a, &messages, full.execution);
+        try full.appendPromptMessages(a, &messages);
         const projected = try execution_memory.buildExecutionMemory(a, messages.items);
         full.execution.files = projected.files;
         var assistant: ?[]u8 = null;
@@ -621,7 +680,70 @@ fn readExecutionThrough(alloc: Allocator, state: *const journal.State, turn: usi
             .provider_replay = if (decision.provider_replay) |replay| try types.dupeProviderReplay(a, replay) else null,
         };
     }
-    return .{ .arena = arena, .execution = .{ .tool_steps = steps } };
+    var steering: std.ArrayList(types.PersistedSteering) = .empty;
+    const turn_id = try journal.string(state.start(turn), "turnId");
+    for (state.records.items) |record| {
+        const body = record.payload.value;
+        if (record.entry.kind != .model_step or !journal.isContext(body) or !try journal.isSteering(body)) continue;
+        if (!std.mem.eql(u8, turn_id, try journal.string(body, "turnId"))) continue;
+        const after = std.math.cast(usize, (try journal.field(body, "afterStepCount", .integer)).integer) orelse return error.InvalidJournalRecord;
+        if (after > count) continue;
+        const prefix = body.object.get("prefix") orelse return error.InvalidJournalRecord;
+        for (try journal.array(body, "guidance"), 0..) |item, index| {
+            try steering.append(a, .{
+                .text = try a.dupe(u8, (try journal.field(item, "text", .string)).string),
+                .assistant_prefix = if (index == 0 and prefix != .null) try a.dupe(u8, (try journal.field(prefix, "text", .string)).string) else null,
+                .after_tool_step_count = after,
+            });
+        }
+    }
+    return .{ .arena = arena, .execution = .{ .tool_steps = steps, .steering = try steering.toOwnedSlice(a) } };
+}
+
+fn steeringCount(state: *const journal.State, turn_id: []const u8) !usize {
+    var count: usize = 0;
+    for (state.records.items) |record| {
+        const body = record.payload.value;
+        if (record.entry.kind == .model_step and journal.isContext(body) and try journal.isSteering(body) and
+            std.mem.eql(u8, turn_id, try journal.string(body, "turnId")))
+            count = try std.math.add(usize, count, (try journal.array(body, "guidance")).len);
+    }
+    return count;
+}
+
+fn steeringId(alloc: Allocator, turn_id: []const u8, index: usize) ![]u8 {
+    return std.fmt.allocPrint(alloc, "{s}:steering:{d}", .{ turn_id, index });
+}
+
+fn validateSteering(alloc: Allocator, state: *const journal.State, body: Value) !void {
+    if (state.turns.items.len == 0) return error.InvalidJournalTransition;
+    const turn_id = try journal.string(body, "turnId");
+    const offset = try steeringCount(state, turn_id);
+    const guidance = try journal.array(body, "guidance");
+    if (guidance.len == 0) return error.InvalidJournalRecord;
+    for (guidance, 0..) |item, index| {
+        if (item != .object or item.object.count() != 2) return error.InvalidJournalRecord;
+        const expected = try steeringId(alloc, turn_id, offset + index + 1);
+        defer alloc.free(expected);
+        if (!std.mem.eql(u8, expected, try journal.string(item, "id"))) return error.JournalConflict;
+        _ = try journal.field(item, "text", .string);
+    }
+    const prefix = body.object.get("prefix") orelse return error.InvalidJournalRecord;
+    if (prefix != .null) {
+        if (prefix != .object or prefix.object.count() != 2) return error.InvalidJournalRecord;
+        const expected = try std.fmt.allocPrint(alloc, "{s}:assistant", .{try journal.string(guidance[0], "id")});
+        defer alloc.free(expected);
+        if (!std.mem.eql(u8, expected, try journal.string(prefix, "id"))) return error.JournalConflict;
+        _ = try journal.field(prefix, "text", .string);
+    }
+    const retired = body.object.get("retiredDraft") orelse return error.InvalidJournalRecord;
+    const turn = state.turns.items.len - 1;
+    if (state.requestForCurrentStep(turn)) |request| {
+        if (retired != .object or retired.object.count() != 3 or
+            !std.mem.eql(u8, turn_id, try journal.string(retired, "turnId")) or
+            !std.mem.eql(u8, try journal.string(request, "messageId"), try journal.string(retired, "messageId")) or
+            !std.mem.eql(u8, try journal.string(request, "generationId"), try journal.string(retired, "generationId"))) return error.JournalConflict;
+    } else if (retired != .null) return error.JournalConflict;
 }
 
 pub fn writeStatus(writer: *std.Io.Writer, alloc: Allocator, state: *const journal.State) !void {
@@ -677,7 +799,11 @@ pub fn pendingHistory(outer_alloc: Allocator, state: *const journal.State) !?typ
         if (latest.tool_results.len == 0) assistant = latest.assistant;
     }
     var messages: std.ArrayList(types.ChatMessage) = .empty;
-    try session.appendExecutionMemoryChatMessages(alloc, &messages, full.execution);
+    try full.appendPromptMessages(alloc, &messages);
+    if (pending != .tool and messages.items.len != 0) {
+        const last = messages.items[messages.items.len - 1];
+        if (last.role == .assistant and last.tool_calls.len == 0) assistant = if (last.content) |text| @constCast(text) else null;
+    }
     const settled = try execution_memory.buildInterruptedExecutionMemory(alloc, messages.items, active);
     const history: types.HistoryTurn = .{ .interrupted = .{
         .user = original_user,
@@ -829,6 +955,7 @@ fn restoreHistoryView(alloc: Allocator, state: *const journal.State, view: enum 
     for (state.records.items) |record| {
         const body = record.payload.value;
         if (record.entry.kind == .model_step and journal.isContext(body)) {
+            if (try journal.isSteering(body)) continue;
             const summary = try session_codec.parseHistoryTurn(alloc, try journal.object(body, "summary"));
             var summary_owned = true;
             defer if (summary_owned) types.freeHistoryTurn(alloc, summary);
@@ -950,6 +1077,7 @@ pub fn validateIncoming(alloc: Allocator, state: *const journal.State, body: Val
         },
         .model_step => {
             if (journal.isContext(body)) {
+                if (try journal.isSteering(body)) return validateSteering(alloc, state, body);
                 const summary = try session_codec.parseHistoryTurn(alloc, try journal.object(body, "summary"));
                 defer types.freeHistoryTurn(alloc, summary);
                 if (summary != .compacted_summary) return error.InvalidJournalRecord;
@@ -1137,6 +1265,80 @@ const TestSink = struct {
 };
 
 const test_input: types.UserTurn = .{ .text = @constCast("Make a durable change") };
+
+test "journal witness steering reopens a final response and preserves its position through recreation" {
+    const alloc = std.testing.allocator;
+    var state: journal.State = .{};
+    defer state.deinit(alloc);
+    var sink: TestSink = .{};
+    var runtime = sink.runtime(&state, "guided-request");
+    _ = try runtime.begin(test_input, "model", 1, false);
+    var first = try runtime.generation();
+    defer first.deinit(alloc);
+    _ = try runtime.recordDecision(.{ .content = "Before guidance" }, &.{}, &.{}, first, true, null, null);
+    try std.testing.expect(state.pending() == .ending);
+    try runtime.recordSteering(&.{"Use the new requirement"}, null);
+    try std.testing.expect(state.pending() == .model);
+    try std.testing.expect(runtime.recoveryStep() == null);
+    var second = try runtime.generation();
+    defer second.deinit(alloc);
+    const context = try testExecutionContext(&runtime, 1, true, &.{});
+    defer alloc.free(context);
+    try runtime.reserveRequest(second, context);
+    try runtime.recordSteering(&.{"Keep the interrupted thought"}, "Partial response");
+
+    var restored: journal.State = .{};
+    defer restored.deinit(alloc);
+    var validator: TestValidator = .{ .alloc = alloc };
+    for (state.records.items) |record| try restoreTestEntry(&restored, &validator, record.entry);
+    var next = sink.runtime(&restored, "guided-request");
+    try std.testing.expectEqual(Selection.pending, try next.begin(test_input, "model", 1, true));
+    var prefix = try next.prefixExecution(alloc);
+    defer prefix.deinit();
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var messages: std.ArrayList(types.ChatMessage) = .empty;
+    try prefix.appendPromptMessages(a, &messages);
+    try std.testing.expectEqual(@as(usize, 4), messages.items.len);
+    try std.testing.expectEqualStrings("Before guidance", messages.items[0].content.?);
+    try std.testing.expect(messages.items[1].role == .user);
+    try std.testing.expect(std.mem.indexOf(u8, messages.items[1].content.?, "Use the new requirement") != null);
+    try std.testing.expectEqualStrings("Partial response", messages.items[2].content.?);
+    try std.testing.expect(messages.items[3].role == .user);
+    try std.testing.expect(std.mem.indexOf(u8, messages.items[3].content.?, "Keep the interrupted thought") != null);
+    const canonical = try execution_memory.buildExecutionMemory(a, messages.items);
+    try std.testing.expectEqual(@as(usize, 2), canonical.steering.len);
+    try std.testing.expectEqualStrings("Use the new requirement", canonical.steering[0].text);
+    try std.testing.expectEqualStrings("Keep the interrupted thought", canonical.steering[1].text);
+    try std.testing.expectEqual(@as(usize, 0), canonical.tool_steps.len);
+    try std.testing.expectEqualStrings("Before guidance", canonical.steering[0].assistant_prefix orelse "missing response");
+    try std.testing.expectEqual(@as(usize, 0), canonical.steering[0].after_tool_step_count);
+    try std.testing.expectEqualStrings("Partial response", canonical.steering[1].assistant_prefix orelse "missing prefix");
+    const pending = (try pendingHistory(alloc, &restored)).?;
+    defer types.freeHistoryTurn(alloc, pending);
+    try std.testing.expectEqual(@as(usize, 2), pending.interrupted.execution.steering.len);
+}
+
+test "journal witness failed steering admission leaves an acknowledged final response recoverable" {
+    const alloc = std.testing.allocator;
+    var state: journal.State = .{};
+    defer state.deinit(alloc);
+    var sink: TestSink = .{};
+    var runtime = sink.runtime(&state, "guided-request");
+    _ = try runtime.begin(test_input, "model", 1, false);
+    var key = try runtime.generation();
+    defer key.deinit(alloc);
+    _ = try runtime.recordDecision(.{ .content = "Saved final answer" }, &.{}, &.{}, key, true, null, null);
+    sink.fail = true;
+    try std.testing.expectError(error.PersistenceUncertain, runtime.recordSteering(&.{"Unacknowledged guidance"}, null));
+    try std.testing.expect(state.blocked);
+    var restored: journal.State = .{};
+    defer restored.deinit(alloc);
+    var validator: TestValidator = .{ .alloc = alloc };
+    for (state.records.items) |record| try restoreTestEntry(&restored, &validator, record.entry);
+    try std.testing.expect(restored.pending() == .ending);
+}
 
 test "journal witness provider terminal response closes after its saved result and respects later reservations" {
     const alloc = std.testing.allocator;

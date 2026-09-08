@@ -109,10 +109,13 @@ fn take_steering_boundary(
 }
 
 fn append_steering_guidance(
+    deps: *const AgentRuntimeDeps,
     arena: Allocator,
     within_turn_suffix: *std.ArrayList(ChatMessage),
     guidance: []const []const u8,
+    uncommitted_prefix: ?[]const u8,
 ) !void {
+    if (deps.journal) |journal| try journal.recordSteering(guidance, uncommitted_prefix);
     for (guidance) |text| {
         try within_turn_suffix.append(arena, .{
             .role = .user,
@@ -128,6 +131,7 @@ fn append_pending_steering_after_assistant(
     turn_id: u64,
     assistant_text: []const u8,
     provider_replay: ?types.ProviderReplay,
+    decision: *JournalDecisionBoundary,
 ) !bool {
     const boundary = try take_steering_boundary(deps, arena, turn_id, .model);
     const guidance = switch (boundary) {
@@ -135,12 +139,15 @@ fn append_pending_steering_after_assistant(
         .none, .handoff, .interrupt => return false,
     };
 
+    decision.provider_replay = provider_replay;
+    _ = try decision.acknowledge(&.{}, true);
+
     try within_turn_suffix.append(arena, .{
         .role = .assistant,
         .content = assistant_text,
         .provider_replay = provider_replay,
     });
-    try append_steering_guidance(arena, within_turn_suffix, guidance);
+    try append_steering_guidance(deps, arena, within_turn_suffix, guidance, null);
     return true;
 }
 
@@ -163,7 +170,7 @@ fn append_immediate_steering_after_cancel(
             .content = try arena.dupe(u8, assistant_text),
         });
     }
-    try append_steering_guidance(arena, within_turn_suffix, guidance);
+    try append_steering_guidance(deps, arena, within_turn_suffix, guidance, if (assistant_text.len > 0) assistant_text else null);
     return true;
 }
 
@@ -4053,7 +4060,8 @@ fn restoreJournalPreparation(preparation: JournalPreparation, arena: Allocator, 
 
 /// Drain only actual results appended by the existing tool loop. The first
 /// unacknowledged result must be durable before any later call can be entered.
-fn acknowledgeJournalResults(deps: *const AgentRuntimeDeps, arena: Allocator, step: ?usize, messages: []const ChatMessage) !void {
+fn acknowledgeJournalResults(deps: *const AgentRuntimeDeps, arena: Allocator, step: ?usize, messages: []const ChatMessage, batch: *const runtime_tool_batch.StepBatchState) !void {
+    const memory = @import("../execution_memory.zig");
     const journal = deps.journal orelse return;
     const step_index = step orelse return error.InvalidJournalTransition;
     while (journal.state.pending() == .tool) {
@@ -4068,8 +4076,18 @@ fn acknowledgeJournalResults(deps: *const AgentRuntimeDeps, arena: Allocator, st
             if (candidate.role == .tool and candidate.tool_call_id != null and std.mem.eql(u8, candidate.tool_call_id.?, id)) break candidate;
         } else return;
         const status = message.tool_result_status orelse .success;
-        const result = try @import("../execution_memory.zig").makePersistedToolResult(arena, id, name, status, message.content orelse "", message.tool_result_memory);
-        defer @import("../execution_memory.zig").freeTransientPersistedToolResult(arena, result);
+        var result = try memory.makePersistedToolResult(arena, id, name, status, message.content orelse "", message.tool_result_memory);
+        defer memory.freeTransientPersistedToolResult(arena, result);
+        // Feedback waits until the whole tool batch is assembled for the model,
+        // but belongs to this result before the next tool can enter execution.
+        for ([_][]const ChatMessage{ messages, batch.pending_user_suffix.items }) |suffix| {
+            for (suffix) |candidate| {
+                if (candidate.role != .user or !candidate.permission_feedback) continue;
+                const source = candidate.tool_call_id orelse continue;
+                if (!std.mem.eql(u8, source, id)) continue;
+                try memory.appendPersistedPermissionFeedback(arena, &result, candidate.content orelse "");
+            }
+        }
         try journal.recordResult(step_index, pending.call, result);
     }
 }
@@ -4097,6 +4115,7 @@ fn restoreJournalToolResult(deps: *const AgentRuntimeDeps, arena: Allocator, ste
         .record_completion = true,
         .status = result.status,
     });
+    try runtime_tool_batch.appendPermissionFeedback(arena, batch, call.id, result.permission_feedback);
     return true;
 }
 
@@ -5062,7 +5081,7 @@ fn processQueuedPromptInner(
         if (journal.resuming) {
             if (try journal.latestContext()) |context| job.recovery_checkpoint = try session_codec.parseRecoveryCheckpoint(arena, try execution_journal.object(context, "recovery"));
             journal_prefix = try journal.prefixExecution(arena);
-            try session_runtime.appendExecutionMemoryChatMessages(arena, &within_turn_suffix, journal_prefix.?.execution);
+            try journal_prefix.?.appendPromptMessages(arena, &within_turn_suffix);
         }
     }
     if (job.recovery_checkpoint) |checkpoint| {
@@ -6317,9 +6336,11 @@ fn processQueuedPromptLoop(
                 return;
             },
             .continue_turn => |guidance| try append_steering_guidance(
+                deps,
                 arena,
                 &within_turn_suffix,
                 guidance,
+                null,
             ),
             .none, .interrupt => {},
         }
@@ -8679,6 +8700,7 @@ fn processQueuedPromptLoop(
                     turn_id,
                     history_text,
                     history_replay,
+                    &journal_decision,
                 ))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
@@ -9218,7 +9240,7 @@ fn processQueuedPromptLoop(
             if (tool_call_index < parallel_skip_until) continue;
             var tool_call = prepared_tool_call.call();
             if (deps.journal != null) {
-                try acknowledgeJournalResults(deps, arena, journal_step, within_turn_suffix.items[journal_result_start..]);
+                try acknowledgeJournalResults(deps, arena, journal_step, within_turn_suffix.items[journal_result_start..], &step_batch);
                 if (try restoreJournalToolResult(deps, arena, journal_step.?, tool_call_index, tool_call, &within_turn_suffix, &completed_tool_names, &step_batch)) continue;
             }
             const root_live_permission_mode = snapshotRootPermissionMode(deps);
@@ -11270,7 +11292,7 @@ fn processQueuedPromptLoop(
                 }
                 // MCP input-required and other tool-driven finishes cannot
                 // clear an earlier unknown effect, even with no suspend flag.
-                if (deps.journal != null) try acknowledgeJournalResults(deps, arena, journal_step, within_turn_suffix.items[journal_result_start..]);
+                if (deps.journal != null) try acknowledgeJournalResults(deps, arena, journal_step, within_turn_suffix.items[journal_result_start..], &step_batch);
                 if (try tool_boundary.pause_before_finish(tool_call_index + 1 < effective_tool_calls.len)) return;
                 const assistant_text: runtime_finalization.TerminalText = .{ .history = "", .presentation = if (stop_state.retained_candidate != null)
                     try hooks.prompt.joinVisibleSegments(
@@ -11356,7 +11378,7 @@ fn processQueuedPromptLoop(
             &step_batch,
             &within_turn_suffix,
         );
-        if (deps.journal != null) try acknowledgeJournalResults(deps, arena, journal_step, within_turn_suffix.items[journal_result_start..]);
+        if (deps.journal != null) try acknowledgeJournalResults(deps, arena, journal_step, within_turn_suffix.items[journal_result_start..], &step_batch);
         if (successful_vision_route == .text_only and settled_vision_ids.items.len > 0) {
             const transition = try runtime_vision_contracts.transition_pending_images(
                 arena,
@@ -11463,6 +11485,7 @@ fn processQueuedPromptLoop(
                     turn_id,
                     raw_final,
                     final_provider_replay,
+                    &journal_decision,
                 ))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });

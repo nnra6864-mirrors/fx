@@ -59,6 +59,7 @@ const Turn = struct {
     last_request: ?usize = null,
     last_request_step: usize = 0,
     last_context: ?usize = null,
+    last_steering: ?usize = null,
     end: ?usize = null,
 };
 
@@ -169,7 +170,8 @@ pub const State = struct {
             .step = step_index,
             .call = step.results.items.len,
         } };
-        return if (body.object.get("final").?.bool)
+        const guided = if (turn.last_steering) |index| index > step.record else false;
+        return if (body.object.get("final").?.bool and !guided)
             .{ .ending = turn_index }
         else
             .{ .model = turn_index };
@@ -261,14 +263,32 @@ pub const State = struct {
             },
             .model_step => {
                 if (isContext(body)) {
+                    const steering = try isSteering(body);
                     const pending_state = self.pending();
-                    if (pending_state != .idle and pending_state != .model) return error.InvalidJournalTransition;
+                    if (steering) {
+                        if (pending_state != .model and pending_state != .ending) return error.InvalidJournalTransition;
+                    } else if (pending_state != .idle and pending_state != .model) return error.InvalidJournalTransition;
                     const count = try field(body, "afterTurnCount", .integer);
                     if (count.integer < 0 or @as(u64, @intCast(count.integer)) != self.turns.items.len) return error.JournalConflict;
                     const turn_id = body.object.get("turnId") orelse return error.InvalidJournalRecord;
-                    if (pending_state == .model) {
-                        try self.checkTurn(body, pending_state.model);
+                    if (pending_state != .idle) {
+                        try self.checkTurn(body, if (pending_state == .model) pending_state.model else pending_state.ending);
                     } else if (turn_id != .null) return error.JournalConflict;
+                    if (steering) {
+                        const turn = self.turns.items.len - 1;
+                        const after = (try field(body, "afterStepCount", .integer)).integer;
+                        if (after < 0 or @as(u64, @intCast(after)) != self.stepCount(turn)) return error.JournalConflict;
+                        const guidance = try array(body, "guidance");
+                        if (guidance.len == 0 or guidance.len > max_records) return error.InvalidJournalRecord;
+                        for (guidance) |item| {
+                            _ = try string(item, "id");
+                            _ = try field(item, "text", .string);
+                        }
+                        if (!body.object.contains("prefix") or !body.object.contains("retiredDraft")) return error.InvalidJournalRecord;
+                        if (body.object.contains("summary") or body.object.contains("retainedFrom")) return error.InvalidJournalRecord;
+                        if (body.object.contains("completion") or body.object.contains("calls") or body.object.contains("generationId")) return error.InvalidJournalRecord;
+                        return;
+                    }
                     _ = try object(body, "summary");
                     _ = try object(body, "retainedFrom");
                     if (body.object.contains("completion") or body.object.contains("calls") or body.object.contains("generationId")) return error.InvalidJournalRecord;
@@ -374,14 +394,18 @@ pub const State = struct {
                 self.requests.putAssumeCapacity(owned.payload.value.object.get("requestId").?.string, self.turns.items.len);
                 self.turns.appendAssumeCapacity(.{ .start = index });
             },
-            .model_step => if (!isContext(owned.payload.value)) {
-                const turn = &self.turns.items[position.model];
-                turn.last_context = index;
-                if (isRequest(owned.payload.value) catch unreachable) {
-                    turn.last_request = index;
-                    turn.last_request_step = turn.steps.items.len;
+            .model_step => {
+                if (isContext(owned.payload.value)) {
+                    if (isSteering(owned.payload.value) catch unreachable) self.turns.items[self.turns.items.len - 1].last_steering = index;
                 } else {
-                    turn.steps.appendAssumeCapacity(.{ .record = index });
+                    const turn = &self.turns.items[position.model];
+                    turn.last_context = index;
+                    if (isRequest(owned.payload.value) catch unreachable) {
+                        turn.last_request = index;
+                        turn.last_request_step = turn.steps.items.len;
+                    } else {
+                        turn.steps.appendAssumeCapacity(.{ .record = index });
+                    }
                 }
             },
             .tool_result => self.turns.items[position.tool.turn].steps.items[position.tool.step].results.appendAssumeCapacity(index),
@@ -490,7 +514,15 @@ pub fn isContext(body: Value) bool {
     return phase == .string and std.mem.eql(u8, phase.string, "context");
 }
 
-pub fn hasProviderTerminalResponse(body: Value) bool {
+pub fn isSteering(body: Value) !bool {
+    const change = body.object.get("change") orelse return false;
+    if (change != .string) return error.InvalidJournalRecord;
+    if (std.mem.eql(u8, change.string, "steering")) return true;
+    if (std.mem.eql(u8, change.string, "compaction")) return false;
+    return error.InvalidJournalRecord;
+}
+
+fn hasProviderTerminalResponse(body: Value) bool {
     const completion = object(body, "completion") catch return false;
     const reason = string(completion, "finish_reason") catch return false;
     if (!std.mem.eql(u8, reason, "stop")) return false;

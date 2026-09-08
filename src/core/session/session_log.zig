@@ -2541,6 +2541,7 @@ pub const LoadedWritableSession = struct {
         journal: struct {
             owner: *@import("execution_journal_store.zig").Session,
             execution: @import("execution_journal.zig").State,
+            failure: ?error{ SessionCommitFailed, SessionPersistenceUncertain } = null,
         },
     };
 
@@ -2569,6 +2570,7 @@ pub const LoadedWritableSession = struct {
         switch (self.writer) {
             .conversation => |writer| if (writer.failure) |err| return err,
             .journal => |*writer| {
+                if (writer.failure) |err| return err;
                 try writer.execution.ensureAvailable();
                 try writer.owner.writer.append_journal.ensure_available();
             },
@@ -2614,6 +2616,7 @@ pub const LoadedWritableSession = struct {
                 writer.failure = error.SessionCommitFailed;
             },
             .journal => |*writer| {
+                if (writer.failure == null) writer.failure = error.SessionCommitFailed;
                 writer.execution.blocked = true;
                 writer.owner.writer.append_journal.blocked = true;
             },
@@ -2625,6 +2628,7 @@ pub const LoadedWritableSession = struct {
             switch (self.writer) {
                 .conversation => |*writer| writer.failure = error.SessionPersistenceUncertain,
                 .journal => |*writer| {
+                    writer.failure = error.SessionPersistenceUncertain;
                     writer.execution.blocked = true;
                     writer.owner.writer.append_journal.blocked = true;
                 },

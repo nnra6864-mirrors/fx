@@ -1127,10 +1127,12 @@ test "open session keeps exclusive writer ownership until close" {
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
-    try Runtime(TestApp).appendHistoryTurn(&app, .{ .assistant = .{
+    const initial: types.HistoryTurn = .{ .assistant = .{
         .user = .{ .text = @constCast("original") },
         .assistant = @constCast("original answer"),
-    } });
+    } };
+    try acknowledgePlainTestResponse(&app, initial);
+    try Runtime(TestApp).appendHistoryTurn(&app, initial);
     const id = try alloc.dupe(u8, app.session_persistence.writable.?.active_id);
     defer alloc.free(id);
     try app.input_runtime.edit_state.input.appendSlice(alloc, "local unfinished draft");
@@ -5696,6 +5698,31 @@ fn configureTestPreferences(app: *TestApp) !void {
     );
 }
 
+// Persistence callback tests supply an already-completed plain response. Use
+// the real journal writer to establish the same prerequisite as the agent loop.
+fn acknowledgePlainTestResponse(app: *TestApp, turn: types.HistoryTurn) !void {
+    try std.testing.expect(turn == .assistant and turn.assistant.execution.isEmpty());
+    const loaded = if (app.session_persistence.writable) |*value| value else return;
+    const state = loaded.journalState() orelse return;
+    const request_id = try std.fmt.allocPrint(app.alloc, "fixture-{d}", .{state.turns.items.len + 1});
+    defer app.alloc.free(request_id);
+    var journal: journal_runtime.Runtime = .{
+        .state = state,
+        .sink = loaded.journalSink().?,
+        .alloc = app.alloc,
+        .namespace = loaded.active_id,
+        .creation_id = "fixture",
+        .request_id = request_id,
+    };
+    _ = try journal.begin(turn.assistant.user, loaded.state.preferences.model, state.turns.items.len + 1, false);
+    var key = try journal.generation();
+    defer key.deinit(app.alloc);
+    _ = try journal.recordDecision(.{ .content = turn.assistant.assistant }, &.{}, &.{}, key, true, null, turn.assistant.provider_replay);
+    const result = try std.json.parseFromSlice(std.json.Value, app.alloc, "{\"ok\":true,\"stopReason\":\"stop\"}", .{});
+    defer result.deinit();
+    try journal.finish(result.value, turn);
+}
+
 fn writeSessionFixture(
     alloc: Allocator,
     store: session_store.Store,
@@ -5875,6 +5902,7 @@ test "resume handoff owns the exact non-pristine session id" {
     try Runtime(TestApp).beginFreshPersistedSession(&app);
     const turn = try session_runtime.makeAssistantTurn(alloc, "question", "answer");
     defer session_runtime.freeHistoryTurn(alloc, turn);
+    try acknowledgePlainTestResponse(&app, turn);
     try Runtime(TestApp).appendHistoryTurn(&app, turn);
     const expected_id = try alloc.dupe(
         u8,
@@ -5909,6 +5937,7 @@ test "resume handoff requires no derived cache write" {
     try Runtime(TestApp).beginFreshPersistedSession(&app);
     const turn = try session_runtime.makeAssistantTurn(alloc, "question", "answer");
     defer session_runtime.freeHistoryTurn(alloc, turn);
+    try acknowledgePlainTestResponse(&app, turn);
     try Runtime(TestApp).appendHistoryTurn(&app, turn);
     const expected_id = try alloc.dupe(
         u8,
@@ -5948,6 +5977,7 @@ test "resume handoff suppresses session id allocation failure" {
     try Runtime(TestApp).beginFreshPersistedSession(&app);
     const turn = try session_runtime.makeAssistantTurn(alloc, "question", "answer");
     defer session_runtime.freeHistoryTurn(alloc, turn);
+    try acknowledgePlainTestResponse(&app, turn);
     try Runtime(TestApp).appendHistoryTurn(&app, turn);
     Runtime(TestApp).requestResumeHandoff(&app);
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
@@ -8177,6 +8207,7 @@ test "appendHistoryTurn commits conversation without copying runtime counters" {
     const turn = try session_runtime.makeAssistantTurn(alloc, "question", "answer");
     defer session_runtime.freeHistoryTurn(alloc, turn);
 
+    try acknowledgePlainTestResponse(&app, turn);
     try Runtime(TestApp).appendHistoryTurn(&app, turn);
 
     var loaded = try app.session_persistence.store.?.loadReadOnly(
@@ -9500,6 +9531,7 @@ test "renameActiveSession persists the title only in session metadata" {
     try Runtime(TestApp).beginFreshPersistedSession(&app);
     Runtime(TestApp).enableSessionStores(&app);
 
+    const journal_position = app.session_persistence.writable.?.position.through_seq;
     try Runtime(TestApp).renameActiveSession(&app, "  deploy pipeline fix  ");
 
     // Cached for the footer without re-reading the sidecar.
@@ -9516,21 +9548,10 @@ test "renameActiveSession persists the title only in session metadata" {
         .{ .preferences_changed = .{ .fast_mode = true } },
         loaded.state.updated_at_ms + 1,
     );
-    var metadata_file = try loaded.log.dir.dir.openFile(
-        std.testing.io,
-        "session.json",
-        .{},
-    );
-    defer metadata_file.close(std.testing.io);
-    const metadata_bytes = try io_mod.readFileToEnd(
-        alloc,
-        &metadata_file,
-        session_codec.max_session_metadata_bytes,
-    );
-    defer alloc.free(metadata_bytes);
-    var metadata = try session_codec.decodeSessionMetadata(alloc, metadata_bytes);
+    var metadata = try loaded.writer.journal.owner.readMetadata();
     defer metadata.deinit();
     try std.testing.expectEqualStrings("deploy pipeline fix", metadata.value.title.?);
+    try std.testing.expectEqual(journal_position, loaded.position.through_seq);
     try std.testing.expectError(
         error.FileNotFound,
         loaded.log.dir.dir.statFile(std.testing.io, "display.json", .{}),
@@ -9794,6 +9815,7 @@ test "failed history delivery rejects the current writer without poisoning a fre
     try std.testing.expectEqual(@as(usize, 0), app.session.historyLen());
     Runtime(TestApp).closeWritableSession(&app);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
+    try acknowledgePlainTestResponse(&app, turn);
     try Runtime(TestApp).appendHistoryTurn(&app, turn);
     try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
     try std.testing.expectEqual(@as(?anyerror, error.InputOutput), app.session_persistence.shutdown_failure);
@@ -9814,14 +9836,15 @@ test "uncertain finished history preserves snapshot files and rejects later writ
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
     const Fault = struct {
-        fn sync(_: ?*anyopaque, _: std.Io.File) !void {
+        fn sync(_: ?*anyopaque, _: std.Io.Dir) !void {
             return error.InputOutput;
         }
     };
-    app.session_persistence.writable.?.writer.conversation.test_sync_ops = .{ .sync_file = Fault.sync };
     var ownership = SnapshotOwnershipProbe{};
     const turn = try session_runtime.makeAssistantTurn(alloc, "request", "answer");
     defer session_runtime.freeHistoryTurn(alloc, turn);
+    try acknowledgePlainTestResponse(&app, turn);
+    app.session_persistence.writable.?.writer.journal.owner.writer.ops = .{ .sync_dir = Fault.sync };
     try std.testing.expectError(error.SessionPersistenceUncertain, Runtime(TestApp).appendFinishedPrompt(&app, .{
         .turn = turn,
         .snapshot_file_ownership = ownership.handle(),

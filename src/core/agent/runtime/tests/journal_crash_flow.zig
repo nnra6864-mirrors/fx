@@ -227,6 +227,31 @@ test "journal witness control actual orchestrator executes the selected calls" {
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, witness.hooks.finalized_outcome.?);
 }
 
+test "journal witness permission feedback is durable before the next tool and survives recovery" {
+    const alloc = std.testing.allocator;
+    var fixture = support.PromptFixture{};
+    var original = Witness.init();
+    defer original.deinit();
+    const feedback = "Preserve the first command's approved change";
+    original.hooks.permission_feedback = &.{feedback};
+    var gateway = support.FakeGateway.init(alloc, &.{ .{ .tool_calls = &calls }, .{ .content = "finished" } });
+    defer gateway.deinit();
+    try original.run(&gateway, &fixture, null);
+    const cut = original.before_tools[1] orelse return error.NoDurableBoundaryBeforeSecondEffect;
+    const result = cut.toolResult(0, 0, 0) orelse return error.MissingDurableResult;
+    const saved_feedback = try journal.array(try journal.object(result, "persisted"), "permission_feedback");
+    try std.testing.expectEqual(@as(usize, 1), saved_feedback.len);
+    try std.testing.expectEqualStrings(feedback, saved_feedback[0].string);
+    var recovered = Witness.init();
+    defer recovered.deinit();
+    var next_gateway = support.FakeGateway.init(alloc, &.{.{ .content = "recovered" }});
+    defer next_gateway.deinit();
+    try recovered.run(&next_gateway, &fixture, &cut);
+    try std.testing.expectEqual(@as(usize, 1), recovered.entries);
+    try std.testing.expectEqual(@as(usize, 1), next_gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, next_gateway.request_bodies.items[0], feedback));
+}
+
 test "journal witness capacity rejects admission before model and tool effects" {
     var fixture = support.PromptFixture{};
     var witness = Witness.init();

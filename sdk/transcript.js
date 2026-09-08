@@ -150,7 +150,7 @@ function applyBody(state, body, changed) {
       state.turnIds.add(body.turnId);
       state.messageIds.add(body.userMessageId);
       state.requests.set(body.requestId, freeze({ inputHash: body.inputHash, turnId: body.turnId, complete: false }));
-      state.pending = { turnId: body.turnId, requestId: body.requestId, calls: [], resultCount: 0, final: false, messageIndex: null, usage: {} };
+      state.pending = { turnId: body.turnId, requestId: body.requestId, calls: [], resultCount: 0, final: false, messageIndex: null, usage: {}, stepCount: 0, steeringCount: 0 };
       updateMessage(state, state.messages.length, {
         id: body.userMessageId, turnId: body.turnId, role: "user", status: "complete",
         parts,
@@ -159,10 +159,37 @@ function applyBody(state, body, changed) {
     }
     case "model_step": {
       if (body.phase === "context") {
+        requireValue(body.change === undefined || body.change === "compaction" || body.change === "steering", "Unknown context change");
         requireValue(body.afterTurnCount === state.requests.size, "Context replacement has the wrong turn boundary");
         requireValue(body.turnId === (state.pending?.turnId ?? null), "Context replacement has the wrong pending turn");
-        requireValue(!state.pending || (!pendingCall(state) && !state.pending.final), "Context replacement precedes the selected decision's completion");
         requireValue(!("completion" in body) && !("calls" in body) && !("generationId" in body), "Context replacement cannot select work");
+        if (body.change === "steering") {
+          requireValue(state.pending && !pendingCall(state), "Steering requires a settled execution boundary");
+          requireValue(body.afterStepCount === state.pending.stepCount, "Steering has the wrong model boundary");
+          requireValue(Array.isArray(body.guidance) && body.guidance.length > 0 && body.guidance.length <= 16384, "Invalid steering messages");
+          requireValue(!("summary" in body) && !("retainedFrom" in body), "Steering cannot replace model history");
+          const reservation = state.pending.reservation;
+          const expectedDraft = reservation ? { turnId: body.turnId, messageId: reservation.messageId, generationId: reservation.generationId } : null;
+          requireValue(equal(body.retiredDraft, expectedDraft), "Steering retires an unrelated draft");
+          const firstId = `${body.turnId}:steering:${state.pending.steeringCount + 1}`;
+          if (body.prefix !== null) {
+            const prefix = object(body.prefix, "steering prefix");
+            requireValue(Object.keys(prefix).length === 2 && prefix.id === `${firstId}:assistant` && !state.messageIds.has(prefix.id), "Invalid steering prefix identity");
+            state.messageIds.add(prefix.id);
+            updateMessage(state, state.messages.length, { id: prefix.id, turnId: body.turnId, role: "assistant", status: "complete", parts: [{ type: "text", text: string(prefix.text, "steering prefix", true) }] }, changed);
+          }
+          for (const item of body.guidance) {
+            const message = object(item, "steering message");
+            const id = `${body.turnId}:steering:${++state.pending.steeringCount}`;
+            requireValue(Object.keys(message).length === 2 && message.id === id && !state.messageIds.has(id), "Invalid steering identity");
+            state.messageIds.add(id);
+            updateMessage(state, state.messages.length, { id, turnId: body.turnId, role: "user", status: "complete", parts: [{ type: "text", text: string(message.text, "steering text", true) }] }, changed);
+          }
+          state.pending.final = false;
+          state.pending.messageIndex = null;
+          break;
+        }
+        requireValue(!state.pending || (!pendingCall(state) && !state.pending.final), "Context replacement precedes the selected decision's completion");
         requireValue(object(body.summary, "context summary").kind === "compacted_summary", "Invalid context summary");
         projectLegacyPayload({ history: [body.summary], usage: {} }, 2, 1);
         const cut = object(body.retainedFrom, "context boundary");
@@ -218,6 +245,7 @@ function applyBody(state, body, changed) {
       state.pending.final = body.final;
       state.pending.messageIndex = state.messages.length;
       state.pending.reservation = null;
+      state.pending.stepCount++;
       state.messageIds.add(body.messageId);
       updateMessage(state, state.messages.length, {
         id: body.messageId, turnId: body.turnId, role: "assistant",
@@ -237,6 +265,17 @@ function applyBody(state, body, changed) {
       parts.push({ type: "tool_result", callId: body.callId, content: body.content, isError: body.isError });
       state.pending.resultCount++;
       updateMessage(state, index, { ...current, parts, status: pendingCall(state) ? "running" : "complete" }, changed);
+      const persisted = body.persisted === undefined ? {} : object(body.persisted, "persisted tool result");
+      const feedback = persisted.permission_feedback === undefined ? [] : legacyArray(persisted.permission_feedback, "permission feedback");
+      for (const [ordinal, value] of feedback.entries()) {
+        const id = `${body.callId}:feedback:${ordinal + 1}`;
+        requireValue(!state.messageIds.has(id), "Duplicate permission feedback identity");
+        state.messageIds.add(id);
+        updateMessage(state, state.messages.length, {
+          id, turnId: body.turnId, role: "user", status: "complete",
+          parts: [{ type: "text", text: string(value, "permission feedback", true) }],
+        }, changed);
+      }
       break;
     }
     case "turn_end": {
@@ -321,7 +360,12 @@ function checkpointState(body, seq, prior) {
 function changeFor(state, entry) {
   const decoded = decodeEntry(entry);
   const retiresGeneration = decoded.kind === "model_step" && decoded.body.phase !== "context" && (decoded.body.phase !== "request" || decoded.body.supersedesGenerationId != null);
-  const completedDrafts = retiresGeneration ? freeze([{
+  const retiredSteeringDraft = decoded.kind === "model_step" && decoded.body.phase === "context" && decoded.body.change === "steering" ? decoded.body.retiredDraft : null;
+  const completedDrafts = retiredSteeringDraft != null ? freeze([{
+    turnId: string(retiredSteeringDraft.turnId, "turnId"),
+    messageId: string(retiredSteeringDraft.messageId, "messageId"),
+    generationId: string(retiredSteeringDraft.generationId, "generationId"),
+  }]) : retiresGeneration ? freeze([{
     turnId: string(decoded.body.turnId, "turnId"),
     messageId: string(decoded.body.messageId, "messageId"),
     generationId: string(decoded.body.phase === "request" ? decoded.body.supersedesGenerationId : decoded.body.generationId, "generationId"),

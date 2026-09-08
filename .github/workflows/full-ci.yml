@@ -53,6 +53,9 @@ jobs:
       - name: Build
         run: zig build -Doptimize=${{ matrix.optimize }}
 
+      - name: Run journal recovery tests
+        run: zig build test-journal --summary all
+
       - name: Run unit tests
         run: zig build test -Doptimize=${{ matrix.optimize }}
 

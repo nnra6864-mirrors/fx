@@ -153,10 +153,14 @@ agent. A rejected callback rejects the turn with `PersistenceUncertain`, retains
 the callback error as `cause`, and fences the instance. Close it and reconcile
 its authoritative storage before recreating an owner.
 
-`model_step` also carries provider reservations and context replacements. These
-records advance the durable sequence without creating an assistant message.
-Use the transcript projection to distinguish them from saved model decisions;
+`model_step` also carries provider reservations, context compaction, and accepted
+steering input. Reservations and compaction advance the durable sequence without
+creating an assistant message. Steering preserves its message identities and any
+interrupted response prefix before another model request. The transcript
+projection handles these records and identifies drafts retired by steering;
 compacting model context does not replace the saved conversation.
+
+Tool permission feedback projects as user messages with stable call-scoped IDs.
 
 Journal prompts require a nonempty caller `requestId`. Retrying a completed ID
 with the same input returns recorded semantic output without new effects or

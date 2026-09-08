@@ -241,12 +241,22 @@ fn validate_artifacts(alloc: Allocator, locked: *session_log.WritableSessionDir,
                 if (!complete) return error.PendingTurnError;
             }
             for (step.tool_results) |result| {
+                const replay_alias = if (result.command_output_replay) |replay|
+                    replay == .available and result.output_handle != null and
+                        std.mem.eql(u8, result.output_handle.?, replay.available.handle)
+                else
+                    false;
                 if (result.output_handle) |handle| {
-                    const bytes = try result_store.readForReplayManaged(alloc, &capability, handle, result.stored_output_bytes);
-                    defer alloc.free(bytes);
-                    var hash: [32]u8 = undefined;
-                    Sha256.hash(bytes, &hash, .{});
-                    if (!result_store.handleMatchesContentDigest(handle, hash)) return error.JournalSourceConflict;
+                    // Older conversation records used the command replay itself
+                    // as the result reference when no text sidecar existed.
+                    if (!replay_alias) {
+                        const bytes = try result_store.readForReplayManaged(alloc, &capability, handle, result.stored_output_bytes);
+                        defer alloc.free(bytes);
+                        var hash: [32]u8 = undefined;
+                        Sha256.hash(bytes, &hash, .{});
+                        if (@import("artifact_digest.zig").hasContentDigest(handle, ".txt") and
+                            !result_store.handleMatchesContentDigest(handle, hash)) return error.JournalSourceConflict;
+                    }
                 }
                 if (result.tool_image_handle) |handle| {
                     const images = try result_store.loadToolImages(alloc, &capability, handle);
@@ -254,13 +264,13 @@ fn validate_artifacts(alloc: Allocator, locked: *session_log.WritableSessionDir,
                 }
                 if (result.command_output_replay) |replay| if (replay == .available) {
                     const descriptor = replay.available;
-                    var reader = try command_replay_store.Reader.open(alloc, &capability, descriptor);
-                    defer reader.deinit();
-                    while (try reader.nextByte()) |_| {}
                     var file = try capability.openFileReadOnly(alloc, .command_artifacts, descriptor.handle);
                     defer file.deinit();
                     const bytes = try file.readToEnd(alloc, max_source_bytes);
                     defer alloc.free(bytes);
+                    // Preserve exact presentation bytes. A malformed replay still
+                    // uses the saved textual result through the existing UI fallback.
+                    if (bytes.len != descriptor.framed_bytes) return error.JournalSourceConflict;
                     var hash: [32]u8 = undefined;
                     Sha256.hash(bytes, &hash, .{});
                     if (command_replay_store.hasContentDigest(descriptor.handle) and !command_replay_store.handleMatchesContentDigest(descriptor.handle, hash)) return error.JournalSourceConflict;
@@ -873,6 +883,15 @@ pub const Snapshot = struct {
 /// Reads one bounded prefix without a writer lock, tail repair, or execution.
 /// A non-journal manifest returns null so legacy readers keep their own policy.
 pub fn inspect(alloc: Allocator, dir: *io_mod.VerifiedDir, session_id: []const u8) !?Snapshot {
+    // Legacy recovery may own an incomplete manifest. Recognize our authority
+    // marker before inspecting it, leaving older formats to their own reader.
+    const marker_bytes = (try authority.readOptionalSessionFile(alloc, dir, marker_name, 16 * 1024)) orelse return null;
+    defer alloc.free(marker_bytes);
+    const marker_version = authority.manifestSchemaVersion(alloc, marker_bytes) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    if (marker_version != 2) return null;
     var metadata_file = authority.openSessionFile(dir, metadata_name, .read_only) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
@@ -1327,6 +1346,28 @@ test "journal witness native conversion migrates legacy permissions without chan
     defer restored.deinit(alloc);
     try std.testing.expectEqual(@as(u8, 2), restored.permission_state.version);
     try expect_archive_unchanged(alloc, &fixture, &source);
+}
+
+test "journal witness native probe preserves legacy interrupted replacement discovery" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fixture = try TestSession.init(alloc, &tmp);
+    defer fixture.deinit();
+    try fixture.writeLegacy(2);
+    const stable = try read_file(alloc, &fixture.locked.dir, metadata_name, max_source_bytes);
+    defer alloc.free(stable);
+    try io_mod.durableReplaceVerified(alloc, &fixture.locked.dir, "session.legacy.json", stable);
+    try io_mod.durableReplaceVerified(alloc, &fixture.locked.dir, "authority.pending.json", "pending");
+    try io_mod.durableReplaceVerified(alloc, &fixture.locked.dir, metadata_name, "interrupted replacement");
+    try std.testing.expect(try inspect(alloc, &fixture.locked.dir, fixture.locked.session_id) == null);
+    fixture.locked.park();
+    var facade = try session_store.Store.initFromHome(alloc, fixture.home, fixture.home);
+    defer facade.deinit(alloc);
+    var resumed = try facade.resumeTargetForWrite(alloc, .last, fixture.home, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqualStrings(fixture.locked.session_id, resumed.active_id);
+    try std.testing.expectEqualStrings("saved legacy answer", resumed.state.history[0].assistant.assistant);
 }
 
 test "journal witness native inspection preserves pending entries and incomplete bytes without repair" {

@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../../evals/eval-helpers";
 import { createProjection } from "../../../sdk/transcript.js";
+import { decodeNativeJournal } from "./storage";
 import { FAKE_GATEWAY_MODEL, fakeGatewayFinalText, fakeShellRun, startFakeGateway, TmuxSession, tmuxAvailable } from "../tmux-helpers";
 
 async function waitForFile(path: string) {
@@ -14,20 +15,6 @@ async function waitForFile(path: string) {
     if (Date.now() > deadline) throw new Error(`fixture did not reach controlled boundary: ${path}`);
     await Bun.sleep(10);
   }
-}
-
-function journalEntries(bytes: Buffer) {
-  const entries = [];
-  for (let offset = 0; offset < bytes.length;) {
-    expect(bytes.subarray(offset, offset + 4).toString()).toBe("FXEJ");
-    const length = bytes.readUInt32LE(offset + 16);
-    const end = offset + 84 + length;
-    expect(end).toBeLessThanOrEqual(bytes.length);
-    const body = bytes.subarray(offset + 84, end);
-    entries.push({ seq: Number(bytes.readBigUInt64LE(offset + 8)), kind: JSON.parse(body.toString()).kind, bytes: body, hash: bytes.subarray(offset + 20, offset + 84).toString() });
-    offset = end;
-  }
-  return entries;
 }
 
 describe("journal witness native ask", () => {
@@ -104,7 +91,7 @@ describe("journal witness native ask", () => {
       expect(existsSync(join(directory, "events.jsonl"))).toBe(false);
       expect(existsSync(join(directory, "recovery.json"))).toBe(false);
       const before = readFileSync(join(directory, "execution.journal"));
-      const entries = journalEntries(before);
+      const entries = decodeNativeJournal(before);
       const transcript = createProjection(entries).transcript();
       expect(JSON.stringify(transcript)).toContain("journal first answer");
       expect(JSON.stringify(transcript)).toContain("journal-tool-result");

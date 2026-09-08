@@ -19,6 +19,8 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { createProjection } from "../../sdk/transcript.js";
+import { decodeNativeJournal } from "./journal/storage";
 import {
   canonicalSubagentIdForStore,
   fakeGatewayPermissionDecision,
@@ -888,11 +890,10 @@ describe("effect-aware command permissions", () => {
       activeSession = null;
 
       const sessionId = sessionIdFromHome(root);
-      const events = readFileSync(
-        join(root.home, ".fx", "sessions", sessionId, "events.jsonl"),
-        "utf8",
-      );
-      expect(events).toContain(feedback);
+      const transcript = createProjection(decodeNativeJournal(readFileSync(
+        join(root.home, ".fx", "sessions", sessionId, "execution.journal"),
+      ))).transcript();
+      expect(JSON.stringify(transcript)).toContain(feedback);
 
       const cliResumeGateway = startFakeGateway([
         finalText("history feedback cli resume complete"),
