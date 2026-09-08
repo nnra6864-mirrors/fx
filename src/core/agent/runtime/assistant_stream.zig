@@ -1034,7 +1034,7 @@ fn assert_frozen_ansi_span_fixture() !void {
         "\x1b[1mName\x1b[22m \xe2\x94\x82 \x1b[1mAge\x1b[22m\n" ++
             "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\xbc\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\n" ++
             "Ana  \xe2\x94\x82 30 \n",
-        "tail \x1b[1mopen\x1b[22m",
+        "tail **open",
     };
 
     try std.testing.expectEqual(expected_spans.len, capture.text_spans.items.len);

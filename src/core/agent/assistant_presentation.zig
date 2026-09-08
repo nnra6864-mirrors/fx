@@ -1454,8 +1454,8 @@ test "underscore formatted URLs require exact active markers" {
         url: []const u8,
         tail: []const u8,
     }{
-        .{ .input = "_https://example.com/path__ tail\n", .url = "https://example.com/path__", .tail = " tail\x1b[23m\n" },
-        .{ .input = "__https://example.com/path_ tail\n", .url = "https://example.com/path_", .tail = " tail\x1b[22m\n" },
+        .{ .input = "_https://example.com/path__ tail\n", .url = "https://example.com/path__", .tail = " tail\n" },
+        .{ .input = "__https://example.com/path_ tail\n", .url = "https://example.com/path_", .tail = " tail\n" },
     };
 
     for (wrong_closer_cases) |case| {
@@ -1467,10 +1467,12 @@ test "underscore formatted URLs require exact active markers" {
         try processor.push(alloc, case.input, &out);
         try std.testing.expect(std.mem.indexOf(u8, out.items, case.url) != null);
         try std.testing.expect(std.mem.endsWith(u8, out.items, case.tail));
+        try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[3m") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[1m") == null);
     }
 }
 
-test "underscore emphasis preserves code literals and closes unpaired spans" {
+test "underscore emphasis preserves code literals and keeps unpaired markers literal" {
     const alloc = std.testing.allocator;
     var processor = MarkdownProcessor{};
     defer processor.deinit(alloc);
@@ -1479,8 +1481,8 @@ test "underscore emphasis preserves code literals and closes unpaired spans" {
 
     try processor.push(alloc, "_unclosed\n__unclosed\n`_literal_ __literal__`\n", &out);
     try std.testing.expectEqualStrings(
-        "\x1b[3munclosed\x1b[23m\n" ++
-            "\x1b[1munclosed\x1b[22m\n" ++
+        "_unclosed\n" ++
+            "__unclosed\n" ++
             "\x1b[38;5;245m_literal_ __literal__\x1b[39m\n",
         out.items,
     );
@@ -3219,7 +3221,7 @@ test "flush emits pending line without newline" {
     try std.testing.expectEqualStrings("partial", out.items);
 }
 
-test "flush closes open styles" {
+test "flush keeps an unmatched emphasis opener literal" {
     const alloc = std.testing.allocator;
     var processor = MarkdownProcessor{};
     defer processor.deinit(alloc);
@@ -3228,10 +3230,10 @@ test "flush closes open styles" {
 
     try processor.push(alloc, "oops **never closed", &out);
     try processor.flush(alloc, &out);
-    try std.testing.expectEqualStrings("oops \x1b[1mnever closed\x1b[22m", out.items);
+    try std.testing.expectEqualStrings("oops **never closed", out.items);
 }
 
-test "flush closes an unpaired inline code span" {
+test "flush keeps an unpaired backtick literal" {
     const alloc = std.testing.allocator;
     var processor = MarkdownProcessor{};
     defer processor.deinit(alloc);
@@ -3240,7 +3242,46 @@ test "flush closes an unpaired inline code span" {
 
     try processor.push(alloc, "run `zig build", &out);
     try processor.flush(alloc, &out);
-    try std.testing.expectEqualStrings("run \x1b[38;5;245mzig build\x1b[39m", out.items);
+    try std.testing.expectEqualStrings("run `zig build", out.items);
+}
+
+test "unmatched asterisk and tilde openers stay literal while matched spans still style" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(
+        alloc,
+        "*not a list item\n" ++
+            "**bold** then **open\n" ++
+            "~~gone~~ and ~~stays\n" ++
+            "a ` b **bold**\n" ++
+            "**bold with `code` inside** *it*\n" ++
+            "***both*** and **`code`**\n",
+        &out,
+    );
+    try std.testing.expectEqualStrings(
+        "*not a list item\n" ++
+            "\x1b[1mbold\x1b[22m then **open\n" ++
+            "\x1b[9mgone\x1b[29m and ~~stays\n" ++
+            "a ` b \x1b[1mbold\x1b[22m\n" ++
+            "\x1b[1mbold with \x1b[38;5;245mcode\x1b[39m inside\x1b[22m \x1b[3mit\x1b[23m\n" ++
+            "\x1b[1m\x1b[3mboth\x1b[22m\x1b[23m and \x1b[1m\x1b[38;5;245mcode\x1b[39m\x1b[22m\n",
+        out.items,
+    );
+}
+
+test "heading with unmatched strong marker keeps it literal" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "## 2 ** 8 and **strong**\n", &out);
+    try std.testing.expectEqualStrings("\x1b[1m2 ** 8 and strong\x1b[22m\n", out.items);
 }
 
 test "header with inline markdown" {

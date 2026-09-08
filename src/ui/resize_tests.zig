@@ -2242,6 +2242,40 @@ test "streamed control character entity cannot erase transcript cells" {
     try expectRowTrimmedEquals(&h, row, "  keep x&#27;[2Ky and &#x9b;2J end");
 }
 
+test "streamed unmatched emphasis markers stay literal and unstyled" {
+    var h = try Harness.init(std.testing.allocator, 40, 40, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(h.alloc);
+    var formatted: std.ArrayList(u8) = .empty;
+    defer formatted.deinit(h.alloc);
+    try processor.push(h.alloc, "*not a list item\n**bold** then **open tail\nrun `zig build\n", &formatted);
+    try processor.flush(h.alloc, &formatted);
+
+    _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, formatted.items);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    const star_row = try findRowContaining(&h, "not a list");
+    try expectRowTrimmedEquals(&h, star_row, "  *not a list item");
+    const star_cell = h.vt.cellAt(star_row, 4) orelse return error.TestMissingCell;
+    try std.testing.expect(!star_cell.style.flags.italic);
+
+    const bold_row = try findRowContaining(&h, "then");
+    try expectRowTrimmedEquals(&h, bold_row, "  bold then **open tail");
+    const bold_cell = h.vt.cellAt(bold_row, 3) orelse return error.TestMissingCell;
+    try std.testing.expect(bold_cell.style.flags.bold);
+    const open_cell = h.vt.cellAt(bold_row, 15) orelse return error.TestMissingCell;
+    try std.testing.expect(!open_cell.style.flags.bold);
+
+    const code_row = try findRowContaining(&h, "zig build");
+    try expectRowTrimmedEquals(&h, code_row, "  run `zig build");
+    const code_cell = h.vt.cellAt(code_row, 8) orelse return error.TestMissingCell;
+    try std.testing.expect(code_cell.style.fg.eql(.default));
+}
+
 test "streamed inline code color survives shrink and grow" {
     const cases = [_]struct { light: bool, fg: u8 }{
         .{ .light = false, .fg = 245 },

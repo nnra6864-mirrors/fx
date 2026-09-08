@@ -16,36 +16,32 @@ pub fn writeInlineNoBold(
     defer stripped.deinit(alloc);
 
     var i: usize = 0;
-    var in_code: bool = false;
     while (i < text.len) {
         const c = text[i];
         if (c == '`') {
-            if (!in_code) {
-                if (codeSpanAt(text, i)) |span| {
-                    try stripped.appendSlice(alloc, text[i..span.end]);
-                    i = span.end;
-                    continue;
-                }
+            if (codeSpanAt(text, i)) |span| {
+                try stripped.appendSlice(alloc, text[i..span.end]);
+                i = span.end;
+                continue;
             }
             const run = backtickRunLength(text, i);
-            if (run == 1) in_code = !in_code;
             try stripped.appendSlice(alloc, text[i .. i + run]);
             i += run;
             continue;
         }
-        if (!in_code and c == '\\' and i + 1 < text.len and tu.isEscapedPunctuationAt(text, i + 1)) {
+        if (c == '\\' and i + 1 < text.len and tu.isEscapedPunctuationAt(text, i + 1)) {
             try stripped.appendSlice(alloc, text[i .. i + 2]);
             i += 2;
             continue;
         }
-        if (!in_code and c == '_' and tu.isValidUnderscoreOpen(text, i, 2)) {
+        if (c == '_' and tu.isValidUnderscoreOpen(text, i, 2)) {
             if (tu.findUnderscoreCloser(text, i + 2, 2)) |closer| {
                 try stripped.appendSlice(alloc, text[i + 2 .. closer]);
                 i = closer + 2;
                 continue;
             }
         }
-        if (!in_code and i + 1 < text.len and c == '*' and text[i + 1] == '*') {
+        if (i + 1 < text.len and c == '*' and text[i + 1] == '*' and (i + 2 < text.len and !tu.isSpace(text[i + 2]) or (i > 0 and !tu.isSpace(text[i - 1])))) {
             i += 2;
             continue;
         }
@@ -70,43 +66,23 @@ pub fn writeInline(
     var in_underscore_bold: bool = false;
     var in_underscore_italic: bool = false;
     var in_strike: bool = false;
-    var in_code: bool = false;
     var link_admission_suppressed_until: usize = 0;
 
     while (i < text.len) {
         const c = text[i];
 
         if (c == '`') {
-            if (!in_code) {
-                if (codeSpanAt(text, i)) |span| {
-                    try out.appendSlice(alloc, ansi.inline_code_open);
-                    try out.appendSlice(alloc, text[span.content_start..span.content_end]);
-                    try out.appendSlice(alloc, ansi.inline_code_close);
-                    i = span.end;
-                    continue;
-                }
-            }
-            const run = backtickRunLength(text, i);
-            if (run > 1) {
-                // A longer run without a partner is literal text.
-                try out.appendSlice(alloc, text[i .. i + run]);
-                i += run;
+            if (codeSpanAt(text, i)) |span| {
+                try out.appendSlice(alloc, ansi.inline_code_open);
+                try out.appendSlice(alloc, text[span.content_start..span.content_end]);
+                try out.appendSlice(alloc, ansi.inline_code_close);
+                i = span.end;
                 continue;
             }
-            if (in_code) {
-                try out.appendSlice(alloc, ansi.inline_code_close);
-                in_code = false;
-            } else {
-                try out.appendSlice(alloc, ansi.inline_code_open);
-                in_code = true;
-            }
-            i += 1;
-            continue;
-        }
-
-        if (in_code) {
-            try out.append(alloc, c);
-            i += 1;
+            // A backtick run without a partner is literal text.
+            const run = backtickRunLength(text, i);
+            try out.appendSlice(alloc, text[i .. i + run]);
+            i += run;
             continue;
         }
 
@@ -206,7 +182,7 @@ pub fn writeInline(
                 try out.appendSlice(alloc, ansi.strike_close);
                 in_strike = false;
             } else {
-                if (i + 2 >= text.len or tu.isSpace(text[i + 2])) {
+                if (i + 2 >= text.len or tu.isSpace(text[i + 2]) or !hasRunCloser(text, i + 2, '~', 2)) {
                     try out.append(alloc, c);
                     i += 1;
                     continue;
@@ -229,7 +205,7 @@ pub fn writeInline(
                 in_bold = false;
                 if (in_underscore_bold) try out.appendSlice(alloc, ansi.bold_open);
             } else {
-                if (i + 2 >= text.len or tu.isSpace(text[i + 2])) {
+                if (i + 2 >= text.len or tu.isSpace(text[i + 2]) or !hasRunCloser(text, i + 2, '*', 2)) {
                     try out.append(alloc, c);
                     i += 1;
                     continue;
@@ -252,7 +228,7 @@ pub fn writeInline(
                 in_underscore_bold = false;
                 if (in_bold) try out.appendSlice(alloc, ansi.bold_open);
             } else {
-                if (!tu.isValidUnderscoreOpen(text, i, 2)) {
+                if (!tu.isValidUnderscoreOpen(text, i, 2) or tu.findUnderscoreCloser(text, i + 2, 2) == null) {
                     try out.append(alloc, c);
                     i += 1;
                     continue;
@@ -275,7 +251,7 @@ pub fn writeInline(
                 in_underscore_italic = false;
                 if (in_italic) try out.appendSlice(alloc, ansi.italic_open);
             } else {
-                if (!tu.isValidUnderscoreOpen(text, i, 1)) {
+                if (!tu.isValidUnderscoreOpen(text, i, 1) or tu.findUnderscoreCloser(text, i + 1, 1) == null) {
                     try out.append(alloc, c);
                     i += 1;
                     continue;
@@ -298,7 +274,7 @@ pub fn writeInline(
                 in_italic = false;
                 if (in_underscore_italic) try out.appendSlice(alloc, ansi.italic_open);
             } else {
-                if (i + 1 >= text.len or tu.isSpace(text[i + 1])) {
+                if (i + 1 >= text.len or tu.isSpace(text[i + 1]) or !hasRunCloser(text, i + 1, '*', 1)) {
                     try out.append(alloc, c);
                     i += 1;
                     continue;
@@ -319,7 +295,36 @@ pub fn writeInline(
     if (in_underscore_bold) try out.appendSlice(alloc, ansi.bold_close);
     if (in_underscore_italic) try out.appendSlice(alloc, ansi.italic_close);
     if (in_strike) try out.appendSlice(alloc, ansi.strike_close);
-    if (in_code) try out.appendSlice(alloc, ansi.inline_code_close);
+}
+
+/// True when a run of at least `run` `marker` bytes preceded by a non-space
+/// appears at or after `start` outside code spans and escapes.
+fn hasRunCloser(text: []const u8, start: usize, marker: u8, run: usize) bool {
+    var i = start;
+    while (i < text.len) {
+        const c = text[i];
+        if (c == '\\' and i + 1 < text.len) {
+            i += 2;
+            continue;
+        }
+        if (c == '`') {
+            if (codeSpanAt(text, i)) |span| {
+                i = span.end;
+            } else {
+                i += backtickRunLength(text, i);
+            }
+            continue;
+        }
+        if (c == marker) {
+            var end = i;
+            while (end < text.len and text[end] == marker) : (end += 1) {}
+            if (end - i >= run and i > 0 and !tu.isSpace(text[i - 1])) return true;
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    return false;
 }
 
 const ParsedFootnoteReference = struct {
