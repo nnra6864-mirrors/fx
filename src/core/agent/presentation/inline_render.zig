@@ -436,7 +436,17 @@ const CloserLookahead = struct {
             .under2 => walk_styles.underscore_bold = true,
         }
         var consumed: ConsumedSpans = .{ .suppressed_until = suppressed_until, .styles = walk_styles };
+        // A run cannot close itself: skip the remainder of the opener's run
+        // so "****" stays literal instead of becoming an empty span.
         var i = start;
+        const run_marker: ?u8 = switch (kind) {
+            .star1, .star2 => '*',
+            .tilde2 => '~',
+            .under1, .under2 => null,
+        };
+        if (run_marker) |marker| {
+            while (i < text.len and text[i] == marker) : (i += 1) {}
+        }
         while (i < text.len) {
             if (self.walk_budget == 0) return self.index.hasAtOrAfter(kind, i);
             const step_start = i;

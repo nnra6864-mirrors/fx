@@ -1043,6 +1043,14 @@ test "bare URL punctuation never hides emphasis that follows the URL" {
     try std.testing.expect(std.mem.indexOf(u8, second, ";https://example.com/a\x1b\\") != null);
     try std.testing.expect(std.mem.endsWith(u8, second, "\x1b[23mb* tail"));
 
+    // A delimiter run never closes itself, with or without a URL on the line.
+    out.clearRetainingCapacity();
+    try processor.push(alloc, "text **** https://example.com\ntext ~~~~ https://example.com\ntext **** here\n***both*** https://example.com\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, out.items, "text **** \x1b]8;"));
+    try std.testing.expect(std.mem.startsWith(u8, tu.nthLine(out.items, 1).?, "text ~~~~ \x1b]8;"));
+    try std.testing.expectEqualStrings("text **** here", tu.nthLine(out.items, 2).?);
+    try std.testing.expect(std.mem.startsWith(u8, tu.nthLine(out.items, 3).?, "\x1b[1m\x1b[3mboth\x1b[22m\x1b[23m \x1b]8;"));
+
     // After an active style ends the URL early, the rest of the line is
     // ordinary markup again: a code span, a bold pair, and another code span.
     out.clearRetainingCapacity();
