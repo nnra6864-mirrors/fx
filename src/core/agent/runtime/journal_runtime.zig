@@ -845,6 +845,12 @@ pub fn pendingHistory(outer_alloc: Allocator, state: *const journal.State) !?typ
     return try types.dupeHistoryTurn(outer_alloc, history);
 }
 
+/// Returns the owned original input for an acknowledged turn.
+pub fn readUser(alloc: Allocator, state: *const journal.State, turn: usize) !types.UserTurn {
+    if (turn >= state.turns.items.len) return error.InvalidJournalTransition;
+    return decodeUser(alloc, state.start(turn));
+}
+
 fn decodeUser(alloc: Allocator, start: Value) !types.UserTurn {
     const bytes = try journal.string(start, "inputJson");
     try entry_codec.validateJsonBounds(bytes);

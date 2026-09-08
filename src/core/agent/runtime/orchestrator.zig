@@ -4892,6 +4892,7 @@ pub fn processAgentPrompt(
     );
     defer finalization.deinit();
 
+    const resume_seq = if (deps.journal) |journal| if (journal.resuming) journal.state.last_seq else null else null;
     processQueuedPromptInner(deps, semantic_presentation, effective_lifecycle, effective_config, effective_job, &finalization, agent) catch |err| {
         if (deps.journal) |journal| {
             if (journal.state.isBlocked()) return err;
@@ -4908,6 +4909,12 @@ pub fn processAgentPrompt(
                 }
                 if (finalization.state == .open) try finalization.finish(.paused, null, null);
                 return error.RecoveryRequired;
+            }
+            // A failed resume that has not advanced execution must not close
+            // the preserved turn. Its input or current authority may be repaired.
+            if (resume_seq != null and journal.state.last_seq == resume_seq.? and journal.state.pending() != .idle) {
+                if (finalization.state == .open) try finalization.finish(.paused, null, null);
+                return err;
             }
         }
         if (finalization.state == .open) {
@@ -8540,6 +8547,7 @@ fn processQueuedPromptLoop(
                 .{pending_image_ids.len},
             );
             finish_trace.finish("required_vision_call_missing");
+            if (deps.journal != null) try finalization.finish(.paused, null, null);
             return error.RequiredVisionToolCallMissing;
         }
         if (recovery_has_unexecuted_tool_start) {

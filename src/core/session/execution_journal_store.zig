@@ -39,6 +39,15 @@ const SourceFile = struct {
     sha256: [64]u8,
 };
 
+const CapturedSnapshot = struct {
+    source_path: []const u8,
+    relative_path: []const u8,
+    active_path: []const u8,
+    bytes: []const u8,
+    sha256: [64]u8,
+    media_type: []const u8,
+};
+
 /// Owns its arena and all state/file identities. Call deinit; do not separately
 /// free state fields. Artifact paths have been resolved through trusted roots.
 pub const ValidatedSource = struct {
@@ -48,6 +57,7 @@ pub const ValidatedSource = struct {
     model_history: []const types.HistoryTurn,
     metadata: session_codec.SessionMetadata,
     files: []const SourceFile,
+    captured_snapshots: []const CapturedSnapshot = &.{},
 
     pub fn deinit(self: *ValidatedSource) void {
         self.arena.deinit();
@@ -82,6 +92,7 @@ pub const Boundary = enum {
     marker_published,
     events_archived,
     controls_archived,
+    images_installed,
     journal_installed,
     manifest_published,
 };
@@ -204,13 +215,16 @@ fn reject_managed_work(alloc: Allocator, root: *io_mod.VerifiedDir, files: []con
     }
 }
 
-fn validate_artifacts(alloc: Allocator, locked: *session_log.WritableSessionDir, state: *session_codec.DurableSessionState, context: store_types.StoreContext) !void {
+fn validate_artifacts(alloc: Allocator, locked: *session_log.WritableSessionDir, state: *session_codec.DurableSessionState, context: store_types.StoreContext, captured: []const CapturedSnapshot) !void {
     const path = try io_mod.dirRealpathAlloc(alloc, locked.dir.dir, ".");
     defer alloc.free(path);
     const expected = try std.fs.path.join(alloc, &.{ context.sessions_dir, locked.session_id });
     defer alloc.free(expected);
     if (!std.mem.eql(u8, path, expected)) return error.JournalSourceConflict;
     try session_store.resolveSessionSnapshotLocators(alloc, state.history, null, context.sessions_dir, locked.session_id);
+    var captured_by_path: std.StringHashMapUnmanaged(*const CapturedSnapshot) = .empty;
+    defer captured_by_path.deinit(alloc);
+    for (captured) |*snapshot| try captured_by_path.put(alloc, snapshot.active_path, snapshot);
     var capability = try child_store.SessionChildCapability.init(alloc, locked.dir.dir, path, .read_only);
     defer capability.deinit();
     for (state.history) |turn| {
@@ -223,8 +237,13 @@ fn validate_artifacts(alloc: Allocator, locked: *session_log.WritableSessionDir,
             },
         };
         for (user.images) |attachment| {
-            var verified = try image_attachments.loadVerifiedSnapshot(alloc, attachment, .{});
-            verified.deinit(alloc);
+            if (captured_by_path.get(attachment.snapshot_path orelse return error.MissingImageSnapshot)) |snapshot| {
+                if (!std.mem.eql(u8, &snapshot.sha256, attachment.snapshot_sha256 orelse return error.MissingImageSnapshot) or
+                    !std.mem.eql(u8, snapshot.media_type, attachment.media_type)) return error.ImageSnapshotCorrupt;
+            } else {
+                var verified = try image_attachments.loadVerifiedSnapshot(alloc, attachment, .{});
+                verified.deinit(alloc);
+            }
         }
         const memory = switch (turn) {
             .assistant => |value| value.execution,
@@ -282,6 +301,54 @@ fn validate_artifacts(alloc: Allocator, locked: *session_log.WritableSessionDir,
 
 /// Reads only, under the caller's existing session lock. No legacy writer,
 /// migration repair, model request, tool effect, or global settings read runs.
+// Capture into temporary storage, then retain verified bytes in the source
+// arena. No source file or active image directory changes during inspection.
+fn captureLegacySnapshots(arena: Allocator, history: []types.HistoryTurn, session_dir: []const u8, source_bytes: *u64, source_files: usize) ![]const CapturedSnapshot {
+    _ = try @import("session.zig").repair_legacy_zero_image_ids(arena, history);
+    var directory: ?[]u8 = null;
+    defer if (directory) |path| image_attachments.cleanupSnapshotDir(path);
+    var captured: std.ArrayList(CapturedSnapshot) = .empty;
+    var by_id: std.AutoHashMapUnmanaged(usize, usize) = .empty;
+    for (history) |*turn| {
+        const images = switch (turn.*) {
+            .compacted_summary => continue,
+            .assistant => |*value| value.user.images,
+            .interrupted => |*value| value.user.images,
+        };
+        for (images) |*image| {
+            if (image.snapshot_path != null) continue;
+            if (by_id.get(image.id)) |index| {
+                const prior = captured.items[index];
+                if (!std.mem.eql(u8, prior.source_path, image.path)) return error.DuplicateImageId;
+                image.snapshot_path = try arena.dupe(u8, prior.relative_path);
+                image.snapshot_sha256 = try arena.dupe(u8, &prior.sha256);
+                arena.free(image.media_type);
+                image.media_type = try arena.dupe(u8, prior.media_type);
+                continue;
+            }
+            if (captured.items.len >= max_source_files - source_files) return error.JournalCapacityExceeded;
+            if (directory == null) directory = try image_attachments.createTempSnapshotDir(arena);
+            try image_attachments.captureImageSnapshot(arena, image, directory.?);
+            const verified = try image_attachments.loadVerifiedSnapshot(arena, image.*, .{});
+            source_bytes.* = std.math.add(u64, source_bytes.*, verified.bytes.len) catch return error.JournalCapacityExceeded;
+            if (source_bytes.* > max_source_bytes) return error.JournalCapacityExceeded;
+            const relative = try std.fmt.allocPrint(arena, "images/{s}", .{std.fs.path.basename(image.snapshot_path.?)});
+            try captured.append(arena, .{
+                .source_path = image.path,
+                .relative_path = relative,
+                .active_path = try std.fs.path.join(arena, &.{ session_dir, relative }),
+                .bytes = verified.bytes,
+                .sha256 = digest(verified.bytes),
+                .media_type = verified.media_type,
+            });
+            try by_id.put(arena, image.id, captured.items.len - 1);
+            arena.free(image.snapshot_path.?);
+            image.snapshot_path = try arena.dupe(u8, relative);
+        }
+    }
+    return captured.toOwnedSlice(arena);
+}
+
 pub fn inspectSource(alloc: Allocator, locked: *session_log.WritableSessionDir, options: SourceOptions) !ValidatedSource {
     try require_lock(locked);
     try reject_control_conflicts(&locked.dir);
@@ -321,6 +388,7 @@ pub fn inspectSource(alloc: Allocator, locked: *session_log.WritableSessionDir, 
         const discarded = try session_log.discardEmptyLegacyFileEvidence(a, state.history);
         if (discarded > 0) @import("../shared/debug_trace.zig").logf("session", "legacy file evidence omitted empty_paths={d} session={s}", .{ discarded, locked.session_id });
     }
+    const captured = if (version < 4) try captureLegacySnapshots(a, state.history, try io_mod.dirRealpathAlloc(a, locked.dir.dir, "."), &total, files.items.len) else &.{};
     const permission_state = @import("../permissions/session_permission_state.zig");
     if (state.permission_state.version == 1) {
         const migrated = try permission_state.migrateV1ToV2(a, state.permission_state);
@@ -329,10 +397,10 @@ pub fn inspectSource(alloc: Allocator, locked: *session_log.WritableSessionDir, 
     }
     try session_codec.validateState(state);
     try reject_managed_work(a, &locked.dir, files.items, locked.session_id);
-    try validate_artifacts(a, locked, &state, options.context);
+    try validate_artifacts(a, locked, &state, options.context, captured);
     const model_history = if (version == 4) model: {
         var current = (try session_log.loadConversationStateIfPresent(a, &locked.dir, locked.session_id)) orelse return error.InvalidSessionMetadata;
-        try validate_artifacts(a, locked, &current, options.context);
+        try validate_artifacts(a, locked, &current, options.context, &.{});
         break :model current.history;
     } else try @import("execution_journal_genesis.zig").legacyContext(a, state.history, state.context_history_start);
     const metadata: session_codec.SessionMetadata = if (version == 4)
@@ -357,7 +425,8 @@ pub fn inspectSource(alloc: Allocator, locked: *session_log.WritableSessionDir, 
         };
     };
     try session_codec.validateSessionMetadata(metadata);
-    return .{ .arena = arena, .schema_version = @intCast(version), .state = state, .model_history = model_history, .metadata = metadata, .files = try files.toOwnedSlice(a) };
+    const source_files = try files.toOwnedSlice(a);
+    return .{ .arena = arena, .schema_version = @intCast(version), .state = state, .model_history = model_history, .metadata = metadata, .files = source_files, .captured_snapshots = captured };
 }
 
 fn read_relative(alloc: Allocator, dir: *io_mod.VerifiedDir, path: []const u8, limit: usize) ![]u8 {
@@ -737,6 +806,7 @@ pub fn cutover(
         defer alloc.free(bytes);
         try write_relative(alloc, &archive, file.path, bytes, options.durable_ops);
     }
+    for (source.captured_snapshots) |snapshot| try write_relative(alloc, &stage, snapshot.relative_path, snapshot.bytes, options.durable_ops);
     const index = try std.json.Stringify.valueAlloc(alloc, source.files, .{});
     defer alloc.free(index);
     if (index.len > max_entry_bytes) return error.JournalCapacityExceeded;
@@ -763,6 +833,45 @@ pub fn cutover(
     try finish_cutover(alloc, locked, marker, &stage, &archive, source.files, options);
 }
 
+fn installGenesisSnapshots(alloc: Allocator, locked: *session_log.WritableSessionDir, stage: *io_mod.VerifiedDir, genesis_body: std.json.Value, ops: io_mod.DurableOps) !void {
+    const base = genesis_body.object.get("nativeBase") orelse return error.InvalidJournalGenesis;
+    var state = try @import("execution_journal_genesis.zig").decodeBase(alloc, base);
+    defer state.deinit(alloc);
+    const active_path = try io_mod.dirRealpathAlloc(alloc, locked.dir.dir, ".");
+    defer alloc.free(active_path);
+    if (!std.mem.eql(u8, std.fs.path.basename(active_path), locked.session_id)) return error.JournalSourceConflict;
+    const parent = std.fs.path.dirname(active_path) orelse return error.JournalSourceConflict;
+    try session_store.resolveSessionSnapshotLocators(alloc, state.history, null, parent, locked.session_id);
+    const staged_path = try io_mod.dirRealpathAlloc(alloc, stage.dir, ".");
+    defer alloc.free(staged_path);
+    for (state.history) |turn| {
+        const images = switch (turn) {
+            .compacted_summary => continue,
+            .assistant => |value| value.user.images,
+            .interrupted => |value| value.user.images,
+        };
+        for (images) |image| {
+            var existing = image_attachments.loadVerifiedSnapshot(alloc, image, .{}) catch |err| switch (err) {
+                error.FileNotFound => {
+                    const leaf = std.fs.path.basename(image.snapshot_path orelse return error.MissingImageSnapshot);
+                    const relative = try std.fmt.allocPrint(alloc, "images/{s}", .{leaf});
+                    defer alloc.free(relative);
+                    const staged_image_path = try std.fs.path.join(alloc, &.{ staged_path, relative });
+                    defer alloc.free(staged_image_path);
+                    var staged_image = image;
+                    staged_image.snapshot_path = staged_image_path;
+                    var verified = try image_attachments.loadVerifiedSnapshot(alloc, staged_image, .{});
+                    defer verified.deinit(alloc);
+                    try write_relative(alloc, &locked.dir, relative, verified.bytes, ops);
+                    continue;
+                },
+                else => return err,
+            };
+            existing.deinit(alloc);
+        }
+    }
+}
+
 fn finish_cutover(alloc: Allocator, locked: *session_log.WritableSessionDir, marker: Marker, stage: *io_mod.VerifiedDir, archive: *io_mod.VerifiedDir, files: []const SourceFile, options: Options) !void {
     // Old v3 readers may have classified before waiting for session.lock. Their
     // under-lock replay begins with events.jsonl; remove that active pathname
@@ -780,6 +889,8 @@ fn finish_cutover(alloc: Allocator, locked: *session_log.WritableSessionDir, mar
     var first = try decode_frame(alloc, genesis);
     defer first.deinit(alloc);
     if (first.entry.seq != 1 or first.entry.kind != .checkpoint or !std.mem.eql(u8, &first.entry.hash, marker.genesis_hash)) return error.InvalidJournalGenesis;
+    try installGenesisSnapshots(alloc, locked, stage, first.payload.value, options.durable_ops);
+    try options.observe(.images_installed);
     const existing = authority.readOptionalSessionFile(alloc, &locked.dir, journal_name, header_bytes + max_entry_bytes) catch return error.JournalSourceConflict;
     defer if (existing) |bytes| alloc.free(bytes);
     if (existing) |bytes| {
@@ -2055,6 +2166,145 @@ test "journal witness native older waiting readers cannot restore legacy authori
         try std.testing.expectEqual(@as(u64, 5), try authority.manifestSchemaVersion(alloc, metadata));
         try std.testing.expect(!try authority.entryExistsRelative(&fixture.locked.dir, "events.jsonl"));
     }
+}
+
+fn writeLegacyImageFixture(fixture: *TestSession, path: []const u8, references: usize) ![]u8 {
+    const alloc = fixture.alloc;
+    const Image = struct { id: usize, path: []const u8, media_type: []const u8 = "image/png" };
+    const Turn = struct {
+        kind: []const u8 = "assistant",
+        user: struct { text: []const u8 = "Legacy [Image #1]", images: []const Image },
+        assistant: []const u8 = "saved image",
+    };
+    const images = [_]Image{.{ .id = if (references == 1) 0 else 1, .path = path }};
+    const history = try alloc.alloc(Turn, references);
+    defer alloc.free(history);
+    for (history) |*turn| turn.* = .{ .user = .{ .images = &images } };
+    const bytes = try std.json.Stringify.valueAlloc(alloc, .{
+        .schema_version = 2,
+        .id = fixture.locked.session_id,
+        .created_at_ms = 1,
+        .updated_at_ms = 2,
+        .workspace_root = fixture.home,
+        .conversation_language = "en",
+        .history_len = references,
+        .history = history,
+    }, .{});
+    errdefer alloc.free(bytes);
+    try io_mod.durableReplaceVerified(alloc, &fixture.locked.dir, metadata_name, bytes);
+    return bytes;
+}
+
+const legacy_image_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1kAAAAASUVORK5CYII=";
+
+fn writeLegacyImage(alloc: Allocator, tmp: *std.testing.TmpDir) ![:0]u8 {
+    const bytes = try alloc.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(legacy_image_png));
+    defer alloc.free(bytes);
+    try std.base64.standard.Decoder.decode(bytes, legacy_image_png);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "legacy.png", .data = bytes });
+    return tmp.dir.realPathFileAlloc(std.testing.io, "legacy.png", alloc);
+}
+
+test "journal witness legacy image capture preserves source and survives every cutover boundary" {
+    const alloc = std.testing.allocator;
+    for (std.enums.values(Boundary)) |boundary| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var fixture = try TestSession.init(alloc, &tmp);
+        defer fixture.deinit();
+        const path = try writeLegacyImage(alloc, &tmp);
+        defer alloc.free(path);
+        const original = try writeLegacyImageFixture(&fixture, path, 1);
+        defer alloc.free(original);
+        var options = fixture.options();
+        options.legacy_preferences = .{ .model = @constCast("test/model"), .effort = .auto, .fast_mode = false };
+        var source = try inspectSource(alloc, &fixture.locked, options);
+        defer source.deinit();
+        try std.testing.expectEqual(@as(usize, 1), source.captured_snapshots.len);
+        try std.testing.expectEqual(@as(usize, 1), source.state.history[0].assistant.user.images[0].id);
+        const unchanged = try read_file(alloc, &fixture.locked.dir, metadata_name, 1024 * 1024);
+        defer alloc.free(unchanged);
+        try std.testing.expectEqualSlices(u8, original, unchanged);
+        try std.testing.expect(!try authority.entryExistsRelative(&fixture.locked.dir, "images"));
+        var encoder: TestGenesis = .{};
+        var cut: TestCut = .{ .boundary = boundary };
+        try std.testing.expectError(error.CutoverInterrupted, cutover(alloc, &fixture.locked, &source, encoder.encoder(), .{ .context = &cut, .boundary_fn = TestCut.stop }));
+        try std.testing.expect(cut.observed);
+        try fixture.relock();
+        if (boundary == .staged) {
+            try std.testing.expect(!try authority.entryExistsRelative(&fixture.locked.dir, "images"));
+            try cutover(alloc, &fixture.locked, &source, encoder.encoder(), .{});
+        } else {
+            try tmp.dir.deleteFile(std.testing.io, "legacy.png");
+            try recoverCutover(alloc, &fixture.locked, .{});
+            try std.testing.expectEqual(@as(usize, 1), encoder.calls);
+        }
+        try expect_archive_unchanged(alloc, &fixture, &source);
+        var image = try image_attachments.loadVerifiedSnapshot(alloc, source.state.history[0].assistant.user.images[0], .{});
+        defer image.deinit(alloc);
+        try std.testing.expectEqualSlices(u8, source.captured_snapshots[0].bytes, image.bytes);
+        var manifest = try read_manifest(alloc, &fixture.locked);
+        defer manifest.deinit();
+        try std.testing.expectEqual(@as(u8, 5), manifest.value.schema_version);
+    }
+}
+
+test "journal witness legacy image capture is deduplicated and missing staged bytes block publication" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |corrupt| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var fixture = try TestSession.init(alloc, &tmp);
+        defer fixture.deinit();
+        const path = try writeLegacyImage(alloc, &tmp);
+        defer alloc.free(path);
+        const original = try writeLegacyImageFixture(&fixture, path, 2);
+        defer alloc.free(original);
+        var options = fixture.options();
+        options.legacy_preferences = .{ .model = @constCast("test/model"), .effort = .auto, .fast_mode = false };
+        var source = try inspectSource(alloc, &fixture.locked, options);
+        defer source.deinit();
+        try std.testing.expectEqual(@as(usize, 1), source.captured_snapshots.len);
+        var encoder: TestGenesis = .{};
+        var cut: TestCut = .{ .boundary = .marker_published };
+        try std.testing.expectError(error.CutoverInterrupted, cutover(alloc, &fixture.locked, &source, encoder.encoder(), .{ .context = &cut, .boundary_fn = TestCut.stop }));
+        var marker = try parse_marker(alloc, &fixture.locked.dir, fixture.locked.session_id);
+        defer marker.deinit();
+        var stage = try open_child(&fixture.locked.dir, marker.value.archive);
+        defer stage.close();
+        const captured = source.captured_snapshots[0];
+        if (corrupt) try write_relative(alloc, &stage, captured.relative_path, "corrupt snapshot", .{}) else try stage.dir.deleteFile(std.testing.io, captured.relative_path);
+        try tmp.dir.deleteFile(std.testing.io, "legacy.png");
+        try fixture.relock();
+        try std.testing.expectError(if (corrupt) error.ImageSnapshotCorrupt else error.FileNotFound, recoverCutover(alloc, &fixture.locked, .{}));
+        try std.testing.expect(!try authority.entryExistsRelative(&fixture.locked.dir, journal_name));
+        try expect_archive_unchanged(alloc, &fixture, &source);
+        // Exact repair of the durable stage can finish without the old file.
+        try write_relative(alloc, &stage, captured.relative_path, captured.bytes, .{});
+        try recoverCutover(alloc, &fixture.locked, .{});
+        try std.testing.expectEqual(@as(usize, 1), encoder.calls);
+    }
+}
+
+test "journal witness missing legacy image leaves original storage untouched" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fixture = try TestSession.init(alloc, &tmp);
+    defer fixture.deinit();
+    const path = try writeLegacyImage(alloc, &tmp);
+    defer alloc.free(path);
+    const original = try writeLegacyImageFixture(&fixture, path, 1);
+    defer alloc.free(original);
+    try tmp.dir.deleteFile(std.testing.io, "legacy.png");
+    var options = fixture.options();
+    options.legacy_preferences = .{ .model = @constCast("test/model"), .effort = .auto, .fast_mode = false };
+    try std.testing.expectError(error.FileNotFound, inspectSource(alloc, &fixture.locked, options));
+    const unchanged = try read_file(alloc, &fixture.locked.dir, metadata_name, 1024 * 1024);
+    defer alloc.free(unchanged);
+    try std.testing.expectEqualSlices(u8, original, unchanged);
+    try std.testing.expect(!try authority.entryExistsRelative(&fixture.locked.dir, "images"));
+    try std.testing.expect(!try authority.entryExistsRelative(&fixture.locked.dir, marker_name));
 }
 
 test "journal witness native source verifies image references under the owning session root" {

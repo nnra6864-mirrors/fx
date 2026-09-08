@@ -107,7 +107,7 @@ fx session resume --id <id>
 
 Repeated continuation reuses validated summaries of unchanged older sessions instead of replaying their histories during selection. The first scan, or a scan after those session files change, can take longer. Opening the resume picker preserves these cached summaries.
 
-Saved CLI and interactive sessions use an execution journal. Eligible completed older sessions convert under the exclusive session lock before accepting a new turn. Conversion preserves their history, settings, permissions, and required artifacts, and archives the original files. Older executables reject the converted format. Legacy sessions with pending work or conflicting recovery data remain inspectable; conversion refuses to guess whether that work completed.
+Saved CLI and interactive sessions use an execution journal. Eligible completed older sessions convert under the exclusive session lock before accepting a new turn. Conversion preserves their history, settings, permissions, and required artifacts, and archives the original files. Conversion also captures legacy images and repairs their IDs; a missing source image stops conversion without dropping it. Older executables reject the converted format. Legacy sessions with pending work or conflicting recovery data remain inspectable; conversion refuses to guess whether that work completed.
 
 Journaled tool groups run sequentially so each result is durable before the next tool starts.
 
