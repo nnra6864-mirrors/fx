@@ -304,37 +304,44 @@ pub fn writeInline(
 const ConsumedSpans = struct {
     suppressed_until: usize = 0,
 
-    /// Index just past the construct consumed at `i`, or null when `i` is an
-    /// ordinary byte the renderer inspects for delimiters.
-    fn endAt(self: *ConsumedSpans, text: []const u8, i: usize) ?usize {
+    const Consumed = union(enum) {
+        /// Opaque construct; nothing inside can act as a delimiter.
+        skip: usize,
+        /// Bare URL at its full extent. An active style would terminate the
+        /// URL at a delimiter inside it, so those bytes are still candidate
+        /// closers, but they are never code or link syntax.
+        bare_url: usize,
+    };
+
+    /// The construct consumed at `i`, or null when `i` is an ordinary byte the
+    /// renderer inspects for delimiters.
+    fn endAt(self: *ConsumedSpans, text: []const u8, i: usize) ?Consumed {
         const c = text[i];
         if (c == '\\' and i + 1 < text.len and tu.isEscapedPunctuationAt(text, i + 1)) {
             if (text[i + 1] == '<') self.suppress(angleAutolinkCandidateEnd(text, i + 1));
             if (text[i + 1] == '[') {
                 if (malformedInlineLinkCandidateEnd(text, i + 1)) |candidate_end| self.suppress(candidate_end);
             }
-            return i + 2;
+            return .{ .skip = i + 2 };
         }
-        if (c == '`') return if (codeSpanAt(text, i)) |span| span.end else i + backtickRunLength(text, i);
+        if (c == '`') return .{ .skip = if (codeSpanAt(text, i)) |span| span.end else i + backtickRunLength(text, i) };
         if (i >= self.suppressed_until and c == '!' and i + 1 < text.len and text[i + 1] == '[') {
-            if (parseInlineImage(text, i)) |image| return image.end;
+            if (parseInlineImage(text, i)) |image| return .{ .skip = image.end };
             if (malformedInlineLinkCandidateEnd(text, i + 1)) |candidate_end| self.suppress(candidate_end);
         }
         if (c == '[') {
-            if (parseFootnoteReference(text, i)) |reference| return reference.end;
+            if (parseFootnoteReference(text, i)) |reference| return .{ .skip = reference.end };
             if (i >= self.suppressed_until) {
-                if (parseInlineLink(text, i)) |link| return link.end;
+                if (parseInlineLink(text, i)) |link| return .{ .skip = link.end };
                 if (malformedInlineLinkCandidateEnd(text, i)) |candidate_end| self.suppress(candidate_end);
             }
         }
         if (i >= self.suppressed_until and c == '<') {
-            if (parseAngleAutolink(text, i)) |link| return link.end;
+            if (parseAngleAutolink(text, i)) |link| return .{ .skip = link.end };
             self.suppress(angleAutolinkCandidateEnd(text, i));
         }
         if (i >= self.suppressed_until) {
-            // Every delimiter terminates the URL here, so a closer that the
-            // renderer would see while a style is active is never hidden.
-            if (parseBareUrl(text, i, true, true, true, true, true)) |link| return link.end;
+            if (parseBareUrl(text, i, false, false, false, false, false)) |link| return .{ .bare_url = link.end };
         }
         return null;
     }
@@ -357,33 +364,44 @@ const CloserIndex = struct {
         var consumed: ConsumedSpans = .{};
         var i: usize = 0;
         while (i < text.len) {
-            if (consumed.endAt(text, i)) |next| {
-                i = next;
-                continue;
-            }
-            const c = text[i];
-            if (c == '*' or c == '~') {
-                var end = i;
-                while (end < text.len and text[end] == c) : (end += 1) {}
-                if (i > 0 and !tu.isSpace(text[i - 1])) {
-                    const run = end - i;
-                    if (c == '*') {
-                        index.set(.star1, i);
-                        if (run >= 2) index.set(.star2, i);
-                    } else if (run >= 2) {
-                        index.set(.tilde2, i);
-                    }
-                }
-                i = end;
-                continue;
-            }
-            if (c == '_') {
-                if (tu.isValidUnderscoreClose(text, i, 1)) index.set(.under1, i);
-                if (tu.isValidUnderscoreClose(text, i, 2)) index.set(.under2, i);
-            }
-            i += 1;
+            if (consumed.endAt(text, i)) |span| switch (span) {
+                .skip => |next| {
+                    i = next;
+                    continue;
+                },
+                .bare_url => |end| {
+                    while (i < end) i = index.record(text, i);
+                    continue;
+                },
+            };
+            i = index.record(text, i);
         }
         return index;
+    }
+
+    /// Records the delimiter run starting at `i`, if any, and returns the next
+    /// position to inspect.
+    fn record(self: *CloserIndex, text: []const u8, i: usize) usize {
+        const c = text[i];
+        if (c == '*' or c == '~') {
+            var end = i;
+            while (end < text.len and text[end] == c) : (end += 1) {}
+            if (i > 0 and !tu.isSpace(text[i - 1])) {
+                const run = end - i;
+                if (c == '*') {
+                    self.set(.star1, i);
+                    if (run >= 2) self.set(.star2, i);
+                } else if (run >= 2) {
+                    self.set(.tilde2, i);
+                }
+            }
+            return end;
+        }
+        if (c == '_') {
+            if (tu.isValidUnderscoreClose(text, i, 1)) self.set(.under1, i);
+            if (tu.isValidUnderscoreClose(text, i, 2)) self.set(.under2, i);
+        }
+        return i + 1;
     }
 
     fn set(self: *CloserIndex, kind: Kind, pos: usize) void {
@@ -402,10 +420,18 @@ fn findUnderscoreCloser(text: []const u8, start: usize, marker_len: usize) ?usiz
     var consumed: ConsumedSpans = .{};
     var i = start;
     while (i < text.len) {
-        if (consumed.endAt(text, i)) |next| {
-            i = next;
-            continue;
-        }
+        if (consumed.endAt(text, i)) |span| switch (span) {
+            .skip => |next| {
+                i = next;
+                continue;
+            },
+            .bare_url => |end| {
+                while (i < end) : (i += 1) {
+                    if (tu.isValidUnderscoreClose(text, i, marker_len)) return i;
+                }
+                continue;
+            },
+        };
         if (tu.isValidUnderscoreClose(text, i, marker_len)) return i;
         i += 1;
     }

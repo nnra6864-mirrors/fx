@@ -1024,6 +1024,26 @@ test "unsafe bare URL renders literally" {
     try std.testing.expect(std.mem.find(u8, out.items, "\x1b]8;") == null);
 }
 
+test "bare URL punctuation never hides emphasis that follows the URL" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    // With no active style the whole URL is one link, including its backticks
+    // and star, and the bold pair after it still styles.
+    try processor.push(alloc, "https://example.com/`x*y` **bold** `code`\n*https://example.com/a*b* tail\n", &out);
+    const first = tu.nthLine(out.items, 0).?;
+    try std.testing.expect(std.mem.indexOf(u8, first, ";https://example.com/`x*y`\x1b\\") != null);
+    try std.testing.expect(std.mem.endsWith(u8, first, " \x1b[1mbold\x1b[22m \x1b[38;5;245mcode\x1b[39m"));
+    // With italic active the URL stops at its first star, which closes it.
+    const second = tu.nthLine(out.items, 1).?;
+    try std.testing.expect(std.mem.startsWith(u8, second, "\x1b[3m"));
+    try std.testing.expect(std.mem.indexOf(u8, second, ";https://example.com/a\x1b\\") != null);
+    try std.testing.expect(std.mem.endsWith(u8, second, "\x1b[23mb* tail"));
+}
+
 test "bare URLs leave closing emphasis delimiters for the inline scanner" {
     const alloc = std.testing.allocator;
     var processor = MarkdownProcessor{};
