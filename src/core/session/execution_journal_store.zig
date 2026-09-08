@@ -350,7 +350,7 @@ pub fn inspectSource(alloc: Allocator, locked: *session_log.WritableSessionDir, 
             .conversation_language = try a.dupe(u8, state.conversation_language.view()),
             .provider = @tagName(state.preferences.provider),
             .model = state.preferences.model,
-            .effort = state.preferences.effort.label(),
+            .effort = try a.dupe(u8, state.preferences.effort.label()),
             .fast_mode = state.preferences.fast_mode,
             .title = if (selected.present) selected.title else null,
             .subagent_child = state.subagent_child,
@@ -1075,7 +1075,7 @@ const TestSession = struct {
                 .origin_workspace_root = self.home,
                 .workspace_root = self.home,
                 .conversation_language = .literal("en"),
-                .preferences = .{ .model = @constCast("test/model"), .effort = .auto, .fast_mode = false },
+                .preferences = .{ .model = @constCast("test/model"), .effort = .literal("high"), .fast_mode = false },
             } },
         });
         defer alloc.free(started);
@@ -1118,7 +1118,7 @@ const TestSession = struct {
             .generation_base_bytes = started.len,
             .checkpoint_seq = null,
             .checkpoint_sha256 = null,
-            .preferences = .{ .model = @constCast("test/model"), .effort = .auto, .fast_mode = false },
+            .preferences = .{ .model = @constCast("test/model"), .effort = .literal("high"), .fast_mode = false },
         });
         defer alloc.free(metadata);
         try io_mod.durableReplaceVerified(alloc, &self.locked.dir, metadata_name, metadata);
@@ -1843,10 +1843,11 @@ test "journal witness native storage converts all completed legacy source versio
         defer fixture.deinit();
         try fixture.writeLegacy(version);
         var source_options = fixture.options();
-        source_options.legacy_preferences = .{ .model = @constCast("test/model"), .effort = .auto, .fast_mode = false };
+        source_options.legacy_preferences = .{ .model = @constCast("test/model"), .effort = .literal("high"), .fast_mode = false };
         var source = try inspectSource(alloc, &fixture.locked, source_options);
         defer source.deinit();
         try std.testing.expectEqual(version, source.schema_version);
+        try std.testing.expectEqualStrings(if (version == 4) "auto" else "high", source.metadata.effort);
         try std.testing.expectEqualStrings("saved legacy answer", source.state.history[0].assistant.assistant);
         var encoder = TestGenesis{};
         try cutover(alloc, &fixture.locked, &source, encoder.encoder(), .{});
