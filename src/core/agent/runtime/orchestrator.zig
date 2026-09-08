@@ -3985,12 +3985,31 @@ const JournalDecisionBoundary = struct {
         const journal = self.deps.journal orelse return null;
         if (self.recorded_step) |step| return step;
         const replay = try self.arena.alloc(execution_journal.Replay, calls.len);
-        for (calls, replay) |call, *policy| {
+        defer self.arena.free(replay);
+        const saved_calls = try self.arena.dupe(ToolCall, calls);
+        defer self.arena.free(saved_calls);
+        var redacted: std.ArrayList([]u8) = .empty;
+        defer {
+            for (redacted.items) |bytes| self.arena.free(bytes);
+            redacted.deinit(self.arena);
+        }
+        for (calls, saved_calls, replay) |call, *saved, *policy| {
             policy.* = if (self.deps.tool_registry.lookup(call.name)) |tool| tool.journal_replay else .blocked;
+            const arguments = try @import("../execution_memory.zig").redactToolArgumentsJson(self.arena, call.name, call.arguments_json);
+            var owned = true;
+            defer if (owned) self.arena.free(arguments);
+            if (!try @import("../../shared/json_comparison.zig").serializedEqual(self.arena, arguments, call.arguments_json)) {
+                try redacted.append(self.arena, arguments);
+                owned = false;
+                saved.arguments_json = arguments;
+                // A safe executor cannot recover an input whose secrets were
+                // removed. Keep the live call unchanged and block its replay.
+                policy.* = .blocked;
+            }
         }
         const context = try self.context.encode(self.arena);
         defer self.arena.free(context);
-        self.recorded_step = try journal.recordDecision(self.completion, calls, replay, self.key orelse return error.InvalidJournalTransition, final, context, self.provider_replay);
+        self.recorded_step = try journal.recordDecision(self.completion, saved_calls, replay, self.key orelse return error.InvalidJournalTransition, final, context, if (redacted.items.len == 0) self.provider_replay else null);
         return self.recorded_step;
     }
 };

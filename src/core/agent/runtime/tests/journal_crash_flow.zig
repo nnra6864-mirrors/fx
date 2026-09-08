@@ -46,6 +46,7 @@ const Witness = struct {
     fail_entry: ?journal.Kind = null,
     fail_model_request: bool = false,
     legacy: bool = false,
+    expected_calls: []const types.ToolCall = &calls,
 
     fn init() Witness {
         return .{ .hooks = support.FakeAgentRuntimeDeps.init(std.testing.allocator) };
@@ -102,14 +103,11 @@ const Witness = struct {
 
     fn execute(raw: *anyopaque, request: contracts.ToolExecutionRequest) !contracts.ToolExecutionResult {
         const self: *Witness = @ptrCast(@alignCast(raw));
-        const index: usize = if (std.mem.eql(u8, request.call.id, calls[0].id))
-            0
-        else if (std.mem.eql(u8, request.call.id, calls[1].id))
-            1
-        else
-            return error.RegeneratedCallIdentity;
-        if (!std.mem.eql(u8, request.call.name, calls[index].name) or
-            !std.mem.eql(u8, request.call.arguments_json, calls[index].arguments_json)) return error.ReceiptInputConflict;
+        const index: usize = for (self.expected_calls, 0..) |expected, index| {
+            if (std.mem.eql(u8, request.call.id, expected.id)) break index;
+        } else return error.RegeneratedCallIdentity;
+        if (!std.mem.eql(u8, request.call.name, self.expected_calls[index].name) or
+            !std.mem.eql(u8, request.call.arguments_json, self.expected_calls[index].arguments_json)) return error.ReceiptInputConflict;
         if (!self.legacy) {
             const context = request.journal_context orelse return error.MissingDurableCallIdentity;
             if (!std.mem.eql(u8, context.requestId, "core-request")) return error.RegeneratedRequestIdentity;
@@ -250,6 +248,31 @@ test "journal witness permission feedback is durable before the next tool and su
     try std.testing.expectEqual(@as(usize, 1), recovered.entries);
     try std.testing.expectEqual(@as(usize, 1), next_gateway.request_bodies.items.len);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, next_gateway.request_bodies.items[0], feedback));
+}
+
+test "journal witness redacted tool arguments never become replayable inputs" {
+    const alloc = std.testing.allocator;
+    const sensitive_calls = [_]types.ToolCall{support.toolCall("secret-call", "shell", "{\"action\":\"run\",\"command\":\"effect-a\",\"password\":\"private-fixture-value\"}")};
+    var fixture = support.PromptFixture{};
+    var original = Witness.init();
+    defer original.deinit();
+    original.expected_calls = &sensitive_calls;
+    var gateway = support.FakeGateway.init(alloc, &.{ .{ .tool_calls = &sensitive_calls }, .{ .content = "finished" } });
+    defer gateway.deinit();
+    try original.run(&gateway, &fixture, null);
+    try std.testing.expectEqual(@as(usize, 1), original.effects);
+    for (original.durable.items) |record| try std.testing.expect(std.mem.find(u8, record.entry.bytes, "private-fixture-value") == null);
+    const cut = original.before_tools[0] orelse return error.NoDurableBoundaryBeforeEffect;
+    const saved = (try journal.array(cut.modelStep(0, 0), "calls"))[0];
+    try std.testing.expectEqualStrings("blocked", try journal.string(saved, "replay"));
+    var recovered = Witness.init();
+    defer recovered.deinit();
+    recovered.expected_calls = &sensitive_calls;
+    var next_gateway = support.FakeGateway.init(alloc, &.{});
+    defer next_gateway.deinit();
+    try std.testing.expectError(error.RecoveryRequired, recovered.run(&next_gateway, &fixture, &cut));
+    try std.testing.expectEqual(@as(usize, 0), recovered.entries);
+    try std.testing.expectEqual(@as(usize, 0), next_gateway.request_bodies.items.len);
 }
 
 test "journal witness capacity rejects admission before model and tool effects" {

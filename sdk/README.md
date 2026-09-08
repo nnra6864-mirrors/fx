@@ -312,6 +312,11 @@ outcome by the recorded call ID, checking that its tool and input match. A
 `recovering` flag does not replace that lookup. Journal tool context contains
 `signal`, `turnId`, `callId`, `requestId`, and `recovering`.
 
+Journal arguments use the same secret redaction as saved history. If redaction
+changes a call's input, that call is recorded with blocked replay even when its
+tool declares safe replay. A pending call requires reconciliation or abandonment;
+an already recorded result remains usable without executing the tool again.
+
 Cancellation aborts tool signals. The SDK retains an entered executor until its
 actual promise settles, including after cancellation or shutdown. Throwing,
 rejecting, invalid encoding, or losing a bridge reply does not prove that an
