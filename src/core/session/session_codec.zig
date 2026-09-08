@@ -1014,12 +1014,24 @@ fn parsePermissionState(
 }
 
 pub fn writeRecoveryCheckpoint(writer: *std.Io.Writer, checkpoint: RecoveryCheckpoint) !void {
+    return writeRecoveryFields(writer, checkpoint, true);
+}
+
+/// Journal context version two takes its user from the owning turn_start.
+pub fn writeRecoveryContext(writer: *std.Io.Writer, checkpoint: RecoveryCheckpoint) !void {
+    return writeRecoveryFields(writer, checkpoint, false);
+}
+
+fn writeRecoveryFields(writer: *std.Io.Writer, checkpoint: RecoveryCheckpoint, include_user: bool) !void {
     if (checkpoint.disposition == .history_only) return error.InvalidDurableField;
-    try writer.print("{{\"version\":{d},\"turn_id\":{d},\"user\":", .{
+    try writer.print("{{\"version\":{d},\"turn_id\":{d}", .{
         checkpoint.version,
         checkpoint.turn_id,
     });
-    try writeUserTurn(writer, checkpoint.user);
+    if (include_user) {
+        try writer.writeAll(",\"user\":");
+        try writeUserTurn(writer, checkpoint.user);
+    }
     try writer.writeAll(",\"assistant_source\":");
     try writeDurableBytes(writer, checkpoint.assistant_source);
     try writer.writeAll(",\"execution\":");

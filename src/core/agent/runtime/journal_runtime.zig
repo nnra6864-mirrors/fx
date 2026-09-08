@@ -263,7 +263,7 @@ pub const Runtime = struct {
             .inputJson = input_json,
         }, .{}, &writer.writer);
         const index = self.state.turns.items.len;
-        const initial_bytes = std.math.add(usize, writer.written().len, 2 * max_model_record_bytes) catch return error.JournalCapacityExceeded;
+        const initial_bytes = std.math.add(usize, writer.written().len, max_decision_record_bytes + 64 * 1024) catch return error.JournalCapacityExceeded;
         const initial_terminal = std.math.add(usize, input_json.len, 2 * max_model_record_bytes + 64 * 1024) catch return error.JournalCapacityExceeded;
         try self.state.preflight(.{ .append_bytes = initial_bytes, .append_records = 3, .terminal_bytes = initial_terminal });
         try self.state.append(self.alloc, self.sink, .turn_start, writer.written());
@@ -1187,9 +1187,31 @@ fn bindOriginalPendingCall(alloc: Allocator, state: *const journal.State, index:
     return error.JournalConflict;
 }
 
+/// Parses provider authority and budgets. Version two references the owning
+/// turn_start instead of duplicating its input. Execution must bind the original
+/// user validated by begin(); the empty user here is only the parser's carrier.
+pub fn parseRecoveryMetadata(alloc: Allocator, context: Value) !session_codec.RecoveryCheckpoint {
+    const recovery = try journal.object(context, "recovery");
+    const version = context.object.get("v") orelse {
+        if (context.object.count() != 2) return error.InvalidJournalRecord;
+        return session_codec.parseRecoveryCheckpoint(alloc, recovery);
+    };
+    if (version != .integer or version.integer != 2 or context.object.count() != 3 or
+        recovery.object.contains("user") or recovery.object.contains("route_identity")) return error.InvalidJournalRecord;
+    if ((try journal.field(recovery, "version", .integer)).integer != 2) return error.InvalidJournalRecord;
+    var fields = try recovery.object.clone(alloc);
+    defer fields.deinit(alloc);
+    var user: std.json.ObjectMap = .empty;
+    defer user.deinit(alloc);
+    try user.put(alloc, "text", .{ .string = "" });
+    try user.put(alloc, "images", .{ .array = std.json.Array.init(alloc) });
+    try fields.put(alloc, "user", .{ .object = user });
+    return session_codec.parseRecoveryCheckpoint(alloc, .{ .object = fields });
+}
+
 fn validateExecutionContext(alloc: Allocator, context: Value, outstanding: bool, calls: []const types.ToolCall) !void {
     if (context != .object) return error.InvalidJournalRecord;
-    var checkpoint = try session_codec.parseRecoveryCheckpoint(alloc, try journal.object(context, "recovery"));
+    var checkpoint = try parseRecoveryMetadata(alloc, context);
     defer checkpoint.deinit(alloc);
     if (checkpoint.outstanding_reservation != outstanding) return error.InvalidJournalRecord;
     const preparations = try journal.array(context, "preparations");
@@ -1790,13 +1812,18 @@ fn restoreTestEntry(state: *journal.State, validator: *TestValidator, entry: jou
 }
 
 fn testExecutionContext(runtime: *const Runtime, consumed: usize, outstanding: bool, preparations: []const Preparation) ![]u8 {
+    return testExecutionContextVersion(runtime, consumed, outstanding, preparations, false);
+}
+
+fn testExecutionContextVersion(runtime: *const Runtime, consumed: usize, outstanding: bool, preparations: []const Preparation, reference_input: bool) ![]u8 {
     const alloc = runtime.alloc;
     const input = try runtime.user(alloc);
     defer types.freeUserTurn(alloc, input);
     var writer: std.Io.Writer.Allocating = .init(alloc);
     errdefer writer.deinit();
-    try writer.writer.writeAll("{\"recovery\":");
-    try session_codec.writeRecoveryCheckpoint(&writer.writer, .{
+    try writer.writer.writeAll(if (reference_input) "{\"v\":2,\"recovery\":" else "{\"recovery\":");
+    const write: *const @TypeOf(session_codec.writeRecoveryCheckpoint) = if (reference_input) session_codec.writeRecoveryContext else session_codec.writeRecoveryCheckpoint;
+    try write(&writer.writer, .{
         .turn_id = try runtime.runtimeTurnId(),
         .user = input,
         .assistant_source = @constCast(""),
@@ -1813,6 +1840,74 @@ fn testExecutionContext(runtime: *const Runtime, consumed: usize, outstanding: b
     try json(&writer.writer, preparations);
     try writer.writer.writeByte('}');
     return writer.toOwnedSlice();
+}
+
+test "journal witness provider metadata references an eight MiB input through checkpoint restore" {
+    const alloc = std.testing.allocator;
+    const text = try alloc.alloc(u8, 8 * 1024 * 1024);
+    defer alloc.free(text);
+    @memset(text, 'x');
+    const input: types.UserTurn = .{ .text = text };
+    var state: journal.State = .{};
+    defer state.deinit(alloc);
+    var sink: TestSink = .{};
+    var runtime = sink.runtime(&state, "large-input");
+    _ = try runtime.begin(input, "model", 1, false);
+    var key = try runtime.generation();
+    defer key.deinit(alloc);
+    const request = try testExecutionContextVersion(&runtime, 0, true, &.{}, true);
+    defer alloc.free(request);
+    const decision = try testExecutionContextVersion(&runtime, 1, false, &.{}, true);
+    defer alloc.free(decision);
+    try std.testing.expect(request.len < 64 * 1024);
+    try std.testing.expect(decision.len < 64 * 1024);
+    try runtime.reserveRequest(key, request);
+    _ = try runtime.recordDecision(.{ .content = "saved" }, &.{}, &.{}, key, true, decision, null);
+    var result = try std.json.parseFromSlice(Value, alloc, "{\"ok\":true,\"stopReason\":\"stop\"}", .{});
+    defer result.deinit();
+    try runtime.finish(result.value, .{ .assistant = .{ .user = input, .assistant = @constCast("saved") } });
+    var checkpoint = try state.checkpoint(alloc, runtime.sink);
+    defer checkpoint.deinit(alloc);
+    var restored: journal.State = .{};
+    defer restored.deinit(alloc);
+    var validator: TestValidator = .{ .alloc = alloc };
+    try restoreTestEntry(&restored, &validator, checkpoint.entry);
+    var next = sink.runtime(&restored, "large-input");
+    try std.testing.expectEqual(Selection.completed, try next.begin(input, "model", 1, false));
+    const history = try restoreHistory(alloc, &restored);
+    defer types.freeHistoryTurnSlice(alloc, history);
+    try std.testing.expectEqualStrings(text, history[0].assistant.user.text);
+    try std.testing.expectEqualStrings("saved", history[0].assistant.assistant);
+    try std.testing.expectEqual(@as(usize, 5), sink.count);
+}
+
+test "journal witness context metadata rejects mixed inputs and owns parser allocations" {
+    const alloc = std.testing.allocator;
+    var state: journal.State = .{};
+    defer state.deinit(alloc);
+    var sink: TestSink = .{};
+    var runtime = sink.runtime(&state, "context-version");
+    _ = try runtime.begin(test_input, "model", 1, false);
+    const bytes = try testExecutionContextVersion(&runtime, 0, true, &.{}, true);
+    defer alloc.free(bytes);
+    var context = try std.json.parseFromSlice(Value, alloc, bytes, .{});
+    defer context.deinit();
+    try std.testing.checkAllAllocationFailures(alloc, struct {
+        fn run(a: Allocator, value: Value) !void {
+            var metadata = try parseRecoveryMetadata(a, value);
+            defer metadata.deinit(a);
+            try std.testing.expectEqual(@as(usize, 0), metadata.user.text.len);
+            try std.testing.expectEqual(@as(usize, 10), metadata.max_provider_attempts);
+        }
+    }.run, .{context.value});
+    context.value.object.getPtr("v").?.* = .{ .integer = 3 };
+    try std.testing.expectError(error.InvalidJournalRecord, parseRecoveryMetadata(alloc, context.value));
+    context.value.object.getPtr("v").?.* = .{ .integer = 2 };
+    context.value.object.getPtr("recovery").?.object.getPtr("version").?.* = .{ .integer = 1 };
+    try std.testing.expectError(error.InvalidJournalRecord, parseRecoveryMetadata(alloc, context.value));
+    context.value.object.getPtr("recovery").?.object.getPtr("version").?.* = .{ .integer = 2 };
+    try context.value.object.getPtr("recovery").?.object.put(context.arena.allocator(), "user", .null);
+    try std.testing.expectError(error.InvalidJournalRecord, parseRecoveryMetadata(alloc, context.value));
 }
 
 test "journal runtime records stable identities and exactly reconstructs selected decisions" {

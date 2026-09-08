@@ -4028,8 +4028,8 @@ const JournalContext = struct {
     fn encode(self: JournalContext, alloc: Allocator) ![]u8 {
         var context: std.Io.Writer.Allocating = .init(alloc);
         defer context.deinit();
-        try context.writer.writeAll("{\"recovery\":");
-        try session_codec.writeRecoveryCheckpoint(&context.writer, .{
+        try context.writer.writeAll("{\"v\":2,\"recovery\":");
+        try session_codec.writeRecoveryContext(&context.writer, .{
             .turn_id = self.job.turn_id,
             .user = .{ .text = self.job.prompt, .images = self.job.images },
             .assistant_source = @constCast(self.assistant_source),
@@ -5105,7 +5105,7 @@ fn processQueuedPromptInner(
     if (deps.journal) |journal| {
         if (journal.resuming) {
             if (try journal.latestContext()) |context| {
-                var checkpoint = try session_codec.parseRecoveryCheckpoint(arena, try execution_journal.object(context, "recovery"));
+                var checkpoint = try runtime_journal.parseRecoveryMetadata(arena, context);
                 const input = try types.dupeUserTurn(arena, .{ .text = job.prompt, .images = job.images });
                 types.freeUserTurn(arena, checkpoint.user);
                 // begin() validated the original input hash; the host has bound

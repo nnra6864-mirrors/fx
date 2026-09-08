@@ -367,7 +367,7 @@ test "journal witness capacity rejects admission before model and tool effects" 
     var fixture = support.PromptFixture{};
     var witness = Witness.init();
     defer witness.deinit();
-    witness.state.limits.bytes = 16 * 1024 * 1024;
+    witness.state.limits.bytes = 12 * 1024 * 1024;
     var gateway = support.FakeGateway.init(std.testing.allocator, &.{.{ .tool_calls = calls[0..1] }});
     defer gateway.deinit();
     try std.testing.expectError(error.JournalCapacityExceeded, witness.run(&gateway, &fixture, null));
@@ -470,7 +470,10 @@ test "journal witness J01 unacknowledged model request blocks provider admission
         .turn = 0,
     };
     const context = (try view.latestContext()) orelse return error.MissingReservationContext;
-    var checkpoint = try codec.parseRecoveryCheckpoint(std.testing.allocator, try journal.object(context, "recovery"));
+    var checkpoint = try journal_runtime.parseRecoveryMetadata(std.testing.allocator, context);
+    const original = try view.user(std.testing.allocator);
+    defer types.freeUserTurn(std.testing.allocator, original);
+    try std.testing.expectEqualStrings(fixture.job().prompt, original.text);
     defer checkpoint.deinit(std.testing.allocator);
     try std.testing.expect(checkpoint.outstanding_reservation);
     try std.testing.expectEqual(@as(usize, 0), checkpoint.consumed_provider_attempts);

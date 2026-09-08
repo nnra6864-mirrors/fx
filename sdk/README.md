@@ -76,6 +76,7 @@ A turn has one event consumer. Breaking out of its iterator cancels the turn;
 message-decoding failures reject the result instead of returning success with
 missing text.
 
+SDK requests are limited to 8 MiB including their encoded request envelope.
 Native transport buffers at most 8 MiB of output bytes. Unread SDK events apply
 backpressure at 1 MiB of encoded messages or 256 events. One message can exceed
 that threshold when the queue is empty; an individual encoded ACP message is
@@ -173,7 +174,9 @@ storage callbacks. Retrying the current live ID attaches to its execution and
 future events. Changed input raises `RequestConflict`; a restored pending
 request raises `PendingTurnError` until the host explicitly resumes or abandons
 it. A different ID does not retry an earlier request. Retained request mappings
-are session-lived; this API has no request TTL or eviction setting.
+are session-lived; this API has no request TTL or eviction setting. Provider
+context records refer to the original saved input rather than rewriting it at
+every model boundary. Existing records that contain the full input remain readable.
 
 Each attached handle has one consumer, sharing the bounded event buffer. A slow
 consumer backpressures all attached handles. Calling `cancel()` or leaving any

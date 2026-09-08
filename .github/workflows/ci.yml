@@ -229,6 +229,8 @@ jobs:
           node --experimental-wasm-jspi --no-experimental-require-module sdk/tests/test-journal-large-result.mjs sdk/dist/libfx cjs
           node --experimental-wasm-jspi sdk/tests/test-journal-compaction.mjs native wasm sdk/dist/libfx esm
           node --experimental-wasm-jspi --no-experimental-require-module sdk/tests/test-journal-compaction.mjs wasm native sdk/dist/libfx cjs
+          node --experimental-wasm-jspi sdk/tests/test-journal-large-input.mjs native wasm sdk/dist/libfx esm
+          node --experimental-wasm-jspi --no-experimental-require-module sdk/tests/test-journal-large-input.mjs wasm native sdk/dist/libfx cjs
           npm pack ./sdk/dist/libfx --ignore-scripts --json > /tmp/libfx-pack.json
           mv "$(node -p 'require("/tmp/libfx-pack.json")[0].filename')" /tmp/libfx-package.tgz
           node sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz native esm
