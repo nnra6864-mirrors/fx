@@ -1612,7 +1612,7 @@ fn failJournalRestore(alloc: Allocator, active: *ActiveSessionState, reason: []c
         transfer.deinit(alloc);
         active.journal_restore_transfer = null;
     }
-    active.session_rt.execution_journal.blocked = true;
+    active.session_rt.execution_journal.block();
 }
 
 fn requireFreshJournalRestore(active: *const ActiveSessionState) !void {
@@ -1695,7 +1695,7 @@ fn handleJournalRestoreTransfer(state: *ServerState, alloc: Allocator, msg: *con
 pub fn validateJournalRestore(alloc: Allocator, journal: *execution_journal.State) !void {
     try journal.ensureAvailable();
     journal_runtime.validateRestoredState(alloc, journal) catch |err| {
-        journal.blocked = true;
+        journal.block();
         return if (err == error.OutOfMemory) error.OutOfMemory else error.JournalConflict;
     };
 }

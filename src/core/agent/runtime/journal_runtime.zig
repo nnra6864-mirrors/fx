@@ -1418,6 +1418,44 @@ const TestSink = struct {
 
 const test_input: types.UserTurn = .{ .text = @constCast("Make a durable change") };
 
+test "journal witness native guard encloses mutation and failed acknowledgement" {
+    const Guarded = struct {
+        state: *journal.State,
+        store: TestSink = .{},
+        held: bool = false,
+        invalid: bool = false,
+
+        fn enter(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.invalid = self.invalid or self.held or self.state.isBlocked();
+            self.held = true;
+        }
+        fn leave(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.invalid = self.invalid or !self.held or self.state.isBlocked() != self.store.fail;
+            self.held = false;
+        }
+        fn append(raw: *anyopaque, entry: journal.Entry) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.invalid = self.invalid or !self.held or !self.state.isBlocked();
+            try TestSink.append(&self.store, entry);
+        }
+    };
+    for ([_]bool{ false, true }) |fail| {
+        var state: journal.State = .{};
+        defer state.deinit(std.testing.allocator);
+        var owner: Guarded = .{ .state = &state, .store = .{ .fail = fail } };
+        var runtime = owner.store.runtime(&state, "guarded-request");
+        runtime.sink = .{ .context = &owner, .append_fn = Guarded.append, .guard = .{ .enter = Guarded.enter, .leave = Guarded.leave } };
+        if (fail) {
+            try std.testing.expectError(error.PersistenceUncertain, runtime.begin(test_input, "model", 1, false));
+        } else _ = try runtime.begin(test_input, "model", 1, false);
+        try std.testing.expect(!owner.invalid);
+        try std.testing.expect(!owner.held);
+        try std.testing.expectEqual(@as(u64, if (fail) 0 else 1), state.last_seq);
+    }
+}
+
 test "journal witness repeated active compaction preserves archive and restores its model boundary" {
     const alloc = std.testing.allocator;
     var state: journal.State = .{};

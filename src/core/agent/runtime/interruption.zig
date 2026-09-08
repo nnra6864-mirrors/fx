@@ -18,6 +18,28 @@ const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const TurnFinalizationGuard = runtime_finalization.TurnFinalizationGuard;
 const QueuedPrompt = worker_runtime.QueuedPrompt;
 
+/// Called only after the executor has returned and the native user requested
+/// cancellation. The terminal record retains the unresolved call as unknown.
+pub fn finishCancelledJournal(hooks: *const AgentRuntimeDeps, finalization: *TurnFinalizationGuard) !void {
+    const journal = hooks.journal orelse return error.InvalidJournalTransition;
+    var arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var turn = (try @import("journal_runtime.zig").pendingHistory(alloc, journal.state)) orelse return error.InvalidJournalTransition;
+    const call = turn.interrupted.tool_call orelse return error.InvalidJournalTransition;
+    turn.interrupted.execution = try finalization.compacted_execution.project(alloc, turn.interrupted.execution);
+    if (try @import("../../tooling/captured_command.zig").isToolCall(alloc, call.name, call.arguments_json)) {
+        turn.interrupted.cancelled_command = .{};
+    }
+    try @import("tool_presentation.zig").finishCancelledToolStatus(hooks, alloc, try journal.runtimeTurnId(), call, true, null, .{
+        .status = .failure,
+        .cancelled = true,
+        .model_output = "",
+    }, &.{call.name});
+    const finished = try types.dupeFinishedPrompt(std.heap.c_allocator, .{ .turn = turn, .terminal_projection = .assistant_text });
+    try finalization.finish(.interrupted, null, finished);
+}
+
 pub fn persistInterruptedTurnOnce(
     hooks: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,

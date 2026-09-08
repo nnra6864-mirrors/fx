@@ -1043,7 +1043,7 @@ pub fn Runtime(comptime App: type) type {
                 if (loaded.journalState()) |records| {
                     native_journal = .{
                         .state = records,
-                        .sink = .{ .context = &journal_sink, .append_fn = NativeJournalSink.append },
+                        .sink = .{ .context = &journal_sink, .append_fn = NativeJournalSink.append, .guard = .{ .enter = NativeJournalSink.enter, .leave = NativeJournalSink.leave } },
                         .alloc = app.alloc,
                         .namespace = loaded.active_id,
                         .creation_id = &creation,
@@ -1065,7 +1065,7 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
             const semantic_presentation = app_callbacks.Bindings(App).semanticPresentationSink(app);
-            const config = buildQueuedPromptConfig(
+            var config = buildQueuedPromptConfig(
                 app,
                 job,
                 .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
@@ -1076,7 +1076,10 @@ pub fn Runtime(comptime App: type) type {
                 session_child_capability,
             );
             var execution_job = job;
-            if (native_journal != null) execution_job.recovery_checkpoint = null;
+            if (native_journal != null) {
+                execution_job.recovery_checkpoint = null;
+                config.journal_cancel_policy = .abandon;
+            }
             const process_result = agent_runtime.processAgentPrompt(&app.session.agent, &deps, semantic_presentation, lifecycleContext(app), config, execution_job);
             try process_result;
         }
@@ -1086,10 +1089,18 @@ pub fn Runtime(comptime App: type) type {
             turn_id: u64,
             images: []const types.ImageAttachment,
 
-            fn append(raw: *anyopaque, entry: execution_journal.Entry) !void {
+            fn enter(raw: *anyopaque) void {
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 self.app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
-                defer self.app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            }
+
+            fn leave(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            }
+
+            fn append(raw: *anyopaque, entry: execution_journal.Entry) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
                 const loaded = if (self.app.session_persistence.writable) |*value| value else return error.SessionPersistenceUnavailable;
                 const sink = loaded.journalSink() orelse return error.JournalWriterRequired;
                 self.app.worker.preservePromptSnapshots(self.turn_id, self.images);

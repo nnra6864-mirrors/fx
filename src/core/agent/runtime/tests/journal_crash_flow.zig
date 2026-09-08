@@ -47,6 +47,8 @@ const Witness = struct {
     fail_model_request: bool = false,
     legacy: bool = false,
     expected_calls: []const types.ToolCall = &calls,
+    cancel_after_effect: ?*std.atomic.Value(bool) = null,
+    abandon_cancelled: bool = false,
 
     fn init() Witness {
         return .{ .hooks = support.FakeAgentRuntimeDeps.init(std.testing.allocator) };
@@ -125,6 +127,10 @@ const Witness = struct {
             self.receipts[index] = true;
         }
         if (self.after_effect[index] == null) self.after_effect[index] = try self.capture();
+        if (self.cancel_after_effect) |flag| {
+            flag.store(true, .seq_cst);
+            return error.Cancelled;
+        }
         return .{ .model_output = try request.result_allocator.dupe(u8, if (index == 0) "receipt:journal-call-a" else "receipt:journal-call-b") };
     }
 
@@ -156,12 +162,14 @@ const Witness = struct {
         deps.journal = &runtime;
         var agent: agent_mod.Agent = .{};
         defer agent.deinit(std.testing.allocator);
+        var config = fixture.config();
+        config.journal_cancel_policy = if (self.abandon_cancelled) .abandon else .preserve;
         try orchestrator.processAgentPrompt(
             &agent,
             &deps,
             null,
             support.testLifecycleContext(hooks_mod.RuntimeView.empty(), std.testing.allocator, fixture.config().workspace_root),
-            fixture.config(),
+            config,
             fixture.job(),
         );
     }
@@ -292,6 +300,47 @@ test "journal witness command permission cancellation closes before executing th
     try std.testing.expect(history.interrupted.cancelled_command != null);
     try std.testing.expect(history.interrupted.cancelled_command.?.output_replay == null);
     try std.testing.expect(history.interrupted.cancelled_command.?.command_artifact_handle == null);
+}
+
+test "journal witness native cancellation abandons an unknown effect without inventing a result" {
+    for ([_]struct { abandon: bool, fail_end: bool = false }{
+        .{ .abandon = false }, .{ .abandon = true }, .{ .abandon = true, .fail_end = true },
+    }) |case| {
+        var fixture = support.PromptFixture{};
+        var witness = Witness.init();
+        defer witness.deinit();
+        witness.cancel_after_effect = &fixture.cancel_flag;
+        witness.abandon_cancelled = case.abandon;
+        if (case.fail_end) witness.fail_entry = .turn_end;
+        var gateway = support.FakeGateway.init(std.testing.allocator, &.{.{ .tool_calls = calls[0..1] }});
+        defer gateway.deinit();
+        if (case.fail_end) {
+            try std.testing.expectError(error.PersistenceUncertain, witness.run(&gateway, &fixture, null));
+            try std.testing.expect(witness.state.blocked);
+            try std.testing.expect(witness.state.outcome(0) == null);
+            var recovered = (try witness.capture()).?;
+            defer recovered.deinit(std.testing.allocator);
+            try std.testing.expect(recovered.pending() == .idle);
+            try std.testing.expect((try journal.object(recovered.outcome(0).?, "result")).object.contains("pendingTool"));
+        } else if (case.abandon) {
+            try witness.run(&gateway, &fixture, null);
+            try std.testing.expect(witness.state.pending() == .idle);
+            const result = try journal.object(witness.state.outcome(0).?, "result");
+            try std.testing.expectEqualStrings("cancelled", try journal.string(result, "reason"));
+            const pending = try journal.object(result, "pendingTool");
+            try std.testing.expectEqualStrings(witness.call_ids[0].?, try journal.string(pending, "callId"));
+            try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, witness.hooks.finalized_outcome.?);
+            try std.testing.expectError(error.RequestAlreadyCompleted, witness.run(&gateway, &fixture, null));
+        } else {
+            try std.testing.expectError(error.RecoveryRequired, witness.run(&gateway, &fixture, null));
+            try std.testing.expect(witness.state.pending() == .tool);
+            try std.testing.expect(witness.state.outcome(0) == null);
+        }
+        try std.testing.expect(witness.state.toolResult(0, 0, 0) == null);
+        try std.testing.expectEqual(@as(usize, 1), witness.entries);
+        try std.testing.expectEqual(@as(usize, 1), witness.effects);
+        try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    }
 }
 
 test "journal witness capacity rejects admission before model and tool effects" {

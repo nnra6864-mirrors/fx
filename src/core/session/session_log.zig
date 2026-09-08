@@ -2617,7 +2617,7 @@ pub const LoadedWritableSession = struct {
             },
             .journal => |*writer| {
                 if (writer.failure == null) writer.failure = error.SessionCommitFailed;
-                writer.execution.blocked = true;
+                writer.execution.block();
                 writer.owner.writer.append_journal.blocked = true;
             },
         }
@@ -2629,7 +2629,7 @@ pub const LoadedWritableSession = struct {
                 .conversation => |*writer| writer.failure = error.SessionPersistenceUncertain,
                 .journal => |*writer| {
                     writer.failure = error.SessionPersistenceUncertain;
-                    writer.execution.blocked = true;
+                    writer.execution.block();
                     writer.owner.writer.append_journal.blocked = true;
                 },
             }
@@ -2776,7 +2776,7 @@ pub const LoadedWritableSession = struct {
     ) !CommitPosition {
         try self.requireWritable();
         const result = switch (event) {
-            .history_turn_committed => if (self.writer == .journal) self.appendJournalHistoryEvent(alloc, event.history_turn_committed, timestamp_ms) else self.appendConversationHistoryEvent(
+            .history_turn_committed => if (self.writer == .journal) self.appendJournalHistoryEvent(alloc, event.history_turn_committed, timestamp_ms, null) else self.appendConversationHistoryEvent(
                 alloc,
                 event,
                 timestamp_ms,
@@ -2840,10 +2840,28 @@ pub const LoadedWritableSession = struct {
         return self.finishConversationCommit(alloc, timestamp_ms);
     }
 
-    fn appendJournalHistoryEvent(self: *LoadedWritableSession, alloc: Allocator, payload: session_event.HistoryTurnCommitted, timestamp_ms: i64) !CommitPosition {
+    pub fn appendHistoryProjection(self: *LoadedWritableSession, alloc: Allocator, payload: session_event.HistoryTurnCommitted, timestamp_ms: i64, reference: ?types.JournalTurnReference) !CommitPosition {
+        if (self.writer != .journal) {
+            if (reference != null) return error.JournalWriterRequired;
+            return self.appendEvent(alloc, .{ .history_turn_committed = payload }, timestamp_ms);
+        }
+        try self.requireWritable();
+        return self.appendJournalHistoryEvent(alloc, payload, timestamp_ms, reference) catch |err| self.recordWriteFailure(err);
+    }
+
+    fn appendJournalHistoryEvent(self: *LoadedWritableSession, alloc: Allocator, payload: session_event.HistoryTurnCommitted, timestamp_ms: i64, reference: ?types.JournalTurnReference) !CommitPosition {
         const execution = &self.writer.journal.execution;
-        if (execution.pending() != .idle or execution.turns.items.len == 0) return error.JournalControlRequired;
-        const outcome = execution.outcome(execution.turns.items.len - 1) orelse return error.JournalControlRequired;
+        const index = if (reference) |value| selected: {
+            if (value.turn_index >= execution.turns.items.len) return error.JournalConflict;
+            const namespace = try @import("execution_journal.zig").string(execution.start(value.turn_index), "namespace");
+            const hash = @import("execution_journal.zig").inputHash(namespace);
+            if (!std.mem.eql(u8, &hash, &value.namespace_hash)) return error.JournalConflict;
+            break :selected value.turn_index;
+        } else selected: {
+            if (execution.pending() != .idle or execution.turns.items.len == 0) return error.JournalControlRequired;
+            break :selected execution.turns.items.len - 1;
+        };
+        const outcome = execution.outcome(index) orelse return error.JournalControlRequired;
         const saved = outcome.object.get("history") orelse return error.InvalidJournalRecord;
         const expected = try std.json.Stringify.valueAlloc(alloc, saved, .{});
         defer alloc.free(expected);

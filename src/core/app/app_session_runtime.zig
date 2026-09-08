@@ -2186,7 +2186,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn appendHistoryTurn(app: *App, turn: types.HistoryTurn) !void {
-            _ = try appendHistoryTurnWithPendingPresentation(app, turn, .strict, null);
+            _ = try appendHistoryTurnWithPendingPresentation(app, turn, .strict, null, null);
         }
 
         pub fn appendFinishedPrompt(
@@ -2202,6 +2202,7 @@ pub fn Runtime(comptime App: type) type {
                 turn,
                 .strict,
                 finished.snapshot_file_ownership,
+                finished.journal_turn,
             );
         }
 
@@ -2386,6 +2387,7 @@ pub fn Runtime(comptime App: type) type {
                 turn,
                 .visual_epoch,
                 null,
+                null,
             );
         }
 
@@ -2398,6 +2400,7 @@ pub fn Runtime(comptime App: type) type {
                 finished.turn,
                 .visual_epoch,
                 finished.snapshot_file_ownership,
+                finished.journal_turn,
             );
         }
 
@@ -2411,21 +2414,22 @@ pub fn Runtime(comptime App: type) type {
             turn: types.HistoryTurn,
             mode: AppendHistoryMode,
             snapshot_file_ownership: ?types.SnapshotFileOwnership,
+            journal_turn: ?types.JournalTurnReference,
         ) !HistoryAppendOutcome {
             if (comptime !@hasField(App, "session_persistence")) {
-                return appendHistoryTurnWithOutcome(app, turn, mode, snapshot_file_ownership);
+                return appendHistoryTurnWithOutcome(app, turn, mode, snapshot_file_ownership, journal_turn);
             }
             const interrupted = switch (turn) {
                 .interrupted => |entry| entry,
-                else => return appendHistoryTurnWithOutcome(app, turn, mode, snapshot_file_ownership),
+                else => return appendHistoryTurnWithOutcome(app, turn, mode, snapshot_file_ownership, journal_turn),
             };
             var pending = app.session_persistence.pending_cancelled_command orelse {
-                return appendHistoryTurnWithOutcome(app, turn, mode, snapshot_file_ownership);
+                return appendHistoryTurnWithOutcome(app, turn, mode, snapshot_file_ownership, journal_turn);
             };
             app.session_persistence.pending_cancelled_command = null;
             const call = interrupted.tool_call orelse {
                 pending.discard(app.alloc);
-                return appendHistoryTurnWithOutcome(app, turn, mode, snapshot_file_ownership);
+                return appendHistoryTurnWithOutcome(app, turn, mode, snapshot_file_ownership, journal_turn);
             };
             const is_command = try captured_command.isToolCall(
                 app.alloc,
@@ -2436,7 +2440,7 @@ pub fn Runtime(comptime App: type) type {
                 !std.mem.eql(u8, call.id, pending.lifecycle_id.call_id))
             {
                 pending.discard(app.alloc);
-                return appendHistoryTurnWithOutcome(app, turn, mode, snapshot_file_ownership);
+                return appendHistoryTurnWithOutcome(app, turn, mode, snapshot_file_ownership, journal_turn);
             }
             defer pending.discard(app.alloc);
 
@@ -2453,6 +2457,7 @@ pub fn Runtime(comptime App: type) type {
                     .{ .interrupted = enriched_interrupted },
                     mode,
                     snapshot_file_ownership,
+                    journal_turn,
                 );
             }
 
@@ -2461,7 +2466,7 @@ pub fn Runtime(comptime App: type) type {
                 .command_artifact_handle = pending.command_artifact_handle,
             };
             const enriched: types.HistoryTurn = .{ .interrupted = enriched_interrupted };
-            return appendHistoryTurnWithOutcome(app, enriched, mode, snapshot_file_ownership);
+            return appendHistoryTurnWithOutcome(app, enriched, mode, snapshot_file_ownership, journal_turn);
         }
 
         fn ensurePendingCancelledCommand(
@@ -2522,6 +2527,7 @@ pub fn Runtime(comptime App: type) type {
             turn: types.HistoryTurn,
             mode: AppendHistoryMode,
             snapshot_file_ownership: ?types.SnapshotFileOwnership,
+            journal_turn: ?types.JournalTurnReference,
         ) !HistoryAppendOutcome {
             var prepared = (if (comptime @hasDecl(@TypeOf(app.session), "prepareHistoryEntry"))
                 app.session.prepareHistoryEntry(app.alloc, turn)
@@ -2564,15 +2570,16 @@ pub fn Runtime(comptime App: type) type {
             };
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             try loaded.prepareHistoryTurnForCommit(app.alloc, &prepared);
-            _ = loaded.appendEvent(
+            _ = loaded.appendHistoryProjection(
                 app.alloc,
-                .{ .history_turn_committed = .{
+                .{
                     .conversation_language = app.session.languageSnapshot(),
                     .total_input_tokens = app.total_input_tokens,
                     .total_output_tokens = app.total_output_tokens,
                     .turn = prepared,
-                } },
+                },
                 io_mod.milliTimestamp(),
+                journal_turn,
             ) catch |err| {
                 if (err == error.SessionPersistenceUncertain) {
                     if (snapshot_file_ownership) |ownership| ownership.transfer();
@@ -9920,6 +9927,57 @@ test "terminal title ignores long session and model context" {
     try Runtime(TestApp).setCachedSessionTitle(&app, "session-" ++ ("title" ** 20));
 
     try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
+}
+
+test "queued journal finish validates its own turn while a later turn is running" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |checkpoint_first| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const paths = try testPaths(alloc, &tmp);
+        defer alloc.free(paths.home);
+        defer alloc.free(paths.workspace);
+        const home = try TestHome.install(alloc, paths.home);
+        defer home.deinit();
+        var app = try TestApp.init(alloc, paths.workspace);
+        defer app.deinit();
+        try configureTestPreferences(&app);
+        try Runtime(TestApp).initializePersistence(&app, true);
+        try Runtime(TestApp).beginFreshPersistedSession(&app);
+        const first = try session_runtime.makeAssistantTurn(alloc, "first", "saved answer");
+        defer types.freeHistoryTurn(alloc, first);
+        try acknowledgeTestHistory(&app, first);
+        const loaded = &app.session_persistence.writable.?;
+        const reference: types.JournalTurnReference = .{
+            .namespace_hash = execution_journal.inputHash(loaded.active_id),
+            .turn_index = 0,
+        };
+        if (checkpoint_first) {
+            var checkpoint = try loaded.journalState().?.checkpoint(alloc, loaded.journalSink().?);
+            checkpoint.deinit(alloc);
+        }
+        var next: journal_runtime.Runtime = .{
+            .state = loaded.journalState().?,
+            .sink = loaded.journalSink().?,
+            .alloc = alloc,
+            .namespace = loaded.active_id,
+            .creation_id = "next",
+            .request_id = "next-request",
+        };
+        _ = try next.begin(.{ .text = @constCast("second") }, loaded.state.preferences.model, 2, false);
+        const position = loaded.position;
+        var foreign = reference;
+        foreign.namespace_hash[0] ^= 1;
+        try std.testing.expectError(error.JournalConflict, Runtime(TestApp).appendFinishedPrompt(&app, .{ .turn = first, .journal_turn = foreign }));
+        var unfinished = reference;
+        unfinished.turn_index = 1;
+        try std.testing.expectError(error.JournalControlRequired, Runtime(TestApp).appendFinishedPrompt(&app, .{ .turn = first, .journal_turn = unfinished }));
+        try Runtime(TestApp).appendFinishedPrompt(&app, .{ .turn = first, .journal_turn = reference });
+        try std.testing.expectEqual(position, loaded.position);
+        try std.testing.expect(loaded.hasPendingTurn());
+        try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
+        try std.testing.expectEqualStrings("saved answer", app.session.agent.history.items[0].assistant.assistant);
+    }
 }
 
 test "failed history delivery rejects the current writer without poisoning a fresh session" {

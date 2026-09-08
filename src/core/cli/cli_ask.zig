@@ -1560,7 +1560,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         if (writable.journalState()) |records| {
             journal = .{
                 .state = records,
-                .sink = .{ .context = &ctx, .append_fn = appendJournalEntry },
+                .sink = .{ .context = &ctx, .append_fn = appendJournalEntry, .guard = .{ .enter = enterJournalMutation, .leave = leaveJournalMutation } },
                 .alloc = ctx.alloc,
                 .namespace = writable.active_id,
                 .creation_id = &journal_creation,
@@ -2925,10 +2925,18 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
     ctx.prompt_snapshot_committed = true;
 }
 
-fn appendJournalEntry(raw_ctx: *anyopaque, entry: journal_codec.Entry) !void {
+fn enterJournalMutation(raw_ctx: *anyopaque) void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
-    defer ctx.session_write_mutex.unlock(io_mod.getIo());
+}
+
+fn leaveJournalMutation(raw_ctx: *anyopaque) void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.session_write_mutex.unlock(io_mod.getIo());
+}
+
+fn appendJournalEntry(raw_ctx: *anyopaque, entry: journal_codec.Entry) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     const writable = if (ctx.writable) |*value| value else return error.SessionPersistenceUnavailable;
     const sink = writable.journalSink() orelse return error.JournalWriterRequired;
     // An uncertain append may reference captured input artifacts. Retain them

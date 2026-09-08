@@ -4894,12 +4894,18 @@ pub fn processAgentPrompt(
 
     processQueuedPromptInner(deps, semantic_presentation, effective_lifecycle, effective_config, effective_job, &finalization, agent) catch |err| {
         if (deps.journal) |journal| {
-            if (journal.state.blocked) return err;
+            if (journal.state.isBlocked()) return err;
             if (err == error.JournalCapacityExceeded) {
                 if (finalization.state == .open) try finalization.finish(.paused, null, null);
                 return err;
             }
             if (err == error.RecoveryRequired or journal.state.pending() == .tool) {
+                if (config.journal_cancel_policy == .abandon and config.cancel_flag.load(.seq_cst) and
+                    journal.state.pending() == .tool and finalization.state == .open)
+                {
+                    try runtime_interruption.finishCancelledJournal(deps, &finalization);
+                    return;
+                }
                 if (finalization.state == .open) try finalization.finish(.paused, null, null);
                 return error.RecoveryRequired;
             }

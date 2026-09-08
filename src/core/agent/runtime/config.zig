@@ -56,6 +56,9 @@ pub const Config = struct {
     workspace_root: []const u8 = "",
     access_scope: ?workspace_access.AccessScope = null,
     origin: TurnOrigin = .root,
+    /// Interactive cancellation may abandon an unknown outcome once the
+    /// executor has returned. Other hosts retain explicit recovery control.
+    journal_cancel_policy: enum { preserve, abandon } = .preserve,
     /// Root-user evidence inherited by a subagent turn. Unused for root turns.
     root_user_intent_context: []const u8 = "",
     /// Exact ordered root-user authority inherited by a child. The child task

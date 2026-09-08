@@ -19,6 +19,12 @@ pub const Replay = enum { blocked, safe };
 pub const Sink = struct {
     context: *anyopaque,
     append_fn: *const fn (*anyopaque, Entry) anyerror!void,
+    /// Native readers share this guard with the entire prepare/write/adopt
+    /// boundary, so an in-flight write is never mistaken for a failed owner.
+    guard: ?struct {
+        enter: *const fn (*anyopaque) void,
+        leave: *const fn (*anyopaque) void,
+    } = null,
 };
 
 /// Typed payload validation runs against the acknowledged prefix before the
@@ -91,7 +97,15 @@ pub const State = struct {
     }
 
     pub fn ensureAvailable(self: *const State) error{PersistenceUncertain}!void {
-        if (self.blocked) return error.PersistenceUncertain;
+        if (self.isBlocked()) return error.PersistenceUncertain;
+    }
+
+    pub fn isBlocked(self: *const State) bool {
+        return @atomicLoad(bool, &self.blocked, .acquire);
+    }
+
+    pub fn block(self: *State) void {
+        @atomicStore(bool, &self.blocked, true, .release);
     }
 
     pub fn preflight(self: *const State, reservation: Reservation) !void {
@@ -197,16 +211,18 @@ pub const State = struct {
     /// All allocation and transition validation precedes the durability callback.
     /// Failure fences this instance; only recreation can establish the new cursor.
     pub fn append(self: *State, alloc: Allocator, sink: Sink, kind: Kind, bytes: []const u8) !void {
+        if (sink.guard) |guard| guard.enter(sink.context);
+        defer if (sink.guard) |guard| guard.leave(sink.context);
         try self.ensureAvailable();
         if (kind == .checkpoint) return error.InvalidJournalTransition;
         const seq = std.math.add(u64, self.last_seq, 1) catch return error.JournalCapacityExceeded;
         var owned = try codec.create(alloc, seq, kind, bytes);
         errdefer owned.deinit(alloc);
         try self.prepare(alloc, owned);
-        self.blocked = true;
+        self.block();
         sink.append_fn(sink.context, owned.entry) catch return error.PersistenceUncertain;
         self.adopt(owned);
-        self.blocked = false;
+        @atomicStore(bool, &self.blocked, false, .release);
     }
 
     /// Pure replay. A caller must discard the whole owner if any entry fails.
@@ -433,6 +449,8 @@ pub const State = struct {
     /// Periodic idle checkpoint: preserves the complete semantic record set and
     /// therefore every request mapping. No per-turn whole-history write is made.
     pub fn checkpoint(self: *State, alloc: Allocator, sink: Sink) !codec.OwnedEntry {
+        if (sink.guard) |guard| guard.enter(sink.context);
+        defer if (sink.guard) |guard| guard.leave(sink.context);
         try self.ensureAvailable();
         if (self.pending() != .idle) return error.PendingTurnError;
         var out: std.Io.Writer.Allocating = .init(alloc);
@@ -450,11 +468,11 @@ pub const State = struct {
         try out.writer.writeAll("]}");
         var owned = try codec.create(alloc, self.last_seq + 1, .checkpoint, out.written());
         errdefer owned.deinit(alloc);
-        self.blocked = true;
+        self.block();
         sink.append_fn(sink.context, owned.entry) catch return error.PersistenceUncertain;
         self.last_seq = owned.entry.seq;
         self.last_hash = owned.entry.hash;
-        self.blocked = false;
+        @atomicStore(bool, &self.blocked, false, .release);
         return owned;
     }
 

@@ -2001,6 +2001,13 @@ pub const SnapshotFileOwnership = struct {
     }
 };
 
+/// Identifies an acknowledged turn while its UI event waits in the queue.
+/// Journal checkpoints preserve the session-lifetime turn ordering.
+pub const JournalTurnReference = struct {
+    namespace_hash: [64]u8,
+    turn_index: usize,
+};
+
 pub const FinishedPrompt = struct {
     turn: HistoryTurn,
     /// Owned display-only text; never serialized as conversation history.
@@ -2009,6 +2016,7 @@ pub const FinishedPrompt = struct {
     terminal_projection: FinishedPromptProjection = .history_default,
     terminal_outcome: ?TurnPresentationOutcome = null,
     snapshot_file_ownership: ?SnapshotFileOwnership = null,
+    journal_turn: ?JournalTurnReference = null,
 };
 
 pub const PermissionMode = enum {
@@ -2385,6 +2393,7 @@ pub fn dupeFinishedPrompt(alloc: std.mem.Allocator, finished: FinishedPrompt) !F
         .terminal_projection = finished.terminal_projection,
         .terminal_outcome = finished.terminal_outcome,
         .snapshot_file_ownership = finished.snapshot_file_ownership,
+        .journal_turn = finished.journal_turn,
     };
 }
 

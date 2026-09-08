@@ -109,8 +109,9 @@ pub const TurnFinalizationGuard = struct {
         self: *TurnFinalizationGuard,
         outcome: types.TurnPresentationOutcome,
         disposition: ?types.ProviderCompletionDisposition,
-        finished_prompt: ?types.FinishedPrompt,
+        incoming_finished: ?types.FinishedPrompt,
     ) !void {
+        var finished_prompt = incoming_finished;
         if (self.state != .open) {
             if (finished_prompt) |finished| {
                 types.freeFinishedPrompt(std.heap.c_allocator, finished);
@@ -127,6 +128,17 @@ pub const TurnFinalizationGuard = struct {
 
         if (self.deps.journal) |journal| {
             if (outcome != .paused) {
+                if (finished_prompt) |*finished| {
+                    const index = journal.turn orelse {
+                        self.state = .fatal;
+                        types.freeFinishedPrompt(std.heap.c_allocator, finished.*);
+                        return error.InvalidJournalTransition;
+                    };
+                    finished.journal_turn = .{
+                        .namespace_hash = execution_journal.inputHash(try execution_journal.string(journal.state.start(index), "namespace")),
+                        .turn_index = index,
+                    };
+                }
                 finishJournal(journal, outcome, disposition, if (finished_prompt) |finished| finished.turn else null) catch |err| {
                     self.state = .fatal;
                     if (finished_prompt) |finished| types.freeFinishedPrompt(std.heap.c_allocator, finished);
@@ -135,7 +147,7 @@ pub const TurnFinalizationGuard = struct {
                 if (finished_prompt) |finished| {
                     self.deps.propagate_history_turn(self.deps.ctx, finished.turn) catch |err| {
                         debug_trace.logf("agent", "journal terminal cache update failed turn_id={d} seq={d} err={s}", .{ self.turn_id, journal.state.last_seq, @errorName(err) });
-                        journal.state.blocked = true;
+                        journal.state.block();
                         self.state = .fatal;
                         types.freeFinishedPrompt(std.heap.c_allocator, finished);
                         return err;

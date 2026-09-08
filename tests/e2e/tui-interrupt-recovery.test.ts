@@ -307,7 +307,9 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       await session.waitForText("Thinking", TIMEOUT);
 
       session.sendKeysImmediate(["C-c", "o", "k", "Enter"]);
-      await waitForCondition(() => followUp.started, "follow-up request after tool completion");
+      await waitForCondition(() => followUp.started, "follow-up request after tool completion").catch(cause => {
+        throw new Error(`follow-up failed: ${readFileSync(stderrPath, "utf8")}\n${readTrace(tracePath)}`, { cause });
+      });
       await session.waitForText("Thinking", TIMEOUT);
       const activeGrid = await session.capturePaneGrid();
       expect(activeGrid.join("\n")).toContain("Read probe.txt");
@@ -596,22 +598,20 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
         .filter((entry) => entry.isDirectory())
         .map((entry) => entry.name)
         .filter((id) => {
-          const path = join(sessionRoot, id, "events.jsonl");
+          const path = join(sessionRoot, id, "execution.journal");
           return existsSync(path) && readFileSync(path, "utf8").includes(
             "Stream a response that I will interrupt.",
           );
         });
       expect(sessionIds).toHaveLength(1);
       const events = readFileSync(
-        join(sessionRoot, sessionIds[0]!, "events.jsonl"),
+        join(sessionRoot, sessionIds[0]!, "execution.journal"),
         "utf8",
       );
-      const interruptedEvents = events
-        .trim()
-        .split("\n")
-        .filter(Boolean)
-        .map((line) => JSON.parse(line) as { event: Record<string, unknown> })
-        .filter((record) => record.event.interrupted !== undefined);
+      const interruptedEvents = decodeNativeJournal(readFileSync(join(sessionRoot, sessionIds[0]!, "execution.journal")))
+        .filter(entry => entry.kind === "turn_end")
+        .map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8")))
+        .filter(record => record.history?.kind === "interrupted");
       expect(interruptedEvents).toHaveLength(1);
       for (const chunk of PARTIAL_CHUNKS) {
         expect(events).toContain(chunk.trim());
