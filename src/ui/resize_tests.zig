@@ -2276,6 +2276,36 @@ test "streamed unmatched emphasis markers stay literal and unstyled" {
     try std.testing.expect(code_cell.style.fg.eql(.default));
 }
 
+test "streamed underscore emphasis styles across a multi backtick code span" {
+    var h = try Harness.init(std.testing.allocator, 48, 40, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(h.alloc);
+    var formatted: std.ArrayList(u8) = .empty;
+    defer formatted.deinit(h.alloc);
+    try processor.push(h.alloc, "See _a ``b`c`` d_ end\n", &formatted);
+    try processor.flush(h.alloc, &formatted);
+
+    _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, formatted.items);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    const row = try findRowContaining(&h, "See ");
+    try expectRowTrimmedEquals(&h, row, "  See a b`c d end");
+    const a_cell = h.vt.cellAt(row, 7) orelse return error.TestMissingCell;
+    try std.testing.expect(a_cell.codepoint == 'a' and a_cell.style.flags.italic);
+    const tick_cell = h.vt.cellAt(row, 10) orelse return error.TestMissingCell;
+    try std.testing.expect(tick_cell.codepoint == '`' and tick_cell.style.fg.eql(.{ .indexed = 245 }));
+    const d_cell = h.vt.cellAt(row, 13) orelse return error.TestMissingCell;
+    try std.testing.expect(d_cell.codepoint == 'd' and d_cell.style.flags.italic);
+    const end_cell = h.vt.cellAt(row, 15) orelse return error.TestMissingCell;
+    try std.testing.expect(end_cell.codepoint == 'e' and !end_cell.style.flags.italic);
+    try expectGridNotContains(&h, "_a");
+    try expectGridNotContains(&h, "d_");
+}
+
 test "streamed inline code color survives shrink and grow" {
     const cases = [_]struct { light: bool, fg: u8 }{
         .{ .light = false, .fg = 245 },

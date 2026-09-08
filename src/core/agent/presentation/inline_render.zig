@@ -298,14 +298,51 @@ pub fn writeInline(
     if (in_strike) try out.appendSlice(alloc, ansi.strike_close);
 }
 
-/// Skips a backslash escape or a backtick run at `i` the same way the inline
-/// walk does, so lookahead and rendering agree on what is literal.
-fn skipEscapeOrCode(text: []const u8, i: usize) ?usize {
-    const c = text[i];
-    if (c == '\\' and i + 1 < text.len) return i + 2;
-    if (c == '`') return if (codeSpanAt(text, i)) |span| span.end else i + backtickRunLength(text, i);
-    return null;
-}
+/// Walks the constructs the inline renderer consumes whole, so delimiter
+/// lookahead never counts a marker inside an escape, code span, image, link,
+/// autolink, or bare URL. Mirrors the renderer's malformed-link suppression.
+const ConsumedSpans = struct {
+    suppressed_until: usize = 0,
+
+    /// Index just past the construct consumed at `i`, or null when `i` is an
+    /// ordinary byte the renderer inspects for delimiters.
+    fn endAt(self: *ConsumedSpans, text: []const u8, i: usize) ?usize {
+        const c = text[i];
+        if (c == '\\' and i + 1 < text.len and tu.isEscapedPunctuationAt(text, i + 1)) {
+            if (text[i + 1] == '<') self.suppress(angleAutolinkCandidateEnd(text, i + 1));
+            if (text[i + 1] == '[') {
+                if (malformedInlineLinkCandidateEnd(text, i + 1)) |candidate_end| self.suppress(candidate_end);
+            }
+            return i + 2;
+        }
+        if (c == '`') return if (codeSpanAt(text, i)) |span| span.end else i + backtickRunLength(text, i);
+        if (i >= self.suppressed_until and c == '!' and i + 1 < text.len and text[i + 1] == '[') {
+            if (parseInlineImage(text, i)) |image| return image.end;
+            if (malformedInlineLinkCandidateEnd(text, i + 1)) |candidate_end| self.suppress(candidate_end);
+        }
+        if (c == '[') {
+            if (parseFootnoteReference(text, i)) |reference| return reference.end;
+            if (i >= self.suppressed_until) {
+                if (parseInlineLink(text, i)) |link| return link.end;
+                if (malformedInlineLinkCandidateEnd(text, i)) |candidate_end| self.suppress(candidate_end);
+            }
+        }
+        if (i >= self.suppressed_until and c == '<') {
+            if (parseAngleAutolink(text, i)) |link| return link.end;
+            self.suppress(angleAutolinkCandidateEnd(text, i));
+        }
+        if (i >= self.suppressed_until) {
+            // Every delimiter terminates the URL here, so a closer that the
+            // renderer would see while a style is active is never hidden.
+            if (parseBareUrl(text, i, true, true, true, true, true)) |link| return link.end;
+        }
+        return null;
+    }
+
+    fn suppress(self: *ConsumedSpans, until: usize) void {
+        self.suppressed_until = @max(self.suppressed_until, until);
+    }
+};
 
 /// Last position of a valid closing run for each emphasis delimiter, built in
 /// one pass per line so every opener check is constant time. An opener at `i`
@@ -317,9 +354,10 @@ const CloserIndex = struct {
 
     fn build(text: []const u8) CloserIndex {
         var index: CloserIndex = .{};
+        var consumed: ConsumedSpans = .{};
         var i: usize = 0;
         while (i < text.len) {
-            if (skipEscapeOrCode(text, i)) |next| {
+            if (consumed.endAt(text, i)) |next| {
                 i = next;
                 continue;
             }
@@ -361,9 +399,10 @@ const CloserIndex = struct {
 /// First valid underscore closer at or after `start`, skipping code spans by
 /// their real run length so ``a`b`` does not desynchronize the search.
 fn findUnderscoreCloser(text: []const u8, start: usize, marker_len: usize) ?usize {
+    var consumed: ConsumedSpans = .{};
     var i = start;
     while (i < text.len) {
-        if (skipEscapeOrCode(text, i)) |next| {
+        if (consumed.endAt(text, i)) |next| {
             i = next;
             continue;
         }

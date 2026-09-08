@@ -3288,6 +3288,24 @@ test "underscore emphasis survives a multi backtick code span" {
     );
 }
 
+test "closer lookahead skips consumed links the same way the renderer does" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    // A backtick inside link text is not a code opener, so the bold pair after
+    // the link still styles. A star inside a real code span is not a closer,
+    // so the unmatched opener stays literal.
+    try processor.push(alloc, "[use `](https://example.com) **bold** `code`\n[use `](https://example.com) *open `code*`\n", &out);
+    const first = tu.nthLine(out.items, 0).?;
+    try std.testing.expect(std.mem.endsWith(u8, first, " \x1b[1mbold\x1b[22m \x1b[38;5;245mcode\x1b[39m"));
+    const second = tu.nthLine(out.items, 1).?;
+    try std.testing.expect(std.mem.endsWith(u8, second, " *open \x1b[38;5;245mcode*\x1b[39m"));
+    try std.testing.expect(std.mem.indexOf(u8, second, "\x1b[3m") == null);
+}
+
 test "long line of unmatched openers renders in linear time" {
     const alloc = std.testing.allocator;
     var processor = MarkdownProcessor{};
