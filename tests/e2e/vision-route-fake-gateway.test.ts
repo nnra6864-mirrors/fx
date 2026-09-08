@@ -1265,7 +1265,7 @@ describe("Vision route fake Gateway", () => {
         });
         expect(rejectionOutput as string).not.toContain(fixture.imagePath);
         expect(filePartCount(recoveryRequest.body)).toBe(1);
-        const eventsPath = join(root.home, ".fx", "sessions", firstJson.session_id, "events.jsonl");
+        const eventsPath = join(root.home, ".fx", "sessions", firstJson.session_id, "execution.journal");
         const originalEvents = readFileSync(eventsPath, "utf8");
         if (shape !== "plain") expect(originalEvents).toContain("removed-vision-signature");
 

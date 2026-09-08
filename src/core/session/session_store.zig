@@ -2790,7 +2790,7 @@ pub const Store = struct {
     ) !LoadedWritableSession {
         var loaded = loaded_value;
         errdefer loaded.deinit(alloc);
-        try resolveSessionSnapshotLocators(
+        if (loaded.writer != .journal) try resolveSessionSnapshotLocators(
             alloc,
             loaded.state.history,
             if (loaded.state.recovery_checkpoint) |*checkpoint| checkpoint else null,

@@ -5098,7 +5098,15 @@ fn processQueuedPromptInner(
     defer if (journal_prefix) |*prefix| prefix.deinit();
     if (deps.journal) |journal| {
         if (journal.resuming) {
-            if (try journal.latestContext()) |context| job.recovery_checkpoint = try session_codec.parseRecoveryCheckpoint(arena, try execution_journal.object(context, "recovery"));
+            if (try journal.latestContext()) |context| {
+                var checkpoint = try session_codec.parseRecoveryCheckpoint(arena, try execution_journal.object(context, "recovery"));
+                const input = try types.dupeUserTurn(arena, .{ .text = job.prompt, .images = job.images });
+                types.freeUserTurn(arena, checkpoint.user);
+                // begin() validated the original input hash; the host has bound
+                // its snapshot locators to the owning native or virtual store.
+                checkpoint.user = input;
+                job.recovery_checkpoint = checkpoint;
+            }
             journal_prefix = try journal.prefixExecution(arena);
             try journal_prefix.?.appendPromptMessages(arena, &within_turn_suffix);
         }

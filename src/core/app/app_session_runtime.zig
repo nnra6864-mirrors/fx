@@ -1131,7 +1131,7 @@ test "open session keeps exclusive writer ownership until close" {
         .user = .{ .text = @constCast("original") },
         .assistant = @constCast("original answer"),
     } };
-    try acknowledgePlainTestResponse(&app, initial);
+    try acknowledgeTestHistory(&app, initial);
     try Runtime(TestApp).appendHistoryTurn(&app, initial);
     const id = try alloc.dupe(u8, app.session_persistence.writable.?.active_id);
     defer alloc.free(id);
@@ -2308,7 +2308,11 @@ pub fn Runtime(comptime App: type) type {
                     .max_provider_attempts = 1,
                     .consumed_provider_attempts = 0,
                 };
-                return try carrier.dupe(alloc);
+                var owned = try carrier.dupe(alloc);
+                errdefer owned.deinit(alloc);
+                const store = app.session_persistence.store orelse return error.SessionPersistenceUnavailable;
+                try session_store.resolveSessionSnapshotLocators(alloc, &.{}, &owned, store.sessions_dir, loaded.active_id);
+                return owned;
             }
             const checkpoint = loaded.state.recovery_checkpoint orelse return null;
             return try checkpoint.dupe(alloc);
@@ -5703,10 +5707,16 @@ fn configureTestPreferences(app: *TestApp) !void {
     );
 }
 
-// Persistence callback tests supply an already-completed plain response. Use
-// the real journal writer to establish the same prerequisite as the agent loop.
-fn acknowledgePlainTestResponse(app: *TestApp, turn: types.HistoryTurn) !void {
-    try std.testing.expect(turn == .assistant and turn.assistant.execution.isEmpty());
+// Exercise host callbacks only after the real journal has acknowledged the
+// fixture's selected decisions, results, and terminal history.
+fn acknowledgeTestHistory(app: *TestApp, turn: types.HistoryTurn) !void {
+    const user = switch (turn) {
+        .assistant => |value| value.user,
+        .interrupted => |value| value.user,
+        .compacted_summary => return error.TestExpectedExecutionTurn,
+    };
+    const memory = if (turn == .assistant) turn.assistant.execution else turn.interrupted.execution;
+    try std.testing.expect(memory.steering.len == 0);
     const loaded = if (app.session_persistence.writable) |*value| value else return;
     const state = loaded.journalState() orelse return;
     const request_id = try std.fmt.allocPrint(app.alloc, "fixture-{d}", .{state.turns.items.len + 1});
@@ -5719,11 +5729,43 @@ fn acknowledgePlainTestResponse(app: *TestApp, turn: types.HistoryTurn) !void {
         .creation_id = "fixture",
         .request_id = request_id,
     };
-    _ = try journal.begin(turn.assistant.user, loaded.state.preferences.model, state.turns.items.len + 1, false);
-    var key = try journal.generation();
-    defer key.deinit(app.alloc);
-    _ = try journal.recordDecision(.{ .content = turn.assistant.assistant }, &.{}, &.{}, key, true, null, turn.assistant.provider_replay);
-    const result = try std.json.parseFromSlice(std.json.Value, app.alloc, "{\"ok\":true,\"stopReason\":\"stop\"}", .{});
+    const runtime_turn_id = if (turn == .interrupted and app.session_persistence.pending_cancelled_command != null)
+        app.session_persistence.pending_cancelled_command.?.lifecycle_id.turn_id
+    else
+        state.turns.items.len + 1;
+    _ = try journal.begin(user, loaded.state.preferences.model, runtime_turn_id, false);
+    for (memory.tool_steps) |step| {
+        var key = try journal.generation();
+        defer key.deinit(app.alloc);
+        const replay = try app.alloc.alloc(execution_journal.Replay, step.tool_calls.len);
+        defer app.alloc.free(replay);
+        @memset(replay, .blocked);
+        const index = try journal.recordDecision(.{ .content = step.assistant }, step.tool_calls, replay, key, false, null, step.provider_replay);
+        for (step.tool_results, 0..) |result, call| try journal.recordResult(index, call, result);
+    }
+    var encoded: std.Io.Writer.Allocating = .init(app.alloc);
+    defer encoded.deinit();
+    if (turn == .assistant) {
+        var key = try journal.generation();
+        defer key.deinit(app.alloc);
+        _ = try journal.recordDecision(.{ .content = turn.assistant.assistant }, &.{}, &.{}, key, true, null, turn.assistant.provider_replay);
+        try encoded.writer.writeAll("{\"ok\":true,\"stopReason\":\"stop\"}");
+    } else {
+        if (turn.interrupted.tool_call) |call| {
+            var key = try journal.generation();
+            defer key.deinit(app.alloc);
+            _ = try journal.recordDecision(.{ .content = turn.interrupted.assistant }, &.{call}, &.{.blocked}, key, false, null, null);
+        }
+        try encoded.writer.writeAll("{\"ok\":false,\"reason\":\"cancelled\",\"retryable\":false,\"message\":\"Cancelled\"");
+        var pending = try journal_runtime.pendingTool(app.alloc, state);
+        defer if (pending) |*value| value.deinit();
+        if (pending) |value| {
+            try encoded.writer.writeAll(",\"pendingTool\":");
+            try std.json.Stringify.value(.{ .callId = value.tool.callId, .name = value.tool.name, .input = value.tool.input }, .{}, &encoded.writer);
+        }
+        try encoded.writer.writeByte('}');
+    }
+    const result = try std.json.parseFromSlice(std.json.Value, app.alloc, encoded.written(), .{});
     defer result.deinit();
     try journal.finish(result.value, turn);
 }
@@ -5907,7 +5949,7 @@ test "resume handoff owns the exact non-pristine session id" {
     try Runtime(TestApp).beginFreshPersistedSession(&app);
     const turn = try session_runtime.makeAssistantTurn(alloc, "question", "answer");
     defer session_runtime.freeHistoryTurn(alloc, turn);
-    try acknowledgePlainTestResponse(&app, turn);
+    try acknowledgeTestHistory(&app, turn);
     try Runtime(TestApp).appendHistoryTurn(&app, turn);
     const expected_id = try alloc.dupe(
         u8,
@@ -5942,7 +5984,7 @@ test "resume handoff requires no derived cache write" {
     try Runtime(TestApp).beginFreshPersistedSession(&app);
     const turn = try session_runtime.makeAssistantTurn(alloc, "question", "answer");
     defer session_runtime.freeHistoryTurn(alloc, turn);
-    try acknowledgePlainTestResponse(&app, turn);
+    try acknowledgeTestHistory(&app, turn);
     try Runtime(TestApp).appendHistoryTurn(&app, turn);
     const expected_id = try alloc.dupe(
         u8,
@@ -5982,7 +6024,7 @@ test "resume handoff suppresses session id allocation failure" {
     try Runtime(TestApp).beginFreshPersistedSession(&app);
     const turn = try session_runtime.makeAssistantTurn(alloc, "question", "answer");
     defer session_runtime.freeHistoryTurn(alloc, turn);
-    try acknowledgePlainTestResponse(&app, turn);
+    try acknowledgeTestHistory(&app, turn);
     try Runtime(TestApp).appendHistoryTurn(&app, turn);
     Runtime(TestApp).requestResumeHandoff(&app);
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
@@ -7031,13 +7073,12 @@ test "upgrade resume restores active session with the installed version notice" 
         .tool_calls = calls[0..],
         .tool_results = results[0..],
     }};
-    var resumed_images = [_]types.ImageAttachment{.{
-        .id = 41,
-        .path = @constCast("/tmp/resumed.png"),
-        .media_type = @constCast("image/png"),
-        .snapshot_path = @constCast("images/image-41-0123456789abcdef.bin"),
-        .snapshot_sha256 = @constCast("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
-    }};
+    const image = try image_attachments.captureInlineImageBytes(alloc, 41, "image/png", "\x89PNG\r\n\x1a\nresume-image", paths.workspace);
+    defer types.freeImageAttachment(alloc, image);
+    const image_locator = try std.fmt.allocPrint(alloc, "images/image-41-{s}.bin", .{image.snapshot_sha256.?[0..16]});
+    defer alloc.free(image_locator);
+    var resumed_images = [_]types.ImageAttachment{image};
+    resumed_images[0].snapshot_path = image_locator;
     const history = [_]types.HistoryTurn{
         .{ .compacted_summary = .{
             .summary = @constCast("<context_handoff>older context</context_handoff>"),
@@ -7066,6 +7107,17 @@ test "upgrade resume restores active session with the installed version notice" 
         &history,
         2,
     );
+    const image_dir = try std.fs.path.join(alloc, &.{ app.session_persistence.store.?.sessions_dir, "session-1", "images" });
+    defer alloc.free(image_dir);
+    const saved_image = try image_attachments.copyVerifiedImageAttachmentToDir(alloc, image, 41, image_dir);
+    defer types.freeImageAttachment(alloc, saved_image);
+    {
+        var fixture = try app.session_persistence.store.?.resumeForWrite(alloc, "session-1");
+        defer fixture.deinit(alloc);
+        const capability = try fixture.childCapability();
+        var artifact = try capability.atomicReplace(alloc, .tool_results, "result-read-file.txt", "file contents");
+        artifact.deinit(alloc);
+    }
     app.requested_resume = .{ .id = try alloc.dupe(u8, "session-1") };
     app.total_web_search_requests = 99;
 
@@ -7786,7 +7838,7 @@ test "cancelled command presentation survives a persisted session restart" {
             true,
         );
 
-        try Runtime(TestApp).appendHistoryTurn(&app, .{ .interrupted = .{
+        const turn: types.HistoryTurn = .{ .interrupted = .{
             .user = .{ .text = @constCast("run the slow command") },
             .assistant = @constCast("I started it."),
             .tool_call = .{
@@ -7796,8 +7848,11 @@ test "cancelled command presentation survives a persisted session restart" {
             },
             .cancelled_command = .{
                 .output_replay = .{ .available = descriptor },
+                .command_artifact_handle = "fx-command-cancelled.log",
             },
-        } });
+        } };
+        try acknowledgeTestHistory(&app, turn);
+        try Runtime(TestApp).appendHistoryTurn(&app, turn);
         session_id = try alloc.dupe(u8, app.session_persistence.writable.?.active_id);
         Runtime(TestApp).finalizePersistence(&app);
     }
@@ -7921,7 +7976,7 @@ fn expectAuthoritativeCancelledReplayIsSoleArtifact() !void {
         true,
     );
 
-    try Runtime(TestApp).appendHistoryTurn(&app, .{ .interrupted = .{
+    const turn: types.HistoryTurn = .{ .interrupted = .{
         .user = .{ .text = @constCast("cancel") },
         .tool_call = .{
             .id = "authoritative-cancelled-command",
@@ -7930,8 +7985,11 @@ fn expectAuthoritativeCancelledReplayIsSoleArtifact() !void {
         },
         .cancelled_command = .{
             .output_replay = .{ .available = descriptor },
+            .command_artifact_handle = "fx-command-cancelled.log",
         },
-    } });
+    } };
+    try acknowledgeTestHistory(&app, turn);
+    try Runtime(TestApp).appendHistoryTurn(&app, turn);
     published = true;
 
     const history = try app.session.snapshotHistory(alloc);
@@ -8258,7 +8316,7 @@ test "appendHistoryTurn commits conversation without copying runtime counters" {
     const turn = try session_runtime.makeAssistantTurn(alloc, "question", "answer");
     defer session_runtime.freeHistoryTurn(alloc, turn);
 
-    try acknowledgePlainTestResponse(&app, turn);
+    try acknowledgeTestHistory(&app, turn);
     try Runtime(TestApp).appendHistoryTurn(&app, turn);
 
     var loaded = try app.session_persistence.store.?.loadReadOnly(
@@ -8289,37 +8347,42 @@ test "fresh TUI prompt preparation preserves equal user text as distinct turns" 
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
+    const loaded = &app.session_persistence.writable.?;
+    var journal: journal_runtime.Runtime = .{
+        .state = loaded.journalState().?,
+        .sink = loaded.journalSink().?,
+        .alloc = alloc,
+        .namespace = loaded.active_id,
+        .creation_id = "old-runtime",
+        .request_id = "old-request",
+    };
+    const user: types.UserTurn = .{ .text = @constCast("same prompt") };
+    _ = try journal.begin(user, loaded.state.preferences.model, 41, false);
+    var key = try journal.generation();
+    defer key.deinit(alloc);
+    _ = try journal.recordDecision(.{ .content = "partial old response" }, &.{}, &.{}, key, false, null, null);
     try Runtime(TestApp).commitContextCompaction(&app, .{
         .summary = @constCast("<context_handoff>unfinished request</context_handoff>"),
         .removed_turn_count = 0,
         .compaction_count = 1,
-    }, .{ .user = .{ .text = @constCast("same prompt") }, .assistant = @constCast("") }, null);
-    const checkpoint: session_codec.RecoveryCheckpoint = .{
-        .turn_id = 41,
-        .user = .{ .text = @constCast("same prompt") },
-        .assistant_source = @constCast("partial old response"),
-        .cause = .response_interrupted,
-        .action = .continuing_response,
-        .authority = .{ .provider = .gateway, .model = @constCast("saved/model") },
-        .requested_fast_mode = false,
-        .fast_mode = false,
-        .max_provider_attempts = 10,
-        .consumed_provider_attempts = 2,
-    };
-    try Runtime(TestApp).setRecoveryCheckpoint(&app, checkpoint);
+    }, .{ .user = user, .assistant = @constCast("") }, null);
+    const abandoned = (try journal.abandon()).?;
+    defer types.freeHistoryTurn(alloc, abandoned);
     var prepared = try Runtime(TestApp).prepareFreshPrompt(&app, .{
         .user = .{ .text = @constCast("same prompt") },
-        .prior_turn = checkpoint.interruptedTurn(),
+        .prior_turn = abandoned,
     });
     defer prepared.deinit(std.heap.c_allocator);
     try std.testing.expectEqual(@as(usize, 2), prepared.history.len);
-    try std.testing.expect(!app.session_persistence.writable.?.writer.conversation.turn_open);
+    try std.testing.expect(!loaded.hasPendingTurn());
     try std.testing.expect(app.session_persistence.writable.?.state.recovery_checkpoint == null);
     try std.testing.expectEqual(@as(usize, 2), app.session.historyLen());
-    try Runtime(TestApp).appendHistoryTurn(&app, .{ .assistant = .{
-        .user = .{ .text = @constCast("same prompt") },
-        .assistant = @constCast("new answer"),
-    } });
+    const next: types.HistoryTurn = .{ .assistant = .{ .user = user, .assistant = @constCast("new answer") } };
+    try acknowledgeTestHistory(&app, next);
+    try Runtime(TestApp).appendHistoryTurn(&app, next);
+    try std.testing.expectEqual(@as(usize, 2), loaded.journalState().?.turns.items.len);
+    try std.testing.expect(!std.mem.eql(u8, try execution_journal.string(loaded.journalState().?.start(0), "requestId"), try execution_journal.string(loaded.journalState().?.start(1), "requestId")));
+
     var page = try app.session_persistence.store.?.loadHistoryPage(alloc, app.session_persistence.writable.?.active_id, null, 10);
     defer page.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), page.turns.len);
@@ -8352,9 +8415,9 @@ test "context checkpoint persists before releasing summarized model memory" {
     defer session_runtime.freeHistoryTurn(alloc, first);
     const second = try session_runtime.makeAssistantTurn(alloc, "second", "two");
     defer session_runtime.freeHistoryTurn(alloc, second);
-    try acknowledgePlainTestResponse(&app, first);
+    try acknowledgeTestHistory(&app, first);
     try Runtime(TestApp).appendHistoryTurn(&app, first);
-    try acknowledgePlainTestResponse(&app, second);
+    try acknowledgeTestHistory(&app, second);
     try Runtime(TestApp).appendHistoryTurn(&app, second);
     var prior_page = try app.session_persistence.store.?.loadHistoryPage(alloc, session_id, null, 1);
     defer prior_page.deinit(alloc);
@@ -8407,7 +8470,7 @@ test "context checkpoint persists before releasing summarized model memory" {
     try std.testing.expect(continued.next_cursor == null);
 }
 
-test "handle-free conversation result is externalized before live commit" {
+test "inline journal result remains complete through the live history callback" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8441,11 +8504,13 @@ test "handle-free conversation result is externalized before live commit" {
         .tool_results = &results,
     }};
 
-    try Runtime(TestApp).appendHistoryTurn(&app, .{ .assistant = .{
+    const turn: types.HistoryTurn = .{ .assistant = .{
         .user = .{ .text = @constCast("run it") },
         .assistant = @constCast("done"),
         .execution = .{ .tool_steps = &steps },
-    } });
+    } };
+    try acknowledgeTestHistory(&app, turn);
+    try Runtime(TestApp).appendHistoryTurn(&app, turn);
     try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
     try std.testing.expectEqual(
         @as(usize, 0),
@@ -8460,24 +8525,14 @@ test "handle-free conversation result is externalized before live commit" {
     defer reloaded.deinit(alloc);
     const stored_result = reloaded.history[0].assistant.execution
         .tool_steps[0].tool_results[0];
-    try std.testing.expect(live_result.output_handle != null);
-    try std.testing.expectEqualStrings(
-        live_result.output_handle.?,
-        stored_result.output_handle.?,
-    );
-    const capability = try app.session_persistence.writable.?.childCapability();
-    const stored = try result_store.readByRangeManaged(
-        alloc,
-        capability,
-        live_result.output_handle.?,
-        0,
-        64,
-    );
-    defer alloc.free(stored);
-    try std.testing.expect(std.mem.find(u8, stored, "done") != null);
+    try std.testing.expect(live_result.output_handle == null);
+    try std.testing.expect(stored_result.output_handle == null);
+    try std.testing.expectEqualStrings("done", live_result.output);
+    try std.testing.expectEqualStrings(live_result.output, stored_result.output);
+    try std.testing.expectEqual(@as(usize, 4), stored_result.stored_output_bytes);
 }
 
-test "completed conversation turn clears its recovery file" {
+test "completed journal turn clears pending execution without a recovery sidecar" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8493,23 +8548,27 @@ test "completed conversation turn clears its recovery file" {
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
-    try Runtime(TestApp).setRecoveryCheckpoint(&app, .{
-        .turn_id = 1,
-        .user = .{ .text = @constCast("prompt") },
-        .assistant_source = @constCast("partial"),
-        .cause = .network_interrupted,
-        .action = .retrying_request,
-        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
-        .requested_fast_mode = false,
-        .fast_mode = false,
-        .max_provider_attempts = 3,
-        .consumed_provider_attempts = 1,
-    });
-    try std.testing.expect(
-        app.session_persistence.writable.?.state.recovery_checkpoint != null,
-    );
+    const loaded = &app.session_persistence.writable.?;
+    var journal: journal_runtime.Runtime = .{
+        .state = loaded.journalState().?,
+        .sink = loaded.journalSink().?,
+        .alloc = alloc,
+        .namespace = loaded.active_id,
+        .creation_id = "completion-fixture",
+        .request_id = "completed-request",
+    };
     const turn = try session_runtime.makeAssistantTurn(alloc, "prompt", "done");
     defer session_runtime.freeHistoryTurn(alloc, turn);
+    _ = try journal.begin(turn.assistant.user, loaded.state.preferences.model, 1, false);
+    try std.testing.expect(loaded.hasPendingTurn());
+    try std.testing.expect(loaded.state.recovery_checkpoint == null);
+    var key = try journal.generation();
+    defer key.deinit(alloc);
+    _ = try journal.recordDecision(.{ .content = "done" }, &.{}, &.{}, key, true, null, null);
+    const result = try std.json.parseFromSlice(std.json.Value, alloc, "{\"ok\":true,\"stopReason\":\"stop\"}", .{});
+    defer result.deinit();
+    try journal.finish(result.value, turn);
+    try std.testing.expect(!loaded.hasPendingTurn());
     try Runtime(TestApp).appendHistoryTurn(&app, turn);
     try std.testing.expectError(
         error.FileNotFound,
@@ -8649,7 +8708,7 @@ test "appendHistoryTurn preserves canonical turns above the context limit" {
     for (users, assistants) |user, assistant| {
         const turn = try session_runtime.makeAssistantTurn(alloc, user, assistant);
         defer session_runtime.freeHistoryTurn(alloc, turn);
-        try acknowledgePlainTestResponse(&app, turn);
+        try acknowledgeTestHistory(&app, turn);
         try Runtime(TestApp).appendHistoryTurn(&app, turn);
     }
 
@@ -9884,7 +9943,7 @@ test "failed history delivery rejects the current writer without poisoning a fre
     try std.testing.expectEqual(@as(usize, 0), app.session.historyLen());
     Runtime(TestApp).closeWritableSession(&app);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
-    try acknowledgePlainTestResponse(&app, turn);
+    try acknowledgeTestHistory(&app, turn);
     try Runtime(TestApp).appendHistoryTurn(&app, turn);
     try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
     try std.testing.expectEqual(@as(?anyerror, error.InputOutput), app.session_persistence.shutdown_failure);
@@ -9912,7 +9971,7 @@ test "uncertain finished history preserves snapshot files and rejects later writ
     var ownership = SnapshotOwnershipProbe{};
     const turn = try session_runtime.makeAssistantTurn(alloc, "request", "answer");
     defer session_runtime.freeHistoryTurn(alloc, turn);
-    try acknowledgePlainTestResponse(&app, turn);
+    try acknowledgeTestHistory(&app, turn);
     app.session_persistence.writable.?.writer.journal.owner.writer.ops = .{ .sync_dir = Fault.sync };
     try std.testing.expectError(error.SessionPersistenceUncertain, Runtime(TestApp).appendFinishedPrompt(&app, .{
         .turn = turn,

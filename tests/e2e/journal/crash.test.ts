@@ -131,6 +131,58 @@ describe("journal witness native ask", () => {
 // No timeout races decide the crash point: the external shell publishes the
 // effect, then waits at a gate while the test kills its exact owning fx process.
 describe("journal witness native crash", () => {
+  for (const surface of ["ask", "tui"] as const) test.skipIf(surface === "tui" && !tmuxAvailable())(`${surface} continues a captured image after process death and source deletion`, async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-journal-image-")));
+    const home = join(root, "home"), workspace = join(root, "workspace");
+    mkdirSync(home); mkdirSync(workspace);
+    const bytes = readFileSync(new URL("../fixtures/favicon.png", import.meta.url));
+    const source = join(workspace, "source.png");
+    writeFileSync(source, bytes);
+    const held = heldFakeGatewayFinalText();
+    const reached = join(root, "request-started");
+    const model = "google/gemini-2.5-flash";
+    const gateway = startFakeGateway([
+      () => { writeFileSync(reached, "ready"); return held.response; },
+      fakeGatewayFinalText("SAVED_IMAGE_RECOVERED"),
+    ], { models: [{ id: model, type: "language", tags: ["vision", "file-input", "tool-use"] }] });
+    const env = { ...process.env, HOME: home, AI_GATEWAY_API_KEY: "fixture-key", VERCEL_OIDC_TOKEN: undefined,
+      FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      FX_MODEL: model, FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0" };
+    const original = Bun.spawn([FX_BIN, "ask", "--json", "--image", source, "Describe the captured image."], { cwd: workspace, env, stdout: "pipe", stderr: "pipe" });
+    const stdout = new Response(original.stdout).text(), stderr = new Response(original.stderr).text();
+    let tui: TmuxSession | undefined;
+    try {
+      await Promise.race([waitForFile(reached), original.exited.then(async code => { throw new Error(`image fixture exited: ${code}; ${await stdout}; ${await stderr}`); })]);
+      original.kill("SIGKILL"); await original.exited;
+      expect(original.signalCode).toBe("SIGKILL");
+      rmSync(source);
+      const ids = readdirSync(join(home, ".fx", "sessions"));
+      expect(ids).toHaveLength(1);
+      if (surface === "ask") {
+        const resumed = await runFx(["ask", "--json", "--resume-id", ids[0]!, "--continue-recovery"], { cwd: workspace, env });
+        expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
+        expect(resumed.stderr).toBe("");
+        expect(resumed.signal).toBe(null);
+        expect(resumed.stdout).toContain("SAVED_IMAGE_RECOVERED");
+      } else {
+        const stderrPath = join(root, "resume.stderr");
+        tui = await TmuxSession.create({ cmd: `${JSON.stringify(FX_BIN)} -c`, cwd: workspace, env, isolated: true, stderrPath });
+        await tui.waitForStableComposer();
+        expect(gateway.requests).toHaveLength(1);
+        await tui.sendText("/continue");
+        const pane = await tui.waitForPane(pane => pane.includes("SAVED_IMAGE_RECOVERED") || pane.includes("request failed:"), 15_000);
+        expect(pane).toContain("SAVED_IMAGE_RECOVERED");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      }
+      expect(gateway.requests).toHaveLength(2);
+      for (const request of gateway.requests) expect(request.body).toContain(bytes.toString("base64"));
+    } finally {
+      if (original.exitCode === null) { original.kill("SIGKILL"); await original.exited; }
+      await tui?.kill(); held.dispose(); gateway.stop(); rmSync(root, { recursive: true, force: true });
+    }
+  }, 35_000);
+
   test("active compaction survives process death before the next model response", async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-journal-compaction-")));
     const home = join(root, "home"), workspace = join(root, "workspace");
