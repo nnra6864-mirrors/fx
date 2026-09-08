@@ -2222,6 +2222,26 @@ test "streamed double backtick span and entities render as plain characters" {
     try expectGridNotContains(&h, "&amp;");
 }
 
+test "streamed control character entity cannot erase transcript cells" {
+    var h = try Harness.init(std.testing.allocator, 40, 40, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(h.alloc);
+    var formatted: std.ArrayList(u8) = .empty;
+    defer formatted.deinit(h.alloc);
+    try processor.push(h.alloc, "keep x&#27;[2Ky and &#x9b;2J end\n", &formatted);
+    try processor.flush(h.alloc, &formatted);
+
+    _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, formatted.items);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    const row = try findRowContaining(&h, "keep x");
+    try expectRowTrimmedEquals(&h, row, "  keep x&#27;[2Ky and &#x9b;2J end");
+}
+
 test "streamed inline code color survives shrink and grow" {
     const cases = [_]struct { light: bool, fg: u8 }{
         .{ .light = false, .fg = 245 },

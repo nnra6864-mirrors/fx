@@ -533,11 +533,15 @@ const DecodedEntity = struct {
 };
 
 /// Decodes the HTML entities models commonly emit plus numeric references.
+const max_entity_name_len = 8;
+
 fn decodeEntity(text: []const u8, start: usize) ?DecodedEntity {
     if (start >= text.len or text[start] != '&') return null;
-    const semicolon = std.mem.indexOfScalarPos(u8, text, start + 1, ';') orelse return null;
+    // Bound the terminator search so a line full of ampersands stays linear.
+    const window_end = @min(text.len, start + 1 + max_entity_name_len + 1);
+    const semicolon = std.mem.indexOfScalarPos(u8, text[0..window_end], start + 1, ';') orelse return null;
     const name = text[start + 1 .. semicolon];
-    if (name.len == 0 or name.len > 8) return null;
+    if (name.len == 0) return null;
 
     var codepoint: u21 = undefined;
     if (name[0] == '#') {
@@ -545,6 +549,9 @@ fn decodeEntity(text: []const u8, start: usize) ?DecodedEntity {
         const digits = if (hex) name[2..] else name[1..];
         if (digits.len == 0) return null;
         const value = std.fmt.parseInt(u21, digits, if (hex) 16 else 10) catch return null;
+        // Control characters would reach the terminal as real control bytes,
+        // so the reference stays literal instead of decoding.
+        if (value != 0 and (value < 0x20 or (value >= 0x7F and value <= 0x9F))) return null;
         codepoint = if (value == 0 or (value >= 0xD800 and value <= 0xDFFF)) 0xFFFD else value;
     } else {
         const named = [_]struct { name: []const u8, codepoint: u21 }{

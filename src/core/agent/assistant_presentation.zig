@@ -1575,6 +1575,38 @@ test "code span closes only on a backtick run of the same length" {
     );
 }
 
+test "numeric entities for control characters stay literal" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "x&#27;[2Ky &#x1b;[31m &#7; &#127;&#x9b; &#0; &#x41;\n", &out);
+    try std.testing.expectEqualStrings("x&#27;[2Ky &#x1b;[31m &#7; &#127;&#x9b; \xef\xbf\xbd A\n", out.items);
+    try std.testing.expect(std.mem.indexOfScalar(u8, out.items, 0x1b) == null);
+}
+
+test "entity lookup is bounded and a long ampersand line stays linear" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    // A semicolon farther than the longest accepted name never forms an entity.
+    try processor.push(alloc, "&ampersand; &amp;\n", &out);
+    try std.testing.expectEqualStrings("&ampersand; &\n", out.items);
+
+    out.clearRetainingCapacity();
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(alloc);
+    try line.appendNTimes(alloc, '&', 64 * 1024);
+    try line.append(alloc, '\n');
+    try processor.push(alloc, line.items, &out);
+    try std.testing.expectEqualStrings(line.items, out.items);
+}
+
 test "code span content is not entity decoded but prose is" {
     const alloc = std.testing.allocator;
     var processor = MarkdownProcessor{};
