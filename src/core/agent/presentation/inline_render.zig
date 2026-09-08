@@ -20,9 +20,17 @@ pub fn writeInlineNoBold(
     while (i < text.len) {
         const c = text[i];
         if (c == '`') {
-            in_code = !in_code;
-            try stripped.append(alloc, c);
-            i += 1;
+            if (!in_code) {
+                if (codeSpanAt(text, i)) |span| {
+                    try stripped.appendSlice(alloc, text[i..span.end]);
+                    i = span.end;
+                    continue;
+                }
+            }
+            const run = backtickRunLength(text, i);
+            if (run == 1) in_code = !in_code;
+            try stripped.appendSlice(alloc, text[i .. i + run]);
+            i += run;
             continue;
         }
         if (!in_code and c == '\\' and i + 1 < text.len and tu.isEscapedPunctuationAt(text, i + 1)) {
@@ -69,6 +77,22 @@ pub fn writeInline(
         const c = text[i];
 
         if (c == '`') {
+            if (!in_code) {
+                if (codeSpanAt(text, i)) |span| {
+                    try out.appendSlice(alloc, ansi.inline_code_open);
+                    try out.appendSlice(alloc, text[span.content_start..span.content_end]);
+                    try out.appendSlice(alloc, ansi.inline_code_close);
+                    i = span.end;
+                    continue;
+                }
+            }
+            const run = backtickRunLength(text, i);
+            if (run > 1) {
+                // A longer run without a partner is literal text.
+                try out.appendSlice(alloc, text[i .. i + run]);
+                i += run;
+                continue;
+            }
             if (in_code) {
                 try out.appendSlice(alloc, ansi.inline_code_close);
                 in_code = false;
@@ -84,6 +108,14 @@ pub fn writeInline(
             try out.append(alloc, c);
             i += 1;
             continue;
+        }
+
+        if (c == '&') {
+            if (decodeEntity(text, i)) |entity| {
+                try out.appendSlice(alloc, entity.utf8[0..entity.len]);
+                i = entity.end;
+                continue;
+            }
         }
 
         if (c == '\\' and i + 1 < text.len and tu.isEscapedPunctuationAt(text, i + 1)) {
@@ -363,16 +395,181 @@ fn parseInlineBracketDestination(text: []const u8, start: usize, allow_empty_tex
     const text_end = j;
     if (!allow_empty_text and text_end == start + 1) return null;
     if (text_end + 1 >= text.len or text[text_end + 1] != '(') return null;
-    var k = text_end + 2;
-    while (k < text.len and text[k] != ')' and text[k] != '\n') : (k += 1) {}
-    if (k >= text.len or text[k] != ')') return null;
-    const url = text[text_end + 2 .. k];
-    if (!isValidLinkUrl(url)) return null;
+    const destination = parseLinkDestination(text, text_end + 2) orelse return null;
+    if (!isValidLinkUrl(destination.url)) return null;
     return .{
         .text = text[start + 1 .. text_end],
-        .url = url,
-        .end = k + 1,
+        .url = destination.url,
+        .end = destination.end,
     };
+}
+
+const LinkDestination = struct {
+    url: []const u8,
+    /// Index just past the closing `)`.
+    end: usize,
+};
+
+/// Parses `(destination "optional title")` starting just after the `(`.
+/// The destination is either `<...>` or a run without spaces whose
+/// parentheses balance; the title is validated and dropped.
+fn parseLinkDestination(text: []const u8, start: usize) ?LinkDestination {
+    var k = skipInlineSpaces(text, start);
+    if (k >= text.len) return null;
+
+    var url: []const u8 = undefined;
+    if (text[k] == '<') {
+        const close = std.mem.indexOfScalarPos(u8, text, k + 1, '>') orelse return null;
+        url = text[k + 1 .. close];
+        for (url) |byte| if (byte == '<' or byte == '\n') return null;
+        k = close + 1;
+    } else {
+        const url_start = k;
+        var depth: usize = 0;
+        while (k < text.len) : (k += 1) {
+            const byte = text[k];
+            if (byte == '\\' and k + 1 < text.len) {
+                k += 1;
+                continue;
+            }
+            if (byte <= ' ' or byte == 0x7f) break;
+            if (byte == '(') {
+                depth += 1;
+            } else if (byte == ')') {
+                if (depth == 0) break;
+                depth -= 1;
+            }
+        }
+        if (depth != 0 or k == url_start) return null;
+        url = text[url_start..k];
+    }
+
+    const after_url = k;
+    k = skipInlineSpaces(text, k);
+    if (k > after_url and k < text.len and text[k] != ')') {
+        k = linkTitleEnd(text, k) orelse return null;
+        k = skipInlineSpaces(text, k);
+    }
+    if (k >= text.len or text[k] != ')') return null;
+    return .{ .url = url, .end = k + 1 };
+}
+
+fn skipInlineSpaces(text: []const u8, start: usize) usize {
+    var k = start;
+    while (k < text.len and (text[k] == ' ' or text[k] == '\t')) : (k += 1) {}
+    return k;
+}
+
+/// Returns the index just past a `"..."`, `'...'`, or `(...)` link title.
+fn linkTitleEnd(text: []const u8, start: usize) ?usize {
+    if (start >= text.len) return null;
+    const closer: u8 = switch (text[start]) {
+        '"' => '"',
+        '\'' => '\'',
+        '(' => ')',
+        else => return null,
+    };
+    var k = start + 1;
+    while (k < text.len) : (k += 1) {
+        if (text[k] == '\\' and k + 1 < text.len) {
+            k += 1;
+            continue;
+        }
+        if (text[k] == '\n') return null;
+        if (text[k] == closer) return k + 1;
+    }
+    return null;
+}
+
+const CodeSpan = struct {
+    content_start: usize,
+    content_end: usize,
+    /// Index just past the closing backtick run.
+    end: usize,
+};
+
+fn backtickRunLength(text: []const u8, start: usize) usize {
+    var end = start;
+    while (end < text.len and text[end] == '`') : (end += 1) {}
+    return end - start;
+}
+
+/// Finds the code span opened by the backtick run at `start`: the content
+/// ends at the next run of exactly the same length. One leading and one
+/// trailing space are stripped when both are present and the content is
+/// not all spaces.
+fn codeSpanAt(text: []const u8, start: usize) ?CodeSpan {
+    const run = backtickRunLength(text, start);
+    if (run == 0) return null;
+    var k = start + run;
+    while (k < text.len) {
+        if (text[k] != '`') {
+            k += 1;
+            continue;
+        }
+        const candidate = backtickRunLength(text, k);
+        if (candidate == run) {
+            var content_start = start + run;
+            var content_end = k;
+            const content = text[content_start..content_end];
+            if (content.len >= 2 and content[0] == ' ' and content[content.len - 1] == ' ' and
+                std.mem.trim(u8, content, " ").len > 0)
+            {
+                content_start += 1;
+                content_end -= 1;
+            }
+            return .{ .content_start = content_start, .content_end = content_end, .end = k + run };
+        }
+        k += candidate;
+    }
+    return null;
+}
+
+const DecodedEntity = struct {
+    utf8: [4]u8,
+    len: usize,
+    /// Index just past the terminating `;`.
+    end: usize,
+};
+
+/// Decodes the HTML entities models commonly emit plus numeric references.
+fn decodeEntity(text: []const u8, start: usize) ?DecodedEntity {
+    if (start >= text.len or text[start] != '&') return null;
+    const semicolon = std.mem.indexOfScalarPos(u8, text, start + 1, ';') orelse return null;
+    const name = text[start + 1 .. semicolon];
+    if (name.len == 0 or name.len > 8) return null;
+
+    var codepoint: u21 = undefined;
+    if (name[0] == '#') {
+        const hex = name.len > 1 and (name[1] == 'x' or name[1] == 'X');
+        const digits = if (hex) name[2..] else name[1..];
+        if (digits.len == 0) return null;
+        const value = std.fmt.parseInt(u21, digits, if (hex) 16 else 10) catch return null;
+        codepoint = if (value == 0 or (value >= 0xD800 and value <= 0xDFFF)) 0xFFFD else value;
+    } else {
+        const named = [_]struct { name: []const u8, codepoint: u21 }{
+            .{ .name = "amp", .codepoint = '&' },
+            .{ .name = "lt", .codepoint = '<' },
+            .{ .name = "gt", .codepoint = '>' },
+            .{ .name = "quot", .codepoint = '"' },
+            .{ .name = "apos", .codepoint = '\'' },
+            .{ .name = "nbsp", .codepoint = 0xA0 },
+            .{ .name = "copy", .codepoint = 0xA9 },
+            .{ .name = "reg", .codepoint = 0xAE },
+            .{ .name = "hellip", .codepoint = 0x2026 },
+            .{ .name = "mdash", .codepoint = 0x2014 },
+            .{ .name = "ndash", .codepoint = 0x2013 },
+            .{ .name = "larr", .codepoint = 0x2190 },
+            .{ .name = "rarr", .codepoint = 0x2192 },
+        };
+        codepoint = for (named) |entry| {
+            if (std.mem.eql(u8, entry.name, name)) break entry.codepoint;
+        } else return null;
+    }
+
+    var decoded: DecodedEntity = .{ .utf8 = undefined, .len = 0, .end = semicolon + 1 };
+    decoded.len = std.unicode.utf8Encode(codepoint, &decoded.utf8) catch return null;
+    return decoded;
 }
 
 fn parseAngleAutolink(text: []const u8, start: usize) ?InlineLink {

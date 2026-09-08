@@ -648,6 +648,61 @@ test "markdown link is blue and underlined inside its OSC 8 scope" {
     try std.testing.expectEqualStrings(expected, out.items);
 }
 
+test "markdown link destination keeps balanced parentheses" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    const id_before = link_id_counter;
+    try processor.push(alloc, "[w](https://en.wikipedia.org/wiki/Foo_(bar)) tail\n", &out);
+
+    var expected_buf: [256]u8 = undefined;
+    const expected = try std.fmt.bufPrint(
+        &expected_buf,
+        "\x1b]8;id=fx-{d};https://en.wikipedia.org/wiki/Foo_(bar)\x1b\\\x1b[4mw\x1b[24m\x1b]8;;\x1b\\ tail\n",
+        .{id_before},
+    );
+    try std.testing.expectEqualStrings(expected, out.items);
+}
+
+test "markdown link drops its title and unwraps angle destinations" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    const id_before = link_id_counter;
+    try processor.push(
+        alloc,
+        "[t](https://example.com \"Title text\") [s](https://example.com/s 'single') [a](<https://example.com/a b>)\n",
+        &out,
+    );
+
+    var expected_buf: [512]u8 = undefined;
+    const expected = try std.fmt.bufPrint(
+        &expected_buf,
+        "\x1b]8;id=fx-{d};https://example.com\x1b\\\x1b[4mt\x1b[24m\x1b]8;;\x1b\\ " ++
+            "\x1b]8;id=fx-{d};https://example.com/s\x1b\\\x1b[4ms\x1b[24m\x1b]8;;\x1b\\ " ++
+            "\x1b]8;id=fx-{d};https://example.com/a b\x1b\\\x1b[4ma\x1b[24m\x1b]8;;\x1b\\\n",
+        .{ id_before, id_before + 1, id_before + 2 },
+    );
+    try std.testing.expectEqualStrings(expected, out.items);
+}
+
+test "markdown link with unbalanced or spaced destination stays literal" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "[u](https://e.com/(x) [v](https://e.com/a b) [w](https://e.com \"open)\n", &out);
+    try std.testing.expectEqualStrings("[u](https://e.com/(x) [v](https://e.com/a b) [w](https://e.com \"open)\n", out.items);
+}
+
 test "markdown image renders its alt text with an image marker inside one OSC 8 scope" {
     const alloc = std.testing.allocator;
     var processor = MarkdownProcessor{};
@@ -1490,6 +1545,62 @@ test "table payload headers reassert outer bold after inline strong closes" {
         out.items,
         "\x1b[1mprefix \x1b[1mstrong\x1b[22m\x1b[1m suffix\x1b[22m",
     ) != null);
+}
+
+test "double backtick code span keeps inner backticks and trims one padding space" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "use `` a ` b `` and ``x`` here\n", &out);
+    try std.testing.expectEqualStrings(
+        "use \x1b[38;5;245ma ` b\x1b[39m and \x1b[38;5;245mx\x1b[39m here\n",
+        out.items,
+    );
+}
+
+test "code span closes only on a backtick run of the same length" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "`a``b` and ``` lonely **bold**\n", &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[38;5;245ma``b\x1b[39m and ``` lonely \x1b[1mbold\x1b[22m\n",
+        out.items,
+    );
+}
+
+test "code span content is not entity decoded but prose is" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "a &amp; b &lt;c&gt; &quot;d&quot; &#39;e&#39; &#x2192; `&amp;` &unknown; &amp\n", &out);
+    try std.testing.expectEqualStrings(
+        "a & b <c> \"d\" 'e' \xe2\x86\x92 \x1b[38;5;245m&amp;\x1b[39m &unknown; &amp\n",
+        out.items,
+    );
+}
+
+test "heading strips emphasis markers around a multi backtick code span" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "## Run ``**raw**`` now\n", &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[1mRun \x1b[38;5;245m**raw**\x1b[39m now\x1b[22m\n",
+        out.items,
+    );
 }
 
 test "inline code backticks wrap with ANSI" {

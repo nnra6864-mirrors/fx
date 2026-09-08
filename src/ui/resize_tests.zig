@@ -2161,6 +2161,67 @@ test "streamed H1 keeps bold underline through shrink and grow" {
     try std.testing.expect(wide_cell.style.flags.underline);
 }
 
+test "streamed link with parenthesized destination keeps the full URL" {
+    var h = try Harness.init(std.testing.allocator, 40, 40, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(h.alloc);
+    var formatted: std.ArrayList(u8) = .empty;
+    defer formatted.deinit(h.alloc);
+    try processor.push(
+        h.alloc,
+        "See [wiki](https://en.wikipedia.org/wiki/Foo_(bar) \"Foo\") tail\n",
+        &formatted,
+    );
+    try processor.flush(h.alloc, &formatted);
+
+    _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, formatted.items);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    const row = try findRowContaining(&h, "wiki");
+    try expectRowTrimmedEquals(&h, row, "  See wiki tail");
+    const link_cell = h.vt.cellAt(row, 7) orelse return error.TestMissingLinkCell;
+    try std.testing.expect(link_cell.style.flags.underline);
+    try std.testing.expectEqualStrings(
+        "https://en.wikipedia.org/wiki/Foo_(bar)",
+        h.vt.hyperlinkUrl(link_cell.style.hyperlink_id) orelse return error.TestMissingHyperlink,
+    );
+    const tail_cell = h.vt.cellAt(row, 13) orelse return error.TestMissingTailCell;
+    try std.testing.expectEqual(@as(u32, 0), tail_cell.style.hyperlink_id);
+    try std.testing.expect(!tail_cell.style.flags.underline);
+}
+
+test "streamed double backtick span and entities render as plain characters" {
+    var h = try Harness.init(std.testing.allocator, 40, 40, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(h.alloc);
+    var formatted: std.ArrayList(u8) = .empty;
+    defer formatted.deinit(h.alloc);
+    try processor.push(h.alloc, "Use ``a ` b`` for &lt;x&gt; &amp; y\n", &formatted);
+    try processor.flush(h.alloc, &formatted);
+
+    _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, formatted.items);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    const row = try findRowContaining(&h, "Use ");
+    try expectRowTrimmedEquals(&h, row, "  Use a ` b for <x> & y");
+    const code_cell = h.vt.cellAt(row, 7) orelse return error.TestMissingInlineCodeCell;
+    try std.testing.expect(code_cell.style.fg.eql(.{ .indexed = 245 }));
+    const inner_tick = h.vt.cellAt(row, 9) orelse return error.TestMissingInlineCodeCell;
+    try std.testing.expect(inner_tick.style.fg.eql(.{ .indexed = 245 }));
+    const prose_cell = h.vt.cellAt(row, 17) orelse return error.TestMissingProseCell;
+    try std.testing.expect(prose_cell.style.fg.eql(.default));
+    try expectGridNotContains(&h, "``");
+    try expectGridNotContains(&h, "&amp;");
+}
+
 test "streamed inline code color survives shrink and grow" {
     const cases = [_]struct { light: bool, fg: u8 }{
         .{ .light = false, .fg = 245 },
