@@ -2197,8 +2197,10 @@ pub fn Runtime(comptime App: type) type {
             finished: types.FinishedPrompt,
         ) !void {
             var turn = finished.turn;
-            if (finished.summary) |summary| {
-                types.setHistoryTurnSummary(&turn, summary);
+            // Rendering may extend the displayed duration after the journal
+            // has acknowledged the canonical turn summary.
+            if (finished.journal_turn == null) {
+                if (finished.summary) |summary| types.setHistoryTurnSummary(&turn, summary);
             }
             _ = try appendHistoryTurnWithPendingPresentation(
                 app,
@@ -9991,8 +9993,10 @@ test "queued journal finish validates its own turn while a later turn is running
         try configureTestPreferences(&app);
         try Runtime(TestApp).initializePersistence(&app, true);
         try Runtime(TestApp).beginFreshPersistedSession(&app);
-        const first = try session_runtime.makeAssistantTurn(alloc, "first", "saved answer");
+        var first = try session_runtime.makeAssistantTurn(alloc, "first", "saved answer");
         defer types.freeHistoryTurn(alloc, first);
+        const saved_summary: types.TurnSummary = .{ .turn_duration_ms = 10, .thinking_duration_ms = 2, .token_progress = .{} };
+        types.setHistoryTurnSummary(&first, saved_summary);
         try acknowledgeTestHistory(&app, first);
         const loaded = &app.session_persistence.writable.?;
         const reference: types.JournalTurnReference = .{
@@ -10019,11 +10023,14 @@ test "queued journal finish validates its own turn while a later turn is running
         var unfinished = reference;
         unfinished.turn_index = 1;
         try std.testing.expectError(error.JournalControlRequired, Runtime(TestApp).appendFinishedPrompt(&app, .{ .turn = first, .journal_turn = unfinished }));
-        try Runtime(TestApp).appendFinishedPrompt(&app, .{ .turn = first, .journal_turn = reference });
+        var presentation_summary = saved_summary;
+        presentation_summary.turn_duration_ms += 100;
+        try Runtime(TestApp).appendFinishedPrompt(&app, .{ .turn = first, .summary = presentation_summary, .journal_turn = reference });
         try std.testing.expectEqual(position, loaded.position);
         try std.testing.expect(loaded.hasPendingTurn());
         try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
         try std.testing.expectEqualStrings("saved answer", app.session.agent.history.items[0].assistant.assistant);
+        try std.testing.expectEqual(saved_summary, app.session.agent.history.items[0].assistant.execution.turn_summary.?);
     }
 }
 
