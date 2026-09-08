@@ -5298,6 +5298,82 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     60_000,
   );
 
+  test.skipIf(!tmuxAvailable())("reasoning replay survives automatic and manual compaction and cold resume", async () => {
+    const root = createFixtureRoot("reasoning-context-budget");
+    const tracePath = join(root.root, "trace.log");
+    const stderrPath = join(root.root, "stderr.log");
+    writeFileSync(join(root.workspace, "sentinel.txt"), "REPLAY_RESULT_SENTINEL\n");
+    let ordinary = 0;
+    let summaries = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      const request = JSON.parse(body);
+      if (request.tools.length === 0) {
+        summaries++;
+        expect(body).not.toContain("LARGE_REASONING_");
+        expect(body).not.toContain("RECENT_REASONING_SIGNATURE");
+        expect(body).toContain("REPLAY_RESULT_SENTINEL");
+        return fakeGatewayFinalText("The prior reads completed. Preserve REPLAY_RESULT_SENTINEL and continue without repeating completed reads.");
+      }
+      ordinary++;
+      if (ordinary === 6) {
+        expect(body).toContain("context_handoff");
+        expect(body).toContain("LARGE_REASONING_5");
+        expect(body).not.toContain("LARGE_REASONING_1");
+      }
+      if (ordinary <= 6) return fakeGatewaySse([
+        { type: "reasoning-start", id: `reasoning-${ordinary}` },
+        { type: "reasoning-end", id: `reasoning-${ordinary}`, providerMetadata: { openai: { reasoningEncryptedContent: `LARGE_REASONING_${ordinary}` + "a".repeat(80_000) } } },
+        { type: "tool-call", toolCallId: `read-${ordinary}`, toolName: "read_file", input: { path: "sentinel.txt" } },
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+      ]);
+      if (ordinary === 7) return fakeGatewayFinalText("REPLAY_TURN_DONE");
+      if (ordinary === 8) return fakeGatewaySse([
+        { type: "reasoning-start", id: "recent-reasoning" },
+        { type: "reasoning-end", id: "recent-reasoning", providerMetadata: { openai: { reasoningEncryptedContent: "RECENT_REASONING_SIGNATURE" } } },
+        { type: "text-delta", id: "recent-answer", delta: "RECENT_TURN_DONE" },
+        { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
+      ]);
+      expect(body).toContain("RECENT_REASONING_SIGNATURE");
+      expect(body).toContain("REPLAY_RESULT_SENTINEL");
+      expect(body).not.toContain("LARGE_REASONING_");
+      return fakeGatewayFinalText("COLD_REPLAY_DONE");
+    }, { models: [{ id: MODEL, type: "language", tags: ["tool-use", "reasoning"], context_window: 128_000, max_tokens: 8192 }] });
+    const env = { ...fixtureEnv(root, gateway, tracePath), FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_TRACE_SCOPES: "agent,session,context_compaction" };
+    let tui: TmuxSession | null = null;
+    try {
+      tui = await TmuxSession.create({ cwd: root.workspace, env, stderrPath, isolated: true });
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Read sentinel.txt six times, then finish.");
+      const automatic = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("REPLAY_TURN_DONE") || text.includes("request failed:")), 30_000);
+      expect(automatic).toContain("REPLAY_TURN_DONE");
+      expect(automatic).not.toContain("request failed:");
+      expect(summaries).toBe(1);
+      await tui.sendText("Remember the result and acknowledge this short follow-up.");
+      await tui.waitForText("RECENT_TURN_DONE", 15_000);
+      await tui.waitForComposer(15_000);
+      await tui.sendText("/compact");
+      await tui.waitForPane((text) => hasEmptyComposer(text) && summaries === 2 && (text.includes("Context compacted.") || text.includes("request failed:")), 20_000);
+      expect(readFileSync(tracePath, "utf8")).not.toContain("ContextCapacityExceeded");
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(15_000)).toBe(true);
+      tui = null;
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      const latest = await runFx(["session", "last", "--json"], { cwd: root.workspace, env });
+      expect(latest.code).toBe(0);
+      const id = JSON.parse(latest.stdout).id;
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", id, "Continue with the saved result."], { cwd: root.workspace, env, timeoutMs: 30_000 });
+      expect(resumed.code, resumed.stderr || resumed.stdout).toBe(0);
+      expect(JSON.parse(resumed.stdout).final_output).toBe("COLD_REPLAY_DONE");
+      expect(ordinary).toBe(9);
+      expect(summaries).toBe(2);
+      expect(readFileSync(join(root.workspace, "sentinel.txt"), "utf8")).toBe("REPLAY_RESULT_SENTINEL\n");
+    } finally {
+      await tui?.kill();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 100_000);
+
   for (const trigger of ["automatic", "manual"] as const) {
     test.skipIf(!tmuxAvailable())(
       `oversized result retrieval survives empty ${trigger} summary recovery and restart`,

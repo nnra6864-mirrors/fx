@@ -129,6 +129,8 @@ Run `/trace` to create a private Markdown diagnostic with logs, session context,
 
 fx automatically summarizes a long session into a fresh context window when the active model request reaches 80% of its usable input capacity, then continues the same turn. Run `/compact` to create the same durable handoff immediately and wait for your next prompt. Manual compaction refreshes the selected login when needed; Ctrl+C cancels preparation. If authentication fails, the chat stays open and unchanged so you can reconnect and retry `/compact`.
 
+Context estimates adjust to observed provider usage, including when a local estimate is too high. Compaction budgets the recent reasoning history it keeps and can retain fewer complete exchanges when needed to leave room for the summary.
+
 Compaction handoffs remain internal context for the model. Resuming a session and opening its full transcript show the conversation and tool activity, not internal summaries or operation ledgers.
 
 Saved conversations preserve original assistant replies and compatible provider continuation data. Display formatting does not rewrite saved text, and hook-driven continuation keeps earlier replies separate from the final response.

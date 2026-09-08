@@ -1144,66 +1144,77 @@ pub fn Runtime(comptime App: type) type {
                 .grants = &.{},
                 .agent_settings = app.worker.effectiveAgentTurnSettings(),
             }, .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics }, &.{}, gateway_retry_count, "", &tool_projection, null);
-            var continuation = try agent_runtime.prepareManualCompactionContinuation(
+            const base_continuation = try agent_runtime.prepareManualCompactionContinuation(
                 arena,
                 &deps,
                 config,
                 job.model,
                 capabilities,
             );
-            const window = try agent_runtime.prepareRetainedCompactionWindow(arena, job.history, null, capabilities, source_tokens, deps.agent_stream_provider, .{ .provider = job.provider, .model = job.model });
-            const continuation_messages = try arena.alloc(ChatMessage, continuation.request.messages.len + window.retained_messages.len);
-            @memcpy(continuation_messages[0..continuation.request.messages.len], continuation.request.messages);
-            @memcpy(continuation_messages[continuation.request.messages.len..], window.retained_messages);
-            continuation.request.messages = continuation_messages;
-            var compaction_count: usize = 0;
-            for (job.history) |turn| switch (turn) {
-                .compacted_summary => |summary| {
-                    compaction_count = @max(
-                        compaction_count,
-                        summary.compaction_count,
-                    );
-                },
-                else => {},
-            };
-            const transaction = agent_runtime.compactContextTransaction(arena, &deps, .{
-                .trigger = .manual,
-                .provider = job.provider,
-                .working_capabilities = capabilities,
-                .request_tokens = source_tokens,
-                .source_tokens = runtime_prompt_context.estimateCompactionSourceTokens(window.source),
-                .continuation = continuation,
-                .retained_from = window.cut,
-                .newest_exchange_tokens = window.newest_exchange_tokens,
-                .source_messages = window.source,
-                .uncertain_source_message_count = if (uncertain_history_count > 0) window.source.len else 0,
-                .result_storage = result_storage,
-                .api_key = job.api_key,
-                .credential_source = job.credential_source,
-                .account_id = job.account_id,
-                .gateway_team = job.gateway_team,
-                .session_id = app_session_runtime.Runtime(App).activeSessionId(app),
-                .retry_count = gateway_retry_count,
-                .cancel_flag = &app.worker.worker_cancel_requested,
-                .trace_ctx = .{ .turn_id = job.turn_id },
-                .removed_turn_count = window.cut.turns,
-                .compaction_count = compaction_count + 1,
-            }) catch |err| {
-                if (err == error.Cancelled and
-                    app.worker.worker_cancel_requested.load(.seq_cst))
-                {
+            var retention_target = runtime_prompt_context.recentContextTarget(capabilities, source_tokens);
+            while (true) {
+                if (app.worker.worker_cancel_requested.load(.seq_cst)) return;
+                var continuation = base_continuation;
+                const window = try agent_runtime.prepareRetainedCompactionWindow(arena, job.history, null, capabilities, source_tokens, deps.agent_stream_provider, .{ .provider = job.provider, .model = job.model }, .{ .target = retention_target });
+                const continuation_messages = try arena.alloc(ChatMessage, continuation.request.messages.len + window.retained_messages.len);
+                @memcpy(continuation_messages[0..continuation.request.messages.len], continuation.request.messages);
+                @memcpy(continuation_messages[continuation.request.messages.len..], window.retained_messages);
+                continuation.request.messages = continuation_messages;
+                const refine = window.refine_budget(arena, deps.agent_stream_provider, continuation, capabilities, source_tokens, &retention_target) catch |err| {
+                    if (err == error.Cancelled and app.worker.worker_cancel_requested.load(.seq_cst)) return;
+                    return err;
+                };
+                if (refine) continue;
+                var compaction_count: usize = 0;
+                for (job.history) |turn| switch (turn) {
+                    .compacted_summary => |summary| {
+                        compaction_count = @max(
+                            compaction_count,
+                            summary.compaction_count,
+                        );
+                    },
+                    else => {},
+                };
+                const transaction = agent_runtime.compactContextTransaction(arena, &deps, .{
+                    .trigger = .manual,
+                    .provider = job.provider,
+                    .working_capabilities = capabilities,
+                    .request_tokens = source_tokens,
+                    .source_tokens = runtime_prompt_context.estimateCompactionSourceTokens(window.source),
+                    .continuation = continuation,
+                    .retained_from = window.cut,
+                    .newest_exchange_tokens = window.newest_exchange_tokens,
+                    .source_messages = window.source,
+                    .uncertain_source_message_count = if (uncertain_history_count > 0) window.source.len else 0,
+                    .result_storage = result_storage,
+                    .api_key = job.api_key,
+                    .credential_source = job.credential_source,
+                    .account_id = job.account_id,
+                    .gateway_team = job.gateway_team,
+                    .session_id = app_session_runtime.Runtime(App).activeSessionId(app),
+                    .retry_count = gateway_retry_count,
+                    .cancel_flag = &app.worker.worker_cancel_requested,
+                    .trace_ctx = .{ .turn_id = job.turn_id },
+                    .removed_turn_count = window.cut.turns,
+                    .compaction_count = compaction_count + 1,
+                }) catch |err| {
+                    if (err == error.Cancelled and
+                        app.worker.worker_cancel_requested.load(.seq_cst))
+                    {
+                        return;
+                    }
+                    return err;
+                };
+                _ = transaction orelse {
+                    try app_worker_runtime.Runtime(App).pushSemanticNotice(app, .{
+                        .topic = "context",
+                        .tone = .neutral,
+                        .body = "No context to compact.",
+                    });
                     return;
-                }
-                return err;
-            };
-            _ = transaction orelse {
-                try app_worker_runtime.Runtime(App).pushSemanticNotice(app, .{
-                    .topic = "context",
-                    .tone = .neutral,
-                    .body = "No context to compact.",
-                });
+                };
                 return;
-            };
+            }
         }
 
         fn lifecycleContext(app: *App) agent_runtime.LifecycleContext {

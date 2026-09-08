@@ -5808,6 +5808,32 @@ pub const RetainedCompactionWindow = struct {
     retained_messages: []ChatMessage,
     cut: types.ContextHistoryCut,
     newest_exchange_tokens: usize,
+    retained_tokens: usize,
+
+    pub fn refine_budget(
+        self: RetainedCompactionWindow,
+        alloc: Allocator,
+        provider: agent_stream_provider.Provider,
+        continuation: CompactionContinuation,
+        capabilities: model_capabilities.Capabilities,
+        source_tokens: usize,
+        target: *usize,
+    ) !bool {
+        if (target.* == 0) return false;
+        const fixed_cost = try continuation.measure(alloc, provider, "");
+        const plan = runtime_prompt_context.planCompaction(.{
+            .trigger = .manual,
+            .capabilities = capabilities,
+            .request_tokens = source_tokens,
+            .source_tokens = source_tokens,
+            .protected_tokens = fixed_cost.estimated_input_tokens,
+            .newest_exchange_tokens = self.newest_exchange_tokens,
+        });
+        if (plan.accepted_handoff_tokens != null) return false;
+        target.* = if (self.retained_tokens <= self.newest_exchange_tokens) 0 else target.* / 2;
+        debug_trace.logf("context_compaction", "refine retained_tokens={d} protected_tokens={d} next_target={d}", .{ self.retained_tokens, fixed_cost.estimated_input_tokens, target.* });
+        return true;
+    }
 };
 
 pub fn prepareRetainedCompactionWindow(
@@ -5818,14 +5844,22 @@ pub fn prepareRetainedCompactionWindow(
     source_tokens: usize,
     provider: agent_stream_provider.Provider,
     provider_selection: model_provider.ProviderSelection,
+    options: struct {
+        target: ?usize = null,
+    },
 ) !RetainedCompactionWindow {
     var combined: std.ArrayList(HistoryTurn) = .empty;
     try combined.appendSlice(arena, history);
     if (active) |turn| try combined.append(arena, .{ .assistant = turn });
-    const selection = runtime_prompt_context.selectRecentContext(
+    const selection: runtime_prompt_context.RetainedContext = if (options.target != null and options.target.? == 0) .{
+        .cut = .{ .turns = session_runtime.rawHistoryTurnCount(combined.items) },
+        .newest_exchange_tokens = 0,
+        .estimated_tokens = 0,
+    } else runtime_prompt_context.selectRecentContext(
         combined.items,
-        runtime_prompt_context.recentContextTarget(capabilities, source_tokens),
+        options.target orelse runtime_prompt_context.recentContextTarget(capabilities, source_tokens),
         runtime_prompt_context.usableInputTokens(capabilities),
+        .{ .provider = provider_selection },
     );
     var cut = selection.cut;
     if (active) |turn| {
@@ -5857,6 +5891,7 @@ pub fn prepareRetainedCompactionWindow(
         .retained_messages = messages.items,
         .cut = cut,
         .newest_exchange_tokens = selection.newest_exchange_tokens,
+        .retained_tokens = selection.estimated_tokens,
     };
 }
 
@@ -5879,11 +5914,11 @@ test "retained context ends an unfinished turn at its completed exchange" {
         .execution = .{ .tool_steps = @constCast(&steps) },
     };
     const capabilities = model_capabilities.Capabilities{ .context_window = 4_000 };
-    const active = try prepareRetainedCompactionWindow(arena_state.allocator(), &.{}, turn, capabilities, 9_000, agent_stream_provider.unavailable_provider, .{ .provider = .gateway, .model = "fixture-model" });
+    const active = try prepareRetainedCompactionWindow(arena_state.allocator(), &.{}, turn, capabilities, 9_000, agent_stream_provider.unavailable_provider, .{ .provider = .gateway, .model = "fixture-model" }, .{});
     try std.testing.expectEqual(types.ContextHistoryCut{ .tool_steps = 1 }, active.cut);
     try std.testing.expectEqual(@as(usize, 3), active.source.len);
     try std.testing.expectEqual(@as(usize, 0), active.retained_messages.len);
-    const saved = try prepareRetainedCompactionWindow(arena_state.allocator(), &.{.{ .assistant = turn }}, null, capabilities, 9_000, agent_stream_provider.unavailable_provider, .{ .provider = .gateway, .model = "fixture-model" });
+    const saved = try prepareRetainedCompactionWindow(arena_state.allocator(), &.{.{ .assistant = turn }}, null, capabilities, 9_000, agent_stream_provider.unavailable_provider, .{ .provider = .gateway, .model = "fixture-model" }, .{});
     try std.testing.expectEqual(types.ContextHistoryCut{ .turns = 1 }, saved.cut);
     try std.testing.expectEqual(@as(usize, 0), saved.retained_messages.len);
 }
@@ -6823,153 +6858,169 @@ fn processQueuedPromptLoop(
                             }
                         }
                     },
-                    .compact => compact_attempt: {
-                        const uncertain_history_count = @min(
-                            @max(
-                                job.unversioned_history_count,
-                                0,
-                            ),
-                            job.history.len,
-                        );
-                        const prefix_execution = try runtime_execution_memory.buildExecutionMemory(arena, within_turn_suffix.items[compacted_suffix_len..]);
-                        const active_prefix: ?types.AssistantHistoryTurn = if (within_turn_suffix.items.len > compacted_suffix_len) .{
-                            .user = .{ .text = job.prompt, .images = job.images },
-                            .assistant = @constCast(""),
-                            .execution = prefix_execution,
-                        } else null;
-                        const window = try prepareRetainedCompactionWindow(arena, compaction_history, .{
-                            .user = .{ .text = job.prompt, .images = job.images },
-                            .assistant = @constCast(""),
-                            .execution = prefix_execution,
-                        }, request_capabilities, request_cost.estimated_input_tokens, deps.agent_stream_provider, .{ .provider = job.provider, .model = job.model });
-                        if (window.source.len == 0) {
-                            if (context_overflow_recovery == .pending or request_cost.estimated_input_tokens > (runtime_prompt_context.usableInputTokens(request_capabilities) orelse std.math.maxInt(usize))) return error.ContextCapacityExceeded;
-                            break :compact_attempt;
-                        }
-                        const raw_history_turns = session_runtime.rawHistoryTurnCount(compaction_history);
-                        const active_cut: runtime_execution_memory.CompactedExecutionBoundary = if (window.cut.turns == raw_history_turns) .{
-                            .tool_steps = window.cut.tool_steps,
-                            .steering = window.cut.steering,
-                        } else .{};
-                        const next_compacted_suffix_len = compacted_suffix_len + try runtime_execution_memory.retainedMessageOffset(within_turn_suffix.items[compacted_suffix_len..], active_cut);
-                        const result_storage: runtime_context_compaction.ResultStorage =
-                            if (config.session_child_capability) |capability|
-                                .{ .managed = capability }
-                            else if (config.tool_result_dir) |dir|
-                                .{ .legacy_dir = dir }
-                            else
-                                .unavailable;
-                        const compaction_source_message_count = window.source.len;
-                        var continuation_projection = try build_provider_prompt_with_response_language_control(
-                            overlay_arena,
-                            stable_prefix.items,
-                            ephemeral_overlay.items,
-                            &.{},
-                            current_user_effective,
-                            within_turn_suffix.items,
-                            config.origin,
-                            config.enforce_response_language,
-                            response_language_correction_attempted,
-                            "",
-                            window.retained_messages,
-                            next_compacted_suffix_len,
-                        );
-                        try appendRecoveryConversationContext(
-                            overlay_arena,
-                            &continuation_projection.messages,
-                            recovery_strategy,
-                        );
-                        var continuation_request = request_data;
-                        continuation_request.instructions = continuation_projection.instructions.items;
-                        continuation_request.messages = if (vision_policy.route == .fallback)
-                            try runtime_vision_contracts.project_text_only_messages(
+                    .compact => {
+                        var retention_target = runtime_prompt_context.recentContextTarget(request_capabilities, request_cost.estimated_input_tokens);
+                        var installed_compaction = false;
+                        compact_attempt: while (true) {
+                            const uncertain_history_count = @min(
+                                @max(
+                                    job.unversioned_history_count,
+                                    0,
+                                ),
+                                job.history.len,
+                            );
+                            const prefix_execution = try runtime_execution_memory.buildExecutionMemory(arena, within_turn_suffix.items[compacted_suffix_len..]);
+                            const active_prefix: ?types.AssistantHistoryTurn = if (within_turn_suffix.items.len > compacted_suffix_len) .{
+                                .user = .{ .text = job.prompt, .images = job.images },
+                                .assistant = @constCast(""),
+                                .execution = prefix_execution,
+                            } else null;
+                            const window = try prepareRetainedCompactionWindow(arena, compaction_history, .{
+                                .user = .{ .text = job.prompt, .images = job.images },
+                                .assistant = @constCast(""),
+                                .execution = prefix_execution,
+                            }, request_capabilities, request_cost.estimated_input_tokens, deps.agent_stream_provider, .{ .provider = job.provider, .model = gateway_model }, .{ .target = retention_target });
+                            if (window.source.len == 0) {
+                                if (context_overflow_recovery == .pending or request_cost.estimated_input_tokens > (runtime_prompt_context.usableInputTokens(request_capabilities) orelse std.math.maxInt(usize))) {
+                                    if (retention_target == 0 or request_cost.estimated_input_tokens <= (runtime_prompt_context.usableInputTokens(request_capabilities) orelse std.math.maxInt(usize))) return error.ContextCapacityExceeded;
+                                    retention_target = 0;
+                                    continue :compact_attempt;
+                                }
+                                break :compact_attempt;
+                            }
+                            const raw_history_turns = session_runtime.rawHistoryTurnCount(compaction_history);
+                            const active_cut: runtime_execution_memory.CompactedExecutionBoundary = if (window.cut.turns == raw_history_turns) .{
+                                .tool_steps = window.cut.tool_steps,
+                                .steering = window.cut.steering,
+                            } else .{};
+                            const next_compacted_suffix_len = compacted_suffix_len + try runtime_execution_memory.retainedMessageOffset(within_turn_suffix.items[compacted_suffix_len..], active_cut);
+                            const result_storage: runtime_context_compaction.ResultStorage =
+                                if (config.session_child_capability) |capability|
+                                    .{ .managed = capability }
+                                else if (config.tool_result_dir) |dir|
+                                    .{ .legacy_dir = dir }
+                                else
+                                    .unavailable;
+                            const compaction_source_message_count = window.source.len;
+                            var continuation_projection = try build_provider_prompt_with_response_language_control(
                                 overlay_arena,
-                                continuation_projection.messages.items,
-                                continuation_projection.current_user_index,
-                                job.authorized_image_catalog,
-                            )
-                        else
-                            continuation_projection.messages.items;
-                        const next_compaction_history_tail = window.retained_messages;
-                        const next_compaction_count = compaction_count + 1;
-                        const next_history = try arena.alloc(HistoryTurn, window.retained_history.len + 1);
-                        const transaction_result = compactContextTransaction(arena, deps, .{
-                            .trigger = compaction_trigger,
-                            .provider = job.provider,
-                            .working_capabilities = request_capabilities,
-                            .request_tokens = request_cost.estimated_input_tokens,
-                            .source_tokens = request_cost.estimated_input_tokens,
-                            .continuation = .{
+                                stable_prefix.items,
+                                ephemeral_overlay.items,
+                                &.{},
+                                current_user_effective,
+                                within_turn_suffix.items,
+                                config.origin,
+                                config.enforce_response_language,
+                                response_language_correction_attempted,
+                                "",
+                                window.retained_messages,
+                                next_compacted_suffix_len,
+                            );
+                            try appendRecoveryConversationContext(
+                                overlay_arena,
+                                &continuation_projection.messages,
+                                recovery_strategy,
+                            );
+                            var continuation_request = request_data;
+                            continuation_request.instructions = continuation_projection.instructions.items;
+                            continuation_request.messages = if (vision_policy.route == .fallback)
+                                try runtime_vision_contracts.project_text_only_messages(
+                                    overlay_arena,
+                                    continuation_projection.messages.items,
+                                    continuation_projection.current_user_index,
+                                    job.authorized_image_catalog,
+                                )
+                            else
+                                continuation_projection.messages.items;
+                            const continuation = CompactionContinuation{
                                 .request = continuation_request,
                                 .handoff_message_index = continuation_projection.current_user_index - window.retained_messages.len - 1,
-                            },
-                            .active_prefix = active_prefix,
-                            .retained_from = window.cut,
-                            .newest_exchange_tokens = window.newest_exchange_tokens,
-                            .source_messages = window.source,
-                            .uncertain_source_message_count = if (uncertain_history_count > 0) compaction_source_message_count else 0,
-                            .result_storage = result_storage,
-                            .api_key = active_api_key,
-                            .credential_source = job.credential_source,
-                            .account_id = job.account_id,
-                            .gateway_team = job.gateway_team,
-                            .session_id = lifecycle.scope.session_id,
-                            .retry_count = config.gateway_retry_count,
-                            .cancel_flag = config.cancel_flag,
-                            .trace_ctx = step_ctx,
-                            .removed_turn_count = window.cut.turns,
-                            .compaction_count = next_compaction_count,
-                        }) catch |err| {
-                            if (err == error.Cancelled and config.cancel_flag.load(.seq_cst)) {
-                                runtime_telemetry.traceCancelObserved(step_ctx, false);
-                                try runtime_interruption.persistInterruptedTurnOnce(
-                                    deps,
-                                    finalization,
-                                    job,
-                                    null,
-                                    null,
-                                    completed_tool_names.items,
-                                    &interrupted_persisted,
-                                    step_ctx,
-                                    within_turn_suffix.items,
-                                    stop_state.retained_candidate,
-                                    &stop_state.terminal_materializing,
-                                );
-                                finish_trace.finish("interrupted");
-                                return;
+                            };
+                            const refine = window.refine_budget(overlay_arena, deps.agent_stream_provider, continuation, request_capabilities, request_cost.estimated_input_tokens, &retention_target) catch |err| blk: {
+                                if (err == error.Cancelled and config.cancel_flag.load(.seq_cst)) break :blk false;
+                                return err;
+                            };
+                            if (refine) continue :compact_attempt;
+                            const next_compaction_history_tail = window.retained_messages;
+                            const next_compaction_count = compaction_count + 1;
+                            const next_history = try arena.alloc(HistoryTurn, window.retained_history.len + 1);
+                            const transaction_result = compactContextTransaction(arena, deps, .{
+                                .trigger = compaction_trigger,
+                                .provider = job.provider,
+                                .working_capabilities = request_capabilities,
+                                .request_tokens = request_cost.estimated_input_tokens,
+                                .source_tokens = request_cost.estimated_input_tokens,
+                                .continuation = continuation,
+                                .active_prefix = active_prefix,
+                                .retained_from = window.cut,
+                                .newest_exchange_tokens = window.newest_exchange_tokens,
+                                .source_messages = window.source,
+                                .uncertain_source_message_count = if (uncertain_history_count > 0) compaction_source_message_count else 0,
+                                .result_storage = result_storage,
+                                .api_key = active_api_key,
+                                .credential_source = job.credential_source,
+                                .account_id = job.account_id,
+                                .gateway_team = job.gateway_team,
+                                .session_id = lifecycle.scope.session_id,
+                                .retry_count = config.gateway_retry_count,
+                                .cancel_flag = config.cancel_flag,
+                                .trace_ctx = step_ctx,
+                                .removed_turn_count = window.cut.turns,
+                                .compaction_count = next_compaction_count,
+                            }) catch |err| {
+                                if (err == error.Cancelled and config.cancel_flag.load(.seq_cst)) {
+                                    runtime_telemetry.traceCancelObserved(step_ctx, false);
+                                    try runtime_interruption.persistInterruptedTurnOnce(
+                                        deps,
+                                        finalization,
+                                        job,
+                                        null,
+                                        null,
+                                        completed_tool_names.items,
+                                        &interrupted_persisted,
+                                        step_ctx,
+                                        within_turn_suffix.items,
+                                        stop_state.retained_candidate,
+                                        &stop_state.terminal_materializing,
+                                    );
+                                    finish_trace.finish("interrupted");
+                                    return;
+                                }
+                                return err;
+                            };
+                            const transaction = transaction_result orelse
+                                return error.ContextCapacityExceeded;
+                            active_compaction_handoff = transaction.compacted.handoff;
+                            active_compaction_history_tail = next_compaction_history_tail;
+                            next_history[0] = .{ .compacted_summary = .{
+                                .summary = transaction.compacted.handoff,
+                                .removed_turn_count = window.cut.turns,
+                                .compaction_count = next_compaction_count,
+                            } };
+                            @memcpy(next_history[1..], window.retained_history);
+                            compaction_history = next_history;
+                            compacted_suffix_len = next_compacted_suffix_len;
+                            finalization.compacted_execution = .{
+                                .tool_steps = finalization.compacted_execution.tool_steps + active_cut.tool_steps,
+                                .steering = finalization.compacted_execution.steering + active_cut.steering,
+                            };
+                            compaction_count = next_compaction_count;
+                            if (context_overflow_recovery == .pending) {
+                                context_overflow_recovery = .used;
                             }
-                            return err;
-                        };
-                        const transaction = transaction_result orelse
-                            return error.ContextCapacityExceeded;
-                        active_compaction_handoff = transaction.compacted.handoff;
-                        active_compaction_history_tail = next_compaction_history_tail;
-                        next_history[0] = .{ .compacted_summary = .{
-                            .summary = transaction.compacted.handoff,
-                            .removed_turn_count = window.cut.turns,
-                            .compaction_count = next_compaction_count,
-                        } };
-                        @memcpy(next_history[1..], window.retained_history);
-                        compaction_history = next_history;
-                        compacted_suffix_len = next_compacted_suffix_len;
-                        finalization.compacted_execution = .{
-                            .tool_steps = finalization.compacted_execution.tool_steps + active_cut.tool_steps,
-                            .steering = finalization.compacted_execution.steering + active_cut.steering,
-                        };
-                        compaction_count = next_compaction_count;
-                        if (context_overflow_recovery == .pending) {
-                            context_overflow_recovery = .used;
+                            debug_trace.eventf(
+                                "context_compaction",
+                                "installed",
+                                step_ctx,
+                                "request_bytes_before={d} estimated_tokens_before={d} handoff_bytes={d} accepted_tokens={d}",
+                                .{ request_cost.serialized_bytes, request_cost.estimated_input_tokens, active_compaction_handoff.?.len, transaction.accepted_tokens },
+                            );
+                            request_token_calibration = null;
+                            skip_next_preflight_refresh = true;
+                            installed_compaction = true;
+                            break :compact_attempt;
                         }
-                        debug_trace.eventf(
-                            "context_compaction",
-                            "installed",
-                            step_ctx,
-                            "request_bytes_before={d} estimated_tokens_before={d} handoff_bytes={d} accepted_tokens={d}",
-                            .{ request_cost.serialized_bytes, request_cost.estimated_input_tokens, active_compaction_handoff.?.len, transaction.accepted_tokens },
-                        );
-                        request_token_calibration = null;
-                        skip_next_preflight_refresh = true;
-                        continue;
+                        if (installed_compaction) continue;
                     },
                 }
             }
