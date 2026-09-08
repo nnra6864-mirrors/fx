@@ -1049,6 +1049,13 @@ test "bare URL punctuation never hides emphasis that follows the URL" {
     try std.testing.expect(std.mem.startsWith(u8, out.items, "text **** \x1b]8;"));
     try std.testing.expect(std.mem.startsWith(u8, tu.nthLine(out.items, 1).?, "text ~~~~ \x1b]8;"));
     try std.testing.expectEqualStrings("text **** here", tu.nthLine(out.items, 2).?);
+    // A run followed by whitespace cannot open even when a later closer exists.
+    out.clearRetainingCapacity();
+    try processor.push(alloc, "text **** here **bold** and ~~~~ then ~~gone~~ and *** https://example.com ***both***\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, out.items, "text **** here \x1b[1mbold\x1b[22m and ~~~~ then \x1b[9mgone\x1b[29m and *** \x1b]8;"));
+    try std.testing.expect(std.mem.endsWith(u8, out.items, " \x1b[1m\x1b[3mboth\x1b[22m\x1b[23m\n"));
+    out.clearRetainingCapacity();
+    try processor.push(alloc, "text **** https://example.com\ntext ~~~~ https://example.com\ntext **** here\n***both*** https://example.com\n", &out);
     try std.testing.expect(std.mem.startsWith(u8, tu.nthLine(out.items, 3).?, "\x1b[1m\x1b[3mboth\x1b[22m\x1b[23m \x1b]8;"));
 
     // After an active style ends the URL early, the rest of the line is

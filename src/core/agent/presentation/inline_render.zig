@@ -190,7 +190,12 @@ pub fn writeInline(
                 try out.appendSlice(alloc, ansi.strike_close);
                 in_strike = false;
             } else {
-                if (i + 2 >= text.len or tu.isSpace(text[i + 2]) or !closers.hasCloser(text, .tilde2, i + 2, styles, link_admission_suppressed_until)) {
+                if (unopenableRunEnd(text, i, '~')) |end| {
+                    try out.appendSlice(alloc, text[i..end]);
+                    i = end;
+                    continue;
+                }
+                if (!closers.hasCloser(text, .tilde2, i + 2, styles, link_admission_suppressed_until)) {
                     try out.append(alloc, c);
                     i += 1;
                     continue;
@@ -213,7 +218,12 @@ pub fn writeInline(
                 in_bold = false;
                 if (in_underscore_bold) try out.appendSlice(alloc, ansi.bold_open);
             } else {
-                if (i + 2 >= text.len or tu.isSpace(text[i + 2]) or !closers.hasCloser(text, .star2, i + 2, styles, link_admission_suppressed_until)) {
+                if (unopenableRunEnd(text, i, '*')) |end| {
+                    try out.appendSlice(alloc, text[i..end]);
+                    i = end;
+                    continue;
+                }
+                if (!closers.hasCloser(text, .star2, i + 2, styles, link_admission_suppressed_until)) {
                     try out.append(alloc, c);
                     i += 1;
                     continue;
@@ -282,7 +292,12 @@ pub fn writeInline(
                 in_italic = false;
                 if (in_underscore_italic) try out.appendSlice(alloc, ansi.italic_open);
             } else {
-                if (i + 1 >= text.len or tu.isSpace(text[i + 1]) or !closers.hasCloser(text, .star1, i + 1, styles, link_admission_suppressed_until)) {
+                if (unopenableRunEnd(text, i, '*')) |end| {
+                    try out.appendSlice(alloc, text[i..end]);
+                    i = end;
+                    continue;
+                }
+                if (!closers.hasCloser(text, .star1, i + 1, styles, link_admission_suppressed_until)) {
                     try out.append(alloc, c);
                     i += 1;
                     continue;
@@ -303,6 +318,16 @@ pub fn writeInline(
     if (in_underscore_bold) try out.appendSlice(alloc, ansi.bold_close);
     if (in_underscore_italic) try out.appendSlice(alloc, ansi.italic_close);
     if (in_strike) try out.appendSlice(alloc, ansi.strike_close);
+}
+
+/// End of the marker run at `i` when that run cannot open a span because it
+/// is followed by whitespace or the end of the line, so the whole run is
+/// literal; null when the run is followed by content.
+fn unopenableRunEnd(text: []const u8, i: usize, marker: u8) ?usize {
+    var end = i;
+    while (end < text.len and text[end] == marker) : (end += 1) {}
+    if (end >= text.len or tu.isSpace(text[end])) return end;
+    return null;
 }
 
 /// Emphasis styles active in the inline renderer at one position. Bare URL
