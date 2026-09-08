@@ -36,6 +36,20 @@ const checkpoint = (seq, entries) => entry(seq, "checkpoint", { lastIncludedSeq:
 const rejected = (fn) => assert.throws(fn, JournalConflict);
 
 {
+  const stopped = { ok: true, stopReason: "tool_limit" };
+  const prefix = [start(), step(2, [call("first"), call("second")])];
+  rejected(() => createProjection([start(), end(2, stopped)]));
+  rejected(() => createProjection([...prefix, end(3, stopped)]));
+  rejected(() => createProjection([...prefix, result(3, "first"), end(4, stopped)]));
+  const entries = [...prefix, result(3, "first", true), result(4, "second"), end(5, stopped)];
+  const projection = createProjection(entries);
+  assert.equal(projection.transcript().messages[1].status, "complete");
+  assert.deepEqual(readCheckpoint(checkpoint(6, entries).bytes), projection.transcript());
+  const request = entry(5, "model_step", { phase: "request", turnId: "turn-1", messageId: "next", generationId: "next-generation", supersedesGenerationId: null, executionContext: {} });
+  rejected(() => createProjection([...entries.slice(0, 4), request, end(6, stopped)]));
+}
+
+{
   const entries = [start(), step(2, [call("first")]), result(3, "first")];
   const p = createProjection(entries);
   const compact = (seq, count) => entry(seq, "model_step", {

@@ -1902,6 +1902,20 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     if (ctx.presenter) |value| try value.finish();
 
     var result = try takePromptRunResult(&ctx, alloc);
+    errdefer result.deinit(alloc);
+    if (journal) |*runtime| {
+        if (runtime.resuming and result.exit_code == 0 and result.recovery == null and runtime.state.pending() == .idle) {
+            if (try runtime.latestContext()) |context| {
+                var metadata = try journal_runtime.parseRecoveryMetadata(alloc, context);
+                defer metadata.deinit(alloc);
+                result.recovery = .{
+                    .kind = .auto_recovered,
+                    .succeeded_attempt = metadata.consumed_provider_attempts,
+                    .attempt_limit = metadata.max_provider_attempts,
+                };
+            }
+        }
+    }
     finalizeFreshAuthSession(&ctx, &result);
     return result;
 }

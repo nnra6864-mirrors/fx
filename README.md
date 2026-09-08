@@ -109,6 +109,8 @@ Repeated continuation reuses validated summaries of unchanged older sessions ins
 
 Saved CLI and interactive sessions use an execution journal. Eligible completed older sessions convert under the exclusive session lock before accepting a new turn. Conversion preserves their history, settings, permissions, and required artifacts, and archives the original files. Older executables reject the converted format. Legacy sessions with pending work or conflicting recovery data remain inspectable; conversion refuses to guess whether that work completed.
 
+Journaled tool groups run sequentially so each result is durable before the next tool starts.
+
 Reopening an unfinished journal session leaves it paused. Use `/continue`, or `fx ask --resume-id <id> --continue-recovery`, to continue the recorded turn. A saved final answer can finish without another model request. A selected tool whose outcome is unconfirmed remains blocked instead of running again.
 
 Automatic compaction within an active turn is journaled before continuing; recovery preserves the compacted model context and full saved transcript. Planned restart/upgrade handoff and native ACP/subagent integration remain incomplete in this branch.

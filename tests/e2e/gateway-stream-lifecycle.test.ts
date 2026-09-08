@@ -1,5 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, test } from "bun:test";
 import { decodeNativeJournal } from "./journal/storage";
+import { createProjection } from "../../sdk/transcript.js";
 import { createServer, type Socket } from "node:net";
 import {
   chmodSync,
@@ -19,6 +20,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { ensureLegacyFixtureBinary, runLegacyFx } from "./legacy-session-fixture";
 import {
   AMBIGUOUS_CAPABILITY_CLAUSES,
   AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
@@ -651,6 +653,7 @@ async function waitForMcpServerReady(
 }
 
 describe("gateway stream lifecycle", () => {
+  beforeAll(ensureLegacyFixtureBinary, 600_000);
   test("skill context keeps complete scoped resources visible through saved tool results", async () => {
     const root = createFixtureRoot("complete-skill-resources");
     writeLargeSkillCatalog(root.workspace, 48);
@@ -698,10 +701,11 @@ describe("gateway stream lifecycle", () => {
           expect(toolResultOutput(body, "whole_reference")).toContain("REFERENCE_RESOURCE_TAIL");
           return fakeGatewayFinalText("Complete resources restored.");
         case 4:
-          expect(toolResultOutput(body, "whole_main")).toContain("unavailable");
-          expect(toolResultOutput(body, "whole_main")).not.toContain('complete="true"');
+          // The journal retains complete inline output even after its sidecar is removed.
+          expect(toolResultOutput(body, "whole_main")).toContain("MAIN_RESOURCE_TAIL");
+          expect(toolResultOutput(body, "whole_main")).toContain('complete="true"');
           expect(toolResultOutput(body, "whole_reference")).toContain("REFERENCE_RESOURCE_TAIL");
-          return fakeGatewayFinalText("Missing saved resource reported.");
+          return fakeGatewayFinalText("Saved resource retained.");
         default:
           return new Response("unexpected request", { status: 500 });
       }
@@ -3209,7 +3213,7 @@ describe("gateway stream lifecycle", () => {
       const replies = [fakeGatewayFinalText("Seed reply."), fakeGatewayFinalText("Resumed reply.")];
       const gateway = startGateway(() => replies.shift() ?? new Response("unexpected request", { status: 500 }));
       try {
-        const seeded = await runFx(["ask", "--json", "--auto", "Seed a conversation."], {
+        const seeded = await runLegacyFx(["ask", "--json", "--auto", "Seed a conversation."], {
           cwd: root.workspace,
           env: fixtureEnv(root, gateway, join(root.root, "seed.log")),
           timeoutMs: 15_000,
@@ -3426,10 +3430,10 @@ describe("gateway stream lifecycle", () => {
             expect(result.final_output).toBe("The notes were read.");
             expect(result.tool_calls.filter((call) => call.name === "read_file")).toEqual([{ name: "read_file", status: "success" }]);
             expect(gateway.requestCount()).toBe(2);
-            const eventsPath = join(root.home, ".fx", "sessions", result.session_id, "events.jsonl");
-            const originalEvents = readFileSync(eventsPath, "utf8");
-            expect(originalEvents).toContain("removed_call");
-            if (metadata) expect(originalEvents).toContain("removed-signature");
+            const eventsPath = join(root.home, ".fx", "sessions", result.session_id, "execution.journal");
+            const originalEvents = readFileSync(eventsPath);
+            expect(originalEvents.toString("utf8")).toContain("removed_call");
+            if (metadata) expect(originalEvents.toString("utf8")).toContain("removed-signature");
             const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "Confirm the saved result without running tools."], {
               cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
             });
@@ -3437,7 +3441,7 @@ describe("gateway stream lifecycle", () => {
             expect(resumed.stderr).toBe("");
             expect(parseAskJson(resumed.stdout).tool_calls).toEqual([]);
             expect(gateway.requestCount()).toBe(3);
-            expect(readFileSync(eventsPath, "utf8").startsWith(originalEvents)).toBe(true);
+            expect(readFileSync(eventsPath).subarray(0, originalEvents.length)).toEqual(originalEvents);
             for (const request of gateway.requests.slice(1)) {
               const prompt = gatewayRequest(request.body).prompt;
               const callIndex = prompt.findIndex((message) => Array.isArray(message.content) && message.content.some((part) => part.type === "tool-call" && part.toolCallId === "retained_call"));
@@ -3485,8 +3489,8 @@ describe("gateway stream lifecycle", () => {
       });
       expect(first.code).toBe(0);
       const sessionId = parseAskJson(first.stdout).session_id;
-      const eventsPath = join(root.home, ".fx", "sessions", sessionId, "events.jsonl");
-      const originalEvents = readFileSync(eventsPath, "utf8");
+      const eventsPath = join(root.home, ".fx", "sessions", sessionId, "execution.journal");
+      const originalEvents = readFileSync(eventsPath);
       const second = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Exercise the second fixture."], {
         cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
       });
@@ -3500,7 +3504,7 @@ describe("gateway stream lifecycle", () => {
       expect(resumed.stderr).toBe("");
       expect(parseAskJson(resumed.stdout).tool_calls).toEqual([]);
       expect(gateway.requestCount()).toBe(5);
-      expect(readFileSync(eventsPath, "utf8").startsWith(originalEvents)).toBe(true);
+      expect(readFileSync(eventsPath).subarray(0, originalEvents.length)).toEqual(originalEvents);
       for (const request of gateway.requests.slice(3)) {
         const parts = gatewayRequest(request.body).prompt.flatMap((message) => Array.isArray(message.content) ? message.content : []);
         const calls = parts.filter((part) => part.type === "tool-call" && part.toolCallId === "reused");
@@ -3563,7 +3567,7 @@ describe("gateway stream lifecycle", () => {
         ".fx",
         "sessions",
         firstJson.session_id,
-        "events.jsonl",
+        "execution.journal",
       );
 
       expect(first.code).toBe(0);
@@ -3573,11 +3577,14 @@ describe("gateway stream lifecycle", () => {
       expect(existsSync(sideEffectPath)).toBe(false);
       expect(existsSync(sessionPath)).toBe(true);
       expect(existsSync(eventsPath)).toBe(true);
-      const savedEvents = readFileSync(eventsPath, "utf8");
+      const records = decodeNativeJournal(readFileSync(eventsPath)).map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8")));
+      const savedEvents = JSON.stringify(records);
       expect(savedEvents).toContain('"arguments_json":"{}"');
       expect(savedEvents).toContain("tool_execution_failed");
-      expect(savedEvents).not.toContain(malformedArguments);
-      expect(savedEvents).not.toContain("malformed_json");
+      const selected = records.find(record => record.kind === "model_step" && record.calls?.length).calls[0];
+      expect(selected.argumentsJson).toBe("{}");
+      expect(selected.argument_integrity).toBe("malformed_json");
+      expect(JSON.stringify(records.find(record => record.kind === "turn_end").history)).not.toContain("malformed_json");
 
       const resumed = await runFx(
         [
@@ -4221,7 +4228,7 @@ describe("gateway stream lifecycle", () => {
         env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "agent,tool,permission" },
         timeoutMs: 15_000,
       });
-      expect(result.code).toBe(0);
+      expect(result.code, result.stdout + result.stderr).toBe(0);
       expect(gateway.requestCount()).toBe(2);
       expect(existsSync(marker)).toBe(false);
       const json = parseAskJson(result.stdout);
@@ -4231,6 +4238,11 @@ describe("gateway stream lifecycle", () => {
         cwd: root.workspace, env: { HOME: root.home },
       });
       expect(saved.code).toBe(0);
+      const journal = decodeNativeJournal(readFileSync(join(root.home, ".fx", "sessions", json.session_id, "execution.journal")));
+      const outcome = JSON.parse(Buffer.from(journal.at(-1)!.bytes).toString("utf8"));
+      expect(outcome.result).toMatchObject({ ok: true, stopReason: "tool_limit" });
+      const transcript = createProjection(journal).transcript();
+      expect(transcript.messages.flatMap(message => message.parts).filter(part => part.type === "tool_result")).toHaveLength(4);
       const history = JSON.parse(saved.stdout).history;
       const results = history.flatMap((turn: any) =>
         (turn.execution?.tool_steps ?? []).flatMap((step: any) => step.tool_results));
@@ -5814,9 +5826,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           });
           expect(sessionId).toBeString();
           const sessionDir = join(sessionsRoot, sessionId!);
-          const eventsPath = join(sessionDir, "events.jsonl");
-          const before = readFileSync(eventsPath, "utf8");
-          expect(before).toContain('"reason":"cancelled"');
+          const eventsPath = join(sessionDir, "execution.journal");
+          const before = readFileSync(eventsPath);
+          const prior = decodeNativeJournal(before).map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8")));
+          expect(prior.find(entry => entry.kind === "turn_end").history.terminal_reason).toBe("cancelled");
           await tui.sendText("Read the follow-up file and briefly acknowledge it. Do not rerun the child.");
           const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("CANCEL_FOLLOWUP_COMPLETE") || text.includes("request failed:")), 20000);
           expect(pane).not.toContain("request failed:");
@@ -5829,9 +5842,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           }
           expect(compactions).toBe(1);
           expect(gateway.requests).toHaveLength(5);
-          const saved = readFileSync(eventsPath, "utf8");
-          expect(saved.startsWith(before)).toBe(true);
-          expect(saved.match(/"context_checkpoint":/g)).toHaveLength(1);
+          const saved = readFileSync(eventsPath);
+          expect(saved.subarray(0, before.length)).toEqual(before);
+          const records = decodeNativeJournal(saved).map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8")));
+          expect(records.filter(entry => entry.kind === "model_step" && entry.phase === "context" && entry.summary?.kind === "compacted_summary")).toHaveLength(1);
           expect(readFileSync(join(sessionDir, "tool-results", diagnosticHandle), "utf8")).toBe("aborted by user");
           expect(await tui.captureFullScrollback()).not.toContain("IncompleteCompactionResult");
           await tui.sendText("/quit");
@@ -5843,10 +5857,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           await tui.sendText("Continue without repeating cancelled work.");
           await tui.waitForPane((text) => hasEmptyComposer(text) && text.includes("CANCEL_RESTART_COMPLETE"), 15000);
           expect(gateway.requests).toHaveLength(6);
-          const events = readFileSync(eventsPath, "utf8").trim().split("\n").map((line) => JSON.parse(line).event);
-          expect(events.filter((event) => event.tool_call?.call_id === "cancelled-history-child")).toHaveLength(1);
-          expect(events.filter((event) => event.tool_call?.call_id === "cancel-follow-up-read")).toHaveLength(1);
-          expect(events.some((event) => event.assistant?.text === "CANCEL_RESTART_COMPLETE")).toBe(true);
+          const events = decodeNativeJournal(readFileSync(eventsPath)).map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8")));
+          const calls = events.filter(entry => entry.kind === "model_step" && entry.calls).flatMap(entry => entry.calls);
+          expect(calls.filter(call => call.providerId === "cancelled-history-child")).toHaveLength(1);
+          expect(calls.filter(call => call.providerId === "cancel-follow-up-read")).toHaveLength(1);
+          expect(events.some(entry => entry.kind === "turn_end" && entry.history?.assistant === "CANCEL_RESTART_COMPLETE")).toBe(true);
           await tui.sendText("/quit");
           await tui.waitForPane(() => paneExitMatches(tui!.paneStatus(), 0), 15000);
           expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -7057,11 +7072,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.code).toBe(0);
       expect(failureObserved).toBe(true);
       expect(parseAskJson(result.stdout).output).toContain("SUBAGENT_FAILURE_REPORTED");
-      const events = readFileSync(join(root.home, ".fx", "sessions", parseAskJson(result.stdout).session_id, "events.jsonl"), "utf8")
-        .trim().split("\n").map((line) => JSON.parse(line));
-      const persisted = events.find((entry) => entry.event.tool_result?.call_id === "delegate")?.event.tool_result;
+      const events = decodeNativeJournal(readFileSync(join(root.home, ".fx", "sessions", parseAskJson(result.stdout).session_id, "execution.journal")))
+        .map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8")));
+      const persisted = events.find(entry => entry.kind === "tool_result" && entry.persisted.tool_call_id === "delegate")?.persisted;
       expect(persisted?.status).toBe("failure");
-      expect(persisted?.preview).toContain("agent_turn_failed: SessionCommitFailed");
+      expect(persisted?.output).toContain("agent_turn_failed: SessionCommitFailed");
       expect(scripted.requestCount()).toBe(6);
       expect(result.stderr).not.toContain("panic");
     } finally {
@@ -7266,7 +7281,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 15_000);
 
-  test("sibling subagents start before either terminal result is awaited", async () => {
+  for (const journaled of [true, false]) test(`sibling subagents preserve execution ordering with journal=${journaled}`, async () => {
     const root = createFixtureRoot("subagent-sibling-start-order");
     const tracePath = join(root.root, "trace.log");
     const firstTask = "Reply exactly SIBLING_FIRST_DONE.";
@@ -7295,6 +7310,14 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         return heldFirst;
       }
       if (childRequest && promptText(body).includes(secondTask)) {
+        if (journaled) {
+          const sessions = join(root.home, ".fx", "sessions");
+          const id = readdirSync(sessions).find(id => existsSync(join(sessions, id, "execution.journal")) && !existsSync(join(sessions, id, "subagent", "owner.json")))!;
+          const entries = decodeNativeJournal(readFileSync(join(sessions, id, "execution.journal")));
+          const last = entries.at(-1)!;
+          expect(last.kind).toBe("tool_result");
+          expect(JSON.parse(Buffer.from(last.bytes).toString("utf8")).persisted.tool_call_id).toBe("sibling_first");
+        }
         started.add("second");
         return heldSecond;
       }
@@ -7321,7 +7344,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
     });
 
-    const run = runFx(
+    const run = (journaled ? runFx : runLegacyFx)(
       ["ask", "--json", "--auto", "Delegate both independent sibling tasks."],
       {
         cwd: root.workspace,
@@ -7331,10 +7354,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     );
     let orderingError: Error | undefined;
     try {
+      if (journaled) {
+        const firstDeadline = Date.now() + 3_000;
+        while (!started.has("first") && Date.now() < firstDeadline) await Bun.sleep(10);
+        if (started.size !== 1 || !started.has("first")) orderingError = new Error(`expected only the first journaled child before release, observed=${JSON.stringify([...started])}`);
+        releaseFirst(fakeGatewayFinalText("SIBLING_FIRST_DONE"));
+      }
       const deadline = Date.now() + 3_000;
       while (started.size < 2 && Date.now() < deadline) await Bun.sleep(10);
       if (started.size !== 2) {
-        orderingError = new Error(
+        orderingError ??= new Error(
           `expected both sibling requests before release, observed=${JSON.stringify([...started])}`,
         );
       }

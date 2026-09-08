@@ -201,6 +201,15 @@ pub const State = struct {
             .{ .model = turn_index };
     }
 
+    /// Internal tool-loop guards may stop successfully after the entire selected
+    /// group settles. A new request or context change invalidates that boundary.
+    pub fn canFinishToolLoop(self: *const State, turn_index: usize) bool {
+        const position = self.pending();
+        if (position != .model or position.model != turn_index or self.records.items.len == 0) return false;
+        return self.records.items[self.records.items.len - 1].entry.kind == .tool_result and
+            self.requestForCurrentStep(turn_index) == null;
+    }
+
     /// Provider-owned tools can arrive with their results and the final answer
     /// in one response. Only the last acknowledged result can close that path;
     /// a later reservation or context record means execution has moved on.
@@ -396,8 +405,10 @@ pub const State = struct {
                 const result = try object(body, "result");
                 const ok = try boolean(result, "ok");
                 if (ok) {
-                    if (position != .ending and (position != .model or !self.canFinishProviderResponse(turn_index))) return error.InvalidJournalTransition;
-                    _ = try string(result, "stopReason");
+                    const stop_reason = try string(result, "stopReason");
+                    const tool_limit = std.mem.eql(u8, stop_reason, "tool_limit") and self.canFinishToolLoop(turn_index);
+                    if (position != .ending and !tool_limit and
+                        (position != .model or !self.canFinishProviderResponse(turn_index))) return error.InvalidJournalTransition;
                 } else {
                     _ = try string(result, "reason");
                     _ = try boolean(result, "retryable");
@@ -677,6 +688,40 @@ const test_decision = "{\"v\":1,\"kind\":\"model_step\",\"turnId\":\"turn\",\"me
 const test_result_a = "{\"v\":1,\"kind\":\"tool_result\",\"turnId\":\"turn\",\"callId\":\"a\",\"content\":\"original receipt\",\"isError\":false}";
 const test_final = "{\"v\":1,\"kind\":\"model_step\",\"turnId\":\"turn\",\"messageId\":\"final-message\",\"generationId\":\"final-generation\",\"final\":true,\"completion\":{\"content\":\"saved answer\"},\"calls\":[]}";
 const test_end = "{\"v\":1,\"kind\":\"turn_end\",\"turnId\":\"turn\",\"result\":{\"ok\":true,\"stopReason\":\"stop\"}}";
+
+test "journal witness tool loop termination requires every result and no later request" {
+    const alloc = std.testing.allocator;
+    const stopped = "{\"v\":1,\"kind\":\"turn_end\",\"turnId\":\"turn\",\"result\":{\"ok\":true,\"stopReason\":\"tool_limit\"}}";
+    const result_b = "{\"v\":1,\"kind\":\"tool_result\",\"turnId\":\"turn\",\"callId\":\"b\",\"content\":\"stored failure\",\"isError\":true}";
+    for ([_]bool{ false, true }) |new_request| {
+        var state: State = .{};
+        defer state.deinit(alloc);
+        var store: TestStore = .{};
+        defer store.deinit();
+        try testStart(&state, &store);
+        try std.testing.expectError(error.InvalidJournalTransition, state.append(alloc, store.sink(), .turn_end, stopped));
+        try state.append(alloc, store.sink(), .model_step, test_decision);
+        try std.testing.expectError(error.InvalidJournalTransition, state.append(alloc, store.sink(), .turn_end, stopped));
+        try state.append(alloc, store.sink(), .tool_result, test_result_a);
+        try std.testing.expectError(error.InvalidJournalTransition, state.append(alloc, store.sink(), .turn_end, stopped));
+        try state.append(alloc, store.sink(), .tool_result, result_b);
+        try std.testing.expect(state.canFinishToolLoop(0));
+        if (new_request) {
+            try state.append(alloc, store.sink(), .model_step, "{\"v\":1,\"kind\":\"model_step\",\"phase\":\"request\",\"turnId\":\"turn\",\"messageId\":\"next\",\"generationId\":\"next\",\"supersedesGenerationId\":null,\"executionContext\":{}}");
+            try std.testing.expect(!state.canFinishToolLoop(0));
+            try std.testing.expectError(error.InvalidJournalTransition, state.append(alloc, store.sink(), .turn_end, stopped));
+        } else {
+            try state.append(alloc, store.sink(), .turn_end, stopped);
+            var checkpoint = try state.checkpoint(alloc, store.sink());
+            defer checkpoint.deinit(alloc);
+            var restored: State = .{};
+            defer restored.deinit(alloc);
+            try store.restore(&restored);
+            try std.testing.expect(restored.pending() == .idle);
+            try std.testing.expectEqualStrings("tool_limit", try string(try object(restored.outcome(0).?, "result"), "stopReason"));
+        }
+    }
+}
 
 test "execution journal preserves pending calls and ordered result progress" {
     const alloc = std.testing.allocator;

@@ -295,7 +295,8 @@ function applyBody(state, body, changed) {
       boolean(result.ok, "turn result ok");
       const firstUnresolved = pendingCall(state);
       if (result.ok) {
-        requireValue((state.pending.final || state.pending.providerTerminal) && !firstUnresolved, "Successful turn end requires a final model response");
+        const toolLimit = result.stopReason === "tool_limit" && state.records.at(-1)?.kind === "tool_result" && !state.pending.reservation;
+        requireValue((state.pending.final || state.pending.providerTerminal || toolLimit) && !firstUnresolved, "Successful turn end requires a final response or settled tool limit");
         requireValue(stopReasons.has(result.stopReason), "Invalid turn stop reason");
         requireValue(result.pendingTool == null, "Successful turn cannot have a pending tool");
       } else {

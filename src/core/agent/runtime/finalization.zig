@@ -197,7 +197,12 @@ fn finishJournal(journal: *@import("journal_runtime.zig").Runtime, outcome: type
         }
         try std.json.Stringify.value(.{
             .ok = true,
-            .stopReason = if (disposition == .length_limited) "length" else "stop",
+            .stopReason = if (journal.state.canFinishToolLoop(journal.turn.?) and !journal.state.canFinishProviderResponse(journal.turn.?))
+                "tool_limit"
+            else if (disposition == .length_limited)
+                "length"
+            else
+                "stop",
             .usage = usage,
         }, .{}, &writer.writer);
     } else {
