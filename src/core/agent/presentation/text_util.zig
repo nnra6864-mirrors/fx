@@ -98,19 +98,6 @@ pub fn isValidUnderscoreClose(text: []const u8, index: usize, marker_len: usize)
     return after >= text.len or !isAsciiWordByte(text[after]);
 }
 
-pub fn findUnderscoreCloser(text: []const u8, start: usize, marker_len: usize) ?usize {
-    var i = start;
-    var in_code = false;
-    while (i < text.len) : (i += 1) {
-        if (text[i] == '`') {
-            in_code = !in_code;
-            continue;
-        }
-        if (!in_code and isValidUnderscoreClose(text, i, marker_len)) return i;
-    }
-    return null;
-}
-
 pub fn nthLine(buf: []const u8, n: usize) ?[]const u8 {
     var idx: usize = 0;
     var start: usize = 0;

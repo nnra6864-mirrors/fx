@@ -35,7 +35,7 @@ pub fn writeInlineNoBold(
             continue;
         }
         if (c == '_' and tu.isValidUnderscoreOpen(text, i, 2)) {
-            if (tu.findUnderscoreCloser(text, i + 2, 2)) |closer| {
+            if (findUnderscoreCloser(text, i + 2, 2)) |closer| {
                 try stripped.appendSlice(alloc, text[i + 2 .. closer]);
                 i = closer + 2;
                 continue;
@@ -67,6 +67,7 @@ pub fn writeInline(
     var in_underscore_italic: bool = false;
     var in_strike: bool = false;
     var link_admission_suppressed_until: usize = 0;
+    const closers = CloserIndex.build(text);
 
     while (i < text.len) {
         const c = text[i];
@@ -182,7 +183,7 @@ pub fn writeInline(
                 try out.appendSlice(alloc, ansi.strike_close);
                 in_strike = false;
             } else {
-                if (i + 2 >= text.len or tu.isSpace(text[i + 2]) or !hasRunCloser(text, i + 2, '~', 2)) {
+                if (i + 2 >= text.len or tu.isSpace(text[i + 2]) or !closers.hasAtOrAfter(.tilde2, i + 2)) {
                     try out.append(alloc, c);
                     i += 1;
                     continue;
@@ -205,7 +206,7 @@ pub fn writeInline(
                 in_bold = false;
                 if (in_underscore_bold) try out.appendSlice(alloc, ansi.bold_open);
             } else {
-                if (i + 2 >= text.len or tu.isSpace(text[i + 2]) or !hasRunCloser(text, i + 2, '*', 2)) {
+                if (i + 2 >= text.len or tu.isSpace(text[i + 2]) or !closers.hasAtOrAfter(.star2, i + 2)) {
                     try out.append(alloc, c);
                     i += 1;
                     continue;
@@ -228,7 +229,7 @@ pub fn writeInline(
                 in_underscore_bold = false;
                 if (in_bold) try out.appendSlice(alloc, ansi.bold_open);
             } else {
-                if (!tu.isValidUnderscoreOpen(text, i, 2) or tu.findUnderscoreCloser(text, i + 2, 2) == null) {
+                if (!tu.isValidUnderscoreOpen(text, i, 2) or !closers.hasAtOrAfter(.under2, i + 2)) {
                     try out.append(alloc, c);
                     i += 1;
                     continue;
@@ -251,7 +252,7 @@ pub fn writeInline(
                 in_underscore_italic = false;
                 if (in_italic) try out.appendSlice(alloc, ansi.italic_open);
             } else {
-                if (!tu.isValidUnderscoreOpen(text, i, 1) or tu.findUnderscoreCloser(text, i + 1, 1) == null) {
+                if (!tu.isValidUnderscoreOpen(text, i, 1) or !closers.hasAtOrAfter(.under1, i + 1)) {
                     try out.append(alloc, c);
                     i += 1;
                     continue;
@@ -274,7 +275,7 @@ pub fn writeInline(
                 in_italic = false;
                 if (in_underscore_italic) try out.appendSlice(alloc, ansi.italic_open);
             } else {
-                if (i + 1 >= text.len or tu.isSpace(text[i + 1]) or !hasRunCloser(text, i + 1, '*', 1)) {
+                if (i + 1 >= text.len or tu.isSpace(text[i + 1]) or !closers.hasAtOrAfter(.star1, i + 1)) {
                     try out.append(alloc, c);
                     i += 1;
                     continue;
@@ -297,34 +298,79 @@ pub fn writeInline(
     if (in_strike) try out.appendSlice(alloc, ansi.strike_close);
 }
 
-/// True when a run of at least `run` `marker` bytes preceded by a non-space
-/// appears at or after `start` outside code spans and escapes.
-fn hasRunCloser(text: []const u8, start: usize, marker: u8, run: usize) bool {
+/// Skips a backslash escape or a backtick run at `i` the same way the inline
+/// walk does, so lookahead and rendering agree on what is literal.
+fn skipEscapeOrCode(text: []const u8, i: usize) ?usize {
+    const c = text[i];
+    if (c == '\\' and i + 1 < text.len) return i + 2;
+    if (c == '`') return if (codeSpanAt(text, i)) |span| span.end else i + backtickRunLength(text, i);
+    return null;
+}
+
+/// Last position of a valid closing run for each emphasis delimiter, built in
+/// one pass per line so every opener check is constant time. An opener at `i`
+/// has a closer when the last valid closer sits at or after the opener's end.
+const CloserIndex = struct {
+    const Kind = enum { star1, star2, tilde2, under1, under2 };
+
+    last: [5]?usize = .{ null, null, null, null, null },
+
+    fn build(text: []const u8) CloserIndex {
+        var index: CloserIndex = .{};
+        var i: usize = 0;
+        while (i < text.len) {
+            if (skipEscapeOrCode(text, i)) |next| {
+                i = next;
+                continue;
+            }
+            const c = text[i];
+            if (c == '*' or c == '~') {
+                var end = i;
+                while (end < text.len and text[end] == c) : (end += 1) {}
+                if (i > 0 and !tu.isSpace(text[i - 1])) {
+                    const run = end - i;
+                    if (c == '*') {
+                        index.set(.star1, i);
+                        if (run >= 2) index.set(.star2, i);
+                    } else if (run >= 2) {
+                        index.set(.tilde2, i);
+                    }
+                }
+                i = end;
+                continue;
+            }
+            if (c == '_') {
+                if (tu.isValidUnderscoreClose(text, i, 1)) index.set(.under1, i);
+                if (tu.isValidUnderscoreClose(text, i, 2)) index.set(.under2, i);
+            }
+            i += 1;
+        }
+        return index;
+    }
+
+    fn set(self: *CloserIndex, kind: Kind, pos: usize) void {
+        self.last[@intFromEnum(kind)] = pos;
+    }
+
+    fn hasAtOrAfter(self: CloserIndex, kind: Kind, start: usize) bool {
+        const pos = self.last[@intFromEnum(kind)] orelse return false;
+        return pos >= start;
+    }
+};
+
+/// First valid underscore closer at or after `start`, skipping code spans by
+/// their real run length so ``a`b`` does not desynchronize the search.
+fn findUnderscoreCloser(text: []const u8, start: usize, marker_len: usize) ?usize {
     var i = start;
     while (i < text.len) {
-        const c = text[i];
-        if (c == '\\' and i + 1 < text.len) {
-            i += 2;
+        if (skipEscapeOrCode(text, i)) |next| {
+            i = next;
             continue;
         }
-        if (c == '`') {
-            if (codeSpanAt(text, i)) |span| {
-                i = span.end;
-            } else {
-                i += backtickRunLength(text, i);
-            }
-            continue;
-        }
-        if (c == marker) {
-            var end = i;
-            while (end < text.len and text[end] == marker) : (end += 1) {}
-            if (end - i >= run and i > 0 and !tu.isSpace(text[i - 1])) return true;
-            i = end;
-            continue;
-        }
+        if (tu.isValidUnderscoreClose(text, i, marker_len)) return i;
         i += 1;
     }
-    return false;
+    return null;
 }
 
 const ParsedFootnoteReference = struct {

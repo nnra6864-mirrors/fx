@@ -3273,6 +3273,43 @@ test "unmatched asterisk and tilde openers stay literal while matched spans stil
     );
 }
 
+test "underscore emphasis survives a multi backtick code span" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "See _a ``b`c`` d_ end\n__x ``y`z`` w__ *p ``q`r`` s* \\_not_\n", &out);
+    try std.testing.expectEqualStrings(
+        "See \x1b[3ma \x1b[38;5;245mb`c\x1b[39m d\x1b[23m end\n" ++
+            "\x1b[1mx \x1b[38;5;245my`z\x1b[39m w\x1b[22m \x1b[3mp \x1b[38;5;245mq`r\x1b[39m s\x1b[23m _not_\n",
+        out.items,
+    );
+}
+
+test "long line of unmatched openers renders in linear time" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(alloc);
+    for (0..40_000) |_| try line.appendSlice(alloc, "*a _b ~~c ");
+    try line.append(alloc, '\n');
+
+    const io_mod = @import("../shared/io.zig");
+    const started = io_mod.nanoTimestamp();
+    try processor.push(alloc, line.items, &out);
+    const elapsed_ms = @divTrunc(io_mod.nanoTimestamp() - started, std.time.ns_per_ms);
+
+    try std.testing.expectEqualStrings(line.items, out.items);
+    // The quadratic lookahead took hundreds of milliseconds for this input.
+    try std.testing.expect(elapsed_ms < 200);
+}
+
 test "heading with unmatched strong marker keeps it literal" {
     const alloc = std.testing.allocator;
     var processor = MarkdownProcessor{};
