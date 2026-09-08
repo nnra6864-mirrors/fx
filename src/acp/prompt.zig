@@ -2181,10 +2181,20 @@ fn commitContextCompaction(
     const session = if (ctx.state.active_session) |*value| value else return error.SessionPersistenceUnavailable;
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
-    const prepared = try session_runtime.prepareCompactedHistory(ctx.alloc, session.session_rt.agent.history.items, summary, retained_from orelse .{ .turns = session_runtime.rawHistoryTurnCount(session.session_rt.agent.history.items) });
+    const cut = retained_from orelse types.ContextHistoryCut{ .turns = session_runtime.rawHistoryTurnCount(session.session_rt.agent.history.items) };
+    var model_cut = cut;
+    if (ctx.journal != null and active_prefix != null and cut.turns == session_runtime.rawHistoryTurnCount(session.session_rt.agent.history.items)) {
+        model_cut.tool_steps = 0;
+        model_cut.steering = 0;
+    }
+    const prepared = try session_runtime.prepareCompactedHistory(ctx.alloc, session.session_rt.agent.history.items, summary, model_cut);
     var prepared_owned = true;
     defer if (prepared_owned) types.freeHistoryTurnSlice(ctx.alloc, prepared);
-    if (session.writable) |*writable| {
+    if (ctx.journal) |journal| {
+        if (active_prefix) |prefix| {
+            try journal_runtime.recordActiveCompaction(ctx.alloc, journal.state, journal.sink, summary, cut, prefix);
+        } else try journal_runtime.recordCompaction(ctx.alloc, journal.state, journal.sink, summary, cut);
+    } else if (session.writable) |*writable| {
         _ = writable.commitContextCompaction(ctx.alloc, summary, active_prefix, retained_from, io_mod.milliTimestamp()) catch |err| {
             if (err == error.SessionPersistenceUncertain and active_prefix != null) {
                 if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
@@ -2195,7 +2205,7 @@ fn commitContextCompaction(
             if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
         }
     }
-    if (comptime host_target.is_wasm) {
+    if (comptime host_target.is_wasm) if (!ctx.state.host_journal) {
         if (session.wasm_state) |*base| {
             var next = try base.dupe(ctx.alloc);
             var next_owned = true;
@@ -2228,7 +2238,7 @@ fn commitContextCompaction(
                 if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
             }
         }
-    }
+    };
     session.session_rt.commitCompactedHistory(ctx.alloc, prepared);
     prepared_owned = false;
 }

@@ -60,6 +60,7 @@ const Turn = struct {
     last_request_step: usize = 0,
     last_context: ?usize = null,
     last_steering: ?usize = null,
+    last_active_compaction: ?usize = null,
     end: ?usize = null,
 };
 
@@ -145,6 +146,11 @@ pub const State = struct {
 
     pub fn latestContextRecord(self: *const State, turn: usize) ?Value {
         const index = self.turns.items[turn].last_context orelse return null;
+        return self.records.items[index].payload.value;
+    }
+
+    pub fn activeCompaction(self: *const State, turn: usize) ?Value {
+        const index = self.turns.items[turn].last_active_compaction orelse return null;
         return self.records.items[index].payload.value;
     }
 
@@ -285,12 +291,18 @@ pub const State = struct {
                             _ = try field(item, "text", .string);
                         }
                         if (!body.object.contains("prefix") or !body.object.contains("retiredDraft")) return error.InvalidJournalRecord;
-                        if (body.object.contains("summary") or body.object.contains("retainedFrom")) return error.InvalidJournalRecord;
+                        if (body.object.contains("summary") or body.object.contains("retainedFrom") or body.object.contains("activeThrough")) return error.InvalidJournalRecord;
                         if (body.object.contains("completion") or body.object.contains("calls") or body.object.contains("generationId")) return error.InvalidJournalRecord;
                         return;
                     }
                     _ = try object(body, "summary");
                     _ = try object(body, "retainedFrom");
+                    if (body.object.contains("activeThrough")) {
+                        if (pending_state != .model) return error.InvalidJournalTransition;
+                        _ = try object(body, "activeThrough");
+                        const after = (try field(body, "afterStepCount", .integer)).integer;
+                        if (after < 0 or @as(u64, @intCast(after)) != self.stepCount(pending_state.model)) return error.JournalConflict;
+                    } else if (body.object.contains("afterStepCount")) return error.InvalidJournalRecord;
                     if (body.object.contains("completion") or body.object.contains("calls") or body.object.contains("generationId")) return error.InvalidJournalRecord;
                     return;
                 }
@@ -397,6 +409,7 @@ pub const State = struct {
             .model_step => {
                 if (isContext(owned.payload.value)) {
                     if (isSteering(owned.payload.value) catch unreachable) self.turns.items[self.turns.items.len - 1].last_steering = index;
+                    if (owned.payload.value.object.contains("activeThrough")) self.turns.items[position.model].last_active_compaction = index;
                 } else {
                     const turn = &self.turns.items[position.model];
                     turn.last_context = index;

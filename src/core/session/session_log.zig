@@ -2810,15 +2810,14 @@ pub const LoadedWritableSession = struct {
     ) !CommitPosition {
         try self.requireWritable();
         if (self.writer == .journal) {
-            if (active_prefix != null) return error.JournalActiveCompactionRequired;
             const runtime = @import("../agent/runtime/journal_runtime.zig");
             const execution = &self.writer.journal.execution;
             const current = try runtime.restoreHistory(alloc, execution);
             defer session.freeHistoryTurnSlice(alloc, current);
             const cut = retained_from orelse types.ContextHistoryCut{ .turns = session.rawHistoryTurnCount(current) };
-            const prepared = try session.prepareCompactedHistory(alloc, current, summary, cut);
-            defer session.freeHistoryTurnSlice(alloc, prepared);
-            try runtime.recordCompaction(alloc, execution, self.journalSink().?, summary, cut);
+            if (active_prefix) |prefix| {
+                try runtime.recordActiveCompaction(alloc, execution, self.journalSink().?, summary, cut, prefix);
+            } else try runtime.recordCompaction(alloc, execution, self.journalSink().?, summary, cut);
             self.state.updated_at_ms = timestamp_ms;
             self.freshly_started = false;
             return self.position;

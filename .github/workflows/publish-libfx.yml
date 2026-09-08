@@ -317,6 +317,8 @@ jobs:
           node --experimental-wasm-jspi sdk/tests/test-node-async-assets.mjs sdk/dist/libfx
           node --experimental-wasm-jspi sdk/tests/test-journal-large-result.mjs sdk/dist/libfx esm
           node --experimental-wasm-jspi --no-experimental-require-module sdk/tests/test-journal-large-result.mjs sdk/dist/libfx cjs
+          node --experimental-wasm-jspi sdk/tests/test-journal-compaction.mjs native wasm sdk/dist/libfx esm
+          node --experimental-wasm-jspi --no-experimental-require-module sdk/tests/test-journal-compaction.mjs wasm native sdk/dist/libfx cjs
           node sdk/tests/test-packed-example.mjs libfx-package.tgz native esm
           node --no-experimental-require-module sdk/tests/test-packed-example.mjs libfx-package.tgz native cjs
           node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs libfx-package.tgz wasm esm

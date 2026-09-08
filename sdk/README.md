@@ -160,6 +160,9 @@ interrupted response prefix before another model request. The transcript
 projection handles these records and identifies drafts retired by steering;
 compacting model context does not replace the saved conversation.
 
+Automatic compaction records the retained model context before continuing. A
+recreated owner restores that boundary and keeps the complete saved tool history.
+
 Tool permission feedback projects as user messages with stable call-scoped IDs.
 
 Journal prompts require a nonempty caller `requestId`. Retrying a completed ID

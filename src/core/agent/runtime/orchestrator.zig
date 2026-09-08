@@ -5667,7 +5667,7 @@ fn buildProviderPromptForCompactionWindow(
         ephemeral_overlay,
         durable_history,
         current_user_message,
-        within_turn_suffix,
+        within_turn_suffix[@min(compacted_suffix_len, within_turn_suffix.len)..],
     );
     var compacted_history: std.ArrayList(ChatMessage) = .empty;
     defer compacted_history.deinit(alloc);
@@ -6198,6 +6198,12 @@ fn processQueuedPromptLoop(
     var active_compaction_history_tail: []const ChatMessage = &.{};
     var compaction_history = job.history;
     var compacted_suffix_len: usize = 0;
+    if (deps.journal) |journal| {
+        if (journal.resuming) {
+            finalization.compacted_execution = try journal.compactionBoundary();
+            compacted_suffix_len = try runtime_execution_memory.retainedMessageOffset(within_turn_suffix.items, finalization.compacted_execution);
+        }
+    }
     var compaction_count = latestCompactionCount(job.history);
     var request_token_calibration: ?struct {
         model: []const u8,

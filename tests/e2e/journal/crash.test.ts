@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { FX_BIN, runFx } from "../../evals/eval-helpers";
 import { createProjection } from "../../../sdk/transcript.js";
 import { decodeNativeJournal } from "./storage";
-import { FAKE_GATEWAY_MODEL, fakeGatewayFinalText, fakeShellRun, startFakeGateway, TmuxSession, tmuxAvailable } from "../tmux-helpers";
+import { FAKE_GATEWAY_MODEL, fakeGatewayFinalText, fakeGatewaySse, fakeShellRun, heldFakeGatewayFinalText, startDynamicFakeGateway, startFakeGateway, TmuxSession, tmuxAvailable } from "../tmux-helpers";
 
 async function waitForFile(path: string) {
   const deadline = Date.now() + 15_000;
@@ -131,6 +131,64 @@ describe("journal witness native ask", () => {
 // No timeout races decide the crash point: the external shell publishes the
 // effect, then waits at a gate while the test kills its exact owning fx process.
 describe("journal witness native crash", () => {
+  test("active compaction survives process death before the next model response", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-journal-compaction-")));
+    const home = join(root, "home"), workspace = join(root, "workspace");
+    mkdirSync(home); mkdirSync(workspace);
+    writeFileSync(join(workspace, "sentinel.txt"), "COMPACTION_RESULT_SENTINEL\n");
+    const held = heldFakeGatewayFinalText();
+    let ordinary = 0, summaries = 0;
+    const reached = join(root, "compacted-request");
+    const gateway = startDynamicFakeGateway(body => {
+      if (JSON.parse(body).tools.length === 0) {
+        summaries++;
+        return fakeGatewayFinalText("Completed earlier reads. Preserve COMPACTION_RESULT_SENTINEL without repeating them.");
+      }
+      ordinary++;
+      if (ordinary <= 5) return fakeGatewaySse([
+        { type: "reasoning-start", id: `reasoning-${ordinary}` },
+        { type: "reasoning-end", id: `reasoning-${ordinary}`, providerMetadata: { openai: { reasoningEncryptedContent: `COMPACTION_REASONING_${ordinary}` + "a".repeat(80_000) } } },
+        { type: "tool-call", toolCallId: `saved-read-${ordinary}`, toolName: "read_file", input: { path: "sentinel.txt" } },
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+      ]);
+      expect(body).toContain("context_handoff");
+      expect(body).toContain("COMPACTION_REASONING_5");
+      expect(body).not.toContain("COMPACTION_REASONING_1");
+      if (ordinary === 6) { writeFileSync(reached, "ready"); return held.response; }
+      return fakeGatewayFinalText("COMPACTION_RECOVERED_ONCE");
+    }, { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use", "reasoning"], context_window: 128_000, max_tokens: 8192 }] });
+    const env = { ...process.env, HOME: home, AI_GATEWAY_API_KEY: "fixture-key", VERCEL_OIDC_TOKEN: undefined,
+      FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      FX_MODEL: FAKE_GATEWAY_MODEL, FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0" };
+    const original = Bun.spawn([FX_BIN, "ask", "--json", "--auto", "Read sentinel.txt five times, then finish."], { cwd: workspace, env, stdout: "pipe", stderr: "pipe" });
+    const stdout = new Response(original.stdout).text(), stderr = new Response(original.stderr).text();
+    try {
+      await Promise.race([waitForFile(reached), original.exited.then(async code => {
+        throw new Error(`exited before compaction cut: ${code}; ${await stdout}; ${await stderr}`);
+      })]);
+      const ids = readdirSync(join(home, ".fx", "sessions"));
+      expect(ids).toHaveLength(1);
+      original.kill("SIGKILL"); await original.exited;
+      expect(original.signalCode).toBe("SIGKILL");
+      const journalPath = join(home, ".fx", "sessions", ids[0]!, "execution.journal");
+      const before = decodeNativeJournal(readFileSync(journalPath));
+      expect(before.filter(entry => entry.kind === "tool_result")).toHaveLength(5);
+      expect(before.some(entry => JSON.parse(Buffer.from(entry.bytes).toString()).activeThrough?.tool_steps > 0)).toBe(true);
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", ids[0]!, "--continue-recovery"], { cwd: workspace, env, timeoutMs: 30_000 });
+      expect(resumed, JSON.stringify(resumed)).toMatchObject({ code: 0, stderr: "", signal: null });
+      expect(resumed.stdout).toContain("COMPACTION_RECOVERED_ONCE");
+      expect(ordinary).toBe(7); expect(summaries).toBe(1);
+      expect(decodeNativeJournal(readFileSync(journalPath)).filter(entry => entry.kind === "tool_result")).toHaveLength(5);
+      const detail = await runFx(["session", "--id", ids[0]!, "--json"], { cwd: workspace, env });
+      expect(detail.code).toBe(0);
+      expect(JSON.parse(detail.stdout).history.filter((turn: { kind: string }) => turn.kind === "assistant").at(-1).execution.tool_steps).toHaveLength(5);
+    } finally {
+      if (original.exitCode === null) { original.kill("SIGKILL"); await original.exited; }
+      held.dispose(); gateway.stop(); rmSync(root, { recursive: true, force: true });
+    }
+  }, 45_000);
+
   for (const surface of ["ask", "tui"] as const) {
   test.skipIf(surface === "tui" && !tmuxAvailable())(`${surface} preserves the selected call after effect but before result`, async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-journal-native-")));

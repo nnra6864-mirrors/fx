@@ -1427,7 +1427,7 @@ export async function createFxAgent(options = {}) {
       durableCalls = [];
       durableMessageId = null;
       pendingTurn = { turnId: body.turnId, requestId: body.requestId, lastSeq: entry.seq, awaiting: "model" };
-    } else if (entry.kind === "model_step") {
+    } else if (entry.kind === "model_step" && body.phase !== "context") {
       durableMessageId = body.messageId;
       durableCalls = body.phase === "request" ? [] : body.calls.map((call) => ({
         callId: call.callId, name: call.name, input: parseToolInput(call.argumentsJson), replay: call.replay,

@@ -167,7 +167,7 @@ function applyBody(state, body, changed) {
           requireValue(state.pending && !pendingCall(state), "Steering requires a settled execution boundary");
           requireValue(body.afterStepCount === state.pending.stepCount, "Steering has the wrong model boundary");
           requireValue(Array.isArray(body.guidance) && body.guidance.length > 0 && body.guidance.length <= 16384, "Invalid steering messages");
-          requireValue(!("summary" in body) && !("retainedFrom" in body), "Steering cannot replace model history");
+          requireValue(!("summary" in body) && !("retainedFrom" in body) && !("activeThrough" in body), "Steering cannot replace model history");
           const reservation = state.pending.reservation;
           const expectedDraft = reservation ? { turnId: body.turnId, messageId: reservation.messageId, generationId: reservation.generationId } : null;
           requireValue(equal(body.retiredDraft, expectedDraft), "Steering retires an unrelated draft");
@@ -195,6 +195,17 @@ function applyBody(state, body, changed) {
         const cut = object(body.retainedFrom, "context boundary");
         requireValue(Object.keys(cut).length === 3, "Invalid context boundary");
         for (const name of ["turns", "tool_steps", "steering"]) legacyInteger(cut[name], name);
+        if (body.activeThrough !== undefined) {
+          requireValue(state.pending && body.afterStepCount === state.pending.stepCount, "Active compaction has the wrong model boundary");
+          const through = object(body.activeThrough, "active compaction boundary");
+          requireValue(Object.keys(through).length === 2, "Invalid active compaction boundary");
+          legacyInteger(through.tool_steps, "active tool steps");
+          legacyInteger(through.steering, "active steering");
+          const prior = state.pending.activeThrough ?? { tool_steps: 0, steering: 0 };
+          requireValue(through.tool_steps >= prior.tool_steps && through.steering >= prior.steering &&
+            through.tool_steps <= state.pending.stepCount && through.steering <= state.pending.steeringCount, "Invalid active compaction boundary");
+          state.pending.activeThrough = through;
+        } else requireValue(body.afterStepCount === undefined, "Missing active compaction boundary");
         break;
       }
       validateTurn(state, body);

@@ -36,6 +36,26 @@ const checkpoint = (seq, entries) => entry(seq, "checkpoint", { lastIncludedSeq:
 const rejected = (fn) => assert.throws(fn, JournalConflict);
 
 {
+  const entries = [start(), step(2, [call("first")]), result(3, "first")];
+  const p = createProjection(entries);
+  const compact = (seq, count) => entry(seq, "model_step", {
+    phase: "context", turnId: "turn-1", afterTurnCount: 1, afterStepCount: 1,
+    summary: { kind: "compacted_summary", summary: "Saved first result", removed_turn_count: 0, compaction_count: 1 },
+    retainedFrom: { turns: 0, tool_steps: 1, steering: 0 },
+    activeThrough: { tool_steps: count, steering: 0 },
+  });
+  const before = p.transcript();
+  entries.push(compact(4, 1));
+  assert.deepEqual(p.apply(entries.at(-1)).delta, { messages: [] });
+  assert.deepEqual(p.transcript(), before);
+  rejected(() => p.preview(compact(5, 0)));
+  rejected(() => p.preview(compact(5, 2)));
+  for (const next of [step(5), end(6)]) { entries.push(next); p.apply(next); }
+  assert.deepEqual(createProjection([checkpoint(7, entries)]).transcript(), p.transcript());
+  assert.equal(p.transcript().messages[1].parts.filter(part => part.type === "tool_result").length, 1);
+}
+
+{
   const feedback = entry(3, "tool_result", {
     ...decodeEntry(result(3, "first")).body,
     persisted: { permission_feedback: ["Keep the existing file", "Run the second command"] },

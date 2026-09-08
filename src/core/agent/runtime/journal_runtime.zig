@@ -566,6 +566,10 @@ pub const Runtime = struct {
         return self.executionThrough(alloc, count, false);
     }
 
+    pub fn compactionBoundary(self: *const Runtime) !execution_memory.CompactedExecutionBoundary {
+        return activeBoundary(self.state, self.turn orelse return error.InvalidJournalTransition);
+    }
+
     fn executionThrough(self: *const Runtime, alloc: Allocator, count: usize, allow_partial: bool) !OwnedExecution {
         return readExecutionThrough(alloc, self.state, self.turn orelse return error.InvalidJournalTransition, count, allow_partial);
     }
@@ -586,8 +590,16 @@ pub const Runtime = struct {
         var arena: std.heap.ArenaAllocator = .init(self.alloc);
         defer arena.deinit();
         const alloc = arena.allocator();
-        const owned_history = (try pendingHistory(self.alloc, self.state)).?;
+        var owned_history = (try pendingHistory(self.alloc, self.state)).?;
         errdefer types.freeHistoryTurn(self.alloc, owned_history);
+        const boundary = try self.compactionBoundary();
+        if (boundary.tool_steps != 0 or boundary.steering != 0) {
+            var projected = owned_history;
+            projected.interrupted.execution = try boundary.project(alloc, owned_history.interrupted.execution);
+            const replacement = try types.dupeHistoryTurn(self.alloc, projected);
+            types.freeHistoryTurn(self.alloc, owned_history);
+            owned_history = replacement;
+        }
         var pending_tool = try pendingTool(self.alloc, self.state);
         defer if (pending_tool) |*owned| owned.deinit();
         var writer: std.Io.Writer.Allocating = .init(alloc);
@@ -905,6 +917,28 @@ pub fn recordCompaction(
     summary: types.CompactedSummaryHistoryTurn,
     retained_from: types.ContextHistoryCut,
 ) !void {
+    return recordCompactionImpl(alloc, state, sink, summary, retained_from, null);
+}
+
+pub fn recordActiveCompaction(
+    alloc: Allocator,
+    state: *journal.State,
+    sink: journal.Sink,
+    summary: types.CompactedSummaryHistoryTurn,
+    retained_from: types.ContextHistoryCut,
+    active: types.AssistantHistoryTurn,
+) !void {
+    return recordCompactionImpl(alloc, state, sink, summary, retained_from, active);
+}
+
+fn recordCompactionImpl(
+    alloc: Allocator,
+    state: *journal.State,
+    sink: journal.Sink,
+    summary: types.CompactedSummaryHistoryTurn,
+    retained_from: types.ContextHistoryCut,
+    active: ?types.AssistantHistoryTurn,
+) !void {
     try state.ensureAvailable();
     const turn_id = switch (state.pending()) {
         .idle => null,
@@ -919,9 +953,94 @@ pub fn recordCompaction(
     try session_codec.writeHistoryTurn(&writer.writer, .{ .compacted_summary = summary });
     try writer.writer.writeAll(",\"retainedFrom\":");
     try json(&writer.writer, retained_from);
+    if (active) |prefix| {
+        if (state.pending() != .model) return error.InvalidJournalTransition;
+        const turn = state.pending().model;
+        var input: std.Io.Writer.Allocating = .init(alloc);
+        defer input.deinit();
+        try session_codec.writeUserTurn(&input.writer, prefix.user);
+        if (!std.mem.eql(u8, try journal.string(state.start(turn), "inputJson"), input.written())) return error.JournalConflict;
+        const history = try restoreHistory(alloc, state);
+        defer types.freeHistoryTurnSlice(alloc, history);
+        var boundary = try activeBoundary(state, turn);
+        if (retained_from.turns == session.rawHistoryTurnCount(history)) {
+            if (retained_from.tool_steps > prefix.execution.tool_steps.len or retained_from.steering > prefix.execution.steering.len) return error.InvalidJournalRecord;
+            boundary.tool_steps = try std.math.add(usize, boundary.tool_steps, retained_from.tool_steps);
+            boundary.steering = try std.math.add(usize, boundary.steering, retained_from.steering);
+        }
+        try writer.writer.print(",\"afterStepCount\":{d},\"activeThrough\":", .{state.stepCount(turn)});
+        try json(&writer.writer, boundary);
+    }
     try writer.writer.writeByte('}');
-    try state.preflight(.{ .append_bytes = writer.written().len, .append_records = 1, .terminal_bytes = max_model_record_bytes });
+    const parsed = try std.json.parseFromSlice(Value, alloc, writer.written(), .{});
+    defer parsed.deinit();
+    try validateIncoming(alloc, state, parsed.value);
+    const terminal_bytes = if (state.pending() == .model) reserve: {
+        const runtime: Runtime = .{
+            .state = state,
+            .sink = sink,
+            .alloc = alloc,
+            .namespace = "",
+            .creation_id = "",
+            .request_id = "",
+            .turn = state.pending().model,
+        };
+        break :reserve @max(max_model_record_bytes, try runtime.terminalBytes());
+    } else max_model_record_bytes;
+    try state.preflight(.{ .append_bytes = writer.written().len, .append_records = 1, .terminal_bytes = terminal_bytes });
     try state.append(alloc, sink, .model_step, writer.written());
+}
+
+fn activeBoundary(state: *const journal.State, turn: usize) !execution_memory.CompactedExecutionBoundary {
+    return if (state.activeCompaction(turn)) |body| try parseActiveBoundary(body) else .{};
+}
+
+fn parseActiveBoundary(body: Value) !execution_memory.CompactedExecutionBoundary {
+    const value = try journal.object(body, "activeThrough");
+    if (value.object.count() != 2) return error.InvalidJournalRecord;
+    var boundary: execution_memory.CompactedExecutionBoundary = .{};
+    inline for (.{ "tool_steps", "steering" }) |name| {
+        const number = (try journal.field(value, name, .integer)).integer;
+        @field(boundary, name) = std.math.cast(usize, number) orelse return error.InvalidJournalRecord;
+    }
+    return boundary;
+}
+
+fn normalizedExecution(alloc: Allocator, state: *const journal.State, turn: usize) !OwnedExecution {
+    var full = try readExecutionThrough(alloc, state, turn, state.stepCount(turn), true);
+    errdefer full.deinit();
+    const a = full.arena.allocator();
+    var messages: std.ArrayList(types.ChatMessage) = .empty;
+    try full.appendPromptMessages(a, &messages);
+    full.execution = try execution_memory.buildExecutionMemory(a, messages.items);
+    return full;
+}
+
+fn restoreCompactedArchivePrefix(alloc: Allocator, state: *const journal.State, index: usize, turn: *types.HistoryTurn) !void {
+    const boundary = try activeBoundary(state, index);
+    if (boundary.tool_steps == 0 and boundary.steering == 0) return;
+    const target = switch (turn.*) {
+        .assistant => |*value| &value.execution,
+        .interrupted => |*value| &value.execution,
+        .compacted_summary => return error.InvalidJournalRecord,
+    };
+    var full = try normalizedExecution(alloc, state, index);
+    defer full.deinit();
+    if (boundary.tool_steps > full.execution.tool_steps.len or boundary.steering > full.execution.steering.len) return error.InvalidJournalRecord;
+    const a = full.arena.allocator();
+    var combined = target.*;
+    combined.tool_steps = try a.alloc(types.ToolExecutionStep, boundary.tool_steps + target.tool_steps.len);
+    @memcpy(combined.tool_steps[0..boundary.tool_steps], full.execution.tool_steps[0..boundary.tool_steps]);
+    @memcpy(combined.tool_steps[boundary.tool_steps..], target.tool_steps);
+    combined.steering = try a.alloc(types.PersistedSteering, boundary.steering + target.steering.len);
+    @memcpy(combined.steering[0..boundary.steering], full.execution.steering[0..boundary.steering]);
+    for (target.steering, combined.steering[boundary.steering..]) |source, *dest| {
+        dest.* = source;
+        dest.after_tool_step_count = std.math.add(usize, source.after_tool_step_count, boundary.tool_steps) catch return error.InvalidJournalRecord;
+    }
+    const replacement = try types.dupeExecutionMemory(alloc, combined);
+    types.freeExecutionMemory(alloc, target.*);
+    target.* = replacement;
 }
 
 fn contextCut(body: Value) !types.ContextHistoryCut {
@@ -960,7 +1079,11 @@ fn restoreHistoryView(alloc: Allocator, state: *const journal.State, view: enum 
             var summary_owned = true;
             defer if (summary_owned) types.freeHistoryTurn(alloc, summary);
             if (summary != .compacted_summary) return error.InvalidJournalRecord;
-            const cut = try contextCut(body);
+            var cut = try contextCut(body);
+            if (body.object.contains("activeThrough") and cut.turns == session.rawHistoryTurnCount(history.items)) {
+                cut.tool_steps = 0;
+                cut.steering = 0;
+            }
             if (view == .model) {
                 const next = try session.prepareCompactedHistory(alloc, history.items, summary.compacted_summary, cut);
                 for (history.items) |turn| types.freeHistoryTurn(alloc, turn);
@@ -981,6 +1104,7 @@ fn restoreHistoryView(alloc: Allocator, state: *const journal.State, view: enum 
         var turn = try session_codec.parseHistoryTurn(alloc, value);
         errdefer types.freeHistoryTurn(alloc, turn);
         try bindOriginalPendingCall(alloc, state, index, &turn);
+        if (view == .archive) try restoreCompactedArchivePrefix(alloc, state, index, &turn);
         try history.append(alloc, turn);
     }
     return history.toOwnedSlice(alloc);
@@ -1081,7 +1205,35 @@ pub fn validateIncoming(alloc: Allocator, state: *const journal.State, body: Val
                 const summary = try session_codec.parseHistoryTurn(alloc, try journal.object(body, "summary"));
                 defer types.freeHistoryTurn(alloc, summary);
                 if (summary != .compacted_summary) return error.InvalidJournalRecord;
-                _ = try contextCut(body);
+                var cut = try contextCut(body);
+                if (body.object.contains("activeThrough")) {
+                    if (state.pending() != .model) return error.InvalidJournalTransition;
+                    const turn = state.pending().model;
+                    const after = (try journal.field(body, "afterStepCount", .integer)).integer;
+                    if (after < 0 or @as(u64, @intCast(after)) != state.stepCount(turn)) return error.JournalConflict;
+                    const boundary = try parseActiveBoundary(body);
+                    const prior = try activeBoundary(state, turn);
+                    var full = try normalizedExecution(alloc, state, turn);
+                    defer full.deinit();
+                    if (boundary.tool_steps < prior.tool_steps or boundary.steering < prior.steering or
+                        boundary.tool_steps > full.execution.tool_steps.len or boundary.steering > full.execution.steering.len) return error.InvalidJournalRecord;
+                } else if (body.object.contains("afterStepCount")) return error.InvalidJournalRecord;
+                const current = try restoreHistory(alloc, state);
+                defer types.freeHistoryTurnSlice(alloc, current);
+                if (body.object.contains("activeThrough")) {
+                    const prior = try activeBoundary(state, state.pending().model);
+                    const boundary = try parseActiveBoundary(body);
+                    const touches_active = cut.turns == session.rawHistoryTurnCount(current);
+                    const steps = std.math.add(usize, prior.tool_steps, if (touches_active) cut.tool_steps else 0) catch return error.InvalidJournalRecord;
+                    const steering = std.math.add(usize, prior.steering, if (touches_active) cut.steering else 0) catch return error.InvalidJournalRecord;
+                    if (boundary.tool_steps != steps or boundary.steering != steering) return error.JournalConflict;
+                    if (touches_active) {
+                        cut.tool_steps = 0;
+                        cut.steering = 0;
+                    }
+                }
+                const prepared = try session.prepareCompactedHistory(alloc, current, summary.compacted_summary, cut);
+                types.freeHistoryTurnSlice(alloc, prepared);
             } else if (try journal.isRequest(body)) {
                 try validateExecutionContext(alloc, try journal.object(body, "executionContext"), true, &.{});
             } else {
@@ -1265,6 +1417,128 @@ const TestSink = struct {
 };
 
 const test_input: types.UserTurn = .{ .text = @constCast("Make a durable change") };
+
+test "journal witness repeated active compaction preserves archive and restores its model boundary" {
+    const alloc = std.testing.allocator;
+    var state: journal.State = .{};
+    defer state.deinit(alloc);
+    var sink: TestSink = .{};
+    var runtime = sink.runtime(&state, "compacted-request");
+    _ = try runtime.begin(test_input, "model", 1, false);
+    for ([_][]const u8{ "first", "second" }) |id| {
+        var key = try runtime.generation();
+        defer key.deinit(alloc);
+        const step = try runtime.recordDecision(.{}, &.{.{ .id = id, .name = "read", .arguments_json = "{}" }}, &.{.safe}, key, false, null, null);
+        try runtime.recordResult(step, 0, .{
+            .tool_call_id = @constCast(id),
+            .tool_name = @constCast("read"),
+            .status = .success,
+            .output = @constCast(id),
+            .output_bytes = id.len,
+            .stored_output_bytes = id.len,
+        });
+    }
+    var full = try normalizedExecution(alloc, &state, 0);
+    defer full.deinit();
+    for (0..2) |round| {
+        const prior = try runtime.compactionBoundary();
+        const remaining = try prior.project(full.arena.allocator(), full.execution);
+        try recordActiveCompaction(alloc, &state, runtime.sink, .{
+            .summary = @constCast("<context_handoff>saved results</context_handoff>"),
+            .removed_turn_count = 0,
+            .compaction_count = round + 1,
+        }, .{ .tool_steps = 1 }, .{ .user = test_input, .assistant = @constCast(""), .execution = remaining });
+        try std.testing.expectEqual(round + 1, (try runtime.compactionBoundary()).tool_steps);
+    }
+    var restored: journal.State = .{};
+    defer restored.deinit(alloc);
+    var validator: TestValidator = .{ .alloc = alloc };
+    for (state.records.items) |record| try restoreTestEntry(&restored, &validator, record.entry);
+    var resumed = sink.runtime(&restored, "compacted-request");
+    _ = try resumed.begin(test_input, "model", 1, true);
+    var prefix = try resumed.prefixExecution(alloc);
+    defer prefix.deinit();
+    var messages: std.ArrayList(types.ChatMessage) = .empty;
+    try prefix.appendPromptMessages(prefix.arena.allocator(), &messages);
+    const boundary = try resumed.compactionBoundary();
+    try std.testing.expectEqual(messages.items.len, try execution_memory.retainedMessageOffset(messages.items, boundary));
+    const model_before = try restoreHistory(alloc, &restored);
+    defer types.freeHistoryTurnSlice(alloc, model_before);
+    try std.testing.expectEqual(@as(usize, 1), model_before.len);
+    try std.testing.expect(model_before[0] == .compacted_summary);
+    var key = try resumed.generation();
+    defer key.deinit(alloc);
+    _ = try resumed.recordDecision(.{ .content = "done" }, &.{}, &.{}, key, true, null, null);
+    const result = try std.json.parseFromSlice(Value, alloc, "{\"ok\":true,\"stopReason\":\"stop\"}", .{});
+    defer result.deinit();
+    try resumed.finish(result.value, .{ .assistant = .{ .user = test_input, .assistant = @constCast("done") } });
+    const model = try restoreHistory(alloc, &restored);
+    defer types.freeHistoryTurnSlice(alloc, model);
+    try std.testing.expectEqual(@as(usize, 0), model[model.len - 1].assistant.execution.tool_steps.len);
+    const archive = try restoreArchiveHistory(alloc, &restored);
+    defer types.freeHistoryTurnSlice(alloc, archive);
+    const steps = archive[archive.len - 1].assistant.execution.tool_steps;
+    try std.testing.expectEqual(@as(usize, 2), steps.len);
+    try std.testing.expectEqualStrings("first", steps[0].tool_results[0].output);
+    try std.testing.expectEqualStrings("second", steps[1].tool_results[0].output);
+    try validateRestoredState(alloc, &restored);
+    var checkpoint = try restored.checkpoint(alloc, resumed.sink);
+    defer checkpoint.deinit(alloc);
+    var reopened: journal.State = .{};
+    defer reopened.deinit(alloc);
+    try restoreTestEntry(&reopened, &validator, checkpoint.entry);
+    const checkpoint_archive = try restoreArchiveHistory(alloc, &reopened);
+    defer types.freeHistoryTurnSlice(alloc, checkpoint_archive);
+    try std.testing.expectEqual(@as(usize, 2), checkpoint_archive[checkpoint_archive.len - 1].assistant.execution.tool_steps.len);
+}
+
+test "journal witness failed active compaction acknowledgement preserves the original model prefix" {
+    const alloc = std.testing.allocator;
+    var state: journal.State = .{};
+    defer state.deinit(alloc);
+    var sink: TestSink = .{};
+    var runtime = sink.runtime(&state, "compacted-request");
+    _ = try runtime.begin(test_input, "model", 1, false);
+    var key = try runtime.generation();
+    defer key.deinit(alloc);
+    _ = try runtime.recordDecision(.{ .content = "before guidance" }, &.{}, &.{}, key, false, null, null);
+    try runtime.recordSteering(&.{"keep this guidance"}, null);
+    var full = try normalizedExecution(alloc, &state, 0);
+    defer full.deinit();
+    sink.fail = true;
+    try std.testing.expectError(error.PersistenceUncertain, recordActiveCompaction(alloc, &state, runtime.sink, .{
+        .summary = @constCast("<context_handoff>new summary</context_handoff>"),
+        .removed_turn_count = 0,
+        .compaction_count = 1,
+    }, .{ .steering = 1 }, .{ .user = test_input, .assistant = @constCast(""), .execution = full.execution }));
+    try std.testing.expect(state.blocked);
+    var restored: journal.State = .{};
+    defer restored.deinit(alloc);
+    var validator: TestValidator = .{ .alloc = alloc };
+    for (state.records.items) |record| try restoreTestEntry(&restored, &validator, record.entry);
+    try std.testing.expectEqual(@as(usize, 0), (try activeBoundary(&restored, 0)).steering);
+    var retained = try normalizedExecution(alloc, &restored, 0);
+    defer retained.deinit();
+    try std.testing.expectEqualStrings("keep this guidance", retained.execution.steering[0].text);
+    try std.testing.expectEqualStrings("before guidance", retained.execution.steering[0].assistant_prefix.?);
+    var next_sink: TestSink = .{ .count = @intCast(restored.last_seq) };
+    var next = next_sink.runtime(&restored, "compacted-request");
+    _ = try next.begin(test_input, "model", 1, true);
+    try recordActiveCompaction(alloc, &restored, next.sink, .{
+        .summary = @constCast("<context_handoff>saved guidance</context_handoff>"),
+        .removed_turn_count = 0,
+        .compaction_count = 1,
+    }, .{ .steering = 1 }, .{ .user = test_input, .assistant = @constCast(""), .execution = retained.execution });
+    const abandoned = (try next.abandon()).?;
+    defer types.freeHistoryTurn(alloc, abandoned);
+    try std.testing.expectEqual(@as(usize, 0), abandoned.interrupted.execution.steering.len);
+    const archive = try restoreArchiveHistory(alloc, &restored);
+    defer types.freeHistoryTurnSlice(alloc, archive);
+    const guidance = archive[archive.len - 1].interrupted.execution.steering;
+    try std.testing.expectEqual(@as(usize, 1), guidance.len);
+    try std.testing.expectEqualStrings("keep this guidance", guidance[0].text);
+    try validateRestoredState(alloc, &restored);
+}
 
 test "journal witness steering reopens a final response and preserves its position through recreation" {
     const alloc = std.testing.allocator;

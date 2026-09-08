@@ -7,6 +7,7 @@ const backend = process.argv[2] ?? "native";
 const target = process.argv[3] ?? backend;
 for (const value of [backend, target]) assert.ok(["native", "wasm"].includes(value), `Invalid backend: ${value}`);
 const cases = [
+  ["test-journal-compaction.mjs", backend, target],
   ["test-suspension.mjs", backend, target],
   ["test-suspension-boundaries.mjs", backend],
   ["test-suspension-failure.mjs", backend],
