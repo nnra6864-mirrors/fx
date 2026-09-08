@@ -1,5 +1,6 @@
 const std = @import("std");
 const worker_runtime = @import("../agent/worker_runtime.zig");
+const restart_handoff = @import("../session/restart_handoff.zig");
 const auto_classifier_context = @import("../permissions/auto_classifier_context.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -263,6 +264,7 @@ const UpgradeNotice = struct {
 };
 
 const ResumeNotice = union(enum) {
+    restart,
     session,
     upgrade: UpgradeNotice,
 };
@@ -355,9 +357,11 @@ test "resume handoff policy requires requested durable non-pristine state" {
 /// Owns `session_id`; callers must release it with `deinit`.
 pub const ResumeHandoff = struct {
     session_id: []u8,
+    upgrade_capability: ?std.Io.File = null,
 
     pub fn deinit(self: *ResumeHandoff, alloc: Allocator) void {
         alloc.free(self.session_id);
+        if (self.upgrade_capability) |file| file.close(io_mod.getIo());
         self.* = undefined;
     }
 };
@@ -1745,6 +1749,16 @@ pub fn Runtime(comptime App: type) type {
             var display = try readNativeResumeDisplay(app, loaded);
             defer display.deinit(app.alloc);
 
+            var handoff_error: ?anyerror = null;
+            const consumed = restart_handoff.consume(app.alloc, loaded, notice == .upgrade, app.workspace_root) catch |err| failed: {
+                if (err == error.SessionPersistenceUncertain) return err;
+                handoff_error = err;
+                break :failed null;
+            };
+            if (comptime @hasField(App, "upgrade_handoff")) {
+                app.upgrade_handoff.continuation = if (consumed) |handoff| handoff.continuation else null;
+            }
+
             closeWritableSession(app);
             app.session_persistence.writable = loaded.*;
             loaded_owned = false;
@@ -1754,12 +1768,18 @@ pub fn Runtime(comptime App: type) type {
                 app.session_persistence.writable = null;
             }
             const active = &app.session_persistence.writable.?;
-            try hydrateResumedSession(app, active.state, display.title, notice);
+            const resume_notice: ResumeNotice = if (consumed != null and consumed.?.reason == .restart) .restart else notice;
+            try hydrateResumedSession(app, active.state, display.title, resume_notice);
             if (comptime @hasField(App, "next_image_id")) {
                 if (active.journalState()) |records| app.next_image_id = try journal_runtime.nextImageId(app.alloc, records, app.next_image_id);
             }
             active.releaseHydrationHistory(app.alloc);
             enableSessionStores(app);
+            if (handoff_error) |err| {
+                const body = try std.fmt.allocPrint(app.alloc, "automatic continuation blocked: {s}; the saved session remains paused", .{@errorName(err)});
+                defer app.alloc.free(body);
+                try app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = body }, true);
+            }
         }
 
         fn hydrateResumedSession(
@@ -2338,6 +2358,20 @@ pub fn Runtime(comptime App: type) type {
             return app.queueRecoveryCheckpoint(&checkpoint);
         }
 
+        pub fn continuePlannedUpgrade(app: *App) !bool {
+            const expected = app.upgrade_handoff.continuation orelse return false;
+            app.upgrade_handoff.continuation = null;
+            if (!app.worker.upgradeQuiescent() or app.question_prompt.isActive() or app.approval_prompt.isActive())
+                return error.UpgradeContinuationBusy;
+            {
+                app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+                defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+                const loaded = if (app.session_persistence.writable) |*value| value else return error.SessionPersistenceUnavailable;
+                if (!std.meta.eql(expected, try restart_handoff.boundary(loaded))) return error.InvalidUpgradeHandoff;
+            }
+            return continuePausedRecovery(app);
+        }
+
         pub fn snapshotFreshPromptBoundary(app: *App, alloc: Allocator) !?session_codec.RecoveryCheckpoint {
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
@@ -2898,6 +2932,24 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn prepareResumeHandoff(app: *App) !void {
+            if (app.session_persistence.subagent_host) |host| {
+                host.managed.mutex.lockUncancelable(io_mod.getIo());
+                defer host.managed.mutex.unlock(io_mod.getIo());
+                for (host.managed.slots.items) |slot| {
+                    if (slot.completion != .published) return error.UpgradeNeedsToolIntervention;
+                }
+            }
+            if (comptime @hasField(App, "managed_executions")) {
+                const executions = try app.managed_executions.list(app.alloc);
+                defer {
+                    for (executions) |*execution| execution.deinit(app.alloc);
+                    app.alloc.free(executions);
+                }
+                for (executions) |execution| switch (execution.state) {
+                    .running, .lost => return error.UpgradeNeedsToolIntervention,
+                    .completed, .stopped => {},
+                };
+            }
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             const loaded = if (app.session_persistence.writable) |*value|
@@ -2905,6 +2957,29 @@ pub fn Runtime(comptime App: type) type {
             else
                 return error.SessionPersistenceUnavailable;
             try settleDurableState(app, loaded);
+            _ = try plannedUpgradeContinuation(app, loaded);
+        }
+
+        fn plannedUpgradeContinuation(app: *App, loaded: *session_store.LoadedWritableSession) !bool {
+            const current = try restart_handoff.boundary(loaded);
+            if (comptime @hasField(@TypeOf(app.worker), "upgrade_turn_id")) {
+                if (!app.worker.upgradeQuiescent()) return error.UpgradeCleanupPending;
+                const turn_id = app.worker.upgrade_turn_id;
+                if (turn_id != 0) {
+                    const finished = app.worker.upgrade_terminal orelse return error.UpgradeTurnNotSettled;
+                    if (finished.turn_id != turn_id) return error.UpgradeTurnNotSettled;
+                    switch (finished.outcome) {
+                        .paused => {
+                            if (current.turn_id != turn_id) return error.InvalidUpgradeHandoff;
+                            return true;
+                        },
+                        .completed => if (current.turn_id != 0) return error.InvalidUpgradeHandoff,
+                        .failed, .interrupted => return error.UpgradeTurnNotSettled,
+                    }
+                }
+            }
+            if (current.turn_id != 0) return error.UpgradeTurnNotSettled;
+            return false;
         }
 
         pub fn suspendToJobControl(app: *App, footer_rows: u16) !void {
@@ -3403,6 +3478,11 @@ pub fn Runtime(comptime App: type) type {
         ) !void {
             try setCachedSessionTitle(app, display_title);
             switch (notice) {
+                .restart => try sink.appendNotice(.{
+                    .topic = "session restarted",
+                    .tone = .neutral,
+                    .body = display_title,
+                }),
                 .session => try sink.appendNotice(.{
                     .topic = "session resumed",
                     .tone = .neutral,
@@ -3438,6 +3518,9 @@ pub fn Runtime(comptime App: type) type {
                         try writeExecutionHistoryToSink(app, sink, entry.execution);
                         if (entry.assistant) |assistant| {
                             if (assistant.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, assistant);
+                        }
+                        if (comptime @hasField(App, "upgrade_handoff")) {
+                            if (app.upgrade_handoff.continuation != null) return;
                         }
                         try sink.appendNotice(.{
                             .topic = "recovery",
@@ -4290,7 +4373,21 @@ pub fn Runtime(comptime App: type) type {
                     );
                     break :blk null;
                 };
-                break :blk .{ .session_id = session_id };
+                var capability: ?std.Io.File = null;
+                if (handoff_intent == .upgrade_requested) {
+                    const continuing = plannedUpgradeContinuation(app, loaded) catch |err| {
+                        app.alloc.free(session_id);
+                        recordShutdownFailure(app, err);
+                        break :blk null;
+                    };
+                    const reason = if (comptime @hasField(App, "upgrade_handoff")) app.upgrade_handoff.reason else .upgrade;
+                    capability = restart_handoff.publish(app.alloc, loaded, continuing, reason) catch |err| {
+                        app.alloc.free(session_id);
+                        recordShutdownFailure(app, err);
+                        break :blk null;
+                    };
+                }
+                break :blk .{ .session_id = session_id, .upgrade_capability = capability };
             } else null;
             if (comptime @hasDecl(
                 @TypeOf(app.session),
@@ -5985,6 +6082,62 @@ test "upgrade resume handoff owns a validated pristine session" {
     defer handoff.deinit(alloc);
 
     try std.testing.expectEqualStrings(expected_id, handoff.session_id);
+}
+
+test "journal handoff consumption is one use and ordinary reopen cannot continue" {
+    const alloc = std.testing.allocator;
+    for ([_]enum { planned, ordinary, stale_position, wrong_workspace, old_version }{ .planned, .ordinary, .stale_position, .wrong_workspace, .old_version }) |mode| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const paths = try testPaths(alloc, &tmp);
+        defer alloc.free(paths.home);
+        defer alloc.free(paths.workspace);
+        const home = try TestHome.install(alloc, paths.home);
+        defer home.deinit();
+        var app = try TestApp.init(alloc, paths.workspace);
+        defer app.deinit();
+        try configureTestPreferences(&app);
+        try Runtime(TestApp).initializePersistence(&app, true);
+        try Runtime(TestApp).beginFreshPersistedSession(&app);
+        const loaded = &app.session_persistence.writable.?;
+        var capability: ?std.Io.File = try restart_handoff.publish(alloc, loaded, false, .restart);
+        defer if (capability) |file| file.close(io_mod.getIo());
+        const before = loaded.position;
+        if (mode == .stale_position or mode == .old_version) {
+            var file = try io_mod.openExistingRegularFile(loaded.log.dir.dir, "upgrade-handoff.json", .read_only);
+            defer file.close(io_mod.getIo());
+            const bytes = try io_mod.readFileToEnd(alloc, &file, 16 * 1024);
+            defer alloc.free(bytes);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+            defer parsed.deinit();
+            if (mode == .old_version) {
+                parsed.value.object.getPtr("version").?.integer = 2;
+            } else {
+                parsed.value.object.getPtr("boundary").?.object.getPtr("seq").?.integer += 1;
+            }
+            const changed = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+            defer alloc.free(changed);
+            try io_mod.durableReplaceVerified(alloc, &loaded.log.dir, "upgrade-handoff.json", changed);
+        }
+        if (mode == .old_version) {
+            try std.testing.expectError(error.InvalidUpgradeHandoff, restart_handoff.consume(alloc, loaded, true, paths.workspace));
+        } else if (mode == .ordinary) {
+            try std.testing.expect(try restart_handoff.consume(alloc, loaded, false, paths.workspace) == null);
+        } else {
+            // These records authenticate the inherited descriptor, so consume
+            // takes ownership even when the later boundary check rejects them.
+            capability = null;
+            if (mode == .stale_position or mode == .wrong_workspace) {
+                try std.testing.expectError(error.InvalidUpgradeHandoff, restart_handoff.consume(alloc, loaded, true, if (mode == .wrong_workspace) "/other" else paths.workspace));
+            } else {
+                const consumed = (try restart_handoff.consume(alloc, loaded, true, paths.workspace)).?;
+                try std.testing.expectEqual(restart_handoff.Reason.restart, consumed.reason);
+                try std.testing.expect(consumed.continuation == null);
+            }
+        }
+        try std.testing.expectEqual(before, loaded.position);
+        if (mode != .old_version) try std.testing.expect(try restart_handoff.consume(alloc, loaded, true, paths.workspace) == null);
+    }
 }
 
 test "resume handoff owns the exact non-pristine session id" {

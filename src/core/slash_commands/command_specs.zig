@@ -40,6 +40,7 @@ pub const SlashKind = enum {
     reset_session,
     resume_session,
     continue_recovery,
+    restart_session,
     rename_session,
     help,
     login,

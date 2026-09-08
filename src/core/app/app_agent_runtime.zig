@@ -1079,6 +1079,9 @@ pub fn Runtime(comptime App: type) type {
             if (native_journal != null) {
                 execution_job.recovery_checkpoint = null;
                 config.journal_cancel_policy = .abandon;
+                if (comptime @hasField(@TypeOf(app.worker), "worker_suspend_requested")) {
+                    config.suspend_flag = &app.worker.worker_suspend_requested;
+                }
             }
             const process_result = agent_runtime.processAgentPrompt(&app.session.agent, &deps, semantic_presentation, lifecycleContext(app), config, execution_job);
             try process_result;

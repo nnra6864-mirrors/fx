@@ -113,7 +113,9 @@ Journaled tool groups run sequentially so each result is durable before the next
 
 Reopening an unfinished journal session leaves it paused. Use `/continue`, or `fx ask --resume-id <id> --continue-recovery`, to continue the recorded turn. A saved final answer can finish without another model request. A selected tool whose outcome is unconfirmed remains blocked instead of running again.
 
-Automatic compaction within an active turn is journaled before continuing; recovery preserves the compacted model context and full saved transcript. Native ACP uses the same journal for new sessions, loading, tool execution, and explicit recovery. Planned restart/upgrade handoff and persistent subagent journal integration remain incomplete in this branch.
+Automatic compaction within an active turn is journaled before continuing; recovery preserves the compacted model context and full saved transcript. Native ACP and persistent subagents use the same journal for new sessions, loading, tool execution, and recovery. A child result committed before its parent registry acknowledgement is recovered from that result without executing the child again.
+
+Use `/restart` to restart a saved session at a safe boundary. It lets the current response and selected tools settle, saves an exact journal handoff, then reopens that session and continues unfinished work. Ctrl+G uses the same handoff when an installed upgrade is ready. An active approval, question, queued prompt, draft, or running local process can block the handoff. A failed or uncertain save cannot authorize continuation. The handoff is valid for one process replacement only; ordinary reopening still leaves unfinished work paused.
 
 Once a native request is admitted, its journal retains the request and terminal outcome even if authentication fails before a response. `--resume last` skips completed requests that produced no conversation history. An unfinished turn cannot be replaced by a different prompt; `/new` starts a separate session while preserving the paused one.
 

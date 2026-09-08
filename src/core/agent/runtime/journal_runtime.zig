@@ -885,7 +885,7 @@ fn decodeUser(alloc: Allocator, start: Value) !types.UserTurn {
     return session_codec.parseUserTurn(alloc, parsed.value);
 }
 
-fn decodeRuntimeTurnId(start: Value) !u64 {
+pub fn decodeRuntimeTurnId(start: Value) !u64 {
     const value = try journal.string(start, "runtimeTurnId");
     const id = std.fmt.parseInt(u64, value, 10) catch return error.InvalidJournalRecord;
     if (id == 0) return error.InvalidJournalRecord;
