@@ -5400,7 +5400,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(Buffer.byteLength(snapshot)).toBeGreaterThan(65536);
           expect(snapshot).toContain(token);
           expect(snapshot).toContain(tail);
-          expect(readFileSync(join(sessionDir, "events.jsonl"), "utf8")).toContain(snapshotHandle);
+          expect(readFileSync(join(sessionDir, "execution.journal"), "utf8")).toContain(snapshotHandle);
           const resumed = await runFx(["ask", "--json", "--resume-id", sessionId, "Recover the clipped tail from the saved retrieval without rerunning the command."], { cwd: root.workspace, env, timeoutMs: 30000 });
           expect(resumed.code).toBe(0);
           expect(resumed.stderr).toBe("Reading tool result\n");
@@ -5510,7 +5510,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(beforeResume.code).toBe(0);
         const sessionsRoot = join(root.home, ".fx", "sessions");
         const sessionFiles = readdirSync(join(sessionsRoot, sessionId));
-        expect(JSON.parse(readFileSync(join(sessionsRoot, sessionId, "session.json"), "utf8")).schema_version).toBe(4);
+        expect(JSON.parse(readFileSync(join(sessionsRoot, sessionId, "session.json"), "utf8")).schema_version).toBe(5);
         expect(sessionFiles).not.toContain("checkpoint.json");
         expect(sessionFiles).not.toContain("display.json");
         expect(sessionFiles).not.toContain("recovery.json");

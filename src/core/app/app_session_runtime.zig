@@ -3417,7 +3417,12 @@ pub fn Runtime(comptime App: type) type {
                     if (loaded.journalState()) |records| {
                         const pending = (try journal_runtime.pendingHistory(app.alloc, records)) orelse return;
                         defer types.freeHistoryTurn(app.alloc, pending);
-                        try replayHistoryToSink(app, sink, &.{pending});
+                        const entry = pending.interrupted;
+                        try sink.appendUserTurn(entry.user, app.session.historyLen() != 0);
+                        try writeExecutionHistoryToSink(app, sink, entry.execution);
+                        if (entry.assistant) |assistant| {
+                            if (assistant.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, assistant);
+                        }
                         try sink.appendNotice(.{
                             .topic = "recovery",
                             .tone = .warning,
@@ -7122,7 +7127,7 @@ test "upgrade resume restores active session with the installed version notice" 
     try std.testing.expect(!app.fast_mode);
 }
 
-test "resumed recovery checkpoint replays its unfinished turn once" {
+test "resumed journal replays its unfinished turn once" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7152,9 +7157,10 @@ test "resumed recovery checkpoint replays its unfinished turn once" {
         0,
     );
     {
-        var writable = try app.session_persistence.store.?.resumeForWrite(
+        var writable = try app.session_persistence.store.?.resumeJournalForWrite(
             alloc,
             "paused-recovery",
+            .{},
         );
         defer writable.deinit(alloc);
         const checkpoint = session_codec.RecoveryCheckpoint{
@@ -7169,11 +7175,23 @@ test "resumed recovery checkpoint replays its unfinished turn once" {
             .max_provider_attempts = 10,
             .consumed_provider_attempts = 2,
         };
-        _ = try writable.appendEvent(
-            alloc,
-            .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
-            789,
-        );
+        var context: std.Io.Writer.Allocating = .init(alloc);
+        defer context.deinit();
+        try context.writer.writeAll("{\"recovery\":");
+        try session_codec.writeRecoveryCheckpoint(&context.writer, checkpoint);
+        try context.writer.writeAll(",\"preparations\":[]}");
+        var journal: journal_runtime.Runtime = .{
+            .state = writable.journalState().?,
+            .sink = writable.journalSink().?,
+            .alloc = alloc,
+            .namespace = writable.active_id,
+            .creation_id = "recovery-fixture",
+            .request_id = "unfinished-request",
+        };
+        _ = try journal.begin(checkpoint.user, checkpoint.authority.model, checkpoint.turn_id, false);
+        var key = try journal.generation();
+        defer key.deinit(alloc);
+        _ = try journal.recordDecision(.{ .content = checkpoint.assistant_source }, &.{}, &.{}, key, false, context.written(), null);
     }
 
     app.requested_resume = .{ .id = try alloc.dupe(u8, "paused-recovery") };
@@ -7187,7 +7205,14 @@ test "resumed recovery checkpoint replays its unfinished turn once" {
         app.assistant_text.items,
     );
     try std.testing.expectEqual(@as(usize, 2), app.notices.items.len);
-    try std.testing.expect(std.mem.find(u8, app.notices.items[1], "attempt 2/10") != null);
+    try std.testing.expect(std.mem.find(u8, app.notices.items[1], "Run /continue") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Cancelled") == null);
+    const records = app.session_persistence.writable.?.journalState().?;
+    const context = try execution_journal.object(records.latestContextRecord(0).?, "executionContext");
+    var saved = try session_codec.parseRecoveryCheckpoint(alloc, try execution_journal.object(context, "recovery"));
+    defer saved.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), saved.consumed_provider_attempts);
+    try std.testing.expectEqual(@as(usize, 10), saved.max_provider_attempts);
 }
 
 test "resumeRequestedSession releases the writer when the startup replay anchor fails" {
@@ -7630,9 +7655,33 @@ test "resumeRequestedSession replays active-tool interruption with live cancella
         alloc,
         app.session_persistence.store.?,
         "session-1",
-        &history,
+        &.{},
         0,
     );
+    {
+        var writable = try app.session_persistence.store.?.resumeJournalForWrite(alloc, "session-1", .{});
+        defer writable.deinit(alloc);
+        var journal: journal_runtime.Runtime = .{
+            .state = writable.journalState().?,
+            .sink = writable.journalSink().?,
+            .alloc = alloc,
+            .namespace = writable.active_id,
+            .creation_id = "cancelled-fixture",
+            .request_id = "cancelled-request",
+        };
+        _ = try journal.begin(history[0].interrupted.user, writable.state.preferences.model, 1, false);
+        var key = try journal.generation();
+        defer key.deinit(alloc);
+        _ = try journal.recordDecision(.{}, &.{history[0].interrupted.tool_call.?}, &.{.blocked}, key, false, null, null);
+        const cancelled = (try journal.abandon()).?;
+        defer types.freeHistoryTurn(alloc, cancelled);
+        _ = try writable.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = writable.state.conversation_language,
+            .total_input_tokens = writable.state.total_input_tokens,
+            .total_output_tokens = writable.state.total_output_tokens,
+            .turn = cancelled,
+        } }, 789);
+    }
     app.requested_resume = .{ .id = try alloc.dupe(u8, "session-1") };
 
     try Runtime(TestApp).resumeRequestedSession(&app);
@@ -8296,26 +8345,35 @@ test "context checkpoint persists before releasing summarized model memory" {
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
-    const session_id = app.session_persistence.writable.?.active_id;
+    const session_id = try alloc.dupe(u8, app.session_persistence.writable.?.active_id);
+    defer alloc.free(session_id);
 
     const first = try session_runtime.makeAssistantTurn(alloc, "first", "one");
     defer session_runtime.freeHistoryTurn(alloc, first);
     const second = try session_runtime.makeAssistantTurn(alloc, "second", "two");
     defer session_runtime.freeHistoryTurn(alloc, second);
+    try acknowledgePlainTestResponse(&app, first);
     try Runtime(TestApp).appendHistoryTurn(&app, first);
+    try acknowledgePlainTestResponse(&app, second);
     try Runtime(TestApp).appendHistoryTurn(&app, second);
+    var prior_page = try app.session_persistence.store.?.loadHistoryPage(alloc, session_id, null, 1);
+    defer prior_page.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), prior_page.history_len);
+    try std.testing.expectEqualStrings("second", prior_page.turns[0].assistant.user.text);
     const summary: types.CompactedSummaryHistoryTurn = .{
         .summary = @constCast("<context_handoff>both turns</context_handoff>"),
         .removed_turn_count = 2,
         .compaction_count = 1,
     };
-    const writer = &app.session_persistence.writable.?.writer.conversation;
-    const saved_seq = writer.last_seq;
-    const saved_bytes = writer.committed_bytes;
-    writer.last_seq = std.math.maxInt(u64);
-    try std.testing.expectError(error.ConversationSequenceOverflow, Runtime(TestApp).commitContextCompaction(&app, summary, null, null));
-    writer.last_seq = saved_seq;
-    try std.testing.expectEqual(saved_bytes, writer.committed_bytes);
+    const loaded = &app.session_persistence.writable.?;
+    const records = loaded.journalState().?;
+    const saved_limit = records.limits.records;
+    const saved_position = loaded.position;
+    records.limits.records = records.records.items.len;
+    try std.testing.expectError(error.JournalCapacityExceeded, Runtime(TestApp).commitContextCompaction(&app, summary, null, null));
+    records.limits.records = saved_limit;
+    try std.testing.expectEqual(saved_position, loaded.position);
+    try std.testing.expect(!records.blocked);
     try std.testing.expectEqual(@as(usize, 2), app.session.historyLen());
     try Runtime(TestApp).commitContextCompaction(&app, summary, null, null);
 
@@ -8324,11 +8382,13 @@ test "context checkpoint persists before releasing summarized model memory" {
         @as(usize, 0),
         app.session_persistence.writable.?.state.history.len,
     );
-    var root = app.session_persistence.store.?.canonical_root;
-    var resumed = try root.loadReadOnly(alloc, session_id, .{});
+    Runtime(TestApp).closeWritableSession(&app);
+    var resumed = try app.session_persistence.store.?.resumeJournalForWrite(alloc, session_id, .{});
     defer resumed.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), resumed.history.len);
-    try std.testing.expect(resumed.history[0] == .compacted_summary);
+    const restored = try journal_runtime.restoreHistory(alloc, resumed.journalState().?);
+    defer types.freeHistoryTurnSlice(alloc, restored);
+    try std.testing.expectEqual(@as(usize, 1), restored.len);
+    try std.testing.expect(restored[0] == .compacted_summary);
     var page = try app.session_persistence.store.?.loadHistoryPage(
         alloc,
         session_id,
@@ -8339,6 +8399,12 @@ test "context checkpoint persists before releasing summarized model memory" {
     try std.testing.expectEqual(@as(usize, 2), page.turns.len);
     try std.testing.expectEqualStrings("first", page.turns[0].assistant.user.text);
     try std.testing.expectEqualStrings("second", page.turns[1].assistant.user.text);
+    try std.testing.expectEqual(@as(usize, 2), page.history_len);
+    var continued = try app.session_persistence.store.?.loadHistoryPage(alloc, session_id, prior_page.next_cursor.?, 1);
+    defer continued.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), continued.turns.len);
+    try std.testing.expectEqualStrings("first", continued.turns[0].assistant.user.text);
+    try std.testing.expect(continued.next_cursor == null);
 }
 
 test "handle-free conversation result is externalized before live commit" {

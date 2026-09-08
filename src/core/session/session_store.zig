@@ -1375,21 +1375,30 @@ pub const Store = struct {
         defer state.deinit(alloc);
         if (native_snapshot != null) resolveSessionSnapshotLocators(alloc, state.history, null, self.sessions_dir, session_id) catch |err| return mapHistoryPageLoadError(err);
 
+        var native_turns: std.ArrayList(session.HistoryTurn) = .empty;
+        defer native_turns.deinit(alloc);
+        const history = if (native_snapshot != null) visible: {
+            for (state.history) |turn| {
+                if (turn != .compacted_summary) try native_turns.append(alloc, turn);
+            }
+            break :visible native_turns.items;
+        } else state.history;
+
         const snapshot: HistoryPageCursor = if (position) |value| blk: {
-            if (value.history_len > state.history.len)
+            if (value.history_len > history.len)
                 return error.StaleHistoryPageCursor;
-            const digest = historyPrefixDigest(state.history[0..value.history_len]) catch return error.SessionStoreUnavailable;
+            const digest = historyPrefixDigest(history[0..value.history_len]) catch return error.SessionStoreUnavailable;
             if (!std.mem.eql(u8, &value.prefix_digest, &digest)) return error.StaleHistoryPageCursor;
             break :blk value;
         } else .{
             .session_id = state.id,
-            .history_len = state.history.len,
+            .history_len = history.len,
             .revision_ms = state.updated_at_ms,
-            .prefix_digest = historyPrefixDigest(state.history) catch return error.SessionStoreUnavailable,
-            .start = state.history.len,
+            .prefix_digest = historyPrefixDigest(history) catch return error.SessionStoreUnavailable,
+            .start = history.len,
         };
-        const window = selectHistoryPageWindow(state.history.len, snapshot.start, limit);
-        const turns = try duplicateHistoryPage(alloc, state.history[window.start..window.end]);
+        const window = selectHistoryPageWindow(history.len, snapshot.start, limit);
+        const turns = try duplicateHistoryPage(alloc, history[window.start..window.end]);
         errdefer session.freeHistoryTurnSlice(alloc, turns);
         const next_cursor = if (window.start > 0) blk: {
             var encoded: [512]u8 = undefined;

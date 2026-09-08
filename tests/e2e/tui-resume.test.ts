@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { decodeNativeJournal } from "./journal/storage";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -282,6 +283,11 @@ async function waitForPersistedSessionMarker(
     return readdirSync(sessionsDir, { withFileTypes: true })
       .filter((entry) => entry.name !== "latest" && entry.isDirectory())
       .some((entry) => {
+        const journalPath = join(sessionsDir, entry.name, "execution.journal");
+        if (existsSync(journalPath)) {
+          return decodeNativeJournal(readFileSync(journalPath)).some(record =>
+            record.kind === "turn_end" && Buffer.from(record.bytes).toString("utf8").includes(marker));
+        }
         const eventsPath = join(sessionsDir, entry.name, "events.jsonl");
         return existsSync(eventsPath) &&
           readFileSync(eventsPath, "utf8").includes(marker);
@@ -5651,7 +5657,7 @@ test.skipIf(!tmuxAvailable())(
 
       const sessionId = sessionIdFromHome(home);
       const eventsJsonl = readFileSync(
-        join(home, ".fx", "sessions", sessionId, "events.jsonl"),
+        join(home, ".fx", "sessions", sessionId, "execution.journal"),
         "utf8",
       );
       expect(eventsJsonl).toContain("committed_file_presentation");
@@ -6886,7 +6892,7 @@ test.skipIf(!tmuxAvailable())(
       expect(seed.code).toBe(0);
       const id = JSON.parse(seed.stdout).session_id;
       const sessions = join(home, ".fx", "sessions");
-      const eventsPath = join(sessions, id, "events.jsonl");
+      const eventsPath = join(sessions, id, "execution.journal");
       const before = readFileSync(eventsPath);
       const metadata = JSON.parse(readFileSync(join(sessions, id, "session.json"), "utf8"));
       const remnants: Array<[string, string]> = [];
@@ -6910,8 +6916,8 @@ test.skipIf(!tmuxAvailable())(
         await active.waitForStableComposer(TIMEOUT);
         await active.sendText("Continue the saved conversation without tools.");
         await active.waitForPane((pane) => pane.includes(reply) && hasEmptyComposer(pane), TIMEOUT);
-        const events = readFileSync(eventsPath, "utf8").trim().split("\n").map((line) => JSON.parse(line).event);
-        expect(events.filter((event) => event.assistant?.text === reply)).toHaveLength(1);
+        const events = decodeNativeJournal(readFileSync(eventsPath)).map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8")));
+        expect(events.filter((event) => event.kind === "model_step" && event.completion?.content === reply)).toHaveLength(1);
         expect(readFileSync(eventsPath).subarray(0, before.length).equals(before)).toBe(true);
         expect(await active.captureFullScrollback()).not.toContain("FileNotFound");
         await active.sendText("/quit");
@@ -7112,7 +7118,7 @@ for (const inspectDetails of [false, true]) {
         await prompt("Read missing.txt once without retrying.");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         const sessionId = sessionIdFromHome(home);
-        const eventsPath = join(home, ".fx", "sessions", sessionId, "events.jsonl");
+        const eventsPath = join(home, ".fx", "sessions", sessionId, "execution.journal");
         await active.kill();
         active = await TmuxSession.create({ cmd: `${FX_BIN} --resume-last`, cwd: workspace, env, stderrPath, isolated: true, remainOnExit: true, width: 88, height: 24 });
         await active.waitForComposer(TIMEOUT);
@@ -7137,11 +7143,11 @@ for (const inspectDetails of [false, true]) {
         expect(readFileSync(join(workspace, "receipt.txt"), "utf8")).toBe("RECEIVED\n");
         expect(readFileSync(join(workspace, "second.txt"), "utf8")).toBe("AFTER\n");
         expect(readFileSync(join(workspace, "ledger.txt"), "utf8")).toBe(ledger);
-        const events = readFileSync(eventsPath, "utf8").trim().split("\n").map(line => JSON.parse(line).event);
-        expect(events.filter(event => event.tool_result?.call_id === "write-second")).toHaveLength(1);
-        expect(events.find(event => event.tool_result?.call_id === "write-receipt").tool_result.committed_file_presentation.lifecycle_id)
+        const events = decodeNativeJournal(readFileSync(eventsPath)).map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8")));
+        expect(events.filter(event => event.kind === "tool_result" && event.persisted.tool_call_id === "write-second")).toHaveLength(1);
+        expect(events.find(event => event.kind === "tool_result" && event.persisted.tool_call_id === "write-receipt").persisted.committed_file_presentation.lifecycle_id)
           .toEqual({ turn_id: 2, call_id: "write-receipt" });
-        expect(events.some(event => event.assistant?.text === savedReply)).toBe(true);
+        expect(events.some(event => event.kind === "model_step" && event.completion?.content === savedReply)).toBe(true);
         expect(gateway.requests).toHaveLength(9);
         expect(active.isPaneAlive()).toBe(true);
         expect(readFileSync(stderrPath, "utf8")).toBe("");

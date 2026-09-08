@@ -211,6 +211,9 @@ describe("journal witness native crash", () => {
         throw new Error(`${error}\nStartup stderr:\n${readFileSync(stderrPath, "utf8")}`);
       }
       // Ordinary -c must stay paused. This is not an upgrade handoff token.
+      const transcript = await resumed.captureFullScrollback();
+      expect(transcript).toContain("Turn paused");
+      expect(transcript).not.toContain("Cancelled");
       expect(gateway.requests).toHaveLength(1);
       expect(readFileSync(effect, "utf8")).toBe("once");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
