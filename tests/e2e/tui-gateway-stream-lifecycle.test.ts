@@ -1384,7 +1384,7 @@ async function launchRouteRecoveryTui(
 }
 
 describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
-  test("retry exhaustion settles a streamed tool start and permits a later prompt", async () => {
+  test("retry exhaustion preserves the pending journal and permits an explicit new session", async () => {
     const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
       "fx-tui-retry-settlement-",
       [
@@ -1405,10 +1405,23 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     expect(scrollback).toContain("Connection interrupted before");
     expect(scrollback).not.toContain("UnknownToolLifecycleIdentity");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
+    const sessionsRoot = join(root!, "home", ".fx", "sessions");
+    const pendingId = readdirSync(sessionsRoot).find(id => existsSync(join(sessionsRoot, id, "execution.journal")))!;
+    const pendingPath = join(sessionsRoot, pendingId, "execution.journal");
+    const before = readFileSync(pendingPath);
+    await session!.sendText("Confirm a later prompt is still usable.");
+    await session!.waitForText("PendingTurnError", TIMEOUT);
+    await session!.waitForStableComposer(TIMEOUT);
+    expect(queuedGateway.requests).toHaveLength(10);
+    expect(readFileSync(pendingPath)).toEqual(before);
+    await session!.sendText("/new");
+    await session!.waitForStableComposer(TIMEOUT);
     await session!.sendText("Confirm a later prompt is still usable.");
     await session!.waitForText("AFTER_NETWORK_RECOVERY", TIMEOUT);
     await session!.waitForStableComposer(TIMEOUT);
     expect(queuedGateway.requests).toHaveLength(11);
+    expect(queuedGateway.requests[10]!.body).not.toContain("Read the notes and continue after a connection failure.");
+    expect(readFileSync(pendingPath)).toEqual(before);
     await session!.sendText("/quit");
     expect(await session!.waitForSessionEnd(TIMEOUT)).toBe(true);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -2698,12 +2711,12 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         () =>
           existsSync(sessionsRoot) &&
           readdirSync(sessionsRoot).some((entry) =>
-            existsSync(join(sessionsRoot, entry, "events.jsonl")),
+            existsSync(join(sessionsRoot, entry, "execution.journal")),
           ),
         "session event log",
       );
       const sessionId = readdirSync(sessionsRoot).find((entry) =>
-        existsSync(join(sessionsRoot, entry, "events.jsonl")),
+        existsSync(join(sessionsRoot, entry, "execution.journal")),
       );
       if (!sessionId) throw new Error("session event log was not found");
 

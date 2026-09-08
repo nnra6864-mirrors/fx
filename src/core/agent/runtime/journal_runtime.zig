@@ -16,6 +16,8 @@ const Value = std.json.Value;
 
 pub const Context = types.JournalToolContext;
 pub const max_model_record_bytes: usize = 4 * 1024 * 1024;
+// A maximum-size file argument still needs its call identity and context envelope.
+const max_decision_record_bytes: usize = max_model_record_bytes + 64 * 1024;
 pub const Selection = enum { new_turn, pending, completed };
 
 pub const GenerationKey = struct {
@@ -340,7 +342,6 @@ pub const Runtime = struct {
         full.execution.files = projected.files;
         var assistant: ?[]u8 = null;
         if (full.execution.tool_steps.len > 0) assistant = full.execution.tool_steps[full.execution.tool_steps.len - 1].assistant;
-        var active: ?types.ToolCall = null;
         var pending_bytes: usize = 0;
         if (self.state.pending() == .tool) {
             const position = self.state.pending().tool;
@@ -352,7 +353,6 @@ pub const Runtime = struct {
                 const size = std.math.cast(usize, counter.fullCount()) orelse return error.JournalCapacityExceeded;
                 if (size >= pending_bytes) {
                     pending_bytes = size;
-                    active = call;
                 }
             }
         }
@@ -361,12 +361,14 @@ pub const Runtime = struct {
         try session_codec.writeHistoryTurn(&counted.writer, .{ .interrupted = .{
             .user = original_user,
             .assistant = assistant,
-            .tool_call = active,
+            .tool_call = null,
             .execution = full.execution,
             .terminal_reason = .cancelled,
         } });
         var size = std.math.cast(usize, counted.fullCount()) orelse return error.JournalCapacityExceeded;
         size = std.math.add(usize, size, pending_bytes) catch return error.JournalCapacityExceeded;
+        // Full execution already includes the active call. Abandonment moves
+        // that call out of execution, so only pendingTool's input is additional.
         // Result envelope, labels, summaries and the pending-tool identity.
         return std.math.add(usize, size, 64 * 1024) catch error.JournalCapacityExceeded;
     }
@@ -509,7 +511,8 @@ pub const Runtime = struct {
         try writer.writer.writeAll(",\"providerReplay\":");
         try json(&writer.writer, provider_replay);
         try writer.writer.writeByte('}');
-        if (writer.written().len > max_model_record_bytes) return error.JournalCapacityExceeded;
+        if (writer.written().len > max_decision_record_bytes) return error.JournalCapacityExceeded;
+        try self.preflightOperation(writer.written().len, 1, writer.written().len * 2);
         try self.state.append(self.alloc, self.sink, .model_step, writer.written());
         return step;
     }
@@ -2100,6 +2103,47 @@ test "journal runtime abandonment before the first model preserves the user and 
     var retry = sink.runtime(&state, "request-a");
     try std.testing.expectEqual(Selection.completed, try retry.begin(test_input, "model", 2, false));
     try std.testing.expectEqual(@as(usize, 2), sink.count);
+}
+
+test "journal witness maximum file arguments reserve an exact pending abandonment" {
+    const alloc = std.testing.allocator;
+    const content = try alloc.alloc(u8, 4 * 1024 * 1024);
+    defer alloc.free(content);
+    @memset(content, 'x');
+    const arguments = try std.fmt.allocPrint(alloc, "{{\"path\":\"maximum.txt\",\"content\":\"{s}\"}}", .{content});
+    defer alloc.free(arguments);
+    for ([_]bool{ false, true }) |first_settled| {
+        var state: journal.State = .{};
+        defer state.deinit(alloc);
+        var sink: TestSink = .{};
+        var runtime = sink.runtime(&state, "large-file-request");
+        _ = try runtime.begin(test_input, "model", 1, false);
+        var key = try runtime.generation();
+        defer key.deinit(alloc);
+        _ = try runtime.recordDecision(.{}, &.{
+            .{ .id = "small", .name = "write_file", .arguments_json = "{}" },
+            .{ .id = "large", .name = "write_file", .arguments_json = arguments },
+        }, &.{ .blocked, .blocked }, key, false, null, null);
+        if (first_settled) try runtime.recordResult(0, 0, .{
+            .tool_call_id = @constCast("small"),
+            .tool_name = @constCast("write_file"),
+            .status = .success,
+            .output = @constCast("saved"),
+            .output_bytes = 5,
+            .stored_output_bytes = 5,
+        });
+        const reserved = try runtime.terminalBytes();
+        try std.testing.expect(try runtime.admitToolResultLimit(2 * 1024 * 1024) >= 1024);
+        const abandoned = (try runtime.abandon()).?;
+        defer types.freeHistoryTurn(alloc, abandoned);
+        const actual = state.records.items[state.records.items.len - 1].entry.bytes.len;
+        try std.testing.expect(actual <= reserved);
+        if (first_settled) {
+            try std.testing.expect(actual > content.len);
+            try std.testing.expectEqualStrings(arguments, abandoned.interrupted.tool_call.?.arguments_json);
+        }
+        try validateRestoredState(alloc, &state);
+    }
 }
 
 test "journal runtime abandonment projects known results and uncertain call without skipped effects" {
