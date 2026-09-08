@@ -129,6 +129,13 @@ pub const TurnFinalizationGuard = struct {
         if (self.deps.journal) |journal| {
             if (outcome != .paused) {
                 if (finished_prompt) |*finished| {
+                    if (journal.work_id) |id| {
+                        @import("../../session/session.zig").copyWorkIdToTurn(std.heap.c_allocator, &finished.turn, id) catch |err| {
+                            self.state = .fatal;
+                            types.freeFinishedPrompt(std.heap.c_allocator, finished.*);
+                            return err;
+                        };
+                    }
                     const index = journal.turn orelse {
                         self.state = .fatal;
                         types.freeFinishedPrompt(std.heap.c_allocator, finished.*);

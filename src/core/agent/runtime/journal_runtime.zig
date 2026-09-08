@@ -208,6 +208,7 @@ pub const Runtime = struct {
     namespace: []const u8,
     creation_id: []const u8,
     request_id: []const u8,
+    work_id: ?[]const u8 = null,
     turn: ?usize = null,
     resuming: bool = false,
     generation_counter: u64 = 0,
@@ -221,7 +222,13 @@ pub const Runtime = struct {
             return error.InvalidJournalRecord;
         var input_writer: std.Io.Writer.Allocating = .init(self.alloc);
         defer input_writer.deinit();
-        try session_codec.writeUserTurn(&input_writer.writer, input);
+        var bound_input = input;
+        if (self.work_id) |id| {
+            try session.validateWorkId(id);
+            if (input.work_id) |current| if (!std.mem.eql(u8, current, id)) return error.RequestConflict;
+            bound_input.work_id = @constCast(id);
+        }
+        try session_codec.writeUserTurn(&input_writer.writer, bound_input);
         const input_json = input_writer.written();
         const input_hash = journal.inputHash(input_json);
         if (self.state.request(self.request_id)) |index| {

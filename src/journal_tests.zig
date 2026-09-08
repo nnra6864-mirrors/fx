@@ -5,4 +5,5 @@ test {
     _ = @import("acp/prompt.zig");
     _ = @import("core/session/execution_journal_store.zig");
     _ = @import("core/session/execution_journal_genesis.zig");
+    _ = @import("core/subagent/managed_owner.zig");
 }

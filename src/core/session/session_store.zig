@@ -1220,6 +1220,15 @@ pub const Store = struct {
         return loaded;
     }
 
+    /// Returns an owned native journal snapshot without acquiring a writer or
+    /// repairing storage. Legacy sessions return null.
+    pub fn loadJournalReadOnly(self: Store, alloc: Allocator, session_id: []const u8) !?@import("execution_journal_store.zig").Snapshot {
+        try validateSessionId(session_id);
+        var dir = try self.openSessionDir(session_id);
+        defer dir.close();
+        return @import("execution_journal_store.zig").inspect(alloc, &dir, session_id);
+    }
+
     /// Loads a session's full durable state read-only. Caller owns the state.
     pub fn loadReadOnly(
         self: Store,

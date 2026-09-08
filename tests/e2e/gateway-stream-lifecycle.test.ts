@@ -5822,7 +5822,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           const sessionsRoot = join(root.home, ".fx", "sessions");
           const sessionId = readdirSync(sessionsRoot).find((id) => {
             const path = join(sessionsRoot, id, "session.json");
-            return existsSync(path) && !JSON.parse(readFileSync(path, "utf8")).subagent_child;
+            return existsSync(path) && !existsSync(join(sessionsRoot, id, "subagent", "owner.json"));
           });
           expect(sessionId).toBeString();
           const sessionDir = join(sessionsRoot, sessionId!);
@@ -7008,7 +7008,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     let childRequests = 0;
     let childId = "";
     let registryPath = "";
-    let recoveryPath = "";
+    const targetFile = join(root.root, "sync-target");
+    const arm = join(root.root, "sync-armed");
+    const receipt = join(root.root, "sync-receipt");
+    const library = join(root.root, process.platform === "darwin" ? "sync-fault.dylib" : "sync-fault.so");
+    const flags = process.platform === "darwin" ? ["-dynamiclib"] : ["-shared", "-fPIC"];
+    const compiled = Bun.spawnSync(["cc", ...flags, "-O2", "-Wall", "-Wextra", join(import.meta.dirname, "fixtures", "session-sync-fault.c"), "-o", library, ...(process.platform === "darwin" ? [] : ["-ldl"])]);
+    expect(compiled.exitCode).toBe(0);
     let failureObserved = false;
     const scripted = startDynamicFakeGateway((body) => {
       if (hasCurrentToolResult(body, "followup")) {
@@ -7019,13 +7025,20 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(child.last_outcome).toBe("completed");
         expect(child.last_failure).toBeNull();
         expect(readFileSync(marker, "utf8")).toBe("EFFECT_ONCE\n");
+        const entries = decodeNativeJournal(readFileSync(join(root.home, ".fx", "sessions", childId, "execution.journal")))
+          .map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8")));
+        const endings = entries.filter(entry => entry.kind === "turn_end");
+        expect(endings).toHaveLength(2);
+        expect(endings[0].result).toMatchObject({ ok: false, reason: "interrupted", pendingTool: { name: "read_file" } });
+        expect(endings[1].result.ok).toBe(true);
+        expect(endings[0].history.execution.tool_steps[0].tool_results[0].tool_call_id).toBe("child_effect");
         return fakeGatewayFinalText("SUBAGENT_FAILURE_REPORTED");
       }
       if (hasCurrentToolResult(body, "delegate")) {
         const result = JSON.parse(toolResultOutput(body, "delegate"));
         expect(result.ok).toBe(false);
         expect(result.error_code).toBe("child_failed");
-        expect(result.result).toContain("SessionCommitFailed");
+        expect(result.result).toContain("PersistenceUncertain");
         expect(result.result).toContain("agent_turn_failed");
         expect(result.result).toContain("Earlier tool calls may have completed");
         expect(childRequests).toBe(2);
@@ -7035,9 +7048,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         const child = registry.children.find((entry: { id: string }) => entry.id === childId);
         expect(child.phase).toBe("idle");
         expect(child.active).toBeNull();
-        expect(child.last_failure).toContain("SessionCommitFailed");
+        expect(child.last_failure).toContain("PersistenceUncertain");
         failureObserved = true;
-        rmSync(recoveryPath, { recursive: true });
+        expect(existsSync(receipt)).toBe(true);
+        rmSync(arm);
         return fakeGatewayToolCall("followup", "subagent", {
           request: { action: "message", agent: "reporter", message: nextTask },
         });
@@ -7052,9 +7066,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(childId).toBeTruthy();
           const owner = JSON.parse(readFileSync(join(sessions, childId, "subagent", "owner.json"), "utf8"));
           registryPath = join(sessions, owner.parent_id, "subagent", "children.json");
-          recoveryPath = join(sessions, childId, "recovery.json");
-          if (existsSync(recoveryPath)) renameSync(recoveryPath, `${recoveryPath}.saved`);
-          mkdirSync(recoveryPath);
+          writeFileSync(targetFile, join(sessions, childId, "execution.journal"));
+          writeFileSync(arm, "armed");
           return fakeGatewayToolCall("read_effect", "read_file", { path: marker });
         }
         return fakeShellRun("child_effect", "printf 'EFFECT_ONCE\\n' >> effect.txt");
@@ -7066,7 +7079,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     try {
       const result = await runFx(["ask", "--json", "--auto", "Exercise a failed child and its next message."], {
         cwd: root.workspace,
-        env: { ...fixtureEnv(root, scripted, ""), FX_TRACE_LOG: undefined, FX_TRACE: undefined, FX_TRACE_SCOPES: undefined },
+        env: { ...fixtureEnv(root, scripted, ""), FX_TRACE_LOG: undefined, FX_TRACE: undefined, FX_TRACE_SCOPES: undefined,
+          [process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD"]: library,
+          FX_TEST_SYNC_TARGET_FILE: targetFile, FX_TEST_SYNC_ARM: arm, FX_TEST_SYNC_RECORD: receipt, FX_TEST_SYNC_MATCH: "read_effect" },
         timeoutMs: 15_000,
       });
       expect(result.code).toBe(0);
@@ -7076,7 +7091,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         .map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8")));
       const persisted = events.find(entry => entry.kind === "tool_result" && entry.persisted.tool_call_id === "delegate")?.persisted;
       expect(persisted?.status).toBe("failure");
-      expect(persisted?.output).toContain("agent_turn_failed: SessionCommitFailed");
+      expect(persisted?.output).toContain("agent_turn_failed: PersistenceUncertain");
       expect(scripted.requestCount()).toBe(6);
       expect(result.stderr).not.toContain("panic");
     } finally {
@@ -7383,6 +7398,61 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 20_000);
 
+  for (const recoveryCase of ["success", "changed input", "recorded failure"] as const) test(`child completion reconciles registry acknowledgement: ${recoveryCase}`, async () => {
+    const changedInput = recoveryCase === "changed input";
+    const failed = recoveryCase === "recorded failure";
+    const root = createFixtureRoot("child-journal-registry-recovery");
+    const task = "CHILD_REGISTRY_CAPTURE: write the effect once.";
+    const next = "Inspect the completed child after reopening.";
+    let childId = "", registryPath = "", activeRegistry = "";
+    const gateway = startDynamicFakeGateway(body => {
+      if (promptText(body).includes(next)) {
+        const registry = JSON.parse(readFileSync(registryPath, "utf8"));
+        const child = registry.children.find(entry => entry.id === childId);
+        expect(child.phase).toBe(changedInput ? "interrupted" : "idle");
+        expect(child.active).toBeNull();
+        expect(child.last_outcome).toBe(changedInput ? "interrupted" : failed ? "failed" : "completed");
+        if (failed) expect(child.last_failure).toContain("provider_error");
+        return fakeGatewayFinalText("OWNER_RECOVERY_OK");
+      }
+      if (hasCurrentToolResult(body, "delegate_saved_child")) {
+        expect(JSON.parse(toolResultOutput(body, "delegate_saved_child")).ok).toBe(!failed);
+        return fakeGatewayFinalText("PARENT_SAVED");
+      }
+      if (hasCurrentToolResult(body, "child_saved_effect")) return fakeGatewayFinalText("CHILD_SAVED");
+      if (promptText(body).includes(task)) {
+        const sessions = join(root.home, ".fx", "sessions");
+        childId = readdirSync(sessions).find(id => existsSync(join(sessions, id, "subagent", "owner.json")))!;
+        const owner = JSON.parse(readFileSync(join(sessions, childId, "subagent", "owner.json"), "utf8"));
+        registryPath = join(sessions, owner.parent_id, "subagent", "children.json");
+        activeRegistry = readFileSync(registryPath, "utf8");
+        if (failed) return new Response(JSON.stringify({ error: { message: "rejected" } }), { status: 401, headers: { "content-type": "application/json" } });
+        return fakeShellRun("child_saved_effect", "printf 'EFFECT_ONCE\\n' >> child-effect.txt");
+      }
+      return fakeGatewayToolCall("delegate_saved_child", "subagent", { request: { action: "message", agent: "saved-worker", message: task } });
+    }, { classifierDecision: "clear", models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    try {
+      const env = fixtureEnv(root, gateway, join(root.root, "trace.log"));
+      const first = await runFx(["ask", "--json", "--yolo", "Create one durable child result."], { cwd: root.workspace, env, timeoutMs: 30_000 });
+      expect(first.code, first.stdout + first.stderr).toBe(0);
+      expect(parseAskJson(first.stdout).output).toBe("PARENT_SAVED");
+      expect(gateway.requestCount()).toBe(failed ? 3 : 4);
+      const childPath = join(root.home, ".fx", "sessions", childId, "execution.journal");
+      const savedChild = readFileSync(childPath);
+      expect(decodeNativeJournal(savedChild).at(-1)!.kind).toBe("turn_end");
+      const interruptedRegistry = JSON.parse(activeRegistry);
+      if (changedInput) interruptedRegistry.children.find(entry => entry.id === childId).active.message = "Different child input";
+      writeFileSync(registryPath, JSON.stringify(interruptedRegistry));
+      const second = await runFx(["ask", "--json", "--auto", "--resume-id", parseAskJson(first.stdout).session_id, next], { cwd: root.workspace, env, timeoutMs: 30_000 });
+      expect(second.code, second.stdout + second.stderr).toBe(0);
+      expect(parseAskJson(second.stdout).output).toBe("OWNER_RECOVERY_OK");
+      expect(gateway.requestCount()).toBe(failed ? 4 : 5);
+      expect(readFileSync(childPath)).toEqual(savedChild);
+      if (failed) expect(existsSync(join(root.workspace, "child-effect.txt"))).toBe(false);
+      else expect(readFileSync(join(root.workspace, "child-effect.txt"), "utf8").match(/EFFECT_ONCE/g)).toHaveLength(1);
+    } finally { gateway.stop(); rmSync(root.root, { recursive: true, force: true }); }
+  }, 60_000);
+
   test("saved ask resume continues one chat-created persistent child", async () => {
     const root = createFixtureRoot("subagent-persistent-resume");
     const resumedWorkspace = join(root.root, "resumed-workspace");
@@ -7528,7 +7598,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 30_000);
 
-  test("SIGKILL during persistent child work keeps parent recovery selectable", async () => {
+  test("SIGKILL preserves selectable parent and uncertain child work", async () => {
     const root = createFixtureRoot("subagent-persistent-sigkill-recovery");
     const tracePath = join(root.root, "trace.log");
     const startedPath = join(root.workspace, "child-command.started");
@@ -7641,29 +7711,30 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         sessions: Array<{ id: string }>;
       }).sessions.map((session) => session.id)).toEqual([parentId!]);
 
-      const resumed = await runFx(
-        [
-          "ask",
-          "--json",
-          "--auto",
-          "--resume-id",
-          parentId!,
-          resumePrompt,
-        ],
-        {
-          cwd: root.workspace,
-          env: fixtureEnv(root, gateway, tracePath),
-          timeoutMs: 15_000,
-        },
-      );
-      if (resumed.code !== 0) {
-        throw new Error(
-          `persistent child recovery failed: code=${resumed.code} signal=${resumed.signal}\nstdout=${resumed.stdout}\nstderr=${resumed.stderr}\ntrace=${existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "<missing>"}`,
-        );
-      }
-      expect(parseAskJson(resumed.stdout).output).toContain(
-        "PARENT_RECOVERY_COMPLETE",
-      );
+      const parentPath = join(sessionsRoot, parentId!, "execution.journal");
+      const childPath = join(sessionsRoot, childId!, "execution.journal");
+      const before = readFileSync(parentPath);
+      const childBefore = readFileSync(childPath);
+      const childEntries = decodeNativeJournal(childBefore).map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8")));
+      const start = childEntries.find(entry => entry.kind === "turn_start");
+      expect(JSON.parse(start.inputJson).work_id).toBe(start.requestId);
+      expect(childEntries.filter(entry => entry.kind === "tool_result")).toHaveLength(0);
+      expect(childEntries.some(entry => entry.kind === "model_step" && entry.calls?.some(call => call.providerId === "persistent_sigkill_shell"))).toBe(true);
+      const count = gateway.requestCount();
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", parentId!, resumePrompt], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
+      });
+      expect(resumed.code).toBe(1);
+      expect(resumed.stdout).toContain("PendingTurnError");
+      const continued = await runFx(["ask", "--json", "--auto", "--resume-id", parentId!, "--continue-recovery"], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
+      });
+      expect(continued.code).toBe(1);
+      expect(continued.stdout).toContain("RecoveryRequired");
+      expect(gateway.requestCount()).toBe(count);
+      expect(readFileSync(parentPath)).toEqual(before);
+      expect(readFileSync(childPath)).toEqual(childBefore);
+      expect(existsSync(finishedPath)).toBe(false);
     } finally {
       if (first.exitCode === null) first.kill("SIGKILL");
       for (const pid of ownedPids) {

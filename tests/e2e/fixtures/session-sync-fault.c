@@ -27,6 +27,17 @@ static int real_sync(int fd) {
 
 static int injected_sync(int fd) {
     const char *target = getenv("FX_TEST_SYNC_TARGET");
+    const char *target_file = getenv("FX_TEST_SYNC_TARGET_FILE");
+    char configured[PATH_MAX];
+    if (target_file) {
+        int source = open(target_file, O_RDONLY);
+        if (source < 0) return real_sync(fd);
+        ssize_t count = read(source, configured, sizeof(configured) - 1);
+        close(source);
+        if (count <= 0 || (size_t)count >= sizeof(configured) - 1) return real_sync(fd);
+        configured[count] = 0;
+        target = configured;
+    }
     const char *arm = getenv("FX_TEST_SYNC_ARM");
     const char *record = getenv("FX_TEST_SYNC_RECORD");
     const char *match = getenv("FX_TEST_SYNC_MATCH");

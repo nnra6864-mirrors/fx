@@ -51,6 +51,7 @@ const Witness = struct {
     abandon_cancelled: bool = false,
     configured_result_limit: ?usize = null,
     admitted_result_limit: usize = 0,
+    work_id: ?[]const u8 = null,
 
     fn init() Witness {
         return .{ .hooks = support.FakeAgentRuntimeDeps.init(std.testing.allocator) };
@@ -160,6 +161,7 @@ const Witness = struct {
             .namespace = "core-session",
             .creation_id = if (cut == null) "first-runtime" else "recreated-runtime",
             .request_id = "core-request",
+            .work_id = self.work_id,
             .resuming = cut != null,
         };
         deps.journal = &runtime;
@@ -361,6 +363,25 @@ test "journal witness high result ceilings admit a bounded executor without chan
     try std.testing.expectEqual(@as(usize, 1), witness.effects);
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     try std.testing.expect(std.mem.find(u8, gateway.request_bodies.items[1], "receipt:journal-call-a") != null);
+}
+
+test "journal witness managed work identity is bound before input and terminal acknowledgement" {
+    const alloc = std.testing.allocator;
+    var fixture = support.PromptFixture{};
+    var witness = Witness.init();
+    defer witness.deinit();
+    witness.work_id = "managed-work-1";
+    var gateway = support.FakeGateway.init(alloc, &.{.{ .content = "managed result" }});
+    defer gateway.deinit();
+    try witness.run(&gateway, &fixture, null);
+    const input = try journal_runtime.readUser(alloc, &witness.state, 0);
+    defer types.freeUserTurn(alloc, input);
+    try std.testing.expectEqualStrings("managed-work-1", input.work_id.?);
+    const history = try journal_runtime.restoreHistory(alloc, &witness.state);
+    defer types.freeHistoryTurnSlice(alloc, history);
+    try std.testing.expectEqualStrings("managed-work-1", history[0].assistant.user.work_id.?);
+    try std.testing.expectEqualStrings("managed result", history[0].assistant.assistant);
+    try journal_runtime.validateRestoredState(alloc, &witness.state);
 }
 
 test "journal witness capacity rejects admission before model and tool effects" {
