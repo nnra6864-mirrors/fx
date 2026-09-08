@@ -7236,9 +7236,10 @@ test "resumeRequestedSession releases the writer when the startup replay anchor 
     try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
 
-    var reopened = try app.session_persistence.store.?.resumeForWrite(
+    var reopened = try app.session_persistence.store.?.resumeJournalForWrite(
         alloc,
         "anchor-failure",
+        .{},
     );
     reopened.deinit(alloc);
 }
@@ -7587,9 +7588,10 @@ test "resumeRequestedSession cleans final owner after post-transfer failure" {
     try std.testing.expect(app.requested_resume == null);
     try std.testing.expect(app.session_persistence.writable == null);
 
-    var reopened = try app.session_persistence.store.?.resumeForWrite(
+    var reopened = try app.session_persistence.store.?.resumeJournalForWrite(
         alloc,
         "session-1",
+        .{},
     );
     defer reopened.deinit(alloc);
     try std.testing.expectEqualStrings("session-1", reopened.active_id);
@@ -8581,6 +8583,7 @@ test "appendHistoryTurn preserves canonical turns above the context limit" {
     for (users, assistants) |user, assistant| {
         const turn = try session_runtime.makeAssistantTurn(alloc, user, assistant);
         defer session_runtime.freeHistoryTurn(alloc, turn);
+        try acknowledgePlainTestResponse(&app, turn);
         try Runtime(TestApp).appendHistoryTurn(&app, turn);
     }
 

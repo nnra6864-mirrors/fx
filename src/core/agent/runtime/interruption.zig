@@ -103,6 +103,16 @@ fn persistInterruptedTurnWithPresentation(
     defer if (durable_active_tool_call) |call| {
         types.freeToolCall(std.heap.c_allocator, call);
     };
+    // Captured-command cancellation has an explicit unavailable presentation,
+    // even if permission was cancelled before the executor produced an artifact.
+    // Establish it before journaling so the UI does not add it after acknowledgement.
+    const command_presentation = cancelled_command orelse if (durable_active_tool_call) |call|
+        (if (try @import("../../tooling/captured_command.zig").isToolCall(std.heap.c_allocator, call.name, call.arguments_json))
+            types.CancelledCommandPresentation{}
+        else
+            null)
+    else
+        null;
     const full_execution = try runtime_execution_memory.buildInterruptedExecutionMemory(
         std.heap.c_allocator,
         current_turn_messages,
@@ -127,7 +137,7 @@ fn persistInterruptedTurnWithPresentation(
             .tool_call = durable_active_tool_call,
             .completed_tool_names = completed_tool_names,
             .execution = execution,
-            .cancelled_command = cancelled_command,
+            .cancelled_command = command_presentation,
         } };
         const finished = try types.dupeFinishedPrompt(
             std.heap.c_allocator,
@@ -171,7 +181,7 @@ fn persistInterruptedTurnWithPresentation(
         .tool_call = durable_active_tool_call,
         .completed_tool_names = completed_tool_names,
         .execution = execution,
-        .cancelled_command = cancelled_command,
+        .cancelled_command = command_presentation,
     } };
 
     var propagation_error: ?anyerror = null;

@@ -7551,6 +7551,8 @@ test "saved ask settles profile publication before persistence teardown" {
     try std.testing.expectEqual(@as(usize, 1), pending.pending.len);
     try std.testing.expectEqual(@as(usize, 1), pending.publication_backlog.len);
 
+    const session_id = try alloc.dupe(u8, ctx.writable.?.active_id);
+    defer alloc.free(session_id);
     publication.allow_generation = true;
     ctx.deinit();
     ctx_live = false;
@@ -7558,10 +7560,9 @@ test "saved ask settles profile publication before persistence teardown" {
 
     var store = try session_store.Store.initFromHome(alloc, home, workspace);
     defer store.deinit(alloc);
-    var resumed = try store.resumeTargetForWrite(
+    var resumed = try store.resumeJournalForWrite(
         alloc,
-        .last,
-        workspace,
+        session_id,
         .{},
     );
     defer resumed.deinit(alloc);

@@ -149,7 +149,7 @@ test("resume keeps conversation history when accounting is damaged", async () =>
   try {
     const id = await createSavedSession(fixture, gateway);
     const dir = join(fixture.home, ".fx", "sessions", id);
-    const events = join(dir, "events.jsonl");
+    const events = join(dir, "execution.journal");
     const before = readFileSync(events);
     writeFileSync(join(dir, "usage-v2.json"), "{broken accounting", { mode: 0o600 });
     const resumed = await continueSession(fixture, gateway, id);
@@ -178,13 +178,13 @@ test("conversation language survives an ordinary saved turn and resume", async (
     expect(seeded.code).toBe(0);
     const id = JSON.parse(seeded.stdout).session_id;
     const metadata = join(fixture.home, ".fx", "sessions", id, "session.json");
-    expect(JSON.parse(readFileSync(metadata, "utf8")).conversation_language).toBe("ja");
+    expect(JSON.parse(readFileSync(metadata, "utf8")).metadata.conversation_language).toBe("ja");
     const resumed = await runFx(["ask", "--json", "--resume-id", id, "👍"], {
       cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
     });
     expect(resumed.code).toBe(0);
     expect(resumed.stderr).toBe("");
-    expect(JSON.parse(readFileSync(metadata, "utf8")).conversation_language).toBe("ja");
+    expect(JSON.parse(readFileSync(metadata, "utf8")).metadata.conversation_language).toBe("ja");
   } finally {
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });

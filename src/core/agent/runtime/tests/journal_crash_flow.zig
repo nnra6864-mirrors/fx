@@ -275,6 +275,25 @@ test "journal witness redacted tool arguments never become replayable inputs" {
     try std.testing.expectEqual(@as(usize, 0), next_gateway.request_bodies.items.len);
 }
 
+test "journal witness command permission cancellation closes before executing the tool" {
+    var fixture = support.PromptFixture{};
+    var witness = Witness.init();
+    defer witness.deinit();
+    witness.hooks.cancel_on_permission = &fixture.cancel_flag;
+    witness.hooks.permission_errors = &.{error.Cancelled};
+    var gateway = support.FakeGateway.init(std.testing.allocator, &.{.{ .tool_calls = calls[0..1] }});
+    defer gateway.deinit();
+    try witness.run(&gateway, &fixture, null);
+    try std.testing.expectEqual(@as(usize, 0), witness.entries);
+    try std.testing.expect(witness.state.pending() == .idle);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, witness.hooks.finalized_outcome.?);
+    const history = try @import("../../../session/session_codec.zig").parseHistoryTurn(std.testing.allocator, try journal.object(witness.state.outcome(0).?, "history"));
+    defer types.freeHistoryTurn(std.testing.allocator, history);
+    try std.testing.expect(history.interrupted.cancelled_command != null);
+    try std.testing.expect(history.interrupted.cancelled_command.?.output_replay == null);
+    try std.testing.expect(history.interrupted.cancelled_command.?.command_artifact_handle == null);
+}
+
 test "journal witness capacity rejects admission before model and tool effects" {
     var fixture = support.PromptFixture{};
     var witness = Witness.init();
