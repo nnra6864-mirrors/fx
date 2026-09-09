@@ -35,6 +35,17 @@ const end = (seq, value = { ok: true, stopReason: "stop" }) => entry(seq, "turn_
 const checkpoint = (seq, entries) => entry(seq, "checkpoint", { lastIncludedSeq: seq - 1, records: entries.map((item) => decodeEntry(item).body) });
 const rejected = (fn) => assert.throws(fn, JournalConflict);
 
+for (const [recorded, expected] of [
+  [{ input_tokens: 3, output_tokens: 2, reasoning_tokens: null }, { inputTokens: 3, outputTokens: 2 }],
+  [{ input_tokens: null, output_tokens: null }, {}],
+]) {
+  const entries = [start(), step(2), end(3, { ok: true, stopReason: "stop", usage: recorded })];
+  const projection = createProjection(entries);
+  assert.deepEqual(projection.requests().get("request-1").result, { ok: true, stopReason: "stop", usage: expected });
+  assert.deepEqual(createProjection([checkpoint(4, entries)]).requests(), projection.requests());
+  assert.deepEqual(decodeEntry(entries[2]).body.result.usage, recorded);
+}
+
 {
   const stopped = { ok: true, stopReason: "tool_limit" };
   const prefix = [start(), step(2, [call("first"), call("second")])];
@@ -256,7 +267,8 @@ for (const text of ["hello", "雪と😀\nquotes: \"\\"]) {
   ]);
   assert.equal(transcript.messages[0].parts[0].text, text);
   assert.equal(transcript.messages[1].parts[0].text, "Saved reply");
-  assert.deepEqual(projection.requests().get("request-1"), { inputHash: decodeEntry(entries[0]).body.inputHash, turnId: "turn-1", complete: true });
+  assert.deepEqual(projection.requests().get("request-1"), { inputHash: decodeEntry(entries[0]).body.inputHash, turnId: "turn-1", complete: true, result: decodeEntry(entries[2]).body.result });
+  assert.ok(Object.isFrozen(projection.requests().get("request-1").result));
   const pruned = checkpoint(4, entries);
   assert.deepEqual(readCheckpoint(pruned.bytes), transcript);
   assert.deepEqual(createProjection([pruned]).transcript(), transcript);

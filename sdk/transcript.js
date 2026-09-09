@@ -1,6 +1,6 @@
 import {
   decodeCheckpoint, decodeEntry, hashBytes, JournalConflict, parseJournalJson, parseToolInput,
-  PendingTurnError, RequestConflict,
+  PendingTurnError, RequestConflict, normalizeTurnUsage,
 } from "./journal-codec.js";
 
 const encoder = new TextEncoder();
@@ -320,7 +320,8 @@ function applyBody(state, body, changed) {
       }
       if (result.usage != null) state.usage = addUsage(state.usage, usage(result.usage), state.pending.usage);
       const request = state.requests.get(state.pending.requestId);
-      state.requests.set(state.pending.requestId, freeze({ ...request, complete: true }));
+      const outcome = { ...result, ...(result.usage === undefined ? {} : { usage: normalizeTurnUsage(result.usage) }) };
+      state.requests.set(state.pending.requestId, freeze({ ...request, complete: true, result: outcome }));
       state.pending = null;
       break;
     }

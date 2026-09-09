@@ -2,7 +2,7 @@ import { CoreOutput, maxCoreMessageBytes } from "./core-output.js";
 import { loadModule } from "./wasm-module.js";
 import {
   decodeEntry, JournalConflict, PersistenceUncertain, PendingTurnError,
-  RequestConflict, RecoveryRequired, JournalCapacityExceeded, parseToolInput, maxJournalEntryBytes,
+  RequestConflict, RecoveryRequired, JournalCapacityExceeded, parseToolInput, maxJournalEntryBytes, normalizeTurnUsage,
 } from "./journal-codec.js";
 import { createProjection } from "./transcript.js";
 
@@ -1923,16 +1923,6 @@ export async function createFxAgent(options = {}) {
   function normalizeJournalResult(value) {
     if (!value || typeof value.ok !== "boolean") throw failJournal(new JournalConflict("fx returned an invalid journal turn result"));
     return { ...value, ...(value.usage === undefined ? {} : { usage: normalizeTurnUsage(value.usage) }) };
-  }
-
-  function normalizeTurnUsage(usage) {
-    const result = {};
-    for (const [camel, snake] of [["inputTokens", "input_tokens"], ["outputTokens", "output_tokens"],
-      ["cacheReadTokens", "cache_read_tokens"], ["cacheWriteTokens", "cache_write_tokens"], ["reasoningTokens", "reasoning_tokens"]]) {
-      const value = usage?.[camel] ?? usage?.[snake];
-      if (Number.isSafeInteger(value)) result[camel] = value;
-    }
-    return result;
   }
 
   function startTurn(input, promptOptions, method = "session/prompt") {

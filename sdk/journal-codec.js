@@ -245,3 +245,12 @@ export function decodeEntry(entry) {
   const body = versionedBody(bytes, entry.kind);
   return { seq: entry.seq, kind: entry.kind, bytes, hash: entry.hash, body };
 }
+export function normalizeTurnUsage(usage) {
+  const result = {};
+  for (const [camel, snake] of [["inputTokens", "input_tokens"], ["outputTokens", "output_tokens"],
+    ["cacheReadTokens", "cache_read_tokens"], ["cacheWriteTokens", "cache_write_tokens"], ["reasoningTokens", "reasoning_tokens"]]) {
+    const value = usage?.[camel] ?? usage?.[snake];
+    if (Number.isSafeInteger(value)) result[camel] = value;
+  }
+  return result;
+}

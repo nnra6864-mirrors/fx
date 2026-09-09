@@ -222,6 +222,7 @@ import { createProjection, readCheckpoint } from "libfx/transcript";
 
 const projection = createProjection(journal);
 const transcript = projection.transcript();
+const recordedRequests = projection.requests(); // input hash, turn ID, completion, and recorded result
 const candidate = projection.preview(nextEntry);
 // After storing nextEntry, adopt candidate.projection and publish its delta.
 const checkpointTranscript = readCheckpoint(checkpointEntry.bytes);
