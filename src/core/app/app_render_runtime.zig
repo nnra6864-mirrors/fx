@@ -3803,7 +3803,7 @@ test "core.app_render_runtime projects Opus 4.8 one million token context to foo
         100,
         &buf,
     );
-    try std.testing.expectEqualStrings("ask · opus 4.8 · Context: 43k/1000k 4%", line);
+    try std.testing.expectEqualStrings("ask · opus 4.8 · 43k/1000k 4%", line);
 }
 
 test "core.app_render_runtime uses Gateway context window from resolved capabilities" {

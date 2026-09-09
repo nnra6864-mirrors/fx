@@ -1663,7 +1663,7 @@ test "top-level help renders flags as compact aligned rows" {
 
     try std.testing.expect(lineContainsBoth(wide, "--context-limit <spec>", "Set name=bytes|off; repeatable"));
     try std.testing.expect(lineContainsBoth(wide, "--add-dir <path>", "Add a workspace directory; repeatable"));
-    try std.testing.expect(lineContainsBoth(wide, "-c, --continue", "Resume the latest workspace session"));
+    try std.testing.expect(lineContainsBoth(wide, "-c, --continue", "Resume the remembered workspace session"));
     try std.testing.expect(lineContainsBoth(wide, "-r", "Open the saved-session picker"));
     try std.testing.expect(lineContainsBoth(wide, "--resume [last|<id>]", "Resume the latest workspace session or an exact ID"));
     try std.testing.expect(lineContainsBoth(wide, "--resume-last", "Resume the latest workspace session"));

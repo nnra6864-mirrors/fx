@@ -31,6 +31,7 @@ import {
   type GatewayRequest,
 } from "./conditional-guidance-oracle";
 import { expectPermissionModeContext } from "./permission-mode-context";
+import { stdoutFrames } from "./render-lab/tape";
 import {
   fakeGatewayFinalText,
   fakeGatewaySse,
@@ -2319,6 +2320,188 @@ describe("gateway stream lifecycle", () => {
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 45_000);
+
+  for (const scenario of [
+    { source: "model-selected", resourceFirst: false, cancel: false },
+    { source: "model-selected", resourceFirst: true, cancel: false },
+    { source: "$skill attachment", resourceFirst: false, cancel: false },
+    { source: "$skill attachment", resourceFirst: true, cancel: false },
+    { source: "$skill attachment", resourceFirst: false, cancel: true },
+  ]) {
+    test.skipIf(!tmuxAvailable())(
+      `held skill resource label: ${scenario.source}, ${scenario.resourceFirst ? "resource-first" : "location-first"}, ${scenario.cancel ? "cancel" : "finish"}`,
+      async () => {
+        const binary = process.env.FX_TEST_PRODUCT_EXE ?? FX_BIN;
+        const root = createFixtureRoot("held-skill-resource-label");
+        const skillName = "streamed-workflow";
+        const skillDirectory = join(root.home, ".fx", "skills", skillName);
+        const resource = "references/contract-design.md";
+        const resourcePath = join(skillDirectory, resource);
+        const mainSentinel = "HELD_SKILL_MAIN_INSTRUCTIONS";
+        const earlySentinel = "RESOURCE_BEFORE_PROVIDER_FINISH";
+        const resourceSentinel = "RESOURCE_AT_PROVIDER_FINISH";
+        const mainCallId = "held_skill_main";
+        const resourceCallId = "held_skill_resource";
+        const attached = scenario.source === "$skill attachment";
+        const heldRequestCount = attached ? 1 : 2;
+        const stderrPath = join(root.root, "stderr.log");
+        const tapePath = join(root.root, "session.fxtape");
+        mkdirSync(join(skillDirectory, "references"), { recursive: true });
+        writeFileSync(join(skillDirectory, "SKILL.md"),
+          `---\nname: ${skillName}\ndescription: Streamed resource label fixture\n---\n${mainSentinel}\nRead ${resource} before answering.\n`);
+        writeFileSync(resourcePath, `${earlySentinel}\n`);
+
+        let location = "";
+        let requestIndex = 0;
+        let stream: ReadableStreamDefaultController<Uint8Array> | undefined;
+        let streamClosed = false;
+        let finishReleased = false;
+        const encoder = new TextEncoder();
+        const send = (event: object) => {
+          stream!.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+        };
+        const releaseFinish = () => {
+          finishReleased = true;
+          if (streamClosed) return;
+          send({ type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } });
+          stream!.enqueue(encoder.encode("data: [DONE]\n\n"));
+          stream!.close();
+          streamClosed = true;
+        };
+        const gateway = startDynamicFakeGateway((body) => {
+          const index = requestIndex++;
+          if (index === 0) {
+            const locations = advertisedSkillLocations(body, skillName);
+            expect(locations).toHaveLength(1);
+            location = locations[0]!;
+            expect(location).toMatch(/^skill:[0-9a-f]{16}:\d+\//);
+            expect(advertisedSkillPath(body, location)).toBe(skillDirectory);
+            if (!attached) return fakeGatewayToolCall(mainCallId, "skill", { location });
+            expect(promptText(body)).toContain("Explicitly invoked skill content");
+            expect(promptText(body)).toContain(mainSentinel);
+          }
+          if (index === heldRequestCount - 1) {
+            if (!attached) expect(toolResultOutput(body, mainCallId)).toContain(mainSentinel);
+            expect(body).not.toContain(earlySentinel);
+            expect(body).not.toContain(resourceSentinel);
+            return new Response(new ReadableStream<Uint8Array>({
+              start(controller) {
+                stream = controller;
+                send({ type: "tool-input-start", id: resourceCallId, toolName: "skill" });
+              },
+              cancel() { streamClosed = true; },
+            }), { headers: { "content-type": "text/event-stream" } });
+          }
+          expect(finishReleased).toBe(true);
+          if (!scenario.cancel && index === heldRequestCount) {
+            const result = toolResultOutput(body, resourceCallId);
+            expect(result).toContain(resourceSentinel);
+            expect(result).not.toContain(earlySentinel);
+            return fakeGatewayFinalText("HELD_SKILL_RESOURCE_COMPLETE");
+          }
+          expect(promptText(body)).toContain("Confirm later input still works.");
+          if (scenario.cancel) {
+            expect(body).not.toContain(earlySentinel);
+            expect(body).not.toContain(resourceSentinel);
+            expect(hasCurrentToolResult(body, resourceCallId)).toBe(false);
+          }
+          return fakeGatewayFinalText("HELD_SKILL_LATER_INPUT_OK");
+        }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+        let tui: TmuxSession | null = null;
+        try {
+          tui = await TmuxSession.create({
+            cmd: binary,
+            cwd: root.workspace,
+            isolated: true,
+            remainOnExit: true,
+            width: 140,
+            height: 40,
+            stderrPath,
+            env: {
+              ...fixtureEnv(root, gateway, join(root.root, "trace.log")),
+              FX_AUTO_UPGRADE: "0",
+              FX_PERMISSION_MODE: "auto",
+              FX_RECORD: tapePath,
+            },
+          });
+          await tui.waitForStableComposer(15_000);
+          await tui.sendText(attached
+            ? `$${skillName} read its supporting resource.`
+            : "Load streamed-workflow and read its supporting resource.");
+          await tui.waitForPane((pane) => stream !== undefined && pane.includes("Loading skill"), 15_000);
+          expect(gateway.requestCount()).toBe(heldRequestCount);
+          expect(await tui.captureFullScrollback()).not.toContain(location);
+
+          // Keep streamed input location-first even when final argument keys are reversed.
+          send({ type: "tool-input-delta", id: resourceCallId, delta: JSON.stringify({ location, resource }) });
+          send({ type: "tool-input-end", id: resourceCallId });
+          send({
+            type: "tool-call", toolCallId: resourceCallId, toolName: "skill",
+            input: scenario.resourceFirst ? { resource, location } : { location, resource },
+          });
+          await tui.waitForPane((pane) =>
+            pane.includes(`Reading skill resource ${resource}`) ||
+            pane.includes(location) || pane.includes(`Loading skill ${resource}`), 10_000);
+          // Observe a held interval, not just the first render, without releasing finish.
+          const heldUntil = Date.now() + 250;
+          while (Date.now() < heldUntil) {
+            expect(gateway.requestCount()).toBe(heldRequestCount);
+            expect(tui.paneStatus().dead).toBe(false);
+            await Bun.sleep(25);
+          }
+          const held = await tui.captureFullScrollback();
+          expect(held).not.toContain(location);
+          expect(held).toContain(`Reading skill resource ${resource}`);
+          expect(held).not.toContain(`Read skill resource ${resource}`);
+          expect(finishReleased).toBe(false);
+          expect(gateway.requestCount()).toBe(heldRequestCount);
+
+          // An early resource read would return the old sentinel after finish.
+          writeFileSync(resourcePath, `${resourceSentinel}\n`);
+          if (scenario.cancel) {
+            await tui.sendKeys("C-c");
+            await tui.waitForText("What can fx do differently?", 10_000);
+            await tui.waitForStableComposer(10_000);
+            expect(gateway.requestCount()).toBe(heldRequestCount);
+            releaseFinish();
+          } else {
+            releaseFinish();
+            await tui.waitForText("HELD_SKILL_RESOURCE_COMPLETE", 15_000);
+            await tui.waitForStableComposer(10_000);
+            const completed = await tui.captureFullScrollback();
+            expect(completed).toContain(`Read skill resource ${resource}`);
+            expect(completed).not.toContain(location);
+            if (!attached) expect(completed).toContain(`Loaded skill ${skillName}`);
+            expect(gateway.requestCount()).toBe(heldRequestCount + 1);
+          }
+          await tui.sendText("Confirm later input still works.");
+          await tui.waitForText("HELD_SKILL_LATER_INPUT_OK", 15_000);
+          await tui.waitForStableComposer(10_000);
+          expect(gateway.requestCount()).toBe(heldRequestCount + (scenario.cancel ? 1 : 2));
+          const scrollback = await tui.captureFullScrollback();
+          expect(scrollback).not.toContain(location);
+          if (scenario.cancel) {
+            expect(scrollback).not.toContain(`Read skill resource ${resource}`);
+            expect(scrollback).not.toContain("HELD_SKILL_RESOURCE_COMPLETE");
+          }
+          await tui.sendText("/quit");
+          await tui.waitForPane(() => paneExitMatches(tui!.paneStatus(), 0), 10_000);
+          expect(tui.paneStatus()).toMatchObject({ dead: true, status: 0 });
+          expect(readFileSync(stderrPath, "utf8")).toBe("");
+          // Inspect every output frame, including provisional rows later overwritten in place.
+          const output = Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)).toString("utf8");
+          expect(output).toContain(resource);
+          expect(output).not.toMatch(/skill:[0-9a-f]{16}:\d+\//);
+        } finally {
+          if (stream && !streamClosed) stream.close();
+          if (tui) await tui.kill();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      },
+      90_000,
+    );
+  }
 
   test("dynamic model-context values stay data", async () => {
     const root = createFixtureRoot(
@@ -6846,6 +7029,64 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 30_000);
+
+  test("ask continues and persists a healthy parent when child recovery is unavailable", async () => {
+    const root = createFixtureRoot("subagent-recovery-unavailable");
+    const tracePath = join(root.root, "trace.log");
+    const replies = ["PARENT_SEED_SENTINEL", "PARENT_CONTINUATION_SAVED", "PARENT_REOPENED"];
+    let requestIndex = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      if (requestIndex > 0) expect(body).toContain(replies[0]);
+      if (requestIndex === 2) expect(body).toContain(replies[1]);
+      return fakeGatewayFinalText(replies[requestIndex++] ?? "UNEXPECTED_REQUEST");
+    });
+    const env = { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "subagent,session" };
+    try {
+      const seeded = await runFx(["ask", "--json", "Start a saved conversation."], {
+        cwd: root.workspace, env, timeoutMs: 15_000,
+      });
+      expect(seeded.code).toBe(0);
+      const id = parseAskJson(seeded.stdout).session_id;
+      expect(id).not.toBe("");
+      const directory = join(root.home, ".fx", "sessions", id);
+      const eventsPath = join(directory, "events.jsonl");
+      const originalEvents = readFileSync(eventsPath, "utf8");
+      const childDirectory = join(directory, "subagent");
+      mkdirSync(childDirectory, { recursive: true, mode: 0o700 });
+      const registryPath = join(childDirectory, "children.json");
+      writeFileSync(registryPath, "[]", { mode: 0o600 });
+
+      const resumed = await runFx(["ask", "--json", "--resume-id", id, "Continue without delegation."], {
+        cwd: root.workspace, env, timeoutMs: 15_000,
+      });
+      expect(resumed.code).toBe(0);
+      expect(resumed.stderr).toBe("");
+      const result = parseAskJson(resumed.stdout);
+      expect(result.session_id).toBe(id);
+      expect(result.final_output).toBe(replies[1]);
+      expect(result.tool_calls).toEqual([]);
+      expect(gateway.requests).toHaveLength(2);
+      const continuedEvents = readFileSync(eventsPath, "utf8");
+      expect(continuedEvents.startsWith(originalEvents)).toBe(true);
+      expect(continuedEvents).toContain(replies[1]);
+      expect(continuedEvents.trim().split("\n").map(line => JSON.parse(line)).filter(frame => frame.event.turn_completed)).toHaveLength(2);
+      expect(readFileSync(registryPath, "utf8")).toBe("[]");
+      expect(readFileSync(tracePath, "utf8")).toContain("ask subagent host unavailable");
+
+      const reopened = await runFx(["ask", "--json", "--resume-id", id, "Continue again without delegation."], {
+        cwd: root.workspace, env, timeoutMs: 15_000,
+      });
+      expect(reopened.code).toBe(0);
+      expect(reopened.stderr).toBe("");
+      expect(parseAskJson(reopened.stdout).session_id).toBe(id);
+      expect(parseAskJson(reopened.stdout).final_output).toBe(replies[2]);
+      expect(gateway.requests).toHaveLength(3);
+      expect(readFileSync(registryPath, "utf8")).toBe("[]");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
 
   test("ask fake Gateway exercises one-off and chat-created persistent subagents", async () => {
     const root = createFixtureRoot("subagent-managed-flow");

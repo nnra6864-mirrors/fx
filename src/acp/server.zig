@@ -624,15 +624,6 @@ pub fn enableSubagentHost(state: *ServerState) void {
         state.subagent_store = null;
         return;
     };
-    state.subagent_host.?.requestBackgroundRecovery(
-        io_mod.milliTimestamp(),
-    ) catch |err| {
-        debug_trace.logf(
-            "subagent",
-            "acp background recovery unavailable root_id={s} outcome={s}",
-            .{ state.subagent_host.?.root_id, @errorName(err) },
-        );
-    };
 }
 
 fn resolveSubagentAuthority(

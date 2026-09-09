@@ -433,6 +433,17 @@ test("switching back reattaches the live original host without recovery or resta
     await f.tui.waitForText("RETURN_OK", 15000);
     await releaseAndAdopt(f, child);
     await quit(f);
+    await f.tui.kill();
+    f.tui = await TmuxSession.create({
+      cmd: `${quote(FX_BIN)} --continue`, cwd: f.workspace,
+      env: { ...f.env, FX_RECORD: join(f.root, "continued.fxtape"), FX_TRACE_LOG: join(f.root, "continued-trace.log") },
+      isolated: true, remainOnExit: true, width: 110, height: 35, stderrPath: f.stderr,
+    });
+    await f.tui.waitForStableComposer(15000);
+    const continued = await f.tui.captureFullScrollback();
+    assert(continued.includes("MAIN_START"), "continuation remembers the explicitly reselected retained session");
+    assert(!continued.includes("OTHER_SESSION"));
+    await quit(f);
   });
 }, 60000);
 

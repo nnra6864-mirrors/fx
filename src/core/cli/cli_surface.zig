@@ -106,13 +106,14 @@ pub const UpgradeRelaunch = struct {
 const resume_picker_alias = "-r";
 
 pub const ResumeTarget = union(enum) {
+    remembered,
     pick,
     last,
     id: []u8,
 
     pub fn deinit(self: *ResumeTarget, alloc: Allocator) void {
         switch (self.*) {
-            .pick, .last => {},
+            .remembered, .pick, .last => {},
             .id => |value| alloc.free(value),
         }
         self.* = undefined;
@@ -3586,6 +3587,7 @@ fn parseResumeArgs(
         }
         if (args.len != 1) return error.InvalidResumeArgs;
         if (std.mem.eql(u8, args[0], resume_picker_alias)) return .pick;
+        if (std.mem.eql(u8, args[0], "-c") or std.mem.eql(u8, args[0], "--continue")) return .remembered;
         if (command_specs.matchesTopLevel(command_catalog, args[0], .@"resume")) return .last;
         if (!std.mem.startsWith(u8, args[0], resume_id_alias_prefix)) return error.InvalidResumeArgs;
         const id = args[0][resume_id_alias_prefix.len..];
@@ -4213,7 +4215,7 @@ test "parse resume args accepts explicit id flag" {
     defer target.deinit(std.testing.allocator);
 
     switch (target) {
-        .pick, .last => return error.TestExpectedExactResumeId,
+        .remembered, .pick, .last => return error.TestExpectedExactResumeId,
         .id => |id| try std.testing.expectEqualStrings("release.2026.06", id),
     }
 }
@@ -4227,7 +4229,7 @@ test "parse resume args accepts an operand on the top-level resume flag" {
     defer target.deinit(std.testing.allocator);
 
     switch (target) {
-        .pick, .last => return error.TestExpectedExactResumeId,
+        .remembered, .pick, .last => return error.TestExpectedExactResumeId,
         .id => |id| try std.testing.expectEqualStrings("session-123", id),
     }
 
@@ -4247,7 +4249,7 @@ test "parse resume args treats last after id flag as exact id" {
     defer target.deinit(std.testing.allocator);
 
     switch (target) {
-        .pick, .last => return error.TestExpectedExactResumeId,
+        .remembered, .pick, .last => return error.TestExpectedExactResumeId,
         .id => |id| try std.testing.expectEqualStrings("last", id),
     }
 }
@@ -4323,7 +4325,7 @@ test "parseInteractiveLaunch shares native resume grammar" {
                 const target = launch.requested_resume orelse return error.TestExpectedResumeTarget;
                 if (case.expected_id) |expected_id| switch (target) {
                     .id => |id| try std.testing.expectEqualStrings(expected_id, id),
-                    .pick, .last => return error.TestExpectedExactResumeId,
+                    .remembered, .pick, .last => return error.TestExpectedExactResumeId,
                 } else try std.testing.expectEqual(ResumeTarget.last, target);
             },
             .noninteractive => |value| {
@@ -4935,7 +4937,10 @@ test "runIfRequested top-level resume aliases return the existing target" {
             capture.deps(),
         );
         switch (result) {
-            .interactive => |launch| try std.testing.expectEqual(ResumeTarget.last, launch.requested_resume.?),
+            .interactive => |launch| {
+                const expected: ResumeTarget = if (std.mem.eql(u8, args[0], "-c") or std.mem.eql(u8, args[0], "--continue")) .remembered else .last;
+                try std.testing.expectEqual(expected, launch.requested_resume.?);
+            },
             else => return error.TestExpectedEqual,
         }
         try std.testing.expectEqualStrings("", capture.stdout.written());
@@ -4957,7 +4962,7 @@ test "runIfRequested top-level resume aliases return the existing target" {
             defer launch.deinit(std.testing.allocator);
             switch (launch.requested_resume.?) {
                 .id => |id| try std.testing.expectEqualStrings("session.123", id),
-                .pick, .last => return error.TestExpectedExactResumeId,
+                .remembered, .pick, .last => return error.TestExpectedExactResumeId,
             }
         },
         else => return error.TestExpectedEqual,
@@ -4978,7 +4983,7 @@ test "runIfRequested top-level resume aliases return the existing target" {
             defer launch.deinit(std.testing.allocator);
             switch (launch.requested_resume.?) {
                 .id => |id| try std.testing.expectEqualStrings("session.123", id),
-                .pick, .last => return error.TestExpectedExactResumeId,
+                .remembered, .pick, .last => return error.TestExpectedExactResumeId,
             }
         },
         else => return error.TestExpectedEqual,

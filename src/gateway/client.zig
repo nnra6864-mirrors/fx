@@ -3411,7 +3411,7 @@ fn consumeSseStreamTraced(
                 return err;
             };
             if (name.len > 0) {
-                if (on_tool_start) |cb| cb(callback_ctx, id, name, null);
+                if (on_tool_start) |cb| cb(callback_ctx, id, name, null, null);
             }
         } else if (std.mem.eql(u8, event_type, "tool-input-delta") or
             std.mem.eql(u8, event_type, "tool-input-end"))
@@ -3583,10 +3583,8 @@ fn consumeSseStreamTraced(
                     acc.argument_integrity == .valid)
                 {
                     if (on_tool_start) |cb| {
-                        if (extractFirstJsonStringValue(acc.arguments.items)) |value| {
-                            record.label_sent = true;
-                            cb(callback_ctx, record.id.items, record.name.items, value);
-                        }
+                        record.label_sent = true;
+                        cb(callback_ctx, record.id.items, record.name.items, extractFirstJsonStringValue(acc.arguments.items), acc.arguments.items);
                     }
                 }
             }
@@ -4455,7 +4453,7 @@ test "consumeSseStream traces every SSE event with keyless metadata" {
             if (std.mem.eql(u8, chunk, "answer")) self.content_chunks += 1;
         }
 
-        fn onToolStart(ctx: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8) void {
+        fn onToolStart(ctx: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8, _: ?[]const u8) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.tool_starts += 1;
         }
@@ -5003,7 +5001,7 @@ test "consumeSseStream does not publish labels from malformed streamed arguments
 
         fn onContent(_: *anyopaque, _: []const u8) void {}
 
-        fn onToolStart(ctx: *anyopaque, _: []const u8, _: []const u8, label: ?[]const u8) void {
+        fn onToolStart(ctx: *anyopaque, _: []const u8, _: []const u8, label: ?[]const u8, _: ?[]const u8) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             const value = label orelse return;
             self.labels += 1;
@@ -5270,7 +5268,7 @@ test "consumeSseStream isolates interleaved streamed inputs by exact event id" {
 
         fn onContent(_: *anyopaque, _: []const u8) void {}
 
-        fn onToolStart(ctx: *anyopaque, _: []const u8, _: []const u8, label: ?[]const u8) void {
+        fn onToolStart(ctx: *anyopaque, _: []const u8, _: []const u8, label: ?[]const u8, _: ?[]const u8) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             if (label == null) {
                 self.starts += 1;
@@ -5305,6 +5303,59 @@ test "consumeSseStream isolates interleaved streamed inputs by exact event id" {
     try std.testing.expectEqualStrings("{\"pattern\":\"needle-B\"}", completion.tool_calls[1].arguments_json);
     try std.testing.expect(completion.tool_calls[1].provisional_id == null);
     try std.testing.expect(completion.provider_result_identity_failure == null);
+}
+
+test "consumeSseStream observes complete skill arguments before finish even without a label hint" {
+    const Capture = struct {
+        expected_json: []const u8,
+        expected_hint: ?[]const u8,
+        starts: usize = 0,
+        updates: usize = 0,
+        matched: bool = true,
+
+        fn content(_: *anyopaque, _: []const u8) void {}
+        fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, hint: ?[]const u8, arguments_json: ?[]const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.matched = self.matched and std.mem.eql(u8, id, "skill_1") and std.mem.eql(u8, name, "skill");
+            if (arguments_json) |json| {
+                self.updates += 1;
+                self.matched = self.matched and std.mem.eql(u8, self.expected_json, json);
+                self.matched = self.matched and if (self.expected_hint) |expected|
+                    if (hint) |actual| std.mem.eql(u8, expected, actual) else false
+                else
+                    hint == null;
+            } else {
+                self.starts += 1;
+                self.matched = self.matched and hint == null;
+            }
+        }
+    };
+    const cases = [_]struct { json: []const u8, hint: ?[]const u8 }{
+        .{ .json = "{\"location\":\"skill:opaque/location\",\"resource\":\"references/types.md\"}", .hint = "skill:opaque/location" },
+        .{ .json = "{\"resource\":\"references/types.md\",\"location\":\"skill:opaque/location\"}", .hint = "references/types.md" },
+        .{ .json = "{\"offset\":0,\"location\":\"skill:opaque/location\",\"resource\":\"references/types.md\"}", .hint = null },
+    };
+    const alloc = std.testing.allocator;
+    for (cases) |case| {
+        const payload = try std.fmt.allocPrint(
+            alloc,
+            "data: {{\"type\":\"tool-input-start\",\"id\":\"skill_1\",\"toolName\":\"skill\"}}\n\n" ++
+                "data: {{\"type\":\"tool-input-end\",\"id\":\"skill_1\"}}\n\n" ++
+                "data: {{\"type\":\"tool-call\",\"toolCallId\":\"skill_1\",\"toolName\":\"skill\",\"input\":{s}}}\n\n",
+            .{case.json},
+        );
+        defer alloc.free(payload);
+        var reader = std.Io.Reader.fixed(payload);
+        var cancelled = std.atomic.Value(bool).init(false);
+        var capture = Capture{ .expected_json = case.json, .expected_hint = case.hint };
+        var completion = try consumeSseStream(alloc, &reader, &capture, Capture.content, Capture.toolStart, &cancelled);
+        defer deinitGatewayCompletion(alloc, &completion);
+        try std.testing.expect(capture.matched);
+        try std.testing.expectEqual(@as(usize, 1), capture.starts);
+        try std.testing.expectEqual(@as(usize, 1), capture.updates);
+        try std.testing.expect(completion.finish_reason == null);
+        try std.testing.expectEqualStrings(case.json, completion.tool_calls[0].arguments_json);
+    }
 }
 
 test "consumeSseStream ignores conflicting and late stream events without mutation" {
@@ -5343,7 +5394,7 @@ test "consumeSseStream ignores conflicting and late stream events without mutati
 
         fn onContent(_: *anyopaque, _: []const u8) void {}
 
-        fn onToolStart(ctx: *anyopaque, _: []const u8, _: []const u8, label: ?[]const u8) void {
+        fn onToolStart(ctx: *anyopaque, _: []const u8, _: []const u8, label: ?[]const u8, _: ?[]const u8) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             if (label == null) {
                 self.starts += 1;
@@ -5896,7 +5947,7 @@ fn checkConsumeSseAllocationFailures(alloc: std.mem.Allocator) !void {
 
     const Noop = struct {
         fn chunk(_: *anyopaque, _: []const u8) void {}
-        fn toolStart(_: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8) void {}
+        fn toolStart(_: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8, _: ?[]const u8) void {}
     };
 
     var reader = std.Io.Reader.fixed(payload);
@@ -5944,7 +5995,7 @@ test "consumeSseStream frees streamed state on cancellation after a start" {
 
         fn chunk(_: *anyopaque, _: []const u8) void {}
 
-        fn toolStart(ctx: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8) void {
+        fn toolStart(ctx: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8, _: ?[]const u8) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.cancel_flag.store(true, .seq_cst);
         }

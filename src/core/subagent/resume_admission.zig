@@ -301,7 +301,10 @@ pub fn loadVisibleReadOnlyDetail(
     };
     if (managed) return error.SessionNotFound;
 
-    var detail = try store.loadReadOnlyDetail(alloc, session_id, options);
+    var detail = store.loadReadOnlyAdmissionDetail(alloc, session_id, options) catch |err| switch (err) {
+        error.ConversationHistoryUnavailable => return error.SessionNotFound,
+        else => return err,
+    };
     errdefer detail.deinit(alloc);
     if (detail.state.subagent_child) return error.SessionNotFound;
     return detail;

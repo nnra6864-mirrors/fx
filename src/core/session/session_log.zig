@@ -884,7 +884,22 @@ fn loadConversationStateIfPresent(
     dir: *io_mod.VerifiedDir,
     expected_session_id: []const u8,
 ) !?session_codec.DurableSessionState {
-    return load_conversation_state_at_boundary(alloc, dir, expected_session_id, null, null);
+    return load_conversation_state_at_boundary(alloc, dir, expected_session_id, null, null, null);
+}
+
+/// Loads owned detail state, distinguishing unreadable conversation history
+/// from supporting-file errors. Writable resume retains its original errors.
+pub fn loadConversationDetailState(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+) !session_codec.DurableSessionState {
+    var history_failed = false;
+    return (load_conversation_state_at_boundary(alloc, dir, session_id, null, null, &history_failed) catch |err| {
+        if (err == error.OutOfMemory or !history_failed) return err;
+        debug_trace.logf("session", "conversation detail history unavailable id={s} err={s}", .{ session_id, @errorName(err) });
+        return error.ConversationHistoryUnavailable;
+    }) orelse error.SessionMigrationRequired;
 }
 
 fn load_conversation_state_at_boundary(
@@ -893,6 +908,7 @@ fn load_conversation_state_at_boundary(
     expected_session_id: []const u8,
     recovery: ?ConversationRecoveryBoundary,
     replay_window: ?ConversationReplayWindow,
+    history_failed: ?*bool,
 ) !?session_codec.DurableSessionState {
     const metadata_bytes = readManagedFileAlloc(
         alloc,
@@ -924,13 +940,18 @@ fn load_conversation_state_at_boundary(
     if (!std.mem.eql(u8, metadata.value.id, expected_session_id)) {
         return error.InvalidSessionMetadata;
     }
-    var event_file = try openManagedFile(dir, events_file, .read_only);
-    defer event_file.close(io_mod.getIo());
     var conversation_seq: u64 = 0;
     var open_work_id: ?[]u8 = null;
     defer if (open_work_id) |work_id| alloc.free(work_id);
-    const length = if (recovery) |boundary| boundary.bytes else try event_file.length(io_mod.getIo());
-    const history = try replayConversationHistory(alloc, event_file, length, &conversation_seq, &open_work_id, replay_window);
+    const history = blk: {
+        errdefer if (history_failed) |failed| {
+            failed.* = true;
+        };
+        var event_file = try openManagedFile(dir, events_file, .read_only);
+        defer event_file.close(io_mod.getIo());
+        const length = if (recovery) |boundary| boundary.bytes else try event_file.length(io_mod.getIo());
+        break :blk try replayConversationHistory(alloc, event_file, length, &conversation_seq, &open_work_id, replay_window);
+    };
     errdefer session.freeHistoryTurnSlice(alloc, history);
     if (recovery == null) try restoreContextResultBodies(alloc, dir, history);
     const latest_work_id = if (recovery != null and recovery.?.turn_open and open_work_id != null)
@@ -1134,7 +1155,7 @@ pub fn load_conversation_recovery_state(
     session_id: []const u8,
     boundary: ConversationRecoveryBoundary,
 ) !session_codec.DurableSessionState {
-    const loaded = load_conversation_state_at_boundary(alloc, dir, session_id, boundary, null) catch |err| switch (err) {
+    const loaded = load_conversation_state_at_boundary(alloc, dir, session_id, boundary, null, null) catch |err| switch (err) {
         error.InvalidSessionMetadata, error.InvalidSessionFormat => return error.SessionRecoveryBoundaryInvalid,
         else => return err,
     };
@@ -1367,6 +1388,7 @@ fn openConversationWritableSession(
         writable.session_id,
         null,
         replay_window,
+        null,
     )) orelse return error.InvalidSessionMetadata;
     errdefer state.deinit(alloc);
     const active_id = try alloc.dupe(u8, writable.session_id);

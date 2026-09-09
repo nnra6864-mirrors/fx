@@ -4118,6 +4118,7 @@ fn onRequiredVisionStreamToolStart(
     tool_id: []const u8,
     tool_name: []const u8,
     label_value: ?[]const u8,
+    arguments_json: ?[]const u8,
 ) void {
     if (!std.mem.eql(u8, tool_name, "vision")) {
         runtime_assistant_stream.recordStreamToolStart(ctx, tool_name);
@@ -4128,6 +4129,7 @@ fn onRequiredVisionStreamToolStart(
         tool_id,
         tool_name,
         label_value,
+        arguments_json,
     );
 }
 
@@ -4143,9 +4145,9 @@ fn onProviderEvent(raw: *anyopaque, event: agent_stream_provider.Event) void {
         .reasoning_delta => |chunk| runtime_assistant_stream.onStreamReasoningChunk(ctx.stream, chunk),
         .tool_input_delta => |chunk| runtime_assistant_stream.onStreamToolInputChunk(ctx.stream, chunk),
         .tool_started => |tool| if (ctx.required_vision)
-            onRequiredVisionStreamToolStart(ctx.stream, tool.id, tool.name, tool.label)
+            onRequiredVisionStreamToolStart(ctx.stream, tool.id, tool.name, tool.label, tool.arguments_json)
         else
-            runtime_assistant_stream.onStreamToolStart(ctx.stream, tool.id, tool.name, tool.label),
+            runtime_assistant_stream.onStreamToolStart(ctx.stream, tool.id, tool.name, tool.label, tool.arguments_json),
     }
 }
 
