@@ -946,7 +946,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "ccc1e489bf536f2f518a0b32c02ddc99a9f2af6fd3466c6456da3b22fbed23d4",
+        "3d0fc5ea5da7d7c136edc732d2229fa0a30f714fcabacd1015706ac16767060e",
         &actual_hex,
     );
 }
@@ -1403,13 +1403,17 @@ test "built-in subagent owns product metadata schema and callbacks" {
     defer std.testing.allocator.free(schema_json);
 
     try std.testing.expectEqualStrings("subagent", subagent.name);
-    try std.testing.expect(std.mem.find(u8, subagent.description, "one temporary child") != null);
-    try std.testing.expect(std.mem.find(u8, subagent.description, "stable name") != null);
+    try std.testing.expect(std.mem.find(u8, subagent.description, "one temporary task") != null);
+    try std.testing.expect(std.mem.find(u8, subagent.description, "named child") != null);
+    try std.testing.expect(std.mem.find(u8, subagent.description, subagent_model_contract.pending_work_guidance) != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"request\":{") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"request\"]") != null);
-    for ([_][]const u8{ "run", "message" }) |action| {
-        try std.testing.expect(std.mem.find(u8, schema_json, action) != null);
+    for ([_][]const u8{ "run", "message", "cancel" }) |action| {
+        var buffer: [64]u8 = undefined;
+        const variant = try std.fmt.bufPrint(&buffer, "\"enum\":[\"{s}\"]", .{action});
+        try std.testing.expect(std.mem.find(u8, schema_json, variant) != null);
     }
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"action\",\"child_id\",\"work_id\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"instructions\":") != null);
     for ([_][]const u8{
         "\"command\":",
@@ -1425,7 +1429,6 @@ test "built-in subagent owns product metadata schema and callbacks" {
         "\"send\"",
         "\"wait\"",
         "\"stop\"",
-        "\"child_id\"",
     }) |mechanism| {
         try std.testing.expect(std.mem.find(u8, schema_json, mechanism) == null);
     }
