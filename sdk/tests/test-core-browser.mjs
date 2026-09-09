@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { readFile, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { extname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -16,9 +17,10 @@ const chromeCandidates = [
   "chromium",
 ].filter(Boolean);
 const chromeStartTimeoutMs = 15_000;
+const chromeProfile = await mkdtemp(resolve(tmpdir(), "libfx-browser-profile-"));
 
 async function stopChrome(process) {
-  if (process.exitCode !== null || process.signalCode !== null) return;
+  if (!process.pid || process.exitCode !== null || process.signalCode !== null) return;
   process.kill();
   await new Promise((resolveExit) => process.once("exit", resolveExit));
 }
@@ -50,6 +52,7 @@ for (const candidate of chromeCandidates) {
   try {
     const args = [
       "--headless=new",
+      `--user-data-dir=${chromeProfile}`,
       "--no-first-run",
       "--no-default-browser-check",
       "--disable-background-networking",
@@ -91,6 +94,7 @@ for (const candidate of chromeCandidates) {
 }
 if (!chrome) {
   server.close();
+  await rm(chromeProfile, { recursive: true, force: true });
   console.error(`Chrome could not be started: ${chromeLaunchError?.message || "no executable found"}`);
   process.exit(2);
 }
@@ -230,4 +234,5 @@ try {
   socket.close();
   await stopChrome(chrome);
   server.close();
+  await rm(chromeProfile, { recursive: true, force: true });
 }
