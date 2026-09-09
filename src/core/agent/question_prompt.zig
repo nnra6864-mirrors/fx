@@ -4,6 +4,7 @@ const edit_contract = @import("../input/editor_state.zig");
 const io_mod = @import("../shared/io.zig");
 const text_boundaries = @import("../input/text_boundaries.zig");
 const types = @import("../shared/types.zig");
+const subagent_domain = @import("../subagent/domain.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -109,6 +110,7 @@ pub const Projection = struct {
 };
 
 pub const QuestionPrompt = struct {
+    child_target: ?subagent_domain.QuestionTarget = null,
     active: bool = false,
     entries: std.ArrayList(OwnedQuestionEntry) = .empty,
     current_index: u8 = 0,
@@ -145,6 +147,11 @@ pub const QuestionPrompt = struct {
     }
 
     pub fn discard(self: *QuestionPrompt, alloc: Allocator, reason: []const u8) void {
+        if (self.child_target) |target| {
+            debug_trace.eventf("subagent", "child_question_display_detached", .{}, "root_id={s} child_id={s} work_id={s} generation={d} reason={s}", .{ target.root_id, target.child_id, target.work_id, target.generation, reason });
+            target.deinit(alloc);
+            self.child_target = null;
+        }
         self.active = false;
         self.current_index = 0;
         for (self.entries.items, 0..) |*entry, entry_index| {
@@ -155,6 +162,11 @@ pub const QuestionPrompt = struct {
     }
 
     pub fn resetAfterSubmission(self: *QuestionPrompt, alloc: Allocator) void {
+        if (self.child_target) |target| {
+            debug_trace.eventf("subagent", "child_question_display_completed", .{}, "root_id={s} child_id={s} work_id={s} generation={d}", .{ target.root_id, target.child_id, target.work_id, target.generation });
+            target.deinit(alloc);
+            self.child_target = null;
+        }
         self.active = false;
         self.current_index = 0;
         for (self.entries.items, 0..) |*entry, entry_index| {
@@ -190,7 +202,20 @@ pub const QuestionPrompt = struct {
         alloc: Allocator,
         entries: []const types.QuestionBatchEntry,
     ) !void {
+        if (self.child_target != null) self.discard(alloc, "main_question_replaced_child_display");
         return self.syncFromOptions(alloc, entries, true);
+    }
+
+    pub fn syncChildFrom(self: *QuestionPrompt, alloc: Allocator, entries: []const types.QuestionBatchEntry, target: subagent_domain.QuestionTarget) !void {
+        if (self.child_target) |prior| {
+            if (prior.eql(target) and self.active and self.matches(entries, true)) return;
+        }
+        const owned = try target.dupe(alloc);
+        errdefer owned.deinit(alloc);
+        self.discard(alloc, "child_question_replaced");
+        try self.syncFromOptions(alloc, entries, true);
+        self.child_target = owned;
+        debug_trace.eventf("subagent", "child_question_display_attached", .{}, "root_id={s} child_id={s} work_id={s} generation={d}", .{ target.root_id, target.child_id, target.work_id, target.generation });
     }
 
     /// Rebuild the prompt without the synthetic freeform slot.
@@ -199,6 +224,7 @@ pub const QuestionPrompt = struct {
         alloc: Allocator,
         entries: []const types.QuestionBatchEntry,
     ) !void {
+        if (self.child_target != null) self.discard(alloc, "main_question_replaced_child_display");
         return self.syncFromOptions(alloc, entries, false);
     }
 
@@ -674,6 +700,34 @@ pub const QuestionPrompt = struct {
         );
     }
 };
+
+test "child question routing owns identity and cannot carry answers into the main prompt" {
+    const Fixture = struct {
+        fn check(alloc: Allocator) !void {
+            var prompt = QuestionPrompt{};
+            defer prompt.deinit(alloc);
+            const options = [_]types.QuestionOption{.{ .label = "Continue", .description = null }};
+            const entries = [_]types.QuestionBatchEntry{.{ .question = "Tool input", .options = &options }};
+            const target = subagent_domain.QuestionTarget{ .root_id = "root", .child_id = "child", .work_id = "work", .generation = 1 };
+            try prompt.syncChildFrom(alloc, &entries, target);
+            try std.testing.expect(prompt.child_target.?.root_id.ptr != target.root_id.ptr);
+            _ = try prompt.apply(alloc, .{ .move_choice = .previous });
+            _ = try prompt.apply(alloc, .{ .insert_ascii = 'x' });
+            try prompt.syncChildFrom(alloc, &entries, target);
+            try std.testing.expectEqualStrings("x", prompt.entries.items[0].freeform_buffer.items);
+            try prompt.syncFrom(alloc, &entries);
+            try std.testing.expect(prompt.child_target == null);
+            try std.testing.expectEqual(@as(usize, 0), prompt.entries.items[0].freeform_buffer.items.len);
+            var next = target;
+            next.generation = 2;
+            try prompt.syncChildFrom(alloc, &entries, next);
+            try std.testing.expectEqual(@as(u64, 2), prompt.child_target.?.generation);
+            prompt.resetAfterSubmission(alloc);
+            try std.testing.expect(prompt.child_target == null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.check, .{});
+}
 
 fn syncTestQuestion(prompt: *QuestionPrompt) !void {
     const opts = [_]types.QuestionOption{

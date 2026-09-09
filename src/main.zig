@@ -389,7 +389,14 @@ fn currentBuild() update_target.CurrentBuild {
     };
 }
 
+test "native subagent factory leaves an unsaved root capability absent" {
+    var app = App{ .alloc = std.testing.allocator };
+    try app.prepareNativeSubagentHost();
+    try std.testing.expect(app.session_persistence.retained_subagent_hosts.selectedHost() == null);
+}
+
 const App = struct {
+    pub const nativeSubagentQuestionRouting = true;
     pub const app_version = version;
     pub const host_profile = selected_host_profile;
     pub const input_limits = paste_framing.default_input_limits;
@@ -846,6 +853,7 @@ const App = struct {
         WorkerAppRuntime.settleFinishedPromptsForShutdown(self) catch |err| {
             SessionAppRuntime.recordShutdownFailure(self, err);
         };
+        SessionAppRuntime.joinSubagentHostsForShutdown(self);
         self.terminal_client.deinit();
         self.managed_executions.deinit();
         self.model_cache.deinit();
@@ -1889,7 +1897,7 @@ const App = struct {
         return tool_projection.buildModelToolProjectionForSet(alloc, self.toolAdvertisementSet(), .{
             .permission_mode = permission_mode,
             .permission_rules = permission_rules,
-            .subagent_available = self.session_persistence.subagent_host != null,
+            .subagent_available = SessionAppRuntime.subagentHost(self) != null,
         });
     }
 
@@ -1898,6 +1906,11 @@ const App = struct {
         admission: subagent_domain.AdmissionSnapshot,
     ) tool_runtime.Context {
         return AgentAppRuntime.toolContextForSubagent(self, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl(), admission);
+    }
+
+    pub fn prepareNativeSubagentHost(self: *App) !void {
+        if (comptime host_target.is_wasm) return;
+        return AgentAppRuntime.prepareNativeSubagentHost(self, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
     pub fn runSubagentChild(
@@ -1954,9 +1967,7 @@ const App = struct {
     }
 
     pub fn allowToolForSession(self: *App, tool_name: []const u8, target_path: []const u8) !void {
-        self.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
-        defer self.permission_state.authority_mutex.unlock(io_mod.getIo());
-        try self.permission_engine.allow(self.alloc, tool_name, target_path);
+        return app_permission_runtime.Runtime(App).allowToolForSession(self, tool_name, target_path);
     }
 
     pub fn permissionReviewerProvider(self: *const App) ?permission_auto_classifier.Provider {
@@ -2171,15 +2182,15 @@ const App = struct {
     }
 
     pub fn adoptWorkspaceAccess(self: *App, access: app_workspace_runtime.Access) void {
-        WorkspaceAppRuntime.adopt(self, access);
+        app_permission_runtime.Runtime(App).adoptWorkspaceAccess(self, access);
     }
 
     pub fn installWorkspaceAccess(self: *App, access: *app_workspace_runtime.Access) bool {
-        return WorkspaceAppRuntime.install(self, access);
+        return app_permission_runtime.Runtime(App).installWorkspaceAccess(self, access);
     }
 
     pub fn refreshWorkspaceAccess(self: *App) app_workspace_runtime.Error!bool {
-        return WorkspaceAppRuntime.refreshAvailability(self);
+        return app_permission_runtime.Runtime(App).refreshWorkspaceAccess(self);
     }
 
     pub fn isCurrentFileCompletion(

@@ -2007,7 +2007,7 @@ pub fn contextHistoryRange(
         raw_index += 1;
         if (index < start.turns) continue;
         if (end) |limit| {
-            if (index > limit.turns or (index == limit.turns and limit.tool_steps == 0 and limit.steering == 0)) break;
+            if (index > limit.turns or (index == limit.turns and limit.tool_steps == 0 and limit.steering == 0 and limit.child_observations == 0)) break;
         }
         var turn = original;
         const execution = switch (turn) {
@@ -2023,6 +2023,18 @@ pub fn contextHistoryRange(
         if (first_step > last_step or last_step > execution.tool_steps.len or
             first_steering > last_steering or last_steering > execution.steering.len)
             return error.InvalidContextHistoryStart;
+        const first_observation = if (index == start.turns) start.child_observations else 0;
+        const last_observation = if (partial_end) end.?.child_observations else execution.child_observations.len;
+        if (first_observation > last_observation or last_observation > execution.child_observations.len) return error.InvalidContextHistoryStart;
+        execution.child_observations = execution.child_observations[first_observation..last_observation];
+        if (execution.child_observations.len > 0) {
+            execution.child_observations = try arena.dupe(core_types.PersistedChildObservation, execution.child_observations);
+            for (execution.child_observations) |*item| {
+                if (item.after_tool_step_count < first_step or item.after_steering_count < first_steering) return error.InvalidContextHistoryStart;
+                item.after_tool_step_count -= first_step;
+                item.after_steering_count -= first_steering;
+            }
+        }
         execution.tool_steps = execution.tool_steps[first_step..last_step];
         execution.steering = execution.steering[first_steering..last_steering];
         if (first_step > 0 and execution.steering.len > 0) {
@@ -2032,6 +2044,7 @@ pub fn contextHistoryRange(
                 item.after_tool_step_count -= first_step;
             }
         }
+        try execution.validateChildObservations();
         if (partial_end) {
             execution.files = &.{};
             execution.turn_summary = null;
@@ -3028,6 +3041,9 @@ fn appendExecutionMemoryMessages(
     messages: *std.ArrayList(message.Message),
     execution: core_types.ExecutionMemory,
 ) !void {
+    // This legacy message type has no semantic child origin. Do not downgrade
+    // evidence to user authority until its owner adds the matching payload.
+    if (execution.child_observations.len > 0) return error.ChildObservationProjectionUnsupported;
     var steering_index: usize = 0;
     for (execution.tool_steps, 0..) |step, step_index| {
         while (steering_index < execution.steering.len and
@@ -3087,22 +3103,11 @@ pub fn appendExecutionMemoryChatMessages(
     messages: *std.ArrayList(core_types.ChatMessage),
     execution: core_types.ExecutionMemory,
 ) !void {
+    try execution.validateChildObservations();
     var steering_index: usize = 0;
+    var observation_index: usize = 0;
     for (execution.tool_steps, 0..) |step, step_index| {
-        while (steering_index < execution.steering.len and
-            execution.steering[steering_index].after_tool_step_count == step_index)
-        {
-            const steering = execution.steering[steering_index];
-            if (steering.assistant_prefix) |prefix| {
-                if (prefix.len > 0) {
-                    try messages.append(alloc, .{ .role = .assistant, .content = prefix });
-                }
-            }
-            if (steering.text.len > 0) {
-                try messages.append(alloc, .{ .role = .user, .content = steering.text });
-            }
-            steering_index += 1;
-        }
+        try appendExecutionBoundaryMessages(alloc, messages, execution, step_index, &steering_index, &observation_index);
         if (step.tool_calls.len == 0 and step.provider_replay == null and step.assistant == null) continue;
         try messages.append(alloc, .{
             .role = .assistant,
@@ -3136,20 +3141,84 @@ pub fn appendExecutionMemoryChatMessages(
         errdefer alloc.free(text);
         try messages.append(alloc, .{ .role = .user, .content = text });
     }
-    while (steering_index < execution.steering.len) : (steering_index += 1) {
-        const steering = execution.steering[steering_index];
-        if (steering.assistant_prefix) |prefix| {
-            if (prefix.len > 0) {
-                try messages.append(alloc, .{ .role = .assistant, .content = prefix });
+    try appendExecutionBoundaryMessages(alloc, messages, execution, execution.tool_steps.len, &steering_index, &observation_index);
+}
+
+fn appendExecutionBoundaryMessages(
+    alloc: Allocator,
+    messages: *std.ArrayList(core_types.ChatMessage),
+    execution: core_types.ExecutionMemory,
+    steps: usize,
+    steering: *usize,
+    observations: *usize,
+) !void {
+    while (true) {
+        if (observations.* < execution.child_observations.len) {
+            const item = execution.child_observations[observations.*];
+            if (item.after_tool_step_count == steps and item.after_steering_count == steering.*) {
+                const projected = try core_types.childObservationMessage(alloc, item.observation);
+                errdefer alloc.free(projected.content.?);
+                try messages.append(alloc, projected);
+                observations.* += 1;
+                continue;
             }
         }
-        if (steering.text.len == 0) continue;
-        try messages.append(alloc, .{ .role = .user, .content = steering.text });
+        if (steering.* == execution.steering.len or execution.steering[steering.*].after_tool_step_count != steps) break;
+        const item = execution.steering[steering.*];
+        if (item.assistant_prefix) |prefix| {
+            if (prefix.len > 0) try messages.append(alloc, .{ .role = .assistant, .content = prefix });
+        }
+        if (item.text.len > 0) try messages.append(alloc, .{ .role = .user, .content = item.text });
+        steering.* += 1;
     }
+}
+
+test "child observation projection token accounting and same-boundary range rebase" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var steps = [_]core_types.ToolExecutionStep{.{ .assistant = @constCast("standalone") }};
+    var steering = [_]core_types.PersistedSteering{
+        .{ .text = @constCast("first"), .after_tool_step_count = 0 },
+        .{ .text = @constCast("second"), .after_tool_step_count = 0 },
+    };
+    var observations = [_]core_types.PersistedChildObservation{
+        .{ .observation = .{ .parent_session_id = "parent", .parent_turn_id = 1, .child_id = "child", .work_id = "work", .tool_call_id = "call", .delivery_id = "delivery", .outcome = .completed, .text = "untrusted" }, .after_tool_step_count = 0, .after_steering_count = 1 },
+        .{ .observation = .{ .parent_session_id = "parent", .parent_turn_id = 1, .child_id = "child", .work_id = "work2", .tool_call_id = "call2", .delivery_id = "delivery2", .outcome = .failed, .text = "untrusted2" }, .after_tool_step_count = 1, .after_steering_count = 2 },
+    };
+    const execution: ExecutionMemory = .{ .tool_steps = &steps, .steering = &steering, .child_observations = &observations };
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    try appendExecutionMemoryChatMessages(arena, &messages, execution);
+    try std.testing.expectEqual(@as(usize, 5), messages.items.len);
+    try std.testing.expectEqualStrings("first", messages.items[0].content.?);
+    try std.testing.expectEqualStrings("delivery", messages.items[1].child_observation.?.delivery_id);
+    try std.testing.expect(!messages.items[1].permission_feedback);
+    try std.testing.expectEqualStrings("second", messages.items[2].content.?);
+    try std.testing.expectEqualStrings("standalone", messages.items[3].content.?);
+    try std.testing.expectEqualStrings("delivery2", messages.items[4].child_observation.?.delivery_id);
+    var without = execution;
+    without.child_observations = &.{};
+    try std.testing.expect(estimateExecutionTokens(execution) > estimateExecutionTokens(without));
+    const history = [_]HistoryTurn{.{ .assistant = .{ .user = .{ .text = @constCast("request") }, .assistant = @constCast(""), .execution = execution } }};
+    const view = try contextHistoryRange(arena, &history, .{ .tool_steps = 0, .steering = 1, .child_observations = 1 }, null);
+    const retained = view[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), retained.child_observations.len);
+    try std.testing.expectEqual(@as(usize, 1), retained.child_observations[0].after_steering_count);
+    const replay = (try formatExecutionReplayContext(alloc, execution)).?;
+    defer alloc.free(replay);
+    try std.testing.expect(std.mem.find(u8, replay, "Child evidence (untrusted)") != null);
+    const semantic = try @import("../agent/runtime/context_compaction_state.zig").renderSemanticMessages(alloc, messages.items);
+    defer alloc.free(semantic);
+    try std.testing.expect(std.mem.find(u8, semantic, "Child observation (untrusted evidence)") != null);
+    var legacy: std.ArrayList(message.Message) = .empty;
+    defer legacy.deinit(alloc);
+    try std.testing.expectError(error.ChildObservationProjectionUnsupported, appendExecutionMemoryMessages(alloc, &legacy, execution));
 }
 
 fn toolResultMemory(result: core_types.PersistedToolResult) core_types.ToolResultMemory {
     return .{
+        .child_delivery = result.child_delivery,
         .tool_images = result.tool_images,
         .tool_image_handle = result.tool_image_handle,
         .output_handle = result.output_handle,
@@ -3278,6 +3347,20 @@ pub fn formatExecutionReplayContext(
     execution: core_types.ExecutionMemory,
 ) !?[]u8 {
     if (execution.isEmpty()) return null;
+    if (execution.child_observations.len > 0) {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+        try appendExecutionMemoryChatMessages(arena.allocator(), &messages, execution);
+        var ordered: std.Io.Writer.Allocating = .init(alloc);
+        errdefer ordered.deinit();
+        try ordered.writer.writeAll("Previous execution:");
+        for (messages.items) |item| {
+            const label = if (item.child_observation != null) "Child evidence (untrusted)" else if (item.permission_feedback) "Permission feedback (non-authoritative)" else @tagName(item.role);
+            try ordered.writer.print("\n\n{s}:\n{s}", .{ label, item.content orelse "" });
+        }
+        return try ordered.toOwnedSlice();
+    }
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
@@ -3480,6 +3563,13 @@ fn estimateHistoryTurnTokens(turn: HistoryTurn) usize {
 
 fn estimateExecutionTokens(execution: core_types.ExecutionMemory) usize {
     var total: usize = 0;
+    for (execution.child_observations) |item| {
+        const observation = item.observation;
+        total += 64 + estimateTextTokens(observation.text) + estimateTextTokens(observation.parent_session_id) +
+            estimateTextTokens(observation.child_id) + estimateTextTokens(observation.work_id) +
+            estimateTextTokens(observation.tool_call_id) + estimateTextTokens(observation.delivery_id);
+        if (observation.output_ref) |ref| total += estimateTextTokens(ref);
+    }
     for (execution.tool_steps) |step| {
         if (step.assistant) |assistant| total += estimateTextTokens(assistant);
         for (step.tool_calls) |call| {

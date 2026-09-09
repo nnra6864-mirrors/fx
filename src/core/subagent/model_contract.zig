@@ -1,11 +1,12 @@
 const std = @import("std");
 const domain = @import("domain.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
 const max_error_code_bytes: usize = 64;
 
-pub const Action = enum { run, message };
+pub const Action = enum { run, message, cancel };
 
 pub const RunInput = struct { task: []const u8 };
 pub const MessageInput = struct {
@@ -13,9 +14,11 @@ pub const MessageInput = struct {
     instructions: ?[]const u8 = null,
     message: []const u8,
 };
+pub const CancelInput = struct { child_id: []const u8, work_id: []const u8 };
 pub const RequestInput = union(Action) {
     run: RunInput,
     message: MessageInput,
+    cancel: CancelInput,
 };
 
 pub const Request = union(Action) {
@@ -25,8 +28,13 @@ pub const Request = union(Action) {
         instructions: ?[]u8 = null,
         message: []u8,
     },
+    cancel: struct { child_id: []u8, work_id: []u8 },
     pub fn deinit(self: *Request, alloc: Allocator) void {
         switch (self.*) {
+            .cancel => |value| {
+                alloc.free(value.child_id);
+                alloc.free(value.work_id);
+            },
             .run => |value| alloc.free(value.task),
             .message => |value| {
                 alloc.free(value.agent);
@@ -44,7 +52,7 @@ pub const Request = union(Action) {
     pub fn agentName(self: Request) ?[]const u8 {
         return switch (self) {
             .message => |value| value.agent,
-            .run => null,
+            .run, .cancel => null,
         };
     }
 };
@@ -55,6 +63,8 @@ pub const ValidationError = error{
     InvalidAgent,
     InvalidInstructions,
     InvalidMessage,
+    InvalidChildId,
+    InvalidWorkId,
 };
 
 pub fn validateRequest(
@@ -62,6 +72,13 @@ pub fn validateRequest(
     input: RequestInput,
 ) ValidationError!Request {
     return switch (input) {
+        .cancel => |value| blk: {
+            domain.validateId(value.child_id) catch return error.InvalidChildId;
+            if (types.ConversationIdentity.invalidReason(value.work_id) != null) return error.InvalidWorkId;
+            const child_id = try alloc.dupe(u8, value.child_id);
+            errdefer alloc.free(child_id);
+            break :blk .{ .cancel = .{ .child_id = child_id, .work_id = try alloc.dupe(u8, value.work_id) } };
+        },
         .run => |value| blk: {
             try validateText(value.task, domain.max_prompt_bytes, error.InvalidTask);
             break :blk .{ .run = .{ .task = try alloc.dupe(u8, value.task) } };
@@ -113,6 +130,7 @@ pub const Snapshot = struct {
 };
 
 pub const RejectCode = enum {
+    not_work_request,
     child_unavailable,
     child_busy,
     child_not_persistent,
@@ -127,6 +145,7 @@ pub const Plan = union(enum) {
 
 pub fn plan(request: Request, snapshot: ?Snapshot) Plan {
     return switch (request) {
+        .cancel => .{ .reject = .not_work_request },
         .run => .create_one_off,
         .message => if (snapshot) |child| switch (child.kind) {
             .one_off => .{ .reject = .child_not_persistent },
@@ -145,6 +164,11 @@ pub fn requestFingerprint(request: Request) [32]u8 {
     hash.update(@tagName(request.action()));
     hash.update("\x00");
     switch (request) {
+        .cancel => |value| {
+            hash.update(value.child_id);
+            hash.update("\x00");
+            hash.update(value.work_id);
+        },
         .run => |value| hash.update(value.task),
         .message => |value| {
             hash.update(value.agent);
@@ -194,7 +218,7 @@ fn writeOptionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
 
 test "minimal request validation owns one-off and persistent intent" {
     const alloc = std.testing.allocator;
-    try std.testing.expectEqual(@as(usize, 2), @typeInfo(Action).@"enum".fields.len);
+    try std.testing.expectEqual(@as(usize, 3), @typeInfo(Action).@"enum".fields.len);
     try std.testing.expectEqual(@as(usize, 4), @typeInfo(Plan).@"union".fields.len);
     var run = try validateRequest(alloc, .{ .run = .{ .task = "review this" } });
     defer run.deinit(alloc);

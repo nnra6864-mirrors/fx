@@ -2,6 +2,7 @@ const std = @import("std");
 const credentials = @import("../auth/credentials.zig");
 const activity_status = @import("../output/activity_status.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
+const native_subagent_environment = @import("native_subagent_environment.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
@@ -330,6 +331,60 @@ fn batchSegmentIsInterrupted(events: []const WorkerEvent, cancelled_turn_id: ?u6
 
 pub fn Runtime(comptime App: type) type {
     return struct {
+        fn selectedNativeChildBinding(app: *App) ?*native_subagent_environment.Binding {
+            if (comptime !@hasField(App, "session_persistence")) return null;
+            const services = app.session_persistence.retained_subagent_hosts.selectedServices() orelse return null;
+            return native_subagent_environment.Binding.fromServices(services);
+        }
+
+        fn syncNativeChildQuestion(app: *App) void {
+            if (app.question_prompt.child_target) |target| {
+                const binding = selectedNativeChildBinding(app);
+                if (binding == null or !binding.?.questionPending(target)) {
+                    app.question_prompt.discard(app.alloc, "child_question_settled_or_selection_changed");
+                    app.shell.render_requests.request(.modal);
+                }
+                return;
+            }
+            if (app.question_prompt.isActive() or app.approval_prompt.isActive()) return;
+            const parent_question = app.worker.snapshotPendingQuestionBatch(app.alloc) catch return;
+            if (parent_question) |snapshot| {
+                snapshot.deinit(app.alloc);
+                return;
+            }
+            var pending = (pendingSubagentQuestion(app) catch |err| {
+                debug_trace.eventf("subagent", "child_question_projection_failed", .{}, "error={s}", .{@errorName(err)});
+                return;
+            }) orelse return;
+            defer pending.deinit(app.alloc);
+            app.question_prompt.syncChildFrom(app.alloc, pending.snapshot.entries, pending.target) catch |err| {
+                debug_trace.eventf("subagent", "child_question_projection_failed", .{}, "error={s}", .{@errorName(err)});
+                app.question_prompt.discard(app.alloc, "child_question_projection_failed");
+                return;
+            };
+            app.shell.render_requests.request(.modal);
+        }
+
+        pub fn pendingSubagentQuestion(app: *App) !?native_subagent_environment.PendingQuestion {
+            const binding = selectedNativeChildBinding(app) orelse return null;
+            return binding.pendingQuestion(app.alloc);
+        }
+
+        pub fn answerSubagentQuestion(app: *App, target: native_subagent_environment.QuestionTarget, answers: ?[]const []const u8) !bool {
+            const binding = selectedNativeChildBinding(app) orelse return false;
+            return binding.answerQuestion(target, std.heap.c_allocator, answers);
+        }
+
+        pub fn showSubagentQuestions(app: *App) void {
+            const binding = selectedNativeChildBinding(app) orelse return;
+            binding.showQuestions();
+        }
+
+        pub fn dismissSubagentQuestion(app: *App, target: native_subagent_environment.QuestionTarget) bool {
+            const binding = selectedNativeChildBinding(app) orelse return false;
+            return binding.dismissQuestion(target);
+        }
+
         fn cancelledToolStartAdmission(
             presenter: activity_runtime.LifecyclePresenter,
             id: types.ToolLifecycleId,
@@ -683,6 +738,17 @@ pub fn Runtime(comptime App: type) type {
                     null
             else
                 null;
+            if (owned_child_pending) |*pending| {
+                if (app.session_persistence.retained_subagent_hosts.selectedHost()) |host| {
+                    if (!app.session_persistence.retained_subagent_hosts.approvalVisible(host, .{
+                        .child_id = pending.child_id,
+                        .request_id = pending.request_id,
+                    })) {
+                        pending.deinit(app.alloc);
+                        owned_child_pending = null;
+                    }
+                }
+            }
             defer if (owned_child_pending) |*pending| pending.deinit(app.alloc);
             const child_pending_request: ?permission_request.PermissionRequest =
                 if (owned_child_pending) |*pending| pending.request.view() else null;
@@ -727,7 +793,8 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
 
-            if (app.question_prompt.isActive()) {
+            const child_question_active = if (comptime @hasDecl(App, "nativeSubagentQuestionRouting")) app.question_prompt.child_target != null else false;
+            if (app.question_prompt.isActive() and !child_question_active) {
                 if (app.worker.snapshotPendingQuestionBatch(app.alloc) catch return) |question_snapshot| {
                     question_snapshot.deinit(app.alloc);
                 } else {
@@ -736,6 +803,10 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
 
+            if (comptime @hasDecl(App, "nativeSubagentQuestionRouting")) {
+                app.session_persistence.retained_subagent_hosts.reapDetached();
+                syncNativeChildQuestion(app);
+            }
             const modal_active = app.approval_prompt.isActive() or app.question_prompt.isActive();
             const worker_events_pending = if (comptime @hasField(@TypeOf(snapshot), "pending_event_count"))
                 snapshot.pending_event_count > 0

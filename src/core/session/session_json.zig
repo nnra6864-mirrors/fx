@@ -140,7 +140,9 @@ fn writeToolCallJson(writer: *std.Io.Writer, tool_call: session.ToolCall) !void 
 }
 
 pub fn writeExecutionMemoryJson(writer: *std.Io.Writer, execution: session.ExecutionMemory) !void {
-    try writer.writeAll("{\"schema_version\":3,\"tool_steps\":[");
+    try execution.validateChildObservations();
+    const independent = execution.child_observations.len > 0 or execution.hasChildDeliveryMetadata();
+    try writer.print("{{\"schema_version\":{d},\"tool_steps\":[", .{@as(u8, if (independent) 4 else 3)});
     for (execution.tool_steps, 0..) |step, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.writeAll("{\"assistant\":");
@@ -179,11 +181,22 @@ pub fn writeExecutionMemoryJson(writer: *std.Io.Writer, execution: session.Execu
         }
         try writer.print(",\"after_tool_step_count\":{d}}}", .{steering.after_tool_step_count});
     }
-    try writer.writeAll("]}");
+    try writer.writeByte(']');
+    if (independent) {
+        try writer.writeAll(",\"child_observations\":");
+        try std.json.Stringify.value(execution.child_observations, .{}, writer);
+    }
+    try writer.writeByte('}');
 }
 
 fn writePersistedToolResultJson(writer: *std.Io.Writer, result: session.PersistedToolResult) !void {
-    try writer.writeAll("{\"tool_call_id\":");
+    try writer.writeByte('{');
+    if (result.child_delivery) |value| {
+        try writer.writeAll("\"child_delivery\":");
+        try std.json.Stringify.value(value, .{}, writer);
+        try writer.writeByte(',');
+    }
+    try writer.writeAll("\"tool_call_id\":");
     try std.json.Stringify.value(result.tool_call_id, .{}, writer);
     try writer.writeAll(",\"tool_name\":");
     try std.json.Stringify.value(result.tool_name, .{}, writer);
@@ -768,7 +781,7 @@ fn parseOptionalExecutionMemory(alloc: Allocator, maybe_value: ?std.json.Value) 
     if (value == .null) return .{};
     const object = try requireObject(value);
     const schema_version: i64 = if (object.get("schema_version")) |version| blk: {
-        if (version != .integer or version.integer < 1 or version.integer > 3) {
+        if (version != .integer or version.integer < 1 or version.integer > 4) {
             return error.InvalidSessionFormat;
         }
         break :blk version.integer;
@@ -787,7 +800,33 @@ fn parseOptionalExecutionMemory(alloc: Allocator, maybe_value: ?std.json.Value) 
     );
     errdefer types.freePersistedSteering(alloc, steering);
     const files = try parseFileEvidenceSlice(alloc, object.get("files"));
-    return .{ .tool_steps = tool_steps, .files = files, .steering = steering };
+    errdefer types.freeFileEvidenceSlice(alloc, files);
+    if (schema_version < 4 and object.contains("child_observations")) return error.InvalidSessionFormat;
+    const observations = try @import("session_codec.zig").parseChildObservations(alloc, object.get("child_observations"), tool_steps, steering);
+    return .{ .tool_steps = tool_steps, .files = files, .steering = steering, .child_observations = observations };
+}
+
+test "child observation export import keeps identity outcome and chronology" {
+    const alloc = std.testing.allocator;
+    var observations = [_]types.PersistedChildObservation{.{
+        .observation = .{ .parent_session_id = "parent", .parent_turn_id = 9, .child_id = "child", .work_id = "work", .tool_call_id = "call", .delivery_id = "delivery", .outcome = .unavailable, .text = "evidence" },
+        .after_tool_step_count = 0,
+        .after_steering_count = 0,
+    }};
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeExecutionMemoryJson(&out.writer, .{ .child_observations = &observations });
+    try std.testing.expect(std.mem.find(u8, out.written(), "\"schema_version\":4") != null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+    defer parsed.deinit();
+    const execution = try parseOptionalExecutionMemory(alloc, parsed.value);
+    defer types.freeExecutionMemory(alloc, execution);
+    try std.testing.expectEqual(@as(usize, 1), execution.child_observations.len);
+    try std.testing.expectEqual(.unavailable, execution.child_observations[0].observation.outcome);
+    try std.testing.expectEqualStrings("delivery", execution.child_observations[0].observation.delivery_id);
+    try std.testing.expectEqual(@as(usize, 0), execution.child_observations[0].after_steering_count);
+    const empty = try parseOptionalExecutionMemory(alloc, null);
+    try std.testing.expect(empty.isEmpty());
 }
 
 fn parseOptionalSteering(
@@ -935,6 +974,7 @@ fn parsePersistedToolResult(
     schema_version: i64,
 ) !session.PersistedToolResult {
     const object = try requireObject(value);
+    if (schema_version < 4 and object.contains("child_delivery")) return error.InvalidSessionFormat;
     const tool_call_id = try alloc.dupe(u8, try requireString(object, "tool_call_id"));
     errdefer alloc.free(tool_call_id);
     const tool_name = try alloc.dupe(u8, try requireString(object, "tool_name"));
@@ -963,6 +1003,7 @@ fn parsePersistedToolResult(
     return .{
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
+        .child_delivery = if (schema_version >= 4) try @import("session_codec.zig").parseChildDelivery(alloc, object.get("child_delivery")) else null,
         .status = try parsePersistedToolStatus(try requireString(object, "status")),
         .output = output,
         .output_handle = output_handle,

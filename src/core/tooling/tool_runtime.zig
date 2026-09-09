@@ -156,6 +156,7 @@ pub const Context = struct {
     host_tool_provider: ?tool_dispatch.HostToolProvider = null,
     subagent_host: ?*subagent_tool_host.Runtime = null,
     subagent_caller_id: ?[]const u8 = null,
+    independent_child_wait: ?subagent_tool_host.ParentWait = null,
     permission_mode: PermissionMode,
     permission_grants: []const PermissionGrant,
     session_grants: []const PermissionGrant = &.{},
@@ -837,6 +838,7 @@ fn executeRegisteredTool(
     else
         toolExecutionResultFromDispatch(dispatched, dispatch_metadata);
     execution.model_output = dispatched.body;
+    execution.child_delivery = subagent_provider.child_delivery;
     if (dispatch_metadata.status_detail) |detail| execution.status_detail = detail;
     if (mcp_call_status == .input_required or
         (execution.status == .failure and
@@ -1947,6 +1949,7 @@ test "file mutations reject ordinary execution authority without mutating" {
 
 const SubagentProviderState = struct {
     runtime: Context,
+    child_delivery: ?types.ChildDelivery = null,
 };
 
 fn subagentProviderFailure(
@@ -1991,11 +1994,13 @@ fn executeSubagentProvider(
         .timestamp_ms = io_mod.milliTimestamp(),
         .identity_epoch = identity_epoch,
         .cancel_flag = runtimeCancelFlag(ctx),
+        .parent_wait = if (ctx.interactive) ctx.independent_child_wait else null,
     }) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         if (err == error.Cancelled) return error.Cancelled;
         return subagentProviderFailure(arena, "host_failure");
     };
+    state.child_delivery = output.child_delivery;
     return .{
         .status = if (output.success) .success else .failure,
         .body = output.body,

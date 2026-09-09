@@ -74,6 +74,7 @@ pub const SecondaryPublicationReport = struct {
 };
 
 pub const ToolExecutionResult = struct {
+    child_delivery: ?types.ChildDelivery = null,
     model_content_kind: tool_dispatch.ModelContentKind = .ordinary,
     model_output: []const u8,
     status: ToolExecutionStatus = .success,

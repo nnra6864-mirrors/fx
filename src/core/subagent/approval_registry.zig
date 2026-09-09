@@ -1,5 +1,6 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
@@ -164,6 +165,9 @@ pub const Registry = struct {
         }
         if (self.bindings.items.len >= max_pending) return error.CapacityExceeded;
         var projected = request;
+        // Worker-local IDs restart for a new work item. The display identity
+        // must not let a stale prompt resolve that later work's request.
+        projected.id = std.math.add(u64, self.pending_revision, 1) catch return error.CapacityExceeded;
         projected.origin = .{ .subagent = child_id };
         const owned_request = permission_request.OwnedPermissionRequest.dupe(
             self.alloc,
@@ -194,6 +198,7 @@ pub const Registry = struct {
             .worker_request_id = request.id,
         });
         self.pending_revision +|= 1;
+        debug_trace.eventf("subagent", "child_approval_registered", .{}, "root_id={s} child_id={s} work_id={s} request_id={s} display_id={d} worker_id={d}", .{ root_id, child_id, work_id, stable_request_id, projected.id, request.id });
     }
 
     pub fn resolve(
@@ -242,6 +247,7 @@ pub const Registry = struct {
         defer removed.deinit(self.alloc);
         defer removed.worker.release();
 
+        debug_trace.eventf("subagent", "child_approval_response_routing", .{}, "root_id={s} child_id={s} work_id={s} request_id={s} display_id={d} worker_id={d} decision={s}", .{ removed.root_id, removed.child_id, removed.work_id, removed.request_id, removed.request.view().id, removed.worker_request_id, @tagName(decision) });
         const submission = removed.worker.submit(
             removed.worker_request_id,
             permission_request.OwnedPermissionResponse.init(
@@ -252,6 +258,7 @@ pub const Registry = struct {
             .{ .context = self, .commit_fn = commitNoop },
         ) catch |err| {
             feedback_owned = false;
+            debug_trace.eventf("subagent", "child_approval_response_failed", .{}, "root_id={s} child_id={s} work_id={s} request_id={s} error={s} source=permission_failure", .{ removed.root_id, removed.child_id, removed.work_id, removed.request_id, @errorName(err) });
             removed.worker.cancel();
             return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
@@ -260,6 +267,7 @@ pub const Registry = struct {
             };
         };
         feedback_owned = false;
+        debug_trace.eventf("subagent", "child_approval_response_applied", .{}, "root_id={s} child_id={s} work_id={s} request_id={s} result={s}", .{ removed.root_id, removed.child_id, removed.work_id, removed.request_id, @tagName(submission) });
         if (submission != .accepted) return .rejected;
         return .accepted;
     }
@@ -346,6 +354,60 @@ fn hashString(hash: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
 
 fn hashOptional(hash: *std.crypto.hash.sha2.Sha256, value: ?[]const u8) void {
     if (value) |text| hashString(hash, text) else hash.update("none\x00");
+}
+
+test "child approval display generations preserve original worker response identity" {
+    const Fixture = struct {
+        calls: usize = 0,
+        last_worker_id: u64 = 0,
+        pins: usize = 0,
+        cancelled: bool = false,
+
+        fn submit(raw: *anyopaque, id: u64, response: permission_request.OwnedPermissionResponse, _: ?worker_runtime.WorkerRuntime.PermissionCommit) worker_runtime.WorkerRuntime.PermissionCommitError!worker_runtime.PermissionSubmissionResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var owned = response;
+            defer owned.deinit();
+            self.calls += 1;
+            self.last_worker_id = id;
+            return .accepted;
+        }
+        fn cancel(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.cancelled = true;
+        }
+        fn pin(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.pins += 1;
+            return true;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.pins -= 1;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var fixture = Fixture{};
+    var registry = Registry{ .alloc = alloc };
+    defer registry.deinit();
+    const route = WorkerRoute{ .context = &fixture, .submit_fn = Fixture.submit, .cancel_fn = Fixture.cancel, .pin_fn = Fixture.pin, .release_fn = Fixture.release };
+    const request = permission_request.PermissionRequest{ .id = 7, .label = "shell" };
+    try registry.registerTool("approval-a", "child", "root", "work-a", request, &.{}, route, 1);
+    var first = (try registry.firstPendingRequest(alloc, "root")).?;
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(.accepted, try registry.resolve("approval-a", "child", .deny, null, 2));
+    try std.testing.expectEqual(@as(u64, 7), fixture.last_worker_id);
+    try registry.registerTool("approval-b", "child", "root", "work-b", request, &.{}, route, 3);
+    var second = (try registry.firstPendingRequest(alloc, "root")).?;
+    defer second.deinit(alloc);
+    try std.testing.expect(first.request.view().id != second.request.view().id);
+    try std.testing.expectEqualStrings("child", second.request.view().origin.subagent);
+    try std.testing.expectError(error.RequestNotFound, registry.resolve("approval-a", "child", .deny, null, 4));
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    try std.testing.expectEqual(.accepted, try registry.resolve("approval-b", "child", .deny, null, 5));
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    try std.testing.expectEqual(@as(u64, 7), fixture.last_worker_id);
+    try std.testing.expectEqual(@as(usize, 0), fixture.pins);
+    try std.testing.expect(!fixture.cancelled);
 }
 
 test "approval identity is deterministic" {

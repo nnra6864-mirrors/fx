@@ -290,6 +290,9 @@ pub const DurableSessionState = struct {
 };
 
 pub const session_metadata_schema_version: u8 = 4;
+/// Required before publishing child evidence; older readers must not salvage a
+/// prefix that excludes an observation they cannot decode.
+pub const child_observation_metadata_schema_version: u8 = 5;
 pub const max_session_metadata_bytes: usize = 64 * 1024;
 pub const max_session_title_bytes: usize = 240;
 
@@ -415,7 +418,7 @@ pub fn decodeRecoveryCheckpoint(
 }
 
 fn validateSessionMetadata(metadata: SessionMetadata) !void {
-    if (metadata.schema_version != session_metadata_schema_version) {
+    if (metadata.schema_version != session_metadata_schema_version and metadata.schema_version != child_observation_metadata_schema_version) {
         return error.UnsupportedSessionSchema;
     }
     try validateSessionId(metadata.id);
@@ -1451,7 +1454,9 @@ fn writeSnapshotLocator(writer: *std.Io.Writer, value: ?[]const u8) !void {
 }
 
 fn writeExecutionMemory(writer: *std.Io.Writer, execution: session.ExecutionMemory) !void {
-    try writer.writeAll("{\"schema_version\":9,\"tool_steps\":[");
+    try execution.validateChildObservations();
+    const independent = execution.child_observations.len > 0 or execution.hasChildDeliveryMetadata();
+    try writer.print("{{\"schema_version\":{d},\"tool_steps\":[", .{@as(u8, if (independent) 10 else 9)});
     for (execution.tool_steps, 0..) |step, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.writeAll("{\"assistant\":");
@@ -1484,7 +1489,12 @@ fn writeExecutionMemory(writer: *std.Io.Writer, execution: session.ExecutionMemo
         try writeOptionalDurableBytes(writer, steering.assistant_prefix);
         try writer.print(",\"after_tool_step_count\":{d}}}", .{steering.after_tool_step_count});
     }
-    try writer.writeAll("],\"turn_summary\":");
+    try writer.writeByte(']');
+    if (independent) {
+        try writer.writeAll(",\"child_observations\":");
+        try std.json.Stringify.value(execution.child_observations, .{}, writer);
+    }
+    try writer.writeAll(",\"turn_summary\":");
     if (execution.turn_summary) |summary| {
         try writeTurnSummary(writer, summary);
     } else {
@@ -1526,7 +1536,13 @@ fn writeToolCall(writer: *std.Io.Writer, tool_call: session.ToolCall) !void {
 }
 
 fn writePersistedToolResult(writer: *std.Io.Writer, result: session.PersistedToolResult) !void {
-    try writer.writeAll("{\"tool_call_id\":");
+    try writer.writeByte('{');
+    if (result.child_delivery) |value| {
+        try writer.writeAll("\"child_delivery\":");
+        try std.json.Stringify.value(value, .{}, writer);
+        try writer.writeByte(',');
+    }
+    try writer.writeAll("\"tool_call_id\":");
     try writeDurableBytes(writer, result.tool_call_id);
     try writer.writeAll(",\"tool_name\":");
     try writeDurableBytes(writer, result.tool_name);
@@ -1856,6 +1872,7 @@ fn parseExecutionMemory(alloc: Allocator, value: std.json.Value) !session.Execut
         5 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "turn_summary" }),
         6 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
         7...9 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
+        10 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary", "child_observations" }),
         else => return error.InvalidSessionFormat,
     };
     const tool_steps = try parseToolSteps(
@@ -1880,12 +1897,109 @@ fn parseExecutionMemory(alloc: Allocator, value: std.json.Value) !session.Execut
         try parseOptionalTurnSummary(object.get("turn_summary").?)
     else
         null;
+    const observations = try parseChildObservations(alloc, object.get("child_observations"), tool_steps, steering);
     return .{
         .tool_steps = tool_steps,
         .files = files,
         .steering = steering,
+        .child_observations = observations,
         .turn_summary = turn_summary,
     };
+}
+
+/// Shared strict JSON decoder for durable and exported child evidence. Caller
+/// owns the result; old records with no field return an empty slice.
+pub fn parseChildDelivery(alloc: Allocator, value: ?std.json.Value) !?types.ChildDelivery {
+    const input = value orelse return null;
+    const parsed = std.json.parseFromValue(types.ChildDelivery, alloc, input, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidSessionFormat,
+    };
+    defer parsed.deinit();
+    return parsed.value;
+}
+
+pub fn parseChildObservations(
+    alloc: Allocator,
+    maybe_value: ?std.json.Value,
+    steps: []types.ToolExecutionStep,
+    steering: []types.PersistedSteering,
+) ![]types.PersistedChildObservation {
+    const value = maybe_value orelse return &.{};
+    if (value != .array or value.array.items.len > types.ChildObservation.max_per_execution) return error.InvalidChildObservation;
+    var parsed = try std.json.parseFromValue([]types.PersistedChildObservation, alloc, value, .{});
+    defer parsed.deinit();
+    try (types.ExecutionMemory{ .tool_steps = steps, .steering = steering, .child_observations = parsed.value }).validateChildObservations();
+    return types.dupeChildObservations(alloc, parsed.value);
+}
+
+test "child observation durable codec roundtrip legacy empty and invalid ordering" {
+    const alloc = std.testing.allocator;
+    var observations = [_]types.PersistedChildObservation{.{
+        .observation = .{ .parent_session_id = "parent", .parent_turn_id = 9, .child_id = "child", .work_id = "work", .tool_call_id = "call", .delivery_id = "delivery", .outcome = .interrupted, .text = "evidence", .output_ref = "result.txt" },
+        .after_tool_step_count = 0,
+        .after_steering_count = 0,
+    }};
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeExecutionMemory(&out.writer, .{ .child_observations = &observations });
+    try std.testing.expect(std.mem.find(u8, out.written(), "\"schema_version\":10") != null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+    defer parsed.deinit();
+    const Fixture = struct {
+        fn check(a: Allocator, value: std.json.Value) !void {
+            const execution = try parseExecutionMemory(a, value);
+            defer types.freeExecutionMemory(a, execution);
+            try std.testing.expectEqual(@as(usize, 1), execution.child_observations.len);
+            try std.testing.expectEqualStrings("result.txt", execution.child_observations[0].observation.output_ref.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Fixture.check, .{parsed.value});
+    var legacy = try std.json.parseFromSlice(std.json.Value, alloc, "{\"schema_version\":9,\"tool_steps\":[],\"files\":[],\"steering\":[],\"turn_summary\":null}", .{});
+    defer legacy.deinit();
+    const empty = try parseExecutionMemory(alloc, legacy.value);
+    defer types.freeExecutionMemory(alloc, empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.child_observations.len);
+    observations[0].after_steering_count = 1;
+    try std.testing.expectError(error.InvalidChildObservation, writeExecutionMemory(&out.writer, .{ .child_observations = &observations }));
+}
+
+test "child delivery codec preserves pending calls with and without later observations" {
+    const alloc = std.testing.allocator;
+    for (0..3) |variant| {
+        var calls = [_]types.ToolCall{.{ .id = "call", .name = "subagent", .arguments_json = "{}" }};
+        var results = [_]types.PersistedToolResult{.{
+            .tool_call_id = @constCast("call"),
+            .tool_name = @constCast("subagent"),
+            .status = .success,
+            .output = @constCast("still running"),
+            .output_bytes = "still running".len,
+            .stored_output_bytes = "still running".len,
+            .child_delivery = if (variant != 2) .{ .key = @splat(7), .state = .running } else null,
+        }};
+        var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+        var observations = [_]types.PersistedChildObservation{.{
+            .observation = .{ .parent_session_id = "parent", .parent_turn_id = 7, .child_id = "child", .work_id = "work", .tool_call_id = "call", .delivery_id = "delivery", .outcome = .completed, .text = "child answer" },
+            .after_tool_step_count = 1,
+            .after_steering_count = 0,
+        }};
+        const memory: types.ExecutionMemory = .{ .tool_steps = &steps, .child_observations = if (variant == 0) &.{} else &observations };
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try writeExecutionMemory(&out.writer, memory);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+        defer parsed.deinit();
+        const restored = try parseExecutionMemory(alloc, parsed.value);
+        defer types.freeExecutionMemory(alloc, restored);
+        try std.testing.expectEqual(@as(usize, 1), restored.tool_steps.len);
+        try std.testing.expectEqual(if (variant == 0) @as(usize, 0) else 1, restored.child_observations.len);
+        const result = restored.tool_steps[0].tool_results[0];
+        if (variant != 2) {
+            try std.testing.expectEqualDeep(results[0].child_delivery.?, result.child_delivery.?);
+            const encoded_result = parsed.value.object.get("tool_steps").?.array.items[0].object.get("tool_results").?.array.items[0];
+            try std.testing.expectError(error.InvalidSessionFormat, parseToolResult(alloc, encoded_result, 9));
+        } else try std.testing.expect(result.child_delivery == null);
+    }
 }
 
 fn parsePersistedSteering(
@@ -2207,12 +2321,20 @@ fn parseToolResult(
         "command_process_presentation",
         "terminal_action_presentation",
     };
+    const v10_keys = v4_keys.* ++ [_][]const u8{"child_delivery"};
     const result_shape: ExactVariantObject = switch (schema_version) {
         1 => .{ .object = try exactObject(value, v1_keys), .extended = false },
         2 => try exactVariantObject(value, v2_keys, v2_extended_keys),
         3 => .{ .object = try exactObject(value, v3_keys), .extended = true },
         4, 5, 6, 7 => .{ .object = try exactObject(value, v4_keys), .extended = true },
-        8, 9 => .{ .object = if (value == .object and value.object.contains("tool_images"))
+        8, 9, 10 => .{ .object = if (schema_version == 10 and value == .object and value.object.contains("child_delivery")) child: {
+            break :child if (value.object.contains("tool_images"))
+                try exactObject(value, &(v10_keys ++ [_][]const u8{"tool_images"}))
+            else if (value.object.contains("tool_image_handle"))
+                try exactObject(value, &(v10_keys ++ [_][]const u8{"tool_image_handle"}))
+            else
+                try exactObject(value, &v10_keys);
+        } else if (value == .object and value.object.contains("tool_images"))
             try exactObject(value, &(v4_keys.* ++ [_][]const u8{"tool_images"}))
         else if (value == .object and value.object.contains("tool_image_handle"))
             try exactObject(value, &(v4_keys.* ++ [_][]const u8{"tool_image_handle"}))
@@ -2303,6 +2425,7 @@ fn parseToolResult(
         .tool_image_handle = tool_image_handle,
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
+        .child_delivery = try parseChildDelivery(alloc, object.get("child_delivery")),
         .status = std.meta.stringToEnum(
             session.PersistedToolStatus,
             try requireString(object, "status"),

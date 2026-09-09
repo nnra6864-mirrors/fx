@@ -50,6 +50,7 @@
   { "file": "tui-slash-extra.test.ts", "weight": 4 },
   { "file": "tui-slash-menu.test.ts", "weight": 88 },
   { "file": "tui-startup.test.ts", "weight": 7 },
+  { "file": "tui-subagent-independent.test.ts", "weight": 50 },
   { "file": "tui-terminal-tool.test.ts", "weight": 129 },
   { "file": "vision-route-fake-gateway.test.ts", "weight": 20 },
   { "file": "web-fetch-fake-network.test.ts", "weight": 3 },

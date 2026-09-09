@@ -45,7 +45,7 @@ const ConversationProgress = struct {
     fn observe(self: *ConversationProgress, seq: u64, event: session_event.ConversationEvent, cut: ?types.ContextHistoryCut) !void {
         if (self.pending_assistant) |assistant| {
             const standalone = switch (event) {
-                .assistant, .context_checkpoint, .interrupted => true,
+                .assistant, .context_checkpoint, .interrupted, .child_observation => true,
                 .steering => assistant.has_replay,
                 else => false,
             };
@@ -76,10 +76,12 @@ const ConversationProgress = struct {
                 if (self.pending == 0) self.point.tool_steps += 1;
             },
             .steering => self.point.steering += 1,
+            .child_observation => self.point.child_observations += 1,
             .turn_completed, .interrupted => {
                 self.point.turns += 1;
                 self.point.tool_steps = 0;
                 self.point.steering = 0;
+                self.point.child_observations = 0;
                 self.pending = 0;
             },
             else => {},
@@ -169,6 +171,13 @@ pub const ConversationWriter = struct {
                     open_turn_offset = null;
                     checkpointed_turn = false;
                 },
+                .child_observation => |observation| {
+                    if (try writer.hasChildObservation(alloc, observation)) return error.DuplicateChildObservation;
+                    if (open_turn_offset == null) return error.InvalidConversationFrame;
+                    open_turn_offset = line.next_offset;
+                    open_turn_prior_seq = decoded.value.seq;
+                    checkpointed_turn = true;
+                },
                 .context_checkpoint => if (open_turn_offset != null) {
                     open_turn_offset = line.next_offset;
                     open_turn_prior_seq = decoded.value.seq;
@@ -220,9 +229,11 @@ pub const ConversationWriter = struct {
         event: session_event.ConversationEvent,
     ) !u64 {
         if (self.failure) |err| return err;
+        if (event == .child_observation and try self.hasChildObservation(alloc, event.child_observation)) return error.DuplicateChildObservation;
         const seq = std.math.add(u64, self.last_seq, 1) catch
             return error.ConversationSequenceOverflow;
         const envelope = session_event.ConversationEnvelope{
+            .schema_version = session_event.schemaVersionForEvent(event),
             .seq = seq,
             .timestamp_ms = timestamp_ms,
             .event = event,
@@ -278,6 +289,72 @@ pub const ConversationWriter = struct {
         return seq;
     }
 
+    pub const ChildObservationAdoption = enum { adopted, already_adopted };
+
+    /// Under the existing writer lease, sync the entire unwritten prefix ending
+    /// in its last observation. No final answer or turn_completed is fabricated.
+    /// Inputs are borrowed. On uncertainty, reopen before retrying or retiring a receipt.
+    pub fn commitChildObservationPrefix(
+        self: *ConversationWriter,
+        alloc: Allocator,
+        timestamp_ms: i64,
+        prefix: types.AssistantHistoryTurn,
+    ) !ChildObservationAdoption {
+        if (self.failure) |err| return err;
+        try prefix.execution.validateChildObservations();
+        if (prefix.assistant.len != 0 or prefix.provider_replay != null or prefix.execution.child_observations.len == 0)
+            return error.InvalidChildObservation;
+        const last = prefix.execution.child_observations[prefix.execution.child_observations.len - 1];
+        if (last.after_tool_step_count != prefix.execution.tool_steps.len or last.after_steering_count != prefix.execution.steering.len)
+            return error.InvalidChildObservation;
+        if (try self.hasChildObservation(alloc, last.observation)) return .already_adopted;
+        try self.appendTurnBatchWithCut(alloc, timestamp_ms, .{ .assistant = prefix }, null, null, true);
+        return .adopted;
+    }
+
+    /// Scans the canonical archive, including covered checkpoint history, with
+    /// bounded frame memory. Reuse of a delivery identity with changed evidence fails.
+    pub fn hasChildObservation(self: *const ConversationWriter, alloc: Allocator, observation: types.ChildObservation) !bool {
+        if (self.failure) |err| return err;
+        try observation.validate();
+        var buffer: [8192]u8 = undefined;
+        var reader = self.file.reader(io_mod.getIo(), &buffer);
+        while (reader.logicalPos() < self.committed_bytes) {
+            const line = try session_replay.readBufferedLine(alloc, &reader, self.committed_bytes, null) orelse return error.TruncatedConversation;
+            defer alloc.free(line.bytes);
+            var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
+            defer decoded.deinit();
+            if (decoded.value.event != .child_observation) continue;
+            const prior = decoded.value.event.child_observation;
+            if (!std.mem.eql(u8, prior.delivery_id, observation.delivery_id)) continue;
+            const prior_json = try std.json.Stringify.valueAlloc(alloc, prior, .{});
+            defer alloc.free(prior_json);
+            const observation_json = try std.json.Stringify.valueAlloc(alloc, observation, .{});
+            defer alloc.free(observation_json);
+            if (!std.mem.eql(u8, prior_json, observation_json)) return error.ChildObservationIdentityConflict;
+            return true;
+        }
+        return false;
+    }
+
+    /// Includes terminal tool results covered by compaction, so a failed receipt
+    /// retirement cannot turn an already delivered result into a new observation.
+    pub fn hasTerminalChildDelivery(self: *const ConversationWriter, alloc: Allocator, key: [32]u8) !bool {
+        if (self.failure) |err| return err;
+        var buffer: [8192]u8 = undefined;
+        var reader = self.file.reader(io_mod.getIo(), &buffer);
+        while (reader.logicalPos() < self.committed_bytes) {
+            const line = try session_replay.readBufferedLine(alloc, &reader, self.committed_bytes, null) orelse return error.TruncatedConversation;
+            defer alloc.free(line.bytes);
+            var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
+            defer decoded.deinit();
+            if (decoded.value.event != .tool_result) continue;
+            const delivery = decoded.value.event.tool_result.child_delivery orelse continue;
+            if (delivery.state == .terminal and std.mem.eql(u8, &delivery.key, &key)) return true;
+        }
+        return false;
+    }
+
     pub fn pendingToolCallCount(self: *const ConversationWriter) usize {
         return self.pending_tool_calls.items.len;
     }
@@ -311,7 +388,7 @@ pub const ConversationWriter = struct {
     ) !void {
         if (prefix) |entry| {
             if (entry.assistant.len != 0) return error.InvalidConversationEvent;
-            try self.appendTurnBatchWithCut(alloc, timestamp_ms, .{ .assistant = entry }, summary.summary, retained_from);
+            try self.appendTurnBatchWithCut(alloc, timestamp_ms, .{ .assistant = entry }, summary.summary, retained_from, false);
         } else {
             const coverage = if (retained_from) |cut| try self.contextCoverage(alloc, cut, &.{}) else self.last_seq;
             _ = try self.append(alloc, timestamp_ms, .{ .context_checkpoint = .{
@@ -328,7 +405,7 @@ pub const ConversationWriter = struct {
         turn: types.HistoryTurn,
         checkpoint_summary: ?[]const u8,
     ) !void {
-        return self.appendTurnBatchWithCut(alloc, timestamp_ms, turn, checkpoint_summary, null);
+        return self.appendTurnBatchWithCut(alloc, timestamp_ms, turn, checkpoint_summary, null, false);
     }
 
     fn appendTurnBatchWithCut(
@@ -338,6 +415,7 @@ pub const ConversationWriter = struct {
         turn: types.HistoryTurn,
         checkpoint_summary: ?[]const u8,
         retained_from: ?types.ContextHistoryCut,
+        observation_prefix: bool,
     ) !void {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
@@ -350,6 +428,7 @@ pub const ConversationWriter = struct {
             const view = try session.contextHistoryRange(arena.allocator(), &.{turn}, .{
                 .tool_steps = progress.point.tool_steps,
                 .steering = progress.point.steering,
+                .child_observations = progress.point.child_observations,
             }, null);
             if (view.len != 1) return error.InvalidConversationEvent;
             break :blk view[0];
@@ -358,6 +437,10 @@ pub const ConversationWriter = struct {
         defer events.deinit(alloc);
         try session_event.appendHistoryTurnConversationEvents(alloc, &events, unwritten);
         const start: usize = if (self.turn_open) 1 else 0;
+        if (observation_prefix) {
+            _ = events.pop(); // Only the actual prefix is durable, not turn completion.
+            if (events.items.len <= start or events.items[events.items.len - 1] != .child_observation) return error.InvalidChildObservation;
+        }
         if (checkpoint_summary) |summary| {
             _ = events.pop();
             const covers_through_seq = if (retained_from) |cut|
@@ -452,10 +535,17 @@ pub const ConversationWriter = struct {
         var seq = self.last_seq;
         var checkpoint_coverage = self.latest_checkpoint_coverage;
         var turn_open = self.turn_open;
-        for (events) |event| {
+        for (events, 0..) |event, event_index| {
+            if (event == .child_observation) {
+                if (try self.hasChildObservation(alloc, event.child_observation)) return error.DuplicateChildObservation;
+                for (events[0..event_index]) |prior| {
+                    if (prior == .child_observation and std.mem.eql(u8, prior.child_observation.delivery_id, event.child_observation.delivery_id)) return error.DuplicateChildObservation;
+                }
+            }
             seq = std.math.add(u64, seq, 1) catch
                 return error.ConversationSequenceOverflow;
             const envelope = session_event.ConversationEnvelope{
+                .schema_version = session_event.schemaVersionForEvent(event),
                 .seq = seq,
                 .timestamp_ms = timestamp_ms,
                 .event = event,
@@ -571,7 +661,7 @@ pub const ConversationWriter = struct {
                 self.latest_checkpoint_coverage = checkpoint.covers_through_seq;
             },
             .interrupted => self.clearPendingToolCalls(),
-            .user, .assistant, .steering, .turn_completed => {},
+            .user, .assistant, .steering, .child_observation, .turn_completed => {},
         }
         self.last_seq = seq;
         self.turn_open = turn_open;
@@ -582,7 +672,7 @@ fn nextConversationTurnOpen(open: bool, event: session_event.ConversationEvent) 
     return switch (event) {
         .user => if (open) error.InvalidConversationFrame else true,
         .turn_completed, .interrupted => if (open) false else error.InvalidConversationFrame,
-        .assistant, .tool_call, .tool_result, .steering => if (open) true else error.InvalidConversationFrame,
+        .assistant, .tool_call, .tool_result, .steering, .child_observation => if (open) true else error.InvalidConversationFrame,
         .context_checkpoint => open,
     };
 }
@@ -632,6 +722,7 @@ fn writeConversationMetadata(
         alloc,
         state,
         if (decoded) |metadata| metadata.value.title else null,
+        if (decoded) |metadata| @max(metadata.value.schema_version, conversationMetadataVersion(state)) else conversationMetadataVersion(state),
     );
     defer alloc.free(bytes);
     try io_mod.durableReplaceVerified(alloc, dir, manifest_file, bytes);
@@ -641,15 +732,32 @@ fn encodeConversationMetadata(
     alloc: Allocator,
     state: session_codec.DurableSessionState,
 ) ![]u8 {
-    return encodeConversationMetadataWithTitle(alloc, state, null);
+    return encodeConversationMetadataWithTitle(alloc, state, null, conversationMetadataVersion(state));
+}
+
+fn conversationMetadataVersion(state: session_codec.DurableSessionState) u8 {
+    for (state.history) |turn| {
+        const execution = switch (turn) {
+            .assistant => |entry| entry.execution,
+            .interrupted => |entry| entry.execution,
+            .compacted_summary => continue,
+        };
+        if (execution.child_observations.len > 0) return session_codec.child_observation_metadata_schema_version;
+    }
+    if (state.recovery_checkpoint) |checkpoint| {
+        if (checkpoint.execution.child_observations.len > 0) return session_codec.child_observation_metadata_schema_version;
+    }
+    return session_codec.session_metadata_schema_version;
 }
 
 fn encodeConversationMetadataWithTitle(
     alloc: Allocator,
     state: session_codec.DurableSessionState,
     title: ?[]const u8,
+    schema_version: u8,
 ) ![]u8 {
     return session_codec.encodeSessionMetadata(alloc, .{
+        .schema_version = schema_version,
         .id = state.id,
         .origin_workspace_root = state.origin_workspace_root,
         .workspace_root = state.workspace_root,
@@ -806,7 +914,7 @@ fn load_conversation_state_at_boundary(
     const object = if (probe.value == .object) probe.value.object else return null;
     const version_value = object.get("schema_version") orelse return null;
     if (version_value != .number_string or
-        !std.mem.eql(u8, version_value.number_string, "4"))
+        (!std.mem.eql(u8, version_value.number_string, "4") and !std.mem.eql(u8, version_value.number_string, "5")))
     {
         return null;
     }
@@ -1002,7 +1110,7 @@ fn scan_conversation_recovery(
         }) |turn| session.freeHistoryTurn(alloc, turn);
         offset = line.next_offset;
         if (!state.turn_open or
-            (decoded.value.event == .context_checkpoint and state.pending_tool_calls.items.len == 0))
+            ((decoded.value.event == .context_checkpoint or decoded.value.event == .child_observation) and state.pending_tool_calls.items.len == 0))
         {
             boundary = .{
                 .bytes = offset,
@@ -1222,7 +1330,7 @@ fn isConversationMetadata(alloc: Allocator, bytes: []const u8) !bool {
     defer parsed.deinit();
     const object = if (parsed.value == .object) parsed.value.object else return false;
     const version = object.get("schema_version") orelse return false;
-    return version == .number_string and std.mem.eql(u8, version.number_string, "4");
+    return version == .number_string and (std.mem.eql(u8, version.number_string, "4") or std.mem.eql(u8, version.number_string, "5"));
 }
 
 fn openConversationWritableSession(
@@ -1341,6 +1449,10 @@ fn replayConversationHistory(
             .tool_call => |value| try turn.appendToolCall(value),
             .tool_result => |value| try turn.appendToolResult(value),
             .steering => |value| try turn.appendSteering(value.text),
+            .child_observation => |value| {
+                try turn.appendChildObservation(value);
+                checkpoint_turn_open = true;
+            },
             .turn_completed => |value| {
                 const completed = try turn.finishAssistant(value);
                 checkpoint_turn_open = false;
@@ -1430,6 +1542,10 @@ pub const ConversationHistoryReader = struct {
                 },
                 .steering => |value| blk: {
                     try self.builder.appendSteering(value.text);
+                    break :blk null;
+                },
+                .child_observation => |value| blk: {
+                    try self.builder.appendChildObservation(value);
                     break :blk null;
                 },
                 .turn_completed => |value| try self.builder.finishAssistant(value),
@@ -1534,6 +1650,10 @@ fn load_conversation_archive_from_file(
                 try builder.appendSteering(value.text);
                 break :blk null;
             },
+            .child_observation => |value| blk: {
+                try builder.appendChildObservation(value);
+                break :blk null;
+            },
             .turn_completed => |value| try builder.finishAssistant(value),
             .interrupted => |value| try builder.finishInterrupted(value),
             .context_checkpoint => |value| blk: {
@@ -1597,6 +1717,7 @@ const ConversationReplayScan = struct {
                 self.turn_count = std.math.add(usize, self.turn_count, 1) catch return error.InvalidConversationFrame;
                 self.window.last_complete_seq = seq;
             },
+            .child_observation => self.window.last_complete_seq = seq,
             .context_checkpoint => |checkpoint| {
                 self.window = .{
                     .offset = offset,
@@ -1675,6 +1796,7 @@ const ConversationTurnBuilder = struct {
     results: std.ArrayList(types.PersistedToolResult) = .empty,
     steps: std.ArrayList(types.ToolExecutionStep) = .empty,
     steering: std.ArrayList(types.PersistedSteering) = .empty,
+    observations: std.ArrayList(types.PersistedChildObservation) = .empty,
 
     fn init(alloc: Allocator) ConversationTurnBuilder {
         return .{ .alloc = alloc };
@@ -1700,6 +1822,8 @@ const ConversationTurnBuilder = struct {
         }
         self.steps.deinit(self.alloc);
         self.steering.deinit(self.alloc);
+        for (self.observations.items) |item| types.freeChildObservation(self.alloc, item.observation);
+        self.observations.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -1709,7 +1833,7 @@ const ConversationTurnBuilder = struct {
             self.calls.items.len == 0 and
             self.results.items.len == 0 and
             self.steps.items.len == 0 and
-            self.steering.items.len == 0;
+            self.steering.items.len == 0 and self.observations.items.len == 0;
     }
 
     fn begin(
@@ -1816,6 +1940,21 @@ const ConversationTurnBuilder = struct {
         });
         self.pending_assistant = null;
         self.pending_replay = null;
+    }
+
+    fn appendChildObservation(self: *ConversationTurnBuilder, value: types.ChildObservation) !void {
+        if (self.user == null or self.observations.items.len >= types.ChildObservation.max_per_execution) return error.InvalidConversationFrame;
+        try self.finishStandalone();
+        for (self.observations.items) |item| {
+            if (std.mem.eql(u8, item.observation.delivery_id, value.delivery_id)) return error.DuplicateChildObservation;
+        }
+        const copy = try types.dupeChildObservation(self.alloc, value);
+        errdefer types.freeChildObservation(self.alloc, copy);
+        try self.observations.append(self.alloc, .{
+            .observation = copy,
+            .after_tool_step_count = self.steps.items.len,
+            .after_steering_count = self.steering.items.len,
+        });
     }
 
     fn appendSteering(self: *ConversationTurnBuilder, text: []const u8) !void {
@@ -1940,10 +2079,13 @@ const ConversationTurnBuilder = struct {
         const steering = try self.steering.toOwnedSlice(self.alloc);
         errdefer types.freePersistedSteering(self.alloc, steering);
         const files = try types.dupeFileEvidenceSlice(self.alloc, files_source);
+        errdefer types.freeFileEvidenceSlice(self.alloc, files);
+        const observations = try self.observations.toOwnedSlice(self.alloc);
         return .{
             .tool_steps = steps,
             .files = files,
             .steering = steering,
+            .child_observations = observations,
             .turn_summary = turn_summary,
         };
     }
@@ -2090,6 +2232,7 @@ fn dupeConversationToolResult(
     return .{
         .tool_call_id = call_id,
         .tool_name = tool_name,
+        .child_delivery = value.child_delivery,
         .status = value.status,
         .output = output,
         .output_handle = handle,
@@ -2590,6 +2733,7 @@ pub const LoadedWritableSession = struct {
         var metadata = try session_codec.decodeSessionMetadata(alloc, bytes);
         defer metadata.deinit();
         const encoded = try session_codec.encodeSessionMetadata(alloc, .{
+            .schema_version = metadata.value.schema_version,
             .id = metadata.value.id,
             .origin_workspace_root = metadata.value.origin_workspace_root,
             .workspace_root = metadata.value.workspace_root,
@@ -2664,6 +2808,92 @@ pub const LoadedWritableSession = struct {
         return result catch |err| self.recordWriteFailure(err);
     }
 
+    fn requireChildObservationReader(self: *LoadedWritableSession, alloc: Allocator) !void {
+        const bytes = try readManagedFileAlloc(alloc, &self.log.dir, manifest_file, session_codec.max_session_metadata_bytes);
+        defer alloc.free(bytes);
+        var metadata = try session_codec.decodeSessionMetadata(alloc, bytes);
+        defer metadata.deinit();
+        if (metadata.value.schema_version == session_codec.child_observation_metadata_schema_version) return;
+        metadata.value.schema_version = session_codec.child_observation_metadata_schema_version;
+        const encoded = try session_codec.encodeSessionMetadata(alloc, metadata.value);
+        defer alloc.free(encoded);
+        // Fence old readers before any new event becomes visible. A crash here
+        // can leave an upgraded, otherwise unchanged session; never downgrade it.
+        io_mod.durableReplaceVerified(alloc, &self.log.dir, manifest_file, encoded) catch |err| return self.recordWriteFailure(err);
+    }
+
+    /// Durably adopts the last observation in a complete active-turn prefix.
+    /// Prefix and optional recovery snapshot are borrowed. The snapshot must
+    /// describe this exact prefix (including its execution), not a future send.
+    /// If recovery is already active, callers must supply its updated snapshot.
+    /// Log sync precedes sidecar publication: a crash in between retains evidence
+    /// and reopens as interrupted, never as an implicitly live provider request.
+    /// Does not mutate model history. Install a prepared projection (or hydrate
+    /// it after already_adopted) before retiring the receipt. A duplicate does
+    /// not append again and leaves position unchanged.
+    pub fn commitChildObservationPrefix(
+        self: *LoadedWritableSession,
+        alloc: Allocator,
+        prefix: types.AssistantHistoryTurn,
+        recovery: ?session_codec.RecoveryCheckpoint,
+        timestamp_ms: i64,
+    ) !ConversationWriter.ChildObservationAdoption {
+        try self.requireWritable();
+        try prefix.execution.validateChildObservations();
+        if (prefix.execution.child_observations.len == 0) return error.InvalidChildObservation;
+        for (prefix.execution.child_observations) |item| {
+            if (!std.mem.eql(u8, item.observation.parent_session_id, self.active_id)) return error.ChildObservationWrongParent;
+        }
+        const last = prefix.execution.child_observations[prefix.execution.child_observations.len - 1].observation;
+        debug_trace.eventf("subagent", "child_observation_adoption_requested", .{ .turn_id = last.parent_turn_id }, "root_id={s} child_id={s} work_id={s} delivery_id={s} text_bytes={d}", .{ self.active_id, last.child_id, last.work_id, last.delivery_id, last.text.len });
+        errdefer |err| debug_trace.eventf("subagent", "child_observation_adoption_failed", .{ .turn_id = last.parent_turn_id }, "root_id={s} child_id={s} work_id={s} delivery_id={s} error={s}", .{ self.active_id, last.child_id, last.work_id, last.delivery_id, @errorName(err) });
+        if (try self.conversation_writer.hasChildObservation(alloc, last)) {
+            debug_trace.eventf("subagent", "child_observation_already_adopted", .{ .turn_id = last.parent_turn_id }, "root_id={s} delivery_id={s} through_seq={d}", .{ self.active_id, last.delivery_id, self.conversation_writer.last_seq });
+            return .already_adopted;
+        }
+        if (self.state.recovery_checkpoint != null and recovery == null) return error.RecoveryCheckpointRequired;
+        var prepared = try session.dupeHistoryTurn(alloc, .{ .assistant = prefix });
+        defer session.freeHistoryTurn(alloc, prepared);
+        try self.prepareHistoryTurnForCommit(alloc, &prepared);
+        var next_recovery = if (recovery) |checkpoint| try checkpoint.dupe(alloc) else null;
+        defer if (next_recovery) |*checkpoint| checkpoint.deinit(alloc);
+        if (next_recovery) |*checkpoint| {
+            if (checkpoint.assistant_source.len != 0 or !std.mem.eql(u8, checkpoint.user.text, prefix.user.text)) return error.InvalidRecoveryCheckpoint;
+            const supplied = try std.json.Stringify.valueAlloc(alloc, checkpoint.execution, .{});
+            defer alloc.free(supplied);
+            const expected = try std.json.Stringify.valueAlloc(alloc, prefix.execution, .{});
+            defer alloc.free(expected);
+            if (!std.mem.eql(u8, supplied, expected)) return error.InvalidRecoveryCheckpoint;
+            const execution = try types.dupeExecutionMemory(alloc, prepared.assistant.execution);
+            types.freeExecutionMemory(alloc, checkpoint.execution);
+            checkpoint.execution = execution;
+        }
+        try self.requireChildObservationReader(alloc);
+        const result = try self.conversation_writer.commitChildObservationPrefix(alloc, timestamp_ms, prepared.assistant);
+        debug_trace.eventf("subagent", "child_observation_prefix_synced", .{ .turn_id = last.parent_turn_id }, "root_id={s} delivery_id={s} through_seq={d} committed_bytes={d}", .{ self.active_id, last.delivery_id, self.conversation_writer.last_seq, self.conversation_writer.committed_bytes });
+        if (next_recovery) |checkpoint| {
+            writeConversationRecoveryState(alloc, &self.log.dir, checkpoint, self.conversation_writer.last_seq) catch |err| {
+                self.conversation_writer.failure = error.SessionPersistenceUncertain;
+                debug_trace.logf("session", "child observation committed but recovery publication failed session={s} err={s}", .{ self.active_id, @errorName(err) });
+                return error.SessionPersistenceUncertain;
+            };
+            if (self.state.recovery_checkpoint) |*prior| prior.deinit(alloc);
+            self.state.recovery_checkpoint = checkpoint;
+            next_recovery = null;
+            debug_trace.eventf("subagent", "child_observation_recovery_published", .{ .turn_id = last.parent_turn_id }, "root_id={s} delivery_id={s} through_seq={d}", .{ self.active_id, last.delivery_id, self.conversation_writer.last_seq });
+        }
+        debug_trace.eventf("subagent", "child_observation_adoption_committed", .{ .turn_id = last.parent_turn_id }, "root_id={s} child_id={s} work_id={s} delivery_id={s}", .{ self.active_id, last.child_id, last.work_id, last.delivery_id });
+        self.state.updated_at_ms = timestamp_ms;
+        self.position = .{
+            .log_generation = self.position.log_generation,
+            .through_seq = self.conversation_writer.last_seq,
+            .through_event_id = randomIdentifier(),
+            .through_event_log_bytes = self.conversation_writer.committed_bytes,
+        };
+        self.freshly_started = false;
+        return result;
+    }
+
     pub fn commitContextCompaction(
         self: *LoadedWritableSession,
         alloc: Allocator,
@@ -2678,7 +2908,10 @@ pub const LoadedWritableSession = struct {
         else
             null;
         defer if (prepared) |turn| session.freeHistoryTurn(alloc, turn);
-        if (prepared) |*turn| try self.prepareHistoryTurnForCommit(alloc, turn);
+        if (prepared) |*turn| {
+            try self.prepareHistoryTurnForCommit(alloc, turn);
+            if (turn.assistant.execution.child_observations.len > 0 or turn.assistant.execution.hasChildDeliveryMetadata()) try self.requireChildObservationReader(alloc);
+        }
         try self.conversation_writer.appendContextCompaction(
             alloc,
             timestamp_ms,
@@ -2706,6 +2939,12 @@ pub const LoadedWritableSession = struct {
         else
             null;
         errdefer if (work_id) |value| alloc.free(value);
+        const execution: types.ExecutionMemory = switch (payload.turn) {
+            .assistant => |entry| entry.execution,
+            .interrupted => |entry| entry.execution,
+            .compacted_summary => .{},
+        };
+        if (execution.child_observations.len > 0 or execution.hasChildDeliveryMetadata()) try self.requireChildObservationReader(alloc);
         try self.conversation_writer.appendHistoryTurn(
             alloc,
             timestamp_ms,
@@ -3049,6 +3288,7 @@ fn importLegacySnapshotStateWithOps(
         alloc,
         converted,
         if (display.present) display.title else null,
+        conversationMetadataVersion(converted),
     );
     defer alloc.free(metadata_bytes);
     const had_previous_log = try entryExists(&writable.dir, events_file);
@@ -3705,6 +3945,7 @@ fn createNativeSession(
     );
     defer display.deinit(alloc);
     var conversation_writer = try createConversationStorage(alloc, &writable.dir, .{
+        .schema_version = conversationMetadataVersion(initial_state),
         .id = initial_state.id,
         .origin_workspace_root = initial_state.origin_workspace_root,
         .workspace_root = initial_state.workspace_root,
@@ -5228,6 +5469,281 @@ test "cache-free usage checkpoints stay outside conversation history" {
     try std.testing.expectEqual(@as(u64, 9), resumed.usage.?.lines_added);
     try std.testing.expectEqual(@as(u64, 4), resumed.usage.?.lines_removed);
     try std.testing.expectEqual(@as(usize, 0), resumed.history.len);
+}
+
+test "child delivery terminal adoption survives compaction and reopen but running acknowledgements do not qualify" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |terminal| {
+        var temp = try TempRoot.init(alloc);
+        defer temp.deinit(alloc);
+        var initial = try testState(alloc, "child-terminal-adoption", 10);
+        defer initial.deinit(alloc);
+        const key = [_]u8{7} ** 32;
+        var calls = [_]types.ToolCall{.{ .id = "original-call", .name = "subagent", .arguments_json = "{}" }};
+        var results = [_]types.PersistedToolResult{.{
+            .tool_call_id = @constCast("original-call"),
+            .tool_name = @constCast("subagent"),
+            .status = .success,
+            .output = @constCast("result"),
+            .output_bytes = 6,
+            .stored_output_bytes = 6,
+            .child_delivery = .{ .key = key, .state = if (terminal) .terminal else .running },
+        }};
+        var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+        {
+            var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+            defer loaded.deinit(alloc);
+            const path = try io_mod.dirRealpathAlloc(alloc, loaded.log.dir.dir, ".");
+            defer alloc.free(path);
+            var capability = try session_child_store.SessionChildCapability.init(alloc, loaded.log.dir.dir, path, .writable);
+            defer capability.deinit();
+            results[0].output_handle = try result_store.storeLargeResultManaged(alloc, &capability, calls[0].id, calls[0].name, results[0].output);
+            defer {
+                alloc.free(results[0].output_handle.?);
+                results[0].output_handle = null;
+            }
+            _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+                .conversation_language = .literal("en"),
+                .total_input_tokens = 0,
+                .total_output_tokens = 0,
+                .turn = .{ .assistant = .{
+                    .user = .{ .text = @constCast("request") },
+                    .assistant = @constCast("answer"),
+                    .execution = .{ .tool_steps = &steps },
+                } },
+            } }, 11);
+            try std.testing.expectEqual(terminal, try loaded.conversation_writer.hasTerminalChildDelivery(alloc, key));
+            try std.testing.expect(!try loaded.conversation_writer.hasTerminalChildDelivery(alloc, [_]u8{8} ** 32));
+            _ = try loaded.commitContextCompaction(alloc, .{ .summary = @constCast("summary"), .removed_turn_count = 1, .compaction_count = 1 }, null, null, 12);
+        }
+        var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqual(terminal, try resumed.conversation_writer.hasTerminalChildDelivery(alloc, key));
+        try std.testing.expect(!try resumed.conversation_writer.hasTerminalChildDelivery(alloc, [_]u8{8} ** 32));
+    }
+}
+
+fn childObservationFixture(parent: []const u8, delivery: []const u8) types.ChildObservation {
+    return .{
+        .parent_session_id = parent,
+        .parent_turn_id = 7,
+        .child_id = "child",
+        .work_id = delivery,
+        .tool_call_id = "original-call",
+        .delivery_id = delivery,
+        .outcome = .completed,
+        .text = "child evidence",
+    };
+}
+
+test "child observation prefix preserves tools steering replies reopen and duplicate identity" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "child-observation-prefix", 10);
+    defer initial.deinit(alloc);
+    var calls = [_]types.ToolCall{.{ .id = "original-call", .name = "subagent", .arguments_json = "{}" }};
+    var results = [_]types.PersistedToolResult{.{ .tool_call_id = @constCast("original-call"), .tool_name = @constCast("subagent"), .status = .success, .output = @constCast("still running"), .output_bytes = 13, .stored_output_bytes = 13 }};
+    var steps = [_]types.ToolExecutionStep{
+        .{ .tool_calls = &calls, .tool_results = &results },
+        .{ .assistant = @constCast("intermediate answer") },
+    };
+    var steering = [_]types.PersistedSteering{
+        .{ .text = @constCast("first update"), .after_tool_step_count = 1 },
+        .{ .text = @constCast("second update"), .after_tool_step_count = 1 },
+    };
+    var observations = [_]types.PersistedChildObservation{
+        .{ .observation = childObservationFixture(initial.id, "delivery-a"), .after_tool_step_count = 1, .after_steering_count = 1 },
+        .{ .observation = childObservationFixture(initial.id, "delivery-b"), .after_tool_step_count = 2, .after_steering_count = 2 },
+    };
+    const prefix: types.AssistantHistoryTurn = .{
+        .user = .{ .text = @constCast("real parent request") },
+        .assistant = @constCast(""),
+        .execution = .{ .tool_steps = &steps, .steering = &steering, .child_observations = &observations },
+    };
+    {
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        const path = try io_mod.dirRealpathAlloc(alloc, loaded.log.dir.dir, ".");
+        defer alloc.free(path);
+        var capability = try session_child_store.SessionChildCapability.init(alloc, loaded.log.dir.dir, path, .writable);
+        defer capability.deinit();
+        results[0].output_handle = try result_store.storeLargeResultManaged(alloc, &capability, calls[0].id, calls[0].name, results[0].output);
+        defer {
+            alloc.free(results[0].output_handle.?);
+            results[0].output_handle = null;
+        }
+        var first = prefix;
+        first.execution.tool_steps = steps[0..1];
+        first.execution.steering = steering[0..1];
+        first.execution.child_observations = observations[0..1];
+        try std.testing.expectEqual(.adopted, try loaded.commitChildObservationPrefix(alloc, first, null, 20));
+        try std.testing.expectEqual(.adopted, try loaded.commitChildObservationPrefix(alloc, prefix, null, 21));
+        try std.testing.expect(try loaded.renameConversation(alloc, "renamed observation session"));
+        const metadata_bytes = try readManagedFileAlloc(alloc, &loaded.log.dir, manifest_file, session_codec.max_session_metadata_bytes);
+        defer alloc.free(metadata_bytes);
+        var metadata = try session_codec.decodeSessionMetadata(alloc, metadata_bytes);
+        defer metadata.deinit();
+        try std.testing.expectEqual(session_codec.child_observation_metadata_schema_version, metadata.value.schema_version);
+        const bytes_before = loaded.conversation_writer.committed_bytes;
+        try std.testing.expectEqual(.already_adopted, try loaded.commitChildObservationPrefix(alloc, prefix, null, 22));
+        try std.testing.expectEqual(bytes_before, loaded.conversation_writer.committed_bytes);
+        try std.testing.expect(loaded.conversation_writer.turn_open);
+        try std.testing.expectEqual(@as(u64, 8), loaded.position.through_seq);
+        const bytes = try loaded.conversation_writer.readAllForTest(alloc);
+        defer alloc.free(bytes);
+        try std.testing.expect(std.mem.find(u8, bytes, "turn_completed") == null);
+        try std.testing.expect(std.mem.find(u8, bytes, "\"schema_version\":3") != null);
+    }
+    {
+        var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), resumed.state.history.len);
+        const entry = resumed.state.history[0].interrupted;
+        try std.testing.expectEqual(@as(usize, 2), entry.execution.child_observations.len);
+        try std.testing.expectEqual(@as(usize, 1), entry.execution.child_observations[0].after_steering_count);
+        try std.testing.expectEqual(@as(usize, 2), entry.execution.child_observations[1].after_steering_count);
+        try std.testing.expectEqualStrings("still running", entry.execution.tool_steps[0].tool_results[0].output);
+        try std.testing.expectEqual(.already_adopted, try resumed.commitChildObservationPrefix(alloc, prefix, null, 23));
+        var changed = observations[1].observation;
+        changed.text = "different result";
+        try std.testing.expectError(error.ChildObservationIdentityConflict, resumed.conversation_writer.hasChildObservation(alloc, changed));
+        _ = try resumed.commitContextCompaction(alloc, .{ .summary = @constCast("summary"), .removed_turn_count = 1, .compaction_count = 1 }, null, null, 24);
+    }
+    var compacted = try temp.root.resumeForWrite(alloc, initial.id, .{});
+    defer compacted.deinit(alloc);
+    try std.testing.expectEqual(.already_adopted, try compacted.commitChildObservationPrefix(alloc, prefix, null, 25));
+}
+
+test "child observation recovery sidecar follows synced prefix and stale recovery cannot erase evidence" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |fail_sidecar| {
+        var temp = try TempRoot.init(alloc);
+        defer temp.deinit(alloc);
+        var initial = try testState(alloc, "child-observation-recovery", 10);
+        defer initial.deinit(alloc);
+        var observations = [_]types.PersistedChildObservation{.{
+            .observation = childObservationFixture(initial.id, "delivery"),
+            .after_tool_step_count = 0,
+            .after_steering_count = 0,
+        }};
+        const prefix: types.AssistantHistoryTurn = .{ .user = .{ .text = @constCast("request") }, .assistant = @constCast(""), .execution = .{ .child_observations = &observations } };
+        const recovery: session_codec.RecoveryCheckpoint = .{
+            .turn_id = 7,
+            .user = prefix.user,
+            .assistant_source = @constCast(""),
+            .execution = prefix.execution,
+            .cause = .network_interrupted,
+            .action = .retrying_request,
+            .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+            .requested_fast_mode = false,
+            .fast_mode = false,
+            .max_provider_attempts = 3,
+            .consumed_provider_attempts = 1,
+        };
+        {
+            var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+            defer loaded.deinit(alloc);
+            var old_recovery = recovery;
+            old_recovery.execution = .{};
+            _ = try loaded.appendEvent(alloc, .{ .recovery_checkpoint_set = .{ .checkpoint = old_recovery } }, 11);
+            if (fail_sidecar) {
+                // A failed replacement after log sync must hold this writer.
+                try loaded.log.dir.dir.deleteFile(std.testing.io, recovery_checkpoint_file);
+                try loaded.log.dir.dir.createDir(std.testing.io, recovery_checkpoint_file, private_dir_permissions);
+                try std.testing.expectError(error.SessionPersistenceUncertain, loaded.commitChildObservationPrefix(alloc, prefix, recovery, 12));
+                try std.testing.expectError(error.SessionPersistenceUncertain, loaded.requireWritable());
+                try loaded.log.dir.dir.deleteDir(std.testing.io, recovery_checkpoint_file);
+                // Restore the pre-append sidecar to model death before publication.
+                try writeConversationRecoveryState(alloc, &loaded.log.dir, old_recovery, 0);
+            } else {
+                try std.testing.expectEqual(.adopted, try loaded.commitChildObservationPrefix(alloc, prefix, recovery, 12));
+                try std.testing.expect(loaded.state.recovery_checkpoint != null);
+            }
+        }
+        var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqual(.already_adopted, try resumed.commitChildObservationPrefix(alloc, prefix, recovery, 13));
+        if (fail_sidecar) {
+            try std.testing.expect(resumed.state.recovery_checkpoint == null);
+            try std.testing.expectEqual(@as(usize, 1), resumed.state.history[0].interrupted.execution.child_observations.len);
+        } else {
+            try std.testing.expectEqual(@as(usize, 1), resumed.state.recovery_checkpoint.?.execution.child_observations.len);
+            try std.testing.expect(resumed.conversation_writer.turn_open);
+            var finished = prefix;
+            finished.assistant = @constCast("final answer");
+            _ = try resumed.appendEvent(alloc, .{ .history_turn_committed = .{
+                .conversation_language = .literal("en"),
+                .total_input_tokens = 0,
+                .total_output_tokens = 0,
+                .turn = .{ .assistant = finished },
+            } }, 14);
+            try std.testing.expect(!resumed.conversation_writer.turn_open);
+            try std.testing.expect(resumed.state.recovery_checkpoint == null);
+            const archive = try loadConversationHistoryRange(alloc, &resumed.log.dir, 0, 1);
+            defer types.freeHistoryTurnSlice(alloc, archive);
+            try std.testing.expectEqual(@as(usize, 1), archive[0].assistant.execution.child_observations.len);
+        }
+    }
+}
+
+test "child observation corrupt reopen leaves bytes untouched and torn suffix retains adoption" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |corrupt| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var observations = [_]types.PersistedChildObservation{.{ .observation = childObservationFixture("parent", "delivery"), .after_tool_step_count = 0, .after_steering_count = 0 }};
+        const prefix: types.AssistantHistoryTurn = .{ .user = .{ .text = @constCast("request") }, .assistant = @constCast(""), .execution = .{ .child_observations = &observations } };
+        var committed: u64 = 0;
+        {
+            const file = try tmp.dir.createFile(std.testing.io, events_file, .{ .read = true });
+            var writer = try ConversationWriter.init(alloc, file);
+            defer writer.deinit();
+            try std.testing.expectEqual(.adopted, try writer.commitChildObservationPrefix(alloc, 10, prefix));
+            committed = writer.committed_bytes;
+            const suffix = if (corrupt) "{\"schema_version\":3,\"seq\":3,\"timestamp_ms\":10,\"event\":{\"child_observation\":{}}}\n" else "{\"schema_version\":2";
+            try file.writePositionalAll(std.testing.io, suffix, committed);
+            try file.sync(std.testing.io);
+        }
+        const file = try tmp.dir.openFile(std.testing.io, events_file, .{ .mode = .read_write });
+        if (corrupt) {
+            defer file.close(std.testing.io);
+            const before = try file.length(std.testing.io);
+            try std.testing.expectError(error.InvalidConversationFrame, ConversationWriter.init(alloc, file));
+            try std.testing.expectEqual(before, try file.length(std.testing.io));
+        } else {
+            var writer = try ConversationWriter.init(alloc, file);
+            defer writer.deinit();
+            try std.testing.expectEqual(committed, writer.committed_bytes);
+            try std.testing.expectEqual(.already_adopted, try writer.commitChildObservationPrefix(alloc, 11, prefix));
+        }
+    }
+}
+
+test "child observation uncertain sync holds writer and reopen permits truthful retry" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var observations = [_]types.PersistedChildObservation{.{ .observation = childObservationFixture("parent", "delivery"), .after_tool_step_count = 0, .after_steering_count = 0 }};
+    const prefix: types.AssistantHistoryTurn = .{ .user = .{ .text = @constCast("request") }, .assistant = @constCast(""), .execution = .{ .child_observations = &observations } };
+    {
+        const file = try tmp.dir.createFile(std.testing.io, events_file, .{ .read = true });
+        var writer = try ConversationWriter.init(alloc, file);
+        defer writer.deinit();
+        const SyncFault = struct {
+            fn sync(_: ?*anyopaque, _: std.Io.File) !void {
+                return error.InjectedSyncFailure;
+            }
+        };
+        writer.test_sync_ops = .{ .sync_file = SyncFault.sync };
+        try std.testing.expectError(error.SessionPersistenceUncertain, writer.commitChildObservationPrefix(alloc, 10, prefix));
+        try std.testing.expectError(error.SessionPersistenceUncertain, writer.commitChildObservationPrefix(alloc, 11, prefix));
+    }
+    const file = try tmp.dir.openFile(std.testing.io, events_file, .{ .mode = .read_write });
+    var writer = try ConversationWriter.init(alloc, file);
+    defer writer.deinit();
+    try std.testing.expectEqual(.adopted, try writer.commitChildObservationPrefix(alloc, 12, prefix));
+    try std.testing.expectEqual(.already_adopted, try writer.commitChildObservationPrefix(alloc, 13, prefix));
 }
 
 test "cache-free recovery checkpoint resumes and clears independently" {

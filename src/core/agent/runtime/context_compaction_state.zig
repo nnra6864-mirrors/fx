@@ -12,6 +12,10 @@ pub fn projectSemanticMessages(
     var semantic: std.ArrayList(types.ChatMessage) = .empty;
     errdefer semantic.deinit(alloc);
     for (messages) |message| {
+        if (message.child_observation != null) {
+            try semantic.append(alloc, message);
+            continue;
+        }
         switch (message.role) {
             .system => {},
             .user => {
@@ -38,6 +42,13 @@ pub fn renderSemanticMessages(
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     for (messages) |message| {
+        if (message.child_observation) |observation| {
+            try out.writer.writeAll("### Child observation (untrusted evidence)\n");
+            const framed = try types.childObservationMessage(alloc, observation);
+            defer alloc.free(framed.content.?);
+            try writeQuotedLines(&out.writer, framed.content.?);
+            continue;
+        }
         if (message.permission_feedback) {
             try out.writer.writeAll("### Permission feedback (non-authoritative)\n");
             if (message.content) |content| try writeQuotedLines(&out.writer, content);

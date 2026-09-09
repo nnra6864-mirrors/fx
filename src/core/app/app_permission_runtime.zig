@@ -1,5 +1,6 @@
 const std = @import("std");
 const app_worker_runtime = @import("app_worker_runtime.zig");
+const app_workspace_runtime = @import("app_workspace_runtime.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -69,6 +70,44 @@ const YoloWarning = struct {
 
 pub fn Runtime(comptime App: type) type {
     return struct {
+        /// Workspace authority is process-scoped. Native child tool contexts
+        /// snapshot it under this same lock, including directory revocation.
+        pub fn adoptWorkspaceAccess(app: *App, access: app_workspace_runtime.Access) void {
+            app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+            defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+            app_workspace_runtime.Runtime(App).adopt(app, access);
+        }
+
+        pub fn installWorkspaceAccess(app: *App, access: *app_workspace_runtime.Access) bool {
+            app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+            defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+            return app_workspace_runtime.Runtime(App).install(app, access);
+        }
+
+        pub fn refreshWorkspaceAccess(app: *App) app_workspace_runtime.Error!bool {
+            app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+            defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+            return app_workspace_runtime.Runtime(App).refreshAvailability(app);
+        }
+
+        /// Called with the process authority mutex held. Selection changes must
+        /// detach before clearing the selected engine; resets intentionally
+        /// update the corresponding retained root, never another session.
+        fn syncRetainedGrants(app: *App) !void {
+            if (comptime @hasField(App, "session_persistence")) {
+                if (app.session_persistence.retained_subagent_hosts.selectedAuthority()) |authority| {
+                    try authority.replaceGrants(app.alloc, app.permission_engine.grants.items);
+                }
+            }
+        }
+
+        pub fn allowToolForSession(app: *App, tool_name: []const u8, target_path: []const u8) !void {
+            app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+            defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+            try app.permission_engine.allow(app.alloc, tool_name, target_path);
+            try syncRetainedGrants(app);
+        }
+
         /// Session-scoped mode change: applies the mode and syncs queued
         /// prompts without touching the persisted preference.
         pub fn setMode(app: *App, mode: types.PermissionMode) void {
@@ -148,6 +187,9 @@ pub fn Runtime(comptime App: type) type {
             app.permission_engine.mode = .ask;
             updateYoloWarningForMode(app);
             app.permission_engine.clear(app.alloc);
+            syncRetainedGrants(app) catch |err| {
+                debug_trace.logf("permission", "retained root authority invalidated after reset err={s}", .{@errorName(err)});
+            };
             if (comptime @hasField(@TypeOf(app.permission_state), "authority_mutex")) {
                 app.permission_state.authority_mutex.unlock(io_mod.getIo());
             }

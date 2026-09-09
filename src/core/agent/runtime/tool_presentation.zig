@@ -984,7 +984,12 @@ pub fn finishExecutedToolStatus(
     else
         null;
     const outcome_decision = command_decision orelse terminal_action_decision;
-    const base_line = if (outcome_decision) |decision| blk: {
+    const waiting_child = if (result.child_delivery) |value| value.state == .running else false;
+    const child_action = if (waiting_child) try tooling_presentation.subagentAction(arena, call, .waiting) else null;
+    defer if (child_action) |value| value.deinit(arena);
+    const base_line = if (child_action) |value|
+        try std.fmt.allocPrint(arena, "{s} {s}", .{ value.label, value.detail })
+    else if (outcome_decision) |decision| blk: {
         const base = try hooks.describe_tool_action_denied(
             hooks.ctx,
             arena,

@@ -2,6 +2,11 @@ const std = @import("std");
 const approval_registry = @import("approval_registry.zig");
 const authority = @import("authority.zig");
 const child_state = @import("child_state.zig");
+const delivery = @import("delivery.zig");
+
+test {
+    _ = delivery;
+}
 const domain = @import("domain.zig");
 const execution = @import("execution.zig");
 const managed_owner = @import("managed_owner.zig");
@@ -16,6 +21,7 @@ const session = @import("../session/session.zig");
 const session_codec = @import("../session/session_codec.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const session_store = @import("../session/session_store.zig");
+const session_child_store = @import("../session/session_child_store.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const types = @import("../shared/types.zig");
 
@@ -51,6 +57,16 @@ fn unavailableChildRun(
     return error.ProviderFailed;
 }
 
+pub const WaitObservation = enum { waiting, steering, handoff, parent_stopped };
+
+/// Borrowed only while executeManaged is on the parent stack. Child workers
+/// never retain this callback or use it as their cancellation source.
+pub const ParentWait = struct {
+    context: *anyopaque,
+    turn_id: u64,
+    observe_fn: *const fn (*anyopaque, u64) WaitObservation,
+};
+
 pub const ExecuteOptions = struct {
     caller_id: []const u8,
     invocation_id: []const u8,
@@ -63,11 +79,13 @@ pub const ExecuteOptions = struct {
     timestamp_ms: i64,
     identity_epoch: u64 = 0,
     cancel_flag: ?*std.atomic.Value(bool) = null,
+    parent_wait: ?ParentWait = null,
 };
 
 pub const ManagedExecutionResult = struct {
     success: bool,
     body: []u8,
+    child_delivery: ?types.ChildDelivery = null,
 };
 
 pub const ApprovalResolveOptions = struct {
@@ -89,6 +107,8 @@ pub const Runtime = struct {
     approvals: approval_registry.Registry,
     authority_resolver: authority.Resolver,
     managed: managed_owner.Owner,
+    /// Owned original-parent output capability; immutable after native creation.
+    delivery_result_capability: ?session_child_store.SessionChildCapability = null,
     recovery_state: std.atomic.Value(RecoveryState) = .init(.pending),
 
     pub fn create(
@@ -131,8 +151,14 @@ pub const Runtime = struct {
         return runtime;
     }
 
+    /// Signal before joining host callers; deinit drains child ownership later.
+    pub fn requestShutdown(self: *Runtime) void {
+        self.managed.requestShutdown();
+    }
+
     pub fn deinit(self: *Runtime) void {
         self.managed.deinit();
+        if (self.delivery_result_capability) |*capability| capability.deinit();
         self.approvals.deinit();
         self.alloc.free(self.root_id);
         const alloc = self.alloc;
@@ -212,6 +238,7 @@ pub const Runtime = struct {
         options: ExecuteOptions,
     ) !ManagedExecutionResult {
         _ = options.max_result_bytes;
+        try self.managed.checkAdmission();
         const identity_epoch = if (options.identity_epoch != 0)
             options.identity_epoch
         else
@@ -224,6 +251,27 @@ pub const Runtime = struct {
         defer alloc.free(operation_id);
 
         return switch (request.*) {
+            .cancel => |target| blk: {
+                if (!std.mem.eql(u8, options.caller_id, self.root_id)) {
+                    break :blk self.encodeManaged(alloc, .{ .ok = false, .error_code = "caller_unavailable" });
+                }
+                const wait = options.parent_wait orelse
+                    break :blk self.encodeManaged(alloc, .{ .ok = false, .error_code = "independent_host_required" });
+                if (wait.observe_fn(wait.context, wait.turn_id) == .parent_stopped) return error.Cancelled;
+                const status = self.managed.cancelWork(.{ .child_id = target.child_id, .work_id = target.work_id }) catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    break :blk self.encodeManaged(alloc, .{ .ok = false, .error_code = switch (err) {
+                        error.StaleWork => "stale_work",
+                        error.ChildUnavailable => "child_unavailable",
+                        error.StateUnavailable => "state_unavailable",
+                        error.OutOfMemory => unreachable,
+                    } });
+                };
+                debug_trace.eventf("subagent", "child_cancel_tool_result", .{ .turn_id = wait.turn_id }, "root_id={s} child_id={s} work_id={s} result={s} source=main_agent", .{ self.root_id, target.child_id, target.work_id, @tagName(status) });
+                const text = try std.fmt.allocPrint(alloc, "{s}\nchild_id={s}\nwork_id={s}", .{ @tagName(status), target.child_id, target.work_id });
+                defer alloc.free(text);
+                break :blk self.encodeManaged(alloc, .{ .ok = true, .result = text });
+            },
             .run, .message => blk: {
                 if (!std.mem.eql(u8, options.caller_id, self.root_id)) {
                     break :blk self.encodeManaged(alloc, .{
@@ -246,12 +294,30 @@ pub const Runtime = struct {
                         });
                     },
                     .ready => |ready| {
-                        _ = try self.managed.start(ready.child_id);
+                        const receipt: ?delivery.Receipt = if (options.parent_wait) |wait| .{
+                            .parent_turn_id = wait.turn_id,
+                            .child_id = ready.child_id,
+                            .work_id = operation_id,
+                            .tool_call_id = options.invocation_id,
+                            .delivery_id = operation_id,
+                        } else null;
+                        if (receipt) |value| {
+                            self.deliveryStore().reserve(alloc, value) catch |err| {
+                                self.rejectUnstartedWork(ready.child_id, operation_id, err);
+                                return err;
+                            };
+                        }
+                        _ = try self.managed.start(.{
+                            .child_id = ready.child_id,
+                            .work_id = operation_id,
+                        });
                         const result = try self.observeManagedState(
                             alloc,
                             ready.child_id,
                             operation_id,
                             options.cancel_flag,
+                            options.parent_wait,
+                            receipt,
                         );
                         break :blk result;
                     },
@@ -278,6 +344,83 @@ pub const Runtime = struct {
             },
             .authority_resolver = &self.authority_resolver,
             .approvals = &self.approvals,
+            .outcome_publisher = .{ .context = self, .publish_fn = publishDelivery },
+        };
+    }
+
+    pub fn deliveryStore(self: *Runtime) delivery.Store {
+        return .{ .sessions = self.sessions, .parent_id = self.root_id, .results = if (self.delivery_result_capability) |*capability| capability else null };
+    }
+
+    /// Returns allocator-owned evidence, or null only for proven active work.
+    /// Reconciles interrupted owners without rerunning a child.
+    pub fn readPendingDelivery(self: *Runtime, alloc: Allocator, receipt: delivery.Receipt) !?types.ChildObservation {
+        if (try self.deliveryStore().outcome(alloc, receipt)) |value| {
+            const state = self.managed.wait(.{ .child_id = receipt.child_id, .work_id = receipt.work_id }, .{ .clock = .awake, .raw = .fromMilliseconds(0) }) catch |err| switch (err) {
+                error.ChildUnavailable, error.StaleWork => return value,
+                else => {
+                    types.freeChildObservation(alloc, value);
+                    return err;
+                },
+            };
+            if (state.phase == .running or state.phase == .awaiting_approval) {
+                types.freeChildObservation(alloc, value);
+                return null;
+            }
+            return value;
+        }
+        const observed = self.managed.wait(.{ .child_id = receipt.child_id, .work_id = receipt.work_id }, .{ .clock = .awake, .raw = .fromMilliseconds(0) }) catch |err| switch (err) {
+            error.ChildUnavailable, error.StaleWork => {
+                try self.deliveryStore().publishText(alloc, receipt, .unavailable, "The exact child work is no longer available. It was not restarted.");
+                return self.deliveryStore().outcome(alloc, receipt);
+            },
+            else => return err,
+        };
+        if (observed.phase == .running or observed.phase == .awaiting_approval) return null;
+        try self.publishDeliveryInner(.{ .child_id = receipt.child_id, .work_id = receipt.work_id }, observed.outcome orelse .interrupted, observed.failure);
+        debug_trace.eventf("subagent", "child_delivery_reconciled", .{ .turn_id = receipt.parent_turn_id }, "root_id={s} child_id={s} work_id={s} delivery_id={s}", .{ self.root_id, receipt.child_id, receipt.work_id, receipt.delivery_id });
+        return self.deliveryStore().outcome(alloc, receipt);
+    }
+
+    fn publishDelivery(raw: *anyopaque, target: managed_owner.WorkTarget, outcome: child_state.Outcome, failure: ?types.ModelFailureDiagnostic) error{ OutOfMemory, DeliveryUnavailable }!void {
+        const self: *Runtime = @ptrCast(@alignCast(raw));
+        self.publishDeliveryInner(target, outcome, failure) catch |err| {
+            debug_trace.eventf("subagent", "child_delivery_publication_failed", .{}, "root_id={s} child_id={s} work_id={s} error={s}", .{ self.root_id, target.child_id, target.work_id, @errorName(err) });
+            return if (err == error.OutOfMemory) error.OutOfMemory else error.DeliveryUnavailable;
+        };
+    }
+
+    fn publishDeliveryInner(self: *Runtime, target: managed_owner.WorkTarget, outcome: child_state.Outcome, failure: ?types.ModelFailureDiagnostic) !void {
+        var index = try self.deliveryStore().load(self.alloc);
+        defer index.deinit();
+        const receipt = index.find(target.child_id, target.work_id) orelse return;
+        const text = try self.managedResultText(self.alloc, target.child_id, target.work_id);
+        defer if (text) |value| self.alloc.free(value);
+        const failure_text = if (outcome == .failed)
+            try formatFailedResult(self.alloc, if (failure) |*value| value.view() else null, text)
+        else
+            null;
+        defer if (failure_text) |value| self.alloc.free(value);
+        try self.deliveryStore().publishText(self.alloc, receipt, switch (outcome) {
+            .completed => .completed,
+            .failed => .failed,
+            .cancelled => .cancelled,
+            .interrupted => .interrupted,
+        }, failure_text orelse text orelse "Child work settled without textual output.");
+    }
+
+    fn rejectUnstartedWork(self: *Runtime, child_id: []const u8, work_id: []const u8, reason: anyerror) void {
+        debug_trace.eventf("subagent", "child_delivery_reservation_failed", .{}, "root_id={s} child_id={s} work_id={s} error={s}", .{ self.root_id, child_id, work_id, @errorName(reason) });
+        var lock = self.childStateStore().acquireLock(self.alloc) catch |err| {
+            debug_trace.logf("subagent", "unstarted work cleanup lock failed root_id={s} work_id={s} error={s}", .{ self.root_id, work_id, @errorName(err) });
+            return;
+        };
+        defer lock.release();
+        var registry = self.childStateStore().load(self.alloc) catch return;
+        defer registry.deinit(self.alloc);
+        registry.finish(self.alloc, child_id, work_id, .failed, execution.failureDiagnosticValue("delivery_reservation", @errorName(reason))) catch return;
+        self.childStateStore().save(self.alloc, registry) catch |err| {
+            debug_trace.logf("subagent", "unstarted work cleanup publication failed root_id={s} work_id={s} error={s}", .{ self.root_id, work_id, @errorName(err) });
         };
     }
 
@@ -321,6 +464,7 @@ pub const Runtime = struct {
         const fingerprint = model_contract.requestFingerprint(request);
         var lock = try self.managed.state_store.acquireLock(alloc);
         defer lock.release();
+        try self.managed.checkAdmission();
         var registry = try self.managed.state_store.load(alloc);
         defer registry.deinit(alloc);
         if (registry.findByOperation(operation_id)) |existing| {
@@ -367,6 +511,7 @@ pub const Runtime = struct {
         );
         defer active.deinit(alloc);
         switch (request) {
+            .cancel => return error.NotWorkRequest,
             .run => {
                 const child_id = try session_store.generateSessionId(alloc);
                 defer alloc.free(child_id);
@@ -463,32 +608,57 @@ pub const Runtime = struct {
         child_id: []const u8,
         work_id: []const u8,
         cancel_flag: ?*std.atomic.Value(bool),
+        parent_wait: ?ParentWait,
+        receipt: ?delivery.Receipt,
     ) !ManagedExecutionResult {
+        const target = managed_owner.WorkTarget{ .child_id = child_id, .work_id = work_id };
+        debug_trace.eventf("subagent", "child_parent_wait_entered", .{ .turn_id = if (parent_wait) |wait| wait.turn_id else 0 }, "root_id={s} child_id={s} work_id={s} independent={s}", .{ self.root_id, child_id, work_id, if (parent_wait != null) "true" else "false" });
         while (true) {
-            if (cancel_flag) |flag| {
-                if (flag.load(.seq_cst)) {
-                    self.managed.cancel(child_id) catch |err| switch (err) {
-                        error.ChildUnavailable => {},
-                    };
-                    return error.Cancelled;
+            const reason: WaitObservation = if (parent_wait) |wait| wait.observe_fn(wait.context, wait.turn_id) else .waiting;
+            if (parent_wait == null) {
+                if (cancel_flag) |flag| {
+                    if (flag.load(.seq_cst)) {
+                        if (self.managed.cancelWork(target)) |_| {} else |err| switch (err) {
+                            error.ChildUnavailable, error.StaleWork => {},
+                            error.OutOfMemory, error.StateUnavailable => debug_trace.logf(
+                                "subagent",
+                                "parent cancellation could not signal child_id={s} work_id={s} err={s}",
+                                .{ child_id, work_id, @errorName(err) },
+                            ),
+                        }
+                        return error.Cancelled;
+                    }
                 }
             }
-            const observation = self.managed.wait(child_id, .{
+            const observation = self.managed.wait(target, .{
                 .clock = .awake,
-                .raw = .fromMilliseconds(terminal_wait_pulse_ms),
+                .raw = .fromMilliseconds(if (reason == .waiting) terminal_wait_pulse_ms else 0),
             }) catch |err| return self.encodeManaged(alloc, .{
                 .ok = false,
                 .error_code = switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.ChildUnavailable => "child_unavailable",
+                    error.StaleWork => "stale_work",
                     error.StateUnavailable => "state_unavailable",
                 },
             });
             switch (observation.phase) {
-                .running, .awaiting_approval => continue,
+                .running, .awaiting_approval => {
+                    if (reason == .waiting) continue;
+                    const ticket = receipt orelse unreachable;
+                    const text = try std.fmt.allocPrint(alloc, "Delegated work is still running.\nchild_id={s}\nwork_id={s}\nOnly the main agent's wait ended. The child was not cancelled; its completion will be delivered separately.", .{ child_id, work_id });
+                    defer alloc.free(text);
+                    var result = try self.encodeManaged(alloc, .{ .ok = true, .result = text });
+                    result.child_delivery = .{ .key = ticket.key(), .state = .running };
+                    debug_trace.eventf("subagent", "child_parent_wait_released", .{ .turn_id = ticket.parent_turn_id }, "root_id={s} child_id={s} work_id={s} delivery_id={s} reason={s} child_cancelled=false", .{ self.root_id, child_id, work_id, ticket.delivery_id, @tagName(reason) });
+                    return result;
+                },
                 .idle, .finished, .interrupted => {},
             }
-            return self.completeManagedResult(alloc, child_id, work_id, observation);
+            var result = try self.completeManagedResult(alloc, child_id, work_id, observation);
+            if (receipt) |ticket| result.child_delivery = .{ .key = ticket.key(), .state = .terminal };
+            debug_trace.eventf("subagent", "child_parent_wait_completed", .{ .turn_id = if (parent_wait) |wait| wait.turn_id else 0 }, "root_id={s} child_id={s} work_id={s}", .{ self.root_id, child_id, work_id });
+            return result;
         }
     }
 
@@ -649,6 +819,36 @@ test "terminal result projects every managed outcome without a lifecycle phase" 
     try std.testing.expectEqualStrings("child_result_unavailable", missing.error_code.?);
 }
 
+test "runtime shutdown is idempotent and rejects new managed admission" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = undefined;
+    runtime.managed = .{
+        .alloc = alloc,
+        .sessions = undefined,
+        .state_store = undefined,
+        .services = undefined,
+        .authority_resolver = undefined,
+        .approvals = undefined,
+    };
+    defer runtime.managed.deinit();
+    runtime.requestShutdown();
+    runtime.requestShutdown();
+    var request = model_contract.Request{ .run = .{ .task = @constCast("review") } };
+    try std.testing.expectError(error.OwnerClosed, runtime.executeManaged(alloc, &request, .{
+        .caller_id = "parent",
+        .invocation_id = "call",
+        .defaults = .{
+            .provider = .gateway,
+            .model = "test",
+            .effort = .auto,
+            .conversation_language = session.ConversationLanguage.literal("en"),
+        },
+        .max_result_bytes = 1024,
+        .timestamp_ms = 1,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), runtime.managed.slots.items.len);
+}
+
 fn managedAdmissionReady(
     alloc: Allocator,
     child_id: []const u8,
@@ -677,6 +877,7 @@ fn makeManagedWork(
     const message = switch (request) {
         .run => |value| value.task,
         .message => |value| value.message,
+        .cancel => return error.NotWorkRequest,
     };
     const id = try alloc.dupe(u8, operation_id);
     errdefer alloc.free(id);

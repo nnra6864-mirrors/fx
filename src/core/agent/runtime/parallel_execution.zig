@@ -325,6 +325,7 @@ fn duplicateParallelToolResult(alloc: Allocator, call: ToolCall, execution: Tool
         };
     }
     var duplicated_execution: ToolExecutionResult = .{
+        .child_delivery = execution.child_delivery,
         .model_content_kind = execution.model_content_kind,
         .status = execution.status,
         .model_output = try alloc.dupe(u8, execution.model_output),
@@ -385,6 +386,7 @@ fn duplicateToolResultMemory(
     return .{
         .tool_images = tool_images,
         .tool_image_handle = image_handle,
+        .child_delivery = memory.child_delivery,
         .output_handle = output_handle,
         .preview = preview,
         .output_bytes = memory.output_bytes,

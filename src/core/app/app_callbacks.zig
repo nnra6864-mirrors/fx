@@ -15,6 +15,7 @@ const provider_runtime = @import("provider_runtime.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
+const app_child_work_runtime = @import("app_child_work_runtime.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -298,6 +299,7 @@ pub fn Bindings(comptime App: type) type {
                     null,
                 .finalize_turn = agentFinalizeTurn,
                 .take_steering_boundary = if (comptime @hasDecl(@TypeOf(app.worker), "takeSteeringBoundary")) agentTakeSteeringBoundary else null,
+                .child_work = if (comptime @import("builtin").os.tag != .wasi and @hasDecl(App, "prepareNativeSubagentHost")) app_child_work_runtime.Runtime(App).callbacks() else null,
                 .append_runtime_context = agentAppendRuntimeContext,
                 .append_static_context = agentAppendStaticContext,
                 .validate_tool_call = agentValidateToolCall,
@@ -646,6 +648,9 @@ pub fn Bindings(comptime App: type) type {
         fn agentAppendRuntimeContext(ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app.appendRuntimeContextMessage(arena, messages);
+            if (comptime @import("builtin").os.tag != .wasi and @hasDecl(App, "prepareNativeSubagentHost")) {
+                try app_child_work_runtime.Runtime(App).appendPendingContext(app, arena, messages);
+            }
         }
 
         fn cooperativeTransportPulse(ctx: *anyopaque) !void {

@@ -20,6 +20,23 @@ const render_request = @import("../../ui/render_request.zig");
 
 const ToolPermissionDecision = types.ToolPermissionDecision;
 
+fn matchesChildApproval(presented: permission_request.PermissionRequest, child_id: []const u8, request_id: u64) bool {
+    if (presented.id != request_id) return false;
+    return switch (presented.origin) {
+        .active_session => false,
+        .subagent => |origin| std.mem.eql(u8, origin, child_id),
+    };
+}
+
+test "child approval routing rejects main prompts other children and stale display identities" {
+    var request = permission_request.PermissionRequest{ .id = 7, .label = "shell" };
+    try std.testing.expect(!matchesChildApproval(request, "child-a", 7));
+    request.origin = .{ .subagent = "child-a" };
+    try std.testing.expect(matchesChildApproval(request, "child-a", 7));
+    try std.testing.expect(!matchesChildApproval(request, "child-b", 7));
+    try std.testing.expect(!matchesChildApproval(request, "child-a", 8));
+}
+
 pub fn ApprovalRuntime(comptime App: type) type {
     return struct {
         const interrupt = input_interrupt_runtime.InterruptRuntime(App);
@@ -331,9 +348,13 @@ pub fn ApprovalRuntime(comptime App: type) type {
             decision: ToolPermissionDecision,
         ) !bool {
             if (comptime !@hasField(App, "session_persistence")) return false;
+            const presented = app.approval_prompt.request orelse return false;
+            if (presented.view().origin != .subagent) return false;
             const host = app_session_runtime.Runtime(App).subagentHost(app) orelse {
                 debug_trace.logf("subagent", "approval response ignored reason=host_unavailable", .{});
-                return false;
+                clearApprovalPrompt(app, "subagent_approval_host_unavailable");
+                requestActiveSurfaceFrame(app);
+                return true;
             };
             const loaded_pending = host.pendingApprovalRequest(app.alloc) catch |err| {
                 debug_trace.logf(
@@ -345,17 +366,21 @@ pub fn ApprovalRuntime(comptime App: type) type {
             };
             var pending = loaded_pending orelse {
                 debug_trace.logf("subagent", "approval response ignored reason=request_unavailable", .{});
-                return false;
+                clearApprovalPrompt(app, "subagent_approval_request_unavailable");
+                requestActiveSurfaceFrame(app);
+                return true;
             };
             defer pending.deinit(app.alloc);
             const request_id = app.approval_prompt.request.?.id;
-            if (pending.request.view().id != request_id) {
+            if (!matchesChildApproval(presented.view(), pending.child_id, pending.request.view().id)) {
                 debug_trace.logf(
                     "subagent",
                     "approval response ignored reason=request_mismatch presented={d} pending={d}",
                     .{ request_id, pending.request.view().id },
                 );
-                return false;
+                clearApprovalPrompt(app, "subagent_approval_stale");
+                requestActiveSurfaceFrame(app);
+                return true;
             }
             var response = try app.approval_prompt.decision.materializeResponse(
                 app.alloc,
@@ -403,7 +428,21 @@ pub fn ApprovalRuntime(comptime App: type) type {
                     var pending = loaded;
                     defer pending.deinit(app.alloc);
                     if (app.approval_prompt.request) |request| {
-                        if (pending.request.view().id == request.id) {
+                        if (matchesChildApproval(request.view(), pending.child_id, pending.request.view().id)) {
+                            if (try app.session_persistence.retained_subagent_hosts.dismissApproval(host, .{
+                                .child_id = pending.child_id,
+                                .request_id = pending.request_id,
+                            })) {
+                                debug_trace.eventf("subagent", "child_approval_display_dismissed", .{}, "root_id={s} child_id={s} request_id={s} child_cancelled=false", .{ host.root_id, pending.child_id, pending.request_id });
+                                app.worker.requestInteractiveCancel();
+                                clearApprovalPrompt(app, "independent_subagent_approval_dismissed");
+                                if (app.stream.active) {
+                                    app.pacer.clear(app.alloc);
+                                    app.stopStream();
+                                }
+                                requestActiveSurfaceFrame(app);
+                                return;
+                            }
                             _ = host.resolveApproval(.{
                                 .request_id = pending.request_id,
                                 .child_id = pending.child_id,

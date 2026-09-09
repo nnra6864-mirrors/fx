@@ -57,6 +57,7 @@ const runtime_tool_admission = @import("tool_admission.zig");
 const runtime_interruption = @import("interruption.zig");
 const runtime_parallel_execution = @import("parallel_execution.zig");
 const runtime_tool_batch = @import("tool_batch.zig");
+const runtime_child_work = @import("child_work.zig");
 const model_response_recovery = @import("model_response_recovery.zig");
 const response_language = @import("response_language.zig");
 const tool_mcp_runtime = @import("../../tooling/tool_mcp_runtime.zig");
@@ -4320,6 +4321,31 @@ fn pushTerminalProviderFailureStatus(
     });
 }
 
+const ChildWaitStop = struct {
+    stream: *runtime_assistant_stream.StreamChunkContext,
+    trace: *PromptFinishTrace,
+    step: TraceContext,
+    completed_tools: [][]u8,
+    interrupted_persisted: *bool,
+    stop: *CommonStopState,
+    attempts: usize,
+    limit: usize,
+    route_fast_mode: bool,
+    cause: model_response_recovery.FailureCause,
+    tool_evidence: model_response_recovery.ToolEvidence,
+};
+
+fn finishChildWaitStop(deps: *const AgentRuntimeDeps, finalization: *TurnFinalizationGuard, arena: Allocator, job: QueuedPrompt, suffix: []const ChatMessage, config: Config, state: ChildWaitStop) !void {
+    debug_trace.eventf("subagent", "parent_child_execution_detaching", .{ .turn_id = job.turn_id }, "reason={s} child_cancelled=false", .{if (recoveryPauseRequested(config)) "pause" else "interrupt"});
+    if (recoveryPauseRequested(config)) {
+        try persistRecoveryCheckpoint(deps, finalization, arena, job, suffix, "", job.model, config.fast_mode, state.route_fast_mode, state.limit, state.attempts, false, state.cause, .pause, state.tool_evidence, state.step);
+        try finishRecoveryPaused(deps, finalization, state.stream, arena, state.trace, state.cause, state.attempts, state.limit, pausedRequiredAction(state.tool_evidence), null);
+        return;
+    }
+    try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, null, null, state.completed_tools, state.interrupted_persisted, state.step, suffix, state.stop.retained_candidate, &state.stop.terminal_materializing);
+    state.trace.finish("interrupted");
+}
+
 fn finishRecoveryPaused(
     deps: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,
@@ -5927,6 +5953,14 @@ fn processQueuedPromptLoop(
         }
         _ = overlay_arena_state.reset(.retain_capacity);
         const overlay_arena = overlay_arena_state.allocator();
+        if (config.origin == .root and try runtime_child_work.adoptAtBoundary(
+            deps,
+            arena,
+            job,
+            finalization.compacted_execution,
+            &within_turn_suffix,
+            if (restore_recovery_source) if (job.recovery_checkpoint) |checkpoint| checkpoint.assistant_source else null else null,
+        )) restore_recovery_source = false;
         const steering_boundary = try take_steering_boundary(
             deps,
             overlay_arena,
@@ -8237,6 +8271,29 @@ fn processQueuedPromptLoop(
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
                 continue;
+            }
+
+            if (config.origin == .root and disposition == .completed and agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
+                switch (try runtime_child_work.afterAnswer(deps, arena, job, finalization.compacted_execution, &within_turn_suffix, history_text, history_replay)) {
+                    .none => {},
+                    .continue_turn => continue :agent_steps_loop,
+                    .stopped => {
+                        try finishChildWaitStop(deps, finalization, arena, job, within_turn_suffix.items, config, .{
+                            .stream = &stream_ctx,
+                            .trace = &finish_trace,
+                            .step = step_ctx,
+                            .completed_tools = completed_tool_names.items,
+                            .interrupted_persisted = &interrupted_persisted,
+                            .stop = stop_state,
+                            .attempts = semantic_attempt,
+                            .limit = semantic_limit,
+                            .route_fast_mode = route_fast_mode,
+                            .cause = recovery_cause,
+                            .tool_evidence = preserved_tool_evidence,
+                        });
+                        return;
+                    },
+                }
             }
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
@@ -10930,6 +10987,29 @@ fn processQueuedPromptLoop(
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
                 continue;
+            }
+
+            if (config.origin == .root and agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
+                switch (try runtime_child_work.afterAnswer(deps, arena, job, finalization.compacted_execution, &within_turn_suffix, raw_final, final_provider_replay)) {
+                    .none => {},
+                    .continue_turn => continue :agent_steps_loop,
+                    .stopped => {
+                        try finishChildWaitStop(deps, finalization, arena, job, within_turn_suffix.items, config, .{
+                            .stream = &stream_ctx,
+                            .trace = &finish_trace,
+                            .step = step_ctx,
+                            .completed_tools = completed_tool_names.items,
+                            .interrupted_persisted = &interrupted_persisted,
+                            .stop = stop_state,
+                            .attempts = semantic_attempt,
+                            .limit = semantic_limit,
+                            .route_fast_mode = route_fast_mode,
+                            .cause = recovery_cause,
+                            .tool_evidence = preserved_tool_evidence,
+                        });
+                        return;
+                    },
+                }
             }
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {

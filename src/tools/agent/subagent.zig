@@ -86,6 +86,8 @@ fn validationErrorCode(err: model_contract.ValidationError) []const u8 {
         error.InvalidAgent => "invalid_agent",
         error.InvalidInstructions => "invalid_instructions",
         error.InvalidMessage => "invalid_message",
+        error.InvalidChildId => "invalid_child_id",
+        error.InvalidWorkId => "invalid_work_id",
     };
 }
 
@@ -109,6 +111,13 @@ fn parseRoot(value: std.json.Value) DecodeError!model_contract.RequestInput {
             .agent = try requiredString(request, "agent"),
             .instructions = try optionalString(request, "instructions"),
             .message = try requiredString(request, "message"),
+        } };
+    }
+    if (std.mem.eql(u8, action, "cancel")) {
+        try rejectUnknown(request, &.{ "action", "child_id", "work_id" });
+        return .{ .cancel = .{
+            .child_id = try requiredString(request, "child_id"),
+            .work_id = try requiredString(request, "work_id"),
         } };
     }
     return error.InvalidEnum;
@@ -183,8 +192,8 @@ pub fn readsOnly(_: tool_dispatch.ToolInput) bool {
     return false;
 }
 
-pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
-    return false;
+pub fn isIrreversible(input: tool_dispatch.ToolInput) bool {
+    return input.as(Input).request == .cancel;
 }
 
 fn expectDecodeFailure(args_json: []const u8, code: []const u8) !void {
@@ -280,13 +289,17 @@ test "call executes a validated managed request through the provider" {
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
 }
 
-test "decode accepts only delegation intents" {
+test "decode accepts delegation and exact work cancellation" {
     try expectRequestTag("{\"request\":{\"action\":\"run\",\"task\":\"do it\"}}", .run);
     try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\"}}", .message);
     try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"instructions\":\"Review strictly.\",\"message\":\"next\"}}", .message);
     try expectDecodeFailure("{\"request\":{\"action\":\"wait\",\"child_id\":\"01J00000000000000000000000\"}}", "invalid_enum");
     try expectDecodeFailure("{\"request\":{\"action\":\"stop\",\"child_id\":\"01J00000000000000000000000\"}}", "invalid_enum");
-    try expectDecodeFailure("{\"request\":{\"action\":\"cancel\",\"child_id\":\"01J00000000000000000000000\"}}", "invalid_enum");
+    try expectDecodeFailure("{\"request\":{\"action\":\"cancel\",\"child_id\":\"01J00000000000000000000000\"}}", "missing_field");
+    try expectRequestTag("{\"request\":{\"action\":\"cancel\",\"child_id\":\"child\",\"work_id\":\"fxop:2:m:1:work\"}}", .cancel);
+    try expectDecodeFailure("{\"request\":{\"action\":\"cancel\",\"child_id\":\"../other\",\"work_id\":\"work\"}}", "invalid_child_id");
+    try expectDecodeFailure("{\"request\":{\"action\":\"cancel\",\"child_id\":\"child\",\"work_id\":\"\"}}", "invalid_work_id");
+    try expectDecodeFailure("{\"request\":{\"action\":\"cancel\",\"child_id\":\"child\",\"work_id\":\"work\",\"task\":\"unexpected\"}}", "unknown_field");
 }
 
 test "decode rejects manager input cross-action fields and unknown actions" {

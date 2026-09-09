@@ -56,6 +56,21 @@ pub const Config = struct {
     context_enabled: bool,
     project_context: []const u8 = "",
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
+    /// The native child owner binds turn-local services after credential routing
+    /// and again after refresh. The callback and its resources outlive run().
+    tool_context_binding: ?struct {
+        context: *anyopaque,
+        bind_fn: *const fn (*anyopaque, Allocator, *tool_runtime.Context) Allocator.Error!void,
+    } = null,
+};
+
+const ToolContextLease = struct {
+    context: tool_runtime.Context,
+    arena: std.heap.ArenaAllocator,
+
+    fn deinit(self: *ToolContextLease) void {
+        self.arena.deinit();
+    }
 };
 
 const Context = struct {
@@ -69,10 +84,15 @@ const Context = struct {
     turn_outcome: ?types.TurnPresentationOutcome = null,
     refreshed_credential: ?credentials.Credential = null,
 
-    fn toolContext(self: *Context) tool_runtime.Context {
+    fn toolContext(self: *Context, alloc: Allocator) Allocator.Error!ToolContextLease {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer arena.deinit();
         var result = self.config.tool_context;
         result.worker = self.turn.workerRuntime();
         result.session = self.turn.sessionRuntime();
+        result.permission_prompter = self.turn.permissionPrompter();
+        result.managed_executions = self.turn.managedExecutionRuntime();
+        result.ephemeral_command_replay = self.turn.managedExecutionRuntime().replayStore();
         result.cancel_flag = self.cancel;
         result.permission_mode = self.admission.permission_mode;
         result.permission_grants = self.admission.grants;
@@ -92,6 +112,7 @@ const Context = struct {
         result.subagent_caller_id = self.turn.child_id;
         result.session_child_capability = self.turn.childCapability() catch null;
         result.interactive = false;
+        result.independent_child_wait = null;
         result.output_chunk_ctx = self;
         result.on_output_chunk = pushLiveOutputChunk;
         result.web_search_progress_ctx = null;
@@ -101,6 +122,7 @@ const Context = struct {
         result.model_capability_resolver = childModelCapabilityResolver(
             result.model_capability_resolver,
         );
+        if (self.config.tool_context_binding) |binding| try binding.bind_fn(binding.context, arena.allocator(), &result);
         result.lifecycle_view = self.config.lifecycle_view;
         result.lifecycle_scope = .{
             .kind = .subagent,
@@ -108,7 +130,7 @@ const Context = struct {
             .session_id = self.turn.child_id,
             .subagent_id = self.subagent_id,
         };
-        return result;
+        return .{ .context = result, .arena = arena };
     }
 
     fn resolveLiveMcpView(
@@ -176,6 +198,7 @@ pub fn run(
         routed_config.tool_context.web_search_backend = null;
         routed_config.tool_context.web_search_runtime_ready = false;
     }
+    if (config.tool_context_binding) |binding| try binding.bind_fn(binding.context, arena, &routed_config.tool_context);
     const trace_context = debug_trace.TraceContext{
         .turn_id = debug_trace.nextTurnId(),
         .subagent_id = debug_trace.nextSubagentId(),
@@ -423,7 +446,9 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
 
 fn releaseAgentTerminalLease(raw: *anyopaque, session_id: []const u8) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
-    return tool_runtime.release_agent_terminal_lease(context.toolContext(), session_id);
+    var lease = try context.toolContext(context.turn.alloc);
+    defer lease.deinit();
+    return tool_runtime.release_agent_terminal_lease(lease.context, session_id);
 }
 
 fn refreshGatewayCredential(
@@ -488,7 +513,9 @@ fn finalizeTurn(
 
 fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayList(types.ChatMessage)) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
-    const tool_ctx = context.toolContext();
+    var lease = try context.toolContext(arena);
+    defer lease.deinit();
+    const tool_ctx = lease.context;
     try context.config.context_registry.appendDefaultTransient(.{
         .workspace_root = tool_ctx.workspace_root,
         .access_scope = tool_ctx.access_scope,
@@ -595,33 +622,43 @@ test "subagent inherits model capabilities" {
 
 fn snapshotMcpDefinition(raw: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
     const context: *Context = @ptrCast(@alignCast(raw));
-    return tool_runtime.snapshotMcpDefinition(context.toolContext(), arena, name, known);
+    var lease = try context.toolContext(arena);
+    defer lease.deinit();
+    return tool_runtime.snapshotMcpDefinition(lease.context, arena, name, known);
 }
 
 fn validateToolCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !agent_runtime.ToolCallValidationResult {
     const context: *Context = @ptrCast(@alignCast(raw));
-    return tool_runtime.validateToolCall(context.toolContext(), arena, call);
+    var lease = try context.toolContext(arena);
+    defer lease.deinit();
+    return tool_runtime.validateToolCall(lease.context, arena, call);
 }
 
 fn checkToolAvailability(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !?[]const u8 {
     const context: *Context = @ptrCast(@alignCast(raw));
-    return tool_runtime.checkToolAvailability(context.toolContext(), arena, call);
+    var lease = try context.toolContext(arena);
+    defer lease.deinit();
+    return tool_runtime.checkToolAvailability(lease.context, arena, call);
 }
 
 fn prepareSkillCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall, locations: ?*const skill_contract.Locations) !skill_contract.CallPreparation {
     const context: *Context = @ptrCast(@alignCast(raw));
-    return tool_runtime.prepareSkillCall(context.toolContext(), arena, call, locations);
+    var lease = try context.toolContext(arena);
+    defer lease.deinit();
+    return tool_runtime.prepareSkillCall(lease.context, arena, call, locations);
 }
 
 fn admissionContext(
     context: *Context,
+    alloc: Allocator,
     dynamic_names: []const []const u8,
     review: ?auto_classifier.ReviewTurnContext,
-) tool_runtime.Context {
-    var tool_ctx = tool_runtime.withAdvertisedDynamicToolNames(context.toolContext(), dynamic_names);
-    tool_ctx.permission_review_turn = review;
-    tool_ctx.permission_prompter = context.turn.permissionPrompter();
-    return tool_ctx;
+) !ToolContextLease {
+    var lease = try context.toolContext(alloc);
+    lease.context = tool_runtime.withAdvertisedDynamicToolNames(lease.context, dynamic_names);
+    lease.context.permission_review_turn = review;
+    lease.context.permission_prompter = context.turn.permissionPrompter();
+    return lease;
 }
 
 fn requestToolPermission(
@@ -637,7 +674,9 @@ fn requestToolPermission(
     mcp_review_schema_json: ?[]const u8,
 ) !command_admission.PermissionOutcome {
     const context: *Context = @ptrCast(@alignCast(raw));
-    var tool_ctx = admissionContext(context, dynamic_names, review);
+    var lease = try admissionContext(context, arena, dynamic_names, review);
+    defer lease.deinit();
+    var tool_ctx = lease.context;
     tool_ctx.mcp_review_schema_json = mcp_review_schema_json;
     if (revalidation) |request| return switch (request) {
         .action => |action| tool_admission.revalidateLiveActionPermissionOutcome(
@@ -671,7 +710,9 @@ fn requestPreparedFileMutationPermission(
     dynamic_names: []const []const u8,
 ) !command_admission.PermissionOutcome {
     const context: *Context = @ptrCast(@alignCast(raw));
-    const tool_ctx = admissionContext(context, dynamic_names, review);
+    var lease = try admissionContext(context, arena, dynamic_names, review);
+    defer lease.deinit();
+    const tool_ctx = lease.context;
     return tool_admission.requestPreparedFileMutationPermissionOutcome(
         tool_ctx.admissionInputWithLiveAuthority(live),
         arena,
@@ -711,7 +752,9 @@ fn describeToolActionDenied(raw: *anyopaque, arena: Allocator, call: types.ToolC
 
 fn permissionTargetForCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall, dynamic_names: []const []const u8) ![]const u8 {
     const context: *Context = @ptrCast(@alignCast(raw));
-    const tool_ctx = tool_runtime.withAdvertisedDynamicToolNames(context.toolContext(), dynamic_names);
+    var lease = try context.toolContext(arena);
+    defer lease.deinit();
+    const tool_ctx = tool_runtime.withAdvertisedDynamicToolNames(lease.context, dynamic_names);
     return tool_admission.permissionTargetForLiveAuthority(
         tool_ctx.admissionInput(),
         arena,
@@ -721,7 +764,9 @@ fn permissionTargetForCall(raw: *anyopaque, arena: Allocator, call: types.ToolCa
 
 fn executeToolCall(raw: *anyopaque, request: agent_runtime.ToolExecutionRequest) !agent_runtime.ToolExecutionResult {
     const context: *Context = @ptrCast(@alignCast(raw));
-    var tool_ctx = context.toolContext();
+    var lease = try context.toolContext(request.result_allocator);
+    defer lease.deinit();
+    var tool_ctx = lease.context;
     tool_ctx.root_user_intent_context = request.root_user_intent_context;
     tool_ctx.root_user_messages = request.root_user_messages;
     tool_ctx.root_user_evidence_complete = request.root_user_evidence_complete;

@@ -3767,6 +3767,13 @@ fn copyRecoveredManagedChildren(
             .assistant => |*entry| &entry.execution,
             .interrupted => |*entry| &entry.execution,
         };
+        for (execution.child_observations) |item| {
+            if (item.observation.output_ref) |handle| {
+                debug_trace.eventf("subagent", "child_output_recovery_copy_started", .{ .turn_id = item.observation.parent_turn_id }, "root_id={s} child_id={s} work_id={s} delivery_id={s}", .{ item.observation.parent_session_id, item.observation.child_id, item.observation.work_id, item.observation.delivery_id });
+                try copyRecoveredManagedChild(alloc, source, target, .tool_results, handle, null);
+                debug_trace.eventf("subagent", "child_output_recovery_copied", .{ .turn_id = item.observation.parent_turn_id }, "root_id={s} delivery_id={s}", .{ item.observation.parent_session_id, item.observation.delivery_id });
+            }
+        }
         for (execution.tool_steps) |*step| {
             for (step.tool_results) |*result| {
                 if (result.tool_image_handle) |handle| {

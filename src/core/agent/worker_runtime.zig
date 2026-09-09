@@ -927,6 +927,24 @@ pub const WorkerRuntime = struct {
         }
     }
 
+    pub const ChildWaitInput = enum { none, text, handoff, stopped };
+
+    /// Observes the exact active turn without draining its queue. Parallel child
+    /// waiters must all see the same boundary until the parent consumes it.
+    pub fn observeChildWaitInput(self: *WorkerRuntime, turn_id: u64) ChildWaitInput {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (!self.worker_processing or self.active_turn_id != turn_id or self.worker_stop_requested or
+            (self.worker_cancel_requested.load(.seq_cst) and self.steering_cancel_turn_id != turn_id)) return .stopped;
+        var has_text = false;
+        for (self.queued_prompts.items) |prompt| {
+            if (prompt.delivery.activeTurnId() != turn_id) continue;
+            if (!sameTurnSteeringEligible(prompt)) return .handoff;
+            has_text = true;
+        }
+        return if (has_text) .text else .none;
+    }
+
     fn sameTurnSteeringEligible(prompt: QueuedPrompt) bool {
         return prompt.images.len == 0 and
             prompt.skill_bindings.len == 0 and

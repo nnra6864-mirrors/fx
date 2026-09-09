@@ -48,6 +48,8 @@ const session_store = @import("../session/session_store.zig");
 const session_catalog_cache = @import("../session/session_catalog_cache.zig");
 const session_summary_codec = @import("../session/session_summary_codec.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
+const subagent_environment = @import("subagent_environment.zig");
+const app_child_work_runtime = @import("app_child_work_runtime.zig");
 const subagent_authority = @import("../subagent/authority.zig");
 const subagent_resume_admission = @import("../subagent/resume_admission.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
@@ -64,6 +66,14 @@ const update_notes = @import("../upgrade/update_notes.zig");
 const update_target = @import("../upgrade/update_target.zig");
 
 const Allocator = std.mem.Allocator;
+
+test {
+    _ = subagent_environment;
+    _ = app_child_work_runtime;
+    _ = @import("native_subagent_environment.zig");
+    _ = @import("../agent/question_prompt.zig");
+    _ = @import("input_approval_runtime.zig");
+}
 
 const BackgroundSessionPolicy = enum {
     carry_forward,
@@ -1038,6 +1048,7 @@ pub const Persistence = struct {
     store: ?session_store.Store = null,
     writable: ?session_store.LoadedWritableSession = null,
     subagent_host: ?*subagent_tool_host.Runtime = null,
+    retained_subagent_hosts: subagent_environment.Owner = .{},
     workspace_preferences: ?session_codec.DurableSessionPreferences = null,
     session_preferences: ?session_codec.DurableSessionPreferences = null,
     fast_mode_model_bound: bool = false,
@@ -1058,7 +1069,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (std.meta.fields(Persistence).len != 19) {
+            if (std.meta.fields(Persistence).len != 20) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1067,6 +1078,7 @@ pub const Persistence = struct {
         storage.store = null;
         storage.writable = null;
         storage.subagent_host = null;
+        storage.retained_subagent_hosts = .{};
         storage.workspace_preferences = null;
         storage.session_preferences = null;
         storage.fast_mode_model_bound = false;
@@ -1098,6 +1110,7 @@ pub const Persistence = struct {
             alloc.free(path);
         }
         if (self.subagent_host) |host| host.deinit();
+        self.retained_subagent_hosts.shutdown();
         if (self.writable) |*loaded| loaded.deinit(alloc);
         if (self.store) |*store| store.deinit(alloc);
         if (self.workspace_preferences) |*preferences| preferences.deinit(alloc);
@@ -1521,6 +1534,10 @@ pub fn Runtime(comptime App: type) type {
                 .last => .last,
                 .id => |session_id| .{ .id = session_id },
             };
+            if (resume_target == .id and app.session_persistence.retained_subagent_hosts.retains(resume_target.id)) {
+                try resumeRetainedSession(app, resume_target.id, notice);
+                return;
+            }
             var loaded = try loadResumeTargetForWrite(app, resume_target, .{});
             var loaded_owned = true;
             errdefer if (loaded_owned) loaded.deinit(app.alloc);
@@ -1687,8 +1704,38 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
+        fn resumeRetainedSession(app: *App, root_id: []const u8, notice: ResumeNotice) !void {
+            const owned_id = try app.alloc.dupe(u8, root_id);
+            defer app.alloc.free(owned_id);
+            try prepareLiveSessionResume(app);
+            const store = app.session_persistence.store orelse return error.SessionStoreUnavailable;
+            // Replay read-only while the retained owner keeps the writer lock.
+            // LoadedWritableSession can have released its hydration history.
+            var detail = try store.loadReadOnlyDetail(app.alloc, owned_id, .{});
+            defer detail.deinit(app.alloc);
+            _ = try app.session_persistence.retained_subagent_hosts.attach(owned_id, &app.session_persistence.writable);
+            try hydrateResumedSession(app, detail.state, detail.summary.title orelse owned_id, notice);
+            if (app.session_persistence.retained_subagent_hosts.selectedAuthority()) |authority| {
+                app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+                defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+                authority.mutex.lockUncancelable(io_mod.getIo());
+                defer authority.mutex.unlock(io_mod.getIo());
+                const grants = try types.dupePermissionGrantSlice(app.alloc, authority.grants);
+                app.permission_engine.clear(app.alloc);
+                app.permission_engine.grants.deinit(app.alloc);
+                app.permission_engine.grants = .fromOwnedSlice(grants);
+            }
+            enableSessionStores(app);
+            startResumedSessionReconciliation(app);
+            try finishLiveSessionResume(app);
+        }
+
         pub fn resumeSelectedSession(app: *App) !bool {
             const selected_id = app.session_persistence.session_picker.selectedId() orelse return false;
+            if (app.session_persistence.retained_subagent_hosts.retains(selected_id)) {
+                try resumeRetainedSession(app, selected_id, .session);
+                return true;
+            }
             const log_options = session_log.Options{
                 .session_lock_deadline_ms = 0,
             };
@@ -2543,6 +2590,9 @@ pub fn Runtime(comptime App: type) type {
                     },
                 };
             };
+            app_child_work_runtime.Runtime(App).acknowledgeTerminalResults(app, prepared) catch |err| {
+                debug_trace.eventf("subagent", "child_terminal_receipt_retirement_deferred", .{}, "root_id={s} error={s}", .{ loaded.active_id, @errorName(err) });
+            };
             if (comptime @hasDecl(@TypeOf(app.session), "commitPreparedHistoryEntry")) {
                 app.session.commitPreparedHistoryEntry(app.alloc, prepared);
                 prepared_owned = false;
@@ -2777,7 +2827,8 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn subagentHost(app: *App) ?*subagent_tool_host.Runtime {
             if (comptime !@hasField(App, "session_persistence")) return null;
-            return app.session_persistence.subagent_host;
+            return app.session_persistence.retained_subagent_hosts.selectedHost() orelse
+                app.session_persistence.subagent_host;
         }
 
         pub fn rebindSubagentHost(app: *App) void {
@@ -2788,6 +2839,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn requestSubagentBackgroundRecovery(app: *App) void {
+            if (app.session_persistence.retained_subagent_hosts.selectedHost() != null) return;
             const host = app.session_persistence.subagent_host orelse return;
             host.requestBackgroundRecovery(io_mod.milliTimestamp()) catch |err| {
                 debug_trace.logf(
@@ -2803,6 +2855,13 @@ pub fn Runtime(comptime App: type) type {
                 host.deinit();
                 app.session_persistence.subagent_host = null;
             }
+        }
+
+        /// Called after the main worker and its tool callers have drained, but
+        /// before terminal, model, MCP, credential or other borrowed services die.
+        pub fn joinSubagentHostsForShutdown(app: *App) void {
+            disableSubagentHost(app);
+            app.session_persistence.retained_subagent_hosts.shutdown();
         }
 
         pub fn finalizePersistence(app: *App) void {
@@ -2866,6 +2925,8 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn requestPersistenceShutdown(app: *App) void {
             app.session_persistence.session_picker_load.requestStop();
+            if (app.session_persistence.subagent_host) |host| host.requestShutdown();
+            app.session_persistence.retained_subagent_hosts.requestShutdown();
         }
 
         fn LiveHistorySink(comptime SinkApp: type) type {
@@ -3545,15 +3606,11 @@ pub fn Runtime(comptime App: type) type {
             sink: anytype,
             execution: types.ExecutionMemory,
         ) !void {
+            try execution.validateChildObservations();
             var steering_index: usize = 0;
+            var observation_index: usize = 0;
             for (execution.tool_steps, 0..) |step, step_index| {
-                try writePersistedSteeringAtBoundary(
-                    app,
-                    sink,
-                    execution.steering,
-                    &steering_index,
-                    step_index,
-                );
+                try writeExecutionBoundary(app, sink, execution, step_index, &steering_index, &observation_index);
                 if (step.assistant) |assistant| {
                     if (assistant.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, assistant);
                 }
@@ -3574,34 +3631,39 @@ pub fn Runtime(comptime App: type) type {
                     }
                 }
             }
-            while (steering_index < execution.steering.len) : (steering_index += 1) {
-                const steering = execution.steering[steering_index];
-                if (steering.assistant_prefix) |prefix| {
-                    if (prefix.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, prefix);
-                }
-                if (steering.text.len == 0) continue;
-                try sink.appendUserTurn(.{ .text = steering.text }, true);
-            }
+            try writeExecutionBoundary(app, sink, execution, execution.tool_steps.len, &steering_index, &observation_index);
+            if (steering_index != execution.steering.len or observation_index != execution.child_observations.len) return error.InvalidChildObservation;
         }
 
-        fn writePersistedSteeringAtBoundary(
+        fn writeExecutionBoundary(
             app: *App,
             sink: anytype,
-            steering: []const types.PersistedSteering,
-            index: *usize,
+            execution: types.ExecutionMemory,
             tool_step_count: usize,
+            steering: *usize,
+            observations: *usize,
         ) !void {
-            while (index.* < steering.len and
-                steering[index.*].after_tool_step_count == tool_step_count)
-            {
-                const item = steering[index.*];
+            while (true) {
+                if (observations.* < execution.child_observations.len) {
+                    const item = execution.child_observations[observations.*];
+                    if (item.after_tool_step_count == tool_step_count and item.after_steering_count == steering.*) {
+                        const notice = try tooling_presentation.childCompletionNotice(app.alloc, item.observation);
+                        defer types.freeSemanticNotice(app.alloc, notice);
+                        try sink.appendNotice(notice);
+                        const detail = try types.childObservationMessage(app.alloc, item.observation);
+                        defer app.alloc.free(detail.content.?);
+                        try sink.appendNotice(.{ .topic = "subagent", .tone = .neutral, .body = detail.content.?, .visibility = .full_only });
+                        observations.* += 1;
+                        continue;
+                    }
+                }
+                if (steering.* == execution.steering.len or execution.steering[steering.*].after_tool_step_count != tool_step_count) break;
+                const item = execution.steering[steering.*];
                 if (item.assistant_prefix) |prefix| {
                     if (prefix.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, prefix);
                 }
-                if (item.text.len > 0) {
-                    try sink.appendUserTurn(.{ .text = item.text }, true);
-                }
-                index.* += 1;
+                if (item.text.len > 0) try sink.appendUserTurn(.{ .text = item.text }, true);
+                steering.* += 1;
             }
         }
 
@@ -3697,6 +3759,14 @@ pub fn Runtime(comptime App: type) type {
                     &.{},
                 )
             else if (result.status == .success) success: {
+                if (result.child_delivery) |value| {
+                    if (value.state == .running) {
+                        if (try tooling_presentation.subagentAction(action_arena.allocator(), call, .waiting)) |waiting| {
+                            defer waiting.deinit(action_arena.allocator());
+                            break :success try std.fmt.allocPrint(action_arena.allocator(), "{s} {s}", .{ waiting.label, waiting.detail });
+                        }
+                    }
+                }
                 var skill_name_buffer: [skill_contract.max_name_bytes]u8 = undefined;
                 const registry = app.toolAdvertisementSet().registry;
                 const display_target = target: {
@@ -4218,6 +4288,12 @@ pub fn Runtime(comptime App: type) type {
             )) {
                 app.session.clearWebFetchArtifacts();
             }
+            if (app.session_persistence.retained_subagent_hosts.selectedHost() != null) {
+                // Both handles were installed from this same validated root;
+                // detach allocates nothing and cannot fail for this selection.
+                app.session_persistence.retained_subagent_hosts.detach(&app.session_persistence.writable) catch unreachable;
+                return handoff;
+            }
             disableSubagentHost(app);
             loaded.deinit(app.alloc);
             app.session_persistence.writable = null;
@@ -4255,6 +4331,10 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             loaded: *session_store.LoadedWritableSession,
         ) void {
+            if (app.session_persistence.retained_subagent_hosts.selectedHost()) |retained| {
+                std.debug.assert(std.mem.eql(u8, retained.root_id, loaded.active_id));
+                return;
+            }
             disableSubagentHost(app);
             const store = if (app.session_persistence.store) |*value| value else return;
             app.session_persistence.subagent_host = subagent_tool_host.Runtime.create(
@@ -4411,6 +4491,9 @@ pub fn Runtime(comptime App: type) type {
                 permission_state,
                 io_mod.milliTimestamp(),
             );
+            if (app.session_persistence.retained_subagent_hosts.selectedAuthority()) |authority| {
+                try authority.replaceSaved(app.alloc, permission_state);
+            }
         }
 
         fn commitJsHostSnapshot(app: *App, boundary: []const u8) void {

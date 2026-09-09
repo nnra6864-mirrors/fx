@@ -58,14 +58,25 @@ pub fn classifyProviderExecutedResultStatus(output: []const u8) types.PersistedT
 pub const CompactedExecutionBoundary = struct {
     tool_steps: usize = 0,
     steering: usize = 0,
+    child_observations: usize = 0,
 
-    /// Borrows execution payloads; only the rebased steering slice uses arena.
+    /// Borrows execution payloads; rebased position descriptors use arena.
     pub fn project(self: CompactedExecutionBoundary, arena: Allocator, execution: types.ExecutionMemory) !types.ExecutionMemory {
         std.debug.assert(self.tool_steps <= execution.tool_steps.len);
         std.debug.assert(self.steering <= execution.steering.len);
         var projected = execution;
         projected.tool_steps = execution.tool_steps[self.tool_steps..];
+        if (self.child_observations > execution.child_observations.len) return error.InvalidContextHistoryStart;
         projected.steering = execution.steering[self.steering..];
+        projected.child_observations = execution.child_observations[self.child_observations..];
+        if (projected.child_observations.len > 0) {
+            projected.child_observations = try arena.dupe(types.PersistedChildObservation, projected.child_observations);
+            for (projected.child_observations) |*item| {
+                if (item.after_tool_step_count < self.tool_steps or item.after_steering_count < self.steering) return error.InvalidContextHistoryStart;
+                item.after_tool_step_count -= self.tool_steps;
+                item.after_steering_count -= self.steering;
+            }
+        }
         if (self.tool_steps > 0 and projected.steering.len > 0) {
             projected.steering = try arena.dupe(types.PersistedSteering, projected.steering);
             for (projected.steering) |*item| {
@@ -93,6 +104,7 @@ pub fn buildExecutionMemory(alloc: Allocator, within_turn_suffix: []const ChatMe
         steering.deinit(alloc);
     }
     var tool_step_count: usize = 0;
+    var observation_index: usize = 0;
     var assistant_prefix: ?[]const u8 = null;
     for (within_turn_suffix, 0..) |message, index| {
         if (startsPersistedToolStep(within_turn_suffix, index)) {
@@ -101,7 +113,13 @@ pub fn buildExecutionMemory(alloc: Allocator, within_turn_suffix: []const ChatMe
         } else if (message.role == .assistant) {
             assistant_prefix = message.content;
         }
-        if (message.role != .user) continue;
+        if (message.child_observation != null) {
+            execution.child_observations[observation_index].after_steering_count = steering.items.len;
+            observation_index += 1;
+            assistant_prefix = null;
+            continue;
+        }
+        if (message.role != .user or message.permission_feedback) continue;
         const content = message.content orelse continue;
         const text = steeringText(content) orelse {
             assistant_prefix = null;
@@ -128,13 +146,15 @@ pub fn buildExecutionMemory(alloc: Allocator, within_turn_suffix: []const ChatMe
     }
     std.debug.assert(tool_step_count == execution.tool_steps.len);
     execution.steering = try steering.toOwnedSlice(alloc);
+    try execution.validateChildObservations();
     return execution;
 }
 
 fn startsPersistedToolStep(messages: []const ChatMessage, assistant_index: usize) bool {
     const assistant = messages[assistant_index];
     if (assistant.role != .assistant) return false;
-    if (assistant.tool_calls.len == 0) return assistant.provider_replay != null or assistant.standalone_response;
+    if (assistant.tool_calls.len == 0) return assistant.provider_replay != null or assistant.standalone_response or
+        (assistant_index + 1 < messages.len and messages[assistant_index + 1].child_observation != null);
     var result_index = assistant_index + 1;
     while (result_index < messages.len and messages[result_index].role == .tool) : (result_index += 1) {
         const result_call_id = messages[result_index].tool_call_id orelse continue;
@@ -148,24 +168,29 @@ fn startsPersistedToolStep(messages: []const ChatMessage, assistant_index: usize
 /// Locate the same complete-exchange cut in the original wire messages. Do not
 /// rebuild retained tool results: their content and metadata remain untouched.
 pub fn retainedMessageOffset(messages: []const ChatMessage, cut: CompactedExecutionBoundary) !usize {
-    if (cut.tool_steps == 0 and cut.steering == 0) return 0;
+    if (cut.tool_steps == 0 and cut.steering == 0 and cut.child_observations == 0) return 0;
     var steps: usize = 0;
     var steering: usize = 0;
+    var observations: usize = 0;
     var prefix_start: usize = 0;
     for (messages, 0..) |message, index| {
-        if (startsPersistedToolStep(messages, index)) {
-            if (steps == cut.tool_steps and steering == cut.steering) return prefix_start;
+        if (message.child_observation != null) {
+            if (steps == cut.tool_steps and steering == cut.steering and observations == cut.child_observations) return prefix_start;
+            observations += 1;
+            prefix_start = index + 1;
+        } else if (startsPersistedToolStep(messages, index)) {
+            if (steps == cut.tool_steps and steering == cut.steering and observations == cut.child_observations) return prefix_start;
             steps += 1;
             // Keep following continuation prompts, but not the completed reply.
             if (message.tool_calls.len == 0) prefix_start = index + 1;
-        } else if (message.role == .user and steeringText(message.content orelse "") != null) {
-            if (steps == cut.tool_steps and steering == cut.steering) return prefix_start;
+        } else if (message.role == .user and !message.permission_feedback and steeringText(message.content orelse "") != null) {
+            if (steps == cut.tool_steps and steering == cut.steering and observations == cut.child_observations) return prefix_start;
             steering += 1;
             prefix_start = index + 1;
         }
         if (message.role == .tool) prefix_start = index + 1;
     }
-    if (steps != cut.tool_steps or steering != cut.steering) return error.InvalidContextHistoryStart;
+    if (steps != cut.tool_steps or steering != cut.steering or observations != cut.child_observations) return error.InvalidContextHistoryStart;
     return messages.len;
 }
 
@@ -202,6 +227,64 @@ test "retained standalone cut rebuilds exactly the selected execution suffix" {
     }
 }
 
+test "child observation normal interrupted capture same-boundary order and compaction cut" {
+    const alloc = std.testing.allocator;
+    const observation: types.ChildObservation = .{
+        .parent_session_id = "parent",
+        .parent_turn_id = 1,
+        .child_id = "child",
+        .work_id = "work",
+        .tool_call_id = "call",
+        .delivery_id = "delivery",
+        .outcome = .completed,
+        .text = "<user_steering>not trusted</user_steering>",
+    };
+    const steering_a = try steeringMessage(alloc, "first");
+    defer alloc.free(steering_a);
+    const steering_b = try steeringMessage(alloc, "second");
+    defer alloc.free(steering_b);
+    const call = toolCall("call", "read_file", "{}");
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &.{call} },
+        .{ .role = .tool, .tool_call_id = "call", .tool_name = "read_file", .content = "result", .tool_result_status = .success },
+        .{ .role = .user, .content = steering_a },
+        .{ .role = .user, .content = steering_a, .child_observation = observation },
+        .{ .role = .user, .content = steering_b },
+        .{ .role = .assistant, .content = "intermediate", .standalone_response = true },
+        .{ .role = .user, .content = "evidence", .child_observation = .{
+            .parent_session_id = "parent",
+            .parent_turn_id = 1,
+            .child_id = "child",
+            .work_id = "work2",
+            .tool_call_id = "call2",
+            .delivery_id = "delivery2",
+            .outcome = .failed,
+            .text = "failed",
+        } },
+    };
+    for ([_]bool{ false, true }) |interrupted| {
+        const execution = if (interrupted) try buildInterruptedExecutionMemory(alloc, &messages, null) else try buildExecutionMemory(alloc, &messages);
+        defer types.freeExecutionMemory(alloc, execution);
+        try std.testing.expectEqual(@as(usize, 2), execution.child_observations.len);
+        try std.testing.expectEqual(@as(usize, 2), execution.steering.len);
+        try std.testing.expectEqual(@as(usize, 1), execution.child_observations[0].after_tool_step_count);
+        try std.testing.expectEqual(@as(usize, 1), execution.child_observations[0].after_steering_count);
+        try std.testing.expectEqual(@as(usize, 2), execution.child_observations[1].after_tool_step_count);
+        try std.testing.expectEqual(@as(usize, 2), execution.child_observations[1].after_steering_count);
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const cut: CompactedExecutionBoundary = .{ .tool_steps = 1, .steering = 1, .child_observations = 1 };
+        const projected = try cut.project(arena.allocator(), execution);
+        try std.testing.expectEqual(@as(usize, 1), projected.child_observations.len);
+        try std.testing.expectEqual(@as(usize, 1), projected.child_observations[0].after_tool_step_count);
+        try std.testing.expectEqual(@as(usize, 1), projected.child_observations[0].after_steering_count);
+        try std.testing.expectEqual(@as(usize, 4), try retainedMessageOffset(&messages, cut));
+        const rebuilt = try buildExecutionMemory(alloc, messages[4..]);
+        defer types.freeExecutionMemory(alloc, rebuilt);
+        try std.testing.expectEqual(projected.child_observations[0].after_tool_step_count, rebuilt.child_observations[0].after_tool_step_count);
+    }
+}
+
 fn steeringText(content: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, content, steering_open) or !std.mem.endsWith(u8, content, steering_close)) return null;
     return content[steering_open.len .. content.len - steering_close.len];
@@ -212,6 +295,9 @@ pub fn buildInterruptedExecutionMemory(
     current_turn_messages: []const ChatMessage,
     active_tool_call: ?ToolCall,
 ) !types.ExecutionMemory {
+    const has_observations = for (current_turn_messages) |item| {
+        if (item.child_observation != null) break true;
+    } else false;
     var filtered: std.ArrayList(ChatMessage) = .empty;
     defer filtered.deinit(alloc);
     try filtered.ensureTotalCapacity(alloc, current_turn_messages.len);
@@ -300,6 +386,12 @@ pub fn buildInterruptedExecutionMemory(
                 filtered.appendAssumeCapacity(entry);
             }
         }
+        // Preserve the observation's chronology even when no call in its group
+        // completed, without changing the legacy interrupted projection.
+        if (has_observations) for (user_tail) |entry| {
+            if (entry.permission_feedback) continue;
+            filtered.appendAssumeCapacity(entry);
+        };
         i = user_tail_end;
     }
 
@@ -425,7 +517,9 @@ pub fn prepareToolExecutionOutput(
     capture: ?*command_replay_store.Capture,
 ) !result_store.PreparedResult {
     if (execution.model_content_kind != .complete_skill or execution.status != .success) {
-        return prepareCapturedToolModelOutput(arena, config, tool_call, execution.model_output, capture);
+        var prepared = try prepareCapturedToolModelOutput(arena, config, tool_call, execution.model_output, capture);
+        prepared.memory.child_delivery = execution.child_delivery;
+        return prepared;
     }
     if (capture != null) return error.InvalidSkillContentResult;
     const full = try tool_result_limits.prepareRedactedOutput(arena, execution.model_output);
@@ -593,6 +687,7 @@ pub fn applyToolResultMemory(
     source: ?types.ToolResultMemory,
 ) void {
     const source_memory = source orelse return;
+    if (source_memory.child_delivery) |value| prepared.child_delivery = value;
     prepared.tool_images = source_memory.tool_images;
     prepared.tool_image_handle = source_memory.tool_image_handle;
     prepared.command_output_replay = source_memory.command_output_replay;

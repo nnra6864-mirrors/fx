@@ -34,6 +34,7 @@ pub const SubagentActionState = union(enum) {
     identity,
     active,
     completed,
+    waiting,
     stopped: []const u8,
 };
 
@@ -66,6 +67,19 @@ pub fn subagentAction(
         else => return null,
     } else outer;
     const action = tool_args.optionalStringArg(args, "action") orelse return null;
+    if (std.mem.eql(u8, action, "cancel")) {
+        const child_id = tool_args.optionalStringArg(args, "child_id") orelse return null;
+        const child = try text_utils.encodeTerminalSafe(scratch, child_id, 64);
+        const label = switch (state) {
+            .identity => try alloc.dupe(u8, "Child cancellation"),
+            .active => try alloc.dupe(u8, "Cancelling child"),
+            .completed => try alloc.dupe(u8, "Child cancellation handled"),
+            .waiting => try alloc.dupe(u8, "Child cancellation pending"),
+            .stopped => |reason| try std.fmt.allocPrint(alloc, "{s} child cancellation", .{reason}),
+        };
+        errdefer alloc.free(label);
+        return .{ .label = label, .detail = try std.fmt.allocPrint(alloc, "· {s}", .{child.bytes}) };
+    }
     const named = std.mem.eql(u8, action, "message");
     if (!named and !std.mem.eql(u8, action, "run")) return null;
     const raw_name = if (named) tool_args.optionalStringArg(args, "agent") orelse return null else "Subagent";
@@ -75,6 +89,7 @@ pub fn subagentAction(
     const label = switch (state) {
         .identity => try alloc.dupe(u8, name.bytes),
         .active => try std.fmt.allocPrint(alloc, "{s} working", .{name.bytes}),
+        .waiting => try std.fmt.allocPrint(alloc, "{s} still running", .{name.bytes}),
         .completed => try std.fmt.allocPrint(alloc, "{s} {s}", .{ name.bytes, if (named) "replied" else "finished" }),
         .stopped => |reason| if (std.mem.eql(u8, reason, "Failed"))
             try std.fmt.allocPrint(alloc, "{s} failed", .{name.bytes})
@@ -89,6 +104,32 @@ pub fn subagentAction(
     else
         try std.fmt.allocPrint(alloc, "· {s}", .{preview});
     return .{ .label = label, .detail = detail };
+}
+
+/// Caller owns both strings and releases them with freeSemanticNotice.
+pub fn childCompletionNotice(alloc: Allocator, observation: types.ChildObservation) !types.SemanticNotice {
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const child = try text_utils.encodeTerminalSafe(scratch.allocator(), observation.child_id, 64);
+    const label = switch (observation.outcome) {
+        .completed => "Subagent finished",
+        .failed => "Subagent failed",
+        .cancelled => "Subagent cancelled",
+        .interrupted => "Subagent interrupted",
+        .unavailable => "Subagent result unavailable",
+    };
+    const topic = try alloc.dupe(u8, "subagent");
+    errdefer alloc.free(topic);
+    return .{
+        .topic = topic,
+        .body = try std.fmt.allocPrint(alloc, "{s} · {s}", .{ label, child.bytes }),
+        .tone = switch (observation.outcome) {
+            .completed => .information,
+            .failed => .@"error",
+            .cancelled => .cancelled,
+            .interrupted, .unavailable => .warning,
+        },
+    };
 }
 
 fn subagentPreview(alloc: Allocator, raw: []const u8) Allocator.Error![]u8 {

@@ -10,6 +10,8 @@ const runtime_profile = @import("../hosts/runtime_profile.zig");
 const host = @import("../hosts/host.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
+const app_child_work_runtime = @import("app_child_work_runtime.zig");
+const native_subagent_environment = @import("native_subagent_environment.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -30,6 +32,7 @@ const skill_runtime = @import("../skills/skill_runtime.zig");
 const subagent_agent_adapter = @import("../subagent/agent_adapter.zig");
 const subagent_domain = @import("../subagent/domain.zig");
 const subagent_execution = @import("../subagent/execution.zig");
+const subagent_tool_host = @import("../subagent/tool_host.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_args = @import("../tooling/tool_args.zig");
@@ -751,6 +754,9 @@ pub fn Runtime(comptime App: type) type {
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
         ) !agent_runtime.ToolExecutionResult {
+            if (comptime @hasDecl(App, "nativeSubagentQuestionRouting")) {
+                if (std.mem.eql(u8, request.call.name, "subagent")) try app.prepareNativeSubagentHost();
+            }
             var ctx = toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url);
             applyCredentialLease(app, &ctx, request.credential, gateway_retry_count, gateway_chat_url);
             ctx.root_user_intent_context = request.root_user_intent_context;
@@ -759,7 +765,26 @@ pub fn Runtime(comptime App: type) type {
             ctx.session_grants = request.session_grants;
             ctx.advertised_dynamic_tool_names = request.advertised_dynamic_tool_names;
             ctx.max_tool_result_bytes = request.max_tool_result_bytes;
+            if (comptime @hasField(App, "session_persistence")) {
+                if (app.session_persistence.retained_subagent_hosts.selectedHost() != null and ctx.interactive) {
+                    if (request.lifecycle_id) |id| ctx.independent_child_wait = .{
+                        .context = &app.worker,
+                        .turn_id = id.turn_id,
+                        .observe_fn = observeParentChildWait,
+                    };
+                }
+            }
             return tool_runtime.executeToolCallAuthorized(ctx, request);
+        }
+
+        fn observeParentChildWait(raw: *anyopaque, turn_id: u64) subagent_tool_host.WaitObservation {
+            const worker: *worker_runtime.WorkerRuntime = @ptrCast(@alignCast(raw));
+            return switch (worker.observeChildWaitInput(turn_id)) {
+                .none => .waiting,
+                .text => .steering,
+                .handoff => .handoff,
+                .stopped => .parent_stopped,
+            };
         }
 
         fn applyCredentialLease(
@@ -1020,6 +1045,11 @@ pub fn Runtime(comptime App: type) type {
                     return error.McpRequiredServerUnavailable;
                 }
             }
+            // Only hosts with exact child-question routing can retain child
+            // execution independently of the main worker's input surface.
+            if (comptime @hasDecl(App, "nativeSubagentQuestionRouting")) {
+                if (try app_child_work_runtime.Runtime(App).needsRetainedHost(app)) try app.prepareNativeSubagentHost();
+            }
             var tool_projection = try app.snapshotModelToolProjection(
                 std.heap.c_allocator,
                 job.permission_mode,
@@ -1180,6 +1210,90 @@ pub fn Runtime(comptime App: type) type {
                 },
                 .outcome_allocator = app.alloc,
             };
+        }
+
+        /// Called for independent delegation or retained delivery recovery, after
+        /// App has its final address. No per-call App borrow escapes into the
+        /// native child runner.
+        pub fn prepareNativeSubagentHost(
+            app: *App,
+            ignored_list_entries: []const []const u8,
+            max_list_entries: usize,
+            max_read_file_bytes: usize,
+            max_read_file_lines: usize,
+            max_read_file_line_len: usize,
+            max_command_output_bytes: usize,
+            gateway_retry_count: usize,
+            gateway_chat_url: []const u8,
+        ) !void {
+            const persistence = &app.session_persistence;
+            if (persistence.retained_subagent_hosts.selectedHost() != null) return;
+            if (persistence.writable == null or persistence.store == null) return;
+            app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+            defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+            // Parallel calls can reach first use together. Recheck after taking
+            // the authority lock before constructing a second environment.
+            if (persistence.retained_subagent_hosts.selectedHost() != null) return;
+            const loaded = &persistence.writable.?;
+            const store = &persistence.store.?;
+            if (persistence.subagent_host) |legacy| {
+                if (legacy.managed.hasRunningWork()) return error.HostBusy;
+            }
+            try native_subagent_environment.validateNativeLifecycle(app.lifecycle_view);
+            var saved = try app.session.snapshotPermissionState(app.alloc);
+            defer saved.deinit(app.alloc);
+            const policy = app.promptPolicy();
+            const binding = try native_subagent_environment.Binding.create(app.alloc, loaded.active_id, .{
+                .mcp = &app.mcp,
+                .process_rules = &app.permission_engine.rules,
+                .authority_mutex = &app.permission_state.authority_mutex,
+                .providers = app.providerSet(),
+                .tools = app.toolAdvertisementSet(),
+                .context_registry = app.contextRegistry(),
+                .model_overlay = policy.model_prompt_overlay_fn,
+                .oauth_transport = app.auth.oauthTransport(),
+                .secret_store = app.auth.secretStore(),
+                .url_opener = app.urlOpener(),
+                .terminal = &app.terminal_client,
+                .web_fetch = &app.web_fetch_runtime,
+                .web_search_provider = app.web_search_runtime.provider,
+                .access_scope = appAccessScope(app) orelse workspace_access.AccessScope.primaryOnly(app.workspace_root),
+                .process_access = app.workspaceAccess(),
+            }, app.permission_engine.grants.items, saved);
+            errdefer binding.deinit();
+            var catalog = app.skills.acquireCatalog();
+            defer catalog.deinit();
+            const settings = app.worker.effectiveAgentTurnSettings();
+            _ = try persistence.retained_subagent_hosts.create(app.alloc, store, loaded, .{
+                .root_id = loaded.active_id,
+                .workspace_root = app.workspace_root,
+                .system_prompt = policy.system_prompt,
+                .project_context = modelVisibleProjectContext(app),
+                .api_key = app.auth.apiKey() orelse "",
+                .credential_source = app.auth.credentialSource(),
+                .gateway_team = app.auth.gatewayTeam(),
+                .account_id = app.auth.accountId(),
+                .gateway_chat_url = gateway_chat_url,
+                .gateway_models_path = app.web_search_models_path,
+                .skills_dir = app.skills.dir,
+                .ignored_list_entries = ignored_list_entries,
+                .catalog = .{ .skills = catalog.items, .diagnostics = catalog.diagnostics },
+                .max_list_entries = max_list_entries,
+                .max_read_file_bytes = max_read_file_bytes,
+                .max_read_file_lines = max_read_file_lines,
+                .max_read_file_line_len = max_read_file_line_len,
+                .max_command_output_bytes = max_command_output_bytes,
+                .max_tool_result_bytes = settings.max_tool_result_bytes,
+                .gateway_retry_count = gateway_retry_count,
+                .agent_step_limit = app.agent_step_limit,
+                .fast_mode = settings.fast_mode,
+                .first_call_tool_choice = settings.first_call_tool_choice,
+                .context_limits = app.context_limits,
+                .context_enabled = app.context_enabled,
+            }, binding.services());
+            // Other calls in this tool batch may still hold an unused legacy
+            // context. Its empty host is reclaimed after callers drain, on the
+            // next selection transition or process shutdown.
         }
 
         pub fn runSubagentChild(

@@ -72,6 +72,23 @@ pub const ConversationToolResult = struct {
     command_replay_bytes: ?u64 = null,
     command_process_presentation: ?types.CommandProcessPresentation = null,
     terminal_action_presentation: ?types.TerminalActionPresentation = null,
+    child_delivery: ?types.ChildDelivery = null,
+
+    pub fn jsonStringify(self: ConversationToolResult, writer: *std.json.Stringify) !void {
+        try writer.beginObject();
+        inline for (std.meta.fields(ConversationToolResult)) |field| {
+            if (comptime std.mem.eql(u8, field.name, "child_delivery")) {
+                if (self.child_delivery) |value| {
+                    try writer.objectField(field.name);
+                    try writer.write(value);
+                }
+            } else {
+                try writer.objectField(field.name);
+                try writer.write(@field(self, field.name));
+            }
+        }
+        try writer.endObject();
+    }
 };
 
 pub const ConversationInterruption = struct {
@@ -100,6 +117,7 @@ pub const ConversationEvent = union(enum) {
     tool_call: ConversationToolCall,
     tool_result: ConversationToolResult,
     steering: ConversationText,
+    child_observation: types.ChildObservation,
     turn_completed: ConversationTurnCompleted,
     interrupted: ConversationInterruption,
     context_checkpoint: ConversationCheckpoint,
@@ -141,7 +159,7 @@ pub fn validateConversationTransition(
     state: ConversationStateView,
     envelope: ConversationEnvelope,
 ) ConversationTransitionError!void {
-    if (envelope.schema_version != 1 and envelope.schema_version != conversation_schema_version) {
+    if (envelope.schema_version != 1 and envelope.schema_version != 3 and envelope.schema_version != conversation_schema_version) {
         return error.UnsupportedConversationSchema;
     }
     const expected_seq = std.math.add(u64, state.last_seq, 1) catch
@@ -180,6 +198,7 @@ pub fn validateConversationTransition(
         .turn_completed => if (state.pending_tool_calls.len != 0) {
             return error.UnresolvedToolCall;
         },
+        .child_observation => if (state.pending_tool_calls.len != 0) return error.UnresolvedToolCall,
         .user, .assistant, .steering, .interrupted => {},
     }
 }
@@ -211,6 +230,10 @@ fn validateConversationEventShape(event: ConversationEvent, schema_version: u8) 
                     !std.unicode.utf8ValidateSlice(replay.parts_json)) return error.InvalidConversationEvent;
             }
         },
+        .child_observation => |value| {
+            if (schema_version != 3) return error.UnsupportedConversationSchema;
+            value.validate() catch return error.InvalidConversationEvent;
+        },
         .steering => |value| try validateConversationText(value.text),
         .tool_call => |call| {
             try validateConversationIdentity(call.call_id);
@@ -231,6 +254,7 @@ fn validateConversationEventShape(event: ConversationEvent, schema_version: u8) 
             }
         },
         .tool_result => |result| {
+            if (result.child_delivery != null and schema_version != 3) return error.UnsupportedConversationSchema;
             try validateConversationIdentity(result.call_id);
             try validateConversationIdentity(result.tool_name);
             if (result.artifact_ref.len == 0 or
@@ -342,11 +366,19 @@ fn findPendingToolCall(
     return null;
 }
 
+pub fn schemaVersionForEvent(event: ConversationEvent) u8 {
+    return switch (event) {
+        .child_observation => 3,
+        .tool_result => |result| if (result.child_delivery != null) 3 else conversation_schema_version,
+        else => conversation_schema_version,
+    };
+}
+
 pub fn encodeConversationFrame(
     alloc: Allocator,
     envelope: ConversationEnvelope,
 ) ![]u8 {
-    if (envelope.schema_version != conversation_schema_version or
+    if ((envelope.schema_version != conversation_schema_version and envelope.schema_version != 3) or
         envelope.seq == 0 or
         envelope.timestamp_ms < 0)
     {
@@ -376,7 +408,7 @@ pub fn decodeConversationFrame(
         else => return error.InvalidConversationFrame,
     };
     errdefer parsed.deinit();
-    if ((parsed.value.schema_version != 1 and parsed.value.schema_version != conversation_schema_version) or
+    if ((parsed.value.schema_version != 1 and parsed.value.schema_version != 3 and parsed.value.schema_version != conversation_schema_version) or
         parsed.value.seq == 0 or
         parsed.value.timestamp_ms < 0)
     {
@@ -385,6 +417,31 @@ pub fn decodeConversationFrame(
     validateConversationEventShape(parsed.value.event, parsed.value.schema_version) catch
         return error.InvalidConversationFrame;
     return parsed;
+}
+
+test "child observation canonical event rejects corrupt payload and legacy schema downgrade" {
+    const alloc = std.testing.allocator;
+    const observation: types.ChildObservation = .{
+        .parent_session_id = "parent",
+        .parent_turn_id = 7,
+        .child_id = "child",
+        .work_id = "work",
+        .tool_call_id = "call",
+        .delivery_id = "delivery",
+        .outcome = .cancelled,
+        .text = "evidence",
+    };
+    const frame = try encodeConversationFrame(alloc, .{ .schema_version = 3, .seq = 1, .timestamp_ms = 1, .event = .{ .child_observation = observation } });
+    defer alloc.free(frame);
+    var decoded = try decodeConversationFrame(alloc, frame);
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("delivery", decoded.value.event.child_observation.delivery_id);
+    try std.testing.expectError(error.UnsupportedConversationSchema, encodeConversationFrame(alloc, .{ .seq = 1, .timestamp_ms = 1, .event = .{ .child_observation = observation } }));
+    var invalid = observation;
+    invalid.delivery_id = "";
+    try std.testing.expectError(error.InvalidConversationEvent, encodeConversationFrame(alloc, .{ .schema_version = 3, .seq = 1, .timestamp_ms = 1, .event = .{ .child_observation = invalid } }));
+    try std.testing.expectError(error.InvalidConversationFrame, decodeConversationFrame(alloc, frame[0 .. frame.len - 1]));
+    try std.testing.expectError(error.UnresolvedToolCall, validateConversationTransition(.{ .pending_tool_calls = &.{.{ .call_id = "pending", .tool_name = "read_file", .seq = 0 }} }, decoded.value));
 }
 
 /// Appends borrowed conversational events for one canonical history turn.
@@ -405,7 +462,7 @@ pub fn appendHistoryTurnConversationEvents(
                 .work_id = entry.user.work_id,
             } });
             try appendExecutionConversationEvents(alloc, events, entry.execution);
-            const follows_standalone = entry.execution.tool_steps.len > 0 and
+            const follows_standalone = entry.execution.child_observations.len == 0 and entry.execution.tool_steps.len > 0 and
                 entry.execution.tool_steps[entry.execution.tool_steps.len - 1].tool_calls.len == 0;
             if (entry.assistant.len > 0 or entry.provider_replay != null or follows_standalone) {
                 try events.append(alloc, .{ .assistant = .{ .text = entry.assistant, .provider_replay = entry.provider_replay } });
@@ -483,17 +540,16 @@ fn appendExecutionConversationEvents(
     events: *std.ArrayList(ConversationEvent),
     execution: types.ExecutionMemory,
 ) !void {
+    try execution.validateChildObservations();
     var steering_index: usize = 0;
-    while (steering_index < execution.steering.len and
-        execution.steering[steering_index].after_tool_step_count == 0)
-    {
-        try appendSteeringConversationEvents(alloc, events, execution.steering[steering_index]);
-        steering_index += 1;
-    }
+    var observation_index: usize = 0;
+    try appendExecutionBoundaryEvents(alloc, events, execution, 0, &steering_index, &observation_index);
     for (execution.tool_steps, 0..) |step, step_index| {
         const assistant: []const u8 = step.assistant orelse "";
         const follows_standalone = step_index > 0 and execution.tool_steps[step_index - 1].tool_calls.len == 0;
-        if (assistant.len > 0 or step.provider_replay != null or follows_standalone) {
+        if (assistant.len > 0 or step.provider_replay != null or follows_standalone or
+            (execution.child_observations.len > 0 and step.tool_calls.len == 0))
+        {
             try events.append(alloc, .{ .assistant = .{
                 .text = assistant,
                 .provider_replay = step.provider_replay,
@@ -521,6 +577,7 @@ fn appendExecutionConversationEvents(
             try events.append(alloc, .{ .tool_result = .{
                 .call_id = result.tool_call_id,
                 .tool_name = result.tool_name,
+                .child_delivery = result.child_delivery,
                 .status = result.status,
                 .artifact_ref = artifact_ref,
                 .tool_image_handle = result.tool_image_handle,
@@ -543,16 +600,33 @@ fn appendExecutionConversationEvents(
                 .terminal_action_presentation = result.terminal_action_presentation,
             } });
         }
-        const completed_steps = step_index + 1;
-        while (steering_index < execution.steering.len and
-            execution.steering[steering_index].after_tool_step_count == completed_steps)
-        {
-            try appendSteeringConversationEvents(alloc, events, execution.steering[steering_index]);
-            steering_index += 1;
-        }
+        try appendExecutionBoundaryEvents(alloc, events, execution, step_index + 1, &steering_index, &observation_index);
     }
-    if (steering_index != execution.steering.len) {
+    if (steering_index != execution.steering.len or observation_index != execution.child_observations.len) {
         return error.InvalidConversationEvent;
+    }
+}
+
+fn appendExecutionBoundaryEvents(
+    alloc: Allocator,
+    events: *std.ArrayList(ConversationEvent),
+    execution: types.ExecutionMemory,
+    steps: usize,
+    steering: *usize,
+    observations: *usize,
+) !void {
+    while (true) {
+        if (observations.* < execution.child_observations.len) {
+            const item = execution.child_observations[observations.*];
+            if (item.after_tool_step_count == steps and item.after_steering_count == steering.*) {
+                try events.append(alloc, .{ .child_observation = item.observation });
+                observations.* += 1;
+                continue;
+            }
+        }
+        if (steering.* == execution.steering.len or execution.steering[steering.*].after_tool_step_count != steps) break;
+        try appendSteeringConversationEvents(alloc, events, execution.steering[steering.*]);
+        steering.* += 1;
     }
 }
 

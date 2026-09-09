@@ -36,6 +36,7 @@ pub fn makePersistedToolResult(
     const tool_images = if (memory) |info| if (tool_image_handle == null) try types.dupeToolImages(alloc, info.tool_images) else try alloc.alloc(types.ToolImage, 0) else try alloc.alloc(types.ToolImage, 0);
     errdefer types.freeToolImages(alloc, tool_images);
     var result: types.PersistedToolResult = .{
+        .child_delivery = if (memory) |info| info.child_delivery else null,
         .tool_images = tool_images,
         .tool_image_handle = tool_image_handle,
         .tool_call_id = tool_call_id,
@@ -245,6 +246,9 @@ pub fn findToolCallById(calls: []const ToolCall, id: []const u8) ?ToolCall {
 }
 
 const ChatMessageAdapter = struct {
+    fn childObservation(value: Message) ?types.ChildObservation {
+        return value.child_observation;
+    }
     fn standalone(value: Message) bool {
         return value.standalone_response or value.provider_replay != null;
     }
@@ -296,6 +300,9 @@ const ChatMessageAdapter = struct {
 };
 
 const MessageAdapter = struct {
+    fn childObservation(_: Message) ?types.ChildObservation {
+        return null;
+    }
     fn standalone(_: Message) bool {
         return false;
     }
@@ -366,16 +373,35 @@ fn buildNormalExecutionMemory(
         files.deinit(alloc);
     }
 
+    var observations: std.ArrayList(types.PersistedChildObservation) = .empty;
+    errdefer {
+        for (observations.items) |item| types.freeChildObservation(alloc, item.observation);
+        observations.deinit(alloc);
+    }
     var i: usize = 0;
     while (i < messages.len) {
         const msg = messages[i];
+        if (Adapter.childObservation(msg)) |observation| {
+            try observation.validate();
+            if (!Adapter.isUser(msg) or Adapter.isPermissionFeedback(msg)) return error.InvalidChildObservation;
+            if (observations.items.len == types.ChildObservation.max_per_execution) return error.InvalidChildObservation;
+            const copy = try types.dupeChildObservation(alloc, observation);
+            errdefer types.freeChildObservation(alloc, copy);
+            try observations.append(alloc, .{
+                .observation = copy,
+                .after_tool_step_count = tool_steps.items.len,
+                .after_steering_count = 0,
+            });
+            i += 1;
+            continue;
+        }
         const tool_calls = Adapter.toolCalls(msg);
         if (!Adapter.isAssistant(msg)) {
             i += 1;
             continue;
         }
         if (tool_calls.len == 0) {
-            if (Adapter.standalone(msg)) {
+            if (Adapter.standalone(msg) or (i + 1 < messages.len and Adapter.childObservation(messages[i + 1]) != null)) {
                 const assistant = if (Adapter.content(msg)) |content| try alloc.dupe(u8, content) else null;
                 errdefer if (assistant) |text| alloc.free(text);
                 const replay = try dupeUnchangedProviderReplay(alloc, Adapter.providerReplay(msg), Adapter.content(msg), assistant, &.{}, &.{});
@@ -431,7 +457,7 @@ fn buildNormalExecutionMemory(
             );
         }
 
-        while (j < messages.len and Adapter.isUser(messages[j])) : (j += 1) {
+        while (j < messages.len and Adapter.isUser(messages[j]) and Adapter.childObservation(messages[j]) == null) : (j += 1) {
             const feedback_msg = messages[j];
             if (!Adapter.isPermissionFeedback(feedback_msg)) continue;
             const text = Adapter.content(feedback_msg) orelse
@@ -477,9 +503,12 @@ fn buildNormalExecutionMemory(
     const owned_files = try files.toOwnedSlice(alloc);
     errdefer types.freeFileEvidenceSlice(alloc, owned_files);
     markStaleFileEvidence(owned_files);
+    const owned_observations = try observations.toOwnedSlice(alloc);
+    errdefer types.freeChildObservations(alloc, owned_observations);
     return .{
         .tool_steps = try tool_steps.toOwnedSlice(alloc),
         .files = owned_files,
+        .child_observations = owned_observations,
     };
 }
 

@@ -190,7 +190,7 @@ const ask_user_question_question_schema = model_tool_schema.ObjectSchema{
 };
 
 const subagent_description =
-    "Delegate work and receive one terminal child result. Use run for one temporary child and one task. Use message with a stable name to create or continue a persistent conversation in this parent session. Optional instructions replace only that child's system overlay; fx preserves its trusted base prompt. fx owns timing, worker identities, cancellation, permissions, persistence, and cleanup.";
+    "Delegate work with run for one temporary task, or message to create or continue a named child in this session. Optional instructions replace only the child's overlay, never its trusted base prompt or authority. In the interactive main agent, steering can release the wait while the child continues; completion is delivered separately. Main-agent input, cancellation and session changes do not stop children. Use cancel with the exact child_id and work_id to intentionally stop your own child work; this action requires the interactive host. fx exits stop owned children. Other hosts keep synchronous run/message behavior. fx owns identities, permissions, persistence and cleanup.";
 
 const subagent_model_run_properties = [_]model_tool_schema.Property{
     .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"run"} } },
@@ -204,9 +204,16 @@ const subagent_model_message_properties = [_]model_tool_schema.Property{
     .{ .name = "message", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_message_bytes }, .description = "Next message for that named agent. fx creates it on first use and continues it afterward." },
 };
 
+const subagent_model_cancel_properties = [_]model_tool_schema.Property{
+    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"cancel"} } },
+    .{ .name = "child_id", .json_type = .string, .bounds = &.{ .min_length = 1 }, .description = "Exact child ID supplied by this session's host. Never a child from another session." },
+    .{ .name = "work_id", .json_type = .string, .bounds = &.{ .min_length = 1 }, .description = "Exact work ID supplied with that child ID. Stale work IDs never cancel replacement work." },
+};
+
 const subagent_model_action_schemas = [_]model_tool_schema.ObjectSchema{
     .{ .properties = &subagent_model_run_properties, .required = &.{ "action", "task" }, .additional_properties = false },
     .{ .properties = &subagent_model_message_properties, .required = &.{ "action", "agent", "message" }, .additional_properties = false },
+    .{ .properties = &subagent_model_cancel_properties, .required = &.{ "action", "child_id", "work_id" }, .additional_properties = false },
 };
 
 const subagent_model_action_union = model_tool_schema.ObjectSchema{

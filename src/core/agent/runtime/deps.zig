@@ -176,8 +176,24 @@ pub const DiffMarkerStyles = struct {
     removed: []const u8 = "",
 };
 
+pub const ChildWorkSnapshot = struct {
+    observations: []const types.ChildObservation = &.{},
+    pending: bool = false,
+};
+
+/// Parent-only pull/adoption boundary. Child workers never retain these callbacks.
+/// prepare returns arena-owned values; commit precedes acknowledge and model send.
+pub const ChildWorkCallbacks = struct {
+    prepare: *const fn (*anyopaque, Allocator, []const ChatMessage) anyerror!ChildWorkSnapshot,
+    commit: *const fn (*anyopaque, u64, types.AssistantHistoryTurn) anyerror!void,
+    acknowledge: *const fn (*anyopaque, []const types.ChildObservation) anyerror!void,
+    observe_input: *const fn (*anyopaque, u64) worker_runtime.WorkerRuntime.ChildWaitInput,
+    begin_wait: ?*const fn (*anyopaque, u64) void = null,
+};
+
 pub const AgentRuntimeDeps = struct {
     ctx: *anyopaque,
+    child_work: ?ChildWorkCallbacks = null,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
     flush_assistant_stream_per_content_chunk: bool = false,
     render_assistant_text: bool = true,

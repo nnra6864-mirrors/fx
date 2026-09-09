@@ -8,6 +8,8 @@ const input_limit_rejection = @import("../input/input_limit_rejection.zig");
 const question_ui = @import("../../ui/footer/question_ui.zig");
 const question_freeform_layout = @import("../../ui/footer/question_freeform_layout.zig");
 const input_interrupt_runtime = @import("input_interrupt_runtime.zig");
+const app_worker_runtime = @import("app_worker_runtime.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 
 pub fn QuestionRuntime(comptime App: type) type {
     return struct {
@@ -57,6 +59,20 @@ pub fn QuestionRuntime(comptime App: type) type {
         }
 
         pub fn cancelQuestionPrompt(app: *App) !void {
+            if (comptime @hasDecl(App, "nativeSubagentQuestionRouting")) {
+                if (app.question_prompt.child_target) |target| {
+                    const matched = app_worker_runtime.Runtime(App).dismissSubagentQuestion(app, target);
+                    debug_trace.eventf("subagent", "child_question_display_dismissed", .{}, "root_id={s} child_id={s} work_id={s} matched={s} child_cancelled=false", .{ target.root_id, target.child_id, target.work_id, if (matched) "true" else "false" });
+                    app.worker.requestInteractiveCancel();
+                    app.question_prompt.discard(app.alloc, "main_control_dismissed_child_question");
+                    app.pacer.clear(app.alloc);
+                    app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
+                    app.input_runtime.gestures = gesture_state.disarmEscapeClear(app.input_runtime.gestures).next;
+                    app.stopStream();
+                    app.shell.render_requests.request(.modal);
+                    return;
+                }
+            }
             const route_recovery = isRouteRecoveryPrompt(app);
             const mcp_elicitation = isMcpElicitationPrompt(app);
             interrupt.traceInterruptRequested(app, "input_question");
@@ -88,6 +104,16 @@ pub fn QuestionRuntime(comptime App: type) type {
                 labels.appendAssumeCapacity(entry.answer.?);
             }
 
+            if (comptime @hasDecl(App, "nativeSubagentQuestionRouting")) {
+                if (app.question_prompt.child_target) |target| {
+                    const accepted = try app_worker_runtime.Runtime(App).answerSubagentQuestion(app, target, labels.items);
+                    debug_trace.eventf("subagent", "child_question_response_routed", .{}, "root_id={s} child_id={s} work_id={s} generation={d} accepted={s}", .{ target.root_id, target.child_id, target.work_id, target.generation, if (accepted) "true" else "false" });
+                    app.question_prompt.resetAfterSubmission(app.alloc);
+                    app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
+                    app.shell.render_requests.request(.modal);
+                    return;
+                }
+            }
             if (!isRouteRecoveryPrompt(app) and !isMcpElicitationPrompt(app)) {
                 try finalizeQuestionTranscript(app, false);
             }

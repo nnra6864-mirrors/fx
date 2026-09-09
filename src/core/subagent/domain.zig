@@ -16,6 +16,34 @@ pub const max_cancellation_reason_bytes: usize = 512;
 pub const max_admission_items: usize = 256;
 pub const max_admission_item_bytes: usize = 4096;
 
+/// Exact route identity for a human-required child tool question. No worker
+/// pointer escapes to the input surface; routing is revalidated on response.
+pub const QuestionTarget = struct {
+    root_id: []const u8,
+    child_id: []const u8,
+    work_id: []const u8,
+    generation: u64,
+
+    pub fn eql(self: QuestionTarget, other: QuestionTarget) bool {
+        return self.generation == other.generation and std.mem.eql(u8, self.root_id, other.root_id) and
+            std.mem.eql(u8, self.child_id, other.child_id) and std.mem.eql(u8, self.work_id, other.work_id);
+    }
+
+    pub fn dupe(self: QuestionTarget, alloc: Allocator) !QuestionTarget {
+        const root_id = try alloc.dupe(u8, self.root_id);
+        errdefer alloc.free(root_id);
+        const child_id = try alloc.dupe(u8, self.child_id);
+        errdefer alloc.free(child_id);
+        return .{ .root_id = root_id, .child_id = child_id, .work_id = try alloc.dupe(u8, self.work_id), .generation = self.generation };
+    }
+
+    pub fn deinit(self: QuestionTarget, alloc: Allocator) void {
+        alloc.free(self.root_id);
+        alloc.free(self.child_id);
+        alloc.free(self.work_id);
+    }
+};
+
 pub const QueuedMessage = struct {
     id: []u8,
     source_id: []u8,
