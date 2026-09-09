@@ -74,6 +74,11 @@ static int injected_sync(int fd) {
         dprintf(log, "hit=%d target=%s\n", hit, actual);
         close(log);
     }
+    const char *mode = getenv("FX_TEST_SYNC_MODE");
+    if (mode && !strcmp(mode, "hold")) {
+        while (!access(arm, F_OK)) usleep(10000);
+        return real_sync(fd);
+    }
     errno = EIO;
     return -1;
 }

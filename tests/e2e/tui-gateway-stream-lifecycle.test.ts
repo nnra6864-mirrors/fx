@@ -1858,6 +1858,50 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     TIMEOUT * 2,
   );
 
+  test("turn summary appears after the response is painted before journal acknowledgement", async () => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), "fx-summary-after-ack-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const arm = join(root, "hold");
+    const entered = join(root, "entered");
+    const target = join(root, "target");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(home); mkdirSync(workspace);
+    const shim = join(root, process.platform === "darwin" ? "sync.dylib" : "sync.so");
+    execFileSync("cc", [process.platform === "darwin" ? "-dynamiclib" : "-shared", "-fPIC", "-O2", "-std=c11",
+      join(REPO_ROOT, "tests/e2e/fixtures/session-sync-fault.c"), "-o", shim, ...(process.platform === "darwin" ? [] : ["-ldl"])], { stdio: "pipe" });
+    const finalText = "RESPONSE_PAINTED_BEFORE_DURABLE_END";
+    const queuedGateway = startFakeGateway([() => {
+      const sessions = join(home, ".fx", "sessions");
+      const ids = readdirSync(sessions).filter(id => existsSync(join(sessions, id, "execution.journal")));
+      expect(ids).toHaveLength(1);
+      writeFileSync(target, join(sessions, ids[0]!, "execution.journal"));
+      writeFileSync(arm, "");
+      return fakeGatewayFinalTextWithUsage(finalText, 10, 600);
+    }], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    gateway = queuedGateway;
+    session = await TmuxSession.create({ cwd: workspace, stderrPath, env: {
+      HOME: home, AI_GATEWAY_API_KEY: "fake-summary-key", FX_MODEL: MODEL, FX_AUTO_UPGRADE: "0",
+      FX_GATEWAY_BASE_URL: queuedGateway.baseUrl, FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+      FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+      [process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD"]: shim,
+      FX_TEST_SYNC_TARGET_FILE: target, FX_TEST_SYNC_ARM: arm, FX_TEST_SYNC_RECORD: entered,
+      FX_TEST_SYNC_MATCH: '"kind":"turn_end"', FX_TEST_SYNC_MODE: "hold",
+    } });
+    try {
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Show the saved summary.");
+      await waitForPath(entered);
+      await session.waitForText(finalText, TIMEOUT);
+      expect(TURN_SUMMARY_WITH_TOKENS.test(await session.captureFullScrollback())).toBe(false);
+      rmSync(arm);
+      const finished = await waitForScrollback(session, value => value.includes(finalText) && TURN_SUMMARY_WITH_TOKENS.test(value), "summary after acknowledged turn end");
+      expect(finished).toContain("↓600");
+      expect(queuedGateway.requests).toHaveLength(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally { rmSync(arm, { force: true }); }
+  }, TIMEOUT * 2);
+
   test(
     "agent-owned HTTP retry renders the final token counter without markers",
     async () => {
