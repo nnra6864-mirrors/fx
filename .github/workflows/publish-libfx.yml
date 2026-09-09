@@ -171,6 +171,7 @@ jobs:
         run: |
           node --test sdk/tests/journal/runtime.test.mjs sdk/tests/test-journal-bridge.mjs sdk/tests/test-transcript.mjs
           node sdk/tests/test-journal-recovery.mjs native
+          node sdk/tests/test-journal-capacity.mjs native
 
       - name: Name native addon for package discovery
         shell: bash
@@ -308,6 +309,7 @@ jobs:
         run: |
           node --experimental-wasm-jspi --test sdk/tests/journal/runtime.test.mjs sdk/tests/test-journal-bridge.mjs sdk/tests/test-transcript.mjs
           node sdk/tests/test-journal-recovery.mjs wasm
+          node --experimental-wasm-jspi sdk/tests/test-journal-capacity.mjs wasm
 
       - name: Test installed package and diagnostics
         run: |
