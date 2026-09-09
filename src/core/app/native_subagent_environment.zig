@@ -573,7 +573,7 @@ test "native subagent runner uses owned credentials and context after detach" {
                 .caller_id = "original",
                 .invocation_id = "native-call",
                 .parent_permission_mode = .yolo,
-                .defaults = .{ .provider = .gateway, .model = "openai/gpt-5.5", .effort = .auto, .conversation_language = @import("../session/session.zig").ConversationLanguage.literal("en") },
+                .defaults = .{ .provider = .gateway, .model = "test/native-child", .effort = .auto, .conversation_language = @import("../session/session.zig").ConversationLanguage.literal("en") },
                 .max_result_bytes = 4096,
                 .timestamp_ms = 1,
             }) catch |err| {
@@ -596,7 +596,7 @@ test "native subagent runner uses owned credentials and context after detach" {
         .created_at_ms = 1,
         .updated_at_ms = 1,
         .conversation_language = @import("../session/session.zig").ConversationLanguage.literal("en"),
-        .preferences = .{ .model = @constCast("openai/gpt-5.5"), .effort = .auto, .fast_mode = false },
+        .preferences = .{ .model = @constCast("test/native-child"), .effort = .auto, .fast_mode = false },
         .history = &.{},
         .total_input_tokens = 0,
         .total_output_tokens = 0,
@@ -651,7 +651,7 @@ test "native subagent runner uses owned credentials and context after detach" {
         const child = binding.runs.items[0];
         try std.testing.expectEqual(&child.turn.sessionRuntime().usage, child.search.usage.?);
         try std.testing.expectEqualStrings("synthetic-original", child.search.api_key);
-        try std.testing.expectEqualStrings("openai/gpt-5.5", child.search.worker_model);
+        try std.testing.expectEqualStrings("test/native-child", child.search.worker_model);
         try std.testing.expectEqualStrings("http://127.0.0.1/unused", child.search.gateway_chat_url);
     }
     key[0] = 'x';
