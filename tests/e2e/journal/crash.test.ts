@@ -167,7 +167,7 @@ describe("journal witness native crash", () => {
         expect(resumed.stdout).toContain("SAVED_IMAGE_RECOVERED");
       } else {
         const stderrPath = join(root, "resume.stderr");
-        tui = await TmuxSession.create({ cmd: `${JSON.stringify(FX_BIN)} -c`, cwd: workspace, env, isolated: true, stderrPath });
+        tui = await TmuxSession.create({ cmd: `${JSON.stringify(FX_BIN)} --resume ${JSON.stringify(ids[0])}`, cwd: workspace, env, isolated: true, stderrPath });
         await tui.waitForStableComposer();
         expect(gateway.requests).toHaveLength(1);
         await tui.sendText("/continue");
@@ -312,7 +312,7 @@ describe("journal witness native crash", () => {
       }
       const stderrPath = join(root, "resume.stderr");
       resumed = await TmuxSession.create({
-        cmd: `${JSON.stringify(FX_BIN)} -c`, cwd: workspace, env,
+        cmd: `${JSON.stringify(FX_BIN)} --resume ${JSON.stringify(sessionId)}`, cwd: workspace, env,
         isolated: true, stderrPath,
       });
       try {
@@ -320,7 +320,7 @@ describe("journal witness native crash", () => {
       } catch (error) {
         throw new Error(`${error}\nStartup stderr:\n${readFileSync(stderrPath, "utf8")}`);
       }
-      // Ordinary -c must stay paused. This is not an upgrade handoff token.
+      // Ordinary reopening must stay paused without an upgrade handoff token.
       const transcript = await resumed.captureFullScrollback();
       expect(transcript).toContain("Turn paused");
       expect(transcript).not.toContain("Cancelled");

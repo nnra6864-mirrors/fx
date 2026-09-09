@@ -78,8 +78,6 @@ pub const ApprovalResolveOptions = struct {
     timestamp_ms: i64,
 };
 
-pub const RecoveryState = enum(u8) { pending, complete };
-
 pub const Runtime = struct {
     alloc: Allocator,
     sessions: *session_store.Store,
@@ -89,8 +87,9 @@ pub const Runtime = struct {
     approvals: approval_registry.Registry,
     authority_resolver: authority.Resolver,
     managed: managed_owner.Owner,
-    recovery_state: std.atomic.Value(RecoveryState) = .init(.pending),
 
+    /// Returns a host only after abandoned child work has been recovered.
+    /// Borrows the store and callback contexts until deinit.
     pub fn create(
         alloc: Allocator,
         sessions: *session_store.Store,
@@ -122,12 +121,9 @@ pub const Runtime = struct {
             .host = host_authority,
         };
         runtime.managed = runtime.managedOwnerValue();
-        runtime.requestBackgroundRecovery(io_mod.milliTimestamp()) catch |err|
-            debug_trace.logf(
-                "subagent",
-                "managed child recovery unavailable root_id={s} err={s}",
-                .{ root_id, @errorName(err) },
-            );
+        errdefer runtime.approvals.deinit();
+        errdefer runtime.managed.deinit();
+        try runtime.managed.recoverInterrupted();
         return runtime;
     }
 
@@ -157,15 +153,6 @@ pub const Runtime = struct {
         self.managed.services.context = self;
         self.managed.authority_resolver = &self.authority_resolver;
         self.managed.approvals = &self.approvals;
-    }
-
-    pub fn requestBackgroundRecovery(self: *Runtime, _: i64) !void {
-        try self.managed.recoverInterrupted();
-        self.recovery_state.store(.complete, .release);
-    }
-
-    pub fn recoveryState(self: *const Runtime) RecoveryState {
-        return self.recovery_state.load(.acquire);
     }
 
     pub fn pendingApprovalRequest(

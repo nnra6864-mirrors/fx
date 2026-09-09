@@ -251,6 +251,14 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
                 writeStderr(deps, "fx: unable to start terminal recording.\n");
                 return .{ .exit = 1 };
             },
+            error.NoRememberedSession => {
+                writeStderr(deps, "fx: no remembered session for this workspace; choose one with fx -r or fx --resume <id>\n");
+                return .{ .exit = 1 };
+            },
+            error.RememberedSessionUnavailable => {
+                writeStderr(deps, "fx: the remembered session ID could not be read; choose one with fx -r or fx --resume <id>\n");
+                return .{ .exit = 1 };
+            },
             error.NoSavedSessions => {
                 writeStderr(deps, "fx: no saved sessions for this workspace.\n");
                 return .{ .exit = 1 };
@@ -629,6 +637,7 @@ fn appendInitEvent(launch: *const cli_surface.InteractiveLaunch) void {
         switch (target) {
             .pick => appendTestEvent("init:pick"),
             .last => appendTestEvent("init:last"),
+            .remembered => appendTestEvent("init:remembered"),
             .id => |id| appendTestEvent(std.fmt.bufPrint(&test_init_event_buf, "init:{s}", .{id}) catch "init:<invalid>"),
         }
     } else {

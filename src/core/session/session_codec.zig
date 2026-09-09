@@ -320,7 +320,7 @@ pub fn encodeSessionMetadata(
     try validateSessionMetadata(metadata);
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    try std.json.Stringify.value(metadata, .{}, &out.writer);
+    std.json.Stringify.value(metadata, .{}, &out.writer) catch return error.OutOfMemory;
     if (out.written().len == 0 or out.written().len > max_session_metadata_bytes) {
         return error.SessionMetadataTooLarge;
     }

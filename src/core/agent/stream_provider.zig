@@ -18,6 +18,7 @@ pub const ToolStartCallback = *const fn (
     tool_id: []const u8,
     tool_name: []const u8,
     label_value: ?[]const u8,
+    arguments_json: ?[]const u8,
 ) void;
 
 pub const Event = union(enum) {
@@ -27,6 +28,8 @@ pub const Event = union(enum) {
         id: []const u8,
         name: []const u8,
         label: ?[]const u8 = null,
+        /// Complete arguments borrowed only for synchronous event delivery.
+        arguments_json: ?[]const u8 = null,
     },
     tool_input_delta: []const u8,
 };

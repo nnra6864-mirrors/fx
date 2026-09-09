@@ -436,7 +436,6 @@ const RunDeps = struct {
     discard_pristine_session_ctx: ?*anyopaque = null,
     discard_pristine_session: DiscardPristineSessionFn = discardPristineSessionDefault,
     install_headless_interrupt: bool = false,
-    start_subagent_background_recovery: bool = true,
     stdin_source: StdinSource = .real,
 };
 
@@ -910,24 +909,21 @@ const AskContext = struct {
             self.effort = preferences.effort;
             self.fast_mode = preferences.fast_mode;
         }
-        self.subagent_host = try subagent_tool_host.Runtime.create(
+        self.subagent_host = subagent_tool_host.Runtime.create(
             self.alloc,
             &self.store.?,
             self.writable.?.active_id,
             .{ .context = self, .resolve_fn = resolveAskSubagentAuthority },
             .{ .context = self, .run_fn = runAskChild },
-        );
-        if (self.deps.start_subagent_background_recovery) {
-            self.subagent_host.?.requestBackgroundRecovery(
-                io_mod.milliTimestamp(),
-            ) catch |err| {
-                debug_trace.logf(
-                    "subagent",
-                    "ask background recovery unavailable root_id={s} outcome={s}",
-                    .{ self.subagent_host.?.root_id, @errorName(err) },
-                );
-            };
-        }
+        ) catch |err| blk: {
+            if (err == error.OutOfMemory) return err;
+            debug_trace.logf(
+                "subagent",
+                "ask subagent host unavailable root_id={s} err={s}",
+                .{ self.writable.?.active_id, @errorName(err) },
+            );
+            break :blk null;
+        };
         const capability = try self.writable.?.childCapability();
         if (legacy_background_migration.migrate(
             self.alloc,
@@ -7260,12 +7256,11 @@ fn exerciseSavedAskSessionStoreAllocation(
     defer stdout_capture.deinit(setup_alloc);
     var stderr_capture: TestCapture = .{};
     defer stderr_capture.deinit(setup_alloc);
-    var deps = testPromptRunDeps(
+    const deps = testPromptRunDeps(
         &stdout_capture,
         &stderr_capture,
         testPresentKeyStartup,
     );
-    deps.start_subagent_background_recovery = false;
     var ctx = AskContext.init(
         alloc,
         testConfig(),

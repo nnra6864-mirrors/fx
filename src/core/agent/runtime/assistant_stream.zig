@@ -292,7 +292,7 @@ pub fn pushTokenProgressUpdate(stream_ctx: *StreamChunkContext, update: runtime_
     }
 }
 
-pub fn onStreamToolStart(ctx: *anyopaque, tool_id: []const u8, tool_name: []const u8, label_value: ?[]const u8) void {
+pub fn onStreamToolStart(ctx: *anyopaque, tool_id: []const u8, tool_name: []const u8, label_value: ?[]const u8, arguments_json: ?[]const u8) void {
     const stream_ctx: *StreamChunkContext = @ptrCast(@alignCast(ctx));
     const first_tool_in_step = !stream_ctx.saw_tool_start;
     recordStreamToolStart(ctx, tool_name);
@@ -331,6 +331,7 @@ pub fn onStreamToolStart(ctx: *anyopaque, tool_id: []const u8, tool_name: []cons
             metadata.activity_kind,
             metadata.action_label,
             label_value,
+            arguments_json,
         ) catch {},
     }
 }
@@ -953,7 +954,7 @@ test "provider callbacks publish each activity phase transition once" {
     onStreamReasoningChunk(&stream_ctx, " continues");
     onStreamContentChunk(&stream_ctx, "response");
     onStreamContentChunk(&stream_ctx, " continues\n");
-    onStreamToolStart(&stream_ctx, "command_1", "shell", null);
+    onStreamToolStart(&stream_ctx, "command_1", "shell", null, null);
 
     try std.testing.expectEqualSlices(
         types.TurnPhase,
@@ -1056,15 +1057,15 @@ test "streamed tool starts emit lifecycle only for identified read-only tools" {
     };
     defer stream_ctx.deinit();
 
-    onStreamToolStart(&stream_ctx, "write_1", "write_file", "file1.txt");
-    onStreamToolStart(&stream_ctx, "edit_1", "edit_file", "file2.txt");
-    onStreamToolStart(&stream_ctx, "ask_1", "request_user_input", null);
-    onStreamToolStart(&stream_ctx, "", "read_file", "src/main.zig");
+    onStreamToolStart(&stream_ctx, "write_1", "write_file", "file1.txt", null);
+    onStreamToolStart(&stream_ctx, "edit_1", "edit_file", "file2.txt", null);
+    onStreamToolStart(&stream_ctx, "ask_1", "request_user_input", null, null);
+    onStreamToolStart(&stream_ctx, "", "read_file", "src/main.zig", null);
 
     try std.testing.expect(stream_ctx.first_model_output_at_ms != null);
     try std.testing.expectEqual(@as(usize, 0), capture.lifecycle_events.items.len);
 
-    onStreamToolStart(&stream_ctx, "read_1", "read_file", "src/main.zig");
+    onStreamToolStart(&stream_ctx, "read_1", "read_file", "src/main.zig", null);
 
     try std.testing.expectEqual(@as(usize, 2), capture.lifecycle_events.items.len);
     try std.testing.expectEqualStrings(
@@ -1090,7 +1091,7 @@ test "streamed unknown tool start preserves the buffered stream boundary" {
     defer stream_ctx.deinit();
 
     try streamAssistantChunk(&stream_ctx, "buffered text");
-    onStreamToolStart(&stream_ctx, "unknown_1", "unknown_tool", null);
+    onStreamToolStart(&stream_ctx, "unknown_1", "unknown_tool", null, null);
 
     try std.testing.expect(stream_ctx.first_model_output_at_ms == null);
     try std.testing.expectEqualStrings("buffered text", stream_ctx.raw_text.items);
@@ -1361,7 +1362,7 @@ test "streamed setext heading waits for its underline and flushes before a tool"
     try streamAssistantChunk(&stream_ctx, "-");
     try std.testing.expectEqual(@as(usize, 0), capture.text_spans.items.len);
 
-    onStreamToolStart(&stream_ctx, "read_1", "read_file", null);
+    onStreamToolStart(&stream_ctx, "read_1", "read_file", null, null);
 
     try std.testing.expectEqualStrings("Streamed title\n---", stream_ctx.raw_text.items);
     try std.testing.expectEqual(@as(usize, 0), capture.thematic_rule_count);
@@ -1392,7 +1393,7 @@ test "streamed definition list retains source and clears before a tool" {
     try streamAssistantChunk(&stream_ctx, "Sta");
     try streamAssistantChunk(&stream_ctx, "tus\n: **Run");
     try streamAssistantChunk(&stream_ctx, "ning**\n");
-    onStreamToolStart(&stream_ctx, "read_1", "read_file", null);
+    onStreamToolStart(&stream_ctx, "read_1", "read_file", null, null);
     try streamAssistantChunk(&stream_ctx, ": stale\n");
     try flushAssistantStream(&stream_ctx);
 
@@ -1456,7 +1457,7 @@ test "streamed footnotes retain raw source and flush before a tool" {
             "| api | [^status] |\n",
     );
     try streamAssistantChunk(&stream_ctx, "[^status]: OBSERVER_FOOTNOTE_PROJECTION\n");
-    onStreamToolStart(&stream_ctx, "read_1", "read_file", null);
+    onStreamToolStart(&stream_ctx, "read_1", "read_file", null, null);
 
     try std.testing.expectEqualStrings(
         "The deployment is stable[^status].\n" ++
@@ -1524,7 +1525,7 @@ test "streamed tool start flushes presentation before separator and lifecycle" {
         defer stream_ctx.deinit();
 
         try streamAssistantChunk(&stream_ctx, "partial");
-        onStreamToolStart(&stream_ctx, case.id, case.name, null);
+        onStreamToolStart(&stream_ctx, case.id, case.name, null, null);
 
         try std.testing.expectEqual(@as(usize, 2), capture.text_spans.items.len);
         try std.testing.expectEqualStrings("partial", capture.text_spans.items[0]);
@@ -1559,7 +1560,7 @@ test "streamed tool start flushes presentation before separator and lifecycle" {
     defer newline_stream_ctx.deinit();
 
     try streamAssistantChunk(&newline_stream_ctx, "complete line\n");
-    onStreamToolStart(&newline_stream_ctx, "read_newline", "read_file", null);
+    onStreamToolStart(&newline_stream_ctx, "read_newline", "read_file", null, null);
 
     try std.testing.expectEqual(@as(usize, 1), newline_capture.text_spans.items.len);
     try std.testing.expectEqualStrings("complete line\n", newline_capture.text_spans.items[0]);
@@ -1588,7 +1589,7 @@ test "assistant prose before the first tool starts a new presentation group" {
     defer stream_ctx.deinit();
 
     try streamAssistantChunk(&stream_ctx, "new batch");
-    onStreamToolStart(&stream_ctx, "read_1", "read_file", null);
+    onStreamToolStart(&stream_ctx, "read_1", "read_file", null, null);
 
     try std.testing.expectEqual(
         types.ToolPresentationGroupId{ .turn_id = 7, .anchor_step_id = 12 },
@@ -1612,9 +1613,9 @@ test "assistant prose between streamed sibling tools keeps their presentation gr
     };
     defer stream_ctx.deinit();
 
-    onStreamToolStart(&stream_ctx, "read_1", "read_file", null);
+    onStreamToolStart(&stream_ctx, "read_1", "read_file", null, null);
     try streamAssistantChunk(&stream_ctx, "provider bridge");
-    onStreamToolStart(&stream_ctx, "read_2", "read_file", null);
+    onStreamToolStart(&stream_ctx, "read_2", "read_file", null, null);
 
     const expected = types.ToolPresentationGroupId{
         .turn_id = 7,
@@ -1668,7 +1669,7 @@ test "semantic table flushes before a tool without visible text or extra separat
             "|------|------:|\n" ++
             "| api | 7 |\n",
     );
-    onStreamToolStart(&stream_ctx, "read_1", "read_file", null);
+    onStreamToolStart(&stream_ctx, "read_1", "read_file", null, null);
 
     try std.testing.expectEqual(@as(usize, 1), capture.tables.items.len);
     try std.testing.expectEqual(@as(usize, 0), capture.text_spans.items.len);
@@ -1715,7 +1716,7 @@ test "semantic thematic rule flushes at EOF before a tool after a blank separato
     defer stream_ctx.deinit();
 
     try streamAssistantChunk(&stream_ctx, "Before rule.\n\n---");
-    onStreamToolStart(&stream_ctx, "read_1", "read_file", null);
+    onStreamToolStart(&stream_ctx, "read_1", "read_file", null, null);
 
     try std.testing.expectEqualStrings("Before rule.\n\n---", stream_ctx.raw_text.items);
     try std.testing.expectEqual(@as(usize, 1), capture.thematic_rule_count);
@@ -1899,7 +1900,7 @@ test "streamed prefix without a code opener is discarded before a tool boundary"
     defer stream_ctx.deinit();
 
     try streamAssistantChunk(&stream_ctx, "   ");
-    onStreamToolStart(&stream_ctx, "read_1", "read_file", "src/main.zig");
+    onStreamToolStart(&stream_ctx, "read_1", "read_file", "src/main.zig", null);
     try streamAssistantChunk(&stream_ctx, "after tool\n");
 
     try std.testing.expectEqualStrings("   after tool\n", stream_ctx.raw_text.items);
@@ -2071,7 +2072,7 @@ test "streamed presentation suppresses callback-time failures" {
         var stream_ctx = StreamChunkContext{ .hooks = &hook_set, .turn_id = 1, .alloc = alloc };
         defer stream_ctx.deinit();
 
-        onStreamToolStart(&stream_ctx, "read_1", "read_file", null);
+        onStreamToolStart(&stream_ctx, "read_1", "read_file", null, null);
 
         try std.testing.expectEqual(@as(usize, 1), capture.lifecycle_calls);
         try std.testing.expectEqual(@as(usize, 0), capture.lifecycle_events.items.len);

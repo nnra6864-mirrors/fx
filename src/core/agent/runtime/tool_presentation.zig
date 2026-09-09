@@ -5,6 +5,7 @@ const permission_auto_classifier = @import("../../permissions/auto_classifier.zi
 const types = @import("../../shared/types.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
+const tool_args = @import("../../tooling/tool_args.zig");
 const tool_specs = @import("../../tooling/tool_specs.zig");
 const tooling_presentation = @import("../../tooling/tool_presentation.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
@@ -118,6 +119,7 @@ pub const ProvisionalToolStatuses = struct {
         activity_kind: types.ToolActivityKind,
         action_label: []const u8,
         label_value: ?[]const u8,
+        arguments_json: ?[]const u8,
     ) !void {
         if (tool_id.len == 0) {
             debug_trace.logf(
@@ -129,19 +131,38 @@ pub const ProvisionalToolStatuses = struct {
         }
 
         var buf: [512]u8 = undefined;
-        const label = try formatProvisionalProgressLabel(&buf, action_label, label_value);
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const is_skill = std.mem.eql(u8, tool_name, "skill");
+        var observed_label = if (is_skill) null else label_value;
+        var observed_kind = activity_kind;
+        const resource_label: ?[]const u8 = if (is_skill) resource: {
+            const json = arguments_json orelse break :resource null;
+            const args = tool_args.parseToolArgsObject(scratch.allocator(), json) catch break :resource null;
+            const spec = hooks.tool_registry.lookup(tool_name) orelse break :resource null;
+            const presentation = tool_dispatch.presentationForArgs(spec.*, args);
+            if (presentation.label_arg_kind != .resource) break :resource null;
+            const value = tool_dispatch.presentationLabelValue(presentation, args) orelse break :resource null;
+            const encoded = text_utils.encodeTerminalSafe(scratch.allocator(), value, buf.len) catch break :resource null;
+            if (encoded.truncated) break :resource null;
+            const formatted = formatProvisionalProgressLabel(&buf, presentation.action_label, encoded.bytes) catch break :resource null;
+            observed_label = value;
+            observed_kind = presentation.activity_kind;
+            break :resource formatted;
+        } else null;
+        const label = resource_label orelse try formatProvisionalProgressLabel(&buf, action_label, observed_label);
         const recorded = try self.recordTracked(
             alloc,
             tool_id,
             tool_name,
-            label_value,
+            observed_label,
         );
         hooks.push_tool_lifecycle(hooks.ctx, .{
             .provisional = .{
                 .id = .{ .turn_id = turn_id, .call_id = tool_id },
                 .presentation_group_id = self.presentation_group_id,
                 .tool_name = tool_name,
-                .activity_kind = activity_kind,
+                .activity_kind = observed_kind,
             },
         }) catch |err| {
             if (recorded) self.forget(alloc, tool_id);
@@ -1423,6 +1444,7 @@ const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.edit_file,
     test_builtin_tools.shell,
     test_builtin_tools.ask_user_question,
+    test_builtin_tools.skill,
 };
 const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
 const custom_activity_tool = blk: {
@@ -1706,8 +1728,8 @@ test "provisional lifecycle formats labeled and unlabeled eligible tools" {
     var statuses = ProvisionalToolStatuses{};
     defer statuses.deinit(alloc);
 
-    try statuses.publish(&hooks, alloc, 7, "read_1", "read_file", activityKind(hooks.tool_registry, "read_file"), eligibleActionLabel("read_file"), "src/main.zig");
-    try statuses.publish(&hooks, alloc, 7, "list_1", "glob_files", activityKind(hooks.tool_registry, "glob_files"), eligibleActionLabel("glob_files"), null);
+    try statuses.publish(&hooks, alloc, 7, "read_1", "read_file", activityKind(hooks.tool_registry, "read_file"), eligibleActionLabel("read_file"), "src/main.zig", null);
+    try statuses.publish(&hooks, alloc, 7, "list_1", "glob_files", activityKind(hooks.tool_registry, "glob_files"), eligibleActionLabel("glob_files"), null, null);
 
     try std.testing.expectEqual(@as(usize, 4), capture.events.items.len);
     switch (capture.events.items[0]) {
@@ -1736,6 +1758,114 @@ test "provisional lifecycle formats labeled and unlabeled eligible tools" {
     }
 }
 
+test "provisional skill labels select complete resource arguments and ignore opaque hints" {
+    const cases = [_]struct {
+        arguments_json: ?[]const u8,
+        hint: ?[]const u8 = "skill:opaque/location",
+        resource: ?[]const u8 = null,
+    }{
+        .{ .arguments_json = "{\"location\":\"skill:opaque/location\",\"resource\":\"references/types.md\"}", .resource = "references/types.md" },
+        .{ .arguments_json = "{\"resource\":\"references/types.md\",\"location\":\"skill:opaque/location\"}", .resource = "references/types.md" },
+        .{ .arguments_json = "{\"resource\":\"references/types.md\"}", .hint = null, .resource = "references/types.md" },
+        .{ .arguments_json = null },
+        .{ .arguments_json = "" },
+        .{ .arguments_json = "{\"resource\":\"partial" },
+        .{ .arguments_json = "[]" },
+        .{ .arguments_json = "null" },
+        .{ .arguments_json = "\"references/types.md\"" },
+        .{ .arguments_json = "{\"resource\":null}" },
+        .{ .arguments_json = "{\"resource\":42}" },
+        .{ .arguments_json = "{\"resource\":false}" },
+        .{ .arguments_json = "{\"resource\":[]}" },
+        .{ .arguments_json = "{\"resource\":{}}" },
+        .{ .arguments_json = "{\"resource\":\"\"}" },
+        .{ .arguments_json = "{\"resource\":\"SKILL.md\"}" },
+        .{ .arguments_json = "{\"resource\":\"SKILL.md\",\"offset\":1}" },
+        .{ .arguments_json = "{\"location\":\"skill:opaque/location\"}" },
+        .{ .arguments_json = "{\"name\":\"root-skill\"}" },
+        .{ .arguments_json = "{}" },
+    };
+    const alloc = std.testing.allocator;
+    for (cases) |case| {
+        var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+        defer capture.deinit();
+        const hooks = capture.hooks();
+        var statuses = ProvisionalToolStatuses{};
+        defer statuses.deinit(alloc);
+        try statuses.publish(&hooks, alloc, 7, "skill_1", "skill", .read, eligibleActionLabel("skill"), case.hint, case.arguments_json);
+        try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
+        try std.testing.expectEqual(types.ToolActivityKind.read, capture.events.items[0].provisional.activity_kind);
+        try std.testing.expectEqualStrings("skill_1", capture.events.items[1].progress.id.call_id);
+        var expected_buf: [512]u8 = undefined;
+        const expected = try formatProvisionalProgressLabel(&expected_buf, if (case.resource != null) "Reading skill resource" else "Loading skill", case.resource);
+        try std.testing.expectEqualStrings(expected, capture.events.items[1].progress.text);
+        if (case.resource) |resource| {
+            try std.testing.expectEqualStrings(resource, statuses.tracked.items[0].label_value.?);
+        } else {
+            try std.testing.expect(statuses.tracked.items[0].label_value == null);
+        }
+    }
+}
+
+test "provisional skill labels decode escaped UTF-8 and encode terminal controls before copying" {
+    const alloc = std.testing.allocator;
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    var statuses = ProvisionalToolStatuses{};
+    defer statuses.deinit(alloc);
+    {
+        const json = try alloc.dupe(u8, "{\"location\":\"skill:opaque/location\",\"resource\":\"r/\\u00e9\\u4e2d\\\"\\u001b[31m\\n\\r\\t\\u0000\\u0080.md\"}");
+        defer alloc.free(json);
+        try statuses.publish(&hooks, alloc, 7, "skill_1", "skill", .read, eligibleActionLabel("skill"), "skill:opaque/location", json);
+    }
+    try std.testing.expectEqualStrings(
+        "● Reading skill resource\x1b[0m \x1b[38;5;245mr/é中\"\\x1b[31m\\x0a\\x0d\\x09\\x00\\u{0080}.md\x1b[0m",
+        capture.events.items[1].progress.text,
+    );
+    try std.testing.expectEqualStrings("r/é中\"\x1b[31m\n\r\t\x00\u{0080}.md", statuses.tracked.items[0].label_value.?);
+}
+
+test "provisional skill labels fall back when encoded resource exceeds the progress buffer" {
+    const alloc = std.testing.allocator;
+    const max_detail = 512 - "● Reading skill resource\x1b[0m \x1b[38;5;245m\x1b[0m".len;
+    for ([_]usize{ max_detail, max_detail + 1, 512, 513, 4096 }) |len| {
+        var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+        defer capture.deinit();
+        const hooks = capture.hooks();
+        var statuses = ProvisionalToolStatuses{};
+        defer statuses.deinit(alloc);
+        const resource = try alloc.alloc(u8, len);
+        defer alloc.free(resource);
+        @memset(resource, 'a');
+        const json = try std.fmt.allocPrint(alloc, "{{\"resource\":\"{s}\"}}", .{resource});
+        defer alloc.free(json);
+        try statuses.publish(&hooks, alloc, 7, "skill_1", "skill", .read, eligibleActionLabel("skill"), "skill:opaque/location", json);
+        const text = capture.events.items[1].progress.text;
+        if (len == max_detail) {
+            try std.testing.expectEqual(@as(usize, 512), text.len);
+            try std.testing.expectEqualStrings(resource, statuses.tracked.items[0].label_value.?);
+        } else {
+            try std.testing.expectEqualStrings("● Loading skill\x1b[0m", text);
+            try std.testing.expect(statuses.tracked.items[0].label_value == null);
+        }
+    }
+}
+
+test "provisional non-skill labels retain hints regardless of completed arguments" {
+    const alloc = std.testing.allocator;
+    for ([_]?[]const u8{ null, "not JSON", "{\"path\":\"different.txt\",\"resource\":\"references/types.md\"}" }) |json| {
+        var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+        defer capture.deinit();
+        const hooks = capture.hooks();
+        var statuses = ProvisionalToolStatuses{};
+        defer statuses.deinit(alloc);
+        try statuses.publish(&hooks, alloc, 7, "read_1", "read_file", .read, eligibleActionLabel("read_file"), "original.txt", json);
+        try std.testing.expectEqualStrings("● Reading\x1b[0m \x1b[38;5;245moriginal.txt\x1b[0m", capture.events.items[1].progress.text);
+        try std.testing.expectEqualStrings("original.txt", statuses.tracked.items[0].label_value.?);
+    }
+}
+
 test "tracked provisional cancellation retains labels without exposing registered names" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -1747,10 +1877,10 @@ test "tracked provisional cancellation retains labels without exposing registere
     var statuses = ProvisionalToolStatuses{};
     defer statuses.deinit(alloc);
 
-    try statuses.publish(&hooks, alloc, 9, "read_1", "read_file", .read, "Reading", null);
-    try statuses.publish(&hooks, alloc, 9, "read_1", "read_file", .read, "Reading", "src/main.zig");
-    try statuses.publish(&hooks, alloc, 9, "command_1", "run_command", .command, "Running", null);
-    try statuses.publish(&hooks, alloc, 9, "mcp_1", "mcp_custom", .read, "Running", null);
+    try statuses.publish(&hooks, alloc, 9, "read_1", "read_file", .read, "Reading", null, null);
+    try statuses.publish(&hooks, alloc, 9, "read_1", "read_file", .read, "Reading", "src/main.zig", null);
+    try statuses.publish(&hooks, alloc, 9, "command_1", "run_command", .command, "Running", null, null);
+    try statuses.publish(&hooks, alloc, 9, "mcp_1", "mcp_custom", .read, "Running", null, null);
     try statuses.finishTrackedCancelled(&hooks, alloc, arena, 9);
 
     var terminal_count: usize = 0;
@@ -1787,8 +1917,8 @@ test "unmatched recovery starts hide registered names but retain unknown identit
     var statuses = ProvisionalToolStatuses{};
     defer statuses.deinit(alloc);
 
-    try statuses.publish(&hooks, alloc, 9, "command_1", "run_command", .command, "Running", null);
-    try statuses.publish(&hooks, alloc, 9, "mcp_1", "mcp_custom", .read, "Running", null);
+    try statuses.publish(&hooks, alloc, 9, "command_1", "run_command", .command, "Running", null, null);
+    try statuses.publish(&hooks, alloc, 9, "mcp_1", "mcp_custom", .read, "Running", null, null);
     try statuses.finishUnmatchedRecoveryStarts(&hooks, alloc, arena, 9, &.{});
 
     var terminal_count: usize = 0;
@@ -1826,7 +1956,7 @@ test "provisional lifecycle remains distinct from authoritative lifecycle" {
     defer statuses.deinit(alloc);
 
     const call = testToolCall("read_1", "read_file");
-    try statuses.publish(&hooks, alloc, 1, call.id, call.name, activityKind(hooks.tool_registry, call.name), eligibleActionLabel(call.name), null);
+    try statuses.publish(&hooks, alloc, 1, call.id, call.name, activityKind(hooks.tool_registry, call.name), eligibleActionLabel(call.name), null, null);
     try std.testing.expect(try startToolVisibleLifecycle(
         &hooks,
         arena,
@@ -1867,7 +1997,7 @@ test "provisional lifecycle rolls back a newly tracked id when provisional publi
 
     try std.testing.expectError(
         error.TestProvisionalPublicationFailure,
-        statuses.publish(&hooks, alloc, 1, "read_1", "read_file", activityKind(hooks.tool_registry, "read_file"), eligibleActionLabel("read_file"), null),
+        statuses.publish(&hooks, alloc, 1, "read_1", "read_file", activityKind(hooks.tool_registry, "read_file"), eligibleActionLabel("read_file"), null, null),
     );
     try std.testing.expect(!statuses.has("read_1"));
     try std.testing.expectEqual(@as(usize, 0), capture.events.items.len);
@@ -1881,7 +2011,7 @@ test "provisional lifecycle keeps a tracked id when progress publication fails" 
     var statuses = ProvisionalToolStatuses{};
     defer statuses.deinit(alloc);
 
-    try statuses.publish(&hooks, alloc, 1, "read_1", "read_file", activityKind(hooks.tool_registry, "read_file"), eligibleActionLabel("read_file"), null);
+    try statuses.publish(&hooks, alloc, 1, "read_1", "read_file", activityKind(hooks.tool_registry, "read_file"), eligibleActionLabel("read_file"), null, null);
     try std.testing.expect(statuses.has("read_1"));
     try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
     try std.testing.expect(capture.events.items[0] == .provisional);
@@ -2135,7 +2265,7 @@ fn checkProvisionalLifecycleAllocationFailures(alloc: Allocator) !void {
     var statuses = ProvisionalToolStatuses{};
     defer statuses.deinit(alloc);
 
-    try statuses.publish(&hooks, alloc, 1, "read_1", "read_file", activityKind(hooks.tool_registry, "read_file"), eligibleActionLabel("read_file"), null);
+    try statuses.publish(&hooks, alloc, 1, "read_1", "read_file", activityKind(hooks.tool_registry, "read_file"), eligibleActionLabel("read_file"), null, null);
     try std.testing.expect(statuses.has("read_1"));
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();

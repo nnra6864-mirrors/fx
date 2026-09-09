@@ -1091,6 +1091,7 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             turn_id: u64,
             images: []const types.ImageAttachment,
+            admitted: bool = false,
 
             fn enter(raw: *anyopaque) void {
                 const self: *@This() = @ptrCast(@alignCast(raw));
@@ -1100,6 +1101,10 @@ pub fn Runtime(comptime App: type) type {
             fn leave(raw: *anyopaque) void {
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 self.app.session_persistence.write_mutex.unlock(io_mod.getIo());
+                if (self.admitted) {
+                    self.admitted = false;
+                    app_session_runtime.Runtime(App).rememberJournalAdmission(self.app);
+                }
             }
 
             fn append(raw: *anyopaque, entry: execution_journal.Entry) !void {
@@ -1108,6 +1113,7 @@ pub fn Runtime(comptime App: type) type {
                 const sink = loaded.journalSink() orelse return error.JournalWriterRequired;
                 self.app.worker.preservePromptSnapshots(self.turn_id, self.images);
                 try sink.append_fn(sink.context, entry);
+                if (entry.kind == .turn_start) self.admitted = true;
             }
         };
 

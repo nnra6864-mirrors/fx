@@ -76,6 +76,8 @@ fx
 
 The current directory becomes the primary workspace. Enter a prompt, or run `/help` to browse interactive commands. While fx is working, you can submit a multiline update with Enter; it steers the active turn at its next safe model boundary. When no tool is running, your message appears in the transcript immediately. Updates waiting for a running tool show their first two lines with a dotted rail and an ellipsis when more text is hidden. Press Escape to interrupt the active work and apply the update as soon as the turn settles.
 
+Type `@` to find workspace files. Use `@~`, `@.`, or `@..` to browse your home, current workspace, or parent directory without typing a trailing slash. Tab or Enter inserts the selected path; selecting a directory continues browsing inside it.
+
 Use `/resume` to choose a saved conversation. The picker shares its catalog across workspace views and reuses unchanged session summaries between launches. The first catalog build, or recovery from missing cache data, scans saved sessions automatically. Changed sessions are checked again, and closing the picker stops obsolete loading work.
 
 Tool calls are expanded by default. Enable `Collapse tool calls` in `/settings`, or set `"collapse_tool_calls": true` in `~/.fx/settings.json`, to show one summary per tool-call group in the main transcript. Individual calls remain available in the full transcript with Ctrl+O. Follow-up activity for captured shell commands shows the original command, such as `Observed zig build`, while tool results keep the same execution handle.
@@ -103,9 +105,9 @@ fx session resume last
 fx session resume --id <id>
 ```
 
-`fx -c` also resumes the latest session for the current workspace. It skips unrelated current-format conversation histories during selection and attempts safe recovery of the selected session after an interrupted migration. A busy or unrecoverable selected session produces an error rather than opening an older conversation.
+`fx -c` (or `fx --continue`) resumes the remembered session for the current workspace directly by ID. Selecting a saved session or saving the first work in a new interactive session remembers it; opening an empty window, later background activity, and quitting do not change that selection. If no session is remembered, choose one with `fx -r` or `fx --resume <id>`. `fx --resume last` still selects the latest workspace session by activity. A busy or unreadable target produces an error rather than opening another conversation. The session picker loads its catalog when opened.
 
-Repeated continuation reuses validated summaries of unchanged older sessions instead of replaying their histories during selection. The first scan, or a scan after those session files change, can take longer. Opening the resume picker preserves these cached summaries.
+Latest-session selection with `fx --resume last` reuses validated summaries of unchanged older sessions instead of replaying their histories. The first scan, or a scan after those session files change, can take longer. Opening the resume picker preserves these cached summaries.
 
 Saved CLI and interactive sessions use an execution journal. Eligible completed older sessions convert under the exclusive session lock before accepting a new turn. Conversion preserves their history, settings, permissions, and required artifacts, and archives the original files. Conversion also captures legacy images and repairs their IDs; a missing source image stops conversion without dropping it. Older executables reject the converted format. Legacy sessions with pending work or conflicting recovery data remain inspectable; conversion refuses to guess whether that work completed.
 
@@ -125,7 +127,7 @@ A saved session has one writer until it closes. Suspending it with Ctrl+Z keeps 
 
 Recovery only reports that no repair is needed after confirming the saved session can be loaded. If a final session save fails during interactive shutdown, fx reports the failure and exits with a nonzero status after cleanup, without a successful resume hint or automatic upgrade relaunch.
 
-New sessions appear in resume selection only after their initial files are ready. Incomplete creation folders left by older builds do not block healthy conversations from resuming with `-c`; those folders remain available for diagnosis and are not deleted.
+New sessions appear in discovery only after their initial files are ready. Incomplete creation folders left by older builds remain available for diagnosis and are not deleted. Remembered continuation does not scan these folders.
 
 Interactive terminal tabs show `fx v<version> | <folder>` using the running binary's version and current workspace folder name, for example `fx v0.0.7 | fx`. Renaming a session or switching models leaves the title unchanged. Resuming from another folder uses that folder's name. Exiting clears the fx-owned title. Noninteractive commands do not emit terminal-title controls.
 
@@ -179,6 +181,8 @@ fx builds as a native binary or WebAssembly. Applications embedding fx can provi
 
 The WebAssembly SDK is experimental. See the [WebAssembly SDK](sdk/README.md) and [ACP documentation](https://fx.sh/docs/using-fx/acp).
 
+For runnable Node.js, browser, Next.js, and Nuxt applications, see the [libfx examples](examples/README.md).
+
 ## Extend fx
 
 In the interactive shell, bare `/mcp` opens an inline browser for servers, tools, resources, and prompts without adding anything to the transcript. Resource and prompt content enters the composer only after an explicit Insert action. Direct `/mcp SUBCOMMAND` forms remain available.
@@ -210,7 +214,7 @@ Skills are advertised in a stable catalog sized to the selected model's context 
 
 Explicit `$skill-name` mentions load the selected instructions before the model starts work. The `skill` tool accepts an advertised `location` and an optional relative `resource`, returning the complete document or a visible failure. Omitting `resource` or passing an empty string reads `SKILL.md`. File and tool-result limits still apply, and an explicit `skill_chunk_bytes` limit blocks a complete read that would exceed it. Existing named, offset-based calls remain supported.
 
-In the interactive shell, explicitly requested skills show a named load summary before the assistant replies. Full failure details are available in Ctrl+O. These automatic loads are not counted as tool calls; a loaded status confirms prepared instructions, not that the model followed them.
+In the interactive shell, explicitly requested skills show a named load summary before the assistant replies. Pending skill resource reads show the relative resource path once the tool arguments arrive, without exposing the internal skill location. Full failure details are available in Ctrl+O. These automatic loads are not counted as tool calls; a loaded status confirms prepared instructions, not that the model followed them.
 
 ## Documentation
 

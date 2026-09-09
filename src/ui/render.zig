@@ -432,11 +432,11 @@ pub fn buildHintLine(
             const total_k: u64 = @as(u64, total) / 1000;
             const pct = if (total > 0) (statusline.context_used * 100) / @as(u64, total) else 0;
             var ctx_buf: [48]u8 = undefined;
-            appendStatusSegment(out, &end, std.fmt.bufPrint(&ctx_buf, "Context: {d}k/{d}k {d}%", .{ used_k, total_k, pct }) catch "");
+            appendStatusSegment(out, &end, std.fmt.bufPrint(&ctx_buf, "{d}k/{d}k {d}%", .{ used_k, total_k, pct }) catch "");
         } else {
             const used_k = statusline.context_used / 1000;
             var ctx_buf: [32]u8 = undefined;
-            appendStatusSegment(out, &end, std.fmt.bufPrint(&ctx_buf, "Context: {d}k", .{used_k}) catch "");
+            appendStatusSegment(out, &end, std.fmt.bufPrint(&ctx_buf, "{d}k", .{used_k}) catch "");
         }
     }
     appendWorkspaceIdentity(out, &end, status_limit, statusline);
@@ -969,7 +969,15 @@ test "buildHintLine shows full context usage" {
         .context_used = 43_000,
         .context_total = 1_000_000,
     }, 80, &buf);
-    try std.testing.expectEqualStrings("ask · opus 4.8 · Context: 43k/1000k 4%", line);
+    try std.testing.expectEqualStrings("ask · opus 4.8 · 43k/1000k 4%", line);
+}
+
+test "buildHintLine shows context usage without a known total" {
+    var buf: [128]u8 = undefined;
+    const line = buildHintLine(false, true, "openai/gpt-5", .ask, false, .auto, false, .{
+        .context_used = 163_000,
+    }, 80, &buf);
+    try std.testing.expectEqualStrings("ask · gpt-5 · 163k", line);
 }
 
 test "buildHintLine shows the session title" {
@@ -1037,7 +1045,7 @@ test "buildHintLine workspace identity does not displace existing status segment
     }, 60, &buf);
     try std.testing.expect(std.mem.find(u8, line, "xhigh") != null);
     try std.testing.expect(std.mem.find(u8, line, "⚡︎") != null);
-    try std.testing.expect(std.mem.find(u8, line, "Context: 1k/100k 1%") != null);
+    try std.testing.expect(std.mem.find(u8, line, "1k/100k 1%") != null);
 }
 
 test "buildHintLine shows a non-Git workspace without branch punctuation" {
@@ -1071,7 +1079,7 @@ test "buildHintLine keeps system labels and dot separators" {
     }, 256, &buf);
     const expected = try std.fmt.allocPrint(
         std.testing.allocator,
-        "run /login · {s}auto{s} · opus 4.8 · low · ⚡︎ · Context: 43k/1000k 4%",
+        "run /login · {s}auto{s} · opus 4.8 · low · ⚡︎ · 43k/1000k 4%",
         .{ permission_auto_style, statusline_style },
     );
     defer std.testing.allocator.free(expected);

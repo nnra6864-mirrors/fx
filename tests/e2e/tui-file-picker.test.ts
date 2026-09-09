@@ -1596,6 +1596,98 @@ describe("@ file picker", () => {
   );
 
   tmuxTest(
+    "browses bare directory shortcuts from startup through submission and exit",
+    async () => {
+      const current = createFixture("fx-file-picker-shortcuts-");
+      initGit(current.workspace);
+      writeFileSync(join(current.home, "home-target.txt"), "DO_NOT_ATTACH_HOME_CONTENT");
+      writeFileSync(join(current.workspace, "local-target.txt"), "local");
+      writeFileSync(join(current.workspace, ".gitignore"), "ignored/\n");
+      writeFileSync(join(current.root, "parent-target.txt"), "parent");
+      git(current.workspace, "add", "local-target.txt", ".gitignore");
+      gateway = startFakeGateway([fakeGatewayFinalText("SHORTCUT_FLOW_OK")]);
+      session = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: current.workspace,
+        env: mockFxEnvironment(current, gateway),
+        isolated: true,
+        width: 112,
+        height: 32,
+        stderrPath: current.stderrPath,
+      });
+      const active = session;
+      await active.waitForComposer(TIMEOUT);
+
+      for (const [shortcut, label] of [
+        ["~", "~/home-target.txt"],
+        [".", "./local-target.txt"],
+        ["..", "../parent-target.txt"],
+      ] as const) {
+        await clearComposer(active);
+        await active.sendLiteral(`@${shortcut}`);
+        await active.waitForText(label, TIMEOUT);
+        expect(await composerPlainText(active)).toBe(`@${shortcut}`);
+        await active.sendLiteral("/");
+        await active.waitForText(label, TIMEOUT);
+        await active.sendKeys("BSpace");
+        await active.waitForPane((pane) =>
+          composerTextFromPane(pane) === `@${shortcut}` && pane.includes(label), TIMEOUT);
+        await active.sendKeys("Escape");
+        await active.waitForPane((pane) => !pane.includes(label), TIMEOUT);
+      }
+
+      await clearComposer(active);
+      await active.sendLiteral("@.gitig");
+      await active.waitForText(".gitignore", TIMEOUT);
+      await active.sendKeys("Tab");
+      expect(await composerPlainText(active)).toBe("@.gitignore");
+      await clearComposer(active);
+      await active.sendLiteral("@lcltrgt");
+      await active.waitForText("local-target.txt", TIMEOUT);
+      await active.sendKeys("Enter");
+      expect(await composerPlainText(active)).toBe("@local-target.txt");
+
+      await clearComposer(active);
+      await active.sendLiteral("@~");
+      await active.waitForText("~/home-target.txt", TIMEOUT);
+      await active.sendKeys("Down Enter");
+      expect(await composerPlainText(active)).toBe("@~/home-target.txt");
+      expect(gateway?.requests).toHaveLength(0);
+      await active.sendLiteral(" Reply with the words SHORTCUT, FLOW, and OK joined by underscores.");
+      await active.sendKeys("Enter");
+      await active.waitForText("SHORTCUT_FLOW_OK", TIMEOUT);
+      await active.waitForStableComposer(TIMEOUT);
+      expect(gateway?.requests).toHaveLength(1);
+      const request = JSON.parse(gateway!.requests[0]!.body);
+      expect(request.prompt.at(-1)).toEqual({
+        role: "user",
+        content: [{ type: "text", text: "@~/home-target.txt Reply with the words SHORTCUT, FLOW, and OK joined by underscores." }],
+      });
+      expect(gateway!.requests[0]!.body).not.toContain("DO_NOT_ATTACH_HOME_CONTENT");
+      const scrollback = await active.captureFullScrollbackEscapes();
+      expect(scrollback).toContain("SHORTCUT_FLOW_OK");
+      expect(scrollback).not.toContain("no matching files");
+      expectCleanRuntime(current, active);
+      await active.sendText("/quit");
+      await active.waitForSessionEnd(TIMEOUT);
+      expect(active.paneStatus()).toEqual({ dead: true, status: 0 });
+      expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+
+      const replay = await runFx(["replay", current.tapePath, "--frames"], {
+        cwd: current.workspace,
+        env: { HOME: current.home },
+        timeoutMs: TIMEOUT,
+      });
+      expect(replay.code).toBe(0);
+      expect(replay.stderr).toBe("");
+      for (const text of ["~/home-target.txt", "./local-target.txt", "../parent-target.txt", "SHORTCUT_FLOW_OK"]) {
+        expect(replay.stdout).toContain(text);
+      }
+    },
+    120_000,
+  );
+
+  tmuxTest(
     "browses current, parent, home, and absolute filesystem paths",
     async () => {
       const current = createFixture("fx-file-picker-filesystem-");
@@ -1879,7 +1971,7 @@ describe("@ file picker", () => {
   );
 
   liveTmuxTest(
-    "browses a home path and submits through the live Gateway",
+    "browses a bare home shortcut through the live Gateway and exits cleanly",
     async () => {
       const current = createFixture("fx-file-picker-live-");
       initGit(current.workspace);
@@ -1900,16 +1992,20 @@ describe("@ file picker", () => {
           FX_MODEL: process.env.FX_FILE_PICKER_LIVE_MODEL ?? "anthropic/claude-sonnet-4.6",
           FX_TRACE_LOG: current.tracePath,
           FX_TRACE_SCOPES: "input,prompt,gateway",
+          FX_RECORD: current.tapePath,
         },
+        isolated: true,
         width: 112,
         height: 32,
         stderrPath: current.stderrPath,
         startupWaitMs: 1000,
       });
       await session.waitForComposer(TIMEOUT);
-      await session.sendLiteral('@"~/live');
-      await session.waitForText("live space/", TIMEOUT);
-      await session.sendKeys("Tab");
+      await session.sendLiteral('@"~');
+      await session.waitForText("~/live space/", TIMEOUT);
+      expect(await composerPlainText(session)).toBe('@"~');
+      await session.sendKeys("Down Tab");
+      expect(await composerPlainText(session)).toBe('@"~/live space/');
       await session.sendLiteral("live-context");
       await session.waitForText("live-context.txt", TIMEOUT);
       await session.sendKeys("Enter");
@@ -1918,7 +2014,22 @@ describe("@ file picker", () => {
       );
       await session.sendKeys("Enter");
       await session.waitForText("LIVE_PICKER_OK", 180_000);
+      await session.waitForStableComposer(TIMEOUT);
+      expect(await session.captureFullScrollback()).toContain("LIVE_PICKER_OK");
       expectCleanRuntime(current, session);
+      await session.sendText("/quit");
+      await session.waitForSessionEnd(TIMEOUT);
+      expect(session.paneStatus()).toEqual({ dead: true, status: 0 });
+      expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+      const replay = await runFx(["replay", current.tapePath, "--frames"], {
+        cwd: current.workspace,
+        env: { HOME: current.home },
+        timeoutMs: TIMEOUT,
+      });
+      expect(replay.code).toBe(0);
+      expect(replay.stderr).toBe("");
+      expect(replay.stdout).toContain("~/live space/");
+      expect(replay.stdout).toContain("LIVE_PICKER_OK");
     },
     180_000,
   );

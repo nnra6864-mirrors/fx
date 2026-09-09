@@ -23,10 +23,7 @@ const ParsedQuery = struct {
 };
 
 pub fn queryMode(query: []const u8) QueryMode {
-    for (query) |byte| {
-        if (std.fs.path.isSep(byte)) return .explicit_path;
-    }
-    return .workspace_index;
+    return if (parseExplicitQuery(query) != null) .explicit_path else .workspace_index;
 }
 
 pub fn complete(
@@ -114,6 +111,13 @@ pub fn isCurrentCandidateKind(
 }
 
 fn parseExplicitQuery(query: []const u8) ?ParsedQuery {
+    inline for (.{ "~", ".", ".." }) |shortcut| {
+        if (std.mem.eql(u8, query, shortcut)) return .{
+            .parent = query,
+            .display_prefix = shortcut ++ "/",
+            .basename_prefix = "",
+        };
+    }
     var separator_index: ?usize = null;
     for (query, 0..) |byte, index| {
         if (std.fs.path.isSep(byte)) separator_index = index;
@@ -206,7 +210,7 @@ fn writeTestFile(dir: std.Io.Dir, path: []const u8) !void {
 
 test "path completion classifies and splits only path-shaped queries" {
     try std.testing.expectEqual(QueryMode.workspace_index, queryMode("main"));
-    try std.testing.expectEqual(QueryMode.workspace_index, queryMode("~"));
+    try std.testing.expectEqual(QueryMode.explicit_path, queryMode("~"));
     try std.testing.expectEqual(QueryMode.explicit_path, queryMode("~/Dow"));
     try std.testing.expectEqual(QueryMode.explicit_path, queryMode("/tmp/fi"));
     try std.testing.expectEqual(QueryMode.explicit_path, queryMode("./src/"));
@@ -217,6 +221,47 @@ test "path completion classifies and splits only path-shaped queries" {
     try std.testing.expectEqualStrings("../shared", parsed.parent);
     try std.testing.expectEqualStrings("../shared/", parsed.display_prefix);
     try std.testing.expectEqualStrings("na", parsed.basename_prefix);
+}
+
+test "path completion treats only exact directory shortcuts as roots" {
+    inline for (.{ "~", ".", ".." }) |shortcut| {
+        try std.testing.expectEqual(QueryMode.explicit_path, queryMode(shortcut));
+        const parsed = parseExplicitQuery(shortcut).?;
+        const with_slash = parseExplicitQuery(shortcut ++ "/").?;
+        try std.testing.expectEqualStrings(shortcut, parsed.parent);
+        try std.testing.expectEqualStrings(shortcut ++ "/", parsed.display_prefix);
+        try std.testing.expectEqualStrings("", parsed.basename_prefix);
+        try std.testing.expectEqualStrings(with_slash.parent, parsed.parent);
+        try std.testing.expectEqualStrings(with_slash.display_prefix, parsed.display_prefix);
+        try std.testing.expectEqualStrings(with_slash.basename_prefix, parsed.basename_prefix);
+    }
+    for ([_][]const u8{ "", ".gitignore", "...", "..notes", "~notes", "main", "readme.md" }) |query| {
+        try std.testing.expectEqual(QueryMode.workspace_index, queryMode(query));
+        try std.testing.expect(parseExplicitQuery(query) == null);
+    }
+}
+
+test "path completion browses bare current and parent directories" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, "workspace/local.txt");
+    try writeTestFile(tmp.dir, "parent.txt");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(root);
+    var results: [4]file_index.SearchResult = undefined;
+    var spans: [4]file_index.MatchSpan = undefined;
+    var paths: [4 * file_index.max_path_len]u8 = undefined;
+
+    try std.testing.expectEqual(@as(usize, 1), try complete(root, ".", &results, &spans, &paths));
+    try std.testing.expectEqualStrings("./local.txt", results[0].path);
+    try std.testing.expectEqual(@as(usize, 0), results[0].matched_spans.len);
+    try std.testing.expect(isCurrentCandidateKind(root, results[0].path, .file));
+
+    try std.testing.expectEqual(@as(usize, 2), try complete(root, "..", &results, &spans, &paths));
+    try std.testing.expectEqualStrings("../parent.txt", results[0].path);
+    try std.testing.expectEqualStrings("../workspace", results[1].path);
+    try std.testing.expect(isCurrentCandidateKind(root, results[1].path, .directory));
 }
 
 test "path completion enumerates immediate entries with deterministic bounded order" {

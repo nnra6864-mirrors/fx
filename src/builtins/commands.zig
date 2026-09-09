@@ -341,7 +341,7 @@ pub const top_level_flags = [_]TopLevelFlag{
     },
     .{
         .usage = "-c, --continue",
-        .description = "Resume the latest workspace session",
+        .description = "Resume the remembered workspace session",
     },
     .{
         .usage = "-r",
