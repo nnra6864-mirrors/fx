@@ -423,35 +423,37 @@ pub fn ApprovalRuntime(comptime App: type) type {
         }
 
         pub fn cancelApprovalOperation(app: *App) !void {
-            if (app_session_runtime.Runtime(App).subagentHost(app)) |host| {
-                if (try host.pendingApprovalRequest(app.alloc)) |loaded| {
-                    var pending = loaded;
-                    defer pending.deinit(app.alloc);
-                    if (app.approval_prompt.request) |request| {
-                        if (matchesChildApproval(request.view(), pending.child_id, pending.request.view().id)) {
-                            if (try app.session_persistence.retained_subagent_hosts.dismissApproval(host, .{
-                                .child_id = pending.child_id,
-                                .request_id = pending.request_id,
-                            })) {
-                                debug_trace.eventf("subagent", "child_approval_display_dismissed", .{}, "root_id={s} child_id={s} request_id={s} child_cancelled=false", .{ host.root_id, pending.child_id, pending.request_id });
-                                app.worker.requestInteractiveCancel();
-                                clearApprovalPrompt(app, "independent_subagent_approval_dismissed");
-                                if (app.stream.active) {
-                                    app.pacer.clear(app.alloc);
-                                    app.stopStream();
+            if (comptime @hasField(App, "session_persistence")) {
+                if (app_session_runtime.Runtime(App).subagentHost(app)) |host| {
+                    if (try host.pendingApprovalRequest(app.alloc)) |loaded| {
+                        var pending = loaded;
+                        defer pending.deinit(app.alloc);
+                        if (app.approval_prompt.request) |request| {
+                            if (matchesChildApproval(request.view(), pending.child_id, pending.request.view().id)) {
+                                if (try app.session_persistence.retained_subagent_hosts.dismissApproval(host, .{
+                                    .child_id = pending.child_id,
+                                    .request_id = pending.request_id,
+                                })) {
+                                    debug_trace.eventf("subagent", "child_approval_display_dismissed", .{}, "root_id={s} child_id={s} request_id={s} child_cancelled=false", .{ host.root_id, pending.child_id, pending.request_id });
+                                    app.worker.requestInteractiveCancel();
+                                    clearApprovalPrompt(app, "independent_subagent_approval_dismissed");
+                                    if (app.stream.active) {
+                                        app.pacer.clear(app.alloc);
+                                        app.stopStream();
+                                    }
+                                    requestActiveSurfaceFrame(app);
+                                    return;
                                 }
+                                _ = host.resolveApproval(.{
+                                    .request_id = pending.request_id,
+                                    .child_id = pending.child_id,
+                                    .decision = .deny,
+                                    .timestamp_ms = io_mod.milliTimestamp(),
+                                }) catch {};
+                                clearApprovalPrompt(app, "subagent_approval_dismissed");
                                 requestActiveSurfaceFrame(app);
                                 return;
                             }
-                            _ = host.resolveApproval(.{
-                                .request_id = pending.request_id,
-                                .child_id = pending.child_id,
-                                .decision = .deny,
-                                .timestamp_ms = io_mod.milliTimestamp(),
-                            }) catch {};
-                            clearApprovalPrompt(app, "subagent_approval_dismissed");
-                            requestActiveSurfaceFrame(app);
-                            return;
                         }
                     }
                 }

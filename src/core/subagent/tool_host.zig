@@ -633,7 +633,7 @@ pub const Runtime = struct {
                 .running, .awaiting_approval => {
                     if (reason == .waiting) continue;
                     const ticket = receipt orelse unreachable;
-                    const text = try std.fmt.allocPrint(alloc, "Delegated work is still running.\nchild_id={s}\nwork_id={s}\nOnly the main agent's wait ended. The child was not cancelled; its completion will be delivered separately.", .{ child_id, work_id });
+                    const text = try std.fmt.allocPrint(alloc, "Delegated work is still running.\nchild_id={s}\nwork_id={s}\nOnly the main agent's wait ended. The child was not cancelled; its completion will be delivered separately. " ++ model_contract.pending_work_guidance, .{ child_id, work_id });
                     defer alloc.free(text);
                     var result = try self.encodeManaged(alloc, .{ .ok = true, .result = text });
                     result.child_delivery = .{ .key = ticket.key(), .state = .running };

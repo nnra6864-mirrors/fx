@@ -2,6 +2,7 @@ const std = @import("std");
 const app_worker = @import("app_worker_runtime.zig");
 const deps = @import("../agent/runtime/deps.zig");
 const delivery = @import("../subagent/delivery.zig");
+const model_contract = @import("../subagent/model_contract.zig");
 const types = @import("../shared/types.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -30,6 +31,9 @@ pub fn Runtime(comptime App: type) type {
             const host = app.session_persistence.retained_subagent_hosts.selectedHost() orelse return;
             var index = try host.deliveryStore().load(arena);
             defer index.deinit();
+            if (index.items().len == 0) return;
+            var registry = try host.managed.state_store.load(arena);
+            defer registry.deinit(arena);
             var out: std.Io.Writer.Allocating = .init(arena);
             defer out.deinit();
             var count: usize = 0;
@@ -38,13 +42,18 @@ pub fn Runtime(comptime App: type) type {
                     types.freeChildObservation(arena, finished);
                     continue;
                 }
+                const child = registry.findById(receipt.child_id) orelse return error.ChildUnavailable;
+                const agent: ?[]const u8 = switch (child.kind) {
+                    .one_off => null,
+                    .persistent => |named| named.agent,
+                };
                 if (count == 0) try out.writer.writeAll("Running delegated work owned by this session (host status, not user input):\n");
-                try std.json.Stringify.value(.{ .child_id = receipt.child_id, .work_id = receipt.work_id }, .{}, &out.writer);
+                try std.json.Stringify.value(.{ .child_id = receipt.child_id, .work_id = receipt.work_id, .kind = @tagName(child.kind), .agent = agent, .phase = child.phase }, .{}, &out.writer);
                 try out.writer.writeByte('\n');
                 count += 1;
             }
             if (count == 0) return;
-            try out.writer.writeAll("Main-agent input, cancellation and session changes do not cancel this work. Use the subagent cancel action with the exact child_id and work_id only when you intend to stop it.");
+            try out.writer.writeAll("Main-agent input, cancellation and session changes do not cancel this work. Use the subagent cancel action with the exact child_id and work_id only when you intend to stop it. " ++ model_contract.pending_work_guidance);
             try messages.append(arena, .{ .role = .system, .content = try arena.dupe(u8, out.written()) });
             debug_trace.eventf("subagent", "child_inventory_projected", .{}, "root_id={s} count={d}", .{ host.root_id, count });
         }

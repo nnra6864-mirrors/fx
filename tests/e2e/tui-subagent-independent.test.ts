@@ -157,6 +157,16 @@ for (const mode of ["run", "message"] as const) test(`independent ${mode} answer
     await assertContinues(f, child.pid);
     assert(f.trace().includes("event=child_parent_wait_released"));
     assert(f.trace().includes("reason=steering child_cancelled=false"));
+    const continued = f.requests.findLast(request => !request.child)!.body;
+    const status = continued.prompt.find((message: any) => message.role === "system" && typeof message.content === "string" && message.content.startsWith("Running delegated work"))?.content;
+    assert(status, "main model receives host-owned child status");
+    const identity = JSON.parse(status.split("\n")[1]);
+    assert.equal(identity.child_id, child.child_id);
+    assert.equal(identity.work_id, child.work_id);
+    assert.equal(identity.kind, mode === "run" ? "one_off" : "persistent");
+    assert.equal(identity.agent, mode === "run" ? null : "worker");
+    assert.equal(identity.phase, "running");
+    assert(status.includes("Do not call run or message just to check progress."));
     await releaseAndAdopt(f, child);
     await quit(f);
     assert(!alive(child.pid));

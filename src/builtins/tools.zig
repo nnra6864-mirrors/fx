@@ -5,6 +5,7 @@ const terminal_contracts = @import("../core/terminal/contracts.zig");
 const managed_execution_contract = @import("../core/execution/managed_execution_contract.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const subagent_domain = @import("../core/subagent/domain.zig");
+const subagent_model_contract = @import("../core/subagent/model_contract.zig");
 const tool_projection = @import("../core/tooling/tool_projection.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const tool_mcp_dispatch = @import("../core/tooling/tool_mcp_dispatch.zig");
@@ -190,7 +191,7 @@ const ask_user_question_question_schema = model_tool_schema.ObjectSchema{
 };
 
 const subagent_description =
-    "Delegate work with run for one temporary task, or message to create or continue a named child in this session. Optional instructions replace only the child's overlay, never its trusted base prompt or authority. In the interactive main agent, steering can release the wait while the child continues; completion is delivered separately. Main-agent input, cancellation and session changes do not stop children. Use cancel with the exact child_id and work_id to intentionally stop your own child work; this action requires the interactive host. fx exits stop owned children. Other hosts keep synchronous run/message behavior. fx owns identities, permissions, persistence and cleanup.";
+    "Delegate work with run for one temporary task, or message to create or continue a named child in this session. Optional instructions replace only the child's overlay, never its trusted base prompt or authority. In the interactive main agent, steering can release the wait while the child continues; completion is delivered separately. Main-agent input, cancellation and session changes do not stop children. Use cancel with the exact child_id and work_id to intentionally stop your own child work; this action requires the interactive host. fx exits stop owned children. Other hosts keep synchronous run/message behavior. fx owns identities, permissions, persistence and cleanup. " ++ subagent_model_contract.pending_work_guidance;
 
 const subagent_model_run_properties = [_]model_tool_schema.Property{
     .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"run"} } },

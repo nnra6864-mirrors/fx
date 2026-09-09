@@ -2891,6 +2891,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(workerBegin).toBeGreaterThan(promptQueued);
       expect(composerContains(cancelledPane, newerDraft)).toBe(false);
 
+      await waitForCondition(() => hold.cancelled, "transport observes the main cancellation");
       expect(hold.cancelled).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(existsSync(tapePath)).toBe(true);
@@ -3239,10 +3240,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         const prompt = contentText(parseGatewayRequest(continued[0]!.body).prompt);
         expect(prompt).toContain(steering);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
-        expect(execFileSync(FX_BIN, ["replay", tapePath, "--frames"], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 })).toContain(finalText);
         expect(session.isPaneAlive()).toBe(true);
         await session.sendText("/quit");
         expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        expect(execFileSync(FX_BIN, ["replay", tapePath, "--frames"], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 })).toContain(finalText);
       } finally {
         writeFileSync(releasePath, "go");
         finalHold.release?.();

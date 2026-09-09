@@ -8,6 +8,8 @@ const max_error_code_bytes: usize = 64;
 
 pub const Action = enum { run, message, cancel };
 
+pub const pending_work_guidance = "Child results arrive automatically; answer progress questions from the pending-work snapshot. Do not call run or message just to check progress. A run child has no agent name and cannot receive messages. A new message name creates a different child; never invent a name to look up existing work.";
+
 pub const RunInput = struct { task: []const u8 };
 pub const MessageInput = struct {
     agent: []const u8,

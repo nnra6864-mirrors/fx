@@ -332,7 +332,7 @@ fn batchSegmentIsInterrupted(events: []const WorkerEvent, cancelled_turn_id: ?u6
 pub fn Runtime(comptime App: type) type {
     return struct {
         fn selectedNativeChildBinding(app: *App) ?*native_subagent_environment.Binding {
-            if (comptime !@hasField(App, "session_persistence")) return null;
+            if (comptime @import("builtin").single_threaded or !@hasField(App, "session_persistence")) return null;
             const services = app.session_persistence.retained_subagent_hosts.selectedServices() orelse return null;
             return native_subagent_environment.Binding.fromServices(services);
         }

@@ -5932,7 +5932,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
   for (const trigger of ["manual", "automatic"] as const) {
     test.skipIf(!tmuxAvailable())(
-      `cancelled tool history survives ${trigger} compaction and restart`,
+      `interrupted parent child-wait history survives ${trigger} compaction and restart`,
       async () => {
         const root = createFixtureRoot(`cancelled-tool-compaction-${trigger}`);
         const tracePath = join(root.root, "trace.log");
@@ -5946,11 +5946,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           const request = JSON.parse(body);
           if (request.tools.length === 0) {
             compactions++;
-            expect(body).toContain("Tool subagent (failure)");
-            expect(body).toContain("aborted by user");
+            expect(body).toContain("Tool subagent (success)");
+            expect(body).toContain("Delegated work is still running.");
             diagnosticHandle = body.match(/result-subagent-[a-f0-9-]+\.txt/)?.[0] ?? "";
             expect(diagnosticHandle).not.toBe("");
-            return fakeGatewayFinalText(`The subagent was cancelled, not completed. Its diagnostic is ${diagnosticHandle}. Continue without repeating it.`);
+            return fakeGatewayFinalText(`The parent was interrupted while its child kept running. Its acknowledgement is ${diagnosticHandle}. Continue without repeating the child.`);
           }
           switch (step++) {
             case 0:
@@ -5960,7 +5960,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             case 1:
               return held.response;
             case 2:
-              expect(toolResultOutput(body, "cancelled-history-child")).toBe("aborted by user");
+              expect(toolResultOutput(body, "cancelled-history-child")).toContain("Delegated work is still running.");
               return fakeGatewaySse([
                 { type: "tool-call", toolCallId: "cancel-follow-up-read", toolName: "read_file", input: { path: "follow-up.txt" } },
                 { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" }, ...(trigger === "automatic" ? { usage: { inputTokens: { total: 120000 }, outputTokens: { total: 10 } } } : {}) },
@@ -5992,7 +5992,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           while (gateway.requests.length < 2 && Date.now() < deadline) await Bun.sleep(10);
           expect(gateway.requests).toHaveLength(2);
           await tui.sendKeys("C-c");
-          await tui.waitForPane((pane) => pane.includes("cancelled") && hasEmptyComposer(pane), 15000);
+          await tui.waitForPane((pane) => pane.includes("What can fx do differently?") && hasEmptyComposer(pane), 15000);
           const sessionsRoot = join(root.home, ".fx", "sessions");
           const sessionId = readdirSync(sessionsRoot).find((id) => {
             const path = join(sessionsRoot, id, "session.json");
@@ -6003,11 +6003,22 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           const eventsPath = join(sessionDir, "events.jsonl");
           const before = readFileSync(eventsPath, "utf8");
           expect(before).toContain('"reason":"cancelled"');
+          const original = before.trim().split("\n").map(line => JSON.parse(line).event).find(event => event.tool_result?.call_id === "cancelled-history-child").tool_result;
+          expect(original.status).toBe("success");
+          expect(original.child_delivery.state).toBe("running");
+          const childState = JSON.parse(readFileSync(join(sessionDir, "subagent", "children.json"), "utf8")).children;
+          expect(childState).toHaveLength(1);
+          expect(childState[0].phase).toBe("running");
+          expect(childState[0].last_outcome).toBeNull();
           await tui.sendText("Read the follow-up file and briefly acknowledge it. Do not rerun the child.");
           const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("CANCEL_FOLLOWUP_COMPLETE") || text.includes("request failed:")), 20000);
           expect(pane).not.toContain("request failed:");
           expect(pane).toContain("CANCEL_FOLLOWUP_COMPLETE");
           if (trigger === "manual") {
+            const beforeStop = readFileSync(tracePath, "utf8").length;
+            await tui.sendKeys("C-c");
+            await tui.waitForPane(() => readFileSync(tracePath, "utf8").slice(beforeStop).includes("event=prompt_finish"), 15000);
+            expect(JSON.parse(readFileSync(join(sessionDir, "subagent", "children.json"), "utf8")).children[0].phase).toBe("running");
             await tui.sendText("/compact");
             const compacted = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("Context compacted.") || text.includes("request failed:")), 20000);
             expect(compacted).not.toContain("request failed:");
@@ -6018,7 +6029,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           const saved = readFileSync(eventsPath, "utf8");
           expect(saved.startsWith(before)).toBe(true);
           expect(saved.match(/"context_checkpoint":/g)).toHaveLength(1);
-          expect(readFileSync(join(sessionDir, "tool-results", diagnosticHandle), "utf8")).toBe("aborted by user");
+          expect(readFileSync(join(sessionDir, "tool-results", diagnosticHandle), "utf8")).toContain("Delegated work is still running.");
           expect(await tui.captureFullScrollback()).not.toContain("IncompleteCompactionResult");
           await tui.sendText("/quit");
           await tui.waitForPane(() => paneExitMatches(tui!.paneStatus(), 0), 15000);
