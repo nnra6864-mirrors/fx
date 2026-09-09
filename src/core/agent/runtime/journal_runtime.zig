@@ -2043,7 +2043,7 @@ test "journal runtime restores original result before final decision and pure hi
     var final_key = try runtime.generation();
     defer final_key.deinit(alloc);
     _ = try runtime.recordDecision(.{ .content = "Could not write the file" }, &.{}, &.{}, final_key, true, null, null);
-    const outcome = try std.json.parseFromSlice(Value, alloc, "{\"ok\":true,\"stopReason\":\"end_turn\"}", .{});
+    const outcome = try std.json.parseFromSlice(Value, alloc, "{\"ok\":true,\"stopReason\":\"stop\"}", .{});
     defer outcome.deinit();
     try runtime.finish(outcome.value, .{ .assistant = .{ .user = test_input, .assistant = @constCast("Could not write the file") } });
     try std.testing.expectEqual(@as(usize, 5), sink.count);

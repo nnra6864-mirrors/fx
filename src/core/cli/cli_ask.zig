@@ -3947,7 +3947,7 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
         var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
         try out.writer.writeAll(",\"recovery\":{\"state\":");
         try std.json.Stringify.value(
-            if (recovery.kind == .terminal_provider_error) "paused" else if (recovery.isRecovered()) "recovered" else "active",
+            if (recovery.is_paused()) "paused" else if (recovery.isRecovered()) "recovered" else "active",
             .{},
             &out.writer,
         );
@@ -7905,6 +7905,25 @@ test "render final JSON includes the latest terminal recovery diagnostic" {
         "⚠ Provider unavailable · HTTP 503 · no_available_providers: No providers are currently available · recovery paused after 2/2 attempts",
         recovery.get("message").?.string,
     );
+}
+
+test "render final JSON keeps suspension status paused" {
+    const alloc = std.testing.allocator;
+    for ([_]types.RouteRecoveryStatus.Kind{ .suspended, .tool_state_uncertain }) |kind| {
+        const result = PromptRunResult{
+            .exit_code = 1,
+            .assistant_output = try alloc.dupe(u8, ""),
+            .recovery = .{ .kind = kind },
+        };
+        defer result.deinit(alloc);
+        const json = try renderFinalJsonResult(alloc, result);
+        defer alloc.free(json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        defer parsed.deinit();
+        const recovery = parsed.value.object.get("recovery").?.object;
+        try std.testing.expectEqualStrings("paused", recovery.get("state").?.string);
+        try std.testing.expectEqualStrings(@tagName(kind), recovery.get("kind").?.string);
+    }
 }
 
 test "cli json records built in web_search completion" {

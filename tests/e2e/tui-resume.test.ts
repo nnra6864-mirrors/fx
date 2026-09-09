@@ -376,6 +376,17 @@ async function waitForSessionPickerClosed(session: TmuxSession): Promise<string>
   );
 }
 
+async function waitForSessionPickerEntries(session: TmuxSession): Promise<string> {
+  await waitForSessionPicker(session);
+  return session.waitForPane(
+    (pane) => {
+      const plain = stripAnsi(pane);
+      return /\bSessions [1-9]\d*\b/.test(plain) && !plain.includes("Loading sessions");
+    },
+    TIMEOUT,
+  );
+}
+
 function stripAnsi(text: string): string {
   return text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
 }
@@ -844,7 +855,7 @@ test.skipIf(!tmuxAvailable())(
         await active.waitForComposer(TIMEOUT);
         if (mode === "picker") {
           await active.sendText("/resume");
-          await waitForSessionPicker(active);
+          await waitForSessionPickerEntries(active);
           await active.sendKeys("Enter");
         }
         const resumed = await waitForScrollback(active, "RECENT_VISIBLE_REPLY");
@@ -4666,7 +4677,7 @@ test.skipIf(!tmuxAvailable())(
 
       await seedTransientDraft("STALE_SESSION_DRAFT_RESUME");
       await active.sendText("/resume");
-      await waitForSessionPicker(active);
+      await waitForSessionPickerEntries(active);
       await active.sendKeys("Enter");
       await waitForSessionPickerClosed(active);
       await proveReset("SESSION_INPUT_RESET_RESUME_OK", 2);
@@ -5554,7 +5565,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendHexBytes(["1b", "5b", "31", "31", "34", "3b", "39", "75"]);
-      await waitForSessionPicker(active);
+      await waitForSessionPickerEntries(active);
       await active.sendKeys("Enter");
       const pickerResumed = await waitForScrollback(active, flagFollowUp);
       expectCompactQuestion(pickerResumed);
@@ -5894,7 +5905,7 @@ printf '${stdoutTail2}\\n'
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("/resume");
-      await waitForSessionPicker(active);
+      await waitForSessionPickerEntries(active);
       await active.sendKeys("Enter");
       await active.waitForPane((pane) => pane.includes("Ran ./resume-command-output.sh"), TIMEOUT);
       const pickerResumed = await active.capturePane();
@@ -5986,7 +5997,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("/resume");
-      await waitForSessionPicker(active);
+      await waitForSessionPickerEntries(active);
       const currentPicker = stripAnsi(await active.capturePane());
       expect(currentPicker).toContain("Sessions 1");
       expect(currentPicker).toContain("[Current workspace]");
@@ -6101,7 +6112,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("/resume");
-      const pane = stripAnsi(await waitForSessionPicker(active));
+      const pane = stripAnsi(await waitForSessionPickerEntries(active));
       expect(pane).toContain("Sessions 3");
       for (const suffix of ["alpha", "beta", "gamma"]) {
         expect(pane).toContain(suffix);
@@ -6185,7 +6196,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendHexBytes(["1b", "5b", "31", "31", "34", "3b", "39", "75"]);
-      await waitForSessionPicker(active);
+      await waitForSessionPickerEntries(active);
 
       let sessionEntries = visibleSessionPickerEntries(await active.capturePaneEscapes());
       expect(sessionEntries).toHaveLength(2);

@@ -406,6 +406,7 @@ pub const State = struct {
                 const ok = try boolean(result, "ok");
                 if (ok) {
                     const stop_reason = try string(result, "stopReason");
+                    _ = std.meta.stringToEnum(enum { stop, length, tool_limit }, stop_reason) orelse return error.InvalidJournalRecord;
                     const tool_limit = std.mem.eql(u8, stop_reason, "tool_limit") and self.canFinishToolLoop(turn_index);
                     if (position != .ending and !tool_limit and
                         (position != .model or !self.canFinishProviderResponse(turn_index))) return error.InvalidJournalTransition;
@@ -688,6 +689,35 @@ const test_decision = "{\"v\":1,\"kind\":\"model_step\",\"turnId\":\"turn\",\"me
 const test_result_a = "{\"v\":1,\"kind\":\"tool_result\",\"turnId\":\"turn\",\"callId\":\"a\",\"content\":\"original receipt\",\"isError\":false}";
 const test_final = "{\"v\":1,\"kind\":\"model_step\",\"turnId\":\"turn\",\"messageId\":\"final-message\",\"generationId\":\"final-generation\",\"final\":true,\"completion\":{\"content\":\"saved answer\"},\"calls\":[]}";
 const test_end = "{\"v\":1,\"kind\":\"turn_end\",\"turnId\":\"turn\",\"result\":{\"ok\":true,\"stopReason\":\"stop\"}}";
+
+test "journal witness invalid stop reasons fail before append and during replay" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "end_turn", "unknown" }) |reason| {
+        var state: State = .{};
+        defer state.deinit(alloc);
+        var store: TestStore = .{};
+        defer store.deinit();
+        try testStart(&state, &store);
+        try state.append(alloc, store.sink(), .model_step, test_final);
+        const invalid = try std.json.Stringify.valueAlloc(alloc, .{
+            .v = 1,
+            .kind = "turn_end",
+            .turnId = "turn",
+            .result = .{ .ok = true, .stopReason = reason },
+        }, .{});
+        defer alloc.free(invalid);
+        try std.testing.expectError(error.InvalidJournalRecord, state.append(alloc, store.sink(), .turn_end, invalid));
+        try std.testing.expectEqual(@as(usize, 2), store.calls);
+        var restored: State = .{};
+        defer restored.deinit(alloc);
+        try store.restore(&restored);
+        var entry = try codec.create(alloc, 3, .turn_end, invalid);
+        defer entry.deinit(alloc);
+        try std.testing.expectError(error.InvalidJournalRecord, restored.restore(alloc, 3, "turn_end", entry.entry.bytes, &entry.entry.hash));
+        try state.append(alloc, store.sink(), .turn_end, test_end);
+        try std.testing.expectEqual(Pending.idle, state.pending());
+    }
+}
 
 test "journal witness tool loop termination requires every result and no later request" {
     const alloc = std.testing.allocator;
