@@ -68,6 +68,9 @@ pub fn writeInline(
     var in_strike: bool = false;
     var link_admission_suppressed_until: usize = 0;
     var closers = CloserLookahead.init(text);
+    // End of the star or tilde run containing `i`, measured once per run so
+    // stepping through a long run byte by byte stays linear.
+    var run_end: usize = 0;
 
     while (i < text.len) {
         const c = text[i];
@@ -190,14 +193,12 @@ pub fn writeInline(
                 try out.appendSlice(alloc, ansi.strike_close);
                 in_strike = false;
             } else {
-                if (unopenableRunEnd(text, i, '~')) |end| {
-                    try out.appendSlice(alloc, text[i..end]);
-                    i = end;
-                    continue;
-                }
-                if (!closers.hasCloser(text, .tilde2, i + 2, styles, link_admission_suppressed_until)) {
-                    try out.append(alloc, c);
-                    i += 1;
+                if (i >= run_end) run_end = markerRunEnd(text, i);
+                // Nothing else is closed by a tilde, so a run that cannot open
+                // strikethrough is literal as a whole.
+                if (runIsUnopenable(text, run_end) or !closers.hasCloser(text, .tilde2, i + 2, styles, link_admission_suppressed_until)) {
+                    try out.appendSlice(alloc, text[i..run_end]);
+                    i = run_end;
                     continue;
                 }
                 try out.appendSlice(alloc, ansi.strike_open);
@@ -218,12 +219,16 @@ pub fn writeInline(
                 in_bold = false;
                 if (in_underscore_bold) try out.appendSlice(alloc, ansi.bold_open);
             } else {
-                if (unopenableRunEnd(text, i, '*')) |end| {
-                    try out.appendSlice(alloc, text[i..end]);
-                    i = end;
-                    continue;
-                }
-                if (!closers.hasCloser(text, .star2, i + 2, styles, link_admission_suppressed_until)) {
+                if (i >= run_end) run_end = markerRunEnd(text, i);
+                const unopenable = runIsUnopenable(text, run_end);
+                if (unopenable or !closers.hasCloser(text, .star2, i + 2, styles, link_admission_suppressed_until)) {
+                    // A later star in this run may still close italic or open
+                    // it, so only a run that can do neither is literal whole.
+                    if (!in_italic and (unopenable or !closers.hasCloser(text, .star1, i + 1, styles, link_admission_suppressed_until))) {
+                        try out.appendSlice(alloc, text[i..run_end]);
+                        i = run_end;
+                        continue;
+                    }
                     try out.append(alloc, c);
                     i += 1;
                     continue;
@@ -292,12 +297,7 @@ pub fn writeInline(
                 in_italic = false;
                 if (in_underscore_italic) try out.appendSlice(alloc, ansi.italic_open);
             } else {
-                if (unopenableRunEnd(text, i, '*')) |end| {
-                    try out.appendSlice(alloc, text[i..end]);
-                    i = end;
-                    continue;
-                }
-                if (!closers.hasCloser(text, .star1, i + 1, styles, link_admission_suppressed_until)) {
+                if (i + 1 >= text.len or tu.isSpace(text[i + 1]) or !closers.hasCloser(text, .star1, i + 1, styles, link_admission_suppressed_until)) {
                     try out.append(alloc, c);
                     i += 1;
                     continue;
@@ -320,14 +320,17 @@ pub fn writeInline(
     if (in_strike) try out.appendSlice(alloc, ansi.strike_close);
 }
 
-/// End of the marker run at `i` when that run cannot open a span because it
-/// is followed by whitespace or the end of the line, so the whole run is
-/// literal; null when the run is followed by content.
-fn unopenableRunEnd(text: []const u8, i: usize, marker: u8) ?usize {
+/// End of the run of `text[i]` bytes starting at `i`.
+fn markerRunEnd(text: []const u8, i: usize) usize {
+    const marker = text[i];
     var end = i;
     while (end < text.len and text[end] == marker) : (end += 1) {}
-    if (end >= text.len or tu.isSpace(text[end])) return end;
-    return null;
+    return end;
+}
+
+/// A run followed by whitespace or the end of the line cannot open a span.
+fn runIsUnopenable(text: []const u8, run_end: usize) bool {
+    return run_end >= text.len or tu.isSpace(text[run_end]);
 }
 
 /// Emphasis styles active in the inline renderer at one position. Bare URL
