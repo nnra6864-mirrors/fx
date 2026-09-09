@@ -145,7 +145,7 @@ pub fn run(
     routed_config.tool_context.agent_stream_provider = provider.agent_stream_or_unavailable();
     routed_config.tool_context.permission_reviewer_provider = provider.permission_reviewer;
     routed_config.tool_context.auto_classifier = auto_classifier.Classifier.disabled();
-    if (!model_provider.authorizesCredential(
+    if (admission.provider == .configured or !model_provider.authorizesCredential(
         admission.provider,
         config.tool_context.credential_source,
     )) {

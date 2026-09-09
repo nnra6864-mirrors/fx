@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createConfiguredProviderFixture } from "./fixtures/chat-completions";
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import {
   chmodSync,
@@ -806,6 +807,33 @@ class AcpClient {
     });
   }
 }
+
+test("configured provider ACP prompts and switching preserve connection credentials", async () => {
+  const fixture = createConfiguredProviderFixture();
+  const client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+  try {
+    const initialized = await client.request("initialize", { protocolVersion: 1, clientCapabilities: {}, clientInfo: { name: "provider-test", version: "1" } }) as any;
+    expect(initialized.error).toBeUndefined();
+    const created = await client.request("session/new", { cwd: fixture.workspace, mcpServers: [] }) as any;
+    if (created.error) throw new Error(JSON.stringify(created));
+    const first = await client.request("session/prompt", { prompt: [{ type: "text", text: "hello local" }] }) as any;
+    if (first.error) throw new Error(JSON.stringify(first));
+    expect(fixture.requests).toHaveLength(1);
+    expect(fixture.requests[0].authorization).toBeNull();
+    const switched = await client.request("session/set_config_option", { configId: "provider", value: "remote" }) as any;
+    if (switched.error) throw new Error(JSON.stringify(switched));
+    const second = await client.request("session/prompt", { prompt: [{ type: "text", text: "hello remote" }] }) as any;
+    if (second.error) throw new Error(JSON.stringify(second));
+    expect(fixture.requests).toHaveLength(2);
+    expect(fixture.requests[1].authorization).toBe("Bearer own-provider-token");
+    expect(fixture.requests[1].body.model).toBe("remote-model");
+    client.endStdin();
+    await client.waitForExit();
+  } finally {
+    await client.close();
+    fixture.close();
+  }
+}, 45000);
 
 function createIsolatedRoot(prefix: string) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), prefix)));

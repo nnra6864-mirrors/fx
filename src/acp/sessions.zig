@@ -625,11 +625,11 @@ fn handleRestoreSession(
     const sid_copy = try alloc.dupe(u8, writable.state.id);
     var sid_owned = true;
     defer if (sid_owned) alloc.free(sid_copy);
-    const effective_provider = if (state.process_model_override)
+    const effective_provider = if (state.process_provider_override)
         state.provider
     else
         writable.state.preferences.provider;
-    const effective_model = if (state.process_model_override)
+    const effective_model = if (state.process_model_override or state.process_provider_override)
         state.selected_model
     else
         writable.state.preferences.model;

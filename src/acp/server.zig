@@ -241,6 +241,7 @@ const ActivePrompt = struct {
 };
 
 pub const ServerState = struct {
+    configured_providers: @import("../core/config/configured_provider.zig").Registry = .{},
     alloc: Allocator,
     cfg: Config,
     writer: jsonrpc.Writer,
@@ -261,6 +262,7 @@ pub const ServerState = struct {
     provider: model_provider.ProviderId = .gateway,
     configured_model: []u8 = &.{},
     process_model_override: bool = false,
+    process_provider_override: bool = false,
     permission_mode: types.PermissionMode = .ask,
     permission_rules: types.PermissionRuleSet = .{},
     agent_step_limit: usize = 0,
@@ -330,6 +332,7 @@ pub const ServerState = struct {
         self.pending_outbound.deinit(self.alloc);
         clearPendingLegacyUrls(self);
         self.pending_legacy_urls.deinit(self.alloc);
+        self.configured_providers.deinit(self.alloc);
     }
 };
 
@@ -346,7 +349,7 @@ fn credentialReadyAt(
     refresh_after_ms: ?i64,
     now_ms: i64,
 ) bool {
-    if (source == null or token.len == 0) return false;
+    if (source == null or (token.len == 0 and source != .configured)) return false;
     if (credentials.sourceRefreshable(source.?) and
         refresh_after_ms != null and refresh_after_ms.? <= now_ms)
     {
@@ -409,7 +412,7 @@ pub fn selectCredentialForProvider(
     }
     const now_ms = io_mod.milliTimestamp();
     if (state.active_session) |active| {
-        if (credentialMatchesProvider(active.credential_source, provider) and
+        if (provider != .configured and credentialMatchesProvider(active.credential_source, provider) and
             credentialReadyAt(
                 active.credential_source,
                 active.api_key,
@@ -417,7 +420,7 @@ pub fn selectCredentialForProvider(
                 now_ms,
             )) return true;
     }
-    if (credentialMatchesProvider(state.credential_source, provider) and
+    if (provider != .configured and credentialMatchesProvider(state.credential_source, provider) and
         credentialReadyAt(
             state.credential_source,
             state.api_key,
@@ -1782,6 +1785,11 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         state.process_model_override = startup.model_source == .process_override;
     }
     state.provider = startup.provider;
+    state.process_provider_override = io_mod.getenv("FX_PROVIDER") != null;
+    state.configured_providers.deinit(alloc);
+    state.configured_providers = startup.configured_providers;
+    startup.configured_providers = .{};
+    state.cfg.provider_set.definitions = state.configured_providers.definitions;
     state.gateway_source_preference = startup.credential_source_preference;
     state.configured_model = try alloc.dupe(u8, startup.configured_model);
 
@@ -1831,7 +1839,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
             }
             break :routed &routed_credential.?;
         };
-        if (credential.token.len == 0) {
+        if (credential.token.len == 0 and credential.source != .configured) {
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_request,
                 .message = if (state.provider == .codex)
@@ -2081,16 +2089,18 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             });
         };
     } else if (std.mem.eql(u8, config_id, "provider")) {
-        const target = model_provider.parse(value) orelse
+        const parsed_provider = model_provider.parse(value) orelse
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_params,
                 .message = "Invalid provider",
             });
+        const target = parsed_provider.bind(state.configured_providers) catch
+            return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Unknown or changed configured provider" });
         const session = if (state.active_session) |*active| active else return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
             .message = "No active session",
         });
-        if (target != session.provider) {
+        if (!target.eql(session.provider)) {
             if (host_target.is_wasm) {
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.invalid_request,

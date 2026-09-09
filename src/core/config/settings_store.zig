@@ -1010,7 +1010,7 @@ fn applyUserPatchToRoot(
     if (patch.model_preference) |preference| {
         application.changed = try putModelPreference(arena, &root.object, preference) or application.changed;
     }
-    if (patch.provider) |value| application.changed = try putString(arena, &root.object, "provider", @tagName(value)) or application.changed;
+    if (patch.provider) |value| application.changed = try putString(arena, &root.object, "provider", value.label()) or application.changed;
     if (patch.permission_mode) |value| application.changed = try putString(arena, &root.object, "permission_mode", @tagName(value)) or application.changed;
     if (patch.credential_source) |value| application.changed = try putString(arena, &root.object, "credential_source", @tagName(value)) or application.changed;
     if (patch.clear_credential_source and root.object.contains("credential_source")) {
@@ -1584,11 +1584,12 @@ fn putModelPreference(
         changed = true;
         break :blk &root.getPtr("models").?.object;
     };
-    changed = try putString(arena, models, @tagName(preference.provider), preference.model) or changed;
+    changed = try putString(arena, models, preference.provider.label(), preference.model) or changed;
     const legacy_key = switch (preference.provider) {
         .gateway => "model",
         .codex => "codex_model",
         .grok => "grok_model",
+        .configured => return changed,
     };
     if (root.contains(legacy_key)) {
         _ = root.orderedRemove(legacy_key);
@@ -1843,7 +1844,7 @@ fn validateKnownSettingsObject(
         while (iterator.next()) |entry| {
             const provider = model_provider.parse(entry.key_ptr.*) orelse
                 return error.InvalidSettingsFormat;
-            if (!std.mem.eql(u8, entry.key_ptr.*, @tagName(provider)) or
+            if (!std.mem.eql(u8, entry.key_ptr.*, provider.label()) or
                 entry.value_ptr.* != .string)
             {
                 return error.InvalidSettingsFormat;
