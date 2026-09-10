@@ -195,6 +195,79 @@ fn check_json_depth(text: []const u8) Error!void {
     }
 }
 
+/// Caller owns the bounded diagnostic. Normalize JSON before masking so later
+/// diagnostic decoding cannot restore an escaped credential.
+pub fn redact_error_detail(alloc: Allocator, raw: []const u8, credential: []const u8) Allocator.Error![]u8 {
+    if (raw.len > 64 * 1024 or credential.len > 16 * 1024) return alloc.dupe(u8, "Provider error details exceeded the local limit");
+    check_json_depth(raw) catch return alloc.dupe(u8, "Provider error details exceeded the nesting limit");
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    const json_shaped = trimmed.len != 0 and (trimmed[0] == '{' or trimmed[0] == '[' or trimmed[0] == '"');
+    var parsed: ?std.json.Parsed(std.json.Value) = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => if (json_shaped) return alloc.dupe(u8, "Provider error details could not be decoded") else null,
+    };
+    defer if (parsed) |*value| value.deinit();
+    const detail = if (parsed) |value| try std.json.Stringify.valueAlloc(alloc, value.value, .{}) else try alloc.dupe(u8, raw);
+    if (detail.len > 64 * 1024) {
+        defer alloc.free(detail);
+        return alloc.dupe(u8, "Provider error details exceeded the local limit");
+    }
+    errdefer alloc.free(detail);
+    const encoded = try std.json.Stringify.valueAlloc(alloc, credential, .{});
+    defer alloc.free(encoded);
+    mask_error_bytes(detail, encoded[1 .. encoded.len - 1]);
+    mask_error_bytes(detail, credential);
+    return detail;
+}
+
+fn mask_error_bytes(detail: []u8, value: []const u8) void {
+    if (value.len == 0) return;
+    var remaining = detail;
+    while (std.mem.find(u8, remaining, value)) |index| {
+        @memset(remaining[index..][0..value.len], '*');
+        remaining = remaining[index + value.len ..];
+    }
+}
+
+test "chat completions error masking survives JSON and recovery decoding" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { raw: []const u8, key: []const u8 }{
+        .{ .raw = "{\"error\":{\"message\":\"rejected alpha\\/beta\",\"code\":\"alpha\\/beta\"}}", .key = "alpha/beta" },
+        .{ .raw = "{\"error\":{\"message\":\"rejected \\u0061lpha\"}}", .key = "alpha" },
+        .{ .raw = "{\"error\":{\"message\":\"rejected alpha\\\"beta\"}}", .key = "alpha\"beta" },
+        .{ .raw = "rejected alpha/beta", .key = "alpha/beta" },
+    };
+    for (cases) |case| {
+        const detail = try redact_error_detail(alloc, case.raw, case.key);
+        defer alloc.free(detail);
+        const message = try @import("../core/shared/gateway_error_format.zig").formatHttpRecoveryDiagnostic(alloc, .bad_request, detail);
+        defer alloc.free(message);
+        try std.testing.expect(std.mem.find(u8, message, case.key) == null);
+        try std.testing.expect(std.mem.find(u8, message, "rejected") != null);
+    }
+    const duplicate = try redact_error_detail(alloc, "{\"error\":{\"message\":\"alpha\\/beta\"},\"alpha/beta\":0,\"alpha\\/beta\":1}", "alpha/beta");
+    defer alloc.free(duplicate);
+    try std.testing.expectEqualStrings("Provider error details could not be decoded", duplicate);
+    const nested = "[" ** 65 ++ "0" ++ "]" ** 65;
+    const bounded = try redact_error_detail(alloc, nested, "alpha");
+    defer alloc.free(bounded);
+    try std.testing.expectEqualStrings("Provider error details exceeded the nesting limit", bounded);
+}
+
+test "chat completions error masking releases partial allocations" {
+    const Probe = struct {
+        fn run(alloc: Allocator) !void {
+            const detail = try redact_error_detail(alloc, "{\"error\":{\"message\":\"alpha\\/beta\"}}", "alpha/beta");
+            defer alloc.free(detail);
+            const invalid = try redact_error_detail(alloc, "{\"x\":0,\"x\":1}", "alpha/beta");
+            defer alloc.free(invalid);
+            const plain = try redact_error_detail(alloc, "rejected alpha/beta", "alpha/beta");
+            defer alloc.free(plain);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
 fn validate_arguments(alloc: Allocator, text: []const u8) Error!void {
     try check_json_depth(text);
     if (try types.ToolArgumentIntegrity.classifyFunctionInput(alloc, text) != .valid) return error.InvalidToolArguments;

@@ -154,16 +154,15 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
     var transfer: [64 * 1024]u8 = undefined;
     const reader = response.reader(&transfer);
     if (response.head.status != .ok) {
-        const detail = reader.allocRemaining(alloc, .limited(64 * 1024)) catch |err| switch (err) {
+        var detail = reader.allocRemaining(alloc, .limited(64 * 1024)) catch |err| switch (err) {
             error.StreamTooLong => try alloc.dupe(u8, "Provider error response exceeded the local limit"),
             else => return err,
         };
+        errdefer alloc.free(detail);
         if (token) |value| {
-            var remaining = detail;
-            while (std.mem.find(u8, remaining, value)) |index| {
-                @memset(remaining[index..][0..value.len], '*');
-                remaining = remaining[index + value.len ..];
-            }
+            const redacted = try codec.redact_error_detail(alloc, detail, value);
+            alloc.free(detail);
+            detail = redacted;
         }
 
         return .{ .failed = .{ .kind = switch (response.head.status) {

@@ -285,6 +285,20 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 15000);
 
+  test.each(["slashes", "unicode", "plain", "duplicate"])("provider errors redact opaque credentials encoded as %s", async encoding => {
+    const token = "alpha/beta/gamma";
+    const encoded = encoding === "slashes" ? token.replaceAll("/", "\\/") : [...token].map(char => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`).join("");
+    const body = encoding === "plain" ? `rejected ${token}` : encoding === "duplicate" ? `{"error":{"message":"rejected ${encoded}"},"${token}":0,"${encoded}":1}` : `{"error":{"message":"rejected ${encoded}","code":"${encoded}"}}`;
+    const f = fixture(() => new Response(body, { status: 400 }));
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "hello"], { cwd: f.workspace, env: { ...f.env, FX_PROVIDER: "remote", FX_TEST_PROVIDER_TOKEN: token } });
+      expect(result.code).toBe(1);
+      expect(() => JSON.parse(result.stdout)).not.toThrow();
+      expect(result.stdout + result.stderr).not.toContain(token);
+      expect(result.stdout + result.stderr).toContain(encoding === "duplicate" ? "could not be decoded" : "rejected");
+    } finally { f.close(); }
+  });
+
   test("corrupt profile JSON cannot silently choose Gateway", async () => {
     const f = fixture();
     try {
