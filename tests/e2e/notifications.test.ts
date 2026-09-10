@@ -16,6 +16,7 @@ import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeGatewayToolCall,
   fakeShellRun,
   startFakeGateway,
   TmuxSession,
@@ -267,6 +268,94 @@ test.skipIf(!tmuxAvailable())(
       }
       expect(await session.captureFullScrollback()).toContain(success);
       expect(gateway.requests).toHaveLength(0);
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd()).toBe(true);
+      expect(session.paneStatus()).toEqual({ dead: true, status: 0 });
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      if (session) await session.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "copy undo and feedback play their assigned cues only in max mode on success",
+  async () => {
+    const fixture = createNotificationRoot({ turn_end: false, attention_required: false });
+    const modes = ["off", "on", "max"] as const;
+    const gateway = startFakeGateway(modes.flatMap((mode) => [
+      fakeGatewayToolCall(`write_${mode}`, "write_file", { path: "tracked.txt", content: mode }),
+      fakeGatewayFinalText(`COMMAND_SOUND_${mode}`),
+    ]));
+    const tracePath = join(fixture.root, "trace.log");
+    const stderrPath = join(fixture.root, "stderr.log");
+    const clipboardPath = join(fixture.root, "clipboard.txt");
+    const openedUrlPath = join(fixture.root, "opened-url.txt");
+    const failurePath = join(fixture.root, "host-failure");
+    const trackedPath = join(fixture.workspace, "tracked.txt");
+    const bin = join(fixture.root, "bin");
+    mkdirSync(bin);
+    const failIfRequested = 'if [ -e "$FX_SOUND_HOST_FAILURE" ]; then exit 1; fi\n';
+    for (const command of ["pbcopy", "xclip"]) {
+      writeFileSync(join(bin, command), '#!/bin/sh\n' + failIfRequested + 'cat > "$FX_SOUND_CLIPBOARD"\n', { mode: 0o755 });
+    }
+    for (const command of ["open", "xdg-open"]) {
+      writeFileSync(join(bin, command), '#!/bin/sh\n' + failIfRequested + 'printf "%s" "$1" > "$FX_SOUND_OPENED_URL"\n', { mode: 0o755 });
+    }
+    writeFileSync(trackedPath, "original");
+    writeFileSync(stderrPath, "");
+    let session: TmuxSession | null = null;
+    try {
+      session = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: fixture.workspace,
+        env: {
+          ...notificationEnv(fixture.home, gateway, tracePath),
+          FX_PERMISSION_MODE: "full-access",
+          PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          FX_SOUND_CLIPBOARD: clipboardPath,
+          FX_SOUND_OPENED_URL: openedUrlPath,
+          FX_SOUND_HOST_FAILURE: failurePath,
+        },
+        stderrPath,
+      });
+      await session.waitForComposer(TIMEOUT);
+      const expectedCues: string[] = [];
+      async function runCommand(command: string, notice: string, cue?: "click" | "release") {
+        const before = (await session!.captureFullScrollback()).split(notice).length;
+        await session!.sendText(command);
+        await session!.waitForStableScrollback((text) => text.split(notice).length > before, TIMEOUT);
+        await session!.waitForStableComposer(TIMEOUT);
+        if (cue) expectedCues.push(cue);
+        const cues = readFileSync(tracePath, "utf8").split("\n").flatMap((line) => {
+          const match = line.match(/sound play cue=(click|release) trigger=max/);
+          return match ? [match[1]!] : [];
+        });
+        expect(cues).toEqual(expectedCues);
+      }
+      await runCommand("/sound max", "● Sound: max");
+      await runCommand("/copy", "No assistant reply to copy.");
+      await runCommand("/undo", "Nothing to undo.");
+      for (const mode of modes) {
+        await runCommand(`/sound ${mode}`, `● Sound: ${mode}`);
+        await session.sendText(`Write the ${mode} fixture.`);
+        await session.waitForText(`COMMAND_SOUND_${mode}`, TIMEOUT);
+        await session.waitForStableComposer(TIMEOUT);
+        expect(readFileSync(trackedPath, "utf8")).toBe(mode);
+        await runCommand("/copy", "Copied to clipboard.", mode === "max" ? "release" : undefined);
+        expect(readFileSync(clipboardPath, "utf8")).toContain(`COMMAND_SOUND_${mode}`);
+        await runCommand("/undo", "Restored ", mode === "max" ? "release" : undefined);
+        expect(readFileSync(trackedPath, "utf8")).toBe("original");
+        await runCommand("/feedback", "Opened https://fx.sh/feedback.", mode === "max" ? "click" : undefined);
+        expect(readFileSync(openedUrlPath, "utf8")).toBe("https://fx.sh/feedback");
+      }
+      writeFileSync(failurePath, "fail");
+      await runCommand("/copy", "Failed to copy to clipboard.");
+      await runCommand("/feedback", "Could not open https://fx.sh/feedback.");
+      await runCommand("/undo", "Nothing to undo.");
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd()).toBe(true);
       expect(session.paneStatus()).toEqual({ dead: true, status: 0 });
