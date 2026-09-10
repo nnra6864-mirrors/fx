@@ -358,7 +358,8 @@ fn credentialReadyAt(
     return true;
 }
 
-fn adoptServerCredential(state: *ServerState, credential: *credentials.Credential) void {
+/// Transfers credential storage after the caller has stopped its prior borrowers.
+pub fn adoptServerCredential(state: *ServerState, credential: *credentials.Credential) void {
     if (state.active_session) |*active| active.api_key = &.{};
     if (state.api_key.len > 0) secret.zeroAndFree(state.alloc, state.api_key);
     if (state.gateway_team) |team| state.alloc.free(team);
@@ -410,6 +411,19 @@ pub fn selectCredentialForProvider(
         }
         return true;
     }
+    var prepared = prepareCredentialForProvider(state, provider) catch |err| {
+        if (err == error.ProviderCredentialUnavailable) return false;
+        return err;
+    };
+    defer if (prepared) |*credential| credential.deinit(state.alloc);
+    if (prepared) |*credential| adoptServerCredential(state, credential);
+    return true;
+}
+
+/// Stages authorization without changing any in-flight credential storage.
+/// The caller owns a non-null credential; null retains the current authorization.
+pub fn prepareCredentialForProvider(state: *ServerState, provider: model_provider.ProviderId) !?credentials.Credential {
+    if (state.cfg.auth_mode == .host_managed) return null;
     const now_ms = io_mod.milliTimestamp();
     if (state.active_session) |active| {
         if (provider != .configured and credentialMatchesProvider(active.credential_source, provider) and
@@ -418,7 +432,7 @@ pub fn selectCredentialForProvider(
                 active.api_key,
                 active.credential_refresh_after_ms,
                 now_ms,
-            )) return true;
+            )) return null;
     }
     if (provider != .configured and credentialMatchesProvider(state.credential_source, provider) and
         credentialReadyAt(
@@ -426,9 +440,9 @@ pub fn selectCredentialForProvider(
             state.api_key,
             state.credential_refresh_after_ms,
             now_ms,
-        )) return true;
+        )) return null;
 
-    var credential = if (provider == .gateway and state.cfg.credential_override != null)
+    return if (provider == .gateway and state.cfg.credential_override != null)
         credentials.Credential{
             .token = try state.alloc.dupe(u8, state.cfg.credential_override.?),
             .source = .ai_gateway_api_key,
@@ -440,11 +454,27 @@ pub fn selectCredentialForProvider(
             state.cfg.secret_store,
             provider,
             if (provider == .gateway) state.gateway_source_preference else state.credential_source,
-        )) orelse return false;
+        )) orelse return error.ProviderCredentialUnavailable;
     };
-    defer credential.deinit(state.alloc);
-    adoptServerCredential(state, &credential);
-    return true;
+}
+
+test "ACP credential preparation preserves the existing borrowed credential" {
+    const alloc = std.testing.allocator;
+    var state: ServerState = undefined;
+    state.alloc = alloc;
+    state.cfg.auth_mode = .local;
+    state.cfg.credential_override = "next-token";
+    state.active_session = null;
+    state.credential_source = .configured;
+    state.api_key = try alloc.dupe(u8, "active-token");
+    defer secret.zeroAndFree(alloc, state.api_key);
+    const borrowed = state.api_key;
+    var prepared = (try prepareCredentialForProvider(&state, .gateway)).?;
+    defer prepared.deinit(alloc);
+    try std.testing.expectEqualStrings("next-token", prepared.token);
+    try std.testing.expectEqualStrings("active-token", borrowed);
+    try std.testing.expect(state.api_key.ptr == borrowed.ptr);
+    try std.testing.expectEqual(types.CredentialSource.configured, state.credential_source.?);
 }
 
 pub fn streamProviderFor(
@@ -2028,29 +2058,33 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             });
         if (comptime !host_target.is_wasm) {
             if (session.provider != .gateway) {
-                try refreshModelCatalogForOptions(state);
-                var model_available = false;
-                if (state.capability_resolver.catalogEntries()) |entries| {
-                    for (entries) |entry| {
-                        if (std.mem.eql(u8, entry.id, value)) {
-                            model_available = true;
-                            break;
+                if (session.provider != .configured) {
+                    try refreshModelCatalogForOptions(state);
+                    var model_available = false;
+                    if (state.capability_resolver.catalogEntries()) |entries| {
+                        for (entries) |entry| {
+                            if (std.mem.eql(u8, entry.id, value)) {
+                                model_available = true;
+                                break;
+                            }
                         }
                     }
-                }
-                if (!model_available) {
-                    return state.writer.writeError(alloc, msg.id, .{
-                        .code = ErrorCode.invalid_params,
-                        .message = "Model is not available for the active provider",
-                    });
+                    if (!model_available) {
+                        return state.writer.writeError(alloc, msg.id, .{
+                            .code = ErrorCode.invalid_params,
+                            .message = "Model is not available for the active provider",
+                        });
+                    }
                 }
                 if (!try selectCredentialForProvider(state, session.provider)) {
                     return state.writer.writeError(alloc, msg.id, .{
                         .code = ErrorCode.invalid_request,
                         .message = if (session.provider == .codex)
                             credentials.missing_chatgpt_credential_message
+                        else if (session.provider == .grok)
+                            credentials.missing_grok_credential_message
                         else
-                            credentials.missing_grok_credential_message,
+                            "Configured provider authentication is unavailable",
                     });
                 }
             }
@@ -2169,7 +2203,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 }),
             };
             defer model_catalog.freeModelCatalog(alloc, &catalog);
-            if (catalog.items.len == 0) {
+            if (target != .configured and catalog.items.len == 0) {
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.invalid_request,
                     .message = "Provider returned no supported models",
@@ -2181,15 +2215,18 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 try config_runtime.loadMergedSettings(alloc, state.workspace_root);
             defer settings.deinit(alloc);
             const saved_model = settings.models.get(target);
-            var selected_model = catalog.items[0].id;
-            if (saved_model) |saved| {
+            var selected_model = if (target == .configured)
+                saved_model orelse return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_request, .message = "Configure a model for the selected provider" })
+            else
+                catalog.items[0].id;
+            if (target != .configured) if (saved_model) |saved| {
                 for (catalog.items) |entry| {
                     if (std.mem.eql(u8, entry.id, saved)) {
                         selected_model = entry.id;
                         break;
                     }
                 }
-            }
+            };
             commitActiveSessionProvider(
                 alloc,
                 session,
@@ -2257,6 +2294,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
         try sessions.writeProviderConfigOption(
             &out.writer,
             if (state.active_session) |session| session.provider else state.provider,
+            state.configured_providers.definitions,
         );
         try out.writer.writeAll(",");
     }

@@ -67,6 +67,22 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 25000);
 
+  test("CLI selection creates an owned model key from workspace-only preferences", async () => {
+    const f = fixture();
+    try {
+      delete (f.settings.models as any).remote;
+      (f.settings as any).workspaces = { [f.workspace]: { models: { remote: "workspace-model" } } };
+      f.save();
+      const selection = await runFx(["provider", "remote"], { cwd: f.workspace, env: f.env });
+      if (selection.code !== 0) throw new Error(selection.stdout + selection.stderr);
+      const saved = JSON.parse(readFileSync(f.settingsPath, "utf8"));
+      expect(saved.provider).toBe("remote");
+      expect(saved.models).toEqual({ local: "local-model", remote: "workspace-model" });
+      expect(saved.workspaces[f.workspace].models.remote).toBe("workspace-model");
+      expect(saved.providers).toEqual(f.settings.providers);
+    } finally { f.close(); }
+  });
+
   test("catalog listing and file model selection do not require a catalog login", async () => {
     const f = fixture();
     try {

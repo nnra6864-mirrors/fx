@@ -62,11 +62,6 @@ pub const Definition = struct {
         return std.mem.concat(alloc, u8, &.{ self.base_url, "/chat/completions" });
     }
 
-    /// Caller owns the returned URL; no discovery or network access occurs here.
-    pub fn models_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
-        return std.mem.concat(alloc, u8, &.{ self.base_url, "/models" });
-    }
-
     /// Borrowed metadata; absence and unspecified fields remain unknown.
     pub fn model(self: Definition, id: []const u8) ?*const ModelMetadata {
         if (id.len > max_model_bytes) return null;
@@ -395,9 +390,6 @@ test "configured provider owns definitions and preserves unknown metadata" {
     try std.testing.expectEqualStrings("OPENROUTER_API_KEY", router.auth.bearer);
     try std.testing.expectEqualStrings("openai/review", router.reviewer_model.?);
     try std.testing.expectEqual(ToolChoiceMode.send, router.tool_choice_mode);
-    const models = try router.models_url(alloc);
-    defer alloc.free(models);
-    try std.testing.expectEqualStrings("https://openrouter.ai/api/v1/models", models);
     const metadata = router.model("openai/gpt-4.1").?;
     try std.testing.expectEqual(@as(?u32, 8192), metadata.context_window);
     try std.testing.expectEqual(@as(?u32, 1024), metadata.max_output_tokens);
@@ -474,8 +466,6 @@ fn test_allocations(alloc: Allocator) !void {
     const definition = registry.get("router").?;
     const chat = try definition.chat_url(alloc);
     defer alloc.free(chat);
-    const models = try definition.models_url(alloc);
-    defer alloc.free(models);
     _ = definition.binding_identity();
 }
 
