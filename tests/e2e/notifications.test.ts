@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -188,6 +189,87 @@ test.skipIf(!tmuxAvailable())(
 
       expect(handlerStartCount(trace, "PostTurnEnd")).toBe(1);
       expect(trace).toContain("handler=fx.sound.turn_end");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      if (session) await session.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "/trace plays the model-switch click only on success with sound enabled",
+  async () => {
+    const fixture = createNotificationRoot({
+      turn_end: false,
+      attention_required: false,
+    });
+    const gateway = startFakeGateway([]);
+    const tracePath = join(fixture.root, "trace.log");
+    const stderrPath = join(fixture.root, "stderr.log");
+    const clipboardPath = join(fixture.root, "clipboard-path.txt");
+    const bin = join(fixture.root, "bin");
+    mkdirSync(bin);
+    const clipboardCommand = join(bin, "osascript");
+    writeFileSync(
+      clipboardCommand,
+      '#!/bin/sh\nfor arg in "$@"; do last="$arg"; done\nprintf "%s" "$last" > "$FX_TRACE_CLIPBOARD_OUTPUT"\n',
+      { mode: 0o755 },
+    );
+    writeFileSync(stderrPath, "");
+    let session: TmuxSession | null = null;
+    const click = "sound play cue=click trigger=direct";
+    try {
+      session = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: fixture.workspace,
+        env: {
+          ...notificationEnv(fixture.home, gateway, tracePath),
+          PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          TMPDIR: fixture.root,
+          FX_TRACE_CLIPBOARD_OUTPUT: clipboardPath,
+        },
+        stderrPath,
+      });
+      await session.waitForComposer(TIMEOUT);
+      const success = process.platform === "darwin"
+        ? "Trace copied to clipboard"
+        : "Trace saved at";
+      for (const enabled of [false, true]) {
+        await session.sendText(`/sound ${enabled ? "on" : "off"}`);
+        await session.waitForText(`● Sound: ${enabled ? "on" : "off"}`, TIMEOUT);
+        await session.sendText("/trace");
+        await session.waitForPane(
+          (pane) => pane.split(success).length - 1 === (enabled ? 2 : 1),
+          TIMEOUT,
+        );
+        await session.waitForStableComposer(TIMEOUT);
+        if (enabled) await waitForTrace(tracePath, (trace) => trace.includes(click));
+        const trace = readFileSync(tracePath, "utf8");
+        expect(trace.split(click).length - 1).toBe(enabled ? 1 : 0);
+        const reports = readdirSync(fixture.root).filter((name) => name.startsWith("fx-trace-") && name.endsWith(".md"));
+        expect(reports).toHaveLength(enabled ? 2 : 1);
+        for (const report of reports) {
+          expect(readFileSync(join(fixture.root, report), "utf8")).toContain("# fx trace");
+        }
+        if (process.platform === "darwin") {
+          expect(reports.map((name) => join(fixture.root, name))).toContain(readFileSync(clipboardPath, "utf8"));
+        }
+      }
+      if (process.platform === "darwin") {
+        writeFileSync(clipboardCommand, "#!/bin/sh\nexit 1\n");
+        await session.sendText("/trace");
+        await session.waitForText("Clipboard copy failed", TIMEOUT);
+        await session.waitForStableComposer(TIMEOUT);
+        expect(readFileSync(tracePath, "utf8").split(click).length - 1).toBe(1);
+      }
+      expect(await session.captureFullScrollback()).toContain(success);
+      expect(gateway.requests).toHaveLength(0);
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd()).toBe(true);
+      expect(session.paneStatus()).toEqual({ dead: true, status: 0 });
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     } finally {
       if (session) await session.kill();

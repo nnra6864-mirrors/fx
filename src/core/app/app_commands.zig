@@ -601,6 +601,9 @@ pub fn Handlers(comptime App: type) type {
                 .copy_failed, .unavailable => .@"error",
             };
             try finish_trace_notice(app, progress_entry_id, tone, body);
+            if (tone == .neutral) {
+                if (comptime @hasDecl(App, "playInteractionSound")) app.playInteractionSound();
+            }
         }
 
         fn commandQuit(ctx: *anyopaque) !void {
