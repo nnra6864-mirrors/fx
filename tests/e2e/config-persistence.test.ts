@@ -7,6 +7,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -125,6 +126,33 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
     session = null;
     secondSession = null;
   });
+
+  serialTest("configured provider interactive unsafe profile permits inspection but blocks model sends", async () => {
+    const fixture = createConfiguredProviderFixture();
+    const profile = join(fixture.home, ".fx");
+    const target = join(fixture.home, "profile-target");
+    try {
+      renameSync(profile, target);
+      symlinkSync(target, profile);
+      session = await TmuxSession.create({ cwd: fixture.workspace, env: fixture.env });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("must not send with an unreadable profile");
+      await session.waitForText("restart fx before sending a message", TIMEOUT);
+      expect(fixture.requests).toHaveLength(0);
+      rmSync(profile);
+      renameSync(target, profile);
+      await session.sendKeys("C-u");
+      await session.sendText("must still not send until restart");
+      await Bun.sleep(300);
+      await session.kill();
+      session = null;
+      expect(fixture.requests).toHaveLength(0);
+    } finally {
+      await session?.kill();
+      session = null;
+      fixture.close();
+    }
+  }, TIMEOUT * 2);
 
   serialTest("configured provider interactive resume isolates keys and honors process selection", async () => {
     const fixture = createConfiguredProviderFixture();

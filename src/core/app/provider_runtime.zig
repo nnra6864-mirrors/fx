@@ -11,6 +11,7 @@ pub const Runtime = struct {
     active_provider: model_provider.ProviderId = .gateway,
     model: std.ArrayList(u8) = .empty,
     definitions: @import("../config/configured_provider.zig").Registry = .{},
+    model_requests_blocked: bool = false,
 
     pub fn init(alloc: Allocator) Self {
         return .{ .alloc = alloc };

@@ -99,6 +99,16 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn ensurePromptCredential(app: *App) !bool {
+            if (comptime @hasField(App, "provider_selection")) {
+                if (app.provider_selection.model_requests_blocked) {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = "Repair profile settings and restart fx before sending a message.",
+                    });
+                    return false;
+                }
+            }
             if (try rejectPendingPreparation(app)) return false;
             if (comptime provider_runtime.supported(App) and
                 @hasDecl(@TypeOf(app.auth), "selectForProvider"))

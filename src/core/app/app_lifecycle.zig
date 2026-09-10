@@ -123,6 +123,7 @@ pub const StartupState = struct {
     stored_key_status: credentials.StoredKeyReadStatus = .not_attempted,
     fx_login_status: credentials.FxLoginReadStatus = .not_attempted,
     configured_providers: @import("../config/configured_provider.zig").Registry = .{},
+    model_requests_blocked: bool = false,
     provider: model_provider.ProviderId = .gateway,
     selected_model: []u8 = &.{},
     configured_model: []u8 = &.{},
@@ -491,7 +492,11 @@ fn loadStartupStateFromOwnedWorkspace(
     if (auth_mode == .local) for (detailed.diagnostics) |diagnostic| {
         if (diagnostic.layer != .user) continue;
         switch (diagnostic.cause) {
-            .malformed_settings, .settings_too_large, .durable_path_unsafe, .invalid_model_id => return error.InvalidProfileConfiguration,
+            .durable_path_unsafe => {
+                if (credential_mode != .stored) return error.InvalidProfileConfiguration;
+                state.model_requests_blocked = true;
+            },
+            .malformed_settings, .settings_too_large, .invalid_model_id => return error.InvalidProfileConfiguration,
             else => {},
         }
     };
@@ -517,7 +522,7 @@ fn loadStartupStateFromOwnedWorkspace(
     state.prompt_history_enabled = settings.prompt_history_enabled orelse true;
     state.prompt_history_store_allowed = detailed.prompt_history_store_allowed;
     state.credential_source_preference = settings.credential_source;
-    if (auth_mode == .local) {
+    if (auth_mode == .local and !state.model_requests_blocked) {
         if (credential_mode) |mode| {
             const resolution = try credentials.resolveForProvider(
                 alloc,
