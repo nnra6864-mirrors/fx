@@ -365,7 +365,8 @@ await runtime.interactive;
 ```
 
 The authenticated application backend provides `connection` after authorizing the
-user's existing sandbox session. See the [native backend example](https://github.com/vercel-labs/fx/tree/main/sdk/examples/remote-terminal)
+user's existing sandbox session. Its URL points to the application WebSocket relay;
+the private sandbox capability stays on the server. See the [native backend example](https://github.com/vercel-labs/fx/tree/main/sdk/examples/remote-terminal)
 for a working WebSocket broker, PTY helper, and Vercel Sandbox startup integration.
 The example requires Node and Python in the sandbox; the SDK itself adds no
 transport dependency. Native fx must be installed at session startup. Reuse the
@@ -415,11 +416,13 @@ native interactions not yet projected into semantic snapshots. Neither rendering
 mode changes backend tool capabilities or permissions. Native process lifetime
 and sandbox billing remain the owning application's responsibility.
 
-Keep model and sandbox credentials on the server. A connection URL is a scoped
-capability and must not appear in logs or analytics. Use your authenticated
-backend proxy for deployments that need session revocation or short-lived tickets.
-The example additionally validates an exact browser Origin and allows one writer
-at a time; Origin validation alone is not authentication.
+Keep model and sandbox credentials on the server. The example includes
+`createTerminalRelay` with a server-owned authentication/session resolver, a
+separate browser Origin check, and bounded forwarding. The browser connects to
+this application backend; it never receives the private sandbox capability URL.
+Do not put private connection URLs in logs or analytics. The sandbox broker also
+validates an exact Origin and allows one writer at a time; Origin validation
+alone is not authentication.
 
 ## Security
 

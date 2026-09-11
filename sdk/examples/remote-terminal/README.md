@@ -28,9 +28,43 @@ const connection = await startVercelTerminal({
 
 `sandbox` is your existing `@vercel/sandbox` handle. Install that SDK in the application that imports this helper. `fxPath`, `cwd`, credentials, ports, and session identity come from trusted server state. Ensure Python 3 and the desired native fx binary exist in the sandbox startup image. `existingPorts` must include all currently exposed ports: the Sandbox update API replaces the list.
 
-Store the returned connection with the owning application session. Call this function once at session initialization, never for every message or browser reconnect. Only return `connection.url` and `connection.sessionId` to the authenticated owner. The URL contains a scoped bearer capability: do not log it or expose it in analytics. The broker additionally requires an exact browser Origin. Production applications may instead forward the connection through their authenticated WebSocket proxy while preserving that Origin.
+Store the returned connection with the owning application session. Call this function once at session initialization, never for every message or browser reconnect. Keep `connection.url` on the application backend. It contains a scoped bearer capability: never send it to the browser, log it, or expose it in analytics. Both terminal and HTML clients connect to the app backend relay below; model, tool, and native UI traffic all stays behind that backend. The broker additionally checks the trusted app Origin.
 
 Call `connection.close()` when the application explicitly closes the native session. A browser socket disconnect only detaches its view and leaves fx running. This helper does not create, stop, or delete the sandbox; its owning application remains responsible for sandbox lifetime and billing.
+
+
+## Authenticated app backend relay
+
+`createTerminalRelay` attaches to an existing Node HTTP server. Supply your app's session authentication and authorization as `resolveAppSession`; it must verify the request's session cookie and return only that user's stored native connection. An Origin check is enforced independently and does not replace authentication.
+
+```js
+import { createServer } from "node:http";
+import { createTerminalRelay } from "./relay.mjs";
+
+export function createFxHttpServer({ origin, handleRequest, resolveAppSession }) {
+  const relay = createTerminalRelay({
+    origin,
+    path: "/api/fx",
+    async resolveSession(request) {
+      const session = await resolveAppSession(request);
+      return session?.nativeFxConnection ?? null;
+    },
+  });
+  const server = createServer(handleRequest);
+  server.on("upgrade", relay.upgrade);
+  return {
+    server,
+    async close() {
+      relay.close();
+      await new Promise((resolve) => server.close(resolve));
+    },
+  };
+}
+```
+
+Return the public app WebSocket URL (`wss://your-app.example/api/fx`) and the authorized session ID to the client. Never accept an upstream target URL or sandbox credentials from browser input. `resolveSession` returns the trusted `{url, sessionId}` retained from startup; its optional `origin` is also server configuration. The relay does not forward browser Authorization or Cookie headers upstream. It verifies the first attachment targets the resolved session, limits message and send-buffer sizes, pauses reads while writes drain, and sanitizes transport failures.
+
+The app authenticates before any upstream connection is opened. The browser upgrade completes only after the native connection opens. Authentication and connection startup have a ten-second deadline. A relay disconnect detaches the view; it does not call `connection.close()` or kill fx. Run `npm test` in this directory to include both backend and relay integration tests.
 
 ## Wire protocol
 
