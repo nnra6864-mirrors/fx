@@ -22,9 +22,11 @@ import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   canonicalSubagentIdForStore,
   fakeGatewayPermissionDecision,
+  fakeGatewayTitleDefault,
   heldFakeGatewayFinalText,
   isVolatileTokenStatusRow,
   startDynamicFakeGateway,
+  TITLE_GENERATION_MARKER,
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
@@ -395,6 +397,7 @@ function startFakeGateway(
         }
         return permissionDecision(options.classifierDecision ?? "clear");
       }
+      if (body.includes(TITLE_GENERATION_MARKER)) return fakeGatewayTitleDefault();
       requests.push({ body, headers: req.headers });
       const response = responses.shift();
       if (!response) return new Response("unexpected request", { status: 500 });

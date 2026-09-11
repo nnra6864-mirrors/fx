@@ -5155,6 +5155,17 @@ fn activeCredentialLease(
     } };
 }
 
+fn reviewFeedbackMemory(reason: types.ToolPermissionDenialReason, output: []const u8) ?types.ToolResultMemory {
+    return switch (reason) {
+        .review_caution, .review_evidence_incomplete, .review_unavailable => .{
+            .review_feedback = true,
+            .output_bytes = output.len,
+            .stored_output_bytes = output.len,
+        },
+        .user_denied, .auto_denied, .policy_denied, .permission_required => null,
+    };
+}
+
 fn appendTrustedPermissionFeedback(
     alloc: Allocator,
     feedback: *std.ArrayList([]const u8),
@@ -9467,7 +9478,11 @@ fn processQueuedPromptLoop(
                         );
                         tool_dispatch.traceDeniedWebSearch(step_ctx, parallel_call, reason);
                         debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind=permission_denied reason={s} model_output_bytes={d}", .{ parallel_call.id, parallel_call.name, @tagName(reason), denied_output.len });
-                        precomputed_results[group_index] = .{ .status = .failure, .model_output = denied_output };
+                        precomputed_results[group_index] = .{
+                            .status = .failure,
+                            .model_output = denied_output,
+                            .tool_result_memory = reviewFeedbackMemory(reason, denied_output),
+                        };
                         continue;
                     }
 
@@ -10677,7 +10692,7 @@ fn processQueuedPromptLoop(
                     &step_batch,
                     tool_call,
                     denied_output,
-                    null,
+                    reviewFeedbackMemory(reason, denied_output),
                     .{
                         .increment_total = false,
                         .status = .failure,

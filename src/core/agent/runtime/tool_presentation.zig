@@ -837,34 +837,6 @@ fn finishDeferredToolStatus(
     } });
 }
 
-pub fn finishDeniedToolStatusWithResultMemory(
-    hooks: *const AgentRuntimeDeps,
-    arena: Allocator,
-    turn_id: u64,
-    call: ToolCall,
-    status_started: bool,
-    display_target: ?[]const u8,
-    label: []const u8,
-    advertised_dynamic_tool_names: []const []const u8,
-    result: ToolExecutionResult,
-    safe_result: []const u8,
-    result_memory: types.ToolResultMemory,
-) !void {
-    return finishDeniedToolStatusInternal(
-        hooks,
-        arena,
-        turn_id,
-        call,
-        status_started,
-        display_target,
-        label,
-        advertised_dynamic_tool_names,
-        safe_result,
-        result_memory,
-        result.command_result_json,
-    );
-}
-
 fn finishDeniedToolStatusInternal(
     hooks: *const AgentRuntimeDeps,
     arena: Allocator,

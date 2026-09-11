@@ -28,6 +28,7 @@ pub const SettingId = enum {
     statusline_workspace,
     slash_menu_categories,
     collapse_tool_calls,
+    session_titles,
     model,
     effort,
     fast_mode,
@@ -56,6 +57,7 @@ pub const Snapshot = struct {
     statusline_workspace: bool = false,
     slash_menu_categories: bool = true,
     collapse_tool_calls: bool = false,
+    session_titles: bool = true,
     startup_scrollback: bool = true,
     prompt_history: bool = true,
     sound_level: []const u8 = "on",
@@ -71,6 +73,7 @@ pub const Snapshot = struct {
             .statusline_workspace => onOff(self.statusline_workspace),
             .slash_menu_categories => onOff(self.slash_menu_categories),
             .collapse_tool_calls => onOff(self.collapse_tool_calls),
+            .session_titles => onOff(self.session_titles),
             .startup_scrollback => onOff(self.startup_scrollback),
             .prompt_history => onOff(self.prompt_history),
             .sound_level => self.sound_level,
@@ -261,6 +264,7 @@ const specs = [_]Spec{
     .{ .id = .effort, .category = .agent, .label = "Reasoning effort", .description = "Control how much reasoning the model applies" },
     .{ .id = .fast_mode, .category = .agent, .label = "Fast mode", .description = "Use faster inference when the model supports it" },
     .{ .id = .permission_mode, .category = .agent, .label = "Permission mode", .description = "Choose when fx asks before taking actions" },
+    .{ .id = .session_titles, .category = .agent, .label = "Session titles", .description = "Generate a short session title from the first prompt" },
     .{ .id = .sound_level, .category = .notifications, .label = "Sound level", .description = "Choose off, on, or max sounds and terminal bells" },
     .{ .id = .startup_scrollback, .category = .advanced, .label = "Startup scrollback", .description = "Restore terminal output when fx starts" },
     .{ .id = .prompt_history, .category = .advanced, .label = "Prompt history", .description = "Save accepted prompts and slash commands for composer history" },
@@ -372,6 +376,7 @@ fn staticOptionsFor(id: SettingId) []const []const u8 {
         .statusline_workspace,
         .slash_menu_categories,
         .collapse_tool_calls,
+        .session_titles,
         .startup_scrollback,
         .prompt_history,
         => &on_off_options,
@@ -430,9 +435,9 @@ test "settings catalog projects grouped searchable preferences" {
         .sound_level = "on",
     };
 
-    try std.testing.expectEqual(@as(usize, 12), filteredCount(snapshot, .all, ""));
+    try std.testing.expectEqual(@as(usize, 13), filteredCount(snapshot, .all, ""));
     try std.testing.expectEqual(@as(usize, 5), filteredCount(snapshot, .interface, ""));
-    try std.testing.expectEqual(@as(usize, 4), filteredCount(snapshot, .agent, ""));
+    try std.testing.expectEqual(@as(usize, 5), filteredCount(snapshot, .agent, ""));
     try std.testing.expectEqual(@as(usize, 1), filteredCount(snapshot, .notifications, ""));
     try std.testing.expectEqual(@as(usize, 2), filteredCount(snapshot, .advanced, ""));
 

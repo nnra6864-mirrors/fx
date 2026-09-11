@@ -13,6 +13,7 @@ pub const literal_command_zero_width_row_byte_limit: usize = 256;
 const WordBreak = struct {
     start: usize,
     end: usize,
+    source_end: usize,
     sgr: assistant_pacer.SgrState,
     hyperlink: ?[]const u8,
     has_preceding_word: bool,
@@ -29,6 +30,7 @@ const WordBreaks = struct {
         if (self.last) |*last| {
             if (last.end == word_break.start) {
                 last.end = word_break.end;
+                last.source_end = word_break.source_end;
                 return;
             }
             self.previous = last.*;
@@ -56,7 +58,7 @@ const AssistantContinuation = union(enum) {
 /// Pre-existing hard newlines in `text` are honoured. The returned slice is
 /// owned by the caller and freed with `alloc`.
 pub fn wrapAssistantText(alloc: Allocator, text: []const u8, cols: u16) ![]u8 {
-    return wrapAssistantTextWithBaseGutter(alloc, text, cols, 0, false, false, null, null);
+    return wrapAssistantTextWithBaseGutter(alloc, text, cols, 0, false, false, null, null, null);
 }
 
 fn wrapAssistantTextWithBaseGutter(
@@ -68,6 +70,7 @@ fn wrapAssistantTextWithBaseGutter(
     literal_command: bool,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
     finalized_prefix_bytes: ?*usize,
+    source_map: ?*RetentionSourceMap,
 ) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
@@ -96,6 +99,7 @@ fn wrapAssistantTextWithBaseGutter(
         return out.toOwnedSlice(alloc);
     }
 
+    if (source_map) |map| try map.rows.append(alloc, 0);
     var sgr: assistant_pacer.SgrState = .{};
     var hyperlink: ?[]const u8 = null;
     const content_cols = cols -| base_gutter;
@@ -115,6 +119,7 @@ fn wrapAssistantTextWithBaseGutter(
             }
         }
 
+        if (source_map) |map| try map.record(alloc, i, out.items.len);
         const ch = text[i];
 
         if (ch == 0x1b) {
@@ -143,6 +148,7 @@ fn wrapAssistantTextWithBaseGutter(
             try out.append(alloc, ch);
             col = base_gutter + 1;
             i += 1;
+            if (ch == '\n') if (source_map) |map| try map.rows.append(alloc, i);
             if (finalized_prefix_bytes) |bytes| {
                 if (i == finalized_source_end) bytes.* = out.items.len;
             }
@@ -192,11 +198,13 @@ fn wrapAssistantTextWithBaseGutter(
                 has_word_on_row = false;
                 row_has_content = true;
                 zero_width_run_bytes = 0;
+                if (source_map) |map| try map.rows.append(alloc, i);
             }
             if (base_gutter > 0 and !row_has_content) {
                 try appendAssistantRowStart(alloc, &out, base_gutter, sgr, hyperlink, literal_command);
                 row_has_content = true;
             }
+            if (source_map) |map| try map.record(alloc, i, out.items.len);
             try out.appendSlice(alloc, text[i .. i + unit.byte_len]);
             if (literal_command) zero_width_run_bytes += unit.byte_len;
             i += unit.byte_len;
@@ -225,12 +233,14 @@ fn wrapAssistantTextWithBaseGutter(
                         base_gutter,
                         next_width,
                         literal_command,
+                        source_map,
                     )) |reflowed_col| {
                         col = reflowed_col;
                         word_breaks = .{};
                         has_word_on_row = true;
                         row_has_content = true;
                         moved_for_orphan = true;
+                        if (source_map) |map| try map.rows.append(alloc, word_break.source_end);
                     }
                 }
             }
@@ -250,6 +260,7 @@ fn wrapAssistantTextWithBaseGutter(
                 has_word_on_row = false;
                 row_has_content = true;
                 i += unit.byte_len;
+                if (source_map) |map| try map.rows.append(alloc, i);
                 continue;
             }
         }
@@ -275,10 +286,12 @@ fn wrapAssistantTextWithBaseGutter(
                     base_gutter,
                     w,
                     literal_command,
+                    source_map,
                 )) |reflowed_col| {
                     col = reflowed_col;
                     word_breaks = .{};
                     row_has_content = true;
+                    if (source_map) |map| try map.rows.append(alloc, break_to_use.source_end);
                 }
             }
         }
@@ -298,6 +311,7 @@ fn wrapAssistantTextWithBaseGutter(
             word_breaks = .{};
             has_word_on_row = false;
             row_has_content = true;
+            if (source_map) |map| try map.rows.append(alloc, i);
         }
 
         if (base_gutter > 0 and !row_has_content) {
@@ -305,6 +319,7 @@ fn wrapAssistantTextWithBaseGutter(
             row_has_content = true;
         }
 
+        if (source_map) |map| try map.record(alloc, i, out.items.len);
         const space_start = out.items.len;
         if (replace_wide_unit) {
             try out.append(alloc, '?');
@@ -316,6 +331,7 @@ fn wrapAssistantTextWithBaseGutter(
             word_breaks.record(.{
                 .start = space_start,
                 .end = out.items.len,
+                .source_end = i + unit.byte_len,
                 .sgr = sgr,
                 .hyperlink = hyperlink,
                 .has_preceding_word = word_breaks.last != null,
@@ -326,6 +342,7 @@ fn wrapAssistantTextWithBaseGutter(
         i += unit.byte_len;
     }
 
+    if (source_map) |map| try map.record(alloc, text.len, out.items.len);
     if (literal_command and !row_has_content) {
         try appendAssistantRowStart(alloc, &out, base_gutter, sgr, hyperlink, true);
     }
@@ -403,6 +420,7 @@ pub fn wrapTranscriptAssistantTextInterruptible(
         false,
         checkpoint,
         null,
+        null,
     );
 }
 
@@ -429,11 +447,77 @@ pub fn wrapTranscriptAssistantTextWithFinalityInterruptible(
         false,
         checkpoint,
         &finalized_prefix_bytes,
+        null,
     );
     return .{
         .bytes = bytes,
         .finalized_prefix_bytes = finalized_prefix_bytes,
     };
+}
+
+pub const RetentionSourceMap = struct {
+    pub const Point = struct { source: usize, rendered: usize };
+    rows: std.ArrayList(usize) = .empty,
+    points: std.ArrayList(Point) = .empty,
+
+    pub fn deinit(self: *RetentionSourceMap, alloc: Allocator) void {
+        self.rows.deinit(alloc);
+        self.points.deinit(alloc);
+    }
+
+    fn record(self: *RetentionSourceMap, alloc: Allocator, source: usize, rendered: usize) !void {
+        try self.points.append(alloc, .{ .source = source, .rendered = rendered });
+    }
+
+    fn boundary(self: RetentionSourceMap, comptime field: enum { source, rendered }, offset: usize) Point {
+        var lo: usize = 0;
+        var hi = self.points.items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (@field(self.points.items[mid], @tagName(field)) <= offset) lo = mid + 1 else hi = mid;
+        }
+        return if (lo == 0) .{ .source = 0, .rendered = 0 } else self.points.items[lo - 1];
+    }
+
+    pub fn sourceAt(self: RetentionSourceMap, rendered: usize) usize {
+        return self.boundary(.rendered, rendered).source;
+    }
+
+    pub fn renderedAt(self: RetentionSourceMap, source: usize) usize {
+        return self.boundary(.source, source).rendered;
+    }
+};
+
+/// Caller-owned source coordinates emitted by the actual wrapping decisions.
+/// Generated gutters and presentation controls never split an input display unit.
+pub fn retentionSourceMap(alloc: Allocator, text: []const u8, cols: u16) !RetentionSourceMap {
+    var map: RetentionSourceMap = .{};
+    errdefer map.deinit(alloc);
+    const wrapped = try wrapAssistantTextWithBaseGutter(
+        alloc,
+        text,
+        cols,
+        gutterWidth(cols),
+        true,
+        false,
+        null,
+        null,
+        &map,
+    );
+    defer alloc.free(wrapped);
+    var leading: usize = 0;
+    while (leading < wrapped.len and wrapped[leading] == '\n') : (leading += 1) {}
+    const skip = @min(leading, map.rows.items.len);
+    std.mem.copyForwards(usize, map.rows.items, map.rows.items[skip..]);
+    map.rows.items.len -= skip;
+    for (map.points.items) |*point| point.rendered -|= leading;
+    return map;
+}
+
+pub fn retentionSourceRows(alloc: Allocator, text: []const u8, cols: u16) ![]usize {
+    var map = try retentionSourceMap(alloc, text, cols);
+    defer map.deinit(alloc);
+    return map.rows.toOwnedSlice(alloc);
 }
 
 /// Reflow canonical command output as literal terminal text. Every physical
@@ -454,6 +538,7 @@ pub fn wrapLiteralCommandOutput(
         gutter,
         true,
         true,
+        null,
         null,
         null,
     );
@@ -487,6 +572,7 @@ pub fn wrapLiteralToolOutputInterruptible(
         true,
         true,
         checkpoint,
+        null,
         null,
     );
 }
@@ -648,6 +734,7 @@ fn reflowAtWordBreak(
     base_gutter: u16,
     next_width: u16,
     literal_command: bool,
+    source_map: ?*RetentionSourceMap,
 ) !?u16 {
     const suffix = out.items[word_break.end..];
     const suffix_width = display_width.visibleWidthIgnoringAnsi(suffix);
@@ -670,6 +757,19 @@ fn reflowAtWordBreak(
         literal_command,
     );
     try out.replaceRange(alloc, word_break.start, word_break.end - word_break.start, replacement.items);
+    if (source_map) |map| {
+        var index = map.points.items.len;
+        while (index > 0) {
+            index -= 1;
+            const point = &map.points.items[index];
+            if (point.rendered <= word_break.start) break;
+            if (point.rendered >= word_break.end) {
+                point.rendered = word_break.start + replacement.items.len + point.rendered - word_break.end;
+            } else {
+                point.rendered = word_break.start;
+            }
+        }
+    }
     return col + @as(u16, @intCast(suffix_width));
 }
 

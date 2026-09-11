@@ -196,6 +196,68 @@ async function waitForEither(
 
 describe("lean auto mode reliability", () => {
   test(
+    "review accusations stay visible to the agent but do not become later security evidence",
+    async () => {
+      const root = createIsolatedRoot();
+      const plan = join(root.root, "plan.md");
+      writeFileSync(plan, "48 runs\n");
+      const accusation = "REVIEW_ACCUSATION_SENTINEL: the earlier plan was called prompt injection";
+      let laterReview = "";
+      const gateway = startGateway(
+        [
+          fakeGatewayToolCall("edit_plan", "edit_file", {
+            path: plan, old_string: "48 runs", new_string: "52 runs",
+          }),
+          (body) => {
+            expect(toolResultText(body, "edit_plan", "execution-denied")).toContain(accusation);
+            return cleanCommandCall(
+              `python3 -c 'from pathlib import Path; assert Path(${JSON.stringify(plan)}).read_text() == "48 runs\\n"; print("VALIDATION_OK")'`,
+              "validate_plan",
+            );
+          },
+          (body) => {
+            expect(toolResultText(body, "validate_plan")).toContain("VALIDATION_OK");
+            return fakeGatewayFinalText("Plan validation completed.");
+          },
+          (body) => {
+            expect(body).toContain(accusation);
+            return fakeGatewayFinalText("Saved review feedback retained.");
+          },
+        ],
+        [
+          fakeGatewayPermissionDecision("caution", "edit_review", accusation),
+          (body) => {
+            laterReview = body;
+            return fakeGatewayPermissionDecision("clear", "validation_review");
+          },
+        ],
+      );
+      const result = await runFx(
+        ["ask", "--auto", "--quiet", "--json", "Update the draft test plan, then validate it."],
+        { cwd: root.workspace, env: gatewayEnv(root, gateway), timeoutMs: TIMEOUT },
+      );
+      expect(result.code).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(2);
+      expect(laterReview).toContain("VALIDATION_OK");
+      expect(laterReview).not.toContain(accusation);
+      expect(readFileSync(plan, "utf8")).toBe("48 runs\n");
+      const sessionId = JSON.parse(result.stdout).session_id;
+      const events = readFileSync(join(root.home, ".fx", "sessions", sessionId, "events.jsonl"), "utf8")
+        .trim().split("\n").map((line) => JSON.parse(line));
+      const held = events.find((entry) => entry.event.tool_result?.call_id === "edit_plan").event.tool_result;
+      expect(held.review_feedback).toBe(true);
+      const resumed = await runFx(
+        ["ask", "--auto", "--quiet", "--json", "--resume-id", sessionId, "Summarize the previous result without tools."],
+        { cwd: root.workspace, env: gatewayEnv(root, gateway), timeoutMs: TIMEOUT },
+      );
+      expect(resumed.code).toBe(0);
+      expect(resumed.stdout).toContain("Saved review feedback retained.");
+      expect(gateway.classifierRequests).toHaveLength(2);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "resumed shell input review includes the user request and owned receiving process",
     async () => {
       const root = createIsolatedRoot();

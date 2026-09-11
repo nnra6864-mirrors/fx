@@ -48,6 +48,7 @@ pub fn makePersistedToolResult(
         .stored_output_bytes = if (memory) |info| info.stored_output_bytes else output.len,
         .truncated = if (memory) |info| info.truncated else false,
         .provider_native = false,
+        .review_feedback = if (memory) |info| info.review_feedback else false,
         .created_at_ms = io_mod.milliTimestamp(),
         .command_output_replay = command_output_replay,
         .command_process_presentation = if (memory) |info| info.command_process_presentation else null,

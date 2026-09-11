@@ -2121,6 +2121,7 @@ fn dupeConversationToolResult(
         .stored_output_bytes = stored_bytes,
         .truncated = value.completeness != .complete,
         .provider_native = value.provider_native,
+        .review_feedback = value.review_feedback,
         .created_at_ms = value.created_at_ms,
         .permission_feedback = permission_feedback,
         .committed_file_presentation = committed_file_presentation,
@@ -2758,6 +2759,18 @@ pub const LoadedWritableSession = struct {
 
     fn writeFirstConversationTitle(self: *LoadedWritableSession, alloc: Allocator, turn: session.HistoryTurn) void {
         if (!self.freshly_started) return;
+        // A generated title (or a user rename) that landed before the first
+        // commit wins; the derived title only names an untitled session.
+        const persisted = self.conversationTitle(alloc) catch |err| {
+            debug_trace.logf(
+                "session",
+                "derived session title check failed session={s} err={s}",
+                .{ self.active_id, @errorName(err) },
+            );
+            return;
+        };
+        defer if (persisted) |value| alloc.free(value);
+        if (persisted != null) return;
         var display = session_display_metadata.deriveFromHistory(alloc, &.{turn}) catch return;
         defer display.deinit(alloc);
         if (!display.present) return;
@@ -5700,6 +5713,70 @@ test "cache-free permission state resumes from its domain file" {
         session_permission_state.StateDecision.deny,
         session_permission_state.decide(resumed.permission_state, key),
     );
+}
+
+test "review feedback survives conversation resume range and archive replay" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |review_feedback| {
+        var temp = try TempRoot.init(alloc);
+        defer temp.deinit(alloc);
+        var initial = try testState(alloc, "review-feedback-resume", 10);
+        defer initial.deinit(alloc);
+        var calls = [_]types.ToolCall{.{
+            .id = "call-review",
+            .name = "shell",
+            .arguments_json = "{}",
+        }};
+        var results = [_]types.PersistedToolResult{.{
+            .tool_call_id = @constCast("call-review"),
+            .tool_name = @constCast("shell"),
+            .status = .failure,
+            .output = @constCast("Security review held this action."),
+            .output_handle = @constCast("review-feedback.txt"),
+            .output_bytes = "Security review held this action.".len,
+            .stored_output_bytes = "Security review held this action.".len,
+            .review_feedback = review_feedback,
+        }};
+        var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+        {
+            var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+            defer loaded.deinit(alloc);
+            const session_path = try io_mod.dirRealpathAlloc(alloc, loaded.log.dir.dir, ".");
+            defer alloc.free(session_path);
+            var capability = try session_child_store.SessionChildCapability.init(alloc, loaded.log.dir.dir, session_path, .writable);
+            defer capability.deinit();
+            var artifact = try capability.atomicReplace(alloc, .tool_results, "review-feedback.txt", "Security review held this action.");
+            defer artifact.deinit(alloc);
+            _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+                .conversation_language = .literal("en"),
+                .total_input_tokens = 1,
+                .total_output_tokens = 1,
+                .turn = .{ .assistant = .{
+                    .user = .{ .text = @constCast("Check the result.") },
+                    .assistant = @constCast("I will inspect another path."),
+                    .execution = .{ .tool_steps = &steps },
+                } },
+            } }, 20);
+        }
+        var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+        defer resumed.deinit(alloc);
+        const range = try loadConversationHistoryRange(alloc, &resumed.log.dir, 0, 1);
+        defer session.freeHistoryTurnSlice(alloc, range);
+        const archive = try loadConversationArchive(alloc, &resumed.log.dir);
+        defer session.freeHistoryTurnSlice(alloc, archive);
+        var readonly = try temp.root.loadReadOnly(alloc, initial.id, .{});
+        defer readonly.deinit(alloc);
+        for ([_][]const types.HistoryTurn{ resumed.state.history, range, archive, readonly.history }) |history| {
+            try std.testing.expectEqual(@as(usize, 1), history.len);
+            const turn = history[0].assistant;
+            try std.testing.expectEqualStrings("Check the result.", turn.user.text);
+            try std.testing.expectEqualStrings("I will inspect another path.", turn.assistant);
+            const result = turn.execution.tool_steps[0].tool_results[0];
+            try std.testing.expectEqual(review_feedback, result.review_feedback);
+            try std.testing.expectEqualStrings("Security review held this action.", result.output);
+            try std.testing.expectEqual(types.PersistedToolStatus.failure, result.status);
+        }
+    }
 }
 
 test "cache-free resume rebuilds tool calls and external result references" {

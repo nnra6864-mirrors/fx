@@ -330,25 +330,6 @@ pub fn replayBoundary(
     };
 }
 
-/// Replays one caller-supplied durable boundary without consulting a commit
-/// watermark. It never searches for or selects a different prefix.
-pub fn replayExactBoundary(
-    alloc: Allocator,
-    file: std.Io.File,
-    expected_generation: Identifier,
-    expected_seq: u64,
-    expected_bytes: u64,
-) !session_codec.DurableSessionState {
-    var replayed = try replayExactPosition(
-        alloc,
-        file,
-        expected_generation,
-        expected_seq,
-        expected_bytes,
-    );
-    return replayed.takeState();
-}
-
 /// Owns `state`; callers must call `deinit` or transfer it with `takeState`.
 pub const ExactReplay = struct {
     state: session_codec.DurableSessionState,

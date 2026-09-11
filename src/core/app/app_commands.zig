@@ -3652,6 +3652,7 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
     }
     if (comptime @hasField(App, "statusline_context")) snapshot.statusline_context = app.statusline_context;
     if (comptime @hasField(App, "statusline_session")) snapshot.statusline_session = app.statusline_session;
+    if (comptime @hasField(App, "session_title_generation")) snapshot.session_titles = app.session_title_generation;
     if (comptime @hasField(App, "workspace_identity")) snapshot.statusline_workspace = app.workspace_identity.enabled;
     if (comptime @hasField(App, "prompt_history")) snapshot.prompt_history = app.prompt_history.enabled;
     if (comptime @hasDecl(App, "notificationPreferences")) {
@@ -3737,6 +3738,24 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
                 app,
                 "slash menu categories",
                 .{ .slash_menu_categories = enabled },
+                runtime_changed,
+            );
+        },
+        .session_titles => {
+            const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
+            const ChangeApp = @TypeOf(app.*);
+            const current = if (comptime @hasField(ChangeApp, "session_title_generation"))
+                app.session_title_generation
+            else
+                true;
+            const runtime_changed = enabled != current;
+            if (comptime @hasField(ChangeApp, "session_title_generation")) {
+                if (runtime_changed) app.session_title_generation = enabled;
+            }
+            try persistUserPreferences(
+                app,
+                "session titles",
+                .{ .session_titles = enabled },
                 runtime_changed,
             );
         },

@@ -65,6 +65,7 @@ pub const ConversationToolResult = struct {
     completeness: ArtifactCompleteness,
     preview: ?[]const u8 = null,
     provider_native: bool = false,
+    review_feedback: bool = false,
     created_at_ms: i64 = 0,
     permission_feedback: []const []const u8 = &.{},
     committed_file_presentation: ?types.CommittedFilePresentation = null,
@@ -72,6 +73,17 @@ pub const ConversationToolResult = struct {
     command_replay_bytes: ?u64 = null,
     command_process_presentation: ?types.CommandProcessPresentation = null,
     terminal_action_presentation: ?types.TerminalActionPresentation = null,
+
+    pub fn jsonStringify(self: ConversationToolResult, writer: *std.json.Stringify) !void {
+        try writer.beginObject();
+        inline for (std.meta.fields(ConversationToolResult)) |field| {
+            if (!std.mem.eql(u8, field.name, "review_feedback") or self.review_feedback) {
+                try writer.objectField(field.name);
+                try writer.write(@field(self, field.name));
+            }
+        }
+        try writer.endObject();
+    }
 };
 
 pub const ConversationInterruption = struct {
@@ -285,6 +297,9 @@ fn validateConversationEventShape(event: ConversationEvent, schema_version: u8) 
             }
         },
         .tool_result => |result| {
+            if (result.review_feedback and (result.status != .failure or result.provider_native)) {
+                return error.InvalidConversationEvent;
+            }
             try validateConversationIdentity(result.call_id);
             try validateConversationIdentity(result.tool_name);
             if (result.artifact_ref.len == 0 or
@@ -589,6 +604,7 @@ fn appendExecutionConversationEvents(
                 else
                     null,
                 .provider_native = result.provider_native,
+                .review_feedback = result.review_feedback,
                 .created_at_ms = result.created_at_ms,
                 .permission_feedback = result.permission_feedback,
                 .committed_file_presentation = result.committed_file_presentation,
@@ -3461,6 +3477,66 @@ test "journal cancellation provenance survives reduction and durable checkpoint 
         try std.testing.expectEqual(origin, restored.state.history[0].interrupted.cancellation_origin);
         try std.testing.expectEqual(session.InterruptedTerminalReason.cancelled, restored.state.history[0].interrupted.terminal_reason);
         try std.testing.expectEqualStrings("partial", restored.state.history[0].interrupted.assistant.?);
+    }
+}
+
+test "review feedback conversation metadata rejects invalid provenance and unknown fields" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { status: []const u8, native: bool, marker: []const u8 }{
+        .{ .status = "success", .native = false, .marker = "true" },
+        .{ .status = "failure", .native = true, .marker = "true" },
+        .{ .status = "failure", .native = false, .marker = "null" },
+        .{ .status = "failure", .native = false, .marker = "1" },
+        .{ .status = "failure", .native = false, .marker = "\"true\"" },
+        .{ .status = "failure", .native = false, .marker = "true,\"unknown_feedback\":true" },
+    };
+    for (cases) |case| {
+        const frame = try std.fmt.allocPrint(
+            alloc,
+            "{{\"schema_version\":2,\"seq\":1,\"timestamp_ms\":1,\"event\":{{\"tool_result\":{{\"call_id\":\"call-review\",\"tool_name\":\"shell\",\"status\":\"{s}\",\"artifact_ref\":\"result.txt\",\"stored_bytes\":0,\"completeness\":\"complete\",\"provider_native\":{},\"review_feedback\":{s}}}}}}}\n",
+            .{ case.status, case.native, case.marker },
+        );
+        defer alloc.free(frame);
+        try std.testing.expectError(error.InvalidConversationFrame, decodeConversationFrame(alloc, frame));
+    }
+    for ([_]bool{ false, true }) |native| {
+        try std.testing.expectError(error.InvalidConversationEvent, encodeConversationFrame(alloc, .{
+            .seq = 1,
+            .timestamp_ms = 1,
+            .event = .{ .tool_result = .{
+                .call_id = "call-review",
+                .tool_name = "shell",
+                .status = if (native) .failure else .success,
+                .artifact_ref = "result.txt",
+                .stored_bytes = 0,
+                .completeness = .complete,
+                .provider_native = native,
+                .review_feedback = true,
+            } },
+        }));
+    }
+}
+
+test "review feedback conversation metadata defaults old records and omits false" {
+    const alloc = std.testing.allocator;
+    for ([_]u8{ 1, 2 }) |version| {
+        const frame = try std.fmt.allocPrint(
+            alloc,
+            "{{\"schema_version\":{d},\"seq\":1,\"timestamp_ms\":1,\"event\":{{\"tool_result\":{{\"call_id\":\"call-review\",\"tool_name\":\"shell\",\"status\":\"failure\",\"artifact_ref\":\"result.txt\",\"stored_bytes\":0,\"completeness\":\"complete\",\"preview\":\"Security review held this action.\"}}}}}}\n",
+            .{version},
+        );
+        defer alloc.free(frame);
+        var decoded = try decodeConversationFrame(alloc, frame);
+        defer decoded.deinit();
+        try std.testing.expect(!decoded.value.event.tool_result.review_feedback);
+        const encoded = try encodeConversationFrame(alloc, .{
+            .seq = decoded.value.seq,
+            .timestamp_ms = decoded.value.timestamp_ms,
+            .event = decoded.value.event,
+        });
+        defer alloc.free(encoded);
+        try std.testing.expect(std.mem.find(u8, encoded, "review_feedback") == null);
+        try std.testing.expectEqualStrings("Security review held this action.", decoded.value.event.tool_result.preview.?);
     }
 }
 

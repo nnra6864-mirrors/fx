@@ -15,7 +15,10 @@ pub const Projection = struct {
     owned_overrides: std.ArrayList(OwnedOverride) = .empty,
 
     pub fn deinit(self: *Projection, alloc: std.mem.Allocator) void {
-        for (self.owned_overrides.items) |owned| alloc.free(owned.bytes);
+        for (self.owned_overrides.items) |owned| {
+            alloc.free(owned.bytes);
+            alloc.free(owned.line_provenance);
+        }
         self.owned_overrides.deinit(alloc);
         self.entry_actions.deinit(alloc);
         self.* = undefined;
@@ -37,6 +40,13 @@ pub const Projection = struct {
             .kind = kind,
             .bytes = bytes,
         } };
+    }
+
+    fn setOwnedGroup(self: *Projection, alloc: std.mem.Allocator, index: usize, group: GroupBlock) !void {
+        errdefer alloc.free(group.lines);
+        try self.setOwnedOverride(alloc, index, .tool_status, group.bytes);
+        self.owned_overrides.items[self.owned_overrides.items.len - 1].line_provenance = group.lines;
+        self.entry_actions.items[index].override.line_provenance = group.lines;
     }
 
     fn appendOwnedOverride(
@@ -85,6 +95,7 @@ pub const Projection = struct {
                 retained_index += 1;
             } else {
                 alloc.free(owned.bytes);
+                alloc.free(owned.line_provenance);
             }
         }
         self.owned_overrides.items.len = retained_index;
@@ -96,6 +107,7 @@ pub const Projection = struct {
             self.owned_overrides.appendAssumeCapacity(.{
                 .entry_index = start_index + owned.entry_index,
                 .bytes = owned.bytes,
+                .line_provenance = owned.line_provenance,
             });
         }
         suffix.entry_actions.items.len = 0;
@@ -106,6 +118,7 @@ pub const Projection = struct {
 const OwnedOverride = struct {
     entry_index: usize,
     bytes: []u8,
+    line_provenance: []const transcript_blocks.LineProvenance = &.{},
 };
 
 pub const SummaryStyle = struct {
@@ -506,6 +519,8 @@ fn formatGroupHeader(
     return applySummaryStyle(alloc, clipped, style);
 }
 
+const GroupBlock = struct { bytes: []u8, lines: []const transcript_blocks.LineProvenance };
+
 fn formatGroupBlock(
     alloc: std.mem.Allocator,
     entries: []const TranscriptEntry,
@@ -518,10 +533,17 @@ fn formatGroupBlock(
     cols: u16,
     style: SummaryStyle,
     styles: transcript_blocks.Styles,
-) ![]u8 {
+) !GroupBlock {
     const header = try formatGroupHeader(alloc, summary, cols, style);
-    if (collapse_tool_calls) return header;
     defer alloc.free(header);
+    var lines: std.ArrayList(transcript_blocks.LineProvenance) = .empty;
+    errdefer lines.deinit(alloc);
+    try lines.append(alloc, .{ .entry = .{ .entry_id = entries[status_indices[0]].id(), .entry_class = .tool_status, .projection_part = .group_header } });
+    if (collapse_tool_calls) {
+        const bytes = try alloc.dupe(u8, header);
+        errdefer alloc.free(bytes);
+        return .{ .bytes = bytes, .lines = try lines.toOwnedSlice(alloc) };
+    }
 
     var focused_in_group = false;
     var static_count: usize = 0;
@@ -565,6 +587,7 @@ fn formatGroupBlock(
         const connector = if (!focused_in_group and static_index == static_count) "└" else "├";
         const child = try std.fmt.allocPrint(scratch, "{s} {s}", .{ connector, phrase });
         const clipped = try clipSummary(scratch, child, cols);
+        try lines.append(alloc, .{ .entry = .{ .entry_id = entry_id, .entry_class = .tool_status, .projection_part = .group_child } });
         const accented = if (entryShowsDiffStats(detail))
             try accentTrailingDiffStats(scratch, clipped, style.text_style)
         else
@@ -583,12 +606,17 @@ fn formatGroupBlock(
 
         const terminal = try transcript_blocks.renderEntryToBlock(scratch, entry, cols, styles);
         if (terminal.bytes.len > 0) {
+            try lines.append(alloc, .block_separator);
+            const count = std.mem.count(u8, std.mem.trimEnd(u8, terminal.bytes, "\n"), "\n") + 1;
+            try lines.appendNTimes(alloc, .{ .entry = .{ .entry_id = entry_id, .entry_class = .tool_status, .projection_part = .group_cancel } }, count);
             try out.writer.writeAll("\n\n");
             try out.writer.writeAll(terminal.bytes);
         }
         terminal.deinit(scratch);
     }
-    return out.toOwnedSlice();
+    const bytes = try out.toOwnedSlice();
+    errdefer alloc.free(bytes);
+    return .{ .bytes = bytes, .lines = try lines.toOwnedSlice(alloc) };
 }
 
 fn reprojectTruncatedCommandPhrase(
@@ -1110,7 +1138,7 @@ fn buildWithStyleAndStats(
                 style,
                 styles,
             );
-            try projection.setOwnedOverride(alloc, index, .tool_status, bytes);
+            try projection.setOwnedGroup(alloc, index, bytes);
             index += 1;
             continue;
         }
@@ -1158,7 +1186,7 @@ fn buildWithStyleAndStats(
             style,
             styles,
         );
-        try projection.setOwnedOverride(alloc, first_index, .tool_status, bytes);
+        try projection.setOwnedGroup(alloc, first_index, bytes);
     }
 
     return projection;

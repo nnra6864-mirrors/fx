@@ -28,6 +28,7 @@ const session_codec = @import("../core/session/session_codec.zig");
 const session_log = @import("../core/session/session_log.zig");
 const session_store = @import("../core/session/session_store.zig");
 const session_runtime = @import("../core/session/session.zig");
+const session_title_generation = @import("../core/session/session_title_generation.zig");
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
 const terminal_client_runtime = @import("../core/terminal/client.zig");
 const subagent_tool_host = @import("../core/subagent/tool_host.zig");
@@ -203,6 +204,7 @@ pub const ActiveSessionState = struct {
     /// profile or project configuration.
     session_grants: []types.PermissionGrant = &.{},
     session_rt: session_runtime.SessionRuntime,
+    title_task: ?*session_title_generation.Task = null,
     mcp: ?*mcp_runtime.McpRuntime = null,
     cancel_flag: std.atomic.Value(bool),
     pending_prompt_id: ?jsonrpc.RequestId,
@@ -272,6 +274,7 @@ pub const ServerState = struct {
     effort: types.ReasoningEffort = .auto,
     first_call_tool_choice: types.ToolChoice = .auto,
     context_enabled: bool = true,
+    session_titles: bool = true,
     active_session: ?ActiveSessionState = null,
     active_prompt: ?*ActivePrompt = null,
     subagent_authority_mutex: std.Io.Mutex = .init,
@@ -619,6 +622,10 @@ fn closeActiveSession(state: *ServerState) !void {
 
 fn destroyActiveSession(state: *ServerState) void {
     const active = if (state.active_session) |*session| session else return;
+    if (active.title_task) |task| {
+        debug_trace.logf("session", "event=title_generation_dropped reason=session_release", .{});
+        task.destroy();
+    }
     state.alloc.free(active.session_id);
     state.alloc.free(active.model);
     types.freePermissionGrantSlice(state.alloc, active.session_grants);
@@ -1894,6 +1901,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.effort = startup.effort;
     state.first_call_tool_choice = startup.first_call_tool_choice;
     state.context_enabled = startup.context_enabled;
+    state.session_titles = startup.session_title_generation;
 
     if (comptime !host_target.is_wasm) {
         if (!state.cfg.minimal_kernel) {

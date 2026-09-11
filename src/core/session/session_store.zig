@@ -246,7 +246,7 @@ fn latestCheckpointHistoryIndex(history: []const session.HistoryTurn) usize {
     return result;
 }
 
-fn historyPrefixDigest(turns: []const session.HistoryTurn) error{ WriteFailed, NoSpaceLeft }![32]u8 {
+fn historyPrefixDigest(turns: []const session.HistoryTurn) error{ WriteFailed, NoSpaceLeft, InvalidSessionFormat }![32]u8 {
     var buffer: [256]u8 = undefined;
     var hashing: std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256) = .init(&buffer);
     try hashing.writer.writeAll("fx.history-page-prefix.v2\x00");
@@ -8684,6 +8684,31 @@ test "history page streaming digest has fixed memory and cursor parser fuzz cove
             try std.testing.expectEqual(error.InvalidHistoryPageCursor, err);
         }
     }
+}
+
+test "history page digest rejects invalid review feedback" {
+    var calls = [_]session.ToolCall{.{ .id = "review", .name = "shell", .arguments_json = "{}" }};
+    var results = [_]session.PersistedToolResult{.{
+        .tool_call_id = @constCast("review"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast("held"),
+        .output_bytes = 4,
+        .stored_output_bytes = 4,
+        .review_feedback = true,
+    }};
+    var steps = [_]session.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    const turns = [_]session.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("inspect") },
+        .assistant = @constCast("held"),
+        .execution = .{ .tool_steps = &steps },
+    } }};
+    try std.testing.expectError(error.InvalidSessionFormat, historyPrefixDigest(&turns));
+    results[0].status = .failure;
+    const marked = try historyPrefixDigest(&turns);
+    results[0].review_feedback = false;
+    const ordinary = try historyPrefixDigest(&turns);
+    try std.testing.expect(!std.mem.eql(u8, &marked, &ordinary));
 }
 
 test "conversation visitation releases turns on consumer and allocation failure" {

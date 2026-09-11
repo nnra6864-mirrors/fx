@@ -61,6 +61,7 @@ pub const Settings = struct {
     statusline_context: ?bool = null,
     statusline_session: ?bool = null,
     statusline_workspace: ?bool = null,
+    session_titles: ?bool = null,
     notification_turn_end: ?bool = null,
     notification_attention_required: ?bool = null,
     notification_max: ?bool = null,
@@ -126,6 +127,7 @@ pub const ConfigSources = struct {
     prompt_history_enabled: ConfigSource = .compiled_default,
     statusline_context: ConfigSource = .compiled_default,
     statusline_session: ConfigSource = .compiled_default,
+    session_titles: ConfigSource = .compiled_default,
     notification_turn_end: ConfigSource = .compiled_default,
     notification_attention_required: ConfigSource = .compiled_default,
     notification_max: ConfigSource = .compiled_default,
@@ -649,6 +651,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "fast_mode_model_bound",
         "slash_menu_categories",
         "collapse_tool_calls",
+        "session_titles",
         "startup_scrollback",
         "prompt_history",
         "statusLine",
@@ -695,6 +698,7 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
     if (settings.fast_mode_model_bound != null) sources.fast_mode_model_bound = source;
     if (settings.slash_menu_categories != null) sources.slash_menu_categories = source;
     if (settings.collapse_tool_calls != null) sources.collapse_tool_calls = source;
+    if (settings.session_titles != null) sources.session_titles = source;
     if (settings.startup_scrollback != null) sources.startup_scrollback = source;
     if (settings.prompt_history_enabled != null) sources.prompt_history_enabled = source;
     if (settings.statusline_context != null) sources.statusline_context = source;
@@ -1481,6 +1485,12 @@ fn parseProfileOnlyFields(
         settings.collapse_tool_calls = value.bool;
     }
 
+    if (root.object.get("session_titles")) |session_titles_value| {
+        const value = session_titles_value;
+        if (value != .bool) return error.InvalidSessionTitlesType;
+        settings.session_titles = value.bool;
+    }
+
     if (root.object.get("auto_upgrade")) |auto_upgrade_value| {
         const value = auto_upgrade_value;
         if (value != .bool) return error.InvalidAutoUpgradeType;
@@ -1605,6 +1615,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.fast_mode_model_bound) |value| target.fast_mode_model_bound = value;
     if (incoming.slash_menu_categories) |value| target.slash_menu_categories = value;
     if (incoming.collapse_tool_calls) |value| target.collapse_tool_calls = value;
+    if (incoming.session_titles) |value| target.session_titles = value;
     if (incoming.auto_upgrade) |value| target.auto_upgrade = value;
     if (incoming.update_channel) |value| target.update_channel = value;
     if (incoming.startup_scrollback) |value| target.startup_scrollback = value;

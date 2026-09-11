@@ -1461,7 +1461,7 @@ fn writeSnapshotLocator(writer: *std.Io.Writer, value: ?[]const u8) !void {
 }
 
 fn writeExecutionMemory(writer: *std.Io.Writer, execution: session.ExecutionMemory) !void {
-    try writer.writeAll("{\"schema_version\":9,\"tool_steps\":[");
+    try writer.writeAll("{\"schema_version\":10,\"tool_steps\":[");
     for (execution.tool_steps, 0..) |step, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.writeAll("{\"assistant\":");
@@ -1536,6 +1536,9 @@ fn writeToolCall(writer: *std.Io.Writer, tool_call: session.ToolCall) !void {
 }
 
 fn writePersistedToolResult(writer: *std.Io.Writer, result: session.PersistedToolResult) !void {
+    if (result.review_feedback and (result.status != .failure or result.provider_native)) {
+        return error.InvalidSessionFormat;
+    }
     try writer.writeAll("{\"tool_call_id\":");
     try writeDurableBytes(writer, result.tool_call_id);
     try writer.writeAll(",\"tool_name\":");
@@ -1549,12 +1552,13 @@ fn writePersistedToolResult(writer: *std.Io.Writer, result: session.PersistedToo
     try writer.writeAll(",\"preview\":");
     try writeOptionalDurableBytes(writer, result.preview);
     try writer.print(
-        ",\"output_bytes\":{d},\"stored_output_bytes\":{d},\"truncated\":{s},\"provider_native\":{s},\"created_at_ms\":{d}",
+        ",\"output_bytes\":{d},\"stored_output_bytes\":{d},\"truncated\":{s},\"provider_native\":{s},\"review_feedback\":{s},\"created_at_ms\":{d}",
         .{
             result.output_bytes,
             result.stored_output_bytes,
             if (result.truncated) "true" else "false",
             if (result.provider_native) "true" else "false",
+            if (result.review_feedback) "true" else "false",
             result.created_at_ms,
         },
     );
@@ -1865,7 +1869,7 @@ fn parseExecutionMemory(alloc: Allocator, value: std.json.Value) !session.Execut
         1...4 => try exactObject(value, &.{ "schema_version", "tool_steps", "files" }),
         5 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "turn_summary" }),
         6 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
-        7...9 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
+        7...10 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
         else => return error.InvalidSessionFormat,
     };
     const tool_steps = try parseToolSteps(
@@ -2228,9 +2232,25 @@ fn parseToolResult(
             try exactObject(value, &(v4_keys.* ++ [_][]const u8{"tool_image_handle"}))
         else
             try exactObject(value, v4_keys), .extended = true },
+        10 => blk: {
+            const keys = v4_keys.* ++ [_][]const u8{"review_feedback"};
+            break :blk .{ .object = if (value == .object and value.object.contains("tool_images"))
+                try exactObject(value, &(keys ++ [_][]const u8{"tool_images"}))
+            else if (value == .object and value.object.contains("tool_image_handle"))
+                try exactObject(value, &(keys ++ [_][]const u8{"tool_image_handle"}))
+            else
+                try exactObject(value, &keys), .extended = true };
+        },
         else => return error.InvalidSessionFormat,
     };
     const object = result_shape.object;
+    const status = std.meta.stringToEnum(
+        session.PersistedToolStatus,
+        try requireString(object, "status"),
+    ) orelse return error.InvalidSessionFormat;
+    const provider_native = try requireBool(object, "provider_native");
+    const review_feedback = if (schema_version >= 10) try requireBool(object, "review_feedback") else false;
+    if (review_feedback and (status != .failure or provider_native)) return error.InvalidSessionFormat;
     const tool_call_id = try parseRequiredDurableBytes(alloc, object, "tool_call_id");
     errdefer alloc.free(tool_call_id);
     const tool_name = try parseRequiredDurableBytes(alloc, object, "tool_name");
@@ -2313,17 +2333,15 @@ fn parseToolResult(
         .tool_image_handle = tool_image_handle,
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
-        .status = std.meta.stringToEnum(
-            session.PersistedToolStatus,
-            try requireString(object, "status"),
-        ) orelse return error.InvalidSessionFormat,
+        .status = status,
         .output = output,
         .output_handle = output_handle,
         .preview = preview,
         .output_bytes = try requireUsize(object, "output_bytes"),
         .stored_output_bytes = try requireUsize(object, "stored_output_bytes"),
         .truncated = try requireBool(object, "truncated"),
-        .provider_native = try requireBool(object, "provider_native"),
+        .provider_native = provider_native,
+        .review_feedback = review_feedback,
         .created_at_ms = try requireI64(object, "created_at_ms"),
         .permission_feedback = permission_feedback,
         .committed_file_presentation = committed_file_presentation,
@@ -3457,6 +3475,99 @@ test "durable state rejects invalid metadata fields before returning" {
     }
 }
 
+test "review feedback survives durable execution memory round trip" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |review_feedback| {
+        var calls = [_]session.ToolCall{.{
+            .id = "call-review",
+            .name = "shell",
+            .arguments_json = "{}",
+        }};
+        var results = [_]session.PersistedToolResult{.{
+            .tool_call_id = @constCast("call-review"),
+            .tool_name = @constCast("shell"),
+            .status = .failure,
+            .output = @constCast("Security review held this action."),
+            .output_bytes = "Security review held this action.".len,
+            .stored_output_bytes = "Security review held this action.".len,
+            .review_feedback = review_feedback,
+        }};
+        var steps = [_]session.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+        var encoded: std.Io.Writer.Allocating = .init(alloc);
+        defer encoded.deinit();
+        try writeExecutionMemory(&encoded.writer, .{ .tool_steps = &steps });
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+        defer parsed.deinit();
+        const decoded = try parseExecutionMemory(alloc, parsed.value);
+        defer session.freeExecutionMemory(alloc, decoded);
+        const result = decoded.tool_steps[0].tool_results[0];
+        try std.testing.expectEqual(review_feedback, result.review_feedback);
+        try std.testing.expectEqualStrings("Security review held this action.", result.output);
+        try std.testing.expectEqual(session.PersistedToolStatus.failure, result.status);
+    }
+}
+
+test "review feedback durable codec rejects invalid provenance and unknown fields" {
+    const alloc = std.testing.allocator;
+    var result = persistedResultForTest("call-review", "shell");
+    result.status = .failure;
+    result.review_feedback = true;
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try writePersistedToolResult(&encoded.writer, result);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+    defer parsed.deinit();
+    const cases = [_]struct { status: []const u8, provider_native: bool, marker: std.json.Value }{
+        .{ .status = "success", .provider_native = false, .marker = .{ .bool = true } },
+        .{ .status = "failure", .provider_native = true, .marker = .{ .bool = true } },
+        .{ .status = "failure", .provider_native = false, .marker = .null },
+        .{ .status = "failure", .provider_native = false, .marker = .{ .integer = 1 } },
+        .{ .status = "failure", .provider_native = false, .marker = .{ .string = "true" } },
+    };
+    for (cases) |case| {
+        parsed.value.object.getPtr("status").?.* = .{ .string = case.status };
+        parsed.value.object.getPtr("provider_native").?.* = .{ .bool = case.provider_native };
+        parsed.value.object.getPtr("review_feedback").?.* = case.marker;
+        try std.testing.expectError(error.InvalidSessionFormat, parseToolResult(alloc, parsed.value, 10));
+    }
+    parsed.value.object.getPtr("status").?.* = .{ .string = "failure" };
+    parsed.value.object.getPtr("review_feedback").?.* = .{ .bool = true };
+    try parsed.value.object.put(parsed.arena.allocator(), "unknown_feedback", .{ .bool = true });
+    try std.testing.expectError(error.InvalidSessionFormat, parseToolResult(alloc, parsed.value, 10));
+    for ([_]bool{ false, true }) |native| {
+        var invalid = result;
+        invalid.status = if (native) .failure else .success;
+        invalid.provider_native = native;
+        try std.testing.expectError(error.InvalidSessionFormat, writePersistedToolResult(&encoded.writer, invalid));
+    }
+}
+
+test "review feedback defaults old durable results without inspecting output" {
+    const alloc = std.testing.allocator;
+    var result = persistedResultForTest("call-review", "shell");
+    result.status = .failure;
+    result.output = @constCast("Security review held this action.");
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try writePersistedToolResult(&encoded.writer, result);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.swapRemove("review_feedback"));
+    for ([_]u64{ 8, 9 }) |version| {
+        const decoded = try parseToolResult(alloc, parsed.value, version);
+        defer {
+            alloc.free(decoded.tool_call_id);
+            alloc.free(decoded.tool_name);
+            alloc.free(decoded.output);
+            types.freeToolImages(alloc, decoded.tool_images);
+        }
+        try std.testing.expect(!decoded.review_feedback);
+        try std.testing.expectEqualStrings("Security review held this action.", decoded.output);
+    }
+    try parsed.value.object.put(parsed.arena.allocator(), "review_feedback", .{ .bool = true });
+    try std.testing.expectError(error.InvalidSessionFormat, parseToolResult(alloc, parsed.value, 9));
+}
+
 test "execution memory codec preserves feedback and reads v1 results without it" {
     const alloc = std.testing.allocator;
     const provider_state = types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"kept\"}]" };
@@ -3528,7 +3639,7 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     var encoded: std.Io.Writer.Allocating = .init(alloc);
     defer encoded.deinit();
     try writeHistoryTurn(&encoded.writer, turn);
-    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"schema_version\":9") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"schema_version\":10") != null);
     try std.testing.expect(std.mem.find(u8, encoded.written(), "\"text\":\"focus on persistence\"") != null);
     try std.testing.expect(std.mem.find(u8, encoded.written(), "\"assistant_prefix\":\"partial assistant\"") != null);
     try std.testing.expect(std.mem.find(u8, encoded.written(), "\"after_tool_step_count\":1") != null);
@@ -3590,6 +3701,7 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     const legacy_execution = parsed.value.object.getPtr("execution").?;
     legacy_execution.object.getPtr("schema_version").?.* = .{ .integer = 8 };
     try std.testing.expect(legacy_execution.object.getPtr("tool_steps").?.array.items[0].object.swapRemove("provider_replay"));
+    try std.testing.expect(legacy_execution.object.getPtr("tool_steps").?.array.items[0].object.getPtr("tool_results").?.array.items[0].object.swapRemove("review_feedback"));
     const v8_decoded = try parseHistoryTurn(alloc, parsed.value);
     defer session.freeHistoryTurn(alloc, v8_decoded);
     try std.testing.expect(v8_decoded.assistant.provider_replay == null);
@@ -4233,6 +4345,7 @@ fn expectExecutionMemoryEqual(expected: session.ExecutionMemory, actual: session
             try std.testing.expectEqual(result.stored_output_bytes, got_result.stored_output_bytes);
             try std.testing.expectEqual(result.truncated, got_result.truncated);
             try std.testing.expectEqual(result.provider_native, got_result.provider_native);
+            try std.testing.expectEqual(result.review_feedback, got_result.review_feedback);
             try std.testing.expectEqual(result.created_at_ms, got_result.created_at_ms);
         }
     }

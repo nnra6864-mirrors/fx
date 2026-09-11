@@ -465,6 +465,14 @@ const App = struct {
             .agent_stream_or_unavailable();
     }
 
+    /// Fixed low-cost model the active provider uses for session title
+    /// generation; null when the provider does not support generated titles.
+    pub fn sessionTitleModel(self: *const Self) ?[]const u8 {
+        return self.providerSet()
+            .select(self.provider_selection.selection().provider)
+            .title_model;
+    }
+
     pub fn providerCatalog(self: *Self, provider: model_provider.ProviderId) ?model_catalog.Provider {
         return self.providerSet().select(provider).model_catalog;
     }
@@ -575,6 +583,9 @@ const App = struct {
 
     statusline_context: bool = false,
     statusline_session: bool = false,
+    /// Resolved `session_titles` preference: generate a model-written session
+    /// title from the first prompt of a fresh session.
+    session_title_generation: bool = true,
     /// Resolved display title for the active session. App owns these bytes;
     /// empty means no title has been derived or restored yet.
     session_title: std.ArrayList(u8) = .empty,
@@ -1365,6 +1376,9 @@ const App = struct {
         turn_id: u64,
         user_prompt_already_presented: bool,
     ) !worker_runtime.QueuedPrompt {
+        if (recovery_checkpoint == null) {
+            SessionAppRuntime.maybeStartSessionTitleGeneration(self, prompt);
+        }
         const source_images = if (recovery_checkpoint) |checkpoint|
             checkpoint.user.images
         else if (prompt_images) |images|
@@ -2960,6 +2974,9 @@ const App = struct {
 
         if (comptime !host_target.is_wasm) {
             try SessionAppRuntime.pollSessionPicker(self);
+            if (try SessionAppRuntime.pollSessionTitleGeneration(self)) {
+                RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
+            }
         }
         try self.shell.prewarmFullTranscriptPage(
             self.fullTranscriptSidecarCapability(),
@@ -4215,6 +4232,7 @@ test {
     _ = @import("core/slash_commands/command_specs.zig");
     _ = @import("core/config/config_runtime.zig");
     _ = @import("core/config/settings_store.zig");
+    _ = @import("core/session/session_title_generation.zig");
     _ = @import("ui/footer/compact_command_menu_presentation.zig");
     _ = @import("ui/footer/settings_menu_presentation.zig");
     _ = @import("builtins/context.zig");

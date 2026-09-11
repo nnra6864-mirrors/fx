@@ -325,11 +325,38 @@ export type FakeGatewayOptions = {
       | Promise<FakeGatewayModel[] | Response>);
   classifierDecision?: "clear" | "caution";
   classifierResponses?: FakeGatewayResponse[];
+  titleResponses?: FakeGatewayResponse[];
   generationResponse?: (
     generationId: string,
     request: Request,
   ) => Response | Promise<Response>;
 };
+
+// Session title generation calls carry this instruction regardless of the
+// provider protocol. Fake servers route them to their own channel so they
+// never consume queued completion responses; the default is a finish-only
+// stream so the call completes without text deltas (which would pollute
+// SSE trace assertions) and without a usable title, leaving the locally
+// derived title in place for tests that do not opt in.
+export const TITLE_GENERATION_MARKER = "Generate a short title";
+
+export function fakeGatewayTitleDefault() {
+  return fakeGatewaySse([{
+    type: "finish",
+    finishReason: { unified: "stop", raw: "stop" },
+    usage: { inputTokens: { total: 2 }, outputTokens: { total: 0 } },
+  }]);
+}
+
+// Finish-only Responses-protocol stream for title generation side calls at
+// Codex/Grok fake servers: completes without text deltas and without usable
+// title content, leaving the locally derived session title in place.
+export function fakeResponsesTitleDefault() {
+  return new Response(
+    'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":2,"output_tokens":0}}}\n\n',
+    { headers: { "content-type": "text/event-stream" } },
+  );
+}
 
 function serveFakeGateway(
   nextCompletion: (body: string) => Response | Promise<Response>,
@@ -338,6 +365,8 @@ function serveFakeGateway(
   const requests: Array<{ body: string; headers: Headers }> = [];
   const classifierRequests: Array<{ body: string; headers: Headers }> = [];
   const classifierResponses = [...(options.classifierResponses ?? [])];
+  const titleRequests: Array<{ body: string; headers: Headers }> = [];
+  const titleResponses = [...(options.titleResponses ?? [])];
   const modelRequests: FakeGatewayModelRequest[] = [];
   const generationRequests: string[] = [];
   const server = Bun.serve({
@@ -375,6 +404,12 @@ function serveFakeGateway(
         if (next) return typeof next === "function" ? await next(body) : next;
         return fakeGatewayPermissionDecision(options.classifierDecision ?? "clear");
       }
+      if (body.includes(TITLE_GENERATION_MARKER)) {
+        titleRequests.push({ body, headers });
+        const next = titleResponses.shift();
+        if (next) return typeof next === "function" ? await next(body) : next;
+        return fakeGatewayTitleDefault();
+      }
       requests.push({ body, headers });
       return nextCompletion(body);
     },
@@ -384,6 +419,7 @@ function serveFakeGateway(
     chatUrl: `http://127.0.0.1:${server.port}/v4/ai/language-model`,
     requests,
     classifierRequests,
+    titleRequests,
     generationRequests,
     modelRequests,
     requestCount() {

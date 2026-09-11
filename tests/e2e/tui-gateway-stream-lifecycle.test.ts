@@ -3855,7 +3855,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(continuedParts.filter((part) => part.type === "file")).toEqual([{
         type: "file",
         mediaType: "image/png",
-        data: expectedImageData,
+        data: { type: "data", data: expectedImageData },
       }]);
       expect(continuedBody).toContain("RICH_STEERING_TOOL_DONE");
       expect(continuedBody).toContain("<user_steering>");
@@ -4149,7 +4149,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(steeringParts.filter((part) => part.type === "file")).toEqual([{
         type: "file",
         mediaType: "image/png",
-        data: expectedImageData,
+        data: { type: "data", data: expectedImageData },
       }]);
       expect(steeringBody).toContain("<user_steering>");
       expect(steeringBody).not.toContain("<turn_aborted>");

@@ -14,7 +14,7 @@ import {
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { FX_BIN, REPO_ROOT } from "../../evals/eval-helpers";
-import { isVolatileTokenStatusRow } from "../tmux-helpers";
+import { fakeGatewayTitleDefault, isVolatileTokenStatusRow, TITLE_GENERATION_MARKER } from "../tmux-helpers";
 import {
   ACTIVE_TOOL_MARKER,
   analyzeRun,
@@ -1655,6 +1655,11 @@ function startLocalGatewayFixture(expectedPromptTail: string): LocalGatewayFixtu
     idleTimeout: 0,
     async fetch(request) {
       const url = new URL(request.url);
+      // Title generation side calls never count as scenario gateway traffic.
+      if (request.method === "POST" && url.pathname === LOCAL_GATEWAY_CHAT_PATH) {
+        const bodyPeek = await request.clone().text();
+        if (bodyPeek.includes(TITLE_GENERATION_MARKER)) return fakeGatewayTitleDefault();
+      }
       requests.push(`${request.method} ${url.pathname}`);
 
       if (request.method === "GET" && url.pathname === LOCAL_GATEWAY_MODELS_PATH) {
@@ -1730,6 +1735,10 @@ function startActiveToolGatewayFixture(): LocalGatewayFixture {
     port: 0,
     async fetch(request) {
       const url = new URL(request.url);
+      if (request.method === "POST" && url.pathname === LOCAL_GATEWAY_CHAT_PATH) {
+        const bodyPeek = await request.clone().text();
+        if (bodyPeek.includes(TITLE_GENERATION_MARKER)) return fakeGatewayTitleDefault();
+      }
       if (request.method === "GET" && url.pathname === LOCAL_GATEWAY_MODELS_PATH) {
         requests.push(`${request.method} ${url.pathname}`);
         return Response.json({ data: [{ id: "anthropic/claude-opus-4.7", type: "language", released: 1, tags: ["tool-use"] }] });
@@ -1807,6 +1816,10 @@ function startObservabilityGatewayFixture(
     idleTimeout: 0,
     async fetch(request) {
       const url = new URL(request.url);
+      if (request.method === "POST" && url.pathname === LOCAL_GATEWAY_CHAT_PATH) {
+        const bodyPeek = await request.clone().text();
+        if (bodyPeek.includes(TITLE_GENERATION_MARKER)) return fakeGatewayTitleDefault();
+      }
       if (request.method === "GET" && url.pathname === LOCAL_GATEWAY_MODELS_PATH) {
         requests.push(`${request.method} ${url.pathname}`);
         return Response.json({

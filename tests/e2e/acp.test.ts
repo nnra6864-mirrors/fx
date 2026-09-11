@@ -39,6 +39,8 @@ import {
   fakeShellRun,
   startDynamicFakeGateway,
   startFakeGateway,
+  fakeResponsesTitleDefault,
+  TITLE_GENERATION_MARKER,
   terminalFixtureShell,
   TmuxSession,
   tmuxAvailable,
@@ -374,6 +376,7 @@ function codexFinalText(text: string): string {
     'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":4,"output_tokens":2}}}\n\n';
 }
 
+
 function codexToolCall(callId: string, name: string, args: object): string {
   return `data: ${JSON.stringify({
     type: "response.output_item.added",
@@ -406,6 +409,7 @@ function startAcpFakeCodex(options: {
   const accessToken = acpChatGptAccessToken("acct_acp_e2e", "stale");
   const refreshedAccessToken = acpChatGptAccessToken("acct_acp_e2e", "fresh");
   const requests: Array<{ path: string; authorization: string | null; body: string }> = [];
+  const titleRequests: Array<{ path: string; authorization: string | null; body: string }> = [];
   const modelRequests: Array<{ path: string; authorization: string | null }> = [];
   const tokenRequests: Array<{ path: string; authorization: string | null }> = [];
   let unauthorizedResponses = options.unauthorizedResponses ?? 0;
@@ -434,6 +438,10 @@ function startAcpFakeCodex(options: {
         });
       }
       const body = await request.text();
+      if (body.includes(TITLE_GENERATION_MARKER)) {
+        titleRequests.push({ ...recorded, body });
+        return fakeResponsesTitleDefault();
+      }
       requests.push({ ...recorded, body });
       if (unauthorizedResponses > 0) {
         unauthorizedResponses -= 1;
@@ -449,6 +457,7 @@ function startAcpFakeCodex(options: {
     accessToken,
     refreshedAccessToken,
     requests,
+    titleRequests,
     modelRequests,
     tokenRequests,
     responsesUrl: `http://127.0.0.1:${server.port}/responses`,
@@ -511,6 +520,18 @@ function startAcpFakeGrok(options: {
     modelOverride: string | null;
     grokUserId: string | null;
   }> = [];
+  const titleRequests: Array<{
+    path: string;
+    authorization: string | null;
+    body: string;
+    conversationId: string | null;
+    tokenAuth: string | null;
+    authenticateResponse: string | null;
+    clientIdentifier: string | null;
+    clientVersion: string | null;
+    modelOverride: string | null;
+    grokUserId: string | null;
+  }> = [];
   const modelRequests: Array<{ path: string; authorization: string | null }> = [];
   const tokenRequests: Array<{ path: string; authorization: string | null; body: string }> = [];
   const userinfoRequests: Array<{ path: string; authorization: string | null }> = [];
@@ -543,6 +564,21 @@ function startAcpFakeGrok(options: {
         return Response.json({ sub: "acct_grok_acp" });
       }
       const body = await request.text();
+      if (body.includes(TITLE_GENERATION_MARKER)) {
+        titleRequests.push({
+          path,
+          authorization,
+          body,
+          conversationId: request.headers.get("x-grok-conv-id"),
+          tokenAuth: request.headers.get("x-xai-token-auth"),
+          authenticateResponse: request.headers.get("x-authenticateresponse"),
+          clientIdentifier: request.headers.get("x-grok-client-identifier"),
+          clientVersion: request.headers.get("x-grok-client-version"),
+          modelOverride: request.headers.get("x-grok-model-override"),
+          grokUserId: request.headers.get("x-grok-user-id"),
+        });
+        return fakeResponsesTitleDefault();
+      }
       requests.push({
         path,
         authorization,
@@ -569,6 +605,7 @@ function startAcpFakeGrok(options: {
     accessToken,
     refreshedAccessToken,
     requests,
+    titleRequests,
     modelRequests,
     tokenRequests,
     userinfoRequests,
@@ -1243,6 +1280,43 @@ describe("acp: model-independent", () => {
         expect(gateway.requests[0]!.headers.get("authorization")).toBeNull();
         expect(gateway.requests[0]!.headers.get("x-vercel-ai-gateway-team")).toBeNull();
         expect(existsSync(join(root.home, ".fx", "auth.json"))).toBe(false);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP session adopts a generated title from the first prompt",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-session-title-");
+      const gateway = startDynamicFakeGateway(_raw => finalText("ACP_MAIN_ANSWER_OK"), {
+        titleResponses: [finalText("ACP Generated Title")],
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine();
+        const result = await runPrompt(client, "Name this conversation for me.", TIMEOUT);
+
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(result.messages)).toContain("ACP_MAIN_ANSWER_OK");
+        expect(JSON.stringify(result.messages)).toContain("ACP Generated Title");
+
+        const sessionsDir = join(root.home, ".fx", "sessions");
+        const titles = readdirSync(sessionsDir)
+          .map(id => join(sessionsDir, id, "session.json"))
+          .filter(path => existsSync(path))
+          .map(path => JSON.parse(readFileSync(path, "utf8")).title);
+        expect(titles).toContain("ACP Generated Title");
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();

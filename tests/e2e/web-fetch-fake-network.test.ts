@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { fakeGatewayTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 
 const TIMEOUT = 20_000;
 const FETCH_URL = "https://example.com/docs";
@@ -89,7 +90,9 @@ function startFakeGateway(
         });
       }
       if (req.method !== "POST") return new Response("not found", { status: 404 });
-      requests.push({ body: await req.text(), headers: req.headers });
+      const body = await req.text();
+      if (body.includes(TITLE_GENERATION_MARKER)) return fakeGatewayTitleDefault();
+      requests.push({ body, headers: req.headers });
       return responses.shift() ?? new Response("unexpected request", { status: 500 });
     },
   });

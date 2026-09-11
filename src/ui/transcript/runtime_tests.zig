@@ -10357,17 +10357,47 @@ test "recorded assistant stream slow path preserves a canonical anchor when rete
         committed_prepared.cursor.cursor_col,
         1,
     );
+    // The synthetic anchor helper does not seal a source. Supply the same
+    // entry identity as a real sealed frame before exercising retention.
+    runtime.transcript_commit_state.stable.retention_identity = try @import("source_preparation.zig").RetentionIdentity.capture(&runtime, alloc, &committed_source);
+    try committed_source.ensureLineIndex(alloc);
     const committed_history_visual_offset = try stableHistoryVisualOffsetForTest(&runtime);
+    const user_start = for (committed_source.line_provenance, 0..) |identity, index| {
+        if (identity == .entry and identity.entry.entry_id == user_id) break index;
+    } else return error.TestExpectedUserEntry;
+    const removed_rows = committed_source.transcript_visual_row_offsets[user_start];
+    try std.testing.expect(removed_rows > 0);
+    const old_boundary = committed_source.byteAtVisualOffset(committed_history_visual_offset);
+    const old_suffix = committed_source.bytes[old_boundary..];
+    const boundary_row = old_suffix[0..std.mem.findScalar(u8, old_suffix, '\n').?];
+    try std.testing.expect(std.mem.find(u8, boundary_row, "long-paste-line-34") != null);
 
     const chunk = "trimmed assistant tail";
     runtime.max_retained_transcript_bytes =
         transcript_store.retainedStructuredBytes(&runtime) + chunk.len - old_prefix.len;
     const assistant_id = try runtime.streamAssistantChunk(alloc, &metrics, chunk);
 
-    try expectStableNormalBufferRecoveryForTest(
-        &runtime,
-        committed_history_visual_offset,
+    var rebased_source = (try runtime.prepareCommittedRetentionSource(alloc)) orelse
+        return error.TestExpectedStableTranscript;
+    defer rebased_source.deinit(alloc);
+    const rebased = runtime.transcript_commit_state.stable;
+    try std.testing.expectEqual(committed_history_visual_offset - removed_rows, rebased.history_visual_offset);
+    try std.testing.expectEqual(rebased.history_visual_offset, rebased.visual_offset);
+    try std.testing.expectEqualStrings(
+        committed_source.bytes[committed_source.hard_line_starts[user_start]..],
+        rebased_source.bytes,
     );
+    try std.testing.expectEqualStrings(
+        committed_source.bytes[old_boundary..],
+        rebased_source.bytes[rebased_source.byteAtVisualOffset(rebased.history_visual_offset)..],
+    );
+    const boundary_identity = rebased_source.line_provenance[rebased.selection.start_line];
+    try std.testing.expect(boundary_identity == .entry);
+    try std.testing.expectEqual(user_id, boundary_identity.entry.entry_id);
+    try std.testing.expectEqual(transcript_blocks.TranscriptEntryClass.user_turn, boundary_identity.entry.entry_class);
+    try std.testing.expect(rebased.flow_materialized);
+    try std.testing.expect(!rebased.normal_buffer_recovery_pending);
+    try std.testing.expect(std.mem.find(u8, rebased_source.bytes, chunk) == null);
     try std.testing.expect(
         transcript_store.retainedStructuredBytes(&runtime) <=
             runtime.max_retained_transcript_bytes,

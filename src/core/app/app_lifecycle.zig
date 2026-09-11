@@ -151,6 +151,7 @@ pub const StartupState = struct {
     statusline_context: bool = false,
     statusline_session: bool = false,
     statusline_workspace: bool = false,
+    session_title_generation: bool = true,
     notification_turn_end: bool = false,
     notification_attention_required: bool = false,
     notification_max: bool = false,
@@ -566,6 +567,7 @@ fn loadStartupStateFromOwnedWorkspace(
     state.statusline_context = settings.statusline_context orelse false;
     state.statusline_session = settings.statusline_session orelse false;
     state.statusline_workspace = settings.statusline_workspace orelse false;
+    state.session_title_generation = settings.session_titles orelse true;
     const sound_override = soundEnvOverride();
     const sound_on_override: ?bool = if (sound_override) |level| level != .off else null;
     const max_override: ?bool = if (sound_override) |level| level == .max else null;

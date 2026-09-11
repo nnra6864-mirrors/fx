@@ -299,6 +299,9 @@ pub fn Runtime(comptime App: type) type {
             app_permission_runtime.Runtime(App).initializeYoloWarning(app);
             app.statusline_context = startup.statusline_context;
             app.statusline_session = startup.statusline_session;
+            if (comptime @hasField(App, "session_title_generation")) {
+                app.session_title_generation = startup.session_title_generation;
+            }
             if (comptime @hasField(App, "workspace_identity")) {
                 app.workspace_identity.enabled = startup.statusline_workspace;
             }
@@ -913,7 +916,7 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
     try std.testing.expectEqualStrings("title", events[5]);
     try std.testing.expectEqual(@as(usize, 1), capture.begin_calls);
     try std.testing.expectEqual(@as(usize, 1), capture.enable_calls);
-    try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", capture.titleText());
+    try std.testing.expectEqualStrings("fx v" ++ build_options.app_version ++ " | workspace", capture.titleText());
 
     try std.testing.expectEqualStrings("/workspace", app.workspace_root);
     try std.testing.expectEqualStrings("api-key", app.auth.apiKey().?);

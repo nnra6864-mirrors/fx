@@ -28,6 +28,7 @@ const image_attachments = @import("../images/image_attachments.zig");
 const hooks = @import("../hooks/hooks.zig");
 const notification_sound = @import("../notifications/sound.zig");
 const io_mod = @import("../shared/io.zig");
+const session_title_generation = @import("../session/session_title_generation.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -1784,6 +1785,13 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     const deps = agentRuntimeDeps(&ctx);
     const semantic_presentation = if (ctx.presenter) |value| value.semanticSink() else null;
     try ctx.checkCancellation();
+    const title_task = maybeStartAskTitleTask(
+        &ctx,
+        startup.session_title_generation,
+        owned_prompt,
+        recovery_checkpoint == null and options.save_session and ctx.requested_resume == null,
+    );
+    defer if (title_task) |task| completeAskTitleTask(&ctx, task);
     const current_prompt_is_root_authority = if (ctx.writable) |writable|
         writable.external_prompt_origin == .persistent_child and
             recovery_checkpoint == null
@@ -1854,6 +1862,69 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     var result = try takePromptRunResult(&ctx, alloc);
     finalizeFreshAuthSession(&ctx, &result);
     return result;
+}
+
+/// Starts background title generation for a fresh saved session. The task runs
+/// concurrently with the first turn and is applied by `completeAskTitleTask`
+/// on every exit path. The locally derived title remains when generation is
+/// skipped or unavailable.
+fn maybeStartAskTitleTask(
+    ctx: *AskContext,
+    setting_enabled: bool,
+    prompt: []const u8,
+    fresh_session: bool,
+) ?*session_title_generation.Task {
+    // Unit tests share the real provider bundles; never spawn network side
+    // calls from a test process. Wiring is covered by e2e mock servers.
+    if (comptime @import("builtin").is_test) return null;
+    if (comptime @import("builtin").os.tag == .wasi) return null;
+    if (!setting_enabled or !fresh_session) return null;
+    if (ctx.session.agent.history.items.len != 0) return null;
+    const writable = if (ctx.writable) |*value| value else return null;
+    const bundle = ctx.cfg.provider_set.select(ctx.provider);
+    const title_model = bundle.title_model orelse return null;
+    const agent_stream = bundle.agent_stream orelse return null;
+    const excerpt = session_title_generation.promptExcerpt(prompt) orelse return null;
+    if (ctx.credential_source != .host_managed and ctx.api_key.len == 0) return null;
+    const task = session_title_generation.Task.create(.{
+        .session_id = writable.active_id,
+        .model = title_model,
+        .prompt_excerpt = excerpt,
+        .api_key = if (ctx.api_key.len > 0) ctx.api_key else null,
+        .gateway_team = ctx.gateway_team,
+        .account_id = ctx.account_id,
+        .credential_source = ctx.credential_source,
+        .stream_provider = agent_stream,
+    }) catch return null;
+    task.spawn() catch |err| {
+        debug_trace.logf("session", "event=title_generation result=unavailable reason=spawn err={s}", .{@errorName(err)});
+        task.destroy();
+        return null;
+    };
+    return task;
+}
+
+/// Joins the bounded title task and installs the generated title unless the
+/// session already carries a user-set title.
+fn completeAskTitleTask(ctx: *AskContext, task: *session_title_generation.Task) void {
+    defer task.destroy();
+    task.join();
+    const title = task.takeTitle() orelse return;
+    defer std.heap.c_allocator.free(title);
+    ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.session_write_mutex.unlock(io_mod.getIo());
+    const writable = if (ctx.writable) |*value| value else return;
+    if (!std.mem.eql(u8, writable.active_id, task.session_id)) {
+        debug_trace.logf("session", "event=title_generation_apply result=dropped reason=session_changed session={s}", .{task.session_id});
+        return;
+    }
+    const installed = session_title_generation.installGeneratedTitle(ctx.alloc, writable, ctx.session.agent.history.items, title) catch |err| {
+        debug_trace.logf("session", "event=title_generation_apply result=failed session={s} err={s}", .{ task.session_id, @errorName(err) });
+        return;
+    };
+    if (installed) {
+        debug_trace.logf("session", "event=title_generation_apply result=installed session={s}", .{task.session_id});
+    }
 }
 
 fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {

@@ -349,6 +349,10 @@ Security is permission-first.
 
 * exact cautions and deterministic incomplete-evidence results are cached only for the current turn; an unavailable outcome is not cached as a security judgment, but the same exact action spends at most one unavailable transport attempt per turn and changed actions remain independently reviewable until the bounded current-turn transport budget is exhausted. Legacy `permission_request_id` input is rejected without prompting
 
+* host-generated review holds retain their advice for the agent and transcript, but carry a saved `review_feedback` marker that excludes them from later security evidence, including after recovery. Old unmarked results remain untrusted evidence; never infer the marker from output text. Quoted review accusations and handling instructions as document or test data are not standalone proof of prompt injection
+
+* execution-memory schema 10 preserves review-feedback provenance while reading older schemas with an unmarked default. Conversation records use optional metadata for marked holds. Older builds may reject the new saved metadata or recovery checkpoints; do not downgrade an active session without preserving its files
+
 * the sandbox backend is configured independently; full access uses an effective backend of `none` without rewriting the saved sandbox setting
 
 Do not add new sensitive tool behavior without integrating it into `src/core/permissions/permissions.zig`.

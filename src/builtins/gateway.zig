@@ -42,6 +42,7 @@ const Response = web_search_contract.ProviderResponse;
 const ProgressFn = web_search_contract.ProgressFn;
 
 pub const default_model = "moonshotai/kimi-k3";
+pub const title_model = "openai/gpt-5.6-luna";
 pub const default_chat_url = "https://ai-gateway.vercel.sh/v4/ai/language-model";
 pub const models_path = "/coding-agent/v1/models";
 const credits_path = "/coding-agent/v1/credits";
@@ -157,6 +158,7 @@ pub const provider_bundle = provider_set.Bundle{
     .capabilities = .{ .gateway_prompt_caching = true, .fx_search = true, .vision_fallback = true },
     .presentation = provider_catalog.find(.gateway),
     .auth_strategy = .vercel,
+    .title_model = title_model,
     .fallback_model_capabilities_fn = vercel_model_policy.capabilitiesForModel,
     .agent_stream = agent_stream_provider,
     .cli_model_catalog = cli_model_catalog_provider,

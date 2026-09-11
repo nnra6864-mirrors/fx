@@ -107,6 +107,7 @@ pub const UserSettingsPatch = struct {
     startup_scrollback: ?bool = null,
     prompt_history_enabled: ?bool = null,
     statusline_item: ?StatuslineItemPatch = null,
+    session_titles: ?bool = null,
     notification_turn_end: ?bool = null,
     notification_attention_required: ?bool = null,
     notification_max: ?bool = null,
@@ -126,6 +127,7 @@ pub const UserSettingsPatch = struct {
             self.startup_scrollback == null and
             self.prompt_history_enabled == null and
             self.statusline_item == null and
+            self.session_titles == null and
             self.notification_turn_end == null and
             self.notification_attention_required == null and
             self.notification_max == null;
@@ -220,6 +222,7 @@ const UserPreferenceField = enum(u4) {
     prompt_history_enabled,
     statusline_context,
     statusline_session,
+    session_titles,
 
     fn mask(self: UserPreferenceField) u16 {
         return @as(u16, 1) << @intFromEnum(self);
@@ -238,6 +241,7 @@ const UserPreferenceField = enum(u4) {
             .prompt_history_enabled => "settings.json.preference-migration.prompt_history_enabled.json",
             .statusline_context => "settings.json.preference-migration.statusline_context.json",
             .statusline_session => "settings.json.preference-migration.statusline_session.json",
+            .session_titles => "settings.json.preference-migration.session_titles.json",
         };
     }
 };
@@ -254,6 +258,7 @@ const user_preference_fields = [_]UserPreferenceField{
     .prompt_history_enabled,
     .statusline_context,
     .statusline_session,
+    .session_titles,
 };
 
 const SettingsMutation = union(enum) {
@@ -1030,6 +1035,7 @@ fn applyUserPatchToRoot(
     if (patch.collapse_tool_calls) |value| application.changed = try putBool(arena, &root.object, "collapse_tool_calls", value) or application.changed;
     if (patch.update_channel) |value| application.changed = try putString(arena, &root.object, "update_channel", value.label()) or application.changed;
     if (patch.startup_scrollback) |value| application.changed = try putBool(arena, &root.object, "startup_scrollback", value) or application.changed;
+    if (patch.session_titles) |value| application.changed = try putBool(arena, &root.object, "session_titles", value) or application.changed;
 
     if (patch.prompt_history_enabled) |enabled| {
         var prompt_history = if (root.object.getPtr("prompt_history")) |value| blk: {
@@ -1178,6 +1184,13 @@ fn cleanupLegacyWorkspacePreferences(
             "startup_scrollback",
             .startup_scrollback,
             patch.startup_scrollback != null,
+            application,
+        );
+        removeLegacyLeaf(
+            &entry.value_ptr.object,
+            "session_titles",
+            .session_titles,
+            patch.session_titles != null,
             application,
         );
         removeLegacyNestedLeaf(

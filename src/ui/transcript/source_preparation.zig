@@ -3,6 +3,7 @@ const command_output_runtime = @import("command_output_runtime.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const transcript_release = @import("../../core/output/transcript_release.zig");
 const build_checkpoint = @import("../render_engine/build_checkpoint.zig");
+const assistant_wrap = @import("../render_engine/assistant_wrap.zig");
 const tool_group_projection = @import("tool_group_projection.zig");
 const render_engine = @import("../render_engine.zig");
 const user_message_card = @import("../assistant/user_message_card.zig");
@@ -204,6 +205,42 @@ fn collectFinalityNominations(
     return nominations;
 }
 
+/// Coordinates for the one committed/attempted source, not another text history.
+/// Text remains owned by the recorded entries and the existing committed flow.
+pub const RetentionIdentity = struct {
+    pub const TextExtent = struct { entry_id: u32, bytes: usize };
+    lines: []const transcript_blocks.LineProvenance = &.{},
+    text_extents: []TextExtent = &.{},
+
+    pub fn deinit(self: *RetentionIdentity, alloc: Allocator) void {
+        alloc.free(self.lines);
+        alloc.free(self.text_extents);
+        self.* = .{};
+    }
+
+    pub fn clone(self: RetentionIdentity, alloc: Allocator) !RetentionIdentity {
+        const lines = try alloc.dupe(transcript_blocks.LineProvenance, self.lines);
+        errdefer alloc.free(lines);
+        return .{ .lines = lines, .text_extents = try alloc.dupe(TextExtent, self.text_extents) };
+    }
+
+    pub fn capture(self: anytype, alloc: Allocator, source: *const TranscriptPreparationSource) !RetentionIdentity {
+        var extents: std.ArrayList(TextExtent) = .empty;
+        errdefer extents.deinit(alloc);
+        for (self.entries.items) |entry| {
+            const bytes = switch (entry) {
+                .assistant_turn => |value| value.segments.text.items.len,
+                .raw_bytes => |value| value.bytes.len,
+                else => continue,
+            };
+            try extents.append(alloc, .{ .entry_id = entry.id(), .bytes = bytes });
+        }
+        const lines = try alloc.dupe(transcript_blocks.LineProvenance, source.line_provenance);
+        errdefer alloc.free(lines);
+        return .{ .lines = lines, .text_extents = try extents.toOwnedSlice(alloc) };
+    }
+};
+
 pub const TranscriptPreparationSource = struct {
     bytes: []u8,
     folded_summary_indices: []usize,
@@ -278,6 +315,17 @@ pub const TranscriptPreparationSource = struct {
         self.transcript_visual_row_offsets = visual_row_offsets;
     }
 
+    pub fn byteAtVisualOffset(self: *const TranscriptPreparationSource, offset: u32) usize {
+        var line: usize = 0;
+        while (line < self.hard_line_starts.len) : (line += 1) {
+            if (self.transcript_visual_row_offsets[line + 1] <= offset) continue;
+            const start = self.hard_line_starts[line];
+            const end = if (line + 1 < self.hard_line_starts.len) self.hard_line_starts[line + 1] else self.bytes.len;
+            return start + transcript_blocks.skipVisualRowsInLine(self.bytes[start..end], self.cols, @intCast(offset - self.transcript_visual_row_offsets[line]));
+        }
+        return self.bytes.len;
+    }
+
     pub fn clone(self: *const TranscriptPreparationSource, alloc: Allocator) !TranscriptPreparationSource {
         const bytes = try alloc.dupe(u8, self.bytes);
         errdefer alloc.free(bytes);
@@ -336,6 +384,266 @@ pub fn prepareTranscriptSource(
         error.InputPending => unreachable,
         else => |other| return other,
     };
+}
+
+/// Retention needs entry identity even when diagnostic observation is disabled.
+pub fn prepareRetentionSource(self: anytype, alloc: Allocator) !TranscriptPreparationSource {
+    var source = try prepareTranscriptSourceInternal(self, alloc, null, null, null, null);
+    errdefer source.deinit(alloc);
+    try source.ensureLineIndex(alloc);
+    return source;
+}
+
+/// Maps boundaries through the producer's retained version of the same source.
+/// Entry identity, not rendered text equality, determines which rows survive.
+pub const RetentionEntryRows = struct {
+    entry_id: u32,
+    removed_bytes: usize,
+    before: []const usize,
+    retained: []const usize,
+    raw_before: ?[]const u8 = null,
+    raw_retained: []const u8 = &.{},
+    assistant_before: ?assistant_wrap.RetentionSourceMap = null,
+    assistant_retained: ?assistant_wrap.RetentionSourceMap = null,
+};
+
+pub const RetentionRebase = struct {
+    before: *const TranscriptPreparationSource,
+    retained: *const TranscriptPreparationSource,
+    entry_rows: []const RetentionEntryRows = &.{},
+    retained_ranges: std.AutoHashMapUnmanaged(EntryIdentity, Range) = .empty,
+
+    const EntryIdentity = @FieldType(transcript_blocks.LineProvenance, "entry");
+    const Range = struct { start: usize, end: usize };
+
+    pub fn init(alloc: Allocator, before: *const TranscriptPreparationSource, retained: *const TranscriptPreparationSource, entry_rows: []const RetentionEntryRows) !RetentionRebase {
+        var result = RetentionRebase{ .before = before, .retained = retained, .entry_rows = entry_rows };
+        errdefer result.deinit(alloc);
+        for (retained.line_provenance, 0..) |identity, index| {
+            if (identity != .entry) continue;
+            const range = try result.retained_ranges.getOrPut(alloc, identity.entry);
+            if (!range.found_existing) range.value_ptr.* = .{ .start = index, .end = index + 1 } else range.value_ptr.end = index + 1;
+        }
+        return result;
+    }
+
+    pub fn deinit(self: *RetentionRebase, alloc: Allocator) void {
+        self.retained_ranges.deinit(alloc);
+    }
+
+    pub fn line(self: RetentionRebase, old_line: usize) usize {
+        if (old_line >= self.before.line_provenance.len) return self.retained.hard_line_starts.len;
+        var probe = old_line;
+        while (probe < self.before.line_provenance.len) : (probe += 1) {
+            const identity = self.before.line_provenance[probe];
+            if (identity != .entry) continue;
+            const range = self.retained_ranges.get(identity.entry) orelse {
+                // Skip the entire absent entry, not a retained-document scan for
+                // each of its old rendered rows.
+                while (probe + 1 < self.before.line_provenance.len and
+                    std.meta.eql(self.before.line_provenance[probe + 1], identity)) : (probe += 1)
+                {}
+                continue;
+            };
+            const start = range.start;
+            const new_end = range.end;
+            if (probe != old_line) {
+                const previous = self.before.line_provenance[old_line];
+                if (previous == .entry and previous.entry.projection_part == .group_header and identity.entry.projection_part == .group_child) return start -| 1;
+                return if (self.before.line_provenance[old_line] == .block_separator)
+                    start -| @min(probe - old_line, start)
+                else
+                    start;
+            }
+            var old_start = probe;
+            while (old_start > 0 and std.meta.eql(self.before.line_provenance[old_start - 1], identity)) : (old_start -= 1) {}
+            const ordinal = old_line - old_start;
+            for (self.entry_rows) |rows| {
+                if (rows.entry_id != identity.entry.entry_id) continue;
+                if (ordinal >= rows.before.len or rows.retained.len == 0) return new_end;
+                const retained_byte = rows.before[ordinal] -| rows.removed_bytes;
+                var retained_row: usize = 0;
+                for (rows.retained, 0..) |source_byte, row| {
+                    if (source_byte > retained_byte) break;
+                    retained_row = row;
+                }
+                return @min(new_end, start + retained_row);
+            }
+            return @min(new_end, start + ordinal);
+        }
+        return self.retained.hard_line_starts.len;
+    }
+
+    pub fn visual(self: RetentionRebase, old_offset: u32) u32 {
+        const offsets = self.before.transcript_visual_row_offsets;
+        if (offsets.len == 0) return 0;
+        var old_line: usize = 0;
+        while (old_line + 1 < offsets.len and offsets[old_line + 1] <= old_offset) : (old_line += 1) {}
+        const new_line = self.line(old_line);
+        const new_offsets = self.retained.transcript_visual_row_offsets;
+        if (new_offsets.len == 0) return 0;
+        const base = new_offsets[@min(new_line, new_offsets.len - 1)];
+        if (old_line < self.before.line_provenance.len and new_line < self.retained.line_provenance.len and
+            !std.meta.eql(self.before.line_provenance[old_line], self.retained.line_provenance[new_line])) return base;
+        const partial = old_offset -| offsets[old_line];
+        if (old_line < self.before.line_provenance.len) {
+            const identity = self.before.line_provenance[old_line];
+            if (identity == .entry) for (self.entry_rows) |rows| {
+                const text = rows.raw_before orelse continue;
+                if (rows.entry_id != identity.entry.entry_id) continue;
+                var old_start = old_line;
+                while (old_start > 0 and std.meta.eql(self.before.line_provenance[old_start - 1], identity)) : (old_start -= 1) {}
+                const ordinal = old_line - old_start;
+                if (ordinal >= rows.before.len) return base;
+                const raw_start = rows.before[ordinal];
+                const raw_end = if (ordinal + 1 < rows.before.len) rows.before[ordinal + 1] else text.len;
+                const point = (raw_start + transcript_blocks.skipVisualRowsInLine(text[raw_start..raw_end], self.before.cols, @intCast(partial))) -| rows.removed_bytes;
+                var new_ordinal: usize = 0;
+                for (rows.retained, 0..) |start, index| {
+                    if (start > point) break;
+                    new_ordinal = index;
+                }
+                if (rows.retained.len == 0 or new_line >= self.retained.transcript_line_visual_rows.len) return base;
+                const start = rows.retained[new_ordinal];
+                const end = if (new_ordinal + 1 < rows.retained.len) rows.retained[new_ordinal + 1] else rows.raw_retained.len;
+                var lo: u16 = 0;
+                var hi = self.retained.transcript_line_visual_rows[new_line];
+                while (lo + 1 < hi) {
+                    const mid = lo + (hi - lo) / 2;
+                    if (transcript_blocks.skipVisualRowsInLine(rows.raw_retained[start..end], self.retained.cols, mid) <= point -| start) lo = mid else hi = mid;
+                }
+                return base + lo;
+            };
+        }
+        return base + if (new_line < self.retained.transcript_line_visual_rows.len)
+            @min(partial, self.retained.transcript_line_visual_rows[new_line] -| 1)
+        else
+            @as(u32, 0);
+    }
+
+    pub fn byte(self: RetentionRebase, old_offset: usize) usize {
+        if (old_offset >= self.before.bytes.len) return self.retained.bytes.len;
+        var old_line: usize = 0;
+        for (self.before.hard_line_starts, 0..) |start, index| {
+            if (start > old_offset) break;
+            old_line = index;
+        }
+        const new_line = self.line(old_line);
+        if (new_line >= self.retained.hard_line_starts.len) return self.retained.bytes.len;
+        const start = self.retained.hard_line_starts[new_line];
+        const end = if (new_line + 1 < self.retained.hard_line_starts.len) self.retained.hard_line_starts[new_line + 1] else self.retained.bytes.len;
+        if (old_line < self.before.line_provenance.len and self.before.line_provenance[old_line] == .entry) {
+            const identity = self.before.line_provenance[old_line];
+            for (self.entry_rows) |rows| {
+                if (rows.entry_id != identity.entry.entry_id) continue;
+                var old_start = old_line;
+                while (old_start > 0 and std.meta.eql(self.before.line_provenance[old_start - 1], identity)) : (old_start -= 1) {}
+                if (rows.assistant_before) |old_map| {
+                    const new_map = rows.assistant_retained.?;
+                    const source_point = old_map.sourceAt(old_offset - self.before.hard_line_starts[old_start]) -| rows.removed_bytes;
+                    const new_entry_start = self.line(old_start);
+                    return @min(self.retained.bytes.len, self.retained.hard_line_starts[new_entry_start] + new_map.renderedAt(source_point));
+                }
+                if (rows.raw_before == null) continue;
+                const point = (rows.before[old_line - old_start] + old_offset - self.before.hard_line_starts[old_line]) -| rows.removed_bytes;
+                var retained_start: usize = 0;
+                for (rows.retained) |source_byte| {
+                    if (source_byte > point) break;
+                    retained_start = source_byte;
+                }
+                return start + @min(point - retained_start, end - start);
+            }
+        }
+        if (old_line < self.before.line_provenance.len and new_line < self.retained.line_provenance.len and
+            !std.meta.eql(self.before.line_provenance[old_line], self.retained.line_provenance[new_line])) return start;
+        return start + @min(old_offset - self.before.hard_line_starts[old_line], end - start);
+    }
+};
+
+test "retention rebase uses entry identity for duplicate content" {
+    const alloc = std.testing.allocator;
+    var before = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "same\nsame\nsame\nsame"), 80, null);
+    defer before.deinit(alloc);
+    var retained = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "same\nsame"), 80, null);
+    defer retained.deinit(alloc);
+    const provenance = [_]transcript_blocks.LineProvenance{
+        .{ .entry = .{ .entry_id = 1, .entry_class = .unknown_raw } },
+        .{ .entry = .{ .entry_id = 2, .entry_class = .unknown_raw } },
+        .{ .entry = .{ .entry_id = 3, .entry_class = .unknown_raw } },
+        .{ .entry = .{ .entry_id = 4, .entry_class = .unknown_raw } },
+    };
+    before.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, &provenance);
+    retained.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, provenance[2..]);
+    var mapping = try RetentionRebase.init(alloc, &before, &retained, &.{});
+    defer mapping.deinit(alloc);
+    for ([_]u32{ 0, 0, 0, 1, 2 }, 0..) |expected, offset| {
+        try std.testing.expectEqual(expected, mapping.visual(@intCast(offset)));
+        try std.testing.expectEqual(@as(usize, expected), mapping.line(offset));
+    }
+    try std.testing.expectEqual(@as(usize, 0), mapping.byte(2));
+    try std.testing.expectEqual(@as(usize, 2), mapping.byte(12));
+    try std.testing.expectEqual(retained.bytes.len, mapping.byte(before.bytes.len));
+}
+
+test "retention rebase deleted soft wrapped entry does not transfer partial rows" {
+    const alloc = std.testing.allocator;
+    var before = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "abcdefghi\njklmnopqr"), 3, null);
+    defer before.deinit(alloc);
+    var after = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "jklmnopqr"), 3, null);
+    defer after.deinit(alloc);
+    const provenance = [_]transcript_blocks.LineProvenance{
+        .{ .entry = .{ .entry_id = 1, .entry_class = .unknown_raw } },
+        .{ .entry = .{ .entry_id = 2, .entry_class = .unknown_raw } },
+    };
+    before.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, &provenance);
+    after.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, provenance[1..]);
+    var mapping = try RetentionRebase.init(alloc, &before, &after, &.{});
+    defer mapping.deinit(alloc);
+    for (0..4) |offset| try std.testing.expectEqual(@as(u32, 0), mapping.visual(@intCast(offset)));
+    try std.testing.expectEqual(@as(usize, 0), mapping.byte(6));
+}
+
+test "retention rebase indexes a large removed entry run once" {
+    const alloc = std.testing.allocator;
+    var before = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "x\n" ** 20_000), 80, null);
+    defer before.deinit(alloc);
+    var after = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "x\n" ** 10_000), 80, null);
+    defer after.deinit(alloc);
+    const old_lines = try alloc.alloc(transcript_blocks.LineProvenance, 20_000);
+    before.line_provenance = old_lines;
+    for (old_lines, 0..) |*identity, index| identity.* = .{ .entry = .{ .entry_id = if (index < 10_000) 1 else 2, .entry_class = .unknown_raw } };
+    after.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, old_lines[10_000..]);
+    var mapping = try RetentionRebase.init(alloc, &before, &after, &.{});
+    defer mapping.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), mapping.retained_ranges.count());
+    for ([_]usize{ 0, 9_999, 10_000, 19_999, 20_000 }) |line_index| {
+        try std.testing.expectEqual(line_index -| 10_000, mapping.line(line_index));
+    }
+}
+
+test "retention rebase maps raw soft wraps and byte endpoints" {
+    const alloc = std.testing.allocator;
+    const text = "abcdefghi\njkl";
+    var before = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, text), 3, null);
+    defer before.deinit(alloc);
+    var after = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, text[2..]), 3, null);
+    defer after.deinit(alloc);
+    const provenance = [_]transcript_blocks.LineProvenance{.{ .entry = .{ .entry_id = 1, .entry_class = .unknown_raw } }} ** 2;
+    before.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, &provenance);
+    after.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, &provenance);
+    const entries = [_]RetentionEntryRows{.{
+        .entry_id = 1,
+        .removed_bytes = 2,
+        .before = &.{ 0, 10 },
+        .retained = &.{ 0, 8 },
+        .raw_before = text,
+        .raw_retained = text[2..],
+    }};
+    var mapping = try RetentionRebase.init(alloc, &before, &after, &entries);
+    defer mapping.deinit(alloc);
+    for ([_]u32{ 0, 0, 1, 3, 4 }, 0..) |expected, offset| try std.testing.expectEqual(expected, mapping.visual(@intCast(offset)));
+    try std.testing.expectEqual(@as(usize, 1), mapping.byte(3));
+    try std.testing.expectEqual(@as(usize, 8), mapping.byte(10));
 }
 
 pub fn prepareTranscriptSourceWithFocusedEntry(
@@ -543,8 +851,7 @@ fn prepareTranscriptSourceInternal(
     errdefer finality.deinit(alloc);
     if (self.entries.items.len > 0 and self.layout.cols > 0) {
         rendered_from_entries = true;
-        const capture_provenance = observationEnabled(self, alloc) or
-            self.command_output_blocks.items.len > 0;
+        const capture_provenance = true;
         const replaceable_entry_id: ?u32 = if (self.replaceable_last_line and
             self.entries.items[self.entries.items.len - 1] == .raw_bytes)
             self.entries.items[self.entries.items.len - 1].raw_bytes.id

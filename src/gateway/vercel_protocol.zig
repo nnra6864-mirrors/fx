@@ -1276,7 +1276,7 @@ test "writeChatMessageJson serializes user text plus image file parts through co
     try std.testing.expect(std.mem.find(u8, json, "\"text\":\"look\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"type\":\"file\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"mediaType\":\"image/png\"") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"data\":\"iVBORw0KGgphYmM=\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"data\":{\"type\":\"data\",\"data\":\"iVBORw0KGgphYmM=\"}") != null);
 }
 
 test "writeChatMessageJson serializes assistant tool call input as raw json" {

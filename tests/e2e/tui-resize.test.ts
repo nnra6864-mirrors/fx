@@ -26,6 +26,7 @@ import {
   hasEmptyComposer,
   paneExitMatches,
   startFakeGateway,
+  startDynamicFakeGateway,
   TmuxSession,
   tmuxAvailable,
   tmuxRawPasteFlags,
@@ -1706,6 +1707,152 @@ describe.skipIf(SKIP)("tui: resize", () => {
       expect(session.isPaneAlive()).toBe(true);
     },
     TIMEOUT,
+  );
+
+  test(
+    "assistant stream retention preserves visible rows at default cap",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-assistant-retention-")));
+      if (!KEEP_LARGE_SKILL_ARTIFACTS) tempDirs.push(root);
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const tracePath = join(root, "trace.log");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ collapse_tool_calls: true }));
+      const children = ["collapsed-child-one.txt", "collapsed-child-two.txt", "collapsed-child-three.txt"];
+      for (const path of children) writeFileSync(join(workspace, path), "retained tool fixture\n");
+      const streams: ReadableStreamDefaultController<Uint8Array>[] = [];
+      const encoder = new TextEncoder();
+      let requestIndex = 0;
+      const gateway = startDynamicFakeGateway(() => {
+        if (requestIndex++ === 1) return fakeGatewaySse([
+          ...children.map((path, index) => ({
+            type: "tool-call", toolCallId: `retention-read-${index}`,
+            toolName: "read_file", input: JSON.stringify({ path }),
+          })),
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+        ]);
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              streams.push(controller);
+              controller.enqueue(encoder.encode(": held response\n\n"));
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      });
+      gateways.push(gateway);
+      const send = (turn: number, delta: string) => streams[turn].enqueue(
+        encoder.encode(`data: ${JSON.stringify({ type: "text-delta", id: `answer-${turn}`, delta })}\n\n`),
+      );
+      const finish = (turn: number) => {
+        streams[turn].enqueue(encoder.encode(`data: ${JSON.stringify({
+          type: "finish",
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: { inputTokens: { total: 3 }, outputTokens: { total: 5 } },
+        })}\n\ndata: [DONE]\n\n`));
+        streams[turn].close();
+      };
+      // Bounded inert destinations consume the real cap without thousands of rows.
+      const inertRow = (marker: string) => Array.from({ length: 14 }, (_, index) =>
+        `[${index === 0 ? marker : "."}](https://example.invalid/${"x".repeat(1000)})`
+      ).join("") + "\n\n";
+      // Removing the old response must leave the collapsed group through a retention frame.
+      const old = (id: number) => id === 0
+        ? inertRow("RETAIN_OLD_0000")
+        : `RETAIN_OLD_${String(id).padStart(4, "0")} immutable sentinel\n\n`;
+      const tail = (id: number) => inertRow(`RETAIN_TAIL_${String(id).padStart(4, "0")}`);
+      session = await createResizeSession({
+        cmd: FX_BIN, cwd: workspace, width: 168, height: 75,
+        isolated: true, remainOnExit: true, minimumHistoryLines: 10_000, stderrPath,
+        env: {
+          HOME: home, AI_GATEWAY_API_KEY: "synthetic-retention-key",
+          VERCEL_OIDC_TOKEN: undefined, FX_DISABLE_KEYCHAIN: "1",
+          FX_E2E_DISABLE_DOTENV: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0",
+          FX_SKIP_ONBOARDING: "1", FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TRACE_SCOPES: "transcript_retention,scroll", FX_TRACE_LOG: tracePath,
+          FX_RECORD: join(root, "terminal.fxtape"),
+        },
+      });
+      const waitStream = async (count: number) => {
+        const deadline = Date.now() + 15_000;
+        while (streams.length < count) {
+          expect(Date.now()).toBeLessThan(deadline);
+          expect(session!.paneStatus().dead).toBe(false);
+          await Bun.sleep(20);
+        }
+      };
+      const assertRows = async (tailCount: number) => {
+        const full = await session!.captureFullScrollback();
+        const ids = [...full.matchAll(/RETAIN_(?:OLD|TAIL)_\d{4}/g)].map(match => match[0]);
+        const expected = [
+          ...Array.from({ length: 120 }, (_, id) => `RETAIN_OLD_${String(id).padStart(4, "0")}`),
+          ...Array.from({ length: tailCount }, (_, id) => `RETAIN_TAIL_${String(id).padStart(4, "0")}`),
+        ];
+        expect(ids).toEqual(expected);
+        if (tailCount > 0) {
+          expect(full.match(/3 tool calls/g)).toHaveLength(1);
+          for (const path of children) expect(full).not.toContain(path);
+        }
+      };
+      await session.waitForStableComposer(15_000);
+      await session.sendText("First deterministic response.");
+      await waitStream(1);
+      send(0, old(0));
+      await session.waitForText("RETAIN_OLD_0000", 10_000);
+      for (let id = 1; id < 120; id += 4) {
+        send(0, Array.from({ length: Math.min(4, 120 - id) }, (_, offset) => old(id + offset)).join(""));
+        await Bun.sleep(80);
+      }
+      finish(0);
+      await session.waitForText("RETAIN_OLD_0119", 10_000);
+      await session.waitForStableComposer(15_000);
+      await assertRows(0);
+      await session.sendText("Second deterministic response.");
+      await waitStream(2);
+      await session.waitForText("3 tool calls", 10_000);
+      send(1, tail(0));
+      await session.waitForText("RETAIN_TAIL_0000", 10_000);
+      expect(await session.capturePane()).not.toContain("xxxxxxxx");
+      for (let id = 1; id < 65; id += 2) {
+        send(1, tail(id) + tail(id + 1));
+        await Bun.sleep(100);
+      }
+      await session.waitForText("RETAIN_TAIL_0064", 15_000);
+      await Bun.sleep(300);
+      await assertRows(65);
+      expect(readFileSync(tracePath, "utf8")).not.toContain("pruned entry");
+      let tailCount = 65;
+      let retained = false;
+      for (let id = 65; id < 81; id++) {
+        send(1, tail(id));
+        await session.waitForText(`RETAIN_TAIL_${String(id).padStart(4, "0")}`, 10_000);
+        await Bun.sleep(150);
+        tailCount = id + 1;
+        await assertRows(tailCount);
+        if (readFileSync(tracePath, "utf8").includes("trimmed protected entry")) {
+          retained = true;
+          break;
+        }
+      }
+      expect(retained).toBe(true);
+      finish(1);
+      await session.waitForStableComposer(15_000);
+      await assertRows(tailCount);
+      await session.sendText("/status");
+      await session.waitForStableComposer(10_000);
+      await assertRows(tailCount);
+      await session.sendText("/quit");
+      await session.waitForPane(() => session!.paneStatus().dead, 10_000);
+      expect(session.paneStatus().status).toBe(0);
+      expectEmptyStderr(stderrPath);
+    },
+    120_000,
   );
 
   test(

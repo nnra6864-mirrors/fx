@@ -263,11 +263,16 @@ pub const RequestTokenCalibration = struct {
     }
 };
 
+const ImagePartData = struct {
+    type: []const u8 = "",
+    data: ?[]const u8 = null,
+};
+
 const ImagePart = struct {
     type: []const u8 = "",
     mediaType: ?[]const u8 = null,
     detail: ?[]const u8 = null,
-    data: ?[]const u8 = null,
+    data: ?ImagePartData = null,
     image_url: ?[]const u8 = null,
 };
 
@@ -330,9 +335,11 @@ pub fn measureProviderRequest(alloc: Allocator, body: []const u8, request: strea
                 part.image_url orelse return error.InvalidRequestMeasurement
             else if (parsed.value.prompt != null and std.mem.eql(u8, part.type, "file") and
                 std.mem.startsWith(u8, part.mediaType orelse "", "image/"))
-                part.data orelse return error.InvalidRequestMeasurement
-            else
-                continue;
+            payload: {
+                const data = part.data orelse return error.InvalidRequestMeasurement;
+                if (!std.mem.eql(u8, data.type, "data")) return error.InvalidRequestMeasurement;
+                break :payload data.data orelse return error.InvalidRequestMeasurement;
+            } else continue;
             const address = @intFromPtr(payload.ptr);
             if (address < @intFromPtr(body.ptr)) return error.InvalidRequestMeasurement;
             const offset = address - @intFromPtr(body.ptr);
@@ -626,13 +633,14 @@ test "provider request measurement includes serialized structure" {
 }
 
 test "provider request image accounting excludes encoded payload length" {
-    const suffix = "\"}]}]}";
-    inline for (.{
-        "{\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,",
-        "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\",\"data\":\"",
-    }) |prefix| {
-        const small = try measureProviderRequest(std.testing.allocator, prefix ++ "AAAA" ++ suffix, measurement_test_request(true));
-        const large = try measureProviderRequest(std.testing.allocator, prefix ++ ("AAAA" ** 1000) ++ suffix, measurement_test_request(true));
+    const Case = struct { prefix: []const u8, suffix: []const u8 };
+    const cases = [_]Case{
+        .{ .prefix = "{\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,", .suffix = "\"}]}]}" },
+        .{ .prefix = "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\",\"data\":{\"type\":\"data\",\"data\":\"", .suffix = "\"}}]}]}" },
+    };
+    inline for (cases) |case| {
+        const small = try measureProviderRequest(std.testing.allocator, case.prefix ++ "AAAA" ++ case.suffix, measurement_test_request(true));
+        const large = try measureProviderRequest(std.testing.allocator, case.prefix ++ ("AAAA" ** 1000) ++ case.suffix, measurement_test_request(true));
         try std.testing.expect(large.serialized_bytes > small.serialized_bytes);
         try std.testing.expectEqual(small.text_tokens, large.text_tokens);
         try std.testing.expectEqual(small.estimated_input_tokens, large.estimated_input_tokens);
@@ -717,7 +725,7 @@ test "provider request image accounting preserves text and tool payloads" {
     ;
     try std.testing.expectEqual(textTokens(without_image_payload), measured.text_tokens);
 
-    const file_text = "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"text/plain\",\"data\":\"AAAA\"}]}]}";
+    const file_text = "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"text/plain\",\"data\":{\"type\":\"data\",\"data\":\"AAAA\"}}]}]}";
     const non_image = try measureProviderRequest(std.testing.allocator, file_text, measurement_test_request(true));
     try std.testing.expectEqual(textTokens(file_text), non_image.text_tokens);
     try std.testing.expectEqual(@as(?[32]u8, null), non_image.image_identity);
@@ -796,6 +804,13 @@ test "provider request image accounting handles allocation and malformed input f
         "{\"input\":[],\"prompt\":[]}",
         "{\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\"}]}]}",
         "{\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"escaped\\nimage\"}]}]}",
+        // Prompt-shape file parts must carry the nested v4 data object; every
+        // other shape is rejected rather than mis-measured.
+        "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\",\"data\":\"AAAA\"}]}]}",
+        "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\"}]}]}",
+        "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\",\"data\":{\"type\":\"url\",\"url\":\"https://x/y.png\"}}]}]}",
+        "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\",\"data\":{\"type\":\"data\"}}]}]}",
+        "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\",\"data\":{\"type\":\"data\",\"data\":\"escaped\\nimage\"}}]}]}",
     }) |body| {
         try std.testing.expectError(error.InvalidRequestMeasurement, measureProviderRequest(std.testing.allocator, body, measurement_test_request(true)));
     }

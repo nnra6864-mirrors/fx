@@ -17,6 +17,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx, providerVersionTestEnv } from "../evals/eval-helpers";
+import { fakeResponsesTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 import { readTapeFrames } from "./render-lab/tape";
 import { equivalentPngEncodings } from "./fixtures/image-encoding";
 import {
@@ -78,7 +79,7 @@ function startFakeDirectUsageProvider(
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
-    fetch(request) {
+    async fetch(request) {
       const path = new URL(request.url).pathname;
       if (path === "/models") {
         return provider === "codex"
@@ -95,6 +96,10 @@ function startFakeDirectUsageProvider(
       }
       if (path === "/modalities") {
         return Response.json({ models: [grokModalityModel(model, false)] });
+      }
+      if (request.method === "POST") {
+        const body = await request.text();
+        if (body.includes(TITLE_GENERATION_MARKER)) return fakeResponsesTitleDefault();
       }
       responses += 1;
       return new Response(
@@ -146,6 +151,7 @@ function startFakeProviderCompaction(provider: "codex" | "grok") {
         ] });
       }
       const body = await request.text();
+      if (body.includes(TITLE_GENERATION_MARKER)) return fakeResponsesTitleDefault();
       bodies.push(body);
       authorizations.push(request.headers.get("authorization"));
       modelOverrides.push(request.headers.get("x-grok-model-override"));
@@ -560,6 +566,9 @@ function startFakeChatGptOAuth(
       const body = url.pathname === "/chatgpt/responses" || url.pathname === "/chatgpt/token"
         ? await request.text()
         : null;
+      if (url.pathname === "/chatgpt/responses" && body?.includes(TITLE_GENERATION_MARKER)) {
+        return fakeResponsesTitleDefault();
+      }
       requests.push({
         method: request.method,
         path: url.pathname,
@@ -673,6 +682,9 @@ function startFakeGrokOAuth(options: {
     async fetch(request) {
       const url = new URL(request.url);
       const body = request.method === "POST" ? await request.text() : null;
+      if (url.pathname === "/v1/responses" && body?.includes(TITLE_GENERATION_MARKER)) {
+        return fakeResponsesTitleDefault();
+      }
       requests.push({
         method: request.method,
         path: url.pathname,
@@ -925,7 +937,9 @@ function startFakeCodexToolLoop(options: {
           { slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128000 },
         ].map((model, index) => index === 0 && options.model ? { ...model, slug: options.model } : model) });
       }
-      bodies.push(await request.text());
+      const titleBody = await request.text();
+      if (titleBody.includes(TITLE_GENERATION_MARKER)) return fakeResponsesTitleDefault();
+      bodies.push(titleBody);
       if (options.responses) return options.responses.shift() ?? new Response("unexpected request", { status: 400 });
       if (bodies.length === 1) {
         return new Response(
@@ -966,7 +980,9 @@ function startFakeCodexCapacityLoop() {
           { slug: "gpt-5.6-luna", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "medium" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
         ] });
       }
-      bodies.push(await request.text());
+      const titleBody = await request.text();
+      if (titleBody.includes(TITLE_GENERATION_MARKER)) return fakeResponsesTitleDefault();
+      bodies.push(titleBody);
       const call = bodies.length;
       if (call <= 64) {
         return new Response(
@@ -1017,7 +1033,9 @@ function startFakeGrokToolLoop(options: {
       if (path === "/modalities") {
         return Response.json({ models: [grokModalityModel(options.model ?? "grok-4.20", true)] });
       }
-      bodies.push(await request.text());
+      const titleBody = await request.text();
+      if (titleBody.includes(TITLE_GENERATION_MARKER)) return fakeResponsesTitleDefault();
+      bodies.push(titleBody);
       if (options.responses) return options.responses.shift() ?? new Response("unexpected request", { status: 400 });
       if (bodies.length === 1) {
         return new Response(
@@ -1062,6 +1080,7 @@ function startFakeCodexAutoReview() {
         ] });
       }
       const body = await request.text();
+      if (body.includes(TITLE_GENERATION_MARKER)) return fakeResponsesTitleDefault();
       bodies.push(body);
       const model = (JSON.parse(body) as { model?: string }).model;
       if (model === "gpt-5.6-luna") {
@@ -1120,6 +1139,8 @@ function startFakeGrokAutoReview() {
       if (path === "/modalities") {
         return Response.json({ models: [grokModalityModel("grok-4.20", false)] });
       }
+      const body = await request.text();
+      if (body.includes(TITLE_GENERATION_MARKER)) return fakeResponsesTitleDefault();
       headers.push({
         tokenAuth: request.headers.get("x-xai-token-auth"),
         authenticateResponse: request.headers.get("x-authenticateresponse"),
@@ -1128,7 +1149,6 @@ function startFakeGrokAutoReview() {
         modelOverride: request.headers.get("x-grok-model-override"),
         grokUserId: request.headers.get("x-grok-user-id"),
       });
-      const body = await request.text();
       bodies.push(body);
       if (body.includes('"name":"permission_decision"')) {
         return new Response(
@@ -1180,7 +1200,9 @@ function startFakeGrokResourceRecovery() {
       if (path === "/modalities") {
         return Response.json({ models: [grokModalityModel("grok-4.20", false)] });
       }
-      bodies.push(await request.text());
+      const titleBody = await request.text();
+      if (titleBody.includes(TITLE_GENERATION_MARKER)) return fakeResponsesTitleDefault();
+      bodies.push(titleBody);
       responseCalls += 1;
       if (responseCalls === 1) {
         return new Response(
@@ -5338,7 +5360,7 @@ test("provider context accounting is independent of image encoding size", async 
         const parts = (request.input ?? request.prompt).flatMap((message: { content: unknown }) => Array.isArray(message.content) ? message.content : []);
         const image = parts.find((part: { type?: string }) => part.type === (provider === "gateway" ? "file" : "input_image"));
         expect(image).toBeDefined();
-        expect(provider === "gateway" ? image.data : image.image_url).toBe((provider === "gateway" ? "" : "data:image/png;base64,") + bytes.toString("base64"));
+        expect(provider === "gateway" ? image.data.data : image.image_url).toBe((provider === "gateway" ? "" : "data:image/png;base64,") + bytes.toString("base64"));
         const decision = readFileSync(trace, "utf8");
         expect(decision).toContain("decision=no_op");
         expect(decision).toContain("has_images=true image_baseline=false");

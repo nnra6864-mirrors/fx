@@ -858,6 +858,7 @@ pub const PersistedToolResult = struct {
     stored_output_bytes: usize,
     truncated: bool = false,
     provider_native: bool = false,
+    review_feedback: bool = false,
     created_at_ms: i64 = 0,
     permission_feedback: [][]u8 = &.{},
     committed_file_presentation: ?CommittedFilePresentation = null,
@@ -1009,6 +1010,8 @@ test "persisted deferred tool result classifier is exact" {
 }
 
 pub const ToolResultMemory = struct {
+    /// Host review feedback is retained for the agent, not security evidence.
+    review_feedback: bool = false,
     tool_images: []const ToolImage = &.{},
     tool_image_handle: ?[]const u8 = null,
     output_handle: ?[]const u8 = null,
@@ -2620,6 +2623,7 @@ fn dupePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult
         .stored_output_bytes = result.stored_output_bytes,
         .truncated = result.truncated,
         .provider_native = result.provider_native,
+        .review_feedback = result.review_feedback,
         .created_at_ms = result.created_at_ms,
         .permission_feedback = permission_feedback,
         .committed_file_presentation = committed_file_presentation,

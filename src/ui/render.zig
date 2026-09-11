@@ -669,9 +669,8 @@ fn titleOutput(raw: ?*anyopaque) std.Io.File {
 }
 
 const terminal_title_osc_prefix = "\x1b]2;";
-const terminal_title_display_prefix = "fx ";
 const terminal_title_max_content_bytes: usize = 128;
-const terminal_title_max_label_bytes = terminal_title_max_content_bytes - terminal_title_display_prefix.len;
+const terminal_title_max_label_bytes = terminal_title_max_content_bytes;
 
 fn sanitizedTerminalTitleLabel(raw: []const u8, buffer: *[terminal_title_max_label_bytes]u8) []const u8 {
     const marker = "...";
@@ -709,7 +708,6 @@ fn setTerminalTitleLabel(raw: ?*anyopaque, label: []const u8) void {
     var sequence_buffer: [terminal_title_osc_prefix.len + terminal_title_max_content_bytes + 1]u8 = undefined;
     var sequence: std.Io.Writer = .fixed(&sequence_buffer);
     sequence.writeAll(terminal_title_osc_prefix) catch return;
-    sequence.writeAll(terminal_title_display_prefix) catch return;
     sequence.writeAll(sanitized) catch return;
     sequence.writeByte('\x07') catch return;
     out.writeStreamingAll(io_mod.getIo(), sequence.buffered()) catch return;
@@ -729,7 +727,7 @@ test "terminal title writes the label to the caller's output file" {
 
     // A host that redirects its output keeps the escape sequence off the
     // real stdout, which the Zig test runner owns as its protocol channel.
-    terminalTitleFor(&sink).set("v" ++ main.version ++ " | fx");
+    terminalTitleFor(&sink).set("fx v" ++ main.version ++ " | fx");
 
     var written_file = try tmp.dir.openFile(io_mod.getIo(), "terminal-title.log", .{});
     defer written_file.close(io_mod.getIo());
@@ -752,7 +750,7 @@ test "terminal title sanitizes and bounds untrusted labels" {
     const written = try io_mod.readFileToEnd(alloc, &written_file, 512);
     defer alloc.free(written);
     try std.testing.expect(written.len <= terminal_title_osc_prefix.len + terminal_title_max_content_bytes + 1);
-    try std.testing.expect(std.mem.startsWith(u8, written, "\x1b]2;fx safe]2;owned"));
+    try std.testing.expect(std.mem.startsWith(u8, written, "\x1b]2;safe]2;owned"));
     try std.testing.expect(std.mem.endsWith(u8, written, "...\x07"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, "\x07"));
     try std.testing.expect(std.mem.find(u8, written[terminal_title_osc_prefix.len..], "\x1b") == null);

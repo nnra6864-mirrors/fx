@@ -22,6 +22,8 @@ import {
   fakeGatewayFinalText,
   fakeGatewayPermissionDecision,
   fakeGatewaySerializedToolCall,
+  fakeGatewayTitleDefault,
+  TITLE_GENERATION_MARKER,
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
@@ -383,6 +385,7 @@ function startFakeGateway(
         classifierRequests.push({ body, headers: req.headers });
         return fakeGatewayPermissionDecision(classifierDecision(body));
       }
+      if (body.includes(TITLE_GENERATION_MARKER)) return fakeGatewayTitleDefault();
       requests.push({ body, headers: req.headers });
       const next = responses.shift();
       if (!next) return new Response("unexpected request", { status: 500 });

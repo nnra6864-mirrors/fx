@@ -43,6 +43,7 @@ const skill_invocation = @import("../skills/skill_invocation.zig");
 const captured_command = @import("../tooling/captured_command.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
+const session_title_generation = @import("../session/session_title_generation.zig");
 const session_log = @import("../session/session_log.zig");
 const session_store = @import("../session/session_store.zig");
 const session_catalog_cache = @import("../session/session_catalog_cache.zig");
@@ -938,6 +939,37 @@ const SessionPickerLoad = struct {
     }
 };
 
+const TitleGenerationLoad = struct {
+    task: ?*session_title_generation.Task = null,
+
+    fn deinit(self: *TitleGenerationLoad) void {
+        if (self.task) |task| {
+            debug_trace.logf("session", "event=title_generation_dropped reason=deinit", .{});
+            task.destroy();
+        }
+        self.* = .{};
+    }
+
+    fn requestStop(self: *TitleGenerationLoad) void {
+        if (self.task) |task| task.cancel();
+    }
+
+    fn start(self: *TitleGenerationLoad, task: *session_title_generation.Task) void {
+        if (self.task) |old| {
+            debug_trace.logf("session", "event=title_generation_dropped reason=superseded session={s}", .{old.session_id});
+            old.destroy();
+        }
+        self.task = task;
+    }
+
+    fn takeCompleted(self: *TitleGenerationLoad) ?*session_title_generation.Task {
+        const task = self.task orelse return null;
+        if (!task.isDone()) return null;
+        self.task = null;
+        return task;
+    }
+};
+
 fn resumePageLimitForRows(rows: u16) usize {
     // Fill the resume screen: terminal rows minus the composer/divider/hint
     // chrome (4), the menu header (1), the top gap (1), and a trailing
@@ -1048,6 +1080,7 @@ pub const Persistence = struct {
     session_picker: SessionPicker = .{},
     session_picker_load: SessionPickerLoad = .{},
     session_picker_cache: SessionPickerCatalogCache = .{},
+    title_generation: TitleGenerationLoad = .{},
     degraded_warning_emitted: bool = false,
     pending_cancelled_command: ?PendingCancelledCommand = null,
     image_snapshot_temp_dir: ?[]u8 = null,
@@ -1059,7 +1092,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (std.meta.fields(Persistence).len != 20) {
+            if (std.meta.fields(Persistence).len != 21) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1078,6 +1111,7 @@ pub const Persistence = struct {
         storage.session_picker = .{};
         storage.session_picker_load = .{};
         storage.session_picker_cache = .{};
+        storage.title_generation = .{};
         storage.degraded_warning_emitted = false;
         storage.pending_cancelled_command = null;
         storage.image_snapshot_temp_dir = null;
@@ -1109,6 +1143,7 @@ pub const Persistence = struct {
         self.session_picker.deinit(alloc);
         self.session_picker_load.deinit();
         self.session_picker_cache.deinit();
+        self.title_generation.deinit();
         self.* = undefined;
     }
 };
@@ -2679,7 +2714,8 @@ pub fn Runtime(comptime App: type) type {
             @compileError("interactive session runtime requires a terminal title host capability");
         }
 
-        /// Terminal tabs identify the running build and workspace, not the session.
+        /// Terminal tabs show the session title once one exists; before the
+        /// first prompt they identify the running build and workspace.
         pub fn syncTerminalTitle(app: *App) void {
             if (comptime !provider_runtime.supported(App)) return;
             syncTerminalTitleWith(app, terminalTitle(app));
@@ -2690,16 +2726,20 @@ pub fn Runtime(comptime App: type) type {
             provider: host_capability.TerminalTitle,
         ) void {
             if (comptime !provider_runtime.supported(App)) return;
+            if (cachedSessionTitle(app)) |title| {
+                provider.set(title);
+                return;
+            }
             const basename = if (comptime @hasField(App, "workspace_root"))
                 std.fs.path.basename(app.workspace_root)
             else
                 "";
             const folder = if (basename.len == 0) "workspace" else basename;
-            const prefix = "v" ++ build_options.app_version ++ " | ";
+            const prefix = "fx v" ++ build_options.app_version ++ " | ";
             var label_buffer: [prefix.len + std.fs.max_path_bytes]u8 = undefined;
             const label = std.fmt.bufPrint(&label_buffer, "{s}{s}", .{ prefix, folder }) catch |err| {
                 debug_trace.logf("session", "terminal title workspace omitted err={s}", .{@errorName(err)});
-                provider.set("v" ++ build_options.app_version);
+                provider.set("fx v" ++ build_options.app_version);
                 return;
             };
             provider.set(label);
@@ -2726,6 +2766,107 @@ pub fn Runtime(comptime App: type) type {
             defer display.deinit(app.alloc);
             if (!display.present) return;
             try setCachedSessionTitle(app, display.title);
+        }
+
+        /// Starts background title generation for a fresh session on the first
+        /// user prompt submit. Fire-and-forget: every gate failure is a silent
+        /// no-op because the locally derived title remains in place. The
+        /// generated title is applied by `pollSessionTitleGeneration`.
+        pub fn maybeStartSessionTitleGeneration(app: *App, prompt: []const u8) void {
+            if (comptime host_target.is_wasm) return;
+            if (comptime !@hasField(App, "session_persistence")) return;
+            if (comptime !@hasField(App, "session_title_generation")) return;
+            if (comptime !@hasField(App, "session_title")) return;
+            if (comptime !@hasField(App, "session")) return;
+            if (comptime !@hasField(App, "auth")) return;
+            if (comptime !@hasDecl(App, "agentStreamProvider")) return;
+            if (comptime !@hasDecl(App, "sessionTitleModel")) return;
+
+            const excerpt = session_title_generation.promptExcerpt(prompt) orelse return;
+            const title_model = app.sessionTitleModel();
+            if (!session_title_generation.shouldGenerate(.{
+                .setting_enabled = app.session_title_generation,
+                .provider_supports_titles = title_model != null,
+                .session_untitled = app.session_title.items.len == 0 and
+                    app.session.agent.history.items.len == 0,
+                .recovery_replay = false,
+                .task_running = app.session_persistence.title_generation.task != null,
+            })) return;
+            const session_id = activeSessionId(app) orelse return;
+            const credential = app.auth.gatewayCredential() orelse return;
+
+            const task = session_title_generation.Task.create(.{
+                .session_id = session_id,
+                .model = title_model.?,
+                .prompt_excerpt = excerpt,
+                .api_key = credential.api_key,
+                .gateway_team = credential.gateway_team,
+                .account_id = app.auth.accountId(),
+                .credential_source = credential.source,
+                .stream_provider = app.agentStreamProvider(),
+            }) catch return;
+            task.spawn() catch |err| {
+                debug_trace.logf("session", "event=title_generation result=unavailable reason=spawn err={s}", .{@errorName(err)});
+                task.destroy();
+                return;
+            };
+            app.session_persistence.title_generation.start(task);
+        }
+
+        /// Applies a finished background title generation on the main loop.
+        /// Returns true when the session title changed.
+        pub fn pollSessionTitleGeneration(app: *App) !bool {
+            if (comptime host_target.is_wasm) return false;
+            if (comptime !@hasField(App, "session_persistence")) return false;
+            if (comptime !@hasField(App, "session_title")) return false;
+            if (comptime !@hasField(App, "session")) return false;
+            const task = app.session_persistence.title_generation.takeCompleted() orelse return false;
+            defer task.destroy();
+            const title = task.takeTitle() orelse return false;
+            defer std.heap.c_allocator.free(title);
+            const active_id = activeSessionId(app) orelse {
+                debug_trace.logf("session", "event=title_generation_apply result=dropped reason=no_active_session", .{});
+                return false;
+            };
+            if (!std.mem.eql(u8, active_id, task.session_id)) {
+                debug_trace.logf(
+                    "session",
+                    "event=title_generation_apply result=dropped reason=session_changed session={s} active={s}",
+                    .{ task.session_id, active_id },
+                );
+                return false;
+            }
+            var installed = false;
+            {
+                app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+                defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+                if (app.session_persistence.writable) |*loaded| {
+                    installed = session_title_generation.installGeneratedTitle(
+                        app.alloc,
+                        loaded,
+                        app.session.agent.history.items,
+                        title,
+                    ) catch |err| {
+                        debug_trace.logf(
+                            "session",
+                            "event=title_generation_apply result=failed session={s} err={s}",
+                            .{ task.session_id, @errorName(err) },
+                        );
+                        return false;
+                    };
+                } else {
+                    debug_trace.logf(
+                        "session",
+                        "event=title_generation_apply result=dropped reason=not_writable session={s}",
+                        .{task.session_id},
+                    );
+                }
+            }
+            if (!installed) return false;
+            try setCachedSessionTitle(app, title);
+            invalidateSessionPickerCaches(app);
+            debug_trace.logf("session", "event=title_generation_apply result=installed session={s}", .{task.session_id});
+            return true;
         }
 
         pub const RenameError = error{
@@ -2869,6 +3010,7 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn requestPersistenceShutdown(app: *App) void {
             app.session_persistence.session_picker_load.requestStop();
+            app.session_persistence.title_generation.requestStop();
         }
 
         fn LiveHistorySink(comptime SinkApp: type) type {
@@ -9683,7 +9825,8 @@ test "renameActiveSession persists the title only in session metadata" {
         Runtime(TestApp).cachedSessionTitle(&app).?,
     );
 
-    try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
+    // The tab shows the renamed title; the title itself lives in session.json.
+    try std.testing.expectEqualStrings("deploy pipeline fix", app.terminalTitleLabelText());
 
     const loaded = &app.session_persistence.writable.?;
     _ = try loaded.appendEvent(
@@ -9846,7 +9989,211 @@ test "ensureCachedSessionTitle derives from the first prompt and then freezes" {
     try std.testing.expect(Runtime(TestApp).cachedSessionTitle(&app) == null);
 }
 
-test "terminal title combines the build version and workspace but ignores session and model changes" {
+const TitleGenerationFakeApp = struct {
+    alloc: Allocator,
+    workspace_root: []u8,
+    session: session_runtime.SessionRuntime = .{ .max_history_turns = 8 },
+    session_persistence: Persistence = .{},
+    session_title: std.ArrayList(u8) = .empty,
+    session_title_generation: bool = true,
+    auth: TitleTestAuth = .{},
+    selected_model: std.ArrayList(u8) = .empty,
+    stream_content: []const u8 = "Refactor the renderer loop",
+
+    const TitleTestAuth = struct {
+        fn gatewayCredential(_: *const TitleTestAuth) ?@import("../auth/auth_runtime.zig").GatewayCredential {
+            return .{ .api_key = "test-key", .gateway_team = null, .source = .ai_gateway_api_key };
+        }
+
+        fn accountId(_: *const TitleTestAuth) ?[]const u8 {
+            return null;
+        }
+    };
+
+    fn init(alloc: Allocator, workspace_root: []const u8) !TitleGenerationFakeApp {
+        return .{
+            .alloc = alloc,
+            .workspace_root = try alloc.dupe(u8, workspace_root),
+        };
+    }
+
+    fn deinit(self: *TitleGenerationFakeApp) void {
+        self.session_title.deinit(self.alloc);
+        self.selected_model.deinit(self.alloc);
+        self.session.deinit(self.alloc);
+        self.session_persistence.deinit(self.alloc);
+        self.alloc.free(self.workspace_root);
+    }
+
+    fn agentStreamProvider(self: *TitleGenerationFakeApp) @import("../agent/stream_provider.zig").Provider {
+        return .{ .context = self, .stream_fn = titleStream };
+    }
+
+    fn sessionTitleModel(_: *TitleGenerationFakeApp) ?[]const u8 {
+        return "test/title-model";
+    }
+
+    fn titleStream(raw: ?*anyopaque, _: Allocator, request: @import("../agent/stream_provider.zig").ModelRequest) anyerror!@import("../agent/stream_provider.zig").Result {
+        const self: *TitleGenerationFakeApp = @ptrCast(@alignCast(raw.?));
+        try std.testing.expectEqualStrings("test/title-model", request.model);
+        try std.testing.expectEqual(@as(usize, 1), request.messages.len);
+        try request.admission.admit();
+        return .{ .completed = .{ .completion = .{
+            .content = self.stream_content,
+            .finish_reason = .stop,
+        }, .ownership = .borrowed } };
+    }
+};
+
+fn initTitleTestSession(app: *TitleGenerationFakeApp, alloc: Allocator, root: []const u8) !void {
+    app.session_persistence.store = try session_store.Store.initFromHome(alloc, root, root);
+    app.session_persistence.writable = try app.session_persistence.store.?.startWritableSession(alloc, .{
+        .id = @constCast("title-test"),
+        .origin_workspace_root = @constCast(root),
+        .workspace_root = @constCast(root),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = .literal("en"),
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+        .preferences = .{ .model = @constCast("test-model"), .effort = .auto, .fast_mode = false },
+    });
+}
+
+fn awaitTitleTask(app: *TitleGenerationFakeApp) !void {
+    var waited_ms: i64 = 0;
+    while (app.session_persistence.title_generation.task != null) {
+        if (waited_ms > 10_000) return error.TitleGenerationTimedOut;
+        io_mod.sleep(10 * std.time.ns_per_ms);
+        waited_ms += 10;
+        _ = try Runtime(TitleGenerationFakeApp).pollSessionTitleGeneration(app);
+    }
+}
+
+test "session title generation installs the model title for a fresh session" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TitleGenerationFakeApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try initTitleTestSession(&app, alloc, paths.workspace);
+
+    Runtime(TitleGenerationFakeApp).maybeStartSessionTitleGeneration(&app, "refactor the renderer loop");
+    try std.testing.expect(app.session_persistence.title_generation.task != null);
+    try awaitTitleTask(&app);
+
+    try std.testing.expectEqualStrings(
+        "Refactor the renderer loop",
+        Runtime(TitleGenerationFakeApp).cachedSessionTitle(&app).?,
+    );
+    const persisted = try app.session_persistence.writable.?.conversationTitle(alloc);
+    defer if (persisted) |value| alloc.free(value);
+    try std.testing.expectEqualStrings("Refactor the renderer loop", persisted.?);
+}
+
+test "session title generation never overwrites a user-set title" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TitleGenerationFakeApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try initTitleTestSession(&app, alloc, paths.workspace);
+
+    Runtime(TitleGenerationFakeApp).maybeStartSessionTitleGeneration(&app, "refactor the renderer loop");
+    try std.testing.expect(app.session_persistence.title_generation.task != null);
+
+    // The first turn commits and the user renames before the task lands.
+    try app.session.appendHistoryEntry(alloc, .{ .assistant = .{
+        .user = .{ .text = @constCast("refactor the renderer loop") },
+        .assistant = @constCast("ok"),
+        .execution = .{},
+    } });
+    _ = try app.session_persistence.writable.?.renameConversation(alloc, "My custom title");
+    try awaitTitleTask(&app);
+
+    const persisted = try app.session_persistence.writable.?.conversationTitle(alloc);
+    defer if (persisted) |value| alloc.free(value);
+    try std.testing.expectEqualStrings("My custom title", persisted.?);
+    try std.testing.expect(Runtime(TitleGenerationFakeApp).cachedSessionTitle(&app) == null);
+}
+
+test "session title generation gates on setting, history, and prompt text" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TitleGenerationFakeApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try initTitleTestSession(&app, alloc, paths.workspace);
+
+    // No usable text: nothing starts.
+    Runtime(TitleGenerationFakeApp).maybeStartSessionTitleGeneration(&app, "   ");
+    try std.testing.expect(app.session_persistence.title_generation.task == null);
+
+    // Setting off: nothing starts.
+    app.session_title_generation = false;
+    Runtime(TitleGenerationFakeApp).maybeStartSessionTitleGeneration(&app, "refactor the renderer loop");
+    try std.testing.expect(app.session_persistence.title_generation.task == null);
+    app.session_title_generation = true;
+
+    // Existing history: nothing starts.
+    try app.session.appendHistoryEntry(alloc, .{ .assistant = .{
+        .user = .{ .text = @constCast("earlier prompt") },
+        .assistant = @constCast("ok"),
+        .execution = .{},
+    } });
+    Runtime(TitleGenerationFakeApp).maybeStartSessionTitleGeneration(&app, "refactor the renderer loop");
+    try std.testing.expect(app.session_persistence.title_generation.task == null);
+}
+
+test "session title generation keeps the derived title when the provider fails" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TitleGenerationFakeApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try initTitleTestSession(&app, alloc, paths.workspace);
+    app.stream_content = "";
+
+    Runtime(TitleGenerationFakeApp).maybeStartSessionTitleGeneration(&app, "refactor the renderer loop");
+    try std.testing.expect(app.session_persistence.title_generation.task != null);
+    try awaitTitleTask(&app);
+
+    try std.testing.expect(Runtime(TitleGenerationFakeApp).cachedSessionTitle(&app) == null);
+    const persisted = try app.session_persistence.writable.?.conversationTitle(alloc);
+    defer if (persisted) |value| alloc.free(value);
+    try std.testing.expect(persisted == null);
+}
+
+test "terminal title shows the session title once cached and falls back to build and workspace" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -9861,11 +10208,11 @@ test "terminal title combines the build version and workspace but ignores sessio
 
     try std.testing.expectEqualStrings("", app.terminalTitleLabelText());
     Runtime(TestApp).syncTerminalTitle(&app);
-    try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("fx v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
 
     try app.selected_model.appendSlice(alloc, "zai/glm-5.2");
     Runtime(TestApp).syncTerminalTitle(&app);
-    try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("fx v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
 
     try app.session.appendHistoryEntry(alloc, .{ .assistant = .{
         .user = .{ .text = @constCast("wire the release notes generator") },
@@ -9877,16 +10224,16 @@ test "terminal title combines the build version and workspace but ignores sessio
         "wire the release notes generator",
         Runtime(TestApp).cachedSessionTitle(&app).?,
     );
-    try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("wire the release notes generator", app.terminalTitleLabelText());
 
     app.selected_model.clearRetainingCapacity();
     try app.selected_model.appendSlice(alloc, "anthropic/claude-opus-5");
     Runtime(TestApp).syncTerminalTitle(&app);
-    try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("wire the release notes generator", app.terminalTitleLabelText());
 
     Runtime(TestApp).clearCachedSessionTitle(&app);
     try std.testing.expect(Runtime(TestApp).cachedSessionTitle(&app) == null);
-    try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("fx v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
 }
 
 test "cached session title drops control bytes before they reach the terminal" {
@@ -9908,7 +10255,7 @@ test "cached session title drops control bytes before they reach the terminal" {
         "safe]2;ownedtail",
         Runtime(TestApp).cachedSessionTitle(&app).?,
     );
-    try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("safe]2;ownedtail", app.terminalTitleLabelText());
 }
 
 test "terminal title uses the workspace basename and handles unnamed roots" {
@@ -9924,12 +10271,12 @@ test "terminal title uses the workspace basename and handles unnamed roots" {
         defer app.deinit();
         Runtime(TestApp).syncTerminalTitle(&app);
         var expected_buffer: [128]u8 = undefined;
-        const expected = try std.fmt.bufPrint(&expected_buffer, "v{s} | {s}", .{ build_options.app_version, case.folder });
+        const expected = try std.fmt.bufPrint(&expected_buffer, "fx v{s} | {s}", .{ build_options.app_version, case.folder });
         try std.testing.expectEqualStrings(expected, app.terminalTitleLabelText());
     }
 }
 
-test "terminal title ignores long session and model context" {
+test "terminal title shows the session title once cached and keeps model context out" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -9945,7 +10292,9 @@ test "terminal title ignores long session and model context" {
     try app.selected_model.appendSlice(alloc, "provider/" ++ ("model" ** 20));
     try Runtime(TestApp).setCachedSessionTitle(&app, "session-" ++ ("title" ** 20));
 
-    try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
+    const expected = "session-" ++ ("title" ** 20);
+    try std.testing.expectEqualStrings(expected, app.terminalTitleLabelText());
+    try std.testing.expect(std.mem.find(u8, app.terminalTitleLabelText(), "model") == null);
 }
 
 test "failed history delivery rejects the current writer without poisoning a fresh session" {

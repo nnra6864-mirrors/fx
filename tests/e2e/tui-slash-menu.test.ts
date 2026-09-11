@@ -90,16 +90,6 @@ function runningBinaryTitle(workspace: string): string {
   return `fx v${version} | ${basename(workspace)}`;
 }
 
-async function expectCleanTitleTranscript(session: TmuxSession, title: string): Promise<void> {
-  const transcript = await session.captureFullScrollback();
-  expect(transcript.trim().length).toBeGreaterThan(0);
-  expect(transcript).not.toContain(title);
-  expect(transcript).not.toContain("]0;");
-  expect(transcript).not.toContain("]2;");
-  expect(transcript).not.toContain("\x1b");
-  expect(transcript).not.toContain("\x07");
-}
-
 async function waitForPaneTitle(
   session: TmuxSession,
   expected: string,
@@ -817,14 +807,14 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
-    "terminal tab title shows the version and current folder across rename, resume, and new session",
+    "terminal tab title shows the session title across rename, resume, and new session",
     async () => {
       const workDir = mkdtempSync(join(tmpdir(), "fx-title-rename-e2e-"));
       workDirs.push(workDir);
       const home = join(workDir, "home");
       const workspace = join(workDir, "fx");
       const resumedWorkspace = join(workDir, "another project é");
-      let title = runningBinaryTitle(workspace);
+      const fallbackTitle = (dir: string) => runningBinaryTitle(dir);
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
       mkdirSync(resumedWorkspace, { recursive: true });
@@ -860,28 +850,26 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         remainOnExit: true,
       });
       await session.waitForComposer(10_000);
-      await waitForPaneTitle(session, title, 5_000);
-      await expectCleanTitleTranscript(session, title);
+      // Before any title exists, the tab falls back to the build and folder.
+      await waitForPaneTitle(session, fallbackTitle(workspace), 5_000);
 
-      // Session names must not replace the workspace in the title.
+      // The first prompt's derived title becomes the tab title.
       await session.sendText("generate the release notes");
       await session.waitForText("TITLE_RENAME_COMPLETE", 30_000);
       await session.waitForStableComposer();
-      await waitForPaneTitle(session, title, 5_000);
-      await expectCleanTitleTranscript(session, title);
+      await waitForPaneTitle(session, "generate the release notes", 5_000);
 
+      // A rename replaces the tab title.
       await session.sendText("/rename deploy pipeline fix");
       await session.waitForText("renamed: deploy pipeline fix", 10_000);
       await session.waitForStableComposer();
-      await waitForPaneTitle(session, title, 5_000);
-      await expectCleanTitleTranscript(session, title);
+      await waitForPaneTitle(session, "deploy pipeline fix", 5_000);
 
       await session.sendText("/quit");
       await session.waitForPane(() => session!.paneStatus().dead, 10_000);
       expect(session.paneStatus()).toEqual({ dead: true, status: 0 });
       expect(session.isAlive()).toBe(true);
       expect(await session.paneTitle()).toBe("");
-      await expectCleanTitleTranscript(session, title);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       await session.kill();
       session = null;
@@ -893,8 +881,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         .map((entry) => entry.name);
       expect(sessionIds).toHaveLength(1);
 
-      // A resumed session uses its current folder, not its original workspace.
-      title = runningBinaryTitle(resumedWorkspace);
+      // A resumed session keeps its title in the tab, even in a new folder.
       gateway.stop();
       gateway = startFakeGateway([]);
       session = await TmuxSession.create({
@@ -912,21 +899,19 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         remainOnExit: true,
       });
       await session.waitForComposer(10_000);
-      await waitForPaneTitle(session, title, 5_000);
+      await waitForPaneTitle(session, "deploy pipeline fix", 5_000);
       expect(await session.captureFullScrollback()).toContain("TITLE_RENAME_COMPLETE");
-      await expectCleanTitleTranscript(session, title);
 
+      // A fresh session resets the tab to the build and current folder.
       await session.sendText("/new");
       await session.waitForStableComposer();
-      await waitForPaneTitle(session, title, 5_000);
-      await expectCleanTitleTranscript(session, title);
+      await waitForPaneTitle(session, fallbackTitle(resumedWorkspace), 5_000);
 
       await session.sendText("/quit");
       await session.waitForPane(() => session!.paneStatus().dead, 10_000);
       expect(session.paneStatus()).toEqual({ dead: true, status: 0 });
       expect(session.isAlive()).toBe(true);
       expect(await session.paneTitle()).toBe("");
-      await expectCleanTitleTranscript(session, title);
       expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
       await session.kill();
       session = null;

@@ -148,6 +148,8 @@ Security is permission-first. All sensitive tool behavior must integrate with `s
 
 * Exact cautions and deterministic incomplete-evidence results are reused only for the current turn. An unavailable outcome is not cached as a security judgment, but the same exact action spends at most one unavailable transport attempt per turn; changed actions remain independently reviewable until the bounded current-turn transport budget is exhausted. Legacy `permission_request_id` input is rejected without prompting
 
+* Host-generated review holds retain their advice for the agent and transcript, but carry a saved `review_feedback` marker that excludes them from later security evidence, including after recovery. Old unmarked results remain untrusted evidence; never infer the marker from output text. Quoted review accusations are not proof of an attack, and handling plans or test instructions as data is not itself prompt injection
+
 Do not bypass the permission system for new tools.
 
 ## Zig-Specific Patterns

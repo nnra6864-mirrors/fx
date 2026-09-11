@@ -7,6 +7,7 @@ const credentials = @import("../core/auth/credentials.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
+const session_title_generation = @import("../core/session/session_title_generation.zig");
 const js_host_tools = if (host_target.is_wasm)
     @import("../core/hosts/js_host_tools.zig")
 else
@@ -861,6 +862,8 @@ pub fn handlePrompt(
         writable.childCapability() catch null
     else
         null;
+    maybeStartAcpTitleTask(state, session, owned_prompt, recovery_checkpoint != null);
+    defer if (session.title_task != null) completeAcpTitleTask(state, session, alloc);
     agent_runtime.processAgentPrompt(&session.session_rt.agent, &deps, null, .{
         .view = state.lifecycle_view,
         .scope = .{
@@ -877,6 +880,7 @@ pub fn handlePrompt(
         }
     };
     prompt_input.retainImageSnapshots();
+    completeAcpTitleTask(state, session, alloc);
     try sessions.sendActiveSessionInfoUpdate(state, alloc);
     try sessions.sendActiveSessionUsageUpdate(state, alloc);
 
@@ -885,6 +889,73 @@ pub fn handlePrompt(
     }
 
     return .{ .stop_reason = ctx.stop_reason };
+}
+
+/// Starts background title generation for a fresh persisted ACP session. The
+/// task runs concurrently with the first prompt turn and is applied by
+/// `completeAcpTitleTask` before the session info update goes out. The locally
+/// derived title remains when generation is skipped or unavailable.
+fn maybeStartAcpTitleTask(
+    state: *server.ServerState,
+    session: *server.ActiveSessionState,
+    prompt_text: []const u8,
+    recovery: bool,
+) void {
+    // Unit tests share the real provider bundles; never spawn network side
+    // calls from a test process. Wiring is covered by e2e mock servers.
+    if (comptime @import("builtin").is_test) return;
+    if (comptime host_target.is_wasm) return;
+    if (!state.session_titles or recovery) return;
+    if (session.title_task != null) return;
+    if (session.session_rt.agent.history.items.len != 0) return;
+    const writable = if (session.writable) |*value| value else return;
+    const bundle = state.cfg.provider_set.select(session.provider);
+    const title_model = bundle.title_model orelse return;
+    const agent_stream = bundle.agent_stream orelse return;
+    const excerpt = session_title_generation.promptExcerpt(prompt_text) orelse return;
+    if (session.credential_source != .host_managed and session.api_key.len == 0) return;
+    const task = session_title_generation.Task.create(.{
+        .session_id = writable.active_id,
+        .model = title_model,
+        .prompt_excerpt = excerpt,
+        .api_key = if (session.api_key.len > 0) session.api_key else null,
+        .gateway_team = state.gateway_team,
+        .account_id = session.account_id,
+        .credential_source = session.credential_source,
+        .stream_provider = agent_stream,
+    }) catch return;
+    task.spawn() catch |err| {
+        debug_trace.logf("session", "event=title_generation result=unavailable reason=spawn err={s}", .{@errorName(err)});
+        task.destroy();
+        return;
+    };
+    session.title_task = task;
+}
+
+/// Joins the bounded title task and installs the generated title unless the
+/// session already carries a user-set title. No-op without a pending task.
+fn completeAcpTitleTask(state: *server.ServerState, session: *server.ActiveSessionState, alloc: Allocator) void {
+    _ = state;
+    const task = session.title_task orelse return;
+    session.title_task = null;
+    defer task.destroy();
+    task.join();
+    const title = task.takeTitle() orelse return;
+    defer std.heap.c_allocator.free(title);
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const writable = if (session.writable) |*value| value else return;
+    if (!std.mem.eql(u8, writable.active_id, task.session_id)) {
+        debug_trace.logf("session", "event=title_generation_apply result=dropped reason=session_changed session={s}", .{task.session_id});
+        return;
+    }
+    const installed = session_title_generation.installGeneratedTitle(alloc, writable, session.session_rt.agent.history.items, title) catch |err| {
+        debug_trace.logf("session", "event=title_generation_apply result=failed session={s} err={s}", .{ task.session_id, @errorName(err) });
+        return;
+    };
+    if (installed) {
+        debug_trace.logf("session", "event=title_generation_apply result=installed session={s}", .{task.session_id});
+    }
 }
 
 pub fn runSubagentChild(

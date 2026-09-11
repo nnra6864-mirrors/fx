@@ -1726,7 +1726,7 @@ pub fn writeVerifiedImageFilePartJsonWithBudget(
 
     try writer.writeAll("{\"type\":\"file\",\"mediaType\":\"");
     try writer.writeAll(snapshot.media_type);
-    try writer.writeAll("\",\"data\":\"");
+    try writer.writeAll("\",\"data\":{\"type\":\"data\",\"data\":\"");
 
     var offset: usize = 0;
     while (offset < snapshot.bytes.len) {
@@ -1736,7 +1736,7 @@ pub fn writeVerifiedImageFilePartJsonWithBudget(
         offset = end;
     }
 
-    try writer.writeAll("\"}");
+    try writer.writeAll("\"}}");
     try budget.check();
 }
 

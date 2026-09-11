@@ -132,6 +132,8 @@ const CommittedTranscriptAnchor = struct {
     history_visual_offset: u32,
     total_visual_rows: u32,
     flow: []u8,
+    retention_identity: source_preparation.RetentionIdentity = .{},
+    flow_materialized: bool = true,
     cursor_row: u16,
     cursor_col: u16,
     occupied_last_row: u16,
@@ -147,6 +149,7 @@ const CommittedTranscriptAnchor = struct {
     history_catchup_pending: bool = false,
 
     fn deinit(self: *CommittedTranscriptAnchor, alloc: Allocator) void {
+        self.retention_identity.deinit(alloc);
         if (self.flow.len > 0) alloc.free(self.flow);
         if (self.row_provenance.len > 0) alloc.free(self.row_provenance);
         self.* = undefined;
@@ -180,6 +183,7 @@ const TranscriptRecoveryReceipt = struct {
     tracks_semantic_progress: bool = false,
     flow: []u8 = &.{},
     flow_owned: bool = true,
+    retention_identity: source_preparation.RetentionIdentity = .{},
     presentation_resume_bytes: []u8 = &.{},
     presentation_pending_wrap: bool = false,
     presentation_valid: bool = false,
@@ -191,6 +195,7 @@ const TranscriptRecoveryReceipt = struct {
     normal_buffer_recovery_pending: bool = false,
 
     fn deinit(self: *TranscriptRecoveryReceipt, alloc: Allocator) void {
+        self.retention_identity.deinit(alloc);
         if (self.flow_owned and self.flow.len > 0) alloc.free(self.flow);
         if (self.presentation_resume_bytes.len > 0) alloc.free(self.presentation_resume_bytes);
         if (self.row_provenance.len > 0) alloc.free(self.row_provenance);
@@ -212,6 +217,108 @@ const TranscriptCommitState = union(enum) {
         self.* = .invalid;
     }
 };
+
+test "retention rebase carries stable and recovering source boundaries" {
+    const alloc = std.testing.allocator;
+    var before = try source_preparation.prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "a\nb\nc\nd\ne\nf"), 80, null);
+    defer before.deinit(alloc);
+    var after = try source_preparation.prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "c\nd\ne\nf"), 80, null);
+    defer after.deinit(alloc);
+    var provenance: [6]transcript_blocks.LineProvenance = undefined;
+    for (&provenance, 0..) |*line, index| line.* = .{ .entry = .{ .entry_id = @intCast(index + 1), .entry_class = .unknown_raw } };
+    before.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, &provenance);
+    after.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, provenance[2..]);
+    var mapping = try source_preparation.RetentionRebase.init(alloc, &before, &after, &.{});
+    defer mapping.deinit(alloc);
+    for ([_]bool{ false, true }) |recovering| {
+        var runtime = TranscriptRuntime{ .detached_commit_alloc = alloc };
+        defer runtime.deinit(alloc);
+        const flow = try alloc.dupe(u8, before.bytes);
+        runtime.transcript_commit_state = if (recovering) .{ .recovering = .{
+            .flow = flow,
+            .accepted_visual_offset = 4,
+            .accepted_history_visual_offset = 3,
+            .attempt_visual_offset = 5,
+            .attempt_total_visual_rows = 6,
+            .materialized_visual_offset = 4,
+            .materialized_visual_rows = 2,
+            .materialized_flow_len = before.bytes.len,
+            .attempt_cols = 80,
+            .remaining_semantic_rows = 2,
+            .remaining_semantic_progress_rows = 1,
+        } } else .{ .stable = .{
+            .flow = flow,
+            .visual_offset = 4,
+            .history_visual_offset = 3,
+            .total_visual_rows = 6,
+            .selection = .{ .start_line = 4, .top_row = 1, .bottom_row = 2, .partial_skip_rows = 0, .line_count = 2 },
+            .cursor_row = 3,
+            .cursor_col = 1,
+            .occupied_last_row = 2,
+            .occupied_last_row_blank = false,
+            .layout_id = 1,
+        } };
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        try std.testing.expectError(error.OutOfMemory, runtime.rebaseRetainedTranscript(failing.allocator(), mapping, .{}));
+        try std.testing.expectEqual(@as(u32, 3), runtime.transcriptCommitDiagnostic().history_visual_offset);
+        try runtime.rebaseRetainedTranscript(alloc, mapping, .{});
+        const diagnostic = runtime.transcriptCommitDiagnostic();
+        try std.testing.expectEqual(@as(u32, 1), diagnostic.history_visual_offset);
+        try std.testing.expectEqual(@as(u32, 2), diagnostic.visual_offset);
+        try std.testing.expectEqual(@as(u32, 4), diagnostic.total_visual_rows);
+        switch (runtime.transcript_commit_state) {
+            .invalid => return error.TestUnexpectedResult,
+            .stable => |anchor| {
+                try std.testing.expectEqualStrings(after.bytes, anchor.flow);
+                try std.testing.expectEqual(@as(usize, 2), anchor.selection.start_line);
+            },
+            .recovering => |receipt| {
+                try std.testing.expectEqualStrings(after.bytes, receipt.flow);
+                try std.testing.expectEqual(@as(u32, 2), receipt.materialized_visual_offset);
+                try std.testing.expectEqual(@as(u16, 2), receipt.materialized_visual_rows);
+                try std.testing.expectEqual(after.bytes.len, receipt.materialized_flow_len.?);
+                try std.testing.expectEqual(@as(u32, 3), receipt.attempt_visual_offset);
+                try std.testing.expectEqual(@as(u32, 2), receipt.remaining_semantic_rows);
+                try std.testing.expectEqual(@as(u32, 1), receipt.remaining_semantic_progress_rows);
+            },
+        }
+    }
+}
+
+test "retention rebase recovery rejects the removed entry partial-row endpoint" {
+    const alloc = std.testing.allocator;
+    var before = try source_preparation.prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "abcdefghi\njklmnopqr"), 3, null);
+    defer before.deinit(alloc);
+    var after = try source_preparation.prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "jklmnopqr"), 3, null);
+    defer after.deinit(alloc);
+    const lines = [_]transcript_blocks.LineProvenance{
+        .{ .entry = .{ .entry_id = 1, .entry_class = .unknown_raw } },
+        .{ .entry = .{ .entry_id = 2, .entry_class = .unknown_raw } },
+    };
+    before.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, &lines);
+    after.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, lines[1..]);
+    var mapping = try source_preparation.RetentionRebase.init(alloc, &before, &after, &.{});
+    defer mapping.deinit(alloc);
+    var runtime = TranscriptRuntime{ .detached_commit_alloc = alloc, .transcript_commit_state = .{ .recovering = .{
+        .flow = try alloc.dupe(u8, before.bytes),
+        .accepted_visual_offset = 2,
+        .accepted_history_visual_offset = 2,
+        .materialized_visual_offset = 2,
+        .materialized_visual_rows = 4,
+        .materialized_flow_len = before.bytes.len,
+        .attempt_cols = 3,
+        .attempt_visual_offset = 2,
+        .attempt_total_visual_rows = 6,
+    } } };
+    defer runtime.deinit(alloc);
+    try runtime.rebaseRetainedTranscript(alloc, mapping, .{});
+    const receipt = runtime.transcript_commit_state.recovering;
+    try std.testing.expectEqual(@as(u32, 0), receipt.accepted_visual_offset);
+    try std.testing.expectEqual(@as(u32, 0), receipt.accepted_history_visual_offset);
+    try std.testing.expectEqual(@as(u32, 0), receipt.materialized_visual_offset);
+    try std.testing.expectEqual(@as(u16, 3), receipt.materialized_visual_rows);
+    try std.testing.expectEqual(@as(?usize, null), receipt.materialized_flow_len);
+}
 
 fn recoveryAppendPrefixMatches(
     target_flow: []const u8,
@@ -336,6 +443,7 @@ pub const TranscriptTransition = struct {
     body_disposition: TranscriptBodyDisposition = .paint,
     target_flow: []u8,
     target_flow_owned: bool = true,
+    retention_identity: source_preparation.RetentionIdentity = .{},
     borrows_full_page: bool = false,
     presentation_resume_bytes: []u8 = &.{},
     presentation_pending_wrap: bool = false,
@@ -367,6 +475,7 @@ pub const TranscriptTransition = struct {
     consumed: bool = false,
 
     pub fn deinit(self: *TranscriptTransition, alloc: Allocator) void {
+        self.retention_identity.deinit(alloc);
         if (self.target_flow_owned and self.target_flow.len > 0) alloc.free(self.target_flow);
         if (self.presentation_resume_bytes.len > 0) alloc.free(self.presentation_resume_bytes);
         if (self.document_append_bytes.len > 0) {
@@ -6765,6 +6874,150 @@ pub const TranscriptRuntime = struct {
         self.transcript_commit_state.deinit(alloc);
     }
 
+    pub fn committedRetentionIdentity(self: *const TranscriptRuntime) ?source_preparation.RetentionIdentity {
+        return switch (self.transcript_commit_state) {
+            .invalid => null,
+            .stable => |anchor| anchor.retention_identity,
+            .recovering => |receipt| receipt.retention_identity,
+        };
+    }
+
+    pub fn prepareCommittedRetentionSource(self: *const TranscriptRuntime, alloc: Allocator) !?TranscriptPreparationSource {
+        const cols = self.retentionSourceCols() orelse return null;
+        const flow = switch (self.transcript_commit_state) {
+            .invalid => return null,
+            .stable => |anchor| anchor.flow,
+            .recovering => |receipt| receipt.flow,
+        };
+        const identity = self.committedRetentionIdentity().?;
+        var source = try source_preparation.prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, flow), cols, null);
+        errdefer source.deinit(alloc);
+        source.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, identity.lines);
+        return source;
+    }
+
+    pub fn retentionSourceCols(self: *const TranscriptRuntime) ?u16 {
+        if (self.fullTranscriptActive()) return null;
+        const cols = switch (self.transcript_commit_state) {
+            .invalid => return null,
+            .stable => self.committed_frame_layout.terminal_cols,
+            .recovering => |receipt| receipt.attempt_cols,
+        };
+        return if (cols == 0) null else cols;
+    }
+
+    /// Rebase source-relative state before publishing a retention mutation.
+    /// Allocation completes before any live boundary or owned flow is changed.
+    pub fn rebaseRetainedTranscript(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        mapping: source_preparation.RetentionRebase,
+        retained_identity: source_preparation.RetentionIdentity,
+    ) !void {
+        const flow = switch (self.transcript_commit_state) {
+            .invalid => return,
+            .stable => |anchor| anchor.flow,
+            .recovering => |receipt| receipt.flow,
+        };
+        var identity = try retained_identity.clone(alloc);
+        errdefer identity.deinit(alloc);
+        const retained_flow = try alloc.dupe(u8, mapping.retained.bytes[0..mapping.byte(flow.len)]);
+        const diagnostic = self.transcriptCommitDiagnostic();
+        switch (self.transcript_commit_state) {
+            .invalid => unreachable,
+            .stable => |*anchor| {
+                const old_start = mapping.before.byteAtVisualOffset(anchor.history_visual_offset);
+                const new_start = mapping.retained.byteAtVisualOffset(mapping.visual(anchor.history_visual_offset));
+                anchor.flow_materialized = anchor.flow_materialized and std.mem.eql(u8, mapping.before.bytes[old_start..], mapping.retained.bytes[new_start..]);
+                if (!anchor.flow_materialized) anchor.normal_buffer_recovery_pending = true;
+                alloc.free(anchor.flow);
+                anchor.flow = retained_flow;
+                anchor.retention_identity.deinit(alloc);
+                anchor.retention_identity = identity;
+                anchor.visual_offset = mapping.visual(anchor.visual_offset);
+                anchor.history_visual_offset = mapping.visual(anchor.history_visual_offset);
+                anchor.total_visual_rows = mapping.visual(anchor.total_visual_rows);
+                anchor.selection = rebaseRetentionSelection(anchor.selection, mapping);
+                anchor.measured_history_origin = rebaseRetentionHistoryOrigin(anchor.measured_history_origin, mapping);
+            },
+            .recovering => |*receipt| {
+                if (receipt.materialized_flow_len) |end| {
+                    const old_start = mapping.before.byteAtVisualOffset(receipt.materialized_visual_offset);
+                    const new_start = mapping.retained.byteAtVisualOffset(mapping.visual(receipt.materialized_visual_offset));
+                    const new_end = mapping.byte(end);
+                    if (old_start > end or new_start > new_end or !std.mem.eql(u8, mapping.before.bytes[old_start..end], mapping.retained.bytes[new_start..new_end])) {
+                        debug_trace.logf("scroll", "retention invalidated materialized endpoint after projection change", .{});
+                        receipt.materialized_flow_len = null;
+                        receipt.presentation_valid = false;
+                    }
+                }
+                if (receipt.flow_owned) alloc.free(receipt.flow);
+                receipt.flow = retained_flow;
+                receipt.flow_owned = true;
+                receipt.retention_identity.deinit(alloc);
+                receipt.retention_identity = identity;
+                receipt.remaining_semantic_rows = mapping.visual(receipt.accepted_history_visual_offset +| receipt.remaining_semantic_rows) -|
+                    mapping.visual(receipt.accepted_history_visual_offset);
+                receipt.remaining_semantic_progress_rows = mapping.visual(receipt.accepted_visual_offset +| receipt.remaining_semantic_progress_rows) -|
+                    mapping.visual(receipt.accepted_visual_offset);
+                receipt.materialized_visual_rows = @intCast(mapping.visual(receipt.materialized_visual_offset +| receipt.materialized_visual_rows) -|
+                    mapping.visual(receipt.materialized_visual_offset));
+                receipt.accepted_visual_offset = mapping.visual(receipt.accepted_visual_offset);
+                receipt.accepted_history_visual_offset = mapping.visual(receipt.accepted_history_visual_offset);
+                receipt.attempt_visual_offset = mapping.visual(receipt.attempt_visual_offset);
+                receipt.attempt_total_visual_rows = mapping.visual(receipt.attempt_total_visual_rows);
+                receipt.materialized_visual_offset = mapping.visual(receipt.materialized_visual_offset);
+                if (receipt.materialized_flow_len) |len| receipt.materialized_flow_len = mapping.byte(len);
+                receipt.measured_history_origin = rebaseRetentionHistoryOrigin(receipt.measured_history_origin, mapping);
+            },
+        }
+        if (self.last_viewport_selection) |*selection| {
+            selection.* = rebaseRetentionSelection(selection.*, mapping);
+            self.last_visible_transcript_partial_skip_rows = selection.partial_skip_rows;
+            self.last_visible_transcript_split_prefix_lines = selection.split_prefix_lines;
+        }
+        self.last_visible_transcript_start_line = mapping.line(self.last_visible_transcript_start_line);
+        if (self.last_visible_transcript_split_active) self.last_visible_transcript_split_suffix_start_line = mapping.line(self.last_visible_transcript_split_suffix_start_line);
+        debug_trace.logf("scroll", "transcript_retention_rebase state={s} history={d}->{d} view={d}->{d}", .{
+            @tagName(diagnostic.state), diagnostic.history_visual_offset,         mapping.visual(diagnostic.history_visual_offset),
+            diagnostic.visual_offset,   mapping.visual(diagnostic.visual_offset),
+        });
+    }
+
+    fn rebaseRetentionSelection(value: ViewportSelection, mapping: source_preparation.RetentionRebase) ViewportSelection {
+        var selection = value;
+        selection.start_line = mapping.line(value.start_line);
+        selection.line_count = mapping.line(value.start_line +| value.line_count) -| selection.start_line;
+        if (value.split_active) {
+            selection.split_prefix_lines = mapping.line(value.split_prefix_lines);
+            selection.split_suffix_start_line = mapping.line(value.split_suffix_start_line);
+        }
+        const old_offsets = mapping.before.transcript_visual_row_offsets;
+        const new_offsets = mapping.retained.transcript_visual_row_offsets;
+        selection.partial_skip_rows = if (value.start_line < old_offsets.len and selection.start_line < new_offsets.len)
+            @intCast(mapping.visual(old_offsets[value.start_line] +| value.partial_skip_rows) -| new_offsets[selection.start_line])
+        else
+            0;
+        return selection;
+    }
+
+    fn rebaseRetentionHistoryOrigin(
+        value: ?transcript_painter.MeasuredHistoryOrigin,
+        mapping: source_preparation.RetentionRebase,
+    ) ?transcript_painter.MeasuredHistoryOrigin {
+        var origin = value orelse return null;
+        if (origin.source_cols != mapping.before.cols) {
+            debug_trace.logf("scroll", "retention dropped measured history origin source_cols={d} retained_cols={d}", .{ origin.source_cols, mapping.before.cols });
+            return null;
+        }
+        origin.source_visual_offset = mapping.visual(origin.source_visual_offset);
+        if (origin.endpoint) |*endpoint| {
+            endpoint.span_start_flow_offset = mapping.byte(endpoint.span_start_flow_offset);
+            endpoint.flow_offset = mapping.byte(endpoint.flow_offset);
+        }
+        return origin;
+    }
+
     pub fn reconcileTranscriptCommitSource(
         self: *TranscriptRuntime,
         rendered_flow: []const u8,
@@ -6900,7 +7153,7 @@ pub const TranscriptRuntime = struct {
                 null
             else
                 .{
-                    .raw_flow_exact = true,
+                    .raw_flow_exact = anchor.flow_materialized,
                     .visual_rows = projectionVisualRowsInArea(
                         anchor.total_visual_rows,
                         committedProjectionVisualOffset(anchor),
@@ -8038,7 +8291,7 @@ pub const TranscriptRuntime = struct {
                             };
                         }
                     }
-                    if (self.committedLayoutMatches(anchor) and
+                    if (anchor.flow_materialized and self.committedLayoutMatches(anchor) and
                         target_flow.len >= anchor.flow.len and
                         std.mem.startsWith(u8, target_flow, anchor.flow))
                     {
@@ -8221,7 +8474,7 @@ pub const TranscriptRuntime = struct {
                     committedProjectionVisualOffset(anchor),
                     self.committed_frame_layout.transcript_area,
                 ),
-                .flow_len = anchor.flow.len,
+                .flow_len = if (anchor.flow_materialized) anchor.flow.len else null,
                 .cursor_row = anchor.cursor_row,
                 .cursor_col = anchor.cursor_col,
             },
@@ -8552,6 +8805,9 @@ pub const TranscriptRuntime = struct {
             }
         }
 
+        var retention_identity = try source_preparation.RetentionIdentity.capture(self, alloc, source);
+        errdefer retention_identity.deinit(alloc);
+
         const target_flow = source.bytes;
         if (!borrows_source) source.bytes = &.{};
         errdefer if (!borrows_source and target_flow.len > 0) alloc.free(target_flow);
@@ -8635,6 +8891,7 @@ pub const TranscriptRuntime = struct {
             natural_projected_flow_end;
         var document_append = render_engine.frame_scroll_plan.FrameDocumentAppend{};
         var document_append_bytes: []u8 = &.{};
+        var append_pending_wrap = false;
         var presentation_resume_bytes: []u8 = &.{};
         var presentation_pending_wrap = false;
         var presentation_valid = false;
@@ -8717,6 +8974,7 @@ pub const TranscriptRuntime = struct {
                     true,
                 );
                 defer prepared_append.deinit(alloc);
+                append_pending_wrap = prepared_append.start_pending_wrap;
                 document_append_bytes = prepared_append.bytes;
                 prepared_append.bytes = &.{};
                 presentation_resume_bytes = prepared_append.endpoint_resume_bytes;
@@ -8724,7 +8982,7 @@ pub const TranscriptRuntime = struct {
                 presentation_pending_wrap = prepared_append.endpoint_pending_wrap;
                 presentation_valid = true;
             } else {
-                document_append_bytes = try transcript_painter.prepareTranscriptDocumentAppendBytes(
+                var prepared_append = try transcript_painter.prepareTranscriptDocumentAppend(
                     alloc,
                     target_flow,
                     self.layout.cols,
@@ -8732,6 +8990,10 @@ pub const TranscriptRuntime = struct {
                     projected_flow_end.?,
                     target.projection_staged,
                 );
+                defer prepared_append.deinit(alloc);
+                append_pending_wrap = prepared_append.start_pending_wrap;
+                document_append_bytes = prepared_append.bytes;
+                prepared_append.bytes = &.{};
             }
             document_append = .{
                 .bytes = if (document_append_bytes.len > 0)
@@ -8740,6 +9002,9 @@ pub const TranscriptRuntime = struct {
                     raw_append,
                 .start_row = base.cursor_row,
                 .start_col = base.cursor_col,
+                // A staged projection may already place the endpoint on the next row.
+                .start_pending_wrap = base.history_replay == null and
+                    base.cursor_col == self.layout.cols and append_pending_wrap,
                 .clear = if (base.history_replay) |replay|
                     .{ .rows = replay.clear_rows }
                 else
@@ -8786,7 +9051,7 @@ pub const TranscriptRuntime = struct {
             source_endpoint_cursor_row,
             source_endpoint_cursor_col,
             append_base,
-            projected_flow_end,
+            if (append_is_history_replay) natural_projected_flow_end else projected_flow_end,
             target_flow.len,
             target_layout.transcript_area,
         );
@@ -8819,6 +9084,7 @@ pub const TranscriptRuntime = struct {
             .recovery_projection_deferred = scroll_facts.recovery_projection_deferred,
             .body_disposition = target.body_disposition,
             .target_flow = target_flow,
+            .retention_identity = retention_identity,
             .target_flow_owned = !borrows_source,
             .borrows_full_page = borrows_full_page,
             .presentation_resume_bytes = presentation_resume_bytes,
@@ -9031,6 +9297,11 @@ pub const TranscriptRuntime = struct {
                 .history_visual_offset = transition.history_visual_offset,
                 .total_visual_rows = transition.total_visual_rows,
                 .flow = stable_flow,
+                .retention_identity = transition.retention_identity,
+                .flow_materialized = if (!retained_body) true else switch (previous_state) {
+                    .stable => |anchor| anchor.flow_materialized,
+                    .invalid, .recovering => false,
+                },
                 .cursor_row = transition.cursor_row,
                 .cursor_col = transition.cursor_col,
                 .occupied_last_row = transition.selection.last_visible_row,
@@ -9042,6 +9313,7 @@ pub const TranscriptRuntime = struct {
                 .history_catchup_pending = transition.history_catchup_pending,
             } };
             transition.row_provenance = &.{};
+            transition.retention_identity = .{};
 
             self.last_rendered_cols = transition.target_layout.terminal_cols;
             if (pending_resume_bytes > 0) {
@@ -9148,6 +9420,7 @@ pub const TranscriptRuntime = struct {
                 .projection_rebase_pending = transition.recovery_rebase,
                 .tracks_semantic_progress = transition.recovery_tracks_semantic_progress,
                 .flow = transition.target_flow,
+                .retention_identity = transition.retention_identity,
                 .flow_owned = transition.target_flow_owned,
                 .presentation_resume_bytes = presentation_resume_bytes,
                 .presentation_pending_wrap = presentation_pending_wrap,
@@ -9161,6 +9434,7 @@ pub const TranscriptRuntime = struct {
             } };
             transition.target_flow = &.{};
             transition.row_provenance = &.{};
+            transition.retention_identity = .{};
             previous_state.deinit(alloc);
             if (commit.complete and
                 !transition.recovery_projection_deferred and
@@ -11051,7 +11325,14 @@ fn resolveRecoveryMaterializedEndpoint(
     result: render_engine.terminal_diff.FrameCommitResult,
     commit: TranscriptTransitionCommit,
 ) MaterializedEndpoint {
-    const planned = transition.materialized;
+    var planned = transition.materialized;
+    if (!commit.complete and !transition.document_append.isEmpty() and transition.document_append.clear == .rows) {
+        // Replaying history does not prove that the subsequent viewport paint
+        // reached its endpoint. Recovery must repaint before resuming there.
+        debug_trace.logf("scroll", "history replay endpoint unconfirmed after partial frame", .{});
+        planned.flow_len = null;
+        return planned;
+    }
     if (commit.complete or
         result.document_append_applied() or
         !transition.recovery_progress_compatible or
@@ -12809,11 +13090,20 @@ test "measured recovery rebases from accepted projection before retiring resize 
 }
 
 test "source rewrite replays unchanged history prefix after footer projection rebase" {
-    const alloc = std.testing.allocator;
-    const target_flow =
+    try expectHistoryReplayBoundary(
         "rewrite-row-01\nrewrite-row-02\nrewrite-row-03\nrewrite-row-04\n" ++
-        "rewrite-row-05\nrewrite-row-06\nrewrite-row-07\nrewrite-row-08\n" ++
-        "rewrite-row-09\nrewrite-row-10\nrewrite-row-11\nrewrite-row-12\n";
+            "rewrite-row-05\nrewrite-row-06\nrewrite-row-07\nrewrite-row-08\n" ++
+            "rewrite-row-09\nrewrite-row-10\nrewrite-row-11\nrewrite-row-12\n",
+        false,
+    );
+}
+
+test "append pending wrap history replay starts a fresh row at a soft wrap" {
+    try expectHistoryReplayBoundary("12345678" ** 60, true);
+}
+
+fn expectHistoryReplayBoundary(target_flow: []const u8, source_pending_wrap: bool) !void {
+    const alloc = std.testing.allocator;
     const layout: Layout = .{
         .rows = 8,
         .cols = 40,
@@ -12931,6 +13221,31 @@ test "source rewrite replays unchanged history prefix after footer projection re
     );
     defer transition.deinit(alloc);
     try std.testing.expect(!transition.document_append.isEmpty());
+    try std.testing.expect(!transition.document_append.start_pending_wrap);
+    try std.testing.expectEqual(@as(u16, 1), transition.document_append.start_col);
+    const base = (try runtime.resolveTransitionAppendBase(&prepared, facts, false, transition.target_flow, facts.target_visual_offset)).?;
+    var boundary = try transcript_painter.prepareTranscriptDocumentAppend(alloc, transition.target_flow, layout.cols, base.flow_len, base.flow_len, false);
+    defer boundary.deinit(alloc);
+    try std.testing.expectEqual(source_pending_wrap, boundary.start_pending_wrap);
+    // A history replay publishes a prefix, but the committed paint also
+    // materializes the viewport. Its cursor must pair with that later byte end.
+    try std.testing.expectEqual(transition.target_flow.len, transition.materialized.flow_len.?);
+    for ([_]bool{ false, true }) |complete| {
+        const result = render_engine.terminal_diff.FrameCommitResult{
+            .bytes_written = 1,
+            .changed_cells = 0,
+            .full_repaint = false,
+            .document_append_committed = true,
+            .terminal_scroll_rows_committed = transition.scroll_plan.terminal_scroll_rows,
+            .committed_cursor_row = transition.cursor_row,
+            .committed_cursor_col = transition.cursor_col,
+            .shadow_state = if (complete) .committed else .terminal_partial_write,
+            .next_invalidation = .empty(),
+        };
+        const commit = resolveTranscriptTransitionCommit(&transition, result, result.scrollCommit(transition.scroll_plan));
+        const endpoint = resolveRecoveryMaterializedEndpoint(&transition, result, commit);
+        try std.testing.expectEqual(if (complete) @as(?usize, transition.target_flow.len) else null, endpoint.flow_len);
+    }
     switch (transition.document_append.clear) {
         .rows => |rows| try std.testing.expectEqual(
             @as(u16, @intCast(facts.semantic_rows)),

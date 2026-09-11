@@ -171,6 +171,7 @@ pub const LineProvenance = union(enum) {
     entry: struct {
         entry_id: u32,
         entry_class: TranscriptEntryClass,
+        projection_part: enum { body, group_header, group_child, group_cancel } = .body,
     },
     block_separator,
     boundary_blank,
@@ -277,6 +278,7 @@ pub const EntryRenderOverride = struct {
     entry_id: u32,
     kind: TranscriptBlockKind,
     bytes: []const u8,
+    line_provenance: []const LineProvenance = &.{},
 };
 
 pub const EntryRenderAction = union(enum) {
@@ -285,6 +287,7 @@ pub const EntryRenderAction = union(enum) {
     override: struct {
         kind: TranscriptBlockKind,
         bytes: []const u8,
+        line_provenance: []const LineProvenance = &.{},
     },
 };
 
@@ -1972,6 +1975,7 @@ const RenderEntriesOptions = struct {
                     .entry_id = entry.id(),
                     .kind = override.kind,
                     .bytes = override.bytes,
+                    .line_provenance = override.line_provenance,
                 },
                 .keep, .hide => null,
             };
@@ -2043,6 +2047,7 @@ const RenderEntriesBuilder = struct {
         entry: TranscriptEntry,
         block: RenderedBlock,
         options: RenderEntriesOptions,
+        block_provenance: []const LineProvenance,
         checkpoint: ?*build_checkpoint.BuildCheckpoint,
     ) !void {
         try self.appendSeparatorBefore(alloc, block.kind, options.line_provenance);
@@ -2063,7 +2068,12 @@ const RenderEntriesBuilder = struct {
         }
 
         try self.out.appendSlice(alloc, block.bytes);
-        try appendBlockProvenance(alloc, options.line_provenance, entry, block);
+        if (block_provenance.len > 0) {
+            if (options.line_provenance) |lines| {
+                std.debug.assert(block_provenance.len >= renderedHardLineCount(block.bytes));
+                try lines.appendSlice(alloc, block_provenance[0..renderedHardLineCount(block.bytes)]);
+            }
+        } else try appendBlockProvenance(alloc, options.line_provenance, entry, block);
         for (block.bytes) |byte| {
             try build_checkpoint.tick(checkpoint);
             if (byte == '\n') self.line_index += 1;
@@ -2123,7 +2133,7 @@ fn renderEntriesInterruptible(
             );
             defer block.deinit(alloc);
             if (!renderedBlockHasContent(block)) continue;
-            try builder.appendBlock(alloc, entry, block, options, checkpoint);
+            try builder.appendBlock(alloc, entry, block, options, override.line_provenance, checkpoint);
             continue;
         }
         const block = try renderEntryToBlockForPresentationInterruptible(
@@ -2137,7 +2147,7 @@ fn renderEntriesInterruptible(
         defer block.deinit(alloc);
         if (!renderedBlockHasContent(block)) continue;
 
-        try builder.appendBlock(alloc, entry, block, options, checkpoint);
+        try builder.appendBlock(alloc, entry, block, options, &.{}, checkpoint);
     }
 
     return builder.finish(alloc);

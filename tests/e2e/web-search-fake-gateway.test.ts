@@ -26,6 +26,7 @@ import {
   contentText,
 } from "./conditional-guidance-oracle";
 import { expectPermissionModeContext } from "./permission-mode-context";
+import { fakeGatewayTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 
 const TIMEOUT = 15_000;
 const SOURCE_URL = "https://ziglang.org/download/";
@@ -251,6 +252,7 @@ function startFakeGateway(
   model: string | ModelCatalogFixture = OUTER_MODEL,
 ) {
   const requests: GatewayRequest[] = [];
+  const titleRequests: GatewayRequest[] = [];
   const server = Bun.serve({
     port: 0,
     async fetch(req) {
@@ -263,7 +265,13 @@ function startFakeGateway(
         });
       }
       if (req.method !== "POST") return new Response("not found", { status: 404 });
-      requests.push({ body: await req.text(), headers: req.headers });
+      const body = await req.text();
+      // Title generation side calls bypass the queued responses entirely.
+      if (body.includes(TITLE_GENERATION_MARKER)) {
+        titleRequests.push({ body, headers: req.headers });
+        return fakeGatewayTitleDefault();
+      }
+      requests.push({ body, headers: req.headers });
       return await (responses.shift() ?? new Response("unexpected request", { status: 500 }));
     },
   });
@@ -272,6 +280,7 @@ function startFakeGateway(
     chatUrl: `http://127.0.0.1:${server.port}/v4/ai/language-model`,
     baseUrl: `http://127.0.0.1:${server.port}`,
     requests,
+    titleRequests,
     stop() {
       server.stop(true);
     },

@@ -4551,6 +4551,17 @@ test "exact caution is reused while the agent continues to a normal completion" 
         "No further action is needed.",
         hooks.history_assistant_text.?,
     );
+    for (hooks.history_turns.items[0].assistant.execution.tool_steps) |step| {
+        for (step.tool_results) |result| try std.testing.expect(result.review_feedback);
+    }
+    var recovered: std.ArrayList(ChatMessage) = .empty;
+    defer recovered.deinit(alloc);
+    try session_runtime.appendExecutionMemoryChatMessages(alloc, &recovered, hooks.history_turns.items[0].assistant.execution);
+    const pending = [_]ToolCall{toolCall("after-recovery", "run_command", "{\"command\":\"pwd\"}")};
+    try recovered.append(alloc, .{ .role = .assistant, .tool_calls = &pending });
+    const evidence = try permission_auto_classifier.selectPriorToolResults(alloc, recovered.items, pending[0].id);
+    defer alloc.free(evidence.entries);
+    try std.testing.expectEqual(@as(usize, 0), evidence.entries.len);
 }
 
 test "three distinct review cautions preserve an exhausted positive step cap" {
@@ -4780,6 +4791,12 @@ test "parallel automatic review reuses exact cautions" {
     try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
     try expectBodyContains(&gateway, 1, "review_caution");
     try expectBodyContains(&gateway, 2, "review_caution");
+    const execution = hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 2), execution.tool_steps.len);
+    for (execution.tool_steps) |step| {
+        try std.testing.expectEqual(@as(usize, 2), step.tool_results.len);
+        for (step.tool_results) |result| try std.testing.expect(result.review_feedback);
+    }
 }
 
 test "permission feedback follows the matching tool result" {
