@@ -365,6 +365,14 @@ const StatToken = struct {
     added: bool,
 };
 
+/// Diff counts exist only on write_file/edit_file status lines; every other
+/// phrase can end in a coincidental " +N" / "-N" (for example `head -80`).
+fn entryShowsDiffStats(detail: ?*const ToolDetailRecord) bool {
+    const record = detail orelse return false;
+    return std.mem.eql(u8, record.tool_name, "write_file") or
+        std.mem.eql(u8, record.tool_name, "edit_file");
+}
+
 /// Matches a trailing " +N" or " -N" diff count in a plain status phrase.
 fn trailingStatToken(text: []const u8) ?StatToken {
     var index = text.len;
@@ -557,7 +565,10 @@ fn formatGroupBlock(
         const connector = if (!focused_in_group and static_index == static_count) "└" else "├";
         const child = try std.fmt.allocPrint(scratch, "{s} {s}", .{ connector, phrase });
         const clipped = try clipSummary(scratch, child, cols);
-        const accented = try accentTrailingDiffStats(scratch, clipped, style.text_style);
+        const accented = if (entryShowsDiffStats(detail))
+            try accentTrailingDiffStats(scratch, clipped, style.text_style)
+        else
+            clipped;
         try out.writer.writeByte('\n');
         if (style.text_style.len > 0) try out.writer.writeAll(style.text_style);
         try out.writer.writeAll(accented);
@@ -609,7 +620,10 @@ fn formatExpandedChild(
     } orelse if (detail) |record| record.tool_name else "tool activity";
     const child = try std.fmt.allocPrint(scratch, "{s} {s}", .{ connector, phrase });
     const clipped = try clipSummary(scratch, child, cols);
-    const accented = try accentTrailingDiffStats(scratch, clipped, "");
+    const accented = if (entryShowsDiffStats(detail))
+        try accentTrailingDiffStats(scratch, clipped, "")
+    else
+        clipped;
     return alloc.dupe(u8, accented);
 }
 
@@ -1316,6 +1330,39 @@ test "collapsed tool group keeps diff count accents" {
             "├ Read runtime.zig\n" ++
             "├ Wrote note.txt [G]+143\x1b[0m\n" ++
             "└ Edited main.zig [G]+12\x1b[0m / [R]-3\x1b[0m",
+        projection.entry_actions.items[0].override.bytes,
+    );
+}
+
+test "grouped command lines keep numeric flags uncolored" {
+    const alloc = std.testing.allocator;
+    const saved_added = ui_render.diff_added_marker_style;
+    const saved_removed = ui_render.diff_removed_marker_style;
+    defer ui_render.diff_added_marker_style = saved_added;
+    defer ui_render.diff_removed_marker_style = saved_removed;
+    ui_render.diff_added_marker_style = "[G]";
+    ui_render.diff_removed_marker_style = "[R]";
+
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran\x1b[0m \x1b[38;5;245mcat log.txt | head -80\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Wrote\x1b[0m \x1b[38;5;245mnote.txt\x1b[0m \x1b[38;2;48;164;108m+2\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Wrote\x1b[0m \x1b[38;5;245mdetached.txt\x1b[0m \x1b[38;2;48;164;108m+7\x1b[0m\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("shell"), .activity_kind = .command, .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("write_file"), .activity_kind = .write, .outcome = .completed },
+        // entry 3 has no detail record; without a recorded file mutation the
+        // suffix cannot be trusted and stays plain.
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "● 3 tool calls · 1 write · 1 command\n" ++
+            "├ Ran cat log.txt | head -80\n" ++
+            "├ Wrote note.txt [G]+2\x1b[0m\n" ++
+            "└ Wrote detached.txt +7",
         projection.entry_actions.items[0].override.bytes,
     );
 }
