@@ -3461,11 +3461,11 @@ const CoordinatorTestApp = struct {
 
     pub fn writeDomainNotice(_: *CoordinatorTestApp, _: types.SemanticNotice, _: bool) !void {}
 
-    fn isModelCacheLoading(self: *CoordinatorTestApp) bool {
+    pub fn isModelCacheLoading(self: *CoordinatorTestApp) bool {
         return self.model_cache_loading;
     }
 
-    fn isModelCacheFailed(_: *CoordinatorTestApp) bool {
+    pub fn isModelCacheFailed(_: *CoordinatorTestApp) bool {
         return false;
     }
 
