@@ -4244,6 +4244,8 @@ test {
     _ = @import("core/input/file_completion_state.zig");
     _ = @import("gateway/vercel_protocol.zig");
     _ = @import("core/gateway/provider_set.zig");
+    _ = @import("core/gateway/model_catalog.zig");
+    _ = @import("gateway/chat_completions.zig");
     _ = @import("core/github/git_context.zig");
     _ = @import("core/github/github_publish.zig");
     _ = @import("core/github/github_workflows.zig");

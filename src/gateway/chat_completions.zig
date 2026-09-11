@@ -6,6 +6,8 @@ const streams = @import("../core/agent/stream_provider.zig");
 const provider_set = @import("../core/gateway/provider_set.zig");
 const catalog = @import("../core/gateway/model_catalog.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
+const model_capabilities = @import("../core/config/model_capabilities.zig");
+const model_catalog_metadata = @import("../core/gateway/model_catalog_metadata.zig");
 const classifier = @import("../core/permissions/auto_classifier.zig");
 const gateway_step = @import("../core/agent/runtime/gateway_step.zig");
 const review_messages = @import("vercel_protocol.zig");
@@ -21,7 +23,7 @@ pub fn bundle(definition: *const definitions.Definition) provider_set.Bundle {
     identity.configured.binding = definition.binding_identity();
     return .{
         .agent_stream = .{ .context = context, .stream_fn = stream, .build_request_fn = build },
-        .model_catalog = .{ .context = context, .fetch_fn = fetch_catalog, .provider_id = identity },
+        .model_catalog = .{ .context = context, .fetch_fn = fetch_catalog, .lookup_capabilities_fn = lookup_capabilities, .provider_id = identity },
         .cli_model_catalog = .{ .context = context, .fetch_fn = fetch_cli_catalog },
         .permission_reviewer = .{ .context = context, .review_fn = review },
     };
@@ -183,25 +185,58 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
     return codec.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag);
 }
 
+/// The returned entry borrows its strings; fetch_catalog replaces them with owned copies.
+fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry {
+    return .{
+        .id = @constCast(metadata.id),
+        .model_type = @constCast("language"),
+        .has_tool_use = metadata.supports_tool_use orelse false,
+        .context_window = metadata.context_window orelse 0,
+        .max_tokens = metadata.max_output_tokens orelse 0,
+    };
+}
+
+fn lookup_capabilities(raw: ?*anyopaque, model: []const u8) model_capabilities.Capabilities {
+    const metadata = definition_at(raw).model(model) orelse return .{};
+    return model_capabilities.mergeCapabilities(.{}, model_catalog_metadata.fromCatalogEntry(metadata_entry(metadata.*)));
+}
+
 fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) Allocator.Error!catalog.ProviderResult {
     if (input.cancel_flag) |flag| if (flag.load(.seq_cst)) return .{ .failure = .{ .category = .cancellation } };
     const definition = definition_at(raw);
     var entries: std.ArrayList(catalog.ModelCatalogEntry) = .empty;
     errdefer catalog.freeModelCatalog(alloc, &entries);
     for (definition.model_metadata) |metadata| {
-        const id = try alloc.dupe(u8, metadata.id);
-        errdefer alloc.free(id);
-        const model_type = try alloc.dupe(u8, "language");
-        errdefer alloc.free(model_type);
-        try entries.append(alloc, .{
-            .id = id,
-            .model_type = model_type,
-            .has_tool_use = metadata.supports_tool_use orelse false,
-            .context_window = metadata.context_window orelse 0,
-            .max_tokens = metadata.max_output_tokens orelse 0,
-        });
+        var entry = metadata_entry(metadata);
+        entry.id = try alloc.dupe(u8, entry.id);
+        errdefer alloc.free(entry.id);
+        entry.model_type = try alloc.dupe(u8, entry.model_type);
+        errdefer alloc.free(entry.model_type);
+        try entries.append(alloc, entry);
     }
     return .{ .catalog = entries };
+}
+
+test "configured capability lookup matches catalog projection and preserves unknowns" {
+    const alloc = std.testing.allocator;
+    var registry = try definitions.Registry.parse_json(alloc,
+        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"},"model_metadata":{"small":{"context_window":8192,"max_output_tokens":512,"supports_tool_use":true,"supports_vision":true},"large":{"context_window":32768,"max_output_tokens":1024,"supports_tool_use":false},"partial":{"max_output_tokens":128},"unknown":{}}}}
+    );
+    defer registry.deinit(alloc);
+    const provider = bundle(registry.get("local").?).model_catalog.?;
+    var fetched = try provider.fetch(alloc, .{ .endpoint = "unused" });
+    defer catalog.freeModelCatalog(alloc, &fetched.catalog);
+    for (fetched.catalog.items) |entry| {
+        const actual = provider.lookupCapabilities(entry.id).?;
+        try std.testing.expectEqualDeep(model_capabilities.mergeCapabilities(.{}, model_catalog_metadata.fromCatalogEntry(entry)), actual);
+        try std.testing.expectEqual(model_capabilities.ImageInputSupport.non_native, actual.image_input_support);
+        try std.testing.expect(!actual.supports_vision);
+    }
+    try std.testing.expectEqual(@as(?u32, 512), provider.lookupCapabilities("small").?.max_output_tokens);
+    try std.testing.expectEqual(@as(?u32, 1024), provider.lookupCapabilities("large").?.max_output_tokens);
+    try std.testing.expect(provider.lookupCapabilities("partial").?.context_window == null);
+    try std.testing.expect(provider.lookupCapabilities("unknown").?.max_output_tokens == null);
+    try std.testing.expectEqualDeep(model_capabilities.Capabilities{}, provider.lookupCapabilities("missing-fast").?);
 }
 
 fn fetch_cli_catalog(raw: ?*anyopaque, alloc: Allocator, input: gateway_provider.CliModelCatalogInput) gateway_provider.CliModelCatalogResult {

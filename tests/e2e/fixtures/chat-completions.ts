@@ -2,18 +2,18 @@ import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { cleanupIsolatedTestHome, createIsolatedTestHome } from "../../evals/eval-helpers";
 
-export function completion(model: string, text = "local reply") {
+export function completion(model: string, text = "local reply", inputTokens = 12) {
   const chunks = [
     { id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: null }] },
     { id: "chat-local", model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
-    { id: "chat-local", model, choices: [], usage: { prompt_tokens: 12, completion_tokens: 3, total_tokens: 15 } },
+    { id: "chat-local", model, choices: [], usage: { prompt_tokens: inputTokens, completion_tokens: 3, total_tokens: inputTokens + 3 } },
   ];
   return new Response(chunks.map(value => `data: ${JSON.stringify(value)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
 }
 
-export function toolCompletion(model: string, name: string, args: unknown) {
+export function toolCompletion(model: string, name: string, args: unknown, callId = "call-local") {
   const chunks = [
-    { id: "chat-tool", model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call-local", type: "function", function: { name, arguments: JSON.stringify(args) } }] }, finish_reason: null }] },
+    { id: "chat-tool", model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: callId, type: "function", function: { name, arguments: JSON.stringify(args) } }] }, finish_reason: null }] },
     { id: "chat-tool", model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
   ];
   return new Response(chunks.map(value => `data: ${JSON.stringify(value)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });

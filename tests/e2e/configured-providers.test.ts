@@ -137,21 +137,95 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 60000);
 
-  test("subagent requests inherit the named connection", async () => {
+  test.each(["inherited", "override", "unknown"])("subagent requests preserve connection and %s model capabilities", async mode => {
+    const childModel = mode === "inherited" ? "local-model" : mode === "override" ? "child-model" : "unknown-model";
     const f = fixture(body => {
       if (body.messages.some((message: any) => message.role === "user" && message.content?.includes("child-marker"))) return completion(body.model, "child reply");
       if (body.messages.some((message: any) => message.role === "tool")) return completion(body.model, "parent reply");
-      return toolCompletion(body.model, "subagent", { request: { action: "run", task: "child-marker" } });
+      return toolCompletion(body.model, "subagent", { request: { action: "run", task: "child-marker", ...(mode === "inherited" ? {} : { model: childModel }) } });
     });
+    f.settings.providers.local.model_metadata["local-model"].max_output_tokens = 512;
+    (f.settings.providers.local.model_metadata as any)["child-model"] = { context_window: 32768, max_output_tokens: 1024, supports_tool_use: true };
+    f.save();
     try {
       const result = await runFx(["ask", "--json", "Delegate a task"], { cwd: f.workspace, env: f.env, timeoutMs: 30000 });
       if (result.code !== 0) throw new Error(result.stdout + result.stderr);
       expect(JSON.parse(result.stdout).output).toBe("parent reply");
-      if (f.requests.length < 3) throw new Error(`child did not run: ${JSON.stringify(f.requests.at(-1)?.body.messages.filter((message: any) => message.role === "tool"))}`);
-      expect(f.requests.length).toBeGreaterThanOrEqual(3);
-      expect(f.requests.every(request => request.authorization === null && request.body.model === "local-model")).toBe(true);
+      expect(f.requests).toHaveLength(3);
+      expect(f.requests.map(request => request.body.model)).toEqual(["local-model", childModel, "local-model"]);
+      expect(f.requests.map(request => request.body.max_tokens)).toEqual([512, mode === "unknown" ? undefined : mode === "override" ? 1024 : 512, 512]);
+      expect(f.requests.every(request => request.authorization === null)).toBe(true);
     } finally { f.close(); }
   }, 35000);
+
+  test("persistent child capabilities stay bound when the parent changes providers", async () => {
+    let callId = 0;
+    const f = fixture(body => {
+      if (!body.tools?.some((tool: any) => tool.function?.name === "subagent")) return completion(body.model, "child reply");
+      if (body.messages.at(-1)?.role === "tool") return completion(body.model, "parent reply");
+      return toolCompletion(body.model, "subagent", { request: { action: "message", agent: "reader", message: "read the child fixture" } }, `child-call-${++callId}`);
+    });
+    f.settings.models.local = "shared-model";
+    f.settings.models.remote = "shared-model";
+    (f.settings.providers.local as any).model_metadata = { "shared-model": { context_window: 32768, max_output_tokens: 512, supports_tool_use: true } };
+    (f.settings.providers.remote as any).model_metadata = { "shared-model": { context_window: 65536, max_output_tokens: 1024, supports_tool_use: true } };
+    f.save();
+    try {
+      const first = await runFx(["ask", "--json", "Create the named child"], { cwd: f.workspace, env: { ...f.env, FX_PROVIDER: "remote" }, timeoutMs: 30000 });
+      if (first.code !== 0) throw new Error(first.stdout + first.stderr);
+      const id = JSON.parse(first.stdout).session_id;
+      expect(f.requests.map(request => request.body.max_tokens)).toEqual([1024, 1024, 1024]);
+      const resumed = await runFx(["ask", "--json", "--resume", id, "Continue the named child"], { cwd: f.workspace, env: { ...f.env, FX_PROVIDER: "local" }, timeoutMs: 30000 });
+      if (resumed.code !== 0) throw new Error(resumed.stdout + resumed.stderr);
+      const resumedResult = f.requests.at(-1)!.body.messages.at(-1).content;
+      if (!JSON.parse(resumedResult).ok) throw new Error(resumedResult);
+      expect(f.requests.map(request => request.body.max_tokens)).toEqual([1024, 1024, 1024, 512, 1024, 512]);
+      expect(f.requests[3].authorization).toBeNull();
+      expect(f.requests[4].authorization).toBe(`Bearer ${f.env.FX_TEST_PROVIDER_TOKEN}`);
+      expect(f.requests[5].authorization).toBeNull();
+      f.settings.providers.remote.base_url += "/changed";
+      f.save();
+      const rebound = await runFx(["ask", "--json", "--resume", id, "Continue the named child again"], { cwd: f.workspace, env: { ...f.env, FX_PROVIDER: "local" }, timeoutMs: 30000 });
+      if (rebound.code !== 0) throw new Error(rebound.stdout + rebound.stderr);
+      expect(f.requests).toHaveLength(8);
+      expect(f.requests.slice(6).every(request => request.authorization === null && request.path === "/v1/chat/completions")).toBe(true);
+      expect(f.requests[7].body.messages.at(-1).content).toContain("child_failed");
+    } finally { f.close(); }
+  }, 100000);
+
+  test("configured child compaction uses the model capability lookup", async () => {
+    let parentTurns = 0;
+    let summaries = 0;
+    const f = fixture(body => {
+      if (body.model === "child-model") {
+        if (!body.tools?.length) {
+          summaries++;
+          return completion(body.model, "The child is retaining repeated context details and should continue acknowledging them.");
+        }
+        return completion(body.model, "child reply", Math.ceil(JSON.stringify(body).length / 4));
+      }
+      if (body.messages.at(-1)?.role === "tool") return completion(body.model, "parent reply");
+      parentTurns++;
+      return toolCompletion(body.model, "subagent", { request: { action: "message", agent: "reader", message: `child context ${parentTurns} ` + "detail ".repeat(2000), ...(parentTurns === 1 ? { model: "child-model" } : {}) } }, `context-call-${parentTurns}`);
+    });
+    (f.settings.providers.local.model_metadata as any)["child-model"] = { context_window: 32768, max_output_tokens: 512, supports_tool_use: true };
+    f.save();
+    let id: string | undefined;
+    try {
+      for (let turn = 0; turn < 12; turn++) {
+        const result = await runFx(["ask", "--json", ...(id ? ["--resume", id] : []), "Continue the child context"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+        if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+        id = JSON.parse(result.stdout).session_id;
+        const returned = f.requests.filter(request => request.body.model === "local-model").at(-1)!.body.messages.at(-1).content;
+        if (!JSON.parse(returned).ok) throw new Error(returned);
+        expect(JSON.parse(returned).ok).toBe(true);
+      }
+      expect(summaries).toBeGreaterThan(0);
+      const childRequests = f.requests.filter(request => request.body.model === "child-model");
+      expect(childRequests.every(request => request.body.max_tokens > 0 && request.body.max_tokens <= 512)).toBe(true);
+      expect(f.requests.every(request => request.path === "/v1/chat/completions" && request.authorization === null)).toBe(true);
+    } finally { f.close(); }
+  }, 90000);
 
   test("automatic permission review uses the custom connection", async () => {
     const f = fixture(body => {
