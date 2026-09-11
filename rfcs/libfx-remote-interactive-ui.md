@@ -40,9 +40,29 @@ including dynamically available commands, rather than preserve a historical
 spelling locally. Unknown slash input must produce a command error, not a model
 request. Explicit literal-text submission remains available.
 
+The existing [libfx terminal workspace adapter](https://fx.sh/docs/lib/terminal)
+can already use a Vercel Sandbox. An app can implement `workspace.exec` by calling
+its authenticated backend, which executes the requested command in the sandbox
+and returns stdout, stderr, and an exit code. This is a feasible integration today;
+Vercel Sandbox is not inherently incompatible with libfx or WebAssembly.
+
+The limitations are in the current adapter contract: completion-only commands,
+a maximum 30-second deadline, bounded 64 KiB output, and no native TTY or managed
+running-process handles. The agent still runs in the browser; each shell operation
+crosses that callback boundary. A proxy must preserve the adapter's limits and
+cancellation semantics rather than silently claim native process support.
+
+The proposed remote mode is different: only the interface runs on the client,
+while the native agent and its tools run together in the sandbox. Shell operations
+do not travel through `workspace.exec` in this mode. Both modes remain useful and
+must coexist; adding remote mode must not break an existing workspace adapter.
+
 ## Scope
 
 Support both terminal and HTML presentation of the same interaction semantics.
+Remote mode must work with the existing `createFxTerminal()` / `xtermAdapter()`
+embedding pattern as well as HTML rendering. This terminal compatibility is a
+required deliverable, not a later optional feature or a synonym for PTY access.
 Reuse existing core owners rather than introduce another command implementation.
 Keep the JS SDK dependency-free; a DOM renderer can be an optional separate
 entry point without imposing a framework or browser runtime on headless users.
@@ -78,10 +98,17 @@ There are two terminal paths:
 
 1. Native fx through PTY/WebSocket already provides the existing terminal
    experience. This remains valid and does not depend on the proposed SDK.
-2. A libfx terminal frontend can eventually consume the interaction controller
-   remotely, keeping composer editing and menu navigation local. If reusing the
-   terminal renderer requires a UI-only WASM artifact, it must not instantiate a
-   second agent or use the browser tool profile for the remote session.
+2. The libfx terminal frontend must support the interaction controller remotely,
+   preserving the `createFxTerminal()` / `xtermAdapter()` embedding contract and
+   keeping composer editing and menu navigation local. Remote backend selection
+   is additive; the precise option or factory shape remains to be designed.
+   Preserve terminal writes, input, resize, interactive readiness, cancellation,
+   exit notification, and subscription cleanup. If reusing the terminal renderer
+   requires a UI-only WASM artifact, it must not instantiate a second agent or
+   use the browser tool profile for the remote session.
+
+The first path is useful independently, but a native PTY does not satisfy the
+second path's libfx compatibility requirement.
 
 HTML is a first-class consumer, not an ANSI-to-DOM conversion. fx supplies the
 command menu, accepted settings, picker descriptions, validation, and actions.
@@ -232,8 +259,8 @@ conflicts remain unchanged by the new remote mode.
 
 1. Extract a narrow interaction result contract around the existing model command
    and accepted configuration. Preserve terminal behavior and test it against the
-   same core owner. Prove one fx-owned picker in native terminal and HTML before
-   expanding the schema.
+   same core owner. Prove one fx-owned picker in the remote libfx terminal and
+   HTML, matching native terminal behavior, before expanding the schema.
 2. Add capability negotiation and a persistent ACP extension adapter. Provide a
    dependency-free libfx remote controller, optional reference DOM interaction
    renderer, and a small authenticated transport example. Include permissions and
@@ -241,10 +268,22 @@ conflicts remain unchanged by the new remote mode.
 3. Move remaining command presentation seams onto the shared contract, including
    session resume, compaction, MCP, and settings. Publish a capability matrix
    derived from implementation coverage. Do not advertise full parity early.
-4. Evaluate a remote libfx terminal renderer independently. Preserve PTY access
-   throughout; do not hold HTML support hostage to terminal rendering extraction.
+4. Validate remote mode through the existing libfx terminal embedding and HTML
+   rendering, including lifecycle behavior and command parity. Work may land
+   incrementally, but neither presentation may be dropped from acceptance.
+   Preserve native PTY access as an independent integration.
 
-Acceptance scenarios for each supported presentation:
+Acceptance scenarios for both required presentations:
+
+- An app using `createFxTerminal()` with `xtermAdapter()` can opt into a native
+  remote backend without replacing its terminal component with a PTY widget.
+  Input, resize, readiness, cancellation, exit, and cleanup retain their expected
+  behavior. The agent and native tools execute remotely, not in a second browser
+  agent. The exact additive API spelling is not prescribed by this RFC.
+- Existing browser-agent terminal mode still supports `workspace.exec` backed by
+  an authenticated app service and Vercel Sandbox, within the current limits.
+  Validate this with a bounded remote command and cancellation; do not confuse
+  that callback mode with the proposed native-agent mode.
 
 - `/model` opens the fx-owned picker and accepts the same model/configuration
   change as native fx. `/models` follows the connected registry: on the inspected
@@ -274,7 +313,8 @@ paid sandbox is required to review this documentation-only proposal.
   interactive handlers need a typed operation result before they can be shared?
 - Should the reference DOM renderer ship inside an optional libfx subpath or as
   a separate package, while preserving a dependency-free core SDK?
-- Is remote terminal rendering worth a UI-only WASM build, or does native PTY
-  provide the better initial terminal experience?
+- Which implementation best preserves the required libfx terminal embedding:
+  a UI-only WASM build or further separation of the renderer? Native PTY remains
+  useful, but is not a replacement for this requirement.
 - What bounded replay window and disconnect policy should the first owner
   service guarantee, and should multi-view ownership transfer wait for a later RFC?
