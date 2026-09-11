@@ -2958,7 +2958,7 @@ test "input escape parser admits raw ctrl+o control byte" {
 
 test "input escape parser admits raw ctrl+p control byte" {
     try std.testing.expectEqual(
-        @as(?InputEscapeAction, .open_model_picker),
+        @as(?InputEscapeAction, .open_model_catalog),
         controlByteFeatureAction(16),
     );
     try std.testing.expectEqual(@as(?InputEscapeAction, null), controlByteFeatureAction(14));

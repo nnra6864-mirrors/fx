@@ -112,6 +112,73 @@ test "composer stash round trip preserves draft text, cursor, and selection" {
     try std.testing.expectEqual(@as(?usize, 3), vertical.preferred_column);
 }
 
+test "composer stash round trip preserves registered entities" {
+    const alloc = std.testing.allocator;
+    var edit: editor_state.State = .{};
+    defer edit.deinit(alloc);
+    var entities: registered_entities.State = .{};
+    defer entities.deinit(alloc);
+    var history: edit_history.State = .{};
+    defer history.deinit(alloc);
+    var vertical: vertical_navigation.State = .{};
+    var prompts: composer_history.State = .{};
+    defer prompts.deinit(alloc);
+
+    const view = State.ComposerView{
+        .edit = &edit,
+        .entities = &entities,
+        .edit_history = &history,
+        .vertical_navigation = &vertical,
+        .composer_history = &prompts,
+    };
+
+    try edit.input.appendSlice(alloc, "draft text");
+    try entities.pasted_blocks.append(alloc, .{
+        .id = 1,
+        .text = try alloc.dupe(u8, "block"),
+        .line_count = 1,
+        .span = .{ .raw_start = 0, .raw_end = 5 },
+    });
+    try entities.image_tokens.append(alloc, .{
+        .span = .{ .raw_start = 0, .raw_end = 5 },
+        .id = 7,
+    });
+    try entities.skill_tokens.append(alloc, .{
+        .raw_start = 6,
+        .raw_end = 11,
+        .name = try alloc.dupe(u8, "skill"),
+        .path = try alloc.dupe(u8, "/tmp/s.md"),
+    });
+    entities.next_paste_id = 9;
+
+    var stash = State.capture(view);
+    defer stash.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), entities.pasted_blocks.items.len);
+    try std.testing.expectEqual(@as(usize, 0), entities.image_tokens.items.len);
+    try std.testing.expectEqual(@as(usize, 0), entities.skill_tokens.items.len);
+    try std.testing.expectEqual(@as(usize, 1), entities.next_paste_id);
+
+    // Flow-era registrations (e.g. a paste into the menu query) are torn down.
+    try entities.pasted_blocks.append(alloc, .{
+        .id = 99,
+        .text = try alloc.dupe(u8, "flow"),
+        .line_count = 1,
+        .span = .{ .raw_start = 0, .raw_end = 4 },
+    });
+
+    stash.restore(alloc, view);
+
+    try std.testing.expectEqual(@as(usize, 1), entities.pasted_blocks.items.len);
+    try std.testing.expectEqualStrings("block", entities.pasted_blocks.items[0].text);
+    try std.testing.expectEqual(@as(usize, 1), entities.pasted_blocks.items[0].id);
+    try std.testing.expectEqual(@as(usize, 1), entities.image_tokens.items.len);
+    try std.testing.expectEqual(@as(usize, 7), entities.image_tokens.items[0].id);
+    try std.testing.expectEqual(@as(usize, 1), entities.skill_tokens.items.len);
+    try std.testing.expectEqualStrings("skill", entities.skill_tokens.items[0].name);
+    try std.testing.expectEqual(@as(usize, 9), entities.next_paste_id);
+}
+
 test "composer stash round trip preserves undo history and drops flow edits" {
     const alloc = std.testing.allocator;
     var edit: editor_state.State = .{};

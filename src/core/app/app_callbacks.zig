@@ -1335,6 +1335,13 @@ pub fn Bindings(comptime App: type) type {
                 provider_runtime.supported(App) and
                 @hasDecl(App, "modelCompletions"))
             {
+                // The Ctrl+P catalog owns the borrowed composer while a draft
+                // is stashed; seeding the inline "/model " flow there would
+                // land in the menu's query box and be discarded on close.
+                const InputRuntime = @TypeOf(app.input_runtime);
+                if (comptime @hasField(InputRuntime, "model_picker_draft")) {
+                    if (app.input_runtime.model_picker_draft != null) return;
+                }
                 try input_completion_runtime.CompletionRuntime(App).openCurrentModelPicker(app);
             }
         }
