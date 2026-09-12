@@ -245,7 +245,7 @@ def gateway(system: str, user: str, output: pathlib.Path) -> dict:
             "Content-Type": "application/json",
             "ai-gateway-protocol-version": "0.0.1",
             "ai-language-model-specification-version": "4",
-            "ai-language-model-id": "anthropic/claude-opus-4.7",
+            "ai-language-model-id": "spacexai/grok-4.6",
             "ai-language-model-streaming": "true",
             "HTTP-Referer": "https://github.com/vercel-labs/fx",
             "X-Title": "fx",
