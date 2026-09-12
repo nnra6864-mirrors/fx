@@ -432,11 +432,12 @@ Check in the golden file and wire a regression test that re-runs `fx replay` in 
 
 Start **Actions > Prepare Release** in this repository:
 
-1. Choose a patch, minor or major bump. Preparation opens the version and changelog PR and waits for its checks.
+1. Write the next changelog entry locally and push a release PR. Enter its number in Prepare Release. The workflow reads the marked version, aligns the version declaration and install example, and waits for the PR's checks without rewriting the notes.
 2. Review the completed release preview. The binaries are signed, the stable SDK is built, and the website and affected demos are tested before approval.
 3. Approve the candidate in the `npm` environment. Publication reuses those artifacts, merges the preparation PRs, publishes the downloads and SDK, and promotes the prepared deployments.
 
 Do not merge the preparation PR or edit fx-web by hand to advance a release.
+Changelog preparation does not use a model or require an inference API key.
 The terminal version, changelog, signed binary sizes and example sources come
 from the same candidate. Setup and recovery are documented in
 [`scripts/RELEASE.md`](scripts/RELEASE.md).

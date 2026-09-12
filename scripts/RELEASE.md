@@ -1,7 +1,16 @@
 # Releasing fx
 
-Start **Actions > Prepare Release** in `vercel-labs/fx` and choose the version
-bump. Review the generated notes and the completed preview, then approve the
+Write the next entry locally in `CHANGELOG.md`, with a stable version heading
+and one `<!-- release:start -->` / `<!-- release:end -->` pair. Remove the old
+entry's markers, then commit and push a release PR targeting `main`.
+
+Start **Actions > Prepare Release** on `main` in `vercel-labs/fx` and enter that
+PR number. The PR must be open and non-draft, and contain only release notes,
+the version declaration and an existing README install-version pin. Preparation
+aligns those version values if needed; an unversioned installer stays unversioned.
+It never writes `CHANGELOG.md` or calls a model.
+
+Review your notes and the completed preview, then approve the
 `npm` environment in **Publish libfx**. You do not need to prepare a separate
 fx-web release.
 
@@ -11,6 +20,9 @@ Preparation keeps the native version PR open. It qualifies the exact source,
 builds all four native targets, signs the macOS binaries, and builds the stable
 SDK archive. It then prepares the website PR and a production-configured
 deployment without assigning the public domain.
+
+The version is taken from the marked changelog entry. Missing, malformed or
+already-released notes stop preparation without changing files.
 
 The website installs that SDK archive from an immutable, checksum-addressed
 mirror. Its package version is the intended release version, not a dev build.
@@ -28,7 +40,7 @@ Browser checks exercise the actual terminal and a synthetic Gateway response;
 they do not spend model credits or disable the public site's request guards.
 
 Edit the native preparation PR to change the notes, then rerun **Prepare
-Release**. Existing edited notes are preserved. Only `src/main.zig`'s version,
+Release** with the same PR number. Existing edited notes are preserved. Only `src/main.zig`'s version,
 the README install example and `CHANGELOG.md` may differ from the reviewed
 main ancestor. Additional product changes must reach main first.
 
@@ -75,7 +87,7 @@ being verified. Activation requires all of the following:
   the separate Apple reviewer only after the trusted-main signing path is
   verified. The older `release` environment is no longer a publisher.
 - The existing `BLOB_READ_WRITE_TOKEN` for the immutable archive mirror and
-  downloads, and `AI_GATEWAY_API_KEY` for drafting notes.
+  downloads. Changelog preparation requires no inference API key.
 - Vercel Authentication for preview and production deployment URLs
   (`prod_deployment_urls_and_all_previews`), leaving public domains open.
   Store the project automation bypass in `FX_WEB_PREVIEW_BYPASS` in

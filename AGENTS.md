@@ -384,13 +384,16 @@ controls the changelog and gives one final publication approval. See
 
 ### Automated flow (preferred)
 
-1. Go to **Actions > Prepare Release** on GitHub
-2. Select the bump type (`patch`, `minor`, or `major`) and run the workflow
-3. The workflow prepares a version and changelog PR, waits for its exact-source checks, then starts release preparation without merging it
+1. Write the next release entry locally in `CHANGELOG.md`, including its version heading and release markers, then push an open release PR targeting `main`
+2. Go to **Actions > Prepare Release** on `main`, enter that PR number, and run the workflow
+3. The workflow validates the committed notes, aligns the version and README install example, waits for exact-source checks, then prepares the preview without merging the PR
 4. Review the notes and the completed website preview. Edit the preparation PR if needed and rerun preparation; existing notes are preserved
 5. Approve the verified candidate in the `npm` environment. The publisher merges eligible preparation PRs and publishes the retained native binaries, SDK, website and affected demos without rebuilding them
 
-The `prepare-release.yml` workflow uses the Vercel AI Gateway (`AI_GATEWAY_API_KEY` secret) to generate the changelog from the real code diff, not from commit messages or PR descriptions.
+Preparation never writes `CHANGELOG.md` or calls a model. The version comes
+from the marked changelog entry. Missing or invalid notes stop preparation
+without replacing the maintainer's text. Keep release PRs limited to the
+changelog, version declaration and README; product changes must reach main first.
 
 ### Manual flow
 
@@ -410,7 +413,7 @@ preview work: it installs the verified stable SDK archive directly.
 
 ### Writing the changelog
 
-Whether automated or manual, the changelog is public product copy. Describe observable user behavior, not the engineering process behind it. Use the diff, commits, and merged pull requests as research evidence only.
+The changelog is public product copy. Describe observable user behavior, not the engineering process behind it. Use the diff, commits, and merged pull requests as research evidence only.
 
 Public changelog entries must:
 

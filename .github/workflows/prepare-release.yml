@@ -3,14 +3,10 @@ name: Prepare Release
 on:
   workflow_dispatch:
     inputs:
-      bump:
-        description: Version bump type
+      release_pr:
+        description: Open fx PR containing your committed changelog entry
         required: true
-        type: choice
-        options:
-          - patch
-          - minor
-          - major
+        type: string
 
 permissions:
   contents: read
@@ -30,7 +26,7 @@ jobs:
       version: ${{ steps.plan.outputs.version }}
       branch: ${{ steps.plan.outputs.branch }}
       release_sha: ${{ steps.commit.outputs.sha || steps.plan.outputs.expected_head }}
-      pr_number: ${{ steps.pr.outputs.number }}
+      pr_number: ${{ steps.plan.outputs.pr_number }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -38,31 +34,18 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Resolve release version and preserve existing preparation
+      - name: Read the locally written release notes
         id: plan
         env:
           GH_TOKEN: ${{ github.token }}
-          BUMP: ${{ inputs.bump }}
-        run: python3 scripts/prepare_release_notes.py plan --bump "$BUMP" --plan "$RUNNER_TEMP/release-plan.json"
+          RELEASE_PR: ${{ inputs.release_pr }}
+        run: python3 -m scripts.prepare_release_notes plan --pr "$RELEASE_PR" --plan "$RUNNER_TEMP/release-plan.json"
 
-      - name: Draft release notes from the complete change range
+      - name: Align the version without changing the changelog
         if: steps.plan.outputs.prepare == 'true'
         env:
-          AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}
-        run: python3 scripts/prepare_release_notes.py draft --plan "$RUNNER_TEMP/release-plan.json" --output "$RUNNER_TEMP/release-notes"
-
-      - name: Retain release note coverage
-        if: always() && steps.plan.outputs.prepare == 'true'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-note-coverage
-          path: ${{ runner.temp }}/release-notes/
-          overwrite: true
-          if-no-files-found: ignore
-
-      - name: Update version and changelog
-        if: steps.plan.outputs.prepare == 'true'
-        run: python3 scripts/prepare_release_notes.py apply --plan "$RUNNER_TEMP/release-plan.json" --output "$RUNNER_TEMP/release-notes"
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -m scripts.prepare_release_notes apply --plan "$RUNNER_TEMP/release-plan.json"
 
       - name: Create release preparation token
         id: app
@@ -83,13 +66,8 @@ jobs:
           VERSION: ${{ steps.plan.outputs.version }}
           BRANCH: ${{ steps.plan.outputs.branch }}
           EXPECTED_HEAD: ${{ steps.plan.outputs.expected_head }}
-          CREATE_BRANCH: ${{ steps.plan.outputs.create_branch }}
         run: |
           set -euo pipefail
-          if [ "$CREATE_BRANCH" = true ]; then
-            gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-              -f ref="refs/heads/${BRANCH}" -f sha="$EXPECTED_HEAD" >/dev/null
-          fi
           jq -n \
             --arg repository "$GITHUB_REPOSITORY" \
             --arg branch "$BRANCH" \
@@ -97,7 +75,6 @@ jobs:
             --arg headline "Prepare v${VERSION} release" \
             --arg main_zig "$(base64 -w 0 src/main.zig)" \
             --arg readme "$(base64 -w 0 README.md)" \
-            --arg changelog "$(base64 -w 0 CHANGELOG.md)" \
             '{
               query: "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }",
               variables: {input: {
@@ -106,8 +83,7 @@ jobs:
                 message: {headline: $headline},
                 fileChanges: {additions: [
                   {path: "src/main.zig", contents: $main_zig},
-                  {path: "README.md", contents: $readme},
-                  {path: "CHANGELOG.md", contents: $changelog}
+                  {path: "README.md", contents: $readme}
                 ]}
               }}
             }' > "$RUNNER_TEMP/create-release-commit.json"
@@ -125,33 +101,19 @@ jobs:
           fi
           echo "sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
 
-      - name: Create or reuse release pull request
-        id: pr
+      - name: Confirm the prepared pull request
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
-          VERSION: ${{ steps.plan.outputs.version }}
-          BRANCH: ${{ steps.plan.outputs.branch }}
-          EXISTING_PR: ${{ steps.plan.outputs.pr_number }}
+          PR_NUMBER: ${{ steps.plan.outputs.pr_number }}
           RELEASE_SHA: ${{ steps.commit.outputs.sha || steps.plan.outputs.expected_head }}
         run: |
           set -euo pipefail
-          CURRENT_HEAD=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BRANCH}" --jq '.object.sha')
+          CURRENT_HEAD=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)
           if [ "$CURRENT_HEAD" != "$RELEASE_SHA" ]; then
             echo "::error::Release branch changed during preparation; preserving its edits"
             exit 1
           fi
-          if [ -n "$EXISTING_PR" ]; then
-            PR_NUMBER="$EXISTING_PR"
-            gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --add-label "type: release"
-          else
-            printf 'Prepare fx v%s with the version, install example, and release notes together.\n\nThe release candidate must pass qualification before publication.\n' \
-              "$VERSION" > "$RUNNER_TEMP/release-pr-body.md"
-            PR_URL=$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$BRANCH" \
-              --title "Prepare v${VERSION} release" --body-file "$RUNNER_TEMP/release-pr-body.md" \
-              --label "type: release")
-            PR_NUMBER="${PR_URL##*/}"
-          fi
-          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --add-label "type: release"
 
   qualify:
     name: Qualify the release snapshot and start its preview

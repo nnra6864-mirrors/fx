@@ -1,4 +1,4 @@
-"""Qualify a generated release PR before building its frozen release snapshot."""
+"""Qualify a release PR before building its frozen release snapshot."""
 
 from __future__ import annotations
 
@@ -17,6 +17,11 @@ REQUIRED_CHECKS = {
     "Full suite (macos-x86_64)", "Full suite (macos-aarch64)",
     "Build & Test (ReleaseSafe)", "Startup Latency",
 }
+
+
+def prepared_readme(before: str, current: str, version: str) -> str:
+    return re.sub(r"\bbash -s v" + re.escape(current) + r"(?![0-9A-Za-z.+-])",
+                  f"bash -s v{version}", before)
 
 
 def verify_version_only_change(before: str, after: str, changed: set[str], version: str) -> None:
@@ -41,8 +46,8 @@ def inspect_release_pr(number: int, source_sha: str, root: pathlib.Path) -> dict
         raise ValueError("release PR source does not match the requested snapshot")
     source = command(["git", "show", f"{source_sha}:src/main.zig"], cwd=root)
     versions = re.findall(r'^pub const version = "(' + SEMVER + r')";$', source, re.MULTILINE)
-    if len(versions) != 1 or pr["head"]["ref"] != f"prepare-v{versions[0]}":
-        raise ValueError("only the generated version preparation branch may build an unpublished release")
+    if len(versions) != 1 or pr["head"]["ref"] == "main":
+        raise ValueError("release preparation must use a stable version on a non-main branch")
     if not pr.get("merged"):
         if pr["state"] != "open":
             raise ValueError("release preparation PR is closed")
@@ -50,6 +55,11 @@ def inspect_release_pr(number: int, source_sha: str, root: pathlib.Path) -> dict
         before = command(["git", "show", f"{base}:src/main.zig"], cwd=root)
         changed = set(command(["git", "diff", "--name-only", base, source_sha], cwd=root).splitlines())
         verify_version_only_change(before, source, changed, versions[0])
+        before_version = re.search(r'^pub const version = "([^"]+)";$', before, re.MULTILINE)[1]
+        readme_before = command(["git", "show", f"{base}:README.md"], cwd=root)
+        readme_after = command(["git", "show", f"{source_sha}:README.md"], cwd=root)
+        if readme_after != prepared_readme(readme_before, before_version, versions[0]):
+            raise ValueError("release README must contain only the prepared install-version change")
     return pr
 
 
