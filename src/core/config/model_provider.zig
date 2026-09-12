@@ -41,7 +41,13 @@ pub const ProviderId = union(enum) {
     }
 
     pub fn eql(self: ProviderId, other: ProviderId) bool {
-        return std.mem.eql(u8, self.label(), other.label());
+        if (std.meta.activeTag(self) != std.meta.activeTag(other)) return false;
+        if (self != .configured) return true;
+        return std.mem.eql(
+            u8,
+            self.configured.bytes[0..self.configured.len],
+            other.configured.bytes[0..other.configured.len],
+        );
     }
 
     pub fn bind(self: ProviderId, registry: configured_provider.Registry) error{ UnknownConfiguredProvider, ConfiguredProviderChanged }!ProviderId {
@@ -62,6 +68,33 @@ pub const ProviderId = union(enum) {
         const first = self.configured.binding orelse return false;
         const second = other.configured.binding orelse return false;
         return std.mem.eql(u8, &first, &second);
+    }
+};
+
+/// Name-only key for provider-keyed stores whose lookups never inspect
+/// binding identity. Narrower than ProviderId so bounded maps copy less.
+pub const NameKey = struct {
+    bytes: [configured_provider.max_id_bytes]u8 = @splat(0),
+    len: u8 = 0,
+
+    pub fn fromProvider(provider: ProviderId) NameKey {
+        var key: NameKey = .{};
+        const name = provider.label();
+        key.len = @intCast(name.len);
+        @memcpy(key.bytes[0..name.len], name);
+        return key;
+    }
+
+    pub fn label(self: *const NameKey) []const u8 {
+        return self.bytes[0..self.len];
+    }
+
+    pub fn eqlName(self: *const NameKey, name: []const u8) bool {
+        return self.len == name.len and std.mem.eql(u8, self.bytes[0..self.len], name);
+    }
+
+    pub fn eqlProvider(self: *const NameKey, provider: ProviderId) bool {
+        return self.eqlName(provider.label());
     }
 };
 
@@ -142,6 +175,26 @@ test "configured provider identity serializes its binding and rejects rebinding"
     try std.testing.expectError(error.InvalidProviderBinding, parse_saved(.{ .string = "local" }));
     try std.testing.expect(!authorizesCredential(.gateway, .configured));
     try std.testing.expect(!authorizesCredential(bound, .ai_gateway_api_key));
+}
+
+test "provider equality compares tags before names and name keys stay name-only" {
+    const gateway = parse("gateway").?;
+    const codex = parse("codex").?;
+    try std.testing.expect(gateway.eql(parse("gateway").?));
+    try std.testing.expect(!gateway.eql(codex));
+    try std.testing.expect(!gateway.eql(parse("local").?));
+    const local = parse("local").?;
+    try std.testing.expect(local.eql(parse("local").?));
+    try std.testing.expect(!local.eql(parse("remote").?));
+    const key = NameKey.fromProvider(local);
+    try std.testing.expectEqualStrings("local", key.label());
+    try std.testing.expect(key.eqlName("local"));
+    try std.testing.expect(!key.eqlName("remote"));
+    try std.testing.expect(key.eqlProvider(local));
+    try std.testing.expect(!key.eqlProvider(parse("remote").?));
+    const builtin_key = NameKey.fromProvider(gateway);
+    try std.testing.expect(builtin_key.eqlName("gateway"));
+    try std.testing.expect(builtin_key.eqlProvider(gateway));
 }
 
 test "provider parsing recognizes builtins and validated configured names" {

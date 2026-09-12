@@ -624,18 +624,22 @@ pub const Reducer = struct {
             }
             calls.deinit(self.alloc);
         }
-        for (self.tools.items) |tool| {
-            const id = try self.alloc.dupe(u8, tool.id.?);
+        for (self.tools.items) |*tool| {
+            // finish() is terminal: ownership moves to the result and the
+            // emptied accumulators cost nothing at reducer deinit.
+            const id = tool.id.?;
+            tool.id = null;
             errdefer self.alloc.free(id);
-            const name = try self.alloc.dupe(u8, tool.name.items);
+            const name = try tool.name.toOwnedSlice(self.alloc);
             errdefer self.alloc.free(name);
-            const arguments = try self.alloc.dupe(u8, tool.arguments.items);
+            const arguments = try tool.arguments.toOwnedSlice(self.alloc);
             errdefer self.alloc.free(arguments);
             try calls.append(self.alloc, .{ .id = id, .name = name, .arguments_json = arguments });
         }
-        const content = if (self.content.items.len != 0) try self.alloc.dupe(u8, self.content.items) else null;
+        const content = if (self.content.items.len != 0) try self.content.toOwnedSlice(self.alloc) else null;
         errdefer if (content) |text| self.alloc.free(text);
-        const generation_id = if (self.generation_id) |id| try self.alloc.dupe(u8, id) else null;
+        const generation_id = self.generation_id;
+        self.generation_id = null;
         errdefer if (generation_id) |id| self.alloc.free(id);
         const owned_calls = try calls.toOwnedSlice(self.alloc);
         self.phase = .closed;

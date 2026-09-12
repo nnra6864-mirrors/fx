@@ -3,11 +3,15 @@ const model_provider = @import("model_provider.zig");
 
 pub const max_preferences = 35;
 pub const Preferences = struct {
-    pub const Entry = struct { provider: model_provider.ProviderId, model: []u8 };
+    pub const Entry = struct { provider: model_provider.NameKey, model: []u8 };
     entries: std.ArrayList(Entry) = .empty,
 
     pub fn get(self: *const Preferences, provider: model_provider.ProviderId) ?[]const u8 {
-        for (self.entries.items) |entry| if (entry.provider.eql(provider)) return entry.model;
+        return self.getName(provider.label());
+    }
+
+    fn getName(self: *const Preferences, name: []const u8) ?[]const u8 {
+        for (self.entries.items) |*entry| if (entry.provider.eqlName(name)) return entry.model;
         return null;
     }
 
@@ -19,25 +23,25 @@ pub const Preferences = struct {
 
     /// Takes model only on success.
     fn putOwned(self: *Preferences, alloc: std.mem.Allocator, provider: model_provider.ProviderId, model: []u8) !void {
-        for (self.entries.items) |*entry| if (entry.provider.eql(provider)) {
+        for (self.entries.items) |*entry| if (entry.provider.eqlProvider(provider)) {
             alloc.free(entry.model);
             entry.model = model;
             return;
         };
         if (self.entries.items.len == max_preferences) return error.TooManyModelPreferences;
-        try self.entries.append(alloc, .{ .provider = provider, .model = model });
+        try self.entries.append(alloc, .{ .provider = model_provider.NameKey.fromProvider(provider), .model = model });
     }
 
     pub fn mergeOwnedFrom(self: *Preferences, alloc: std.mem.Allocator, incoming: *Preferences) !void {
         var additional: usize = 0;
-        for (incoming.entries.items) |entry| if (self.get(entry.provider) == null) {
+        for (incoming.entries.items) |entry| if (self.getName(entry.provider.label()) == null) {
             additional += 1;
         };
         if (additional > max_preferences - self.entries.items.len) return error.TooManyModelPreferences;
         try self.entries.ensureUnusedCapacity(alloc, additional);
         for (incoming.entries.items) |entry| {
             for (self.entries.items) |*current| {
-                if (!current.provider.eql(entry.provider)) continue;
+                if (!current.provider.eqlName(entry.provider.label())) continue;
                 alloc.free(current.model);
                 current.* = entry;
                 break;

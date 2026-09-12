@@ -134,20 +134,20 @@ pub const ConfigSources = struct {
 };
 
 pub const ProviderModelSources = struct {
-    const Entry = struct { provider: model_provider.ProviderId, source: ConfigSource };
+    const Entry = struct { provider: model_provider.NameKey, source: ConfigSource };
     entries: [model_preferences.max_preferences]?Entry = @splat(null),
 
-    pub fn get(self: ProviderModelSources, provider: model_provider.ProviderId) ConfigSource {
-        for (self.entries) |entry| if (entry) |value| {
-            if (value.provider.eql(provider)) return value.source;
+    pub fn get(self: *const ProviderModelSources, provider: model_provider.NameKey) ConfigSource {
+        for (self.entries) |entry| if (entry) |*value| {
+            if (value.provider.eqlName(provider.label())) return value.source;
         };
         return .compiled_default;
     }
 
-    pub fn set(self: *ProviderModelSources, provider: model_provider.ProviderId, source: ConfigSource) !void {
+    pub fn set(self: *ProviderModelSources, provider: model_provider.NameKey, source: ConfigSource) !void {
         for (&self.entries) |*entry| {
             if (entry.*) |*value| {
-                if (!value.provider.eql(provider)) continue;
+                if (!value.provider.eqlName(provider.label())) continue;
                 value.source = source;
                 return;
             } else {
@@ -543,14 +543,14 @@ fn loadMergedSettingsDetailedWithOptionalHome(
     if (io_mod.getenv("FX_PROVIDER") != null) sources.provider = .process_override;
     if (io_mod.getenv("FX_MODEL")) |model_override| {
         if (std.mem.trim(u8, model_override, " \t\r\n").len > 0) {
-            try sources.models.set(settings.provider orelse .gateway, .process_override);
+            try sources.models.set(model_provider.NameKey.fromProvider(settings.provider orelse .gateway), .process_override);
         }
     }
 
     return .{
         .settings = settings,
         .diagnostics = try diagnostics.toOwnedSlice(alloc),
-        .model_source = sources.models.get(settings.provider orelse .gateway),
+        .model_source = sources.models.get(model_provider.NameKey.fromProvider(settings.provider orelse .gateway)),
         .sources = sources,
         .permission_sources = permission_sources,
         .prompt_history_store_allowed = prompt_history_store_allowed,
@@ -3436,7 +3436,7 @@ test "detailed settings expose target sources and permission views" {
     var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
     defer result.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(ConfigSource.user_workspace, result.sources.models.get(.gateway));
+    try std.testing.expectEqual(ConfigSource.user_workspace, result.sources.models.get(model_provider.NameKey.fromProvider(.gateway)));
     try std.testing.expectEqual(ConfigSource.user_workspace, result.sources.permission_mode);
     try std.testing.expectEqual(ConfigSource.compiled_default, result.sources.effort);
     try std.testing.expectEqual(ConfigSource.user_global, result.sources.fast_mode);
@@ -3478,7 +3478,7 @@ test "detailed settings report non-empty process model override as winning sourc
     var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
     defer result.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(ConfigSource.process_override, result.sources.models.get(.gateway));
+    try std.testing.expectEqual(ConfigSource.process_override, result.sources.models.get(model_provider.NameKey.fromProvider(.gateway)));
     try std.testing.expectEqual(ModelSource.process_override, result.model_source.?);
     try std.testing.expectEqualStrings("user/model", result.settings.models.get(.gateway).?);
 }

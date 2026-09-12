@@ -70,51 +70,6 @@ fn phase_deadline(milliseconds: i64, caller: ?std.Io.Clock.Timestamp) std.Io.Clo
     return phase;
 }
 
-const Opened = struct {
-    request: ?std.http.Client.Request,
-    pub fn deinit(self: *Opened, _: Allocator) void {
-        if (self.request) |*request| request.deinit();
-        self.request = null;
-    }
-};
-
-const Open = struct {
-    client: *std.http.Client,
-    uri: std.Uri,
-    authorization: ?[]const u8,
-    pub fn run(self: *Open) !Opened {
-        var headers: std.http.Client.Request.Headers = .{
-            .content_type = .{ .override = "application/json" },
-            .accept_encoding = .omit,
-            .user_agent = .{ .override = client_mod.user_agent },
-        };
-        if (self.authorization) |value| headers.authorization = .{ .override = value };
-        return .{ .request = try self.client.request(.POST, self.uri, .{
-            .headers = headers,
-            .extra_headers = &.{.{ .name = "accept", .value = "text/event-stream" }},
-            .keep_alive = false,
-            .redirect_behavior = .unhandled,
-        }) };
-    }
-};
-
-const Watch = struct {
-    done: std.atomic.Value(bool) = .init(false),
-    thread: ?std.Thread = null,
-    fn start(self: *Watch, cancel: *std.atomic.Value(bool), deadline: ?std.Io.Clock.Timestamp, connection: std.Io.net.Stream) !void {
-        self.done.store(false, .seq_cst);
-        self.thread = if (deadline) |limit|
-            try client_mod.spawnHttpCancelWatcherBounded(&self.done, cancel, limit, connection)
-        else
-            try client_mod.spawnHttpCancelWatcher(&self.done, cancel, connection);
-    }
-    fn stop(self: *Watch) void {
-        self.done.store(true, .seq_cst);
-        if (self.thread) |thread| thread.join();
-        self.thread = null;
-    }
-};
-
 fn post(alloc: Allocator, definition: *const definitions.Definition, request: streams.ModelRequest, token: ?[]const u8, payload: []const u8) !streams.Result {
     const url = try definition.chat_url(alloc);
     defer alloc.free(url);
@@ -124,12 +79,17 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
     defer client.deinit();
     var uri = try std.Uri.parse(url);
     uri.scheme = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) "https" else if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) "http" else return error.UnsupportedUriScheme;
-    var operation = Open{ .client = &client, .uri = uri, .authorization = authorization };
+    var operation = client_mod.PostOperation{
+        .client = &client,
+        .uri = uri,
+        .authorization = authorization,
+        .extra_headers = &.{.{ .name = "accept", .value = "text/event-stream" }},
+    };
     try request.admission.admit();
-    var opened = try client_mod.runBoundedHttpOperation(Opened, alloc, request.cancel_flag, phase_deadline(30_000, request.deadline), &operation);
+    var opened = try client_mod.openBoundedPost(alloc, request.cancel_flag, phase_deadline(30_000, request.deadline), &operation);
     defer opened.deinit(alloc);
     const http = &opened.request.?;
-    var watch: Watch = .{};
+    var watch: client_mod.CancelWatch = .{};
     defer watch.stop();
     const head_deadline = phase_deadline(120_000, request.deadline);
     if (http.connection) |connection| try watch.start(request.cancel_flag, head_deadline, connection.stream_writer.stream);
