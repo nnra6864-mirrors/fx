@@ -37,9 +37,14 @@ class PgsoToolchainTests(unittest.TestCase):
         self.write_clang()
         for name in ("strip", "codesign", "otool"):
             self.write_executable(self.system_bin / name, "exit 0")
+        self.write_executable(self.system_bin / "ld64.lld", "printf 'LLD 21.1.8\\n'")
         self.write_executable(
             self.system_bin / "xcrun",
-            f"printf '%s\\n' {shlex.quote(str(self.sdk))}",
+            f"""case "$3" in
+  --show-sdk-path) printf '%s\\n' {shlex.quote(str(self.sdk))} ;;
+  --show-sdk-version) printf '26.4\\n' ;;
+  *) exit 2 ;;
+esac""",
         )
 
     def tearDown(self) -> None:
@@ -96,6 +101,8 @@ esac"""
         )
         self.assertEqual((self.system_bin / "otool").resolve(), toolchain.otool)
         self.assertEqual(self.sdk.resolve(), toolchain.sdk)
+        self.assertEqual("26.4", toolchain.sdk_version)
+        self.assertEqual((self.system_bin / "ld64.lld").resolve(), toolchain.ld64_lld)
         self.assertEqual(self.profile_runtime.resolve(), toolchain.profile_runtime)
         self.assertEqual("0.16.0", toolchain.zig_version)
         self.assertEqual("21.1.8", toolchain.llvm_version)
@@ -163,6 +170,40 @@ esac"""
         self.sdk.rmdir()
 
         with self.assertRaisesRegex(PgsoError, "macOS SDK does not exist"):
+            self.discover()
+
+    def test_discover_rejects_a_missing_or_wrong_version_linker(self) -> None:
+        linker = self.system_bin / "ld64.lld"
+        linker.unlink()
+        with self.assertRaisesRegex(PgsoError, "missing executable: ld64.lld"):
+            self.discover()
+        self.write_executable(linker, "printf 'LLD 22.1.0\\n'")
+        with self.assertRaisesRegex(PgsoError, "requires LLVM 21.1.8"):
+            self.discover()
+
+    def test_discover_preserves_the_multicall_linker_name(self) -> None:
+        driver = self.system_bin / "lld"
+        self.write_executable(driver, """case "$0" in
+  */ld64.lld) printf 'LLD 21.1.8\\n' ;;
+  *) exit 1 ;;
+esac""")
+        linker = self.system_bin / "ld64.lld"
+        linker.unlink()
+        linker.symlink_to("lld")
+        toolchain = self.discover()
+        self.assertEqual("ld64.lld", toolchain.ld64_lld.name)
+        self.assertEqual(driver.resolve(), toolchain.ld64_lld.resolve())
+
+    def test_discover_rejects_an_invalid_sdk_version(self) -> None:
+        self.write_executable(
+            self.system_bin / "xcrun",
+            f"""case "$3" in
+  --show-sdk-path) printf '%s\\n' {shlex.quote(str(self.sdk))} ;;
+  --show-sdk-version) printf 'unknown-sdk\\n' ;;
+  *) exit 2 ;;
+esac""",
+        )
+        with self.assertRaisesRegex(PgsoError, "invalid macOS SDK version"):
             self.discover()
 
 

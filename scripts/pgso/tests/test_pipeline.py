@@ -19,6 +19,9 @@ from scripts.pgso.pipeline import (
     apply_profile,
     candidate_object_argv,
     candidate_link_argv,
+    candidate_runtime_probe_argv,
+    temporal_candidate_link_argv,
+    parse_temporal_layout,
     instrumentation_argv,
     instrumented_run_argv,
     instrumented_link_argv,
@@ -39,6 +42,52 @@ from scripts.pgso.toolchain import Toolchain
 
 
 class PgsoPipelineTests(unittest.TestCase):
+    def test_temporal_layout_requires_ordered_code_and_rejects_warnings(self) -> None:
+        summary = (
+            "Ordered 851 sections (713260 bytes) using balanced partitioning:\n"
+            "  Functions for startup: 851 (713260 bytes)\n"
+            "  Functions for compression: 0 (0 bytes)\n"
+            "  Duplicate functions: 0 (0 bytes)\n"
+            "  Data for compression: 0 (0 bytes)\n"
+            "  Duplicate data: 0 (0 bytes)\n"
+            "Total area under the page fault curve: 2.425340e+05\n"
+        )
+        self.assertEqual(
+            {"ordered_sections": 851, "ordered_bytes": 713260, "page_fault_area": 242534.0},
+            parse_temporal_layout(summary),
+        )
+        for invalid in (
+            "", summary + "warning: unknown symbol\n",
+            "warning: unknown symbol\n" + summary,
+            summary.replace("851", "0"),
+            summary.replace("startup: 851", "startup: 850"),
+            summary.replace("Functions for compression: 0", "Functions for compression: 1"),
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(PgsoError):
+                parse_temporal_layout(invalid)
+
+    def test_temporal_link_preserves_the_control_platform_and_original_object(self) -> None:
+        runtime = self.root / "libcompiler_rt.a"
+        command = temporal_candidate_link_argv(self.toolchain, self.paths, runtime, "13.3")
+        self.assertEqual(str(self.toolchain.ld64_lld), command[0])
+        platform = command.index("-platform_version")
+        self.assertEqual(("macos", "13.3", "26.4"), command[platform + 1:platform + 4])
+        self.assertIn(str(self.paths.profile_use_object), command)
+        self.assertIn(str(runtime), command)
+        self.assertNotIn(str(self.paths.instrumented_object), command)
+        self.assertNotIn(str(self.toolchain.profile_runtime), command)
+        self.assertIn(f"--irpgo-profile={self.paths.merged_profile}", command)
+        for flag in ("--bp-startup-sort=function", "--icf=none", "-no_function_starts",
+                     "--bp-compression-sort=none", "--no-bp-compression-sort-startup-functions",
+                     "--no-call-graph-profile-sort", "--verbose-bp-section-orderer"):
+            self.assertIn(flag, command)
+        original = candidate_link_argv(self.toolchain, self.paths)
+        probe = candidate_runtime_probe_argv(self.toolchain, self.paths)
+        self.assertEqual(original, tuple(arg for arg in probe if arg != "-###"))
+        self.assertEqual(1, probe.count("-###"))
+        self.assertIn("-O2", probe)
+        self.assertIn("-s", probe)
+
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory(
             prefix="fx-pgso-pipeline-"
@@ -71,11 +120,13 @@ class PgsoPipelineTests(unittest.TestCase):
             "llvm_profdata": tool_root / "llvm-profdata",
             "llvm_ar": tool_root / "llvm-ar",
             "clang": tool_root / "clang",
+            "ld64_lld": tool_root / "ld64.lld",
             "strip": tool_root / "strip",
             "codesign": tool_root / "codesign",
             "otool": tool_root / "otool",
             "xcrun": tool_root / "xcrun",
             "sdk": self.root / "MacOSX.sdk",
+            "sdk_version": "26.4",
             "profile_runtime": self.root / "libclang_rt.profile_osx.a",
             "zig_version": "0.16.0",
             "llvm_version": "21.1.8",
@@ -96,6 +147,7 @@ class PgsoPipelineTests(unittest.TestCase):
             (
                 "--disable-vp",
                 "--runtime-counter-relocation",
+                "--pgo-temporal-instrumentation",
                 "-pgo-kind=pgo-instr-gen-pipeline",
                 "-passes=default<O2>",
             ),
@@ -293,6 +345,11 @@ class PgsoPipelineTests(unittest.TestCase):
 
     def test_candidate_object_and_signing_contract(self) -> None:
         actions = self.root / "candidate-actions.txt"
+        runtime = self.root / "libcompiler_rt.a"
+        runtime.write_bytes(b"compiler runtime")
+        self.paths.merged_profile.write_bytes(b"temporal profile")
+        self.paths.control_binary.parent.mkdir(parents=True)
+        self.paths.control_binary.write_bytes(b"control")
         artifact_tool = self.write_executable(
             "artifact-tool",
             f"""import pathlib,sys
@@ -314,9 +371,37 @@ with pathlib.Path({str(actions)!r}).open('a') as stream:
 with pathlib.Path({str(actions)!r}).open('a') as stream:
     stream.write('codesign ' + ' '.join(sys.argv[1:]) + '\\n')""",
         )
+        zig = self.write_executable(
+            "zig-probe",
+            f"""import pathlib,sys
+assert '-###' in sys.argv and '-O2' in sys.argv and '-s' in sys.argv
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('probe ' + ' '.join(sys.argv[1:]) + '\\n')
+print('zig ld {runtime}')""",
+        )
+        otool = self.write_executable("otool", "print('minos 13.0')")
+        linker_summary = (
+            "Ordered 851 sections (713260 bytes) using balanced partitioning:\n"
+            "  Functions for startup: 851 (713260 bytes)\n"
+            "  Functions for compression: 0 (0 bytes)\n"
+            "  Duplicate functions: 0 (0 bytes)\n"
+            "  Data for compression: 0 (0 bytes)\n"
+            "  Duplicate data: 0 (0 bytes)\n"
+            "Total area under the page fault curve: 2.425340e+05\n"
+        )
+        linker = self.write_executable(
+            "ld64.lld",
+            f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('link ' + ' '.join(sys.argv[1:]) + '\\n')
+pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'artifact')
+sys.stderr.write({linker_summary!r})""",
+        )
         toolchain = dataclasses.replace(
             self.toolchain,
-            zig=artifact_tool,
+            zig=zig,
+            otool=otool,
+            ld64_lld=linker,
             opt=artifact_tool,
             llc=artifact_tool,
             strip=strip,
@@ -339,15 +424,42 @@ with pathlib.Path({str(actions)!r}).open('a') as stream:
                 "-machine-outliner-reruns=1 "
                 f"{self.paths.profile_use_bitcode} -o "
                 f"{self.paths.profile_use_object}",
-                "artifact cc -target aarch64-macos -O2 -Wl,-dead_strip -s "
+                "probe cc -### -target aarch64-macos -O2 -Wl,-dead_strip -s "
                 f"{self.paths.profile_use_object} -o "
                 f"{self.paths.candidate_binary} -lc",
+                "link " + " ".join(temporal_candidate_link_argv(
+                    toolchain, self.paths, runtime, "13.0",
+                )[1:]),
                 f"strip -S -x {self.paths.candidate_binary}",
                 "codesign --force --sign - --options linker-signed "
                 f"--pagesize 16384 {self.paths.candidate_binary}",
             ],
             actions.read_text().splitlines(),
         )
+        self.assertEqual(b"compiler runtime", runtime.read_bytes())
+        self.assertIn(
+            sha256_file(runtime),
+            (self.paths.logs / "candidate-layout.json").read_text(),
+        )
+
+    def test_benchmark_candidate_keeps_the_zig_linker(self) -> None:
+        paths = PipelinePaths.create(self.root / "benchmark-link", selector="ui_activity")
+        artifact = self.write_executable(
+            "benchmark-tool",
+            """import pathlib,sys
+pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'artifact')""",
+        )
+        noop = self.write_executable("noop", "pass")
+        toolchain = dataclasses.replace(
+            self.toolchain, zig=artifact, opt=artifact, llc=artifact,
+            strip=noop, codesign=noop,
+        )
+        paths.profile_use_bitcode.write_bytes(b'bitcode')
+        self.assertEqual(paths.candidate_binary, link_candidate(
+            toolchain, paths, require_release_safe_evidence=False,
+        ))
+        self.assertFalse((paths.logs / "candidate-runtime-probe.json").exists())
+        self.assertFalse((paths.logs / "candidate-layout.json").exists())
 
     def test_bitcode_hash_must_match_the_original(self) -> None:
         bitcode = self.root / "fx.bc"

@@ -920,6 +920,7 @@ def run_candidate(arguments: argparse.Namespace) -> pathlib.Path:
             "version": candidate.version_output,
         },
         "warnings": 0,
+        "linker": _read_json(paths.logs / "candidate-layout.json", "candidate layout"),
     }
     smoke_profile = _mapping(
         instrumented.get("smoke_profile"),

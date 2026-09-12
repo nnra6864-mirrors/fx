@@ -12,17 +12,29 @@ The driver fails unless all of these match exactly:
 - generic `aarch64-macos` output
 - Zig `0.16.0`
 - LLVM `21.1.8` tools and profile runtime from one configured LLVM root
+- LLD `21.1.8` (`ld64.lld` on the executable path)
 - Bun `1.3.14`
 - Hyperfine `1.20.0`
 - the selected source commit, update channel, bitcode hash, corpus hash, and profile-generation flags
 
 The pipeline does not use the host CPU as the release target. The final candidate must match the control's architecture and minimum macOS version, contain a valid code signature, contain no profile sections or profile-runtime dependency, and produce no profile output when executed.
 
+Training records execution counts and first-use function timestamps in the same
+continuous profiles. Counter supplements preserve the temporal traces. The
+main PGSO executable uses LLD's temporal startup ordering; benchmark and other
+native release links keep their existing paths. Identical-code folding and
+compression ordering stay disabled. The function-starts table is omitted,
+matching the existing stripped Zig link, and the actual SDK version, runtime
+archive digest, and ordered code counts are retained in build evidence.
+
 ## Commands
 
 Every mutating command requires a fresh or empty output directory. State from separate runs is never merged implicitly.
 
 ```bash
+brew install llvm@21 lld@21
+export PATH="$(brew --prefix lld@21)/bin:$PATH"
+
 python3 -m scripts.pgso build \
   --llvm-bin "$(brew --prefix llvm@21)/bin" \
   --output-dir /tmp/fx-pgso-build

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import dataclasses
+import json
+import math
 import os
 import pathlib
 import re
@@ -21,6 +23,7 @@ from scripts.pgso.toolchain import SUPPORTED_TARGET, Toolchain
 GENERATION_FLAGS = (
     "--disable-vp",
     "--runtime-counter-relocation",
+    "--pgo-temporal-instrumentation",
     "-pgo-kind=pgo-instr-gen-pipeline",
     "-passes=default<O2>",
 )
@@ -375,6 +378,79 @@ def candidate_link_argv(
         str(paths.candidate_binary),
         "-lc",
     )
+
+
+def candidate_runtime_probe_argv(
+    toolchain: Toolchain,
+    paths: PipelinePaths,
+) -> tuple[str, ...]:
+    command = candidate_link_argv(toolchain, paths)
+    return (*command[:2], "-###", *command[2:])
+
+
+def temporal_candidate_link_argv(
+    toolchain: Toolchain,
+    paths: PipelinePaths,
+    compiler_runtime: pathlib.Path,
+    minimum_macos: str,
+) -> tuple[str, ...]:
+    return (
+        str(toolchain.ld64_lld),
+        "-arch",
+        "arm64",
+        "-platform_version",
+        "macos",
+        minimum_macos,
+        toolchain.sdk_version,
+        "-syslibroot",
+        str(toolchain.sdk),
+        "-dead_strip",
+        "-e",
+        "_main",
+        "--icf=none",
+        "-no_function_starts",
+        "--no-call-graph-profile-sort",
+        f"--irpgo-profile={paths.merged_profile}",
+        "--bp-startup-sort=function",
+        "--bp-compression-sort=none",
+        "--no-bp-compression-sort-startup-functions",
+        "--verbose-bp-section-orderer",
+        str(paths.profile_use_object),
+        str(compiler_runtime),
+        "-lSystem",
+        "-o",
+        str(paths.candidate_binary),
+    )
+
+
+def parse_temporal_layout(stderr: str) -> dict[str, int | float]:
+    match = re.fullmatch(
+        r"Ordered (\d+) sections \((\d+) bytes\) using balanced partitioning:\n"
+        r"  Functions for startup: (\d+) \((\d+) bytes\)\n"
+        r"  Functions for compression: 0 \(0 bytes\)\n"
+        r"  Duplicate functions: 0 \(0 bytes\)\n"
+        r"  Data for compression: 0 \(0 bytes\)\n"
+        r"  Duplicate data: 0 \(0 bytes\)\n"
+        r"Total area under the page fault curve: (\d+(?:\.\d+)?(?:e[+-]?\d+)?)\n",
+        stderr,
+    )
+    if match is None:
+        raise PgsoError("unexpected temporal linker output")
+    sections, size, functions, function_bytes = map(int, match.groups()[:4])
+    area = float(match.group(5))
+    if (
+        sections <= 0
+        or size <= 0
+        or sections != functions
+        or size != function_bytes
+        or not math.isfinite(area)
+    ):
+        raise PgsoError("invalid temporal linker layout evidence")
+    return {
+        "ordered_sections": sections,
+        "ordered_bytes": size,
+        "page_fault_area": area,
+    }
 
 
 def candidate_object_argv(
@@ -773,6 +849,50 @@ def verify_release_safe_ir(ir_path: pathlib.Path) -> None:
     raise PgsoError(f"ReleaseSafe evidence missing: {missing}")
 
 
+def _link_temporal_candidate(toolchain: Toolchain, paths: PipelinePaths) -> None:
+    _require_nonempty_file(paths.merged_profile, "temporal production profile")
+    _require_nonempty_file(paths.control_binary, "ReleaseSafe control")
+    minimum_macos = read_macos_minos(
+        toolchain,
+        paths.control_binary,
+        paths.logs / "link-control-macos.json",
+    )
+    probe = run_checked(
+        candidate_runtime_probe_argv(toolchain, paths),
+        cwd=paths.root,
+        env=os.environ.copy(),
+        timeout_s=120,
+        log_path=paths.logs / "candidate-runtime-probe.json",
+    )
+    runtime = parse_compiler_runtime(probe.stdout + "\n" + probe.stderr)
+    _require_nonempty_file(runtime, "candidate compiler runtime")
+    runtime_hash = sha256_file(runtime)
+    result = run_checked(
+        temporal_candidate_link_argv(toolchain, paths, runtime, minimum_macos),
+        cwd=paths.root,
+        env=os.environ.copy(),
+        timeout_s=900,
+        log_path=paths.logs / "link-candidate.json",
+    )
+    if result.stdout:
+        raise PgsoError("unexpected temporal linker stdout")
+    layout = parse_temporal_layout(result.stderr)
+    validate_archive_unchanged(runtime, runtime_hash)
+    evidence = {
+        "linker": "ld64.lld",
+        "linker_version": toolchain.llvm_version,
+        "minimum_macos": minimum_macos,
+        "sdk_version": toolchain.sdk_version,
+        "runtime_archive_sha256": runtime_hash,
+        "profile_sha256": sha256_file(paths.merged_profile),
+        **layout,
+    }
+    (paths.logs / "candidate-layout.json").write_text(
+        json.dumps(evidence, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def link_candidate(
     toolchain: Toolchain,
     paths: PipelinePaths,
@@ -807,14 +927,17 @@ def link_candidate(
         require_empty_stderr=True,
     )
     _require_nonempty_file(paths.profile_use_object, "candidate object")
-    run_checked(
-        candidate_link_argv(toolchain, paths),
-        cwd=paths.root,
-        env=os.environ.copy(),
-        timeout_s=900,
-        log_path=paths.logs / "link-candidate.json",
-        require_empty_stderr=True,
-    )
+    if paths.selector == "fx":
+        _link_temporal_candidate(toolchain, paths)
+    else:
+        run_checked(
+            candidate_link_argv(toolchain, paths),
+            cwd=paths.root,
+            env=os.environ.copy(),
+            timeout_s=900,
+            log_path=paths.logs / "link-candidate.json",
+            require_empty_stderr=True,
+        )
     _require_nonempty_file(paths.candidate_binary, "candidate executable")
     run_checked(
         (

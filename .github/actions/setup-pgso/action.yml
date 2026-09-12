@@ -45,9 +45,12 @@ runs:
       if: inputs.llvm == 'true'
       shell: bash
       run: |
-        brew install llvm@21
+        brew install llvm@21 lld@21
         llvm_bin="$(brew --prefix llvm@21)/bin"
+        lld_bin="$(brew --prefix lld@21)/bin"
         "$llvm_bin/opt" --version | grep -F "version 21.1.8"
+        "$lld_bin/ld64.lld" --version | grep -F "LLD 21.1.8"
+        echo "$lld_bin" >> "$GITHUB_PATH"
         echo "path=$llvm_bin" >> "$GITHUB_OUTPUT"
 
     - name: Setup Bun

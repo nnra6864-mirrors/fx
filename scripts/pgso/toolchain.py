@@ -67,11 +67,13 @@ class Toolchain:
     llvm_profdata: pathlib.Path
     llvm_ar: pathlib.Path
     clang: pathlib.Path
+    ld64_lld: pathlib.Path
     strip: pathlib.Path
     codesign: pathlib.Path
     otool: pathlib.Path
     xcrun: pathlib.Path
     sdk: pathlib.Path
+    sdk_version: str
     profile_runtime: pathlib.Path
     zig_version: str
     llvm_version: str
@@ -122,6 +124,13 @@ class Toolchain:
             for name, path in llvm_tools.items()
         }
         llvm_version = versions["opt"]
+        linker_command = shutil.which("ld64.lld")
+        if linker_command is None:
+            raise PgsoError("missing executable: ld64.lld")
+        linker_path = pathlib.Path(linker_command)
+        # LLD selects its Mach-O driver from argv[0], including through symlinks.
+        ld64_lld = linker_path.parent.resolve() / linker_path.name
+        _llvm_version(ld64_lld, "ld64.lld")
 
         strip = _resolve_executable("strip", "strip")
         codesign = _resolve_executable("codesign", "codesign")
@@ -135,6 +144,12 @@ class Toolchain:
         sdk = pathlib.Path(sdk_output).expanduser().resolve()
         if not sdk.is_dir():
             raise PgsoError(f"macOS SDK does not exist: {sdk}")
+        sdk_version = _capture(
+            (str(xcrun), "--sdk", "macosx", "--show-sdk-version"),
+            "macOS SDK version",
+        )
+        if re.fullmatch(r"\d+\.\d+(?:\.\d+)?", sdk_version) is None:
+            raise PgsoError(f"invalid macOS SDK version: {sdk_version}")
 
         resource_output = _capture(
             (str(llvm_tools["clang"]), "--print-resource-dir"),
@@ -157,11 +172,13 @@ class Toolchain:
             llvm_profdata=llvm_tools["llvm-profdata"],
             llvm_ar=llvm_tools["llvm-ar"],
             clang=llvm_tools["clang"],
+            ld64_lld=ld64_lld,
             strip=strip,
             codesign=codesign,
             otool=otool,
             xcrun=xcrun,
             sdk=sdk,
+            sdk_version=sdk_version,
             profile_runtime=profile_runtime.resolve(),
             zig_version=zig_version,
             llvm_version=llvm_version,
