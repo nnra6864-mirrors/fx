@@ -133,7 +133,7 @@ class ReleaseNotesTests(unittest.TestCase):
             with self.subTest(response=response), self.assertRaises(ValueError):
                 notes.parse_stream(response)
 
-    def test_gateway_uses_grok_4_6_with_existing_v4_protocol(self) -> None:
+    def test_gateway_uses_kimi_k3_with_xhigh_reasoning(self) -> None:
         with tempfile.TemporaryDirectory(prefix="release-gateway-") as tmp:
             response = io.BytesIO(stream({"result": "complete"}).encode())
             with mock.patch.dict(notes.os.environ, {"AI_GATEWAY_API_KEY": "fixture-key"}), \
@@ -143,9 +143,10 @@ class ReleaseNotesTests(unittest.TestCase):
             request = send.call_args.args[0]
             self.assertEqual("https://ai-gateway.vercel.sh/v4/ai/language-model", request.full_url)
             self.assertEqual("4", request.get_header("Ai-language-model-specification-version"))
-            self.assertEqual("spacexai/grok-4.6", request.get_header("Ai-language-model-id"))
+            self.assertEqual("moonshotai/kimi-k3", request.get_header("Ai-language-model-id"))
             self.assertEqual("true", request.get_header("Ai-language-model-streaming"))
             payload = json.loads(request.data)
+            self.assertEqual("xhigh", payload.get("reasoning"))
             self.assertEqual("system", payload["prompt"][0]["role"])
             self.assertEqual([{"type": "text", "text": "evidence"}], payload["prompt"][1]["content"])
             with mock.patch.object(notes, "MAX_REQUEST_BYTES", 1), \
