@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import pathlib
 import tempfile
@@ -15,13 +16,16 @@ from scripts.pgso.pipeline import (
     USE_FLAGS,
     ArtifactSpec,
     CandidateMetadata,
+    MacosLinkContract,
     PipelinePaths,
     apply_profile,
     candidate_object_argv,
     candidate_link_argv,
     candidate_runtime_probe_argv,
     temporal_candidate_link_argv,
-    parse_temporal_layout,
+    map_temporal_symbols,
+    parse_macos_link_contract,
+    validate_temporal_link_map,
     instrumentation_argv,
     instrumented_run_argv,
     instrumented_link_argv,
@@ -42,44 +46,68 @@ from scripts.pgso.toolchain import Toolchain
 
 
 class PgsoPipelineTests(unittest.TestCase):
-    def test_temporal_layout_requires_ordered_code_and_rejects_warnings(self) -> None:
-        summary = (
-            "Ordered 851 sections (713260 bytes) using balanced partitioning:\n"
-            "  Functions for startup: 851 (713260 bytes)\n"
-            "  Functions for compression: 0 (0 bytes)\n"
-            "  Duplicate functions: 0 (0 bytes)\n"
-            "  Data for compression: 0 (0 bytes)\n"
-            "  Duplicate data: 0 (0 bytes)\n"
-            "Total area under the page fault curve: 2.425340e+05\n"
+    def test_temporal_order_binds_real_text_symbols_and_accounts_for_unmapped_names(self) -> None:
+        ordered, evidence = map_temporal_symbols(
+            "# Ordered 4 functions\n# fx\nalpha\nbeta\nalias\nmissing\n",
+            "_alpha T 0 0\nl_beta t 8 0\nl_alias t 8 0\n_missing d 20 0\n",
+        )
+        self.assertEqual(("_alpha", "l_beta"), ordered)
+        self.assertEqual(4, evidence["profile_functions"])
+        self.assertEqual(3, len(evidence["bindings"]))
+        self.assertEqual(["missing"], evidence["unmapped_symbols"])
+
+    def test_temporal_order_preserves_symbol_names_with_spaces(self) -> None:
+        ordered, _ = map_temporal_symbols("# Ordered 1 functions\nname with spaces\n", "l_name with spaces t 0 0\n")
+        self.assertEqual(("l_name with spaces",), ordered)
+
+    def test_temporal_order_rejects_ambiguous_empty_or_malformed_input(self) -> None:
+        for order, symbols in (
+            ("# Ordered 1 functions\nalpha\n", "_alpha T 0 0\nl_alpha t 8 0\n"),
+            ("# Ordered 1 functions\nalpha\n", "_alpha T 0 0\n_alpha T 8 0\n"),
+            ("# Ordered 1 functions\nmissing\n", "_alpha T 0 0\n"),
+            ("# Ordered 2 functions\nalpha\n", "_alpha T 0 0\n"),
+            ("# Ordered 2 functions\nalpha\nalpha\n", "_alpha T 0 0\n"),
+            ("# Ordered 0 functions\n", "_alpha T 0 0\n"),
+            ("# Ordered 1 functions\nalpha\n", "[truncated output]\n"),
+        ):
+            with self.subTest(order=order, symbols=symbols), self.assertRaises(PgsoError):
+                map_temporal_symbols(order, symbols)
+
+    def test_link_map_proves_applied_order_in_the_original_object(self) -> None:
+        link_map = (
+            f"# Object files:\n[ 1] {self.paths.profile_use_object}\n[ 2] /runtime.o\n"
+            "# Sections:\n0x1000 0x18 __TEXT __text\n0x2000 0x10 __TEXT __const\n"
+            "# Symbols:\n0x1000 0x8 [ 1] _alpha\n0x1000 0x0 [ 1] l_alias\n"
+            "0x1008 0x10 [ 1] l_beta\n0x10 0x100 [ 2] l_beta\n"
+            "0x2000 0x8 [ 1] 8-byte-literal\n0x2008 0x8 [ 1] 8-byte-literal\n"
+            "# Dead Stripped Symbols:\n<<dead>> 0x8 [ 1] l_removed\n"
         )
         self.assertEqual(
-            {"ordered_sections": 851, "ordered_bytes": 713260, "page_fault_area": 242534.0},
-            parse_temporal_layout(summary),
+            {"ordered_sections": 2, "ordered_bytes": 24, "linker_removed_symbols": ["l_removed"]},
+            validate_temporal_link_map(link_map, self.paths.profile_use_object, ("l_alias", "l_beta", "l_removed")),
         )
-        for invalid in (
-            "", summary + "warning: unknown symbol\n",
-            "warning: unknown symbol\n" + summary,
-            summary.replace("851", "0"),
-            summary.replace("startup: 851", "startup: 850"),
-            summary.replace("Functions for compression: 0", "Functions for compression: 1"),
-        ):
-            with self.subTest(invalid=invalid), self.assertRaises(PgsoError):
-                parse_temporal_layout(invalid)
+        for names in (("l_beta", "_alpha"), ("unknown",), ("l_alias", "_alpha")):
+            with self.subTest(names=names), self.assertRaises(PgsoError):
+                validate_temporal_link_map(link_map, self.paths.profile_use_object, names)
+        with self.assertRaises(PgsoError):
+            validate_temporal_link_map(link_map, self.root / "other.o", ("_alpha",))
 
     def test_temporal_link_preserves_the_control_platform_and_original_object(self) -> None:
-        runtime = self.root / "libcompiler_rt.a"
-        command = temporal_candidate_link_argv(self.toolchain, self.paths, runtime, "13.3")
-        self.assertEqual(str(self.toolchain.ld64_lld), command[0])
+        runtime = self.root / "libcompiler_rt_zcu.o"
+        contract = MacosLinkContract(1, "13.3", "26.4", 16 * 1024 * 1024, ())
+        toolchain = dataclasses.replace(self.toolchain, sdk_version="15.5")
+        command = temporal_candidate_link_argv(toolchain, self.paths, runtime, contract)
+        self.assertEqual(str(self.toolchain.apple_ld), command[0])
         platform = command.index("-platform_version")
         self.assertEqual(("macos", "13.3", "26.4"), command[platform + 1:platform + 4])
         self.assertIn(str(self.paths.profile_use_object), command)
         self.assertIn(str(runtime), command)
         self.assertNotIn(str(self.paths.instrumented_object), command)
         self.assertNotIn(str(self.toolchain.profile_runtime), command)
-        self.assertIn(f"--irpgo-profile={self.paths.merged_profile}", command)
-        for flag in ("--bp-startup-sort=function", "--icf=none", "-no_function_starts",
-                     "--bp-compression-sort=none", "--no-bp-compression-sort-startup-functions",
-                     "--no-call-graph-profile-sort", "--verbose-bp-section-orderer"):
+        self.assertEqual("1000000", command[command.index("-stack_size") + 1])
+        self.assertIn(str(toolchain.zig_darwin_sdk / "libSystem.tbd"), command)
+        self.assertIn(str(self.paths.logs / "candidate-order.txt"), command)
+        for flag in ("-order_file", "-no_deduplicate", "-no_function_starts", "-map"):
             self.assertIn(flag, command)
         original = candidate_link_argv(self.toolchain, self.paths)
         probe = candidate_runtime_probe_argv(self.toolchain, self.paths)
@@ -119,14 +147,18 @@ class PgsoPipelineTests(unittest.TestCase):
             "llc": tool_root / "llc",
             "llvm_profdata": tool_root / "llvm-profdata",
             "llvm_ar": tool_root / "llvm-ar",
+            "llvm_nm": tool_root / "llvm-nm",
             "clang": tool_root / "clang",
-            "ld64_lld": tool_root / "ld64.lld",
+            "apple_ld": tool_root / "ld",
+            "apple_ld_version": "1167.5",
             "strip": tool_root / "strip",
             "codesign": tool_root / "codesign",
             "otool": tool_root / "otool",
             "xcrun": tool_root / "xcrun",
             "sdk": self.root / "MacOSX.sdk",
             "sdk_version": "26.4",
+            "zig_darwin_sdk": self.root / "ZigDarwin.sdk",
+            "zig_sdk_version": "26.4",
             "profile_runtime": self.root / "libclang_rt.profile_osx.a",
             "zig_version": "0.16.0",
             "llvm_version": "21.1.8",
@@ -347,6 +379,9 @@ class PgsoPipelineTests(unittest.TestCase):
         actions = self.root / "candidate-actions.txt"
         runtime = self.root / "libcompiler_rt.a"
         runtime.write_bytes(b"compiler runtime")
+        self.toolchain.zig_darwin_sdk.mkdir()
+        (self.toolchain.zig_darwin_sdk / "libSystem.tbd").write_bytes(b"system stub")
+        (self.paths.compiler_runtime / "instrumented.o").write_bytes(b"instrumented runtime")
         self.paths.merged_profile.write_bytes(b"temporal profile")
         self.paths.control_binary.parent.mkdir(parents=True)
         self.paths.control_binary.write_bytes(b"control")
@@ -377,31 +412,50 @@ with pathlib.Path({str(actions)!r}).open('a') as stream:
 assert '-###' in sys.argv and '-O2' in sys.argv and '-s' in sys.argv
 with pathlib.Path({str(actions)!r}).open('a') as stream:
     stream.write('probe ' + ' '.join(sys.argv[1:]) + '\\n')
-print('zig ld {runtime}')""",
+print('zig ld -platform_version macos 13.0.0 26.4 {runtime}')""",
         )
-        otool = self.write_executable("otool", "print('minos 13.0')")
-        linker_summary = (
-            "Ordered 851 sections (713260 bytes) using balanced partitioning:\n"
-            "  Functions for startup: 851 (713260 bytes)\n"
-            "  Functions for compression: 0 (0 bytes)\n"
-            "  Duplicate functions: 0 (0 bytes)\n"
-            "  Data for compression: 0 (0 bytes)\n"
-            "  Duplicate data: 0 (0 bytes)\n"
-            "Total area under the page fault curve: 2.425340e+05\n"
+        otool = self.write_executable("otool", f"print({self.good_candidate_metadata().load_commands!r})")
+        ar = self.write_executable(
+            "ar-tool",
+            f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('ar ' + ' '.join(sys.argv[1:]) + '\\n')
+if sys.argv[1] == 't': print('libcompiler_rt_zcu.o')
+elif sys.argv[1] == 'x': pathlib.Path('libcompiler_rt_zcu.o').write_bytes(b'optimized runtime object')
+else: sys.exit(2)""",
         )
+        profiler = self.write_executable(
+            "profile-tool",
+            f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('order ' + ' '.join(sys.argv[1:]) + '\\n')
+pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_text('# Ordered 1 functions\\n# fx\\nalpha\\n')""",
+        )
+        nm = self.write_executable(
+            "nm-tool",
+            f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('symbols ' + ' '.join(sys.argv[1:]) + '\\n')
+print('_alpha T 0 0')""",
+        )
+        link_map = f"# Object files:\n[ 1] {self.paths.profile_use_object}\n# Sections:\n0x1000 0x8 __TEXT __text\n# Symbols:\n0x1000 0x8 [ 1] _alpha\n"
         linker = self.write_executable(
-            "ld64.lld",
+            "ld-tool",
             f"""import pathlib,sys
 with pathlib.Path({str(actions)!r}).open('a') as stream:
     stream.write('link ' + ' '.join(sys.argv[1:]) + '\\n')
 pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'artifact')
-sys.stderr.write({linker_summary!r})""",
+pathlib.Path(sys.argv[sys.argv.index('-map') + 1]).write_bytes({link_map!r}.encode() + b'\\x89 literal data\\n')""",
         )
         toolchain = dataclasses.replace(
             self.toolchain,
             zig=zig,
             otool=otool,
-            ld64_lld=linker,
+            apple_ld=linker,
+            llvm_ar=ar,
+            llvm_profdata=profiler,
+            llvm_nm=nm,
+            sdk_version="15.5",
             opt=artifact_tool,
             llc=artifact_tool,
             strip=strip,
@@ -427,8 +481,14 @@ sys.stderr.write({linker_summary!r})""",
                 "probe cc -### -target aarch64-macos -O2 -Wl,-dead_strip -s "
                 f"{self.paths.profile_use_object} -o "
                 f"{self.paths.candidate_binary} -lc",
+                f"ar t {runtime}",
+                f"ar x {runtime}",
+                f"order order {self.paths.merged_profile} -o {self.paths.logs / 'candidate-profile.order'}",
+                f"symbols --defined-only --format=posix --radix=x {self.paths.profile_use_object}",
                 "link " + " ".join(temporal_candidate_link_argv(
-                    toolchain, self.paths, runtime, "13.0",
+                    toolchain, self.paths,
+                    self.paths.candidate_binary.parent / "compiler-runtime" / "libcompiler_rt_zcu.o",
+                    self.good_link_contract(),
                 )[1:]),
                 f"strip -S -x {self.paths.candidate_binary}",
                 "codesign --force --sign - --options linker-signed "
@@ -437,6 +497,12 @@ sys.stderr.write({linker_summary!r})""",
             actions.read_text().splitlines(),
         )
         self.assertEqual(b"compiler runtime", runtime.read_bytes())
+        self.assertEqual(b"instrumented runtime", (self.paths.compiler_runtime / "instrumented.o").read_bytes())
+        layout = json.loads((self.paths.logs / "candidate-layout.json").read_text())
+        self.assertEqual("26.4", layout["sdk_version"])
+        self.assertEqual("15.5", layout["sysroot_sdk_version"])
+        self.assertEqual(16777216, layout["main_stack_size"])
+        self.assertEqual(8, layout["ordered_bytes"])
         self.assertIn(
             sha256_file(runtime),
             (self.paths.logs / "candidate-layout.json").read_text(),
@@ -640,9 +706,58 @@ sys.stderr.write('optimizer warning')""",
             signature_valid=True,
             architecture="arm64",
             min_macos="13.0",
-            load_commands="LC_BUILD_VERSION\nminos 13.0",
-            dependencies="/usr/lib/libSystem.B.dylib",
+            load_commands=(
+                "Load command 0\ncmd LC_BUILD_VERSION\nplatform 1\nminos 13.0\nsdk 26.4\n"
+                "Load command 1\ncmd LC_MAIN\nentryoff 1736\nstacksize 16777216\n"
+                "Load command 2\ncmd LC_LOAD_DYLIB\nname /usr/lib/libSystem.B.dylib (offset 24)\n"
+                "current version 1356.0.0\ncompatibility version 1.0.0\n"
+            ),
+            dependencies="fx:\n/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1356.0.0)",
         )
+
+    def good_link_contract(self) -> MacosLinkContract:
+        return parse_macos_link_contract(self.good_candidate_metadata().load_commands)
+
+    def test_candidate_metadata_accepts_the_complete_control_contract(self) -> None:
+        validate_candidate_metadata(self.good_candidate_metadata(), expected_minos="13.0", expected_contract=self.good_link_contract())
+
+    def test_link_contract_rejects_missing_or_duplicate_commands(self) -> None:
+        commands = self.good_candidate_metadata().load_commands
+        for invalid in (
+            commands.replace("sdk 26.4\n", ""),
+            commands.replace("platform 1", "platform 2"),
+            commands.replace("stacksize 16777216", "stacksize -1"),
+            commands.replace("stacksize 16777216", f"stacksize {1 << 64}"),
+            commands + "Load command 3\ncmd LC_MAIN\nentryoff 1736\nstacksize 16777216\n",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(PgsoError):
+                parse_macos_link_contract(invalid)
+
+    def test_candidate_metadata_rejects_library_version_drift(self) -> None:
+        metadata = self.good_candidate_metadata()
+        with self.assertRaisesRegex(PgsoError, "library dependencies"):
+            validate_candidate_metadata(
+                dataclasses.replace(metadata, load_commands=metadata.load_commands.replace("1356.0.0", "1351.0.0")),
+                expected_minos="13.0", expected_contract=self.good_link_contract(),
+            )
+
+    def test_candidate_metadata_rejects_sdk_compatibility_drift(self) -> None:
+        metadata = self.good_candidate_metadata()
+        with self.assertRaisesRegex(PgsoError, "SDK"):
+            validate_candidate_metadata(
+                dataclasses.replace(metadata, load_commands=metadata.load_commands.replace("sdk 26.4", "sdk 15.5")),
+                expected_minos="13.0",
+                expected_contract=self.good_link_contract(),
+            )
+
+    def test_candidate_metadata_rejects_lost_main_stack_request(self) -> None:
+        metadata = self.good_candidate_metadata()
+        with self.assertRaisesRegex(PgsoError, "stack"):
+            validate_candidate_metadata(
+                dataclasses.replace(metadata, load_commands=metadata.load_commands.replace("stacksize 16777216", "stacksize 0")),
+                expected_minos="13.0",
+                expected_contract=self.good_link_contract(),
+            )
 
     def test_candidate_metadata_rejects_missing_signature(self) -> None:
         with self.assertRaisesRegex(PgsoError, "code signature"):
@@ -652,6 +767,7 @@ sys.stderr.write('optimizer warning')""",
                     signature_valid=False,
                 ),
                 expected_minos="13.0",
+                expected_contract=self.good_link_contract(),
             )
 
     def test_candidate_metadata_rejects_wrong_architecture_or_minos(self) -> None:
@@ -668,6 +784,7 @@ sys.stderr.write('optimizer warning')""",
                             **{field: value},
                         ),
                         expected_minos="13.0",
+                        expected_contract=self.good_link_contract(),
                     )
 
     def test_candidate_metadata_rejects_profile_runtime_or_sections(self) -> None:
@@ -692,6 +809,7 @@ sys.stderr.write('optimizer warning')""",
                             **{field: value},
                         ),
                         expected_minos="13.0",
+                        expected_contract=self.good_link_contract(),
                     )
 
     def test_candidate_size_rejects_more_than_7_800_mib(self) -> None:
