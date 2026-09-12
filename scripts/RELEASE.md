@@ -74,10 +74,12 @@ being verified. Activation requires all of the following:
   verified. The older `release` environment is no longer a publisher.
 - The existing `BLOB_READ_WRITE_TOKEN` for the immutable archive mirror and
   downloads, and `AI_GATEWAY_API_KEY` for drafting notes.
-- A protected staged deployment URL. If Vercel Deployment Protection requires
-  it, store the project automation bypass in `FX_WEB_PREVIEW_BYPASS`. Browser
-  checks send it only to that deployment's exact origin. This is not a BotID
-  bypass and does not change public request protection.
+- Vercel Authentication for preview and production deployment URLs
+  (`prod_deployment_urls_and_all_previews`), leaving public domains open.
+  Store the project automation bypass in `FX_WEB_PREVIEW_BYPASS` in
+  `release-preparation`. Browser checks send it only to that deployment's
+  exact origin. This is not a BotID bypass and does not change public request
+  protection. Preparation rejects missing protection before building.
 
 Check branch protections before activation. The App must be able to merge
 qualified preparation PRs without bypassing required checks. If policy requires

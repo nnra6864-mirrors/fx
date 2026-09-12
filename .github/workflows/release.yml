@@ -2,8 +2,6 @@ name: Release
 run-name: Prepare ${{ inputs.validate_only && 'rehearsal' || 'release' }} ${{ inputs.source_sha || github.sha }}
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       validate_only:
@@ -118,8 +116,9 @@ jobs:
           APP_ID: ${{ vars.FX_RELEASE_APP_ID }}
           APP_KEY: ${{ secrets.FX_RELEASE_APP_PRIVATE_KEY }}
           WEB_TOKEN: ${{ secrets.FX_WEB_VERCEL_TOKEN }}
+          PREVIEW_BYPASS: ${{ secrets.FX_WEB_PREVIEW_BYPASS }}
         run: |
-          for name in APP_ID APP_KEY WEB_TOKEN; do
+          for name in APP_ID APP_KEY WEB_TOKEN PREVIEW_BYPASS; do
             if [[ -z "${!name}" ]]; then
               echo "::error::Release automation credential $name is not configured"
               exit 1
@@ -147,6 +146,7 @@ jobs:
           test "$(gh api repos/vercel-labs/fx-web --jq .full_name)" = vercel-labs/fx-web
           python3 - <<'PY'
           import json, os, urllib.request
+          from scripts.release_delivery import require_website_protection
           request = urllib.request.Request(
               'https://api.vercel.com/v9/projects/prj_rIMZjpSjEoVhPtOV7y2v35UIDWQK?teamId=team_nO2mCG4W8IxPIeKoSsqwAxxB',
               headers={'Authorization': 'Bearer ' + os.environ['WEB_TOKEN']},
@@ -155,6 +155,7 @@ jobs:
               project = json.load(response)
           assert project['id'] == 'prj_rIMZjpSjEoVhPtOV7y2v35UIDWQK'
           assert project['accountId'] == 'team_nO2mCG4W8IxPIeKoSsqwAxxB'
+          require_website_protection(project)
           print('Release website credentials verified')
           PY
 

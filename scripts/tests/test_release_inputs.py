@@ -1,4 +1,5 @@
 import copy
+import pathlib
 import unittest
 from unittest import mock
 
@@ -7,6 +8,14 @@ from scripts.publish_prepared_sdk import check_registry_identity, check_channel_
 
 
 class PreparationInputTests(unittest.TestCase):
+    def test_prepare_release_is_the_single_stable_entrypoint(self):
+        workflows = pathlib.Path(__file__).resolve().parents[2] / ".github/workflows"
+        release = (workflows / "release.yml").read_text()
+        triggers = release.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+        self.assertIn("  workflow_dispatch:", triggers)
+        self.assertNotIn("  push:", triggers)
+        self.assertIn("gh workflow run release.yml --ref main", (workflows / "prepare-release.yml").read_text())
+
     def test_newer_ready_candidate_invalidates_an_old_approval(self):
         responses = [{"workflow_runs": [{"id": 124, "display_title": "Prepare release new"}]},
                      {"total_count": 1, "artifacts": [{"name": "fx-release-ready", "expired": False}]}]

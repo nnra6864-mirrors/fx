@@ -8,7 +8,7 @@ import unittest
 import urllib.error
 from unittest import mock
 
-from scripts.release_delivery import BlobConflictError, BlobStore, PUBLIC_BLOB, TransientDeliveryError, put_immutable, release_branch, website_checks_pass, linked_website, TEAM, WEB_PROJECT
+from scripts.release_delivery import BlobConflictError, BlobStore, PUBLIC_BLOB, TransientDeliveryError, put_immutable, release_branch, website_checks_pass, linked_website, require_website_protection, TEAM, WEB_PROJECT
 
 
 class Store:
@@ -26,6 +26,12 @@ class Store:
 
 
 class ReleaseDeliveryTests(unittest.TestCase):
+    def test_staged_urls_require_protection_without_locking_public_domains(self):
+        require_website_protection({"ssoProtection": {"deploymentType": "prod_deployment_urls_and_all_previews"}})
+        for policy in (None, {}, {"deploymentType": "all"}, {"deploymentType": "preview"}):
+            with self.subTest(policy=policy), self.assertRaisesRegex(ValueError, "Vercel protection"):
+                require_website_protection({"ssoProtection": policy})
+
     def test_website_link_is_scoped_and_cleaned_without_editing_gitignore(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

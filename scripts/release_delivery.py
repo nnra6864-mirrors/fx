@@ -293,6 +293,12 @@ def vercel(path: str):
     return json.loads(command(["vercel", "api", path, "--scope", "vercel-labs", "--raw"]))
 
 
+def require_website_protection(project: dict) -> None:
+    protection = project.get("ssoProtection") or {}
+    if protection.get("deploymentType") != "prod_deployment_urls_and_all_previews":
+        raise ValueError("configure Vercel protection for preview and production deployment URLs, leaving public domains open")
+
+
 @contextlib.contextmanager
 def linked_website(web_root: pathlib.Path):
     local = web_root / ".vercel"
@@ -309,6 +315,8 @@ def linked_website(web_root: pathlib.Path):
 def prepare_website(candidate_path: pathlib.Path, artifacts: pathlib.Path, fx_root: pathlib.Path, web_root: pathlib.Path, output: pathlib.Path, *, publication_allowed: bool, native_pr: int = 0) -> dict:
     candidate = json.loads(candidate_path.read_text())
     verify_candidate(candidate, artifacts, command(["git", "rev-parse", "HEAD"], cwd=fx_root))
+    project = vercel(f"/v9/projects/{WEB_PROJECT}")
+    require_website_protection(project)
     previous_version = (BlobStore().read("cli/latest.txt") or b"").decode().strip()
     examples = prepare_examples(candidate, previous_version, fx_root, output.parent / "example-evidence")
     stage_sdk(candidate, artifacts)
@@ -327,7 +335,6 @@ def prepare_website(candidate_path: pathlib.Path, artifacts: pathlib.Path, fx_ro
     command(["pnpm", "install", "--frozen-lockfile"], cwd=app)
     for test in ("test:release", "test:docs", "test:gateway"):
         command(["pnpm", "run", test], cwd=app)
-    project = vercel(f"/v9/projects/{WEB_PROJECT}")
     previous = project.get("targets", {}).get("production", {}).get("id")
     with linked_website(web_root):
         command(["vercel", "pull", "--yes", "--environment=production", "--scope", "vercel-labs"], cwd=web_root)
