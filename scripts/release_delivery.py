@@ -18,13 +18,12 @@ import urllib.parse
 import urllib.request
 
 from scripts.release_candidate import PLATFORMS, sha256_file, verify_candidate
-from scripts.release_examples import prepare_examples
+from scripts.release_examples import prepare_examples, vercel_team
 
 
 NATIVE_REPO = "vercel-labs/fx"
 WEB_REPO = "vercel-labs/fx-web"
 WEB_PROJECT = "prj_rIMZjpSjEoVhPtOV7y2v35UIDWQK"
-TEAM = "team_nO2mCG4W8IxPIeKoSsqwAxxB"
 PUBLIC_BLOB = "https://ugiwefobuo4tac0m.public.blob.vercel-storage.com/"
 RELEASE_PATHS = (
     "apps/marketing/package.json",
@@ -306,7 +305,7 @@ def linked_website(web_root: pathlib.Path):
         raise ValueError("website preparation requires a checkout without an existing Vercel link")
     local.mkdir(mode=0o700)
     try:
-        (local / "project.json").write_text(json.dumps({"orgId": TEAM, "projectId": WEB_PROJECT}))
+        (local / "project.json").write_text(json.dumps({"orgId": vercel_team(), "projectId": WEB_PROJECT}))
         yield
     finally:
         shutil.rmtree(local)

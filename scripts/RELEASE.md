@@ -65,6 +65,8 @@ being verified. Activation requires all of the following:
   `FX_RELEASE_APP_PRIVATE_KEY` in both `release-preparation` and `npm`, not in
   repository-wide secrets.
 - A separate Vercel project token for marketing and for each hosted example.
+  Set the fx repository variable `FX_RELEASE_VERCEL_TEAM_ID` to their owner
+  team ID; do not commit the team's identifier in release source.
   Store `FX_WEB_VERCEL_TOKEN` and `FX_EXAMPLE_VERCEL_TOKENS` in those same two
   environments. The example secret is a JSON map keyed by `node-chat`,
   `browser-agent`, `nextjs-agent` and `nuxt-agent`. Do not use a team-wide token.

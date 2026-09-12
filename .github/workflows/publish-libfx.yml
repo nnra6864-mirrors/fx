@@ -20,6 +20,9 @@ on:
 permissions:
   contents: read
 
+env:
+  FX_RELEASE_VERCEL_TEAM_ID: ${{ vars.FX_RELEASE_VERCEL_TEAM_ID }}
+
 jobs:
   metadata:
     if: >-

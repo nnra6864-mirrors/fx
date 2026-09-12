@@ -49,7 +49,7 @@ class Platform:
         ident = next(ident for ident, expected in TOKENS.items() if token == expected)
         record = prepared(ident)
         if path.startswith("/v9/projects/"):
-            return dict(id=examples.PROJECTS[ident], accountId=examples.TEAM,
+            return dict(id=examples.PROJECTS[ident], accountId="team_000000000000000000000000",
                         rootDirectory=f"examples/{ident}",
                         targets={"production": {"id": self.active[ident]}})
         if path.startswith("/v13/deployments/"):
@@ -82,6 +82,22 @@ class Platform:
 
 
 class ReleaseExamplesTests(unittest.TestCase):
+    def setUp(self):
+        environment = mock.patch.dict(examples.os.environ, {"FX_RELEASE_VERCEL_TEAM_ID": "team_000000000000000000000000"})
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def test_vercel_requests_require_a_configured_team_before_network_access(self):
+        for value in ("", "invalid", "team_000000000000000000000000&other=1"):
+            with mock.patch.dict(examples.os.environ, {"FX_RELEASE_VERCEL_TEAM_ID": value}), \
+                    mock.patch.object(examples, "run", return_value="{}") as run:
+                with self.assertRaisesRegex(ValueError, "FX_RELEASE_VERCEL_TEAM_ID"):
+                    examples.vercel("/v9/projects/example", cwd=pathlib.Path("."), token="fixture")
+                run.assert_not_called()
+        with mock.patch.object(examples, "run", return_value="{}") as run:
+            examples.vercel("/v9/projects/example", cwd=pathlib.Path("."), token="fixture")
+        self.assertEqual(["vercel", "api", "/v9/projects/example?teamId=team_000000000000000000000000", "--scope", "team_000000000000000000000000", "--raw"], run.call_args.args[0])
+
     def test_affected_selection_covers_shared_catalog_and_individual_apps(self) -> None:
         self.assertEqual(set(), examples.affected_examples(["src/main.zig"]))
         self.assertEqual({"node-chat"}, examples.affected_examples(["examples/node-chat/handler.mjs"]))

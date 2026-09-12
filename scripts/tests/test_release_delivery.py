@@ -3,12 +3,13 @@ from __future__ import annotations
 import pathlib
 import io
 import json
+import os
 import tempfile
 import unittest
 import urllib.error
 from unittest import mock
 
-from scripts.release_delivery import BlobConflictError, BlobStore, PUBLIC_BLOB, TransientDeliveryError, put_immutable, release_branch, website_checks_pass, linked_website, require_website_protection, TEAM, WEB_PROJECT
+from scripts.release_delivery import BlobConflictError, BlobStore, PUBLIC_BLOB, TransientDeliveryError, put_immutable, release_branch, website_checks_pass, linked_website, require_website_protection, WEB_PROJECT
 
 
 class Store:
@@ -26,6 +27,11 @@ class Store:
 
 
 class ReleaseDeliveryTests(unittest.TestCase):
+    def setUp(self):
+        environment = mock.patch.dict(os.environ, {"FX_RELEASE_VERCEL_TEAM_ID": "team_000000000000000000000000"})
+        environment.start()
+        self.addCleanup(environment.stop)
+
     def test_staged_urls_require_protection_without_locking_public_domains(self):
         require_website_protection({"ssoProtection": {"deploymentType": "prod_deployment_urls_and_all_previews"}})
         for policy in (None, {}, {"deploymentType": "all"}, {"deploymentType": "preview"}):
@@ -38,7 +44,7 @@ class ReleaseDeliveryTests(unittest.TestCase):
             (root / ".gitignore").write_text("existing rules\n")
             with self.assertRaisesRegex(RuntimeError, "staging failure"):
                 with linked_website(root):
-                    self.assertEqual({"orgId": TEAM, "projectId": WEB_PROJECT}, json.loads((root / ".vercel/project.json").read_text()))
+                    self.assertEqual({"orgId": "team_000000000000000000000000", "projectId": WEB_PROJECT}, json.loads((root / ".vercel/project.json").read_text()))
                     (root / ".vercel/.env.production.local").write_text("test-value")
                     raise RuntimeError("staging failure")
             self.assertFalse((root / ".vercel").exists())

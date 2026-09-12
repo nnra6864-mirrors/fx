@@ -13,7 +13,6 @@ import tempfile
 
 from scripts.release_candidate import SEMVER
 
-TEAM = "team_nO2mCG4W8IxPIeKoSsqwAxxB"
 PROJECTS = {
     "node-chat": "prj_W5dY7GTXPZ66l2AVL5q39RuyIirt",
     "browser-agent": "prj_uqZvHZYVkbFilG75KBxKdevCKnuw",
@@ -39,8 +38,16 @@ def run(args: list[str], *, cwd: pathlib.Path, token: str | None = None) -> str:
     return result.stdout.strip()
 
 
+def vercel_team() -> str:
+    team = os.environ.get("FX_RELEASE_VERCEL_TEAM_ID", "")
+    if not re.fullmatch(r"team_[A-Za-z0-9]{24}", team):
+        raise ValueError("FX_RELEASE_VERCEL_TEAM_ID must contain the configured Vercel team ID")
+    return team
+
+
 def vercel(path: str, *, cwd: pathlib.Path, token: str) -> dict:
-    return json.loads(run(["vercel", "api", f"{path}?teamId={TEAM}", "--scope", TEAM, "--raw"],
+    team = vercel_team()
+    return json.loads(run(["vercel", "api", f"{path}?teamId={team}", "--scope", team, "--raw"],
                           cwd=cwd, token=token))
 
 
@@ -100,7 +107,7 @@ def catalog(fx_root: pathlib.Path) -> dict[str, str]:
 
 def project_state(ident: str, *, cwd: pathlib.Path, token: str) -> dict:
     project = vercel(f"/v9/projects/{PROJECTS[ident]}", cwd=cwd, token=token)
-    if (project.get("id") != PROJECTS[ident] or project.get("accountId") != TEAM
+    if (project.get("id") != PROJECTS[ident] or project.get("accountId") != vercel_team()
             or project.get("rootDirectory") != f"examples/{ident}"):
         raise ValueError(f"{ident} project identity or rootDirectory differs from its configured example")
     previous = project.get("targets", {}).get("production", {}).get("id")
@@ -138,7 +145,7 @@ def linked_project(fx_root: pathlib.Path, ident: str):
         raise ValueError("example staging requires an fx checkout without an existing .vercel directory")
     local.mkdir(mode=0o700)
     try:
-        (local / "project.json").write_text(json.dumps({"projectId": PROJECTS[ident], "orgId": TEAM}))
+        (local / "project.json").write_text(json.dumps({"projectId": PROJECTS[ident], "orgId": vercel_team()}))
         yield
     finally:
         shutil.rmtree(local)
@@ -195,13 +202,13 @@ def prepare_examples(candidate: dict, previous_version: str, fx_root: pathlib.Pa
             ident, token = record["id"], tokens[record["id"]]
             record["previous_deployment_id"] = projects[ident]["targets"]["production"]["id"]
             with linked_project(fx_root, ident):
-                run(["vercel", "pull", "--yes", "--environment=production", "--scope", TEAM],
+                run(["vercel", "pull", "--yes", "--environment=production", "--scope", vercel_team()],
                     cwd=fx_root, token=token)
                 run(["vercel", "build", "--prod", "--yes"], cwd=fx_root, token=token)
                 if run(["git", "diff", "--name-only", sha, "--", "examples/"], cwd=fx_root):
                     raise ValueError(f"{ident} production build changed the example source")
                 url = run(["vercel", "deploy", "--prebuilt", "--prod", "--skip-domain", "--yes",
-                           "--scope", TEAM, "--meta", f"fxSourceSha={sha}",
+                           "--scope", vercel_team(), "--meta", f"fxSourceSha={sha}",
                            "--meta", f"fxExampleId={ident}", "--meta", f"fxSdkVersion={versions[ident]}"],
                           cwd=fx_root, token=token)
             if not re.fullmatch(DEPLOYMENT_URL, url):
@@ -272,7 +279,7 @@ def promote_examples(records: list[dict]) -> None:
                 continue
             if current != record["previous_deployment_id"]:
                 raise ValueError(f"{ident} production changed before promotion")
-            run(["vercel", "promote", record["deployment_id"], "--yes", "--scope", TEAM],
+            run(["vercel", "promote", record["deployment_id"], "--yes", "--scope", vercel_team()],
                 cwd=cwd, token=token)
             if project_state(ident, cwd=cwd, token=token)["targets"]["production"]["id"] != record["deployment_id"]:
                 raise ValueError(f"{ident} did not promote the prepared deployment")

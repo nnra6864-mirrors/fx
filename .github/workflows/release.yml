@@ -24,6 +24,9 @@ on:
 permissions:
   contents: read
 
+env:
+  FX_RELEASE_VERCEL_TEAM_ID: ${{ vars.FX_RELEASE_VERCEL_TEAM_ID }}
+
 concurrency:
   group: release-preparation
   cancel-in-progress: false
@@ -147,14 +150,16 @@ jobs:
           python3 - <<'PY'
           import json, os, urllib.request
           from scripts.release_delivery import require_website_protection
+          from scripts.release_examples import vercel_team
+          team = vercel_team()
           request = urllib.request.Request(
-              'https://api.vercel.com/v9/projects/prj_rIMZjpSjEoVhPtOV7y2v35UIDWQK?teamId=team_nO2mCG4W8IxPIeKoSsqwAxxB',
+              f'https://api.vercel.com/v9/projects/prj_rIMZjpSjEoVhPtOV7y2v35UIDWQK?teamId={team}',
               headers={'Authorization': 'Bearer ' + os.environ['WEB_TOKEN']},
           )
           with urllib.request.urlopen(request, timeout=30) as response:
               project = json.load(response)
           assert project['id'] == 'prj_rIMZjpSjEoVhPtOV7y2v35UIDWQK'
-          assert project['accountId'] == 'team_nO2mCG4W8IxPIeKoSsqwAxxB'
+          assert project['accountId'] == team
           require_website_protection(project)
           print('Release website credentials verified')
           PY
