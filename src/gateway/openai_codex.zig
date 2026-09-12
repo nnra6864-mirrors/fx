@@ -191,8 +191,6 @@ const PreparedStreamOperation = struct {
     }
 };
 
-const OpenedRequest = gateway_client.OpenedPost;
-
 const RequestAuthHeaders = struct {
     authorization: ?[]u8 = null,
     account_id: ?[]u8 = null,

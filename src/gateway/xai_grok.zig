@@ -176,8 +176,6 @@ fn requestDeadlineExpired(request: stream_provider.ModelRequest) bool {
     return !std.Io.Clock.Timestamp.compare(now, .lt, deadline);
 }
 
-const OpenedRequest = gateway_client.OpenedPost;
-
 const RequestAuthHeaders = struct {
     authorization: ?[]u8 = null,
     account_id: ?[]const u8 = null,
