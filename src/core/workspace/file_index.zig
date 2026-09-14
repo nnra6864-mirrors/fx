@@ -83,8 +83,17 @@ const LoaderOutcome = union(enum) {
     }
 };
 
+/// Value-only identity of one readable prefix; it grants no borrowed lifetime.
+pub const ReadableRevision = struct {
+    scope_epoch: u64 = 0,
+    generation: usize = 0,
+    count: usize = 0,
+    state: State = .idle,
+};
+
 const Generation = struct {
     id: usize,
+    scope_epoch: u64 = 0,
     paths_buf: []u8 = &.{},
     lower_buf: []u8 = &.{},
     offsets: []u32 = &.{},
@@ -246,6 +255,8 @@ const Generation = struct {
 };
 
 pub const FileIndex = struct {
+    const PendingScope = struct { roots: [][]u8, epoch: u64 };
+
     /// The main thread is the sole owner allowed to replace or reclaim these
     /// generation pointers. The loader writes only `loading_generation`.
     active_generation: ?*Generation = null,
@@ -253,8 +264,9 @@ pub const FileIndex = struct {
     /// Owned roots for the current generation. The primary root is first;
     /// active additional roots follow in configured order.
     roots: [][]u8 = &.{},
-    /// Owned replacement roots for one coalesced refresh while loading.
-    pending_roots: ?[][]u8 = null,
+    scope_epoch: u64 = 0,
+    /// Roots and their installed-scope identity transfer together.
+    pending_scope: ?PendingScope = null,
 
     stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
@@ -268,7 +280,7 @@ pub const FileIndex = struct {
             if (self.thread == null) "none" else "owned",
             self.active_generation != null,
             self.loading_generation != null,
-            self.pending_roots != null,
+            self.pending_scope != null,
         });
     }
 
@@ -291,8 +303,8 @@ pub const FileIndex = struct {
         self.active_generation = null;
         freeRoots(alloc, self.roots);
         self.roots = &.{};
-        if (self.pending_roots) |roots| freeRoots(alloc, roots);
-        self.pending_roots = null;
+        if (self.pending_scope) |pending| freeRoots(alloc, pending.roots);
+        self.pending_scope = null;
         debug_trace.logf("core", "file index shutdown complete generation={d}", .{self.generation});
     }
 
@@ -316,10 +328,15 @@ pub const FileIndex = struct {
 
     /// Kick off one background generation from an immutable access scope.
     pub fn ensureScope(self: *FileIndex, alloc: Allocator, scope: workspace_access.AccessScope) void {
+        self.ensureScopeEpoch(alloc, scope, 0);
+    }
+
+    pub fn ensureScopeEpoch(self: *FileIndex, alloc: Allocator, scope: workspace_access.AccessScope, epoch: u64) void {
         if (self.currentState() != .idle) return;
         if (scope.primary_directory.len == 0) return;
 
         self.roots = activeRootsAlloc(alloc, scope) catch return;
+        self.scope_epoch = epoch;
         _ = self.startLoad(alloc);
     }
 
@@ -335,6 +352,7 @@ pub const FileIndex = struct {
             debug_trace.logf("core", "file index generation allocation failed generation={d} err={s}", .{ generation_id, @errorName(err) });
             return false;
         };
+        loading.scope_epoch = self.scope_epoch;
         self.loading_generation = loading;
         self.generation = generation_id;
         self.initial_failed = false;
@@ -390,10 +408,11 @@ pub const FileIndex = struct {
         }
 
         if (!self.stop_requested.load(.seq_cst)) {
-            if (self.pending_roots) |roots| {
-                self.pending_roots = null;
+            if (self.pending_scope) |pending| {
+                self.pending_scope = null;
                 freeRoots(alloc, self.roots);
-                self.roots = roots;
+                self.roots = pending.roots;
+                self.scope_epoch = pending.epoch;
                 _ = self.startLoad(alloc);
             }
         }
@@ -403,31 +422,36 @@ pub const FileIndex = struct {
     /// Requests one replacement generation. A current loader retains its
     /// immutable scope and coalesces only the latest owned replacement scope.
     pub fn refresh(self: *FileIndex, alloc: Allocator) void {
-        const roots = cloneRoots(alloc, self.pending_roots orelse self.roots) catch |err| {
+        const epoch = if (self.pending_scope) |pending| pending.epoch else self.scope_epoch;
+        const roots = cloneRoots(alloc, if (self.pending_scope) |pending| pending.roots else self.roots) catch |err| {
             debug_trace.logf("core", "file index refresh snapshot failed generation={d} err={s}", .{ self.generation, @errorName(err) });
             return;
         };
-        self.refreshOwnedRoots(alloc, roots);
+        self.refreshOwnedRoots(alloc, roots, epoch);
     }
 
     /// Refreshes from the latest active scope. A loading generation keeps its
     /// immutable roots and receives one owned, coalesced replacement snapshot.
     pub fn refreshScope(self: *FileIndex, alloc: Allocator, scope: workspace_access.AccessScope) void {
+        self.refreshScopeEpoch(alloc, scope, 0);
+    }
+
+    pub fn refreshScopeEpoch(self: *FileIndex, alloc: Allocator, scope: workspace_access.AccessScope, epoch: u64) void {
         const roots = activeRootsAlloc(alloc, scope) catch |err| {
             debug_trace.logf("core", "file index scope snapshot failed generation={d} err={s}", .{ self.generation, @errorName(err) });
             return;
         };
-        self.refreshOwnedRoots(alloc, roots);
+        self.refreshOwnedRoots(alloc, roots, epoch);
     }
 
-    fn refreshOwnedRoots(self: *FileIndex, alloc: Allocator, roots: [][]u8) void {
+    fn refreshOwnedRoots(self: *FileIndex, alloc: Allocator, roots: [][]u8, epoch: u64) void {
         if (self.stop_requested.load(.seq_cst)) {
             freeRoots(alloc, roots);
             debug_trace.logf("core", "file index refresh discarded during shutdown generation={d}", .{self.generation});
             return;
         }
         if (self.thread != null) {
-            self.replacePendingRoots(alloc, roots);
+            self.replacePendingRoots(alloc, roots, epoch);
             return;
         }
 
@@ -438,26 +462,27 @@ pub const FileIndex = struct {
         }
         freeRoots(alloc, self.roots);
         self.roots = roots;
+        self.scope_epoch = epoch;
         const started = self.startLoad(alloc);
         if (!started) debug_trace.logf("core", "file index refresh not started generation={d}", .{self.generation});
     }
 
-    fn replacePendingRoots(self: *FileIndex, alloc: Allocator, roots: [][]u8) void {
-        if (self.pending_roots) |pending| {
-            if (rootsEqual(pending, roots)) {
+    fn replacePendingRoots(self: *FileIndex, alloc: Allocator, roots: [][]u8, epoch: u64) void {
+        if (self.pending_scope) |pending| {
+            if (pending.epoch == epoch and rootsEqual(pending.roots, roots)) {
                 freeRoots(alloc, roots);
                 debug_trace.logf("core", "file index refresh coalesced generation={d} identical=true", .{self.generation});
                 return;
             }
-            freeRoots(alloc, pending);
+            freeRoots(alloc, pending.roots);
             debug_trace.logf("core", "file index pending refresh superseded generation={d}", .{self.generation});
         }
-        self.pending_roots = roots;
+        self.pending_scope = .{ .roots = roots, .epoch = epoch };
         debug_trace.logf("core", "file index refresh coalesced generation={d} identical=false", .{self.generation});
     }
 
     pub fn isCurrentCandidateKind(self: *const FileIndex, path: []const u8, expected_kind: CandidateKind) bool {
-        const current_roots = self.pending_roots orelse self.roots;
+        const current_roots = if (self.pending_scope) |pending| pending.roots else self.roots;
         if (!text_utils.isTerminalSafe(path) or current_roots.len == 0) return false;
         const root_path, const relative = if (std.fs.path.isAbsolute(path)) resolved: {
             for (current_roots) |root| {
@@ -500,10 +525,37 @@ pub const FileIndex = struct {
         out: []SearchResult,
         match_spans: []MatchSpan,
     ) SearchError!usize {
-        if (out.len == 0) return 0;
-        const generation = self.searchableGeneration() orelse return 0;
-        const total = generation.count();
-        if (total == 0 or query.len > max_path_len) return 0;
+        return self.searchAtRevision(self.readableRevision(), query, out, match_spans);
+    }
+
+    pub fn readableRevision(self: *const FileIndex) ReadableRevision {
+        const generation = self.searchableGeneration() orelse return .{
+            .scope_epoch = self.scope_epoch,
+            .state = self.currentState(),
+        };
+        return .{
+            .scope_epoch = generation.scope_epoch,
+            .generation = generation.id,
+            .count = generation.count(),
+            .state = self.currentState(),
+        };
+    }
+
+    /// Main-thread-only search of the captured prefix. Results retain the same
+    /// borrowing contract as searchTyped; this revision is not a generation lease.
+    pub fn searchAtRevision(
+        self: *const FileIndex,
+        revision: ReadableRevision,
+        query: []const u8,
+        out: []SearchResult,
+        match_spans: []MatchSpan,
+    ) SearchError!usize {
+        if (out.len == 0 or revision.count == 0) return 0;
+        const generation = self.searchableGeneration() orelse return error.InvalidIndexData;
+        if (generation.id != revision.generation or generation.scope_epoch != revision.scope_epoch or
+            revision.count > generation.kinds.len) return error.InvalidIndexData;
+        const total = revision.count;
+        if (query.len > max_path_len) return 0;
 
         if (query.len == 0) {
             const result_count = @min(total, out.len);
@@ -520,7 +572,7 @@ pub const FileIndex = struct {
         var query_scratch: QueryScratch = undefined;
         const prepared = prepareQuery(query, &query_scratch) orelse return 0;
         var indices: [max_search_results]u32 = undefined;
-        const result_count = rankTopN(generation, prepared, indices[0..@min(out.len, max_search_results)]);
+        const result_count = rankTopN(generation, total, prepared, indices[0..@min(out.len, max_search_results)]);
 
         var path_scratch: FoldedPathScratch = undefined;
         var matched_offsets: [max_path_len]u16 = undefined;
@@ -995,7 +1047,7 @@ fn alphaMask(bytes: []const u8) u32 {
 }
 
 const non_ascii_mask: u32 = @as(u32, 1) << 31;
-const max_search_results: usize = 64;
+pub const max_search_results: usize = 64;
 
 fn asciiToLower(b: u8) u8 {
     return if (b >= 'A' and b <= 'Z') b + 32 else b;
@@ -1084,6 +1136,63 @@ const MatchScore = struct {
     gaps: usize,
 };
 
+/// Owns its prepared query without interior pointers. Names are borrowed only
+/// during each call; scoring and highlighting share the indexed-search rules.
+pub const NameQuery = struct {
+    scratch: QueryScratch,
+    len: usize,
+    ascii: bool,
+    ascii_mask: u32,
+
+    pub const Score = MatchScore;
+
+    pub fn init(query: []const u8) ?NameQuery {
+        if (query.len > max_path_len) return null;
+        var result: NameQuery = undefined;
+        const prepared = prepareQuery(query, &result.scratch) orelse return null;
+        result.len = prepared.folded.len;
+        result.ascii = prepared.ascii != null;
+        result.ascii_mask = if (prepared.ascii) |bytes| alphaMask(bytes) else 0;
+        return result;
+    }
+
+    pub fn score(self: *const NameQuery, name: []const u8) ?Score {
+        if (name.len == 0 or name.len > max_path_len) return null;
+        if (self.len == 0) return matchScore(false, false, .{});
+        for (name) |byte| {
+            if (byte >= 0x80) {
+                var scratch: FoldedPathScratch = undefined;
+                return scoreFoldedMatch(name, 0, self.scratch.folded[0..self.len], &scratch);
+            }
+        }
+        if (!self.ascii or alphaMask(name) & self.ascii_mask != self.ascii_mask) return null;
+        var lower: [max_path_len]u8 = undefined;
+        for (name, lower[0..name.len]) |byte, *folded| folded.* = asciiToLower(byte);
+        return scoreAsciiMatch(name, lower[0..name.len], 0, self.scratch.ascii[0..self.len]);
+    }
+
+    pub fn better(self: *const NameQuery, left: Score, left_path: []const u8, right: Score, right_path: []const u8) bool {
+        if (self.len > 0) {
+            if (scoreBetter(left, right)) return true;
+            if (scoreBetter(right, left)) return false;
+            if (left_path.len != right_path.len) return left_path.len < right_path.len;
+        }
+        return std.mem.order(u8, left_path, right_path) == .lt;
+    }
+
+    /// Writes name-relative byte spans into caller-owned storage.
+    pub fn match_spans(self: *const NameQuery, name: []const u8, out: []MatchSpan) SearchError!usize {
+        if (self.len == 0) return 0;
+        var scratch: FoldedPathScratch = undefined;
+        var offsets: [max_path_len]u16 = undefined;
+        var spans: [max_path_len]MatchSpan = undefined;
+        const count = reconstructMatchSpans(name, 0, self.scratch.folded[0..self.len], &scratch, &offsets, &spans) orelse return error.InvalidIndexData;
+        if (count > out.len) return error.NoSpaceLeft;
+        @memcpy(out[0..count], spans[0..count]);
+        return count;
+    }
+};
+
 const SubsequenceFacts = struct {
     boundary_matches: usize = 0,
     prefix: bool = false,
@@ -1098,7 +1207,7 @@ const RankedCandidate = struct {
     index: u32,
 };
 
-fn rankTopN(generation: *const Generation, query: PreparedQuery, out: []u32) usize {
+fn rankTopN(generation: *const Generation, total: usize, query: PreparedQuery, out: []u32) usize {
     const top_cap = @min(out.len, max_search_results);
     if (top_cap == 0) return 0;
 
@@ -1110,7 +1219,6 @@ fn rankTopN(generation: *const Generation, query: PreparedQuery, out: []u32) usi
     const query_mask = if (query_ascii) |ascii| alphaMask(ascii) else 0;
     var scalar_scratch: FoldedPathScratch = undefined;
 
-    const total = generation.count();
     var candidate_index: u32 = 0;
     while (candidate_index < total) : (candidate_index += 1) {
         const path_mask = generation.char_masks[candidate_index];
@@ -1397,6 +1505,43 @@ fn spansFromMatchedOffsets(
     return span_count;
 }
 
+test "filename fuzzy matcher shares indexed ordering and Unicode highlight spans" {
+    const alloc = std.testing.allocator;
+    const names = [_][]const u8{ "Desktop", "desktop-tools", "myDesktop", "Desk top", "dusk-top", "Ärger-file.txt", "Kelvin", "cafe\u{301}.txt" };
+    var candidates: [names.len]Candidate = undefined;
+    for (names, &candidates) |name, *candidate| candidate.* = .{ .path = name, .kind = .file };
+    var index: FileIndex = .{};
+    defer index.deinit(alloc);
+    try index.buildFromCandidates(alloc, &candidates);
+    const RankedName = struct { name: []const u8, score: NameQuery.Score };
+    for ([_][]const u8{ "ktop", "dsktp", "desk", "ärf", "klv", "ce", "nomatch" }) |query| {
+        const matcher = NameQuery.init(query).?;
+        var results: [names.len]SearchResult = undefined;
+        var spans: [names.len * max_path_len]MatchSpan = undefined;
+        const count = try index.searchTyped(query, &results, &spans);
+        var ranked: [names.len]RankedName = undefined;
+        var matched: usize = 0;
+        for (names) |name| {
+            if (matcher.score(name)) |score| {
+                ranked[matched] = .{ .name = name, .score = score };
+                matched += 1;
+            }
+        }
+        std.mem.sort(RankedName, ranked[0..matched], &matcher, struct {
+            fn less(ctx: *const NameQuery, left: RankedName, right: RankedName) bool {
+                return ctx.better(left.score, left.name, right.score, right.name);
+            }
+        }.less);
+        try std.testing.expectEqual(count, matched);
+        for (ranked[0..matched], results[0..count]) |name, result| {
+            try std.testing.expectEqualStrings(result.path, name.name);
+            var name_spans: [max_path_len]MatchSpan = undefined;
+            const span_count = try matcher.match_spans(name.name, &name_spans);
+            try std.testing.expectEqualSlices(MatchSpan, result.matched_spans, name_spans[0..span_count]);
+        }
+    }
+}
+
 fn expectValidSearchSpans(result: SearchResult) !void {
     var previous_end: usize = 0;
     for (result.matched_spans) |span| {
@@ -1561,11 +1706,13 @@ test "buildFromCandidates handles empty and rejected typed candidates" {
     var filtered = FileIndex{};
     defer filtered.deinit(alloc);
     try filtered.buildFromCandidates(alloc, &candidates);
-    try std.testing.expectEqual(@as(usize, 2), filtered.count());
-    try std.testing.expectEqualStrings("src", filtered.pathAt(0));
+    try std.testing.expectEqual(@as(usize, 3), filtered.count());
+    try std.testing.expectEqualStrings("space \" dir", filtered.pathAt(0));
     try std.testing.expectEqual(CandidateKind.directory, filtered.kindAt(0));
-    try std.testing.expectEqualStrings("README.md", filtered.pathAt(1));
-    try std.testing.expectEqual(CandidateKind.file, filtered.kindAt(1));
+    try std.testing.expectEqualStrings("src", filtered.pathAt(1));
+    try std.testing.expectEqual(CandidateKind.directory, filtered.kindAt(1));
+    try std.testing.expectEqualStrings("README.md", filtered.pathAt(2));
+    try std.testing.expectEqual(CandidateKind.file, filtered.kindAt(2));
 }
 
 test "typed candidate publication exposes matching immutable kinds" {
@@ -2666,13 +2813,13 @@ test "refresh during a coalesced scope change keeps the latest roots" {
     var index = FileIndex{};
     defer index.deinit(alloc);
     index.roots = try cloneRoots(alloc, &.{"/primary"});
-    index.pending_roots = try cloneRoots(alloc, &.{ "/primary", "/shared" });
+    index.pending_scope = .{ .roots = try cloneRoots(alloc, &.{ "/primary", "/shared" }), .epoch = 0 };
     var gate: TestLoaderGate = .{ .outcome = .canceled };
     _ = try installTestLoader(&index, alloc, "item.txt\x00", &gate);
 
     index.refresh(alloc);
 
-    const pending = index.pending_roots orelse return error.TestExpectedEqual;
+    const pending = (index.pending_scope orelse return error.TestExpectedEqual).roots;
     try std.testing.expectEqual(@as(usize, 2), pending.len);
     try std.testing.expectEqualStrings("/shared", pending[1]);
     index.requestStop();
@@ -2975,7 +3122,7 @@ test "latest and identical refresh roots coalesce without a second loader" {
             .active = true,
         }},
     });
-    const first_pending = index.pending_roots.?;
+    const first_pending = index.pending_scope.?.roots;
     index.refreshScope(alloc, .{
         .primary_directory = "/primary",
         .additional_directories = &.{.{
@@ -2986,7 +3133,7 @@ test "latest and identical refresh roots coalesce without a second loader" {
             .active = true,
         }},
     });
-    try std.testing.expect(index.pending_roots.?.ptr == first_pending.ptr);
+    try std.testing.expect(index.pending_scope.?.roots.ptr == first_pending.ptr);
 
     index.refreshScope(alloc, .{
         .primary_directory = "/primary",
@@ -2998,7 +3145,7 @@ test "latest and identical refresh roots coalesce without a second loader" {
             .active = true,
         }},
     });
-    try std.testing.expectEqualStrings("/latest", index.pending_roots.?[1]);
+    try std.testing.expectEqualStrings("/latest", index.pending_scope.?.roots[1]);
     try std.testing.expectEqual(@as(usize, 1), index.generation);
 
     index.requestStop();
@@ -3064,7 +3211,7 @@ test "stop before and after completion suppresses queued work" {
         try std.testing.expect(!index.joinThreadIfDone(alloc));
         try std.testing.expect(index.thread == null);
         try std.testing.expectEqual(@as(usize, 1), index.generation);
-        try std.testing.expect(index.pending_roots != null);
+        try std.testing.expect(index.pending_scope != null);
     }
 
     {
@@ -3087,7 +3234,7 @@ test "deinit cancels and joins one loader while suppressing queued refresh" {
     const alloc = std.testing.allocator;
     var index = FileIndex{};
     index.roots = try cloneRoots(alloc, &.{"/primary"});
-    index.pending_roots = try cloneRoots(alloc, &.{ "/primary", "/queued" });
+    index.pending_scope = .{ .roots = try cloneRoots(alloc, &.{ "/primary", "/queued" }), .epoch = 0 };
     const loading = try Generation.create(alloc, 1);
     index.loading_generation = loading;
     index.generation = 1;
@@ -3113,7 +3260,7 @@ test "deinit cancels and joins one loader while suppressing queued refresh" {
     try std.testing.expect(index.thread == null);
     try std.testing.expect(index.loading_generation == null);
     try std.testing.expect(index.active_generation == null);
-    try std.testing.expect(index.pending_roots == null);
+    try std.testing.expect(index.pending_scope == null);
 }
 
 test "file index raw-list and Unicode query bytes remain bounded" {
@@ -3149,6 +3296,52 @@ fn fuzzRawListAndQuery(_: void, smith: *std.testing.Smith) !void {
         try std.testing.expectEqual(CandidateKind.file, typed.kind);
         try expectValidSearchSpans(typed);
     }
+}
+
+test "file picker readable revision captures one prefix and survives equal count replacement" {
+    const alloc = std.testing.allocator;
+    var index: FileIndex = .{};
+    defer index.deinit(alloc);
+    try index.buildFromRaw(alloc, "a.txt\x00b.txt\x00c.txt\x00");
+    const first = index.active_generation.?;
+    first.scope_epoch = 7;
+    first.ready_count.store(1, .release);
+    const revision = index.readableRevision();
+    first.ready_count.store(3, .release);
+    var results: [4]SearchResult = undefined;
+    var spans: [16]MatchSpan = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try index.searchAtRevision(revision, "txt", &results, &spans));
+    try std.testing.expectEqualStrings("a.txt", results[0].path);
+    try std.testing.expectEqual(@as(u64, 7), revision.scope_epoch);
+    try std.testing.expectEqual(@as(usize, 3), index.readableRevision().count);
+    try index.buildFromRaw(alloc, "d.txt\x00e.txt\x00f.txt\x00");
+    try std.testing.expect(index.readableRevision().generation != revision.generation);
+    try std.testing.expectError(error.InvalidIndexData, index.searchAtRevision(revision, "txt", &results, &spans));
+}
+
+test "file picker pending scope coalesces epochs through A B A and failed refresh" {
+    const alloc = std.testing.allocator;
+    var index: FileIndex = .{};
+    defer index.deinit(alloc);
+    try index.buildFromRaw(alloc, "stable.txt\x00");
+    index.active_generation.?.scope_epoch = 1;
+    index.scope_epoch = 1;
+    index.roots = try cloneRoots(alloc, &.{"/A"});
+    index.replacePendingRoots(alloc, try cloneRoots(alloc, &.{"/A"}), 1);
+    index.replacePendingRoots(alloc, try cloneRoots(alloc, &.{"/B"}), 2);
+    index.replacePendingRoots(alloc, try cloneRoots(alloc, &.{"/A"}), 3);
+    try std.testing.expectEqual(@as(u64, 3), index.pending_scope.?.epoch);
+    index.replacePendingRoots(alloc, try cloneRoots(alloc, &.{"/A"}), 4);
+    try std.testing.expectEqual(@as(u64, 4), index.pending_scope.?.epoch);
+    const pending = index.pending_scope.?.roots.ptr;
+    index.replacePendingRoots(alloc, try cloneRoots(alloc, &.{"/A"}), 4);
+    try std.testing.expectEqual(pending, index.pending_scope.?.roots.ptr);
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    index.refreshScopeEpoch(failing.allocator(), workspace_access.AccessScope.primaryOnly("/C"), 5);
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(u64, 1), index.readableRevision().scope_epoch);
+    try std.testing.expectEqual(@as(u64, 4), index.pending_scope.?.epoch);
+    try std.testing.expectEqualStrings("/A", index.pending_scope.?.roots[0]);
 }
 
 fn sleepBlocking(milliseconds: u64) void {

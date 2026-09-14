@@ -44,6 +44,35 @@ pub fn persistInterruptedTurnOnce(
         retained_candidate,
         terminal_materializing,
         null,
+        .turn,
+    );
+}
+
+pub fn persistCompactionInterruptedTurnOnce(
+    hooks: *const AgentRuntimeDeps,
+    finalization: *TurnFinalizationGuard,
+    job: QueuedPrompt,
+    completed_tool_names: [][]u8,
+    persisted: *bool,
+    trace_ctx: TraceContext,
+    current_turn_messages: []const types.ChatMessage,
+    retained_candidate: ?[]const u8,
+    terminal_materializing: *bool,
+) !void {
+    return persistInterruptedTurnWithPresentation(
+        hooks,
+        finalization,
+        job,
+        null,
+        null,
+        completed_tool_names,
+        persisted,
+        trace_ctx,
+        current_turn_messages,
+        retained_candidate,
+        terminal_materializing,
+        null,
+        .compaction,
     );
 }
 
@@ -74,6 +103,7 @@ pub fn persistInterruptedCommandTurnOnce(
         retained_candidate,
         terminal_materializing,
         cancelled_command,
+        .turn,
     );
 }
 
@@ -90,11 +120,12 @@ fn persistInterruptedTurnWithPresentation(
     retained_candidate: ?[]const u8,
     terminal_materializing: *bool,
     cancelled_command: ?types.CancelledCommandPresentation,
+    cancellation_origin: types.CancellationOrigin,
 ) !void {
     if (persisted.*) return;
 
     const durable_active_tool_call = if (active_tool_call) |call|
-        try execution_memory_helpers.dupeRedactedToolCall(
+        try execution_memory_helpers.dupePersistedToolCall(
             std.heap.c_allocator,
             call,
         )
@@ -128,6 +159,7 @@ fn persistInterruptedTurnWithPresentation(
             .completed_tool_names = completed_tool_names,
             .execution = execution,
             .cancelled_command = cancelled_command,
+            .cancellation_origin = cancellation_origin,
         } };
         const finished = try types.dupeFinishedPrompt(
             std.heap.c_allocator,
@@ -170,6 +202,7 @@ fn persistInterruptedTurnWithPresentation(
         .completed_tool_names = completed_tool_names,
         .execution = execution,
         .cancelled_command = cancelled_command,
+        .cancellation_origin = cancellation_origin,
     } };
 
     var propagation_error: ?anyerror = null;

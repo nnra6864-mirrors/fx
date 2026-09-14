@@ -482,7 +482,7 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
             TIMEOUT,
           );
           await session.sendKeys("Enter");
-          await session.waitForText("● Session resumed:", TIMEOUT);
+          await session.waitForText("* session resumed:", TIMEOUT);
         }
 
         await waitForGenerationRequests(gateway, 2);

@@ -59,10 +59,6 @@ pub fn chatgptAuthPath(alloc: Allocator, home: []const u8) ![]u8 {
     return std.fs.path.join(alloc, &.{ home, root_dir_name, chatgpt_auth_file_name });
 }
 
-pub fn grokAuthPath(alloc: Allocator, home: []const u8) ![]u8 {
-    return std.fs.path.join(alloc, &.{ home, root_dir_name, grok_auth_file_name });
-}
-
 pub fn apiKeyPath(alloc: Allocator, home: []const u8) ![]u8 {
     return std.fs.path.join(alloc, &.{ home, root_dir_name, api_key_file_name });
 }

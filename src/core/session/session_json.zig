@@ -114,6 +114,9 @@ fn writeHistoryTurnJson(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writeStringArrayJson(writer, entry.completed_tool_names);
             try writer.writeAll(",\"terminal_reason\":");
             try std.json.Stringify.value(@tagName(entry.terminal_reason), .{}, writer);
+            if (entry.cancellation_origin == .compaction) {
+                try writer.writeAll(",\"cancellation_origin\":\"compaction\"");
+            }
             if (!entry.execution.isEmpty()) {
                 try writer.writeAll(",\"execution\":");
                 try writeExecutionMemoryJson(writer, entry.execution);
@@ -704,6 +707,11 @@ fn parseLegacyHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Hist
         const completed_tool_names = try parseOptionalStringArray(alloc, object.get("completed_tool_names"));
         errdefer session.freeCompletedToolNames(alloc, completed_tool_names);
         const terminal_reason = try parseLegacyInterruptedTerminalReason(object.get("terminal_reason"));
+        const cancellation_origin: types.CancellationOrigin = if (object.get("cancellation_origin")) |origin| blk: {
+            if (origin != .string) return error.InvalidSessionFormat;
+            break :blk std.meta.stringToEnum(types.CancellationOrigin, origin.string) orelse
+                return error.InvalidSessionFormat;
+        } else .turn;
         const execution = try parseOptionalExecutionMemory(alloc, object.get("execution"));
         return .{ .interrupted = .{
             .user = user,
@@ -712,6 +720,7 @@ fn parseLegacyHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Hist
             .completed_tool_names = completed_tool_names,
             .execution = execution,
             .terminal_reason = terminal_reason,
+            .cancellation_origin = cancellation_origin,
         } };
     }
 
@@ -1370,16 +1379,6 @@ fn parseOptionalBackgroundRecordId(
     return id;
 }
 
-fn writeHexString(writer: *std.Io.Writer, bytes: []const u8) !void {
-    try writer.writeByte('"');
-    const alphabet = "0123456789abcdef";
-    for (bytes) |byte| {
-        try writer.writeByte(alphabet[byte >> 4]);
-        try writer.writeByte(alphabet[byte & 0x0f]);
-    }
-    try writer.writeByte('"');
-}
-
 noinline fn requireObject(value: std.json.Value) !std.json.ObjectMap {
     if (value != .object) return error.InvalidSessionFormat;
     return value.object;
@@ -1789,6 +1788,52 @@ test "non-object legacy interrupted repair cleans every allocation failure" {
     , .{});
     defer parsed.deinit();
     try std.testing.checkAllAllocationFailures(alloc, checkNonObjectLegacyInterruptedAllocationFailures, .{parsed.value});
+}
+
+test "legacy cancellation provenance reads old sessions and roundtrips optional origin" {
+    const Case = struct {
+        fn run(alloc: Allocator, origin_field: []const u8, expected: types.CancellationOrigin) !void {
+            const json = try std.fmt.allocPrint(
+                alloc,
+                "{{\"schema_version\":1,\"id\":\"old\",\"created_at_ms\":1,\"updated_at_ms\":2," ++
+                    "\"workspace_root\":\"/tmp/workspace\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[" ++
+                    "{{\"kind\":\"interrupted\",\"user\":{{\"text\":\"request\",\"images\":[]}},\"assistant\":\"partial\"{s}}}]}}",
+                .{origin_field},
+            );
+            defer alloc.free(json);
+            var loaded = try parseStoredSession(TestStoredSession, alloc, json);
+            defer loaded.deinit(alloc);
+            try std.testing.expectEqual(expected, loaded.history[0].interrupted.cancellation_origin);
+            try std.testing.expectEqual(types.InterruptedTerminalReason.cancelled, loaded.history[0].interrupted.terminal_reason);
+            // This in-memory writer reports injected allocation failure as WriteFailed.
+            const encoded = renderSessionJson(alloc, loaded.id, loaded.created_at_ms, loaded.updated_at_ms, loaded.conversation_language, loaded.workspace_root.?, loaded.history, .{}) catch |err|
+                return if (err == error.WriteFailed) error.OutOfMemory else err;
+            defer alloc.free(encoded);
+            try std.testing.expectEqual(expected == .compaction, std.mem.find(u8, encoded, "\"cancellation_origin\"") != null);
+            var reloaded = try parseStoredSession(TestStoredSession, alloc, encoded);
+            defer reloaded.deinit(alloc);
+            try std.testing.expectEqual(expected, reloaded.history[0].interrupted.cancellation_origin);
+            try std.testing.expectEqualStrings("partial", reloaded.history[0].interrupted.assistant.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{ "", types.CancellationOrigin.turn });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{ ",\"cancellation_origin\":\"turn\"", types.CancellationOrigin.turn });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{ ",\"cancellation_origin\":\"compaction\"", types.CancellationOrigin.compaction });
+}
+
+test "legacy cancellation provenance rejects invalid values after owned fields" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "\"unknown\"", "null", "1", "false", "[]", "{}" }) |origin| {
+        const json = try std.fmt.allocPrint(
+            alloc,
+            "{{\"kind\":\"interrupted\",\"user\":{{\"text\":\"request\",\"images\":[]}},\"assistant\":\"partial\",\"completed_tool_names\":[\"read_file\"],\"cancellation_origin\":{s}}}",
+            .{origin},
+        );
+        defer alloc.free(json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidSessionFormat, parseLegacyHistoryTurn(alloc, parsed.value));
+    }
 }
 
 test "old assistant session JSON without execution parses as empty memory" {

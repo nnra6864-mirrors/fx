@@ -146,11 +146,11 @@ fn composeArgumentRow(
 
 fn confirmationText(action: ?mcp_menu_state.Action) []const u8 {
     return switch (action orelse return "Confirm this MCP action before continuing.") {
-        .remove => "Remove this profile MCP server? Press Enter to confirm.",
-        .logout => "Log out of this MCP server? Press Enter to confirm.",
-        .trust_reject => "Reject this project MCP server? Press Enter to confirm.",
-        .trust_approve_all => "Approve all pending project MCP servers? Press Enter to confirm.",
-        .trust_reset => "Reset all project MCP choices? Press Enter to confirm.",
+        .remove => "Remove this profile MCP server? press enter to confirm.",
+        .logout => "Log out of this MCP server? press enter to confirm.",
+        .trust_reject => "Reject this project MCP server? press enter to confirm.",
+        .trust_approve_all => "Approve all pending project MCP servers? press enter to confirm.",
+        .trust_reset => "Reset all project MCP choices? press enter to confirm.",
         else => "Confirm this MCP action before continuing.",
     };
 }
@@ -285,11 +285,11 @@ fn composeInfoRow(alloc: Allocator, row_index: u16, width: u16) !std.ArrayList(u
     return switch (row_index) {
         0 => composeFactRow(alloc, "Profile config", "~/.fx/mcp.json", width),
         1 => composeFactRow(alloc, "Project config", "<workspace>/.mcp.json", width),
-        2 => composeTextRow(alloc, "Servers: A Add · R Reload · Enter Inspect", width, ui_render.dim_style, 2),
-        3 => composeTextRow(alloc, "Project trust: P Approve all · Z Reset", width, ui_render.dim_style, 2),
-        4 => composeTextRow(alloc, "Details: Enter Sign in · L Logout · D Remove", width, ui_render.dim_style, 2),
-        5 => composeTextRow(alloc, "Project details: A Approve · X Reject", width, ui_render.dim_style, 2),
-        6 => composeTextRow(alloc, "Catalogs: / Filter · Enter Open · I Insert preview", width, ui_render.dim_style, 2),
+        2 => composeTextRow(alloc, "servers: a add · r reload · enter inspect", width, ui_render.dim_style, 2),
+        3 => composeTextRow(alloc, "project trust: p approve all · z reset", width, ui_render.dim_style, 2),
+        4 => composeTextRow(alloc, "details: enter sign in · l logout · d remove", width, ui_render.dim_style, 2),
+        5 => composeTextRow(alloc, "project details: a approve · x reject", width, ui_render.dim_style, 2),
+        6 => composeTextRow(alloc, "catalogs: / filter · enter open · i insert preview", width, ui_render.dim_style, 2),
         else => .empty,
     };
 }
@@ -987,6 +987,6 @@ test "MCP menu every screen and section renders through the VT" {
         projection,
         width,
         max_inline_rows,
-        &.{"Remove this profile MCP server? Press Enter to confirm."},
+        &.{"Remove this profile MCP server? press enter to confirm."},
     );
 }

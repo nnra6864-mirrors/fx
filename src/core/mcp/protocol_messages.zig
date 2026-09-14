@@ -189,13 +189,6 @@ pub fn buildCancellationNotification(
     return out.toOwnedSlice();
 }
 
-pub fn parseToolsListChangedCapabilityFromResponse(
-    alloc: Allocator,
-    response: []const u8,
-) !bool {
-    return (try parseServerCapabilitiesFromResponse(alloc, response)).tools_list_changed;
-}
-
 pub fn parseServerCapabilitiesFromResponse(
     alloc: Allocator,
     response: []const u8,
@@ -229,10 +222,6 @@ pub fn parseServerIdentity(value: std.json.Value) !ParsedServerIdentity {
         break :blk if (field.string.len > 0) field.string else null;
     } else null;
     return .{ .name = name, .version = version };
-}
-
-pub fn parseToolsListChangedCapability(value: std.json.Value) !bool {
-    return (try parseServerCapabilities(value)).tools_list_changed;
 }
 
 pub fn parseServerCapabilities(value: std.json.Value) !ParsedServerCapabilities {

@@ -529,7 +529,7 @@ test "capability search combines bounded skill and MCP results" {
     try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("total_matches").?.object.get("skills").?.integer);
     try std.testing.expect(parsed.value.object.get("more_available") == null);
     try std.testing.expect(parsed.value.object.get("next_cursors") == null);
-    try std.testing.expect(parsed.value.object.get("authentication_required") == null);
+    try std.testing.expect(parsed.value.object.get("authentication_required") != null);
 }
 
 test "capability search combined projection releases every allocation failure" {

@@ -1759,7 +1759,7 @@ describe("modern MCP Streamable HTTP", () => {
         fixture.requests.some((entry) => entry.message.method === "tools/call"),
       ).toBe(true);
 
-      await tui.sendKeys("Escape");
+      await tui.sendInterruptEscapePair(10_000);
       await tui.waitForText(`Cancelled ${TOOL_NAME}`, 10_000);
       const cancelDeadline = Date.now() + 5_000;
       while (fixture.cancelledCalls === 0 && Date.now() < cancelDeadline) {

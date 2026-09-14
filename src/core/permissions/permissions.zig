@@ -1430,10 +1430,6 @@ pub fn permissionNameForTool(tool_name: []const u8) []const u8 {
     return tool_name;
 }
 
-pub fn permissionRuleCategoryForGrant(permission_name: []const u8) ?[]const u8 {
-    return permissionNameForTool(permission_name);
-}
-
 /// Returns the persistent rule pattern for a session grant. Caller owns the returned slice.
 pub fn permissionRulePatternForGrant(alloc: std.mem.Allocator, workspace_root: []const u8, permission_name: []const u8, pattern: []const u8) ![]u8 {
     const permission = permissionNameForTool(permission_name);

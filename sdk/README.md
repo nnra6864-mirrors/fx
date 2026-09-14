@@ -273,8 +273,14 @@ JIT tier-up.
 
 Create agents in a server route using the Node.js runtime. Import `libfx`
 normally; the package includes its native assets and exposes both ESM and
-CommonJS Node entrypoints. No `serverExternalPackages` setting or manual native
-file inclusion is required.
+CommonJS Node entrypoints. Native agents support Next.js 15 with webpack and
+Next.js 16 with webpack or Turbopack, without `serverExternalPackages` or manual
+native-file inclusion. Webpack's emitted assets are resolved relative to the
+server bundle, including standalone builds with a custom `distDir` or `assetPrefix`.
+
+This native setup does not require JSPI. Explicit WebAssembly use still needs
+JSPI and available Wasm assets; Next.js's standalone tracer excludes `.wasm`
+files, so a standalone Wasm host must supply those assets separately.
 
 ```js
 import { createFxAgent } from "libfx";
@@ -319,9 +325,25 @@ const runtime = await createFxTerminal({
 await runtime.interactive;
 ```
 
+The xterm adapter preserves browser-style composer editing for Shift+Enter,
+Command+A, Command+C, Command+X, Command+Z, and Command+Shift+Z. Shift+Enter
+inserts a newline without submitting. A click inside the visible composer moves
+its caret; pointer drags remain xterm terminal-output selections.
+When xterm already has an output selection, Command+C copies that selection
+instead of the composer selection.
+
 The terminal runtime exposes `interactive`, `exited`, `write`, `resize`, and
-`abort`. Terminal session, config, OAuth, prompt-history, URL, and workspace
-stores remain terminal-only host integrations.
+`abort`. Terminal session, config, OAuth, prompt-history, clipboard, URL, and
+workspace stores remain terminal-only host integrations. Clipboard copy writes
+through the host `clipboard.writeText(text)` adapter and defaults to
+`navigator.clipboard`.
+
+During `/compact` and automatic compaction, the terminal shows a live
+`Compacting` activity row with elapsed time. Input and cancellation remain
+responsive while the summary request is pending. Compaction progress and
+outcomes do not add transcript entries, including cancellation after resume.
+Stored snapshots retain cancellation-origin metadata; keep them opaque and
+resume with the same or a newer SDK build. Older snapshots remain readable.
 
 ## Security
 

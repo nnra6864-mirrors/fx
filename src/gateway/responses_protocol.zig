@@ -938,7 +938,7 @@ pub const Reducer = struct {
                         try appendToolArguments(alloc, &tool.arguments, value.string, limits.tool_arguments_bytes);
                     }
                     if (callbacks.on_tool_start) |callback| {
-                        callback(callbacks.context, call_id, name, null);
+                        callback(callbacks.context, call_id, name, null, null);
                     }
                 } else {
                     const index = findTool(self.tools.items, output_index).?;

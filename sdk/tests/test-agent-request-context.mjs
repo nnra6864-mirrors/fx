@@ -118,7 +118,7 @@ try {
   for (const event of transportStarts) {
     assert.equal(event.endpoint, event.method === "GET"
       ? "https://ai-gateway.vercel.sh/coding-agent/v1/models"
-      : "https://ai-gateway.vercel.sh/v3/ai/language-model");
+      : "https://ai-gateway.vercel.sh/v4/ai/language-model");
     assert.equal(event.model, "request-context/model");
   }
   for (const event of transportResponses) {

@@ -23,6 +23,7 @@ const max_summary_chunks: usize = 64;
 
 pub const Request = struct {
     stream_provider: agent_stream_provider.Provider,
+    cooperative_transport_pulse: ?agent_stream_provider.CooperativePulse = null,
     model: []const u8,
     api_key: []const u8,
     credential_source: ?types.CredentialSource = null,
@@ -401,6 +402,7 @@ fn runSummaryCall(
                 .admission = .{},
                 .cancel_flag = request.cancel_flag,
                 .trace_ctx = request.trace_ctx,
+                .cooperative_pulse = request.cooperative_transport_pulse,
             },
             request.usage,
             request.usage_allocator,
@@ -515,6 +517,7 @@ const FakeProvider = struct {
         request: agent_stream_provider.ModelRequest,
     ) !agent_stream_provider.Result {
         const self: *FakeProvider = @ptrCast(@alignCast(raw.?));
+        if (request.cooperative_pulse) |pulse| try pulse.pulse();
         if (self.request_count < self.retry_counts.len) self.retry_counts[self.request_count] = request.retry_count;
         self.request_count += 1;
         if (self.request_count == 1) {
@@ -562,6 +565,38 @@ const FakeProvider = struct {
         } } };
     }
 };
+
+test "compaction activity forwards cooperative pulse through summary retry and cancellation" {
+    const Pulse = struct {
+        calls: usize = 0,
+        cancel: ?*std.atomic.Value(bool) = null,
+        fn run(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.cancel) |flag| flag.store(true, .seq_cst);
+        }
+    };
+    var pulse: Pulse = .{};
+    var provider: FakeProvider = .{ .response = "", .retry_response = "The requested work was recorded." };
+    var cancel = std.atomic.Value(bool).init(false);
+    const request: Request = .{
+        .stream_provider = provider.provider(),
+        .cooperative_transport_pulse = .{ .ctx = &pulse, .run = Pulse.run },
+        .model = "fixture/model",
+        .api_key = "fixture-key",
+        .retry_count = 1,
+        .cancel_flag = &cancel,
+        .accepted_tokens = 100,
+        .generation_tokens = 100,
+        .trace_ctx = .{},
+    };
+    const result = try runSummaryCall(std.testing.allocator, request, "source", 100, 1000);
+    defer std.testing.allocator.free(result.text);
+    try std.testing.expectEqual(@as(usize, 2), pulse.calls);
+    pulse.cancel = &cancel;
+    try std.testing.expectError(error.Cancelled, runSummaryCall(std.testing.allocator, request, "source", 100, 1000));
+    try std.testing.expectEqual(@as(usize, 3), pulse.calls);
+}
 
 test "compaction result exposes only caller-consumed state" {
     try std.testing.expect(!@hasField(Result, "usage"));

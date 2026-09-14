@@ -5173,23 +5173,6 @@ fn appendStoredResultFallback(
     return true;
 }
 
-fn appendSavedResultUnavailable(
-    alloc: Allocator,
-    walker: *ProjectionRowWalker,
-    styles: transcript_blocks.Styles,
-    line_prefix: []const u8,
-) !bool {
-    var line: std.Io.Writer.Allocating = .init(alloc);
-    defer line.deinit();
-    try writeSecondaryPrefixedLine(
-        &line.writer,
-        styles,
-        line_prefix,
-        "Full saved result unavailable.",
-    );
-    return walker.append(line.written());
-}
-
 fn appendPermanentCommandUnavailable(
     walker: *ProjectionRowWalker,
     styles: transcript_blocks.Styles,

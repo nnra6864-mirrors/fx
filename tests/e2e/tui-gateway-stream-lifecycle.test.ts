@@ -49,6 +49,158 @@ import { expectPermissionModeContext } from "./permission-mode-context";
 import { readTapeFrames, stdoutFrames } from "./render-lab/tape";
 
 const MODEL = "openai/gpt-5.5";
+
+for (const { cancelBeforeConsumption, lateFeedback } of [
+  { cancelBeforeConsumption: false, lateFeedback: false },
+  { cancelBeforeConsumption: true, lateFeedback: false },
+  { cancelBeforeConsumption: false, lateFeedback: true },
+]) test.skipIf(!tmuxAvailable())(
+  `persistent child steering preserves work and follow-up, cancelled=${cancelBeforeConsumption}, late=${lateFeedback}`, async () => {
+  root = realpathSync(mkdtempSync(join(tmpdir(), "fx-child-steering-")));
+  const home = join(root, "home"), workspace = join(root, "workspace");
+  const trace = join(root, "trace.log"), stderr = join(root, "stderr.log");
+  mkdirSync(join(home, ".fx"), { recursive: true }); mkdirSync(workspace);
+  writeFileSync(join(home, ".fx/settings.json"), "{}");
+  const release = join(workspace, "release");
+  writeFileSync(join(workspace, "hold.sh"), "printf 'once\\n' >> starts\nwhile [ ! -f release ]; do sleep 0.05; done\nprintf ORIGINAL_TOOL_DONE\n");
+  let first = true, sentFeedback = false, receivedFeedback: any, followup = false;
+  let childCalls = 0, applied = false, followupDone = false;
+  let releaseFeedback!: () => void;
+  const feedbackGate = new Promise<void>(resolve => { releaseFeedback = resolve; });
+  const routeErrors: string[] = [];
+  const toolResult = (request: any, id: string) => {
+    const part = request.prompt.flatMap((m: any) => Array.isArray(m.content) ? m.content : [])
+      .find((p: any) => p.type === "tool-result" && p.toolCallId === id);
+    return part ? JSON.parse(part.output.value) : null;
+  };
+  const host = startDynamicFakeGateway(raw => {
+    try {
+      const request = JSON.parse(raw), child = !raw.includes('"name":"subagent"');
+      if (child) {
+        childCalls++;
+        const latest = contentText(request.prompt.findLast((m: any) => m.role === "user")?.content);
+        if (lateFeedback && latest.includes("CHILD_FEEDBACK_TOKEN")) {
+          expect(raw).toContain("CHILD_STEERING_ORIGINAL_DONE");
+          followupDone = true;
+          return fakeGatewayFinalText("CHILD_LATE_FEEDBACK_DONE");
+        }
+        if (latest.includes("FOLLOW_SAME_CHILD")) {
+          expect(raw).toContain("CHILD_STEERING_TASK");
+          if (cancelBeforeConsumption) expect(raw).not.toContain("CHILD_FEEDBACK_TOKEN");
+          else { expect(raw).toContain("CHILD_STEERING_ORIGINAL_DONE"); expect(raw).toContain("CHILD_FEEDBACK_TOKEN"); }
+          followupDone = true; return fakeGatewayFinalText("CHILD_FOLLOWUP_DONE");
+        }
+        if (childCalls === 1) return fakeShellRun("child-steering-shell", "sh hold.sh");
+        expect(raw).toContain("ORIGINAL_TOOL_DONE");
+        if (!lateFeedback) {
+          expect(raw).toContain("CHILD_FEEDBACK_TOKEN");
+          expect(raw).toContain("parent-agent");
+          applied = true;
+        }
+        return fakeGatewayFinalText("CHILD_STEERING_ORIGINAL_DONE");
+      }
+      if (first) { first = false; return fakeGatewayToolCall("child-steering-start", "subagent",
+        { request: { action: "message", agent: "reviewer", message: "CHILD_STEERING_TASK: run the prepared command." } }); }
+      if (toolResult(request, "child-steering-follow")) return fakeGatewayFinalText("CHILD_STEERING_ALL_DONE");
+      const receipt = toolResult(request, "child-steering-feedback");
+      if (receipt) receivedFeedback = receipt;
+      if (lateFeedback && receipt) {
+        expect(receipt.result).toBe("CHILD_LATE_FEEDBACK_DONE");
+        expect(raw).toContain("CHILD_STEERING_ORIGINAL_DONE");
+        return fakeGatewayFinalText("CHILD_STEERING_ALL_DONE");
+      }
+      const latestParent = contentText(request.prompt.findLast((m: any) => m.role === "user")?.content);
+      if ((raw.includes("CHILD_STEERING_ORIGINAL_DONE") || latestParent.includes("FOLLOWUP_AFTER_CANCELLATION")) && !followup) {
+        followup = true; return fakeGatewayToolCall("child-steering-follow", "subagent",
+          { request: { action: "message", agent: "reviewer", message: "FOLLOW_SAME_CHILD: retain the original work and feedback." } });
+      }
+      if (receipt) return fakeGatewayFinalText("CHILD_FEEDBACK_ACKNOWLEDGED");
+      expect(sentFeedback).toBe(false); sentFeedback = true;
+      const feedback = fakeGatewayToolCall("child-steering-feedback", "subagent",
+        { request: { action: "message", agent: "reviewer", message: "CHILD_FEEDBACK_TOKEN: report the command result and continue." } });
+      return lateFeedback ? feedbackGate.then(() => feedback) : feedback;
+    } catch (error) { routeErrors.push(String(error)); return new Response("fixture route error", { status: 422 }); }
+  }, { classifierDecision: "clear" });
+  gateway = host;
+  const options = { cwd: workspace, width: 120, height: 40, stderrPath: stderr, isolated: true, remainOnExit: true,
+    env: { HOME: home, AI_GATEWAY_API_KEY: "fake-child-steering", FX_DISABLE_KEYCHAIN: "1",
+      FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: MODEL, FX_PERMISSION_MODE: "full-access",
+      FX_GATEWAY_BASE_URL: host.baseUrl, FX_GATEWAY_CHAT_URL: host.chatUrl, FX_E2E_GATEWAY_CHAT_URL: host.chatUrl,
+      FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "agent,worker,tool,subagent,permission,session,input,interrupt" } };
+  session = await TmuxSession.create(options);
+  let parentId = "";
+  const childState = () => {
+    for (const id of readdirSync(join(home, ".fx/sessions"))) {
+      const file = join(home, ".fx/sessions", id, "subagent/children.json");
+      if (existsSync(file)) {
+        const registry = JSON.parse(readFileSync(file, "utf8"));
+        if (registry.children.length) { parentId = id; return registry.children[0]; }
+      }
+    }
+    throw new Error("child registry missing");
+  };
+  try {
+    await session.waitForStableComposer(TIMEOUT);
+    await session.sendText("Start the child task.");
+    await waitForPath(join(workspace, "starts"));
+    const original = childState();
+    await session.sendText("Send the child useful review feedback.");
+    if (lateFeedback) {
+      await waitForCondition(() => sentFeedback, "parent request before child completion");
+      writeFileSync(release, "go");
+      await waitForCondition(() => childState().phase === "idle", "child completion before feedback delivery");
+      releaseFeedback();
+    }
+    await waitForCondition(() => receivedFeedback != null, "steering receipt");
+    expect(receivedFeedback).toMatchObject(lateFeedback ? { ok: true, result: "CHILD_LATE_FEEDBACK_DONE" } : { ok: true, delivery: "queued" });
+    expect(childState().id).toBe(original.id);
+    if (!lateFeedback) {
+      expect(childState().active.id).toBe(original.active.id);
+      expect(childCalls).toBe(1);
+    }
+    if (cancelBeforeConsumption) {
+      await session.waitForText("CHILD_FEEDBACK_ACKNOWLEDGED", TIMEOUT);
+      await session.waitForPane(pane => /^[• ] Running \([^\n]+$/m.test(pane), TIMEOUT);
+      await session.sendInterruptEscapePair(TIMEOUT);
+      await waitForCondition(() => childState().last_outcome === "cancelled", "child cancellation").catch(async error => {
+        throw new Error(`${error}\n${JSON.stringify(childState())}\n${await session!.capturePane()}\n${readFileSync(trace, "utf8").slice(-16000)}`);
+      });
+      await session.waitForStableComposer(TIMEOUT);
+      await session.sendText("FOLLOWUP_AFTER_CANCELLATION: continue the same child.");
+    } else writeFileSync(release, "go");
+    await session.waitForText("CHILD_STEERING_ALL_DONE", TIMEOUT);
+    expect(applied).toBe(!cancelBeforeConsumption && !lateFeedback); expect(followupDone).toBe(true);
+    expect(childCalls).toBe(cancelBeforeConsumption ? 2 : 3);
+    expect(readFileSync(join(workspace, "starts"), "utf8")).toBe("once\n");
+    const final = childState();
+    expect(final.id).toBe(original.id); expect(final.phase).toBe("idle"); expect(final.active).toBeNull();
+    const journal = readFileSync(join(home, ".fx/sessions", original.id, "events.jsonl"), "utf8");
+    if (cancelBeforeConsumption) {
+      expect(journal).not.toContain("CHILD_FEEDBACK_TOKEN");
+      expect(readFileSync(trace, "utf8")).toContain("event=feedback_not_applied");
+    } else {
+      expect(journal).toContain("CHILD_FEEDBACK_TOKEN"); expect(journal).toContain("CHILD_STEERING_ORIGINAL_DONE");
+      if (!lateFeedback) expect(readFileSync(trace, "utf8")).toContain("event=feedback_applied");
+    }
+    expect(await session.captureFullScrollback()).not.toContain("reviewer failed");
+    expect(routeErrors).toEqual([]);
+    await session.waitForStableComposer(TIMEOUT); await session.sendText("/quit");
+    await waitForCondition(() => session!.paneStatus().dead, "fx exit");
+    expect(session.paneStatus().status).toBe(0); expect(readFileSync(stderr, "utf8")).toBe("");
+    if (!cancelBeforeConsumption && !lateFeedback) {
+      await session.kill();
+      const resumedStderr = join(root!, "resumed-stderr.log");
+      const requestsBeforeResume = host.requests.length;
+      session = await TmuxSession.create({ ...options, cmd: `${JSON.stringify(FX_BIN)} --resume ${parentId}`, stderrPath: resumedStderr });
+      await session.waitForStableComposer(TIMEOUT);
+      expect(await session.captureFullScrollback()).toContain("reviewer feedback queued");
+      expect(host.requests.length).toBe(requestsBeforeResume);
+      await session.sendText("/quit");
+      await waitForCondition(() => session!.paneStatus().dead, "resumed fx exit");
+      expect(session.paneStatus().status).toBe(0); expect(readFileSync(resumedStderr, "utf8")).toBe("");
+    }
+  } finally { releaseFeedback(); writeFileSync(release, "go"); }
+}, 60000);
 const GLM_MODEL = "zai/glm-5.2";
 const TURN_SUMMARY_WITH_TOKENS =
   /^ {2}(?:\d+s|\d+m \d+s|\d+h \d{2}m) \(↑\d+(?:\.\d)?k? ↓\d+(?:\.\d)?k?\)$/m;
@@ -1384,6 +1536,36 @@ async function launchRouteRecoveryTui(
 }
 
 describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
+  test("retry exhaustion settles a streamed tool start and permits a later prompt", async () => {
+    const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+      "fx-tui-retry-settlement-",
+      [
+        () => new Response(
+          'data: {"type":"tool-input-start","id":"interrupted-read","toolName":"read_file"}\n\n' +
+          'data: {"type":"tool-input-delta","id":"interrupted-read","delta":"{\\"path\\":\\"notes"}\n\n',
+          { headers: { "content-type": "text/event-stream" } },
+        ),
+        ...Array.from({ length: 9 }, () => () => retryAfterUnavailable(0)),
+        () => fakeGatewayFinalText("AFTER_NETWORK_RECOVERY"),
+      ],
+    );
+    await session!.sendText("Read the notes and continue after a connection failure.");
+    await session!.waitForText("recovery paused", TIMEOUT);
+    await session!.waitForStableComposer(TIMEOUT);
+    expect(queuedGateway.requests).toHaveLength(10);
+    const scrollback = await session!.captureFullScrollback();
+    expect(scrollback).toContain("Connection interrupted before");
+    expect(scrollback).not.toContain("UnknownToolLifecycleIdentity");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    await session!.sendText("Confirm a later prompt is still usable.");
+    await session!.waitForText("AFTER_NETWORK_RECOVERY", TIMEOUT);
+    await session!.waitForStableComposer(TIMEOUT);
+    expect(queuedGateway.requests).toHaveLength(11);
+    await session!.sendText("/quit");
+    expect(await session!.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  }, TIMEOUT * 2);
+
   test("file edits keep earlier instruction bytes stable", async () => {
     const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
       "fx-tui-stable-verification-",
@@ -2253,7 +2435,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           resumed.release?.();
           await session.waitForText(finalText, TIMEOUT);
         } else {
-          await session.sendKeys("Escape");
+          await session.sendInterruptEscapePair(TIMEOUT);
           await session.waitForText("What can fx do differently?", TIMEOUT);
         }
         await session.waitForPane((pane) => !pane.includes("Thinking") && hasEmptyComposer(pane), TIMEOUT);
@@ -2433,14 +2615,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         "provider_error: route failed three times",
         TIMEOUT,
       );
-      await session!.sendKeys("Escape");
+      await session!.sendInterruptEscapePair(TIMEOUT);
       await session!.waitForText("What can fx do differently?", TIMEOUT);
       await session!.waitForComposer(TIMEOUT);
       const scrollback = await session!.captureFullScrollback();
 
       expect(queuedGateway.requests).toHaveLength(3);
       expect(scrollback).toContain("What can fx do differently?");
-      expect(scrollback).not.toContain("System: cancelled");
+      expect(scrollback).not.toContain("system: cancelled");
       expect(scrollback).not.toContain("Cancelling");
       expect(scrollback).not.toContain("request failed: ModelError");
       expect(scrollback).not.toContain("must not send");
@@ -3673,7 +3855,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(continuedParts.filter((part) => part.type === "file")).toEqual([{
         type: "file",
         mediaType: "image/png",
-        data: expectedImageData,
+        data: { type: "data", data: expectedImageData },
       }]);
       expect(continuedBody).toContain("RICH_STEERING_TOOL_DONE");
       expect(continuedBody).toContain("<user_steering>");
@@ -3826,7 +4008,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForText(`┋ ${steering}`, TIMEOUT);
       expect(steeringGateway.requests).toHaveLength(1);
 
-      await session.sendKeys("Escape");
+      await session.sendInterruptEscapePair(TIMEOUT);
       await session.waitForText(finalText, TIMEOUT);
       await waitForCondition(
         () => steeringGateway.requests.length === 2,
@@ -3967,7 +4149,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(steeringParts.filter((part) => part.type === "file")).toEqual([{
         type: "file",
         mediaType: "image/png",
-        data: expectedImageData,
+        data: { type: "data", data: expectedImageData },
       }]);
       expect(steeringBody).toContain("<user_steering>");
       expect(steeringBody).not.toContain("<turn_aborted>");
@@ -4020,7 +4202,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const readFilename = "ACTIVE_PERMISSION_READ_SENTINEL.txt";
       const toolHeader = "● 1 tool call · 1 read";
       const toolMarker = `└ Read ${readFilename}`;
-      const permissionMarker = "● Permissions: mode=auto";
+      const permissionMarker = "* permissions: mode=auto";
       const activeBefore = "ACTIVE_PERMISSION_BEFORE_SENTINEL\n";
       const activeAfter = "ACTIVE_PERMISSION_AFTER_SENTINEL\n";
       const followupPrompt = "ACTIVE_PERMISSION_FOLLOWUP_PROMPT_SENTINEL";
@@ -4177,7 +4359,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
       await waitForCondition(() => hold.cancelled, "stream cancellation");
       expect(afterFirst).toContain("■ Cancelled");
-      expect(afterFirst).not.toContain("System: cancelled");
+      expect(afterFirst).not.toContain("system: cancelled");
       expect(afterFirst).not.toContain("Cancelling");
       expect(session.isPaneAlive()).toBe(true);
 
@@ -4199,7 +4381,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(
         countOccurrences(scrollback, "What can fx do differently?"),
       ).toBe(1);
-      expect(scrollback).not.toContain("System: cancelled");
+      expect(scrollback).not.toContain("system: cancelled");
       expect(scrollback).not.toContain("Cancelling");
       expect(countOccurrences(trace, "source=input_active_stream")).toBe(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -4882,6 +5064,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const instruction = "NESTED_INSTRUCTION_REFRESH_SENTINEL";
       const command = "cat AGENTS.md && printf 'executed\\n' >> executions.log";
       const finalText = "INSTRUCTION_REFRESH_FINAL";
+      const nextFinalText = "INSTRUCTION_REFRESH_NEXT_TURN_FINAL";
+      const currentInstruction = "NESTED_CURRENT_INSTRUCTION_SENTINEL";
       const refreshLabel = "Reading project instructions before continuing:";
       const header = "● 2 tool calls · 2 commands";
       mkdirSync(join(home, ".fx"), { recursive: true });
@@ -4903,6 +5087,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
             : undefined;
           return fakeGatewayFinalText(finalText);
         },
+        fakeShellRun("retained_scope_next_turn", command, { cwd: nested }),
+        fakeGatewayFinalText(nextFinalText),
       ]);
       gateway = refreshGateway;
       session = await TmuxSession.create({
@@ -4947,6 +5133,21 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       for (const output of [compact, escapes]) {
         expect(output).not.toMatch(/command not run|project instructions changed|\bfailed\b/i);
       }
+
+      writeFileSync(join(nested, "AGENTS.md"), `${currentInstruction}\n`);
+      await session.sendText("Run that same command once more.");
+      await session.waitForText(nextFinalText, TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      expect(refreshGateway.requests).toHaveLength(5);
+      const nextInstructions = (parseGatewayRequest(refreshGateway.requests[3]!.body).prompt ?? [])
+        .filter((message) => message.role === "system")
+        .map((message) => contentText(message.content)).join("\n");
+      expect(nextInstructions).toContain(currentInstruction);
+      expect(nextInstructions).not.toContain(instruction);
+      expect(readFileSync(markerPath, "utf8")).toBe("executed\nexecuted\n");
+      expect(countOccurrences(await session.captureFullScrollback(), refreshLabel))
+        .toBe(countOccurrences(compact, refreshLabel));
+      expect(hasEmptyComposer(await session.capturePane())).toBe(true);
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);
       await session.sendText("/quit");
@@ -5108,6 +5309,111 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
+    "persistent subagent accepts the next message after cancellation",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-child-completion-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const marker = "CHILD_MEMORY_" + crypto.randomUUID();
+      const hold: HoldState = { started: false, cancelled: false };
+      const childRequests = new Map<string, number>();
+      const replies = new Map<string, { ok: boolean; result: string }>();
+      const childGateway = startDynamicFakeGateway((body) => {
+        const request = JSON.parse(body) as {
+          prompt: Array<{ role: string; content: unknown }>;
+        };
+        const user = contentText(request.prompt.findLast((message) => message.role === "user")?.content);
+        const stage = user.match(/HANDOFF_(SEED|CANCEL|NEXT|AGAIN)/)?.[1];
+        if (!stage) throw new Error("missing handoff request stage");
+        if (user.startsWith("CHILD_HANDOFF_")) {
+          childRequests.set(stage, (childRequests.get(stage) ?? 0) + 1);
+          if (stage === "CANCEL") return heldGatewayResponse(hold, [], []);
+          if (stage !== "SEED") expect(body).toContain(marker);
+          return fakeGatewayFinalText(marker + "_" + stage);
+        }
+        const id = "handoff_" + stage.toLowerCase();
+        const parts = request.prompt.flatMap((message) =>
+          Array.isArray(message.content) ? message.content : [],
+        );
+        const result = parts.findLast((part) =>
+          part.type === "tool-result" && part.toolCallId === id,
+        );
+        if (result) {
+          replies.set(stage, JSON.parse(result.output.value));
+          return fakeGatewayFinalText("PARENT_HANDOFF_" + stage + "_DONE");
+        }
+        return fakeGatewayToolCall(id, "subagent", {
+          request: {
+            action: "message",
+            agent: "reviewer",
+            message: "CHILD_HANDOFF_" + stage + (stage === "SEED" ? " Remember " + marker : " Continue."),
+          },
+        });
+      }, { classifierDecision: "clear" });
+      gateway = childGateway;
+      const env = {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "fake-child-completion-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_SOUND: "0",
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "auto",
+        FX_GATEWAY_BASE_URL: childGateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: childGateway.chatUrl,
+        FX_E2E_GATEWAY_CHAT_URL: childGateway.chatUrl,
+        FX_MODEL: MODEL,
+      };
+      session = await TmuxSession.create({ cwd: workspace, env, stderrPath, width: 110, height: 35 });
+      try {
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText("PARENT_HANDOFF_SEED");
+        await session.waitForText("PARENT_HANDOFF_SEED_DONE", TIMEOUT);
+        expect(replies.get("SEED")).toMatchObject({ ok: true, result: marker + "_SEED" });
+        const sessionsPath = join(home, ".fx", "sessions");
+        const parentId = readdirSync(sessionsPath).find((id) =>
+          existsSync(join(sessionsPath, id, "subagent", "children.json")),
+        );
+        expect(parentId).toBeDefined();
+        const registryPath = join(sessionsPath, parentId!, "subagent", "children.json");
+        const registry = () => JSON.parse(readFileSync(registryPath, "utf8"));
+        const childId = registry().children[0].id;
+        await session.waitForStableComposer(TIMEOUT);
+        await session.sendText("PARENT_HANDOFF_CANCEL");
+        await waitForCondition(() => childRequests.get("CANCEL") === 1, "child request held");
+        await session.waitForText("reviewer working", TIMEOUT);
+        await session.sendKeys("C-c");
+        await waitForCondition(() => registry().children[0].phase === "idle", "child cancellation saved");
+        expect(registry().children[0].last_outcome).toBe("cancelled");
+        for (const stage of ["NEXT", "AGAIN"]) {
+          await session.waitForStableComposer(TIMEOUT);
+          await session.sendText("PARENT_HANDOFF_" + stage);
+          await session.waitForText("PARENT_HANDOFF_" + stage + "_DONE", TIMEOUT);
+          expect(replies.get(stage)).toMatchObject({ ok: true, result: marker + "_" + stage });
+          expect(childRequests.get(stage)).toBe(1);
+          const state = registry();
+          expect(state.children).toHaveLength(1);
+          expect(state.children[0]).toMatchObject({ id: childId, phase: "idle", active: null, last_outcome: "completed" });
+        }
+        expect(registry().children[0].work_generation).toBe(4);
+        const scrollback = await session.captureFullScrollback();
+        expect(scrollback).toContain("reviewer replied");
+        expect(scrollback).not.toContain("child_busy");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      } finally {
+        hold.release?.();
+      }
+    },
+    TIMEOUT * 3,
+  );
+
+  test(
     "subagent rows show task previews and named replies through resume",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-subagent-rows-")));
@@ -5189,7 +5495,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         expect(narrow).toContain("reviewer replied · Check replay again");
         await session.resizeWindow(110, 35);
         await session.sendKeys("C-o");
-        await session.waitForText("Full detail", TIMEOUT);
+        await session.waitForText("full detail", TIMEOUT);
         let details = await session.capturePane();
         for (let page = 0; page < 8 && !details.includes("CHILD_ROW_REPLY_0"); page += 1) {
           await session.sendKeys("PPage");

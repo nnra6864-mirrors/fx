@@ -414,10 +414,10 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
         5_000,
       );
       expect(pane).toContain("[30 days]");
-      expect(pane).not.toMatch(/^● Usage/m);
-      expect(pane).toContain("Tab Scope");
-      expect(pane).toContain("R Refresh");
-      expect(pane).toContain("Esc Close");
+      expect(pane).not.toMatch(/^[*✓!✗⊘i] usage/m);
+      expect(pane).toContain("tab scope");
+      expect(pane).toContain("r refresh");
+      expect(pane).toContain("esc close");
       await session.sendKeys("Escape");
       await session.waitForComposer(5_000);
       await session.sendText("/usage");
@@ -560,15 +560,15 @@ describe.skipIf(!tmuxAvailable())("tui: MCP commands", () => {
         const menu = await session.waitForText("MCP 0", 5_000);
         expect(menu).toContain("[Servers]");
         expect(menu).toContain("No MCP servers configured.");
-        expect(menu).toContain("A Add");
-        expect(menu).toContain("C Help");
+        expect(menu).toContain("a add");
+        expect(menu).toContain("c help");
         expect(menu).not.toContain("MCP: no servers configured");
 
         await session.sendKeys("C");
         const info = await session.waitForText("~/.fx/mcp.json", 5_000);
         expect(info).toContain("<workspace>/.mcp.json");
-        expect(info).toContain("P Approve all");
-        expect(info).toContain("Z Reset");
+        expect(info).toContain("p approve all");
+        expect(info).toContain("z reset");
         await session.sendKeys("Escape");
         await session.waitForText("No MCP servers configured.", 5_000);
 
@@ -848,7 +848,7 @@ describe.skipIf(!tmuxAvailable())("tui: MCP commands", () => {
         await session.sendKeys("Enter");
         await session.sendKeys("D");
         const confirmation = await session.waitForText("Remove this profile MCP server?", 5_000);
-        expect(confirmation).toContain("Enter Confirm");
+        expect(confirmation).toContain("enter confirm");
         await session.sendKeys("Enter");
         const removed = await session.waitForText("MCP 0", 15_000);
         expect(removed).toContain("No MCP servers configured.");

@@ -16,6 +16,7 @@ const pathing = @import("../workspace/pathing.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const terminal_contracts = @import("../terminal/contracts.zig");
+const terminal_managed_observer = @import("../terminal/managed_observer.zig");
 const permission_prompter = @import("../permissions/permission_prompter.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const permissions = @import("../permissions/permissions.zig");
@@ -80,6 +81,7 @@ pub const Input = struct {
     mcp_runtime: tool_mcp_runtime.RuntimeCapabilities,
     context_limits: context_limits.Values = .{},
     auto_classifier: permission_auto_classifier.Classifier = .disabled(),
+    terminal_review_context: ?terminal_managed_observer.Context = null,
     host_sandbox_default: HostSandboxDefault = .none,
 };
 
@@ -748,6 +750,11 @@ fn reviewRequestForCall(
                 .background = false,
                 .target_os = command.target_os,
             } };
+        } else if (try isShellInputCall(input, arena, call)) blk: {
+            break :blk .{ .shell_input = .{
+                .arguments_json = call.arguments_json,
+                .receiver = try shellInputReceiver(input, arena, call),
+            } };
         } else blk: {
             break :blk .{ .tool = .{
                 .tool_name = call.name,
@@ -773,13 +780,45 @@ fn reviewRequestForCall(
     };
 }
 
+fn isShellInputCall(input: Input, arena: Allocator, call: ToolCall) !bool {
+    const tool = registeredTool(input, call.name) orelse return false;
+    if (!std.mem.eql(u8, call.name, "shell") or tool.executor_kind != .terminal) return false;
+    const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
+    if (!std.mem.eql(u8, tool_args.optionalStringArg(args, "action") orelse "", "interact")) return false;
+    const chars = tool_args.optionalStringArg(args, "chars") orelse return false;
+    return chars.len > 0;
+}
+
+fn shellInputReceiver(
+    input: Input,
+    arena: Allocator,
+    call: ToolCall,
+) !?permission_auto_classifier.ShellInputReceiver {
+    var context = input.terminal_review_context orelse return null;
+    context.alloc = arena;
+    const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
+    const session_id = try tool_args.requiredStringArg(args, "session_id");
+    const snapshot = terminal_managed_observer.inspectInput(context, session_id) catch |err| {
+        if (err == error.OutOfMemory or err == error.Cancelled) return err;
+        debug_trace.logf("permission", "event=shell_input_review_receiver_unavailable call_id={s} session_id={s} reason={s}", .{ call.id, session_id, @errorName(err) });
+        return null;
+    };
+    // The request borrows these owned slices for the admission arena's lifetime.
+    return .{
+        .session_id = snapshot.session_id,
+        .launch_command = snapshot.launch_command,
+        .cwd = snapshot.cwd,
+        .screen = snapshot.screen,
+    };
+}
+
 fn provenBindingsForAction(
     arena: Allocator,
     action: permission_auto_classifier.Action,
 ) !permission_auto_classifier.ProvenBindings {
     const command = switch (action) {
         .command => |value| value,
-        .file_mutation, .tool => return .{},
+        .file_mutation, .tool, .shell_input => return .{},
     };
     const expected = try directGitPushBranch(arena, command.command) orelse
         return .{};
@@ -2358,6 +2397,13 @@ pub fn permissionTargetResolutionFailureMessage(
     return switch (err) {
         error.PathOutsideWorkspace,
         error.FileNotFound,
+        error.NotDir,
+        error.SymLinkLoop,
+        error.AccessDenied,
+        error.PermissionDenied,
+        error.NameTooLong,
+        error.BadPathName,
+        error.InputOutput,
         error.HomeNotSet,
         error.InvalidPath,
         error.WorkspaceUnavailable,
@@ -2504,6 +2550,17 @@ test "permission target resolution reports a missing home" {
     )).?;
     defer std.testing.allocator.free(failure);
     try std.testing.expect(std.mem.find(u8, failure, "HomeNotSet") != null);
+}
+
+test "permission target failures preserve filesystem causes without hiding runtime errors" {
+    for ([_]anyerror{ error.FileNotFound, error.NotDir, error.SymLinkLoop, error.AccessDenied, error.PermissionDenied, error.NameTooLong }) |err| {
+        const failure = (try permissionTargetResolutionFailureMessage(std.testing.allocator, "grep_files", err)) orelse return error.TestExpectedToolFailure;
+        defer std.testing.allocator.free(failure);
+        try std.testing.expect(std.mem.find(u8, failure, @errorName(err)) != null);
+    }
+    for ([_]anyerror{ error.OutOfMemory, error.Cancelled, error.HostAuthorityUnavailable }) |err| {
+        try std.testing.expectEqual(null, try permissionTargetResolutionFailureMessage(std.testing.allocator, "grep_files", err));
+    }
 }
 
 test "interactive terminal exec approval permits command amendments" {
@@ -3489,6 +3546,7 @@ const FakeAutoClassifier = struct {
         self.proven_current_branch = request.proven_bindings.current_branch;
         self.action_tag = std.meta.activeTag(request.action);
         switch (request.action) {
+            .shell_input => |shell_input| self.exact_arguments_json = shell_input.arguments_json,
             .command => |command| self.exact_command = command.command,
             .file_mutation => |file| {
                 self.file_display_path = file.display_path;

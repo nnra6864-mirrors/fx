@@ -326,11 +326,11 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
       expect(warningPane).toContain("full access ·");
 
       await session.sendText("/settings");
-      const settingsPane = await session.waitForText("←→ Change", TIMEOUT);
+      const settingsPane = await session.waitForText("←→ change", TIMEOUT);
       expect(settingsPane).toContain("Permission mode");
       expect(settingsPane).not.toContain("Command sandbox");
       await Bun.sleep(4_300);
-      expect(await session.capturePane()).toContain("←→ Change");
+      expect(await session.capturePane()).toContain("←→ change");
 
       await session.sendKeys("Escape");
       const resumedWarning = await session.waitForText(WARNING, TIMEOUT);

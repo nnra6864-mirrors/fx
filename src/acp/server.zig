@@ -28,6 +28,7 @@ const session_codec = @import("../core/session/session_codec.zig");
 const session_log = @import("../core/session/session_log.zig");
 const session_store = @import("../core/session/session_store.zig");
 const session_runtime = @import("../core/session/session.zig");
+const session_title_generation = @import("../core/session/session_title_generation.zig");
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
 const terminal_client_runtime = @import("../core/terminal/client.zig");
 const subagent_tool_host = @import("../core/subagent/tool_host.zig");
@@ -203,6 +204,7 @@ pub const ActiveSessionState = struct {
     /// profile or project configuration.
     session_grants: []types.PermissionGrant = &.{},
     session_rt: session_runtime.SessionRuntime,
+    title_task: ?*session_title_generation.Task = null,
     mcp: ?*mcp_runtime.McpRuntime = null,
     cancel_flag: std.atomic.Value(bool),
     pending_prompt_id: ?jsonrpc.RequestId,
@@ -270,6 +272,7 @@ pub const ServerState = struct {
     effort: types.ReasoningEffort = .auto,
     first_call_tool_choice: types.ToolChoice = .auto,
     context_enabled: bool = true,
+    session_titles: bool = true,
     active_session: ?ActiveSessionState = null,
     active_prompt: ?*ActivePrompt = null,
     subagent_authority_mutex: std.Io.Mutex = .init,
@@ -466,6 +469,10 @@ pub fn refreshModelCredential(
     expected_account_id: ?[]const u8,
 ) !?[]u8 {
     const state: *ServerState = @ptrCast(@alignCast(raw));
+    if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
+        debug_trace.logf("auth", "credential refresh skipped source={t} reason=verified_recently", .{source});
+        return null;
+    }
     var refreshed = (try auth_runtime.refreshCredentialForAccount(
         state.cfg.gateway_provider.oauth_transport,
         state.alloc,
@@ -586,6 +593,10 @@ fn closeActiveSession(state: *ServerState) !void {
 
 fn destroyActiveSession(state: *ServerState) void {
     const active = if (state.active_session) |*session| session else return;
+    if (active.title_task) |task| {
+        debug_trace.logf("session", "event=title_generation_dropped reason=session_release", .{});
+        task.destroy();
+    }
     state.alloc.free(active.session_id);
     state.alloc.free(active.model);
     types.freePermissionGrantSlice(state.alloc, active.session_grants);
@@ -623,15 +634,6 @@ pub fn enableSubagentHost(state: *ServerState) void {
         state.subagent_store.?.deinit(state.alloc);
         state.subagent_store = null;
         return;
-    };
-    state.subagent_host.?.requestBackgroundRecovery(
-        io_mod.milliTimestamp(),
-    ) catch |err| {
-        debug_trace.logf(
-            "subagent",
-            "acp background recovery unavailable root_id={s} outcome={s}",
-            .{ state.subagent_host.?.root_id, @errorName(err) },
-        );
     };
 }
 
@@ -1865,6 +1867,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.effort = startup.effort;
     state.first_call_tool_choice = startup.first_call_tool_choice;
     state.context_enabled = startup.context_enabled;
+    state.session_titles = startup.session_title_generation;
 
     if (comptime !host_target.is_wasm) {
         if (!state.cfg.minimal_kernel) {
@@ -2216,6 +2219,33 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             defer state.subagent_authority_mutex.unlock(io_mod.getIo());
             applySessionMode(state.cfg.mode_registry, session, value);
         }
+    } else if (std.mem.eql(u8, config_id, "effort")) {
+        const session = if (state.active_session) |*active| active else return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "No active session",
+        });
+        const effort = types.ReasoningEffort.parse(value) orelse
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = "Invalid reasoning effort",
+            });
+        const config = sessions.effortConfigState(state) orelse
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = "Reasoning effort is unavailable for the active model",
+            });
+        if (!sessions.effortSupportedBy(config.efforts, effort)) {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = "Reasoning effort is not available for the active model",
+            });
+        }
+        commitActiveSessionEffort(alloc, session, effort) catch {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.internal_error,
+                .message = "Failed to persist session effort",
+            });
+        };
     }
 
     try refreshModelCatalogForOptions(state);
@@ -2239,6 +2269,10 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
     );
     try out.writer.writeAll(",");
     try sessions.writeModeConfigOption(&out.writer, state.cfg.mode_registry, current_mode);
+    if (sessions.effortConfigState(state)) |config| {
+        try out.writer.writeAll(",");
+        try sessions.writeEffortConfigOption(&out.writer, config.efforts, config.current);
+    }
     try out.writer.writeAll("]}");
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }
@@ -2327,6 +2361,34 @@ fn commitSessionModel(
     );
     alloc.free(active_model.*);
     active_model.* = staged_model;
+}
+
+fn commitActiveSessionEffort(
+    alloc: Allocator,
+    session: *ActiveSessionState,
+    effort: types.ReasoningEffort,
+) !void {
+    if (host_target.is_wasm and session.writable == null) {
+        const previous = session.effort;
+        session.effort = effort;
+        sessions.commitWasmSession(alloc, session) catch |err| {
+            session.effort = previous;
+            return err;
+        };
+        return;
+    }
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const writable = if (session.writable) |*active|
+        active
+    else
+        return error.SessionPersistenceUnavailable;
+    _ = try writable.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .effort = effort } },
+        io_mod.milliTimestamp(),
+    );
+    session.effort = effort;
 }
 
 fn handleSetMode(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {

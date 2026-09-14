@@ -2564,7 +2564,7 @@ describe("MCP remote authentication lifecycle", () => {
       expect(stored.credentials[0].access_token).toBe(ACCESS_INITIAL);
 
       await tui.sendKeys("Escape");
-      await tui.waitForText("Enter Inspect", 5_000);
+      await tui.waitForText("enter inspect", 5_000);
       await tui.sendKeys("Escape");
       await tui.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
       expect(await tui.captureFullScrollback()).toBe(beforeMenu);
@@ -3399,7 +3399,7 @@ describe("MCP remote authentication lifecycle", () => {
       }
       expect(auth.refreshes).toBe(1);
 
-      await tui.sendKeys("Escape");
+      await tui.sendInterruptEscapePair(10_000);
       await tui.waitForText(`Cancelled ${TOOL_NAME}`, 10_000);
       const cancelDeadline = Date.now() + 5_000;
       while (
@@ -3468,7 +3468,7 @@ describe("MCP remote authentication lifecycle", () => {
       await tui.waitForPane((pane) => /fixture\s+Disconnected/.test(pane), 5_000);
       expect(auth.authorizationRequests).toBe(0);
       await tui.sendKeys("Enter");
-      await tui.waitForText("Enter Sign in", 5_000);
+      await tui.waitForText("enter sign in", 5_000);
       expect(await tui.capturePane()).toMatch(/State\s+Disconnected/);
 
       await tui.sendKeys("Enter");

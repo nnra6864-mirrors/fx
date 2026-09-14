@@ -1045,7 +1045,7 @@ const BrowserOpenPrompt = struct {
 
     fn writeWaitingMessage(self: BrowserOpenPrompt) !void {
         if (self.enabled) {
-            try writeStdout("Waiting for authentication. Press Enter to open this in your browser, or use the URL manually.\n");
+            try writeStdout("Waiting for authentication. press enter to open this in your browser, or use the URL manually.\n");
         } else {
             try writeStdout("Waiting for authentication...\n");
         }

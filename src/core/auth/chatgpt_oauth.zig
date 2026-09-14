@@ -700,16 +700,6 @@ fn isLoopbackHttpUrl(url: []const u8) bool {
         std.mem.eql(u8, host_name, "[::1]");
 }
 
-fn requestAccepted(
-    alloc: Allocator,
-    transport: oauth_transport.Provider,
-    method: oauth_transport.Method,
-    url: []const u8,
-    payload: []const u8,
-) ![]u8 {
-    return requestAcceptedWithBounds(alloc, transport, method, url, payload, null, null);
-}
-
 fn requestAcceptedWithBounds(
     alloc: Allocator,
     transport: oauth_transport.Provider,
@@ -733,24 +723,6 @@ fn requestAcceptedWithBounds(
         return error.ChatGptOAuthRequestFailed;
     }
     return response.takeBody();
-}
-
-fn sessionFromToken(alloc: Allocator, token: *TokenSet, now_ms: i64) !chatgpt_session.Session {
-    const account_id = try extractAccountId(alloc, token.access_token);
-    errdefer alloc.free(account_id);
-    const duration_ms = std.math.mul(i64, token.expires_in, std.time.ms_per_s) catch
-        return error.InvalidChatGptOAuthResponse;
-    const expires_at_ms = std.math.add(i64, now_ms, duration_ms) catch
-        return error.InvalidChatGptOAuthResponse;
-    const session = chatgpt_session.Session{
-        .access_token = token.access_token,
-        .refresh_token = token.refresh_token,
-        .expires_at_ms = expires_at_ms,
-        .account_id = account_id,
-    };
-    token.access_token = &.{};
-    token.refresh_token = &.{};
-    return session;
 }
 
 pub fn extractAccountId(alloc: Allocator, token: []const u8) ![]u8 {
@@ -787,18 +759,6 @@ fn requiredPositiveInteger(object: std.json.ObjectMap, key: []const u8) !i64 {
     const value = object.get(key) orelse return error.InvalidChatGptOAuthResponse;
     if (value != .integer or value.integer <= 0) return error.InvalidChatGptOAuthResponse;
     return value.integer;
-}
-
-fn flexiblePositiveInteger(object: std.json.ObjectMap, key: []const u8) !i64 {
-    const value = object.get(key) orelse return error.InvalidChatGptOAuthResponse;
-    const result = switch (value) {
-        .integer => value.integer,
-        .string => std.fmt.parseInt(i64, std.mem.trim(u8, value.string, " \t\r\n"), 10) catch
-            return error.InvalidChatGptOAuthResponse,
-        else => return error.InvalidChatGptOAuthResponse,
-    };
-    if (result < 0) return error.InvalidChatGptOAuthResponse;
-    return result;
 }
 
 const BrowserCallback = struct {

@@ -4,6 +4,7 @@ import unittest
 
 import pathlib
 import dataclasses
+import re
 
 from scripts.pgso.corpus import Corpus, Scenario
 from scripts.pgso.distributed import (
@@ -34,6 +35,17 @@ def scenario(name: str, timeout_seconds: float) -> Scenario:
 
 
 class WorkflowContractTests(unittest.TestCase):
+    def test_reruns_replace_each_producer_artifact(self) -> None:
+        repo_root = pathlib.Path(__file__).resolve().parents[3]
+        workflow = (repo_root / ".github/workflows/pgso-macos-arm64.yml").read_text()
+        for job in ("seed", "train", "candidate", "behavior", "startup", "heavy", "aggregate"):
+            with self.subTest(job=job):
+                job_body = re.split(
+                    r"\n  (?=\S)", workflow.split(f"\n  {job}:\n", 1)[1], maxsplit=1
+                )[0]
+                upload = job_body.split("uses: actions/upload-artifact@", 1)[1]
+                self.assertIn("          overwrite: true\n", upload)
+
     def test_behavior_workers_install_pinned_zig_without_llvm(self) -> None:
         repo_root = pathlib.Path(__file__).resolve().parents[3]
         action = (repo_root / ".github/actions/setup-pgso/action.yml").read_text()

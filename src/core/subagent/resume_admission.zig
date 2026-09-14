@@ -9,7 +9,6 @@ const catalog_cache = @import("../session/session_catalog_cache.zig");
 const session_summary_codec = @import("../session/session_summary_codec.zig");
 
 const Allocator = std.mem.Allocator;
-const max_page_limit: usize = 100;
 
 pub const ActionableContinuation = struct {
     updated_at_ms: i64,
@@ -22,19 +21,6 @@ pub const ActionableContinuation = struct {
 
     pub fn view(self: ActionableContinuation) session_store.ResumableSessionContinuation {
         return .{ .updated_at_ms = self.updated_at_ms, .id = self.id };
-    }
-};
-
-pub const ActionableSessionPage = struct {
-    summaries: std.ArrayList(session_store.SessionSummary) = .empty,
-    has_more: bool = false,
-    continuation: ?ActionableContinuation = null,
-
-    pub fn deinit(self: *ActionableSessionPage, alloc: Allocator) void {
-        for (self.summaries.items) |*summary| summary.deinit(alloc);
-        self.summaries.deinit(alloc);
-        if (self.continuation) |*continuation| continuation.deinit(alloc);
-        self.* = undefined;
     }
 };
 
@@ -105,7 +91,7 @@ const CatalogWorker = struct {
             if (is_active and !candidate.summary.hasResumableContent()) continue;
             if (self.read.cancelled.load(.acquire)) return error.Cancelled;
             var cacheable = candidate.storage == .conversation;
-            const managed = if (!candidate.summary.hasResumableContent()) true else child_state.isListedManagedChildSession(self.read.store, self.alloc, &candidate) catch |err| switch (err) {
+            const managed = if (!candidate.summary.hasResumableContent()) true else child_state.isDiscoveredManagedChildSession(self.read.store, self.alloc, candidate.summary.id, candidate.subagent_child) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => blk: {
                     cacheable = false;
@@ -301,84 +287,13 @@ pub fn loadVisibleReadOnlyDetail(
     };
     if (managed) return error.SessionNotFound;
 
-    var detail = try store.loadReadOnlyDetail(alloc, session_id, options);
+    var detail = store.loadReadOnlyAdmissionDetail(alloc, session_id, options) catch |err| switch (err) {
+        error.ConversationHistoryUnavailable => return error.SessionNotFound,
+        else => return err,
+    };
     errdefer detail.deinit(alloc);
     if (detail.state.subagent_child) return error.SessionNotFound;
     return detail;
-}
-
-pub fn listActionablePage(
-    store: session_store.Store,
-    alloc: Allocator,
-    scope: session_store.SessionListScope,
-    active_id: ?[]const u8,
-    continuation: ?session_store.ResumableSessionContinuation,
-    limit: usize,
-) !ActionableSessionPage {
-    if (limit == 0 or limit > max_page_limit) return error.InvalidSessionListLimit;
-
-    var result: ActionableSessionPage = .{};
-    errdefer result.deinit(alloc);
-    var position: ?ActionableContinuation = if (continuation) |value| .{
-        .updated_at_ms = value.updated_at_ms,
-        .id = try alloc.dupe(u8, value.id),
-    } else null;
-    defer if (position) |*value| value.deinit(alloc);
-
-    var scanned: usize = 0;
-    while (result.summaries.items.len < limit and scanned < max_page_limit) {
-        var scoped = store;
-        scoped.resume_page_limit = @min(
-            limit - result.summaries.items.len,
-            max_page_limit - scanned,
-        );
-        const next = if (position) |value| value.view() else null;
-        var page = switch (scope) {
-            .current_workspace => try scoped.listResumableWorkspacePage(
-                alloc,
-                active_id,
-                next,
-            ),
-            .all_workspaces => try scoped.listResumablePage(
-                alloc,
-                active_id,
-                next,
-            ),
-        };
-        defer page.deinit(alloc);
-        result.has_more = page.has_more;
-        if (page.summaries.items.len == 0) break;
-
-        for (page.summaries.items) |summary| {
-            scanned += 1;
-            if (position) |*value| value.deinit(alloc);
-            position = .{
-                .updated_at_ms = summary.updated_at_ms,
-                .id = try alloc.dupe(u8, summary.id),
-            };
-            const managed = child_state.isManagedChildSession(
-                store,
-                alloc,
-                summary.id,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => true,
-            };
-            if (managed) continue;
-            var cloned = try session_summary_codec.cloneSessionSummary(alloc, summary);
-            result.summaries.append(alloc, cloned) catch |err| {
-                cloned.deinit(alloc);
-                return err;
-            };
-        }
-        if (!page.has_more) break;
-    }
-
-    if (position) |value| {
-        result.continuation = value;
-        position = null;
-    }
-    return result;
 }
 
 pub fn resumeForExternalPrompt(
@@ -402,36 +317,6 @@ pub fn resumeForExternalPrompt(
     try ensureExternalMarkerAllowed(store, alloc, loaded.active_id);
     try ensureLoadedExternalPromptAllowed(&loaded);
     return loaded;
-}
-
-/// Direct child prompts no longer exist. Parent-owned child execution resumes
-/// child history internally, so an externally resumed ordinary session has no
-/// subagent root-user evidence to retain.
-pub fn retainExternalRootUserTurn(
-    _: ?session_store.Store,
-    _: Allocator,
-    _: *session_store.LoadedWritableSession,
-    _: session.HistoryTurn,
-    _: bool,
-) !void {}
-
-fn ensureExternalPromptAllowed(
-    store: session_store.Store,
-    alloc: Allocator,
-    session_id: []const u8,
-) !void {
-    const managed = child_state.isManagedChildSession(
-        store,
-        alloc,
-        session_id,
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.SessionNotFound,
-        error.SessionStoreUnavailable,
-        => return,
-        else => return err,
-    };
-    if (managed) return error.OneOffSessionNotResumable;
 }
 
 fn isVisibleSession(

@@ -762,20 +762,6 @@ fn encodeBase64UrlNoPad(output: []u8, input: []const u8) []const u8 {
     return output[0..encoded_len];
 }
 
-pub fn generatePkce(
-    verifier_buf: *[64]u8,
-    challenge_buf: *[43]u8,
-    random: std.Random,
-) struct { verifier: []const u8, challenge: []const u8 } {
-    var entropy: [48]u8 = undefined;
-    random.bytes(&entropy);
-    const verifier = encodeBase64UrlNoPad(verifier_buf, &entropy);
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(verifier, &digest, .{});
-    const challenge = encodeBase64UrlNoPad(challenge_buf, &digest);
-    return .{ .verifier = verifier, .challenge = challenge };
-}
-
 test "PKCE base64url encoding covers complete and partial groups" {
     const cases = .{
         .{ "", "" },
@@ -1723,6 +1709,7 @@ fn chooseTokenEndpointAuthMethod(
     if (has_secret and metadata.supports(.client_secret_basic)) return "client_secret_basic";
     if (has_secret and metadata.supports(.client_secret_post)) return "client_secret_post";
     if (metadata.supports(.none)) return "none";
+    if (!has_secret and metadata.supports(.s256)) return "none";
     if (metadata.supports(.client_secret_basic)) return "client_secret_basic";
     if (metadata.supports(.client_secret_post)) return "client_secret_post";
     return error.UnsupportedTokenEndpointAuthenticationMethod;
@@ -2541,6 +2528,25 @@ test "authorization metadata defaults omitted token endpoint authentication to c
     try std.testing.expectEqualStrings(
         "client_secret_basic",
         try chooseTokenEndpointAuthMethod(metadata, false),
+    );
+}
+
+test "authorization metadata chooses none for secretless clients when S256 PKCE is supported" {
+    const alloc = std.testing.allocator;
+    var metadata = try parseAuthorizationMetadata(
+        alloc,
+        "{\"issuer\":\"https://mcp.slack.com\",\"authorization_endpoint\":\"https://slack.com/oauth/v2_user/authorize\",\"token_endpoint\":\"https://slack.com/api/oauth.v2.user.access\",\"token_endpoint_auth_methods_supported\":[\"client_secret_post\"],\"code_challenge_methods_supported\":[\"S256\"]}",
+        "https://mcp.slack.com",
+    );
+    defer metadata.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "none",
+        try chooseTokenEndpointAuthMethod(metadata, false),
+    );
+    try std.testing.expectEqualStrings(
+        "client_secret_post",
+        try chooseTokenEndpointAuthMethod(metadata, true),
     );
 }
 

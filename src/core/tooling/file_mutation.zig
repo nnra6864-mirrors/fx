@@ -41,7 +41,6 @@ pub const CreatedParentResidue = struct {
     component_index: usize,
     path_end: usize,
     permission_target_index: usize,
-    created_identity: file_mutation_contract.FileIdentity,
     observed_identity: ?file_mutation_contract.FileIdentity,
     reason: ParentCleanupResidueReason,
 };
@@ -1174,7 +1173,6 @@ fn createdParentResidue(
         .component_index = created.component_index,
         .path_end = created.path_end,
         .permission_target_index = created.permission_target_index,
-        .created_identity = created.identity,
         .observed_identity = observed_identity,
         .reason = reason,
     };

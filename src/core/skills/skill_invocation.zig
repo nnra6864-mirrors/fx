@@ -269,7 +269,7 @@ pub fn buildExplicitPromptSection(
     const summary = if (failed == 0)
         try std.fmt.allocPrint(alloc, "{d} requested skill{s} loaded{s}", .{ loaded, if (loaded == 1) "" else "s", load_rows.written() })
     else
-        try std.fmt.allocPrint(alloc, "Requested skills · {d} loaded · {d} failed (ctrl o for details){s}", .{ loaded, failed, load_rows.written() });
+        try std.fmt.allocPrint(alloc, "Requested skills · {d} loaded · {d} failed (ctrl+o for details){s}", .{ loaded, failed, load_rows.written() });
     errdefer alloc.free(summary);
     const details = if (load_details.written().len > 0) try load_details.toOwnedSlice() else null;
     errdefer if (details) |value| alloc.free(value);
@@ -297,9 +297,9 @@ fn appendExplicitLoadRow(alloc: Allocator, out: *std.Io.Writer, name: []const u8
     else
         try std.fmt.allocPrint(alloc, "Loaded skill {s}", .{name});
     defer alloc.free(row);
-    const redacted = try tool_result_limits.prepareRedactedOutput(alloc, row);
-    defer alloc.free(redacted);
-    const safe = try text_utils.encodeTerminalSafe(alloc, redacted, context_limits.emergency_ceiling_bytes);
+    const sanitized = try tool_result_limits.prepareSanitizedOutput(alloc, row);
+    defer alloc.free(sanitized);
+    const safe = try text_utils.encodeTerminalSafe(alloc, sanitized, context_limits.emergency_ceiling_bytes);
     defer alloc.free(safe.bytes);
     try out.writeAll(safe.bytes);
 }
@@ -320,7 +320,7 @@ test "explicit skill requests report ambiguous names without selecting a source"
     try expectContains(section.load_notice.?.body, "ambiguous name");
     try expectNotContains(section.load_notice.?.body, "/workspace/review");
     try expectNotContains(section.load_notice.?.body, "/global/review");
-    try expectContains(section.load_notice.?.body, "ctrl o");
+    try expectContains(section.load_notice.?.body, "ctrl+o");
     try expectContains(section.load_details.?, "/workspace/review");
     try expectContains(section.load_details.?, "/global/review");
     try std.testing.expect(section.notice == null);
@@ -352,7 +352,7 @@ test "explicit skills include complete instructions beyond the default chunk" {
     try std.testing.expectError(error.Cancelled, buildExplicitPromptSection(alloc, .{ .skills = &skills }, "$workflow", &.{}, .{}, &cancelled));
 }
 
-test "explicit load rows keep untrusted names and diagnostics terminal safe" {
+test "explicit load rows keep untrusted names terminal safe and diagnostics verbatim" {
     const alloc = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -361,7 +361,7 @@ test "explicit load rows keep untrusted names and diagnostics terminal safe" {
     try std.testing.expect(text_utils.isTerminalSafe(out.written()));
     try expectNotContains(out.written(), "\n");
     try expectNotContains(out.written(), "\x1b");
-    try expectNotContains(out.written(), "private-skill-secret");
+    try expectContains(out.written(), "private-skill-secret");
 }
 
 test "explicit load summary reports a missing bound skill without success" {
@@ -898,7 +898,7 @@ fn loadByIdentityWithOptions(
         full.writer.writeAll("\" complete=\"true\">\n") catch return error.OutOfMemory;
         full.writer.writeAll(resource_read.bytes) catch return error.OutOfMemory;
         full.writer.writeAll("\n</skill_content>") catch return error.OutOfMemory;
-        const output = try tool_result_limits.prepareRedactedOutput(alloc, full.written());
+        const output = try tool_result_limits.prepareSanitizedOutput(alloc, full.written());
         if (output.len > primary_budget) {
             defer alloc.free(output);
             const message = try std.fmt.allocPrint(alloc, "Complete skill content exceeds max_tool_result_bytes ({d} bytes). No complete instructions were loaded.", .{primary_budget});
@@ -906,7 +906,7 @@ fn loadByIdentityWithOptions(
             return attachOwnedDiscoveryNotice(alloc, .{ .failure = .{ .model_output = try boundedSkillError(alloc, message, primary_budget) } }, &discovery_notice, max_tool_result_bytes);
         }
         const notice = if (!std.mem.eql(u8, output, full.written()))
-            alloc.dupe(u8, "[context] Skill content was sanitized or secret-masked before delivery.\n") catch |err| {
+            alloc.dupe(u8, "[context] Skill content was sanitized before delivery.\n") catch |err| {
                 alloc.free(output);
                 return err;
             }

@@ -158,7 +158,7 @@ pub fn Runtime(comptime App: type) type {
 
         // Neutral one-line summary inline; the full detail stays behind Ctrl+O.
         fn writeCollapsedStartupNotice(app: *App, topic: []const u8, summary_lead: []const u8, detail: []const u8) !void {
-            const summary = try std.fmt.allocPrint(app.alloc, "{s} (ctrl o to view)", .{summary_lead});
+            const summary = try std.fmt.allocPrint(app.alloc, "{s} (ctrl+o to view)", .{summary_lead});
             defer app.alloc.free(summary);
             try app.writeDomainNotice(.{ .topic = topic, .tone = .neutral, .body = summary }, true);
             try app.writeDomainNotice(.{ .topic = topic, .tone = .neutral, .body = detail, .visibility = .full_only }, true);
@@ -296,6 +296,9 @@ pub fn Runtime(comptime App: type) type {
             app_permission_runtime.Runtime(App).initializeYoloWarning(app);
             app.statusline_context = startup.statusline_context;
             app.statusline_session = startup.statusline_session;
+            if (comptime @hasField(App, "session_title_generation")) {
+                app.session_title_generation = startup.session_title_generation;
+            }
             if (comptime @hasField(App, "workspace_identity")) {
                 app.workspace_identity.enabled = startup.statusline_workspace;
             }
@@ -618,14 +621,15 @@ const TestApp = struct {
             styles.system_notice_text_style.len > 0 and
             styles.reset_style.len > 0;
         const notice = if (semantic_notice.topic.len > 0)
-            try std.fmt.allocPrint(self.alloc, "● {c}{s}: {s}{s}\n", .{
-                std.ascii.toUpper(semantic_notice.topic[0]),
-                semantic_notice.topic[1..],
+            try std.fmt.allocPrint(self.alloc, "{s} {s}: {s}{s}\n", .{
+                types.noticeGlyph(semantic_notice.tone),
+                semantic_notice.topic,
                 semantic_notice.body,
                 if (semantic_notice.visibility == .full_only) " [full-only]" else "",
             })
         else
-            try std.fmt.allocPrint(self.alloc, "● {s}{s}\n", .{
+            try std.fmt.allocPrint(self.alloc, "{s} {s}{s}\n", .{
+                types.noticeGlyph(semantic_notice.tone),
                 semantic_notice.body,
                 if (semantic_notice.visibility == .full_only) " [full-only]" else "",
             });
@@ -847,21 +851,6 @@ fn runBootstrapForTest(app: *TestApp, capture: *TestCapture) !void {
     );
 }
 
-fn tracePathForTest(alloc: Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]u8 {
-    const io_mod = @import("../shared/io.zig");
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    return std.fs.path.join(alloc, &.{ root, name });
-}
-
-fn readTraceForTest(alloc: Allocator, path: []const u8) ![]u8 {
-    const io_mod = @import("../shared/io.zig");
-    debug_trace.shutdown();
-    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
-    defer file.close(io_mod.getIo());
-    return io_mod.readFileToEnd(alloc, &file, 8192);
-}
-
 fn resizeHandlerForTest(_: std.posix.SIG) callconv(.c) void {}
 
 test "app_bootstrap_runtime transfers startup state and starts a fresh session" {
@@ -910,7 +899,7 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
     try std.testing.expectEqualStrings("title", events[5]);
     try std.testing.expectEqual(@as(usize, 1), capture.begin_calls);
     try std.testing.expectEqual(@as(usize, 1), capture.enable_calls);
-    try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", capture.titleText());
+    try std.testing.expectEqualStrings("fx v" ++ build_options.app_version ++ " | workspace", capture.titleText());
 
     try std.testing.expectEqualStrings("/workspace", app.workspace_root);
     try std.testing.expectEqualStrings("api-key", app.auth.apiKey().?);
@@ -1035,8 +1024,8 @@ test "app_bootstrap_runtime reports a bounded skill discovery warning" {
 
     try std.testing.expectEqual(@as(usize, 1), app.skills.diagnostics.len);
     try std.testing.expect(capture.early_notice_palette_initialized);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "● Skills: 1 discovery issue; some skills may be missing (ctrl o to view)\n") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "● Skills: skill discovery warning:") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "* skills: 1 discovery issue; some skills may be missing (ctrl+o to view)\n") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "* skills: skill discovery warning:") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "hostile&#x0a;path/body-sentinel") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "metadata is invalid (missing_name)") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, " [full-only]\n") != null);
@@ -1051,6 +1040,6 @@ test "app_bootstrap_runtime collapses config diagnostics into one neutral summar
 
     try runBootstrapForTest(&app, &capture);
 
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "● Config: 2 configuration issues (ctrl o to view)\n") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "* config: 2 configuration issues (ctrl+o to view)\n") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "user: malformed_settings\nproject: settings_too_large [full-only]\n") != null);
 }

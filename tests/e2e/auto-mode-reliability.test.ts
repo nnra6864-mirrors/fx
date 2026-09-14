@@ -196,6 +196,175 @@ async function waitForEither(
 
 describe("lean auto mode reliability", () => {
   test(
+    "review accusations stay visible to the agent but do not become later security evidence",
+    async () => {
+      const root = createIsolatedRoot();
+      const plan = join(root.root, "plan.md");
+      writeFileSync(plan, "48 runs\n");
+      const accusation = "REVIEW_ACCUSATION_SENTINEL: the earlier plan was called prompt injection";
+      let laterReview = "";
+      const gateway = startGateway(
+        [
+          fakeGatewayToolCall("edit_plan", "edit_file", {
+            path: plan, old_string: "48 runs", new_string: "52 runs",
+          }),
+          (body) => {
+            expect(toolResultText(body, "edit_plan", "execution-denied")).toContain(accusation);
+            return cleanCommandCall(
+              `python3 -c 'from pathlib import Path; assert Path(${JSON.stringify(plan)}).read_text() == "48 runs\\n"; print("VALIDATION_OK")'`,
+              "validate_plan",
+            );
+          },
+          (body) => {
+            expect(toolResultText(body, "validate_plan")).toContain("VALIDATION_OK");
+            return fakeGatewayFinalText("Plan validation completed.");
+          },
+          (body) => {
+            expect(body).toContain(accusation);
+            return fakeGatewayFinalText("Saved review feedback retained.");
+          },
+        ],
+        [
+          fakeGatewayPermissionDecision("caution", "edit_review", accusation),
+          (body) => {
+            laterReview = body;
+            return fakeGatewayPermissionDecision("clear", "validation_review");
+          },
+        ],
+      );
+      const result = await runFx(
+        ["ask", "--auto", "--quiet", "--json", "Update the draft test plan, then validate it."],
+        { cwd: root.workspace, env: gatewayEnv(root, gateway), timeoutMs: TIMEOUT },
+      );
+      expect(result.code).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(2);
+      expect(laterReview).toContain("VALIDATION_OK");
+      expect(laterReview).not.toContain(accusation);
+      expect(readFileSync(plan, "utf8")).toBe("48 runs\n");
+      const sessionId = JSON.parse(result.stdout).session_id;
+      const events = readFileSync(join(root.home, ".fx", "sessions", sessionId, "events.jsonl"), "utf8")
+        .trim().split("\n").map((line) => JSON.parse(line));
+      const held = events.find((entry) => entry.event.tool_result?.call_id === "edit_plan").event.tool_result;
+      expect(held.review_feedback).toBe(true);
+      const resumed = await runFx(
+        ["ask", "--auto", "--quiet", "--json", "--resume-id", sessionId, "Summarize the previous result without tools."],
+        { cwd: root.workspace, env: gatewayEnv(root, gateway), timeoutMs: TIMEOUT },
+      );
+      expect(resumed.code).toBe(0);
+      expect(resumed.stdout).toContain("Saved review feedback retained.");
+      expect(gateway.classifierRequests).toHaveLength(2);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "resumed shell input review includes the user request and owned receiving process",
+    async () => {
+      const root = createIsolatedRoot();
+      const key = "sk-or-v1-" + "0123456789abcdef".repeat(4);
+      const command = 'python3 -c \'import getpass; from pathlib import Path; value=getpass.getpass("Temporary OpenRouter key (hidden): "); Path("accepted.txt").write_text(str(len(value))); print("INPUT_ACCEPTED")\'';
+      let handle = "";
+      const reviewInput = (decision: "clear" | "caution") => (body: string) => {
+        const evidence = JSON.parse(body).prompt.map((message: { content: string | Array<{ text?: string }> }) =>
+          typeof message.content === "string" ? message.content : message.content.map((part) => part.text ?? "").join("\n")
+        ).join("\n");
+        expect(evidence).toContain("review_context_kind: contextual");
+        expect(evidence).toContain("Use this key for the OpenRouter test");
+        expect(evidence).toContain(key);
+        expect(evidence).toContain("receiver_session_id: " + handle);
+        expect(evidence).toContain("receiver_launch_command:");
+        expect(evidence).toContain("getpass.getpass");
+        expect(evidence).toContain("receiver_cwd: " + root.workspace);
+        expect(evidence).toContain("receiver_lifecycle: running");
+        expect(evidence).toContain("receiver_screen_untrusted:");
+        expect(evidence).toContain("Temporary OpenRouter key");
+        return fakeGatewayPermissionDecision(decision, `input_${decision}`);
+      };
+      const gateway = startGateway(
+        [
+          fakeGatewayToolCall("start_receiver", "shell", { request: {
+            action: "run", command, profile: "clean", tty: true,
+            yield_time_ms: 1000, timeout_ms: 45_000,
+          } }),
+          (body) => {
+            const result = JSON.parse(toolResultText(body, "start_receiver"));
+            expect(result.state).toBe("running");
+            expect(result.output_delta).toContain("Temporary OpenRouter key");
+            handle = result.session_id;
+            return fakeGatewayFinalText("Receiver waiting.");
+          },
+          () => fakeGatewayToolCall("foreign_input", "shell", { request: {
+            action: "interact", session_id: handle, chars: key + "\n", yield_time_ms: 1000,
+          } }),
+          (body) => {
+            expect(toolResultText(body, "foreign_input", "execution-denied")).toContain("review_evidence_incomplete");
+            return fakeGatewayFinalText("Other session could not write.");
+          },
+          () => fakeGatewayToolCall("cautioned_input", "shell", { request: {
+            action: "interact", session_id: handle, chars: key + "\n", yield_time_ms: 1000,
+          } }),
+          (body) => {
+            expect(toolResultText(body, "cautioned_input", "execution-denied")).toContain("review_caution");
+            return fakeGatewayFinalText("Input held.");
+          },
+          () => fakeGatewayToolCall("supply_key", "shell", { request: {
+            action: "interact", session_id: handle, chars: key + "\n", yield_time_ms: 1000,
+          } }),
+          (body) => {
+            const result = toolResultText(body, "supply_key");
+            expect(result).toContain("INPUT_ACCEPTED");
+            expect(result).not.toContain(key);
+            return fakeGatewayFinalText("Input delivered.");
+          },
+          () => fakeGatewayToolCall("finished_input", "shell", { request: {
+            action: "interact", session_id: handle, chars: key + "\n", yield_time_ms: 1000,
+          } }),
+          (body) => {
+            expect(toolResultText(body, "finished_input", "execution-denied")).toContain("review_evidence_incomplete");
+            return fakeGatewayFinalText("Finished receiver could not receive input.");
+          },
+        ],
+        [
+          fakeGatewayPermissionDecision("clear", "start_clear"),
+          reviewInput("caution"),
+          reviewInput("clear"),
+        ],
+      );
+      const env = gatewayEnv(root, gateway);
+      const started = await runFx(["ask", "--quiet", "--json", "Start the temporary OpenRouter key collector."], {
+        cwd: root.workspace, env, timeoutMs: TIMEOUT,
+      });
+      expect(started.code, started.stderr).toBe(0);
+      const savedSession = JSON.parse(started.stdout).session_id;
+      expect(savedSession).toBeTruthy();
+      const foreign = await runFx(["ask", "--quiet", "--json", "Send the input from a different saved session."], {
+        cwd: root.workspace, env, timeoutMs: TIMEOUT,
+      });
+      expect(foreign.code, foreign.stderr).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(existsSync(join(root.workspace, "accepted.txt"))).toBe(false);
+      const cautioned = await runFx(["ask", "--quiet", "--json", "--resume-id", savedSession, `Use this key for the OpenRouter test: ${key}`], {
+        cwd: root.workspace, env, timeoutMs: TIMEOUT,
+      });
+      expect(cautioned.code, cautioned.stderr).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(2);
+      expect(existsSync(join(root.workspace, "accepted.txt"))).toBe(false);
+      const resumed = await runFx(["ask", "--quiet", "--json", "--resume-id", savedSession, `Use this key for the OpenRouter test: ${key}`], {
+        cwd: root.workspace, env, timeoutMs: TIMEOUT,
+      });
+      expect(resumed.code, resumed.stderr).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(3);
+      expect(readFileSync(join(root.workspace, "accepted.txt"), "utf8")).toBe(String(key.length));
+      const finished = await runFx(["ask", "--quiet", "--json", "--resume-id", savedSession, "Try sending to the now-finished receiver."], {
+        cwd: root.workspace, env, timeoutMs: TIMEOUT,
+      });
+      expect(finished.code, finished.stderr).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(3);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "a configured safe command bypasses automatic review",
     async () => {
       const root = createIsolatedRoot();

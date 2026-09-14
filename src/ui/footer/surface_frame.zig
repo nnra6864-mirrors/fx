@@ -812,10 +812,7 @@ fn assembleSurfaceFooterFrame(
         .activity_label = activity_label,
         .tool_activity_label = tool_activity_label,
         .shimmer_pos = assembly.planner_input.ctx.shimmer_pos,
-        .thinking_blink = activity_status.activityBlinkVisible(
-            assembly.planner_input.ctx.stream,
-            assembly.planner_input.ctx.now_ms,
-        ),
+        .thinking_blink = render_input.frameActivityBlink(assembly.planner_input.ctx),
         .trace_paint_frame = assembly.trace_paint_frame,
     };
 }
@@ -1463,7 +1460,6 @@ fn footerGeometryForRows(rows: FooterRows, activity: ActivityPlacement) footer_v
         .bottom_divider = rows.bottom_divider,
         .hint = rows.hint,
         .activity_row = activity.row(),
-        .activity_reserved_rows = activity.reservedFooterRows(),
     };
 }
 
@@ -1481,6 +1477,30 @@ fn surfaceTestContext(input: *InputRuntime) RenderContext {
         .model = "gpt-5.1",
         .input = input,
     };
+}
+
+test "surface footer frame snapshots manual compaction blink with an inactive stream" {
+    const alloc = std.testing.allocator;
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var shell = surfaceTestShell(24, 80);
+    defer shell.deinit(alloc);
+    var metrics = Metrics{};
+    var force_redraw = false;
+    var ctx = surfaceTestContext(&input);
+    ctx.compaction = .{ .revision = 1, .operation = .{
+        .id = @enumFromInt(1),
+        .turn_id = 1,
+        .origin = .manual,
+        .phase = .{ .running = .summary },
+        .started_at_ms = 1_000,
+    } };
+    ctx.now_ms = 1_500;
+    var frame = try prepareSurfaceFooterFrameWithReservation(alloc, &shell, &metrics, &force_redraw, null, ctx, .{}, FrameInvalidationSet.empty());
+    defer frame.deinit(alloc);
+    try std.testing.expectEqual(@as(?bool, false), frame.thinking_blink);
+    try std.testing.expect(std.mem.find(u8, frame.activity_label.items, "Compacting (0s)") != null);
+    try std.testing.expect(!ctx.stream.active);
 }
 
 test "surface footer frame snapshots the thinking blink from the frame clock" {
@@ -2934,7 +2954,6 @@ fn surfaceTestRetargetPaintPlan(top: u16) PaintPlan {
         .footer_clean_allowed = true,
         .synchronized_update = true,
         .cursor_target = .{ .row = top + 1, .col = 4, .visible = true },
-        .footer_reservation_source = .none,
         .bottom_reserved_rows = 0,
         .preserve_scrollback = true,
     };

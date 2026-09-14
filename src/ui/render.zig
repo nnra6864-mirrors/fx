@@ -13,12 +13,9 @@ const theme_protocol = @import("terminal/theme_protocol.zig");
 const visual_layout = @import("input/visual_layout.zig");
 const update_target = @import("../core/upgrade/update_target.zig");
 
-pub const input_prefix = "❯ ";
 pub const TerminalRgb = user_message_card.Rgb;
 pub const reset_style = "\x1b[0m";
 pub const bold_style = "\x1b[1m";
-pub const app_name = "fx";
-pub const right_tag = "/fx";
 pub const ask_activity_label = "⏺ Asking";
 
 const user_message_card = @import("assistant/user_message_card.zig");
@@ -125,8 +122,6 @@ pub fn themeNeedsUpdate(light: bool, terminal_bg: ?TerminalRgb) bool {
 }
 
 // Explicit theme overrides skip OSC 11, leaving `rgb` null for fallback shading.
-pub const ThemeDetection = theme_detection.Detection;
-pub const TerminalBackground = theme_protocol.Background;
 pub const explicitThemeOverride = theme_detection.explicitThemeOverride;
 pub const detectTheme = theme_detection.detectTheme;
 pub const parseOsc11Response = theme_protocol.parseOsc11Response;
@@ -432,11 +427,11 @@ pub fn buildHintLine(
             const total_k: u64 = @as(u64, total) / 1000;
             const pct = if (total > 0) (statusline.context_used * 100) / @as(u64, total) else 0;
             var ctx_buf: [48]u8 = undefined;
-            appendStatusSegment(out, &end, std.fmt.bufPrint(&ctx_buf, "Context: {d}k/{d}k {d}%", .{ used_k, total_k, pct }) catch "");
+            appendStatusSegment(out, &end, std.fmt.bufPrint(&ctx_buf, "{d}k/{d}k {d}%", .{ used_k, total_k, pct }) catch "");
         } else {
             const used_k = statusline.context_used / 1000;
             var ctx_buf: [32]u8 = undefined;
-            appendStatusSegment(out, &end, std.fmt.bufPrint(&ctx_buf, "Context: {d}k", .{used_k}) catch "");
+            appendStatusSegment(out, &end, std.fmt.bufPrint(&ctx_buf, "{d}k", .{used_k}) catch "");
         }
     }
     appendWorkspaceIdentity(out, &end, status_limit, statusline);
@@ -545,10 +540,6 @@ fn appendSpacesToBuffer(out: []u8, len: *usize, count: usize) void {
         out[len.*] = ' ';
         len.* += 1;
     }
-}
-
-pub fn isPrintableAscii(byte: u8) bool {
-    return byte >= 32 and byte <= 126;
 }
 
 test "input line wraps to the cursor row" {
@@ -669,9 +660,8 @@ fn titleOutput(raw: ?*anyopaque) std.Io.File {
 }
 
 const terminal_title_osc_prefix = "\x1b]2;";
-const terminal_title_display_prefix = "fx ";
 const terminal_title_max_content_bytes: usize = 128;
-const terminal_title_max_label_bytes = terminal_title_max_content_bytes - terminal_title_display_prefix.len;
+const terminal_title_max_label_bytes = terminal_title_max_content_bytes;
 
 fn sanitizedTerminalTitleLabel(raw: []const u8, buffer: *[terminal_title_max_label_bytes]u8) []const u8 {
     const marker = "...";
@@ -709,7 +699,6 @@ fn setTerminalTitleLabel(raw: ?*anyopaque, label: []const u8) void {
     var sequence_buffer: [terminal_title_osc_prefix.len + terminal_title_max_content_bytes + 1]u8 = undefined;
     var sequence: std.Io.Writer = .fixed(&sequence_buffer);
     sequence.writeAll(terminal_title_osc_prefix) catch return;
-    sequence.writeAll(terminal_title_display_prefix) catch return;
     sequence.writeAll(sanitized) catch return;
     sequence.writeByte('\x07') catch return;
     out.writeStreamingAll(io_mod.getIo(), sequence.buffered()) catch return;
@@ -729,7 +718,7 @@ test "terminal title writes the label to the caller's output file" {
 
     // A host that redirects its output keeps the escape sequence off the
     // real stdout, which the Zig test runner owns as its protocol channel.
-    terminalTitleFor(&sink).set("v" ++ main.version ++ " | fx");
+    terminalTitleFor(&sink).set("fx v" ++ main.version ++ " | fx");
 
     var written_file = try tmp.dir.openFile(io_mod.getIo(), "terminal-title.log", .{});
     defer written_file.close(io_mod.getIo());
@@ -752,7 +741,7 @@ test "terminal title sanitizes and bounds untrusted labels" {
     const written = try io_mod.readFileToEnd(alloc, &written_file, 512);
     defer alloc.free(written);
     try std.testing.expect(written.len <= terminal_title_osc_prefix.len + terminal_title_max_content_bytes + 1);
-    try std.testing.expect(std.mem.startsWith(u8, written, "\x1b]2;fx safe]2;owned"));
+    try std.testing.expect(std.mem.startsWith(u8, written, "\x1b]2;safe]2;owned"));
     try std.testing.expect(std.mem.endsWith(u8, written, "...\x07"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, "\x07"));
     try std.testing.expect(std.mem.find(u8, written[terminal_title_osc_prefix.len..], "\x1b") == null);
@@ -969,7 +958,15 @@ test "buildHintLine shows full context usage" {
         .context_used = 43_000,
         .context_total = 1_000_000,
     }, 80, &buf);
-    try std.testing.expectEqualStrings("ask · opus 4.8 · Context: 43k/1000k 4%", line);
+    try std.testing.expectEqualStrings("ask · opus 4.8 · 43k/1000k 4%", line);
+}
+
+test "buildHintLine shows context usage without a known total" {
+    var buf: [128]u8 = undefined;
+    const line = buildHintLine(false, true, "openai/gpt-5", .ask, false, .auto, false, .{
+        .context_used = 163_000,
+    }, 80, &buf);
+    try std.testing.expectEqualStrings("ask · gpt-5 · 163k", line);
 }
 
 test "buildHintLine shows the session title" {
@@ -1037,7 +1034,7 @@ test "buildHintLine workspace identity does not displace existing status segment
     }, 60, &buf);
     try std.testing.expect(std.mem.find(u8, line, "xhigh") != null);
     try std.testing.expect(std.mem.find(u8, line, "⚡︎") != null);
-    try std.testing.expect(std.mem.find(u8, line, "Context: 1k/100k 1%") != null);
+    try std.testing.expect(std.mem.find(u8, line, "1k/100k 1%") != null);
 }
 
 test "buildHintLine shows a non-Git workspace without branch punctuation" {
@@ -1071,7 +1068,7 @@ test "buildHintLine keeps system labels and dot separators" {
     }, 256, &buf);
     const expected = try std.fmt.allocPrint(
         std.testing.allocator,
-        "run /login · {s}auto{s} · opus 4.8 · low · ⚡︎ · Context: 43k/1000k 4%",
+        "run /login · {s}auto{s} · opus 4.8 · low · ⚡︎ · 43k/1000k 4%",
         .{ permission_auto_style, statusline_style },
     );
     defer std.testing.allocator.free(expected);

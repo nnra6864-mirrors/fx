@@ -5,8 +5,6 @@ const app_commands = @import("app_commands.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
-const app_terminal_runtime = @import("app_terminal_runtime.zig");
-const managed_execution = @import("../execution/managed_execution.zig");
 const terminal_ui_projection = @import("../terminal/ui_projection.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -80,6 +78,7 @@ const FrameAttemptResult = struct {
     animation_visible: bool,
     yolo_warning_visible: bool = false,
     pending_prompt_presented: bool = false,
+    file_picker_receipt: ?input_completion_runtime.FilePickerReceipt = null,
 
     fn is_committed(self: FrameAttemptResult) bool {
         return self.shadow_state.is_committed();
@@ -137,7 +136,7 @@ const RenderReconciliation = union(enum) {
 const SteeringProjection = struct {
     messages: [][]u8 = &.{},
     pending_feedback: [][]u8 = &.{},
-    waits_for_tool: bool = false,
+    waits_for_boundary: bool = false,
 
     fn deinit(self: *SteeringProjection, alloc: std.mem.Allocator) void {
         for (self.messages) |message| alloc.free(message);
@@ -296,7 +295,7 @@ fn buildPendingSteeringCardProjection(
     steering: SteeringProjection,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) !?PendingCardProjection {
-    const queued_count = if (steering.waits_for_tool) 0 else steering.messages.len;
+    const queued_count = if (steering.waits_for_boundary) 0 else steering.messages.len;
     var index = steering.pending_feedback.len + queued_count;
     if (index == 0) return null;
 
@@ -399,7 +398,7 @@ fn buildSteeringProjection(comptime App: type, app: *App) !SteeringProjection {
     if (comptime @hasDecl(@TypeOf(app.worker), "snapshotSteeringPresentation")) {
         var snapshot = try app.worker.snapshotSteeringPresentation(app.alloc);
         defer snapshot.deinit(app.alloc);
-        projection.waits_for_tool = snapshot.waits_for_tool;
+        projection.waits_for_boundary = snapshot.waits_for_boundary;
         projection.messages = snapshot.messages;
         snapshot.messages = &.{};
         projection.pending_feedback = snapshot.pending_feedback;
@@ -433,7 +432,7 @@ pub fn Runtime(comptime App: type) type {
                 finished.*,
             )) {
                 .uncommitted => .uncommitted,
-                .committed, .committed_degraded => .committed,
+                .committed => .committed,
             };
         }
 
@@ -506,7 +505,6 @@ pub fn Runtime(comptime App: type) type {
                 .reset_style = ui_render.reset_style,
                 .dim_style = ui_render.dim_style,
                 .red_style = ui_render.red_style,
-                .cancelled_text_style = ui_render.hint_style,
                 .notice_information_style = ui_render.system_notice_label_style,
                 .notice_success_style = ui_render.green_style,
                 .notice_warning_style = ui_render.warning_style,
@@ -521,9 +519,6 @@ pub fn Runtime(comptime App: type) type {
         var effort_picker_labels_buf: [types.ReasoningEffort.max_options + 1][]const u8 = undefined;
         var fast_picker_labels_buf: [2][]const u8 = undefined;
         var provider_picker_column: provider_picker_runtime.ColumnBuffer = .{};
-        var file_completions_buf: [input_completion_runtime.file_picker_completion_cap]file_index.SearchResult = undefined;
-        var file_match_spans_buf: [input_completion_runtime.file_picker_completion_cap * file_index.max_path_len]file_index.MatchSpan = undefined;
-        var file_path_storage_buf: [input_completion_runtime.file_picker_path_storage_cap]u8 = undefined;
         noinline fn footerContext(
             app: *App,
             upgrade_status_buf: *[64]u8,
@@ -608,22 +603,22 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
 
-            const file_query = if (model_query == null and provider_query == null)
+            const completion_rt = input_completion_runtime.CompletionRuntime(App);
+            const file_query = if (model_query == null and provider_query == null and completion_rt.hasFileQuery(app))
                 app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state)
             else
                 null;
-            var file_items: []const file_index.SearchResult = &.{};
-            var file_anchor: usize = 0;
-            var file_selection_index: usize = 0;
-            if (file_query) |fq| {
-                file_anchor = fq.at_offset;
-                const count = app.fileCompletions(fq.query, &file_completions_buf, &file_match_spans_buf, &file_path_storage_buf) catch |err| failed: {
-                    debug_trace.logf("render", "file picker render search failed err={s}", .{@errorName(err)});
-                    break :failed 0;
-                };
-                file_items = file_completions_buf[0..count];
-                file_selection_index = app.input_runtime.picker.file_completion_index;
-            }
+            const file_view = completion_rt.filePickerView(app);
+            const file_anchor = if (file_query) |fq| fq.at_offset else 0;
+            const file_selection = if (file_view.receipt) |receipt| receipt.selected else null;
+            const file_status: ?[]const u8 = switch (file_view.status) {
+                .unavailable => if (app.input_runtime.picker.file_completion.indexed)
+                    "Files unavailable. tab to retry; esc to dismiss."
+                else
+                    "Directory unavailable. tab to retry; esc to dismiss.",
+                .stale => "Selection unavailable. navigate to choose; tab to retry.",
+                .loading, .ready, .empty => null,
+            };
             const inline_completion =
                 input_completion_runtime.CompletionRuntime(App).visibleInlineCompletion(app);
 
@@ -688,6 +683,7 @@ pub fn Runtime(comptime App: type) type {
             return .{
                 .slash_registry = app.slashRegistry(),
                 .stream = visible_stream,
+                .compaction = if (comptime @hasDecl(@TypeOf(app.worker), "compactionActivitySnapshot")) app.worker.compactionActivitySnapshot() else .{},
                 .pending_prompt_activity = pendingPromptActivityVisible(app),
                 .completed_assistant_presentation_tail = app.pacer.hasCompletedAssistantPresentationTail(),
                 .writing_response = app.pacer.hasPending(),
@@ -699,7 +695,7 @@ pub fn Runtime(comptime App: type) type {
                 else
                     .ask,
                 .steering_messages = steering.messages,
-                .steering_waits_for_tool = steering.waits_for_tool,
+                .steering_waits_for_boundary = steering.waits_for_boundary,
                 .fast_indicator_active = fast_indicator_active,
                 .effort = visible_effort,
                 .model_supports_effort = model_supports_effort,
@@ -722,18 +718,14 @@ pub fn Runtime(comptime App: type) type {
                 .provider_picker_completion_window_start = provider_picker_window_start,
                 .provider_picker_completion_anchor = provider_picker_anchor,
                 .file_query_active = file_query != null,
-                .file_completions = file_items,
-                .file_completion_index = file_selection_index,
+                .file_completions = file_view.items,
+                .file_completion_index = file_selection orelse 0,
+                .file_completion_has_selection = file_selection != null,
+                .file_completion_status = file_status,
                 .file_completion_window_start = app.input_runtime.picker.file_completion_window_start,
                 .file_completion_anchor = file_anchor,
-                .file_completions_loading = if (file_query) |fq|
-                    fileCompletionsDependOnIndex(app, fq.query) and app.isFileIndexLoading()
-                else
-                    false,
-                .file_completions_failed = if (file_query) |fq|
-                    fileCompletionsDependOnIndex(app, fq.query) and app.isFileIndexFailed()
-                else
-                    false,
+                .file_completions_loading = file_view.status == .loading,
+                .file_completions_failed = file_view.status == .unavailable,
                 .inline_completion_suffix = if (inline_completion) |completion|
                     completion.suffix()
                 else
@@ -821,6 +813,7 @@ pub fn Runtime(comptime App: type) type {
                 else
                     "",
                 .esc_clear_armed = app.input_runtime.gestures.escapeClearArmed(),
+                .esc_interrupt_armed = app.input_runtime.gestures.escapeInterruptArmed(),
                 .question = app.question_prompt.projection(),
                 .statusline = buildStatuslineItems(
                     app,
@@ -880,13 +873,6 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
             return fast_index % picker_state.model_picker_fast_options.len == 1;
-        }
-
-        fn fileCompletionsDependOnIndex(app: *App, query: []const u8) bool {
-            if (comptime @hasDecl(App, "fileCompletionsDependOnIndex")) {
-                return app.fileCompletionsDependOnIndex(query);
-            }
-            return true;
         }
 
         pub fn flushRequestedFrame(app: *App) !void {
@@ -963,6 +949,7 @@ pub fn Runtime(comptime App: type) type {
             };
 
             if (!result.is_committed()) {
+                input_completion_runtime.CompletionRuntime(App).distrustFilePicker(app);
                 render_requests.resetInputPendingAbortStreak();
                 attempt.restore();
                 debug_trace.logf(
@@ -981,6 +968,11 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
 
+            if (result.file_picker_receipt) |receipt| {
+                input_completion_runtime.CompletionRuntime(App).acknowledgeFilePicker(app, receipt);
+            } else {
+                input_completion_runtime.CompletionRuntime(App).distrustFilePicker(app);
+            }
             const committed_at_ms = io_mod.milliTimestamp();
             attempt.commit(
                 committed_at_ms,
@@ -1202,6 +1194,7 @@ pub fn Runtime(comptime App: type) type {
                 shimmer_pos,
                 &steering,
             );
+            const file_picker_receipt = input_completion_runtime.CompletionRuntime(App).filePickerView(app).receipt;
             var footer_ctx = main_footer_ctx;
             const render_reconciliation = switch (try reconcileBeforeFrameRender(app, render_input.steeringBannerRows(footer_ctx, app.shell.layout.cols))) {
                 .inline_render => |inline_render| inline_render,
@@ -1777,7 +1770,6 @@ pub fn Runtime(comptime App: type) type {
                     if (footer_measurement) |*measurement| measurement else null,
                 );
                 presentation_shell.shimmer_active = frame_ctx.activity_result.painted;
-                presentation_shell.shimmer_row = if (frame_ctx.activity_result.painted) frame_ctx.activity_result.row else 1;
                 presentation_shell.shimmer_is_overlay = frame_ctx.activity_result.overlay;
                 if (scroll_plan.remaining_inline_advance_rows > 0) {
                     presentation_shell.markTranscriptDirty();
@@ -1794,6 +1786,12 @@ pub fn Runtime(comptime App: type) type {
                 .yolo_warning_visible = !render_reconciliation.alternate_screen_owns_rendering and
                     footer_frame.composed.danger_status_visible,
                 .pending_prompt_presented = pending_submission_card and pending_paint_ctx != null,
+                .file_picker_receipt = if (result.is_committed() and presentation_commits_transcript and
+                    footer_measurement != null and footer_measurement.?.show_picker and
+                    footer_measurement.?.picker_kind == .file and footer_measurement.?.picker_rows > 0)
+                    file_picker_receipt
+                else
+                    null,
             };
         }
 
@@ -1991,45 +1989,6 @@ pub fn Runtime(comptime App: type) type {
             };
         }
     };
-}
-
-fn managedExecutionProjection(
-    alloc: std.mem.Allocator,
-    runtime: *managed_execution.Runtime,
-) !terminal_ui_projection.Snapshot {
-    const executions = try runtime.list(alloc);
-    defer {
-        for (executions) |*execution| execution.deinit(alloc);
-        alloc.free(executions);
-    }
-    const rows = try alloc.alloc(terminal_ui_projection.Row, executions.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (rows[0..initialized]) |*row| {
-            alloc.free(row.label);
-            alloc.free(row.session_id);
-        }
-        alloc.free(rows);
-    }
-    for (executions, rows) |execution, *row| {
-        const session_id = try alloc.dupe(u8, execution.execution_id);
-        errdefer alloc.free(session_id);
-        row.* = .{
-            .session_id = session_id,
-            .label = try alloc.dupe(u8, execution.command),
-            .lifecycle = switch (execution.state) {
-                .running => .running,
-                .completed => .exited,
-                .stopped => .closed,
-                .lost => .lost,
-            },
-            .attention = .{},
-            .backend = .native,
-            .attachable = execution.backend == .tty,
-        };
-        initialized += 1;
-    }
-    return .{ .alloc = alloc, .rows = rows };
 }
 
 fn renderReasonNames(
@@ -2568,7 +2527,7 @@ test "pending steering cards preserve feedback order and tool waiting placement"
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, card.bytes, "┃"));
     try std.testing.expect(std.mem.find(u8, card.bytes, "┋") == null);
 
-    steering.waits_for_tool = true;
+    steering.waits_for_boundary = true;
     var waiting = (try buildPendingSteeringCardProjection(alloc, &shell, steering, null)).?;
     defer waiting.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, waiting.bytes, "accepted earlier") != null);
@@ -2576,7 +2535,7 @@ test "pending steering cards preserve feedback order and tool waiting placement"
     steering.pending_feedback = &.{};
     try std.testing.expect((try buildPendingSteeringCardProjection(alloc, &shell, steering, null)) == null);
 
-    steering.waits_for_tool = false;
+    steering.waits_for_boundary = false;
     shell.layout.content_bottom = 1;
     var clipped = (try buildPendingSteeringCardProjection(alloc, &shell, steering, null)).?;
     defer clipped.deinit(alloc);
@@ -2821,7 +2780,6 @@ test "core.app_render_runtime rejects prepared transcript outside final plan ban
         .footer_clean_allowed = true,
         .synchronized_update = true,
         .cursor_target = .{ .row = 43, .col = 3, .visible = true },
-        .footer_reservation_source = .transient_activity,
         .bottom_reserved_rows = 2,
         .preserve_scrollback = true,
     };
@@ -2891,6 +2849,8 @@ test "transcript checkpoint sees input retained above an empty terminal" {
 }
 
 const CoordinatorFaultTestApp = struct {
+    alloc: std.mem.Allocator = std.testing.allocator,
+    input_runtime: core_input_runtime.Runtime = .{},
     shell: struct {
         terminal_dimensions_invalid: bool = false,
         terminal_reset_pending: bool = false,
@@ -2908,6 +2868,7 @@ const CoordinatorFaultTestApp = struct {
     inject_animation_reset: bool = false,
     animation_visible: bool = false,
     notification_flushes: usize = 0,
+    file_picker_receipt: ?input_completion_runtime.FilePickerReceipt = null,
     last_snapshot: ?render_request.AttemptSnapshot = null,
 
     fn flushNotifications(self: *CoordinatorFaultTestApp) void {
@@ -2933,6 +2894,7 @@ const CoordinatorFaultTestApp = struct {
                 break :blk .{
                     .shadow_state = .committed,
                     .animation_visible = self.animation_visible,
+                    .file_picker_receipt = self.file_picker_receipt,
                 };
             },
             .preparation_error => error.TestPreparationFailure,
@@ -2948,6 +2910,37 @@ const CoordinatorFaultTestApp = struct {
         };
     }
 };
+
+test "file picker receipt aborts preserve authority and uncertain writes revoke it" {
+    const state_mod = @import("../input/file_completion_state.zig");
+    const alloc = std.testing.allocator;
+    for ([_]CoordinatorFault{ .preparation_error, .input_pending, .terminal_partial_write, .shadow_feed_failed }) |fault| {
+        var app: CoordinatorFaultTestApp = .{};
+        defer app.input_runtime.deinit(alloc);
+        try app.input_runtime.textReplacementState().replace(alloc, "@file");
+        const picker = &app.input_runtime.picker;
+        _ = picker.file_completion.reconcile(picker.activeFilePickerQuery(&app.input_runtime.edit_state), 0, true);
+        const values = [_]file_index.SearchResult{.{ .path = "file.txt", .kind = .file, .matched_spans = &.{} }};
+        picker.file_completion.stage(alloc, .{}, .ready, try state_mod.Rows.copy(alloc, &values));
+        app.file_picker_receipt = picker.file_completion.view(0, 0).receipt;
+        app.shell.render_requests.request(.footer);
+        try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+        try std.testing.expect(picker.file_completion.selected(0) != null);
+        picker.file_completion.stage(alloc, .{}, .ready, try state_mod.Rows.copy(alloc, &values));
+        app.file_picker_receipt = picker.file_completion.view(0, 0).receipt;
+        app.fault = fault;
+        app.shell.render_requests.request(.footer);
+        if (fault == .preparation_error) {
+            try std.testing.expectError(error.TestPreparationFailure, Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app));
+        } else try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+        try std.testing.expect(picker.file_completion.prepared != null);
+        try std.testing.expectEqual(fault == .preparation_error or fault == .input_pending, picker.file_completion.selected(0) != null);
+        app.fault = .committed;
+        try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+        try std.testing.expect(picker.file_completion.prepared == null);
+        try std.testing.expectEqualStrings("file.txt", picker.file_completion.selected(0).?.path);
+    }
+}
 
 test "core.app_render_runtime requested-frame flush skips absent and blocked work" {
     var app = CoordinatorFaultTestApp{};
@@ -3415,6 +3408,8 @@ const CoordinatorTestApp = struct {
     permission_state: app_permission_runtime.State = .{},
     upgrader: CoordinatorTestUpgrader = .{},
     terminal_client: CoordinatorTestTerminalClient = .{},
+    file_completion_values: []const file_index.SearchResult = &.{},
+    file_completion_calls: usize = 0,
 
     pub fn slashRegistry(_: *const CoordinatorTestApp) command_specs.SlashRegistry {
         return coordinator_test_slash_registry;
@@ -3432,18 +3427,32 @@ const CoordinatorTestApp = struct {
         self.model_cache.deinit();
     }
 
+    pub fn prepareDirectoryCompletion(self: *CoordinatorTestApp) void {
+        const completion = @import("../input/file_completion_state.zig");
+        const state = &self.input_runtime.picker.file_completion;
+        const rows = completion.Rows.copy(self.alloc, self.file_completion_values) catch {
+            state.stage(self.alloc, .{ .state = .ready }, .unavailable, null);
+            return;
+        };
+        self.file_completion_calls += 1;
+        state.stage(self.alloc, .{ .state = .ready }, if (rows.results.len == 0) .empty else .ready, rows);
+    }
+
     pub fn modelCompletions(_: *CoordinatorTestApp, _: []const u8, _: [][]const u8) usize {
         return 0;
     }
 
     pub fn fileCompletions(
-        _: *CoordinatorTestApp,
+        self: *CoordinatorTestApp,
         _: []const u8,
-        _: []file_index.SearchResult,
+        out: []file_index.SearchResult,
         _: []file_index.MatchSpan,
         _: []u8,
     ) file_index.SearchError!usize {
-        return 0;
+        self.file_completion_calls += 1;
+        const count = @min(out.len, self.file_completion_values.len);
+        @memcpy(out[0..count], self.file_completion_values[0..count]);
+        return count;
     }
 
     pub fn writeDomainNotice(_: *CoordinatorTestApp, _: types.SemanticNotice, _: bool) !void {}
@@ -3512,6 +3521,54 @@ fn initCoordinatorProjectionTestApp(
     try app.shell.initBacking(alloc);
     try app.shell.enableShadowVt(alloc);
     return app;
+}
+
+test "file picker real frame receipt promotes only visible rows and preserves prepared identity" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(std.testing.io);
+    var app = try initCoordinatorProjectionTestApp(alloc, sink);
+    defer app.deinit();
+    app.terminal_client.source_running = false;
+    const completion = input_completion_runtime.CompletionRuntime(CoordinatorTestApp);
+    const first = [_]file_index.SearchResult{
+        .{ .path = "b.txt", .kind = .file, .matched_spans = &.{} },
+        .{ .path = "c.txt", .kind = .file, .matched_spans = &.{} },
+    };
+    app.file_completion_values = &first;
+    try app.input_runtime.textReplacementState().replace(alloc, "@txt");
+    completion.prepareFilePicker(&app);
+    try std.testing.expect(app.input_runtime.picker.file_completion.selected(0) == null);
+    app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try std.testing.expectEqualStrings("b.txt", app.input_runtime.picker.file_completion.selected(0).?.path);
+    var grid: std.ArrayList(u8) = .empty;
+    defer grid.deinit(alloc);
+    try app.shell.shadow_vt.?.snapshot(&grid);
+    try std.testing.expect(std.mem.find(u8, grid.items, "c.txt") != null);
+    const picker = &app.input_runtime.picker;
+    picker.file_completion.navigate(&picker.file_completion_index, &picker.file_completion_window_start, 1);
+    const next = [_]file_index.SearchResult{.{ .path = "a.txt", .kind = .file, .matched_spans = &.{} }} ++ first;
+    app.file_completion_values = &next;
+    picker.file_completion.retry();
+    completion.prepareFilePicker(&app);
+    try std.testing.expectEqualStrings("c.txt", picker.file_completion.selected(picker.file_completion_index).?.path);
+    // A catalog owns the frame while the completion stays staged.
+    app.input_runtime.help_menu.active = true;
+    completion.reconcileFilePicker(&app);
+    const prepared_revision = completion.filePickerView(&app).receipt.?.revision;
+    app.shell.render_requests.request(.footer);
+    app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try std.testing.expect(picker.file_completion.prepared != null);
+    try std.testing.expect(picker.file_completion.selected(picker.file_completion_index) == null);
+    app.input_runtime.help_menu.active = false;
+    app.shell.render_requests.request(.footer);
+    app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try std.testing.expectEqual(prepared_revision, completion.filePickerView(&app).receipt.?.revision);
+    try std.testing.expectEqualStrings("c.txt", picker.file_completion.selected(picker.file_completion_index).?.path);
+    try std.testing.expectEqual(@as(usize, 2), app.file_completion_calls);
 }
 
 test "core.app_render_runtime keeps final token progress during paced response tail" {
@@ -3803,7 +3860,7 @@ test "core.app_render_runtime projects Opus 4.8 one million token context to foo
         100,
         &buf,
     );
-    try std.testing.expectEqualStrings("ask · opus 4.8 · Context: 43k/1000k 4%", line);
+    try std.testing.expectEqualStrings("ask · opus 4.8 · 43k/1000k 4%", line);
 }
 
 test "core.app_render_runtime uses Gateway context window from resolved capabilities" {
@@ -3941,18 +3998,139 @@ noinline fn coordinatorGridContains(grid: vt_emulator.Grid, needle: []const u8) 
     return false;
 }
 
-noinline fn coordinatorGridOccurrenceCount(grid: vt_emulator.Grid, needle: []const u8) !usize {
-    var row: u16 = 1;
-    var count: usize = 0;
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(grid.alloc);
+test "core.app_render_runtime resume publication preserves the pre-scroll origin through the coordinator" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { origin: u16, rows: u16, post_top: u16 }{
+        .{ .origin = 1, .rows = 3, .post_top = 1 },
+        .{ .origin = 5, .rows = 3, .post_top = 5 },
+        .{ .origin = 5, .rows = 6, .post_top = 4 },
+        .{ .origin = 8, .rows = 6, .post_top = 4 },
+        .{ .origin = 1, .rows = 12, .post_top = 1 },
+        .{ .origin = 5, .rows = 12, .post_top = 1 },
+        .{ .origin = 1, .rows = 80, .post_top = 1 },
+        .{ .origin = 5, .rows = 80, .post_top = 1 },
+    };
+    for (cases) |case| {
+        errdefer std.debug.panic("resume origin={d} rows={d}", .{ case.origin, case.rows });
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var file = try tmp.dir.createFile(std.testing.io, "resume-origin.log", .{ .read = true });
+        defer file.close(std.testing.io);
+        var app = try initCoordinatorProjectionTestApp(alloc, file);
+        defer app.deinit();
+        app.terminal_client.source_running = false;
+        try app.shell.initViewport(&app.metrics, case.origin);
 
-    while (row <= grid.rows) : (row += 1) {
-        buf.clearRetainingCapacity();
-        try grid.rowTextTrimmed(row, &buf);
-        count += std.mem.count(u8, buf.items, needle);
+        var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &app.shell, 0, 1);
+        defer projection.deinit();
+        var flow: std.ArrayList(u8) = .empty;
+        defer flow.deinit(alloc);
+        for (0..case.rows) |i| {
+            var buf: [32]u8 = undefined;
+            try flow.appendSlice(alloc, try std.fmt.bufPrint(
+                &buf,
+                "{s}ORIGIN_ROW_{d:0>3}",
+                .{ if (i == 0) "" else "\n", i },
+            ));
+        }
+        _ = try projection.appendRawClassified(flow.items, .unknown_raw);
+        try projection.finalize();
+        projection.install(&app.shell);
+        try std.testing.expectEqual(.invalid, app.shell.transcriptCommitDiagnostic().state);
+        var read_offset = try file.length(std.testing.io);
+
+        // Interrupt actual preparation, not the coordinator's synthetic receipt stub.
+        app.terminal_input_runtime.terminal_action_decoder.stage = 2;
+        app.shell.render_requests.request(.first_frame);
+        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+        try std.testing.expectEqual(read_offset, try file.length(std.testing.io));
+        try std.testing.expectEqual(case.origin, app.shell.owned_top_row);
+        try std.testing.expectEqual(.invalid, app.shell.transcriptCommitDiagnostic().state);
+        try std.testing.expect(app.shell.pending_resume_source != null);
+        try std.testing.expect(app.shell.render_requests.hasPending());
+        app.terminal_input_runtime.resetEscapeDecoder();
+
+        // A unit-test stdin can be closed; suppress that unrelated poll on retries.
+        app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+        const first = try readCoordinatorFrameBytes(alloc, file, &read_offset);
+        defer alloc.free(first);
+        const document_start = std.mem.find(u8, first, "ORIGIN_ROW_000") orelse return error.MissingResumeDocument;
+        var physical = try vt_emulator.Grid.init(alloc, 80, 12);
+        defer physical.deinit();
+        if (case.rows > 9) {
+            var origin_buf: [32]u8 = undefined;
+            const origin = try std.fmt.bufPrint(&origin_buf, "\x1b[{d};1H", .{case.origin});
+            try std.testing.expect(std.mem.find(u8, first[0..document_start], origin) != null);
+        }
+        var first_stats: vt_emulator.FeedStats = .{};
+        try physical.feedWithStats(first, &first_stats);
+        var physical_scroll_rows = first_stats.scroll_rows;
+        try std.testing.expectEqual(case.post_top, app.shell.owned_top_row);
+        try std.testing.expectEqual(case.post_top, app.shell.committed_frame_layout.transcript_area.top);
+
+        const history_rows: u32 = case.rows -| 9;
+        const first_history = @min(history_rows, 64);
+        const diagnostic = app.shell.transcriptCommitDiagnostic();
+        if (history_rows > 64) {
+            try std.testing.expectEqual(first_history, diagnostic.history_visual_offset);
+            try std.testing.expectEqual(history_rows - first_history, diagnostic.remaining_inline_rows);
+        }
+        try std.testing.expectEqual(@as(u16, 0), diagnostic.remaining_unplanned_scroll_rows);
+        var row: std.ArrayList(u8) = .empty;
+        defer row.deinit(alloc);
+        try physical.rowTextTrimmed(case.post_top, &row);
+        var expected_buf: [32]u8 = undefined;
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected_buf, "ORIGIN_ROW_{d:0>3}", .{first_history}), row.items);
+
+        if (history_rows > 64) {
+            try std.testing.expectEqual(.recovering, diagnostic.state);
+            const receipt = app.shell.transcript_commit_state.recovering;
+            try std.testing.expect(receipt.materialized_flow_len != null);
+            app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+            try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+            const next = try readCoordinatorFrameBytes(alloc, file, &read_offset);
+            defer alloc.free(next);
+            // Recovery continues the materialized suffix instead of replaying row zero.
+            try std.testing.expect(std.mem.find(u8, next, "ORIGIN_ROW_000") == null);
+            const suffix_start = std.mem.find(u8, next, "ORIGIN_ROW_") orelse return error.MissingResumeSuffix;
+            var receipt_cursor_buf: [32]u8 = undefined;
+            const receipt_cursor = try std.fmt.bufPrint(&receipt_cursor_buf, "\x1b[{d};{d}H", .{ receipt.cursor_row, receipt.cursor_col });
+            try std.testing.expect(std.mem.find(u8, next[0..suffix_start], receipt_cursor) != null);
+            var next_stats: vt_emulator.FeedStats = .{};
+            try physical.feedWithStats(next, &next_stats);
+            physical_scroll_rows += next_stats.scroll_rows;
+            row.clearRetainingCapacity();
+            try physical.rowTextTrimmed(case.post_top, &row);
+            try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected_buf, "ORIGIN_ROW_{d:0>3}", .{history_rows}), row.items);
+            try std.testing.expectEqual(@as(u32, 0), app.shell.transcriptCommitDiagnostic().remaining_inline_rows);
+        }
+        for (0..3) |_| {
+            app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+            try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+        }
+        try std.testing.expectEqual(.stable, app.shell.transcriptCommitDiagnostic().state);
+        try std.testing.expectEqual(history_rows, app.shell.transcriptCommitDiagnostic().history_visual_offset);
+        try std.testing.expectEqual(history_rows + case.origin - case.post_top, physical_scroll_rows);
+        try std.testing.expect(app.shell.pending_resume_source == null);
+        try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, try std.fmt.bufPrint(&expected_buf, "ORIGIN_ROW_{d:0>3}", .{case.rows - 1})));
+
+        const anchor = app.shell.transcript_commit_state.stable;
+        read_offset = try file.length(std.testing.io);
+        try app.shell.writeTranscript(alloc, &app.metrics, "\nAFTER_RESUME", true);
+        app.shell.render_requests.request(.transcript);
+        app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+        const appended = try readCoordinatorFrameBytes(alloc, file, &read_offset);
+        defer alloc.free(appended);
+        var cursor_buf: [32]u8 = undefined;
+        const append_cursor = try std.fmt.bufPrint(&cursor_buf, "\x1b[{d};{d}H", .{ anchor.cursor_row, anchor.cursor_col });
+        if (history_rows > 0) {
+            const suffix_start = std.mem.find(u8, appended, "AFTER_RESUME") orelse return error.MissingAppend;
+            try std.testing.expect(std.mem.find(u8, appended[0..suffix_start], append_cursor) != null);
+        }
+        try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "AFTER_RESUME"));
     }
-    return count;
 }
 
 test "core.app_render_runtime first requested startup frame commits through the ordinary coordinator" {
@@ -4452,7 +4630,7 @@ test "core.app_render_runtime active setup hub stays on the inline transcript su
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Setup"));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Connections"));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Credential source"));
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Enter Open"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "enter open"));
     try std.testing.expect(!(try coordinatorGridContains(app.shell.shadow_vt.?.*, "test-model")));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "setup transcript stays behind"));
 

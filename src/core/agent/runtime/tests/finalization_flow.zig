@@ -32,6 +32,7 @@ const registerStopTestHandler = test_support.registerStopTestHandler;
 const testLifecycleContext = test_support.testLifecycleContext;
 const finishCommonAssistantTerminal = runtime_orchestrator.finishCommonAssistantTerminal;
 const expectBodyContains = test_support.expectBodyContains;
+const expectBodyContainsInOrder = test_support.expectBodyContainsInOrder;
 const expectBodyNotContains = test_support.expectBodyNotContains;
 const countText = test_support.countText;
 const countNeedle = test_support.countNeedle;
@@ -359,6 +360,86 @@ test "processQueuedPrompt stops repeated malformed calls before another provider
     }
     try std.testing.expectEqual(@as(usize, 0), hooks.permission_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+}
+
+test "processQueuedPrompt continues with steering queued before a repeated-malformed terminal" {
+    const alloc = std.testing.allocator;
+    const call_one = [_]ToolCall{.{
+        .id = "call_1",
+        .name = "read_file",
+        .arguments_json = "{}",
+        .argument_integrity = .malformed_json,
+    }};
+    const call_two = [_]ToolCall{.{
+        .id = "call_2",
+        .name = "read_file",
+        .arguments_json = "{}",
+        .argument_integrity = .malformed_json,
+    }};
+    const call_three = [_]ToolCall{.{
+        .id = "call_3",
+        .name = "read_file",
+        .arguments_json = "{}",
+        .argument_integrity = .malformed_json,
+    }};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &call_one },
+        .{ .tool_calls = &call_two },
+        .{ .tool_calls = &call_three },
+        .{ .content = "Steered recovery answer" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    const steering = [_][]const u8{"stop repeating the broken call"};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    // Step-top boundaries are takes 1-3; the terminal-exit boundary is take 4.
+    hooks.steering_messages = &steering;
+    hooks.steering_take_at = 4;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    // The turn continued instead of ending: the fourth request carries the
+    // queued steering, and the malformed-stop notice never rendered.
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 3, "user_steering");
+    try expectBodyContains(&gateway, 3, "stop repeating the broken call");
+    try std.testing.expect(!textContains(&hooks, "Repeated malformed tool arguments"));
+    try std.testing.expectEqualStrings("Steered recovery answer", hooks.finish_assistant_text.?);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    const execution = hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), execution.steering.len);
+    try std.testing.expectEqualStrings("stop repeating the broken call", execution.steering[0].text);
+}
+
+test "processQueuedPrompt continues with steering queued before a length-limited tool completion" {
+    const alloc = std.testing.allocator;
+    const truncated_calls = [_]ToolCall{toolCall("len_call_1", "read_file", "{\"path\":\"a.txt\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .content = "partial draft", .tool_calls = &truncated_calls, .finish_reason = .length },
+        .{ .content = "Steered length recovery" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    const steering = [_][]const u8{"narrow the scope"};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    // Step-top boundary is take 1; the length-limited terminal boundary is take 2.
+    hooks.steering_messages = &steering;
+    hooks.steering_take_at = 2;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyContainsInOrder(&gateway, 1, &.{
+        "partial draft",
+        "user_steering",
+        "narrow the scope",
+    });
+    try std.testing.expectEqualStrings("Steered length recovery", hooks.finish_assistant_text.?);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 
 test "processQueuedPrompt returns a final response after a repeated tool-name cycle" {

@@ -106,13 +106,14 @@ pub const UpgradeRelaunch = struct {
 const resume_picker_alias = "-r";
 
 pub const ResumeTarget = union(enum) {
+    remembered,
     pick,
     last,
     id: []u8,
 
     pub fn deinit(self: *ResumeTarget, alloc: Allocator) void {
         switch (self.*) {
-            .pick, .last => {},
+            .remembered, .pick, .last => {},
             .id => |value| alloc.free(value),
         }
         self.* = undefined;
@@ -310,14 +311,12 @@ const LoadCatalogStartupStateWithAuthModeFn = *const fn (Allocator, host.SecretS
 const LoadStartupStatusWithAuthModeFn = *const fn (Allocator, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupStatus;
 const GetenvFn = *const fn (?*anyopaque, []const u8) ?[]const u8;
 const EnvironMapFn = *const fn (?*anyopaque) ?*const std.process.Environ.Map;
-const SelfExePathFn = *const fn (?*anyopaque, Allocator) anyerror![]u8;
 const ReadMaskedKeyFn = *const fn (?*anyopaque, Allocator, WriteFn, ?*anyopaque) anyerror![]u8;
 const SetupTerminalAvailableFn = *const fn (?*anyopaque) bool;
 const RunDeps = struct {
     stdout_ctx: ?*anyopaque = null,
     stderr_ctx: ?*anyopaque = null,
     env_ctx: ?*anyopaque = null,
-    self_exe_ctx: ?*anyopaque = null,
     setup_ctx: ?*anyopaque = null,
     write_stdout: WriteFn = writeRealStdout,
     write_stderr: WriteFn = writeRealStderr,
@@ -329,7 +328,6 @@ const RunDeps = struct {
     load_startup_status_with_auth_mode: LoadStartupStatusWithAuthModeFn = app_lifecycle.loadStartupStatusWithAuthMode,
     getenv: GetenvFn = getenvDefault,
     environ_map: EnvironMapFn = environMapDefault,
-    self_exe_path: SelfExePathFn = selfExePathDefault,
     read_masked_key: ReadMaskedKeyFn = readMaskedKeyDefault,
     setup_terminal_available: SetupTerminalAvailableFn = setupTerminalAvailableDefault,
 };
@@ -599,10 +597,6 @@ fn topLevelHelpRequest(command_catalog: CommandCatalog, args: []const [:0]const 
 
 pub fn runIfRequested(alloc: Allocator, args: []const [:0]const u8, cfg: Config) !RunResult {
     return runIfRequestedWithDeps(alloc, args, cfg, .{});
-}
-
-pub fn runNoConfigIfRequested(alloc: Allocator, args: []const [:0]const u8, version: []const u8, command_catalog: CommandCatalog) !bool {
-    return runNoConfigIfRequestedWithDeps(alloc, args, version, command_catalog, .{});
 }
 
 fn runNoConfigIfRequestedWithDeps(
@@ -2160,12 +2154,6 @@ fn environMapDefault(_: ?*anyopaque) ?*const std.process.Environ.Map {
     return io_mod.environMap();
 }
 
-fn selfExePathDefault(_: ?*anyopaque, alloc: Allocator) ![]u8 {
-    const path_z = try std.process.executablePathAlloc(io_mod.getIo(), alloc);
-    defer alloc.free(path_z);
-    return alloc.dupe(u8, path_z);
-}
-
 fn writeTopLevelUsage(command_catalog: CommandCatalog, deps: RunDeps, kind: TopLevelKind) !void {
     try writeStderr(deps, "usage: fx ");
     try writeStderr(deps, command_specs.topLevelUsage(command_catalog, kind));
@@ -2766,22 +2754,6 @@ fn permissionRulesForSnapshot(alloc: Allocator, active_rules: anytype) !types.Pe
     return .{ .rules = rules };
 }
 
-fn loadLatestWorkspaceSessionDetail(
-    alloc: Allocator,
-    store: session_store.Store,
-) !session_store.ReadOnlyDetail {
-    var summary = try store.latestReadOnlyWorkspaceSummary(alloc);
-    defer summary.deinit(alloc);
-    return store.loadReadOnlyDetail(alloc, summary.id, .{});
-}
-
-fn loadLatestWorkspaceSessionSummary(
-    alloc: Allocator,
-    store: session_store.Store,
-) !session_store.SessionSummary {
-    return store.latestReadOnlyWorkspaceSummary(alloc);
-}
-
 fn catalogFailureDetail(failure: model_catalog.Failure) []const u8 {
     return switch (failure.category) {
         .authentication => "AuthenticationRejected",
@@ -2857,7 +2829,12 @@ fn writeLookupFailure(
         error.SessionNotFound => {
             try writeStderr(deps, "fx session: record not found\n");
         },
-        error.InvalidSessionFormat => {
+        error.InvalidSessionFormat,
+        error.InvalidPermissionState,
+        error.PermissionStateTooLarge,
+        error.InvalidRecoveryCheckpoint,
+        error.InvalidUsageSidecar,
+        => {
             try writeStderr(
                 deps,
                 "fx session: record is corrupt; run `fx doctor` for recovery guidance\n",
@@ -3033,7 +3010,12 @@ fn lookupFailureMessage(err: anyerror) ?[]const u8 {
         error.NoSavedSessions => "no saved sessions for this workspace",
         error.NoReadableSessions => "saved sessions are unreadable; run `fx doctor` for recovery guidance",
         error.SessionNotFound => "record not found",
-        error.InvalidSessionFormat => "record is corrupt; run `fx doctor` for recovery guidance",
+        error.InvalidSessionFormat,
+        error.InvalidPermissionState,
+        error.PermissionStateTooLarge,
+        error.InvalidRecoveryCheckpoint,
+        error.InvalidUsageSidecar,
+        => "record is corrupt; run `fx doctor` for recovery guidance",
         error.UnsupportedSessionSchema => "record uses an unsupported session version",
         error.InvalidSessionId => "invalid session id",
         error.LegacySessionTooLarge => "legacy session is too large for automatic loading; run `fx session migrate <id> --allow-large`",
@@ -3116,6 +3098,32 @@ test "session detail failures separate corruption from unsupported schema" {
         "fx session: session future-session uses an unsupported session version\n",
         unsupported_text.stderr.written(),
     );
+}
+
+test "session lookup failures preserve supporting-state errors in the requested format" {
+    const cases = [_]struct { err: anyerror, code: []const u8 }{
+        .{ .err = error.InvalidPermissionState, .code = "InvalidPermissionState" },
+        .{ .err = error.PermissionStateTooLarge, .code = "PermissionStateTooLarge" },
+        .{ .err = error.InvalidRecoveryCheckpoint, .code = "InvalidRecoveryCheckpoint" },
+        .{ .err = error.InvalidUsageSidecar, .code = "InvalidUsageSidecar" },
+    };
+    for (cases) |case| {
+        for ([_]output_contracts.OutputFormat{ .text, .json }) |format| {
+            var output = CaptureOutput.init(std.testing.allocator);
+            defer output.deinit();
+            try writeLookupFailure(std.testing.allocator, output.deps(), "session", case.err, format);
+            const body = if (format == .json) output.stdout.written() else output.stderr.written();
+            const unused = if (format == .json) output.stderr.written() else output.stdout.written();
+            try std.testing.expectEqual(@as(usize, 0), unused.len);
+            try std.testing.expect(std.mem.find(u8, body, "fx doctor") != null);
+            try std.testing.expect(std.mem.find(u8, body, "resume it normally") == null);
+            if (format == .json) {
+                var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+                defer parsed.deinit();
+                try std.testing.expectEqualStrings(case.code, parsed.value.object.get("code").?.string);
+            }
+        }
+    }
 }
 
 test "session recovery boundary failures keep stable text and json guidance" {
@@ -3550,6 +3558,7 @@ fn parseResumeArgs(
         }
         if (args.len != 1) return error.InvalidResumeArgs;
         if (std.mem.eql(u8, args[0], resume_picker_alias)) return .pick;
+        if (std.mem.eql(u8, args[0], "-c") or std.mem.eql(u8, args[0], "--continue")) return .remembered;
         if (command_specs.matchesTopLevel(command_catalog, args[0], .@"resume")) return .last;
         if (!std.mem.startsWith(u8, args[0], resume_id_alias_prefix)) return error.InvalidResumeArgs;
         const id = args[0][resume_id_alias_prefix.len..];
@@ -4177,7 +4186,7 @@ test "parse resume args accepts explicit id flag" {
     defer target.deinit(std.testing.allocator);
 
     switch (target) {
-        .pick, .last => return error.TestExpectedExactResumeId,
+        .remembered, .pick, .last => return error.TestExpectedExactResumeId,
         .id => |id| try std.testing.expectEqualStrings("release.2026.06", id),
     }
 }
@@ -4191,7 +4200,7 @@ test "parse resume args accepts an operand on the top-level resume flag" {
     defer target.deinit(std.testing.allocator);
 
     switch (target) {
-        .pick, .last => return error.TestExpectedExactResumeId,
+        .remembered, .pick, .last => return error.TestExpectedExactResumeId,
         .id => |id| try std.testing.expectEqualStrings("session-123", id),
     }
 
@@ -4211,7 +4220,7 @@ test "parse resume args treats last after id flag as exact id" {
     defer target.deinit(std.testing.allocator);
 
     switch (target) {
-        .pick, .last => return error.TestExpectedExactResumeId,
+        .remembered, .pick, .last => return error.TestExpectedExactResumeId,
         .id => |id| try std.testing.expectEqualStrings("last", id),
     }
 }
@@ -4287,7 +4296,7 @@ test "parseInteractiveLaunch shares native resume grammar" {
                 const target = launch.requested_resume orelse return error.TestExpectedResumeTarget;
                 if (case.expected_id) |expected_id| switch (target) {
                     .id => |id| try std.testing.expectEqualStrings(expected_id, id),
-                    .pick, .last => return error.TestExpectedExactResumeId,
+                    .remembered, .pick, .last => return error.TestExpectedExactResumeId,
                 } else try std.testing.expectEqual(ResumeTarget.last, target);
             },
             .noninteractive => |value| {
@@ -4899,7 +4908,10 @@ test "runIfRequested top-level resume aliases return the existing target" {
             capture.deps(),
         );
         switch (result) {
-            .interactive => |launch| try std.testing.expectEqual(ResumeTarget.last, launch.requested_resume.?),
+            .interactive => |launch| {
+                const expected: ResumeTarget = if (std.mem.eql(u8, args[0], "-c") or std.mem.eql(u8, args[0], "--continue")) .remembered else .last;
+                try std.testing.expectEqual(expected, launch.requested_resume.?);
+            },
             else => return error.TestExpectedEqual,
         }
         try std.testing.expectEqualStrings("", capture.stdout.written());
@@ -4921,7 +4933,7 @@ test "runIfRequested top-level resume aliases return the existing target" {
             defer launch.deinit(std.testing.allocator);
             switch (launch.requested_resume.?) {
                 .id => |id| try std.testing.expectEqualStrings("session.123", id),
-                .pick, .last => return error.TestExpectedExactResumeId,
+                .remembered, .pick, .last => return error.TestExpectedExactResumeId,
             }
         },
         else => return error.TestExpectedEqual,
@@ -4942,7 +4954,7 @@ test "runIfRequested top-level resume aliases return the existing target" {
             defer launch.deinit(std.testing.allocator);
             switch (launch.requested_resume.?) {
                 .id => |id| try std.testing.expectEqualStrings("session.123", id),
-                .pick, .last => return error.TestExpectedExactResumeId,
+                .remembered, .pick, .last => return error.TestExpectedExactResumeId,
             }
         },
         else => return error.TestExpectedEqual,

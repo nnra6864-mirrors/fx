@@ -11,6 +11,7 @@ const versions = @import("../core/gateway/provider_versions.zig");
 const version_lookup = @import("provider_versions.zig");
 
 const max_catalog_models: usize = 128;
+pub const title_model = "grok-4.5";
 const max_model_id_bytes: usize = 256;
 const max_catalog_bytes: usize = 1024 * 1024;
 const fetch_timeout_ms: i64 = 30_000;

@@ -32,7 +32,6 @@ pub const RouteRecoveryRequest = runtime_deps.RouteRecoveryRequest;
 pub const CredentialRefreshMode = runtime_deps.CredentialRefreshMode;
 pub const SemanticPresentationSink = runtime_assistant_stream.SemanticPresentationSink;
 pub const LifecycleContext = runtime_lifecycle.LifecycleContext;
-pub const PreparedToolBlockKind = runtime_lifecycle.PreparedToolBlockKind;
 pub const PreparedToolCall = runtime_lifecycle.PreparedToolCall;
 pub const prepareToolCallForLifecycle = runtime_lifecycle.prepareToolCallForLifecycle;
 pub const dispatchAttentionRequiredCheckpoint = runtime_lifecycle.dispatchAttentionRequiredCheckpoint;

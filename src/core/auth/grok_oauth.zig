@@ -409,7 +409,7 @@ pub fn runLogin(
     try writeStdout("Open this URL to sign in with Grok:\n");
     try writeStdout(authorization_url);
     try writeStdout("\n\nWaiting for browser authorization...\n");
-    try writeStdout("Paste the code shown by xAI and press Enter if the browser doesn't return.\n");
+    try writeStdout("Paste the code shown by xAI and press enter if the browser doesn't return.\n");
     if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) {
         _ = url_opener.open(alloc, authorization_url) catch false;
     }

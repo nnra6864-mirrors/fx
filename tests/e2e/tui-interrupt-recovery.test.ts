@@ -12,12 +12,14 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { findFooterBlocks, readTrace } from "./tui-render-assertions";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewayToolCall,
   fakeShellRun,
+  heldFakeGatewayFinalText,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -62,6 +64,66 @@ afterEach(async () => {
 });
 
 describe.skipIf(SKIP)("tui: interrupt recovery", () => {
+  for (const inject of [false, true]) test(`quit reports final history persistence failure with fault=${inject}`, async () => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), "fx-shutdown-save-")));
+    const home = join(root, "home"), workspace = join(root, "workspace");
+    mkdirSync(home); mkdirSync(workspace);
+    const library = join(root, process.platform === "darwin" ? "sync-fault.dylib" : "sync-fault.so");
+    const source = join(import.meta.dirname, "fixtures", "session-sync-fault.c");
+    const flags = process.platform === "darwin" ? ["-dynamiclib"] : ["-shared", "-fPIC"];
+    const compiled = Bun.spawnSync(["cc", ...flags, "-O2", "-Wall", "-Wextra", source, "-o", library,
+      ...(process.platform === "darwin" ? [] : ["-ldl"])]);
+    expect(compiled.exitCode).toBe(0);
+    const held = heldFakeGatewayFinalText();
+    let requestHeld = false;
+    gateway = startFakeGateway([
+      fakeGatewayFinalText("SHUTDOWN_SAVED_FACT_281"),
+      () => { requestHeld = true; return held.response; },
+      fakeGatewayFinalText("SHUTDOWN_RESUMED_281"),
+    ]);
+    const env = { HOME: home, AI_GATEWAY_API_KEY: "fake-shutdown-save", VERCEL_OIDC_TOKEN: undefined,
+      FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0",
+      FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models` };
+    try {
+      const seeded = await runFx(["ask", "--json", "Save the first fact."], { cwd: workspace, env, timeoutMs: TIMEOUT });
+      expect(seeded.code).toBe(0); expect(seeded.stderr).toBe("");
+      const id = JSON.parse(seeded.stdout).session_id;
+      const eventPath = join(home, ".fx", "sessions", id, "events.jsonl");
+      const saved = readFileSync(eventPath);
+      const stderrPath = join(root, "stderr.log"), tracePath = join(root, "trace.log");
+      const arm = join(root, "armed"), receipt = join(root, "injected.txt");
+      const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`;
+      session = await TmuxSession.create({ cmd: `${quote(FX_BIN)} --resume ${quote(id)}`, cwd: workspace,
+        isolated: true, remainOnExit: true, width: 110, height: 36, stderrPath,
+        env: { ...env, [process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD"]: library,
+          FX_TEST_SYNC_TARGET: eventPath, FX_TEST_SYNC_ARM: arm, FX_TEST_SYNC_RECORD: receipt,
+          FX_TEST_SYNC_MATCH: "SHUTDOWN_PENDING_REQUEST_392", FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "session,worker,input", FX_RECORD: join(root, "shutdown.fxtape") } });
+      await session.waitForStableComposer(TIMEOUT);
+      await session.sendText("SHUTDOWN_PENDING_REQUEST_392");
+      await waitForCondition(() => requestHeld, "held shutdown request");
+      if (inject) writeFileSync(arm, "armed");
+      await session.sendText("/quit");
+      await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
+      const output = await session.captureFullScrollback();
+      const stderr = readFileSync(stderrPath, "utf8");
+      expect(existsSync(receipt)).toBe(inject);
+      if (inject) {
+        expect(readFileSync(receipt, "utf8")).toContain(`target=${eventPath}`);
+        expect(readFileSync(tracePath, "utf8")).toContain("shutdown finished prompt persistence failed");
+        expect(session.paneStatus().status).toBe(1);
+        expect(output + stderr).toMatch(/save.*fail|fail.*sav|could not.*sav|unable to.*sav/i);
+      } else { expect(session.paneStatus().status).toBe(0); expect(stderr).toBe(""); }
+      expect(readFileSync(eventPath).subarray(0, saved.length).equals(saved)).toBe(true);
+      const resumed = await runFx(["ask", "--json", "--resume-id", id, "Continue without repeating work."], {
+        cwd: workspace, env, timeoutMs: TIMEOUT });
+      expect(resumed.code).toBe(0); expect(resumed.stderr).toBe("");
+      expect(JSON.parse(resumed.stdout).session_id).toBe(id);
+      expect(gateway.requests.at(-1)!.body).toContain("SHUTDOWN_SAVED_FACT_281");
+    } finally { held.dispose(); }
+  }, TIMEOUT * 3);
+
   test(
     "Ctrl-C clears the composer before cancelling an active response",
     async () => {
@@ -193,7 +255,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       expect(countOccurrences(readTrace(tracePath), "event=worker_begin")).toBe(2);
 
       await session.sendKeys("C-o");
-      await session.waitForText("Full detail", TIMEOUT);
+      await session.waitForText("full detail", TIMEOUT);
       await session.sendKeys("C-o");
       await session.waitForText("Thinking", TIMEOUT);
       await session.sendKeys("C-c");
@@ -328,6 +390,86 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
   );
 
   test(
+    "up arrow retracts a tool-queued steer into the composer for editing",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-steer-retract-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const tracePath = join(root, "trace.log");
+      const startPath = join(workspace, "started");
+      const releasePath = join(workspace, "release");
+      const finishedPath = join(workspace, "finished");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(
+        join(workspace, "check.sh"),
+        "printf started > started\nwhile [ ! -f release ]; do sleep 0.05; done\nprintf done > finished\n",
+      );
+
+      const steerText = "change the header tone";
+      const editSuffix = " and keep it short";
+      gateway = startFakeGateway([
+        fakeShellRun("steer_retract_command", "sh check.sh"),
+        fakeGatewayFinalText("STEER_RETRACT_COMPLETE"),
+      ]);
+      session = await TmuxSession.create({
+        cwd: realpathSync(workspace),
+        stderrPath,
+        width: 120,
+        height: 40,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-steer-retract-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          FX_PERMISSION_MODE: "yolo",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_TRACE_SCOPES: TRACE_SCOPES,
+          FX_TRACE_LOG: tracePath,
+        },
+      });
+      await session.waitForComposer(TIMEOUT);
+
+      await session.sendText("Run the prepared check.");
+      await waitForCondition(() => existsSync(startPath), "held tool start");
+
+      await session.sendText(steerText);
+      // The queued steer is only visible as the waiting banner above the composer.
+      await session.waitForText(steerText, TIMEOUT);
+
+      await session.sendKeys("Up");
+      await waitForTrace(tracePath, "event=prompt_steering_retracted", TIMEOUT);
+
+      await session.sendLiteral(editSuffix);
+      await session.sendKeys("Enter");
+      await waitForCondition(
+        () => countOccurrences(readTrace(tracePath), "event=prompt_enqueue") >= 3,
+        "edited steer requeued",
+      );
+
+      writeFileSync(releasePath, "go");
+      await session.waitForText("STEER_RETRACT_COMPLETE", TIMEOUT);
+      await waitForCondition(() => existsSync(finishedPath), "held tool completion");
+
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.requests[1]!.body).toContain("<user_steering>");
+      expect(gateway.requests[1]!.body).toContain(`${steerText}${editSuffix}`);
+      const trace = readTrace(tracePath);
+      expect(countOccurrences(trace, "event=prompt_steering_retracted")).toBe(1);
+      expect(countOccurrences(trace, "event=prompt_steering_consumed")).toBe(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(session.isPaneAlive()).toBe(true);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "partial output survives cancellation and the next prompt completes",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-interrupt-recovery-")));
@@ -382,6 +524,10 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       await waitForCondition(() => held.started, "held response start");
       await session.waitForText(VISIBLE_PARTIAL_CHUNKS.at(-1)!.trim(), TIMEOUT);
       await session.sendKeys("Escape");
+      await session.waitForText("esc again to interrupt", TIMEOUT);
+      await Bun.sleep(150);
+      expect(held.cancelled).toBe(false);
+      await session.sendKeys("Escape");
       await waitForCondition(() => held.cancelled, "gateway stream cancellation");
       await waitForTrace(tracePath, "event=interrupt_persisted", TIMEOUT);
       await session.waitForText("What can fx do differently?", TIMEOUT);
@@ -409,7 +555,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       expect(
         countOccurrences(interruptedScrollback, "What can fx do differently?"),
       ).toBe(1);
-      expect(interruptedScrollback).not.toContain("System: cancelled");
+      expect(interruptedScrollback).not.toContain("system: cancelled");
       expect(interruptedScrollback).not.toContain("Cancelling");
 
       await session.waitForText(FOLLOW_UP_RESPONSE, TIMEOUT);
@@ -426,7 +572,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       expect(
         countOccurrences(finalScrollback, "What can fx do differently?"),
       ).toBe(1);
-      expect(finalScrollback).not.toContain("System: cancelled");
+      expect(finalScrollback).not.toContain("system: cancelled");
       expect(finalScrollback).not.toContain("Cancelling");
       expect(gateway.requests).toHaveLength(2);
       expect(held.cancelCount).toBe(1);
@@ -580,6 +726,9 @@ while :; do sleep 1; done
       );
 
       const command = `/workspace add ${sharedRoot}`;
+      await session.sendKeys("Escape");
+      await session.waitForText("esc again to interrupt", TIMEOUT);
+      await Bun.sleep(150);
       const cancelStartedAt = Date.now();
       await session.sendKeys("Escape");
       const immediateCancellation = await session.waitForText(
@@ -588,7 +737,7 @@ while :; do sleep 1; done
       );
       expect(Date.now() - cancelStartedAt).toBeLessThan(500);
       expect(immediateCancellation).toContain("■ Cancelled");
-      expect(immediateCancellation).not.toContain("System: cancelled");
+      expect(immediateCancellation).not.toContain("system: cancelled");
       expect(immediateCancellation).not.toContain("Cancelling");
       await waitForTrace(
         tracePath,
@@ -689,6 +838,9 @@ while :; do sleep 1; done
         `event=after_tool_execution call_id=${callId}`,
       );
 
+      await session.sendKeys("Escape");
+      await session.waitForText("esc again to interrupt", TIMEOUT);
+      await Bun.sleep(150);
       const cancelStartedAt = Date.now();
       await session.sendKeys("Escape");
       await session.waitForText("What can fx do differently?", TIMEOUT);
@@ -708,7 +860,7 @@ while :; do sleep 1; done
       const scrollback = await session.captureFullScrollback();
       expect(scrollback).toContain(`Searched ${pattern}`);
       expect(countOccurrences(scrollback, "What can fx do differently?")).toBe(1);
-      expect(scrollback).not.toContain("System: cancelled");
+      expect(scrollback).not.toContain("system: cancelled");
       expect(scrollback).not.toContain("Cancelling");
       expect(gateway.requests).toHaveLength(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");

@@ -9,6 +9,7 @@ const termScripts = [
   "test-term-headless.mjs",
   "test-term-table-stream.mjs",
   "test-term-lifecycle.mjs",
+  "test-term-compaction.mjs",
   "test-term-features.mjs",
   "test-term-history.mjs",
   "test-term-workspace.mjs",

@@ -381,7 +381,7 @@ pub fn Commands(comptime App: type) type {
                 return;
             }
 
-            try app.writeDomainNotice(.{ .topic = "permissions", .tone = .@"error", .body = permissions_usage }, true);
+            try app.writeDomainNotice(.{ .topic = "", .tone = .@"error", .body = permissions_usage }, true);
         }
 
         pub fn handleAllowlist(app: *App, rest: []const u8) !void {
@@ -501,7 +501,7 @@ pub fn Commands(comptime App: type) type {
 
         fn writeAllowlistUsage(app: *App) !void {
             try app.writeDomainNotice(.{
-                .topic = "allowlist",
+                .topic = "",
                 .tone = .@"error",
                 .body = "usage: /allowlist [view [effective|local|user]|[local|user] add|remove|reset ...]",
             }, true);
@@ -514,7 +514,7 @@ pub fn Commands(comptime App: type) type {
         ) !void {
             const target = (try parseAllowlistTargetAlloc(app.alloc, app.toolRegistry(), raw)) orelse {
                 try app.writeDomainNotice(.{
-                    .topic = "allowlist",
+                    .topic = "",
                     .tone = .@"error",
                     .body = "usage: /allowlist add [command|tool|url|web-fetch-domain] <pattern>",
                 }, true);
@@ -556,7 +556,7 @@ pub fn Commands(comptime App: type) type {
         ) !void {
             const target = (try parseAllowlistTargetAlloc(app.alloc, app.toolRegistry(), raw)) orelse {
                 try app.writeDomainNotice(.{
-                    .topic = "allowlist",
+                    .topic = "",
                     .tone = .@"error",
                     .body = "usage: /allowlist remove [command|tool|url|web-fetch-domain] <pattern>",
                 }, true);
@@ -603,7 +603,7 @@ pub fn Commands(comptime App: type) type {
         ) !void {
             const reset_scope = parseAllowlistResetScope(raw) orelse {
                 try app.writeDomainNotice(.{
-                    .topic = "allowlist",
+                    .topic = "",
                     .tone = .@"error",
                     .body = "usage: /allowlist reset [commands|tools|urls|web-fetch-domains|all]",
                 }, true);
@@ -1004,7 +1004,7 @@ pub fn Commands(comptime App: type) type {
 
         fn writeSettingsUsage(app: *App) !void {
             try app.writeDomainNotice(.{
-                .topic = "settings",
+                .topic = "",
                 .tone = .@"error",
                 .body = "usage: /settings [startup-scrollback [on|off]]",
             }, true);
@@ -1712,13 +1712,13 @@ const FakeApp = struct {
         self.semantic_write_count += 1;
         self.last_tone = notice.tone;
         const rendered = if (notice.topic.len > 0)
-            try std.fmt.allocPrint(self.alloc, "● {c}{s}: {s}\n", .{
-                std.ascii.toUpper(notice.topic[0]),
-                notice.topic[1..],
+            try std.fmt.allocPrint(self.alloc, "{s} {s}: {s}\n", .{
+                types.noticeGlyph(notice.tone),
+                notice.topic,
                 notice.body,
             })
         else
-            try std.fmt.allocPrint(self.alloc, "● {s}\n", .{notice.body});
+            try std.fmt.allocPrint(self.alloc, "{s} {s}\n", .{ types.noticeGlyph(notice.tone), notice.body });
         defer self.alloc.free(rendered);
         try self.transcript.appendSlice(self.alloc, rendered);
     }
@@ -1939,7 +1939,7 @@ test "session_commands showStatus writes session status snapshot" {
 
     try Commands(FakeApp).showStatus(&app);
 
-    try expectTranscriptContains(&app, "● Status: model=anthropic/test-model\n");
+    try expectTranscriptContains(&app, "* status: model=anthropic/test-model\n");
     try expectTranscriptContains(&app, "auth=missing\n");
     try expectTranscriptContains(&app, "auth_refreshable=false\n");
     try expectTranscriptContains(&app, "permission_mode=auto\n");
@@ -2175,7 +2175,7 @@ test "session_commands handleSettings reports usage and save failures" {
 
     app.clearTranscript();
     try Commands(FakeApp).handleSettings(&app, "startup-scrollback off");
-    try expectTranscriptContains(&app, "● Startup-scrollback: not saved to user settings (HomeNotSet)");
+    try expectTranscriptContains(&app, "✗ startup-scrollback: not saved to user settings (HomeNotSet)");
     try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
 }
 
@@ -2186,7 +2186,7 @@ test "session_commands handleModel reports current model for empty query" {
 
     try Commands(FakeApp).handleModel(&app, "");
 
-    try std.testing.expectEqualStrings("● Model: anthropic/claude-opus-4.6\n", app.text());
+    try std.testing.expectEqualStrings("* model: anthropic/claude-opus-4.6\n", app.text());
     try std.testing.expect(app.worker.synced_model == null);
     try std.testing.expectEqualStrings("", app.terminalTitleLabelText());
 }
@@ -2208,10 +2208,10 @@ test "session_commands handleModel resolves fuzzy cached model and syncs queued 
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", app.worker.synced_model.?);
     try std.testing.expectEqual(model_provider.ProviderId.codex, app.last_preference_provider.?);
     try std.testing.expectEqualStrings(
-        "v" ++ build_options.app_version ++ " | workspace",
+        "fx v" ++ build_options.app_version ++ " | workspace",
         app.terminalTitleLabelText(),
     );
-    try expectTranscriptContains(&app, "● Switched to anthropic/claude-sonnet-4-20250514");
+    try expectTranscriptContains(&app, "* Switched to anthropic/claude-sonnet-4-20250514");
 }
 
 test "session_commands handleModel falls back to raw query when model fetch fails" {
@@ -2225,7 +2225,7 @@ test "session_commands handleModel falls back to raw query when model fetch fail
     try std.testing.expectEqualStrings("custom/provider-model", app.selected_model.items);
     try std.testing.expectEqualStrings("custom/provider-model", app.worker.synced_model.?);
     try std.testing.expectEqualStrings(
-        "v" ++ build_options.app_version ++ " | workspace",
+        "fx v" ++ build_options.app_version ++ " | workspace",
         app.terminalTitleLabelText(),
     );
 }
@@ -2330,19 +2330,19 @@ test "session_commands handleAllowlist adds lists and removes workspace rules" {
     app.tool_registry = .{ .tools = &.{builtin_tools.read_file} };
 
     try Commands(FakeApp).handleAllowlist(&app, "add command \"git *\"");
-    try expectTranscriptContains(&app, "● Allowlist: added command: \"git *\"");
+    try expectTranscriptContains(&app, "* allowlist: added command: \"git *\"");
 
     app.clearTranscript();
     try Commands(FakeApp).handleAllowlist(&app, "add tool read_file");
-    try expectTranscriptContains(&app, "● Allowlist: added tool read: \"*\"");
+    try expectTranscriptContains(&app, "* allowlist: added tool read: \"*\"");
 
     app.clearTranscript();
     try Commands(FakeApp).handleAllowlist(&app, "add url \"https://example.com/*\"");
-    try expectTranscriptContains(&app, "● Allowlist: added url: \"https://example.com/*\"");
+    try expectTranscriptContains(&app, "* allowlist: added url: \"https://example.com/*\"");
 
     app.clearTranscript();
     try Commands(FakeApp).handleAllowlist(&app, "add command echo");
-    try expectTranscriptContains(&app, "● Allowlist: added command: \"echo\"");
+    try expectTranscriptContains(&app, "* allowlist: added command: \"echo\"");
 
     _ = try config_runtime.addPermissionRule(std.testing.allocator, .local, workspace_root, "read", "docs/*", .allow);
 
@@ -2357,19 +2357,19 @@ test "session_commands handleAllowlist adds lists and removes workspace rules" {
 
     app.clearTranscript();
     try Commands(FakeApp).handleAllowlist(&app, "");
-    try expectTranscriptContains(&app, "● Allowlist: effective persistent allow rules:");
+    try expectTranscriptContains(&app, "* allowlist: effective persistent allow rules:");
     try expectTranscriptContains(&app, "  tools:\n    read: workspace, docs/*");
     try expectTranscriptContains(&app, "  commands:\n    git *, echo");
     try expectTranscriptContains(&app, "  urls:\n    https://example.com/*");
 
     app.clearTranscript();
     try Commands(FakeApp).handleAllowlist(&app, "view");
-    try expectTranscriptContains(&app, "● Allowlist: effective persistent allow rules:");
+    try expectTranscriptContains(&app, "* allowlist: effective persistent allow rules:");
     try expectTranscriptContains(&app, "  commands:\n    git *, echo");
 
     app.clearTranscript();
     try Commands(FakeApp).handleAllowlist(&app, "remove command \"git *\"");
-    try expectTranscriptContains(&app, "● Allowlist: removed command: \"git *\"");
+    try expectTranscriptContains(&app, "* allowlist: removed command: \"git *\"");
 
     var after_remove = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
     defer after_remove.deinit(std.testing.allocator);
@@ -2381,11 +2381,11 @@ test "session_commands handleAllowlist adds lists and removes workspace rules" {
 
     app.clearTranscript();
     try Commands(FakeApp).handleAllowlist(&app, "reset tools");
-    try expectTranscriptContains(&app, "● Allowlist: reset tools: removed 2 rules");
+    try expectTranscriptContains(&app, "* allowlist: reset tools: removed 2 rules");
 
     app.clearTranscript();
     try Commands(FakeApp).handleAllowlist(&app, "reset all");
-    try expectTranscriptContains(&app, "● Allowlist: reset all: removed 2 rules");
+    try expectTranscriptContains(&app, "* allowlist: reset all: removed 2 rules");
 
     var after_reset = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
     defer after_reset.deinit(std.testing.allocator);
@@ -2393,7 +2393,7 @@ test "session_commands handleAllowlist adds lists and removes workspace rules" {
 
     app.clearTranscript();
     try Commands(FakeApp).handleAllowlist(&app, "view");
-    try expectTranscriptContains(&app, "● Allowlist: effective persistent allow rules: (none)");
+    try expectTranscriptContains(&app, "* allowlist: effective persistent allow rules: (none)");
 }
 
 test "session_commands allowlist scopes expose and mutate hidden user rules independently" {
@@ -2422,19 +2422,19 @@ test "session_commands allowlist scopes expose and mutate hidden user rules inde
 
     app.clearTranscript();
     try Commands(FakeApp).handleAllowlist(&app, "view user");
-    try expectTranscriptContains(&app, "● Allowlist: user persistent allow rules:");
+    try expectTranscriptContains(&app, "* allowlist: user persistent allow rules:");
     try expectTranscriptContains(&app, "user *");
     try expectTranscriptContains(&app, "user rules are shadowed by local settings");
 
     app.clearTranscript();
     try Commands(FakeApp).handleAllowlist(&app, "view local");
-    try expectTranscriptContains(&app, "● Allowlist: local persistent allow rules:");
+    try expectTranscriptContains(&app, "* allowlist: local persistent allow rules:");
     try expectTranscriptContains(&app, "local *");
     try std.testing.expect(std.mem.find(u8, app.text(), "user *") == null);
 
     app.clearTranscript();
     try Commands(FakeApp).handleAllowlist(&app, "view effective");
-    try expectTranscriptContains(&app, "● Allowlist: effective persistent allow rules:");
+    try expectTranscriptContains(&app, "* allowlist: effective persistent allow rules:");
     try expectTranscriptContains(&app, "local *");
     try std.testing.expect(std.mem.find(u8, app.text(), "user *") == null);
 
@@ -2514,7 +2514,7 @@ test "web_fetch allowlist add remove view and reset persist exact canonical doma
     defer app.deinit();
 
     try Commands(FakeApp).handleAllowlist(&app, "add web-fetch-domain Example.COM.");
-    try expectTranscriptContains(&app, "● Allowlist: added web-fetch-domain: \"domain:example.com\"");
+    try expectTranscriptContains(&app, "* allowlist: added web-fetch-domain: \"domain:example.com\"");
 
     var settings = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
     defer settings.deinit(std.testing.allocator);
@@ -2527,13 +2527,13 @@ test "web_fetch allowlist add remove view and reset persist exact canonical doma
 
     app.clearTranscript();
     try Commands(FakeApp).handleAllowlist(&app, "remove web-fetch-domain EXAMPLE.com");
-    try expectTranscriptContains(&app, "● Allowlist: removed web-fetch-domain: \"domain:example.com\"");
+    try expectTranscriptContains(&app, "* allowlist: removed web-fetch-domain: \"domain:example.com\"");
 
     _ = try config_runtime.addPermissionRule(std.testing.allocator, .local, workspace_root, "web_fetch", "domain:example.com", .allow);
     _ = try config_runtime.addPermissionRule(std.testing.allocator, .local, workspace_root, "web_fetch", "domain:example.org", .allow);
     app.clearTranscript();
     try Commands(FakeApp).handleAllowlist(&app, "reset web-fetch-domains");
-    try expectTranscriptContains(&app, "● Allowlist: reset web-fetch-domains: removed 2 rules");
+    try expectTranscriptContains(&app, "* allowlist: reset web-fetch-domains: removed 2 rules");
 }
 
 test "web_fetch allowlist rejects wildcard url shaped and tool wide authorization" {
@@ -2639,7 +2639,7 @@ test "session_commands handleAllowlist recognizes tools from the active registry
     app.tool_registry = .{ .tools = &.{provider_tool} };
 
     try Commands(FakeApp).handleAllowlist(&app, "add tool provider_custom");
-    try expectTranscriptContains(&app, "● Allowlist: added tool provider_custom: \"*\"");
+    try expectTranscriptContains(&app, "* allowlist: added tool provider_custom: \"*\"");
 
     var settings = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
     defer settings.deinit(std.testing.allocator);
@@ -2665,7 +2665,7 @@ test "session_commands toggleFast reports unsupported model and redraws footer" 
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
     try std.testing.expect(app.worker.synced_fast_mode == null);
     try std.testing.expectEqual(@as(usize, 0), app.worker.fast_sync_count);
-    try expectTranscriptContains(&app, "● Fast: This model does not come with a fast mode.");
+    try expectTranscriptContains(&app, "* fast: This model does not come with a fast mode.");
 }
 
 test "session_commands toggleFast disables stale fast mode for unsupported model" {
@@ -2726,7 +2726,7 @@ test "session_commands toggleFast syncs queued fast mode for supported models" {
     try std.testing.expect(app.fast_mode);
     try std.testing.expectEqual(@as(?bool, true), app.worker.synced_fast_mode);
     try std.testing.expectEqual(@as(usize, 1), app.worker.fast_sync_count);
-    try expectTranscriptContains(&app, "● Fast: on");
+    try expectTranscriptContains(&app, "* fast: on");
 }
 
 test "session_commands selectModelFromPicker skips effort changes for models without reasoning support" {
@@ -2761,7 +2761,7 @@ test "session_commands model picker accepts the current selected model slice" {
     try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", app.worker.synced_model.?);
     try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", app.last_preference_model.items);
     try std.testing.expectEqualStrings(
-        "v" ++ build_options.app_version ++ " | workspace",
+        "fx v" ++ build_options.app_version ++ " | workspace",
         app.terminalTitleLabelText(),
     );
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
@@ -2913,7 +2913,7 @@ test "session_commands user save notice uses one post-commit load after legacy c
     try Commands(FakeApp).handleModel(&app, "user/new");
 
     try std.testing.expectEqual(@as(usize, 1), app.post_commit_resolution_count);
-    try expectTranscriptContains(&app, "● Model: saved to user settings (scope=user)");
+    try expectTranscriptContains(&app, "* model: saved to user settings (scope=user)");
     try std.testing.expect(std.mem.find(u8, app.text(), "model=project") == null);
     try expectTranscriptContains(&app, "normalized 1 legacy value across 1 workspace");
     try expectTranscriptContains(&app, "settings.json.preference-migration.model.");
@@ -2947,7 +2947,7 @@ test "session_commands durable user save survives post-commit resolver failure" 
     try Commands(FakeApp).handleModel(&app, "user/new");
 
     try std.testing.expectEqual(@as(usize, 1), app.post_commit_resolution_count);
-    try expectTranscriptContains(&app, "● Model: saved to user settings (scope=user)");
+    try expectTranscriptContains(&app, "! model: saved to user settings (scope=user)");
     try expectTranscriptContains(&app, "next-startup source unknown");
     try expectTranscriptContains(&app, "normalized 1 legacy value across 1 workspace");
     try expectTranscriptContains(&app, "settings.json.preference-migration.model.");
@@ -2981,7 +2981,7 @@ test "session_commands durable user save survives post-commit resolver diagnosti
     try Commands(FakeApp).handleModel(&app, "user/new");
 
     try std.testing.expectEqual(@as(usize, 1), app.post_commit_resolution_count);
-    try expectTranscriptContains(&app, "● Model: saved to user settings (scope=user)");
+    try expectTranscriptContains(&app, "! model: saved to user settings (scope=user)");
     try expectTranscriptContains(&app, "next-startup source unknown (DurablePathUnsafe)");
 }
 
@@ -2998,7 +2998,7 @@ test "session_commands allowlist failures retain explicit scope and error" {
 
     try expectTranscriptContains(
         &app,
-        "● Allowlist: failed to add rule to settings (scope=user, error=HomeNotSet)",
+        "✗ allowlist: failed to add rule to settings (scope=user, error=HomeNotSet)",
     );
     try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
 }
@@ -3025,7 +3025,7 @@ test "session_commands allowlist durable save survives post-commit resolver diag
         "user add command \"git status *\"",
     );
 
-    try expectTranscriptContains(&app, "● Allowlist: added command");
+    try expectTranscriptContains(&app, "! allowlist: added command");
     try expectTranscriptContains(&app, "(scope=user)");
     try expectTranscriptContains(
         &app,
@@ -3049,11 +3049,11 @@ test "session_commands runtime-first model keeps runtime state when both durable
     try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
     try expectTranscriptContains(
         &app,
-        "● Model: active for this process but not saved to user settings",
+        "✗ model: active for this process but not saved to user settings",
     );
     try expectTranscriptContains(
         &app,
-        "● Model: failed to persist current session",
+        "✗ model: failed to persist current session",
     );
 }
 
@@ -3077,7 +3077,7 @@ test "session_commands report indeterminate settings and session failures indepe
     try expectTranscriptContains(&app, "user settings persistence uncertain");
     try expectTranscriptContains(&app, "normalized 1 legacy value across 1 workspace");
     try expectTranscriptContains(&app, "recovery=/tmp/settings.json.preference-migration.model.json");
-    try expectTranscriptContains(&app, "● Model: failed to persist current session");
+    try expectTranscriptContains(&app, "✗ model: failed to persist current session");
 }
 
 test "session_commands no-op model still attempts its durable targets" {

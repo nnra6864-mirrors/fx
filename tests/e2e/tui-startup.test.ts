@@ -42,8 +42,8 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
       await session.sendText("/help");
       const pane = await session.waitForText("Commands 35", 5_000);
       expect(pane).toContain("[All]");
-      expect(pane).toContain("Tab Category");
-      expect(pane).toContain("Enter Open");
+      expect(pane).toContain("tab category");
+      expect(pane).toContain("enter open");
       expect(pane).toContain("Run /help for commands");
     },
     TIMEOUT,
@@ -437,7 +437,7 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
       const initial = await session.waitForText("Welcome to fx", TIMEOUT);
       expect(initial).toContain("Sign in with Vercel");
       expect(initial).toContain("Add an API key");
-      expect(initial).toContain("Esc to set up later");
+      expect(initial).toContain("esc to set up later");
       expect(initial).not.toContain("Change team");
       expect(initial).not.toContain("Switch credential");
       expect(initial).not.toContain("Skip for now");

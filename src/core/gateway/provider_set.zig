@@ -25,6 +25,9 @@ pub const Bundle = struct {
     capabilities: Capabilities = .{},
     presentation: ?*const provider_catalog.Entry = null,
     auth_strategy: ?AuthStrategy = null,
+    /// Fixed low-cost model used for session title generation side calls.
+    /// Null disables generated titles for the provider.
+    title_model: ?[]const u8 = null,
     fallback_model_capabilities_fn: *const fn ([]const u8) model_capabilities.Capabilities = emptyModelCapabilities,
     agent_stream: ?stream_provider.Provider = null,
     cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,

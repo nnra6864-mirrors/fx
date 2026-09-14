@@ -12,6 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EVAL_MODEL, HAS_API_KEY, runFx } from "../evals/eval-helpers";
+import { fakeGatewayTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 
 const TIMEOUT = 20_000;
 const MODEL = "openai/gpt-5";
@@ -185,6 +186,7 @@ function startFakeGateway(
         classifierRequests.push({ body });
         return permissionDecision(options.classifierDecision);
       }
+      if (body.includes(TITLE_GENERATION_MARKER)) return fakeGatewayTitleDefault();
       requests.push({ body });
       const response = responses.shift();
       if (!response) {
@@ -196,7 +198,7 @@ function startFakeGateway(
 
   return {
     baseUrl: `http://127.0.0.1:${server.port}`,
-    chatUrl: `http://127.0.0.1:${server.port}/v3/ai/language-model`,
+    chatUrl: `http://127.0.0.1:${server.port}/v4/ai/language-model`,
     requests,
     classifierRequests,
     remainingResponseCount() {

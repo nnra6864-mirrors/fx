@@ -969,39 +969,6 @@ fn nthAllowlistArgLabel(query: []const u8, n: usize) ?[]const u8 {
     return full[state.label_offset..];
 }
 
-/// Returns the index of `label` among the matching arg completions for
-/// the given prefix, or null if the label is not in the filtered set.
-pub fn argCompletionIndexForLabel(prefix: []const u8, label: []const u8) ?usize {
-    if (allowlistArgCompletionPrefix(prefix)) |query| {
-        const state = allowlistArgCompletionState(query);
-        return indexOfArgLabel(state.completions, state.label_offset, state.query, label);
-    }
-    if (statuslineArgCompletionPrefix(prefix)) |query| {
-        return indexOfArgLabel(&statusline_arg_completions, "/statusline ".len, query, label);
-    }
-    if (notificationsArgCompletionPrefix(prefix)) |query| {
-        return indexOfArgLabel(&notifications_arg_completions, "/sound ".len, query, label);
-    }
-    if (permissionsArgCompletionPrefix(prefix)) |query| {
-        return indexOfArgLabel(&permissions_arg_completions, "/permissions ".len, query, label);
-    }
-    if (workspaceArgCompletionPrefix(prefix)) |query| {
-        return indexOfArgLabel(&workspace_arg_completions, "/workspace ".len, query, label);
-    }
-    return null;
-}
-
-fn indexOfArgLabel(completions: []const []const u8, command_with_space_len: usize, query: []const u8, label: []const u8) ?usize {
-    var idx: usize = 0;
-    for (completions) |completion| {
-        if (!argCompletionMatches(completion, command_with_space_len, query)) continue;
-        const arg = completion[command_with_space_len..];
-        if (std.mem.eql(u8, arg, label)) return idx;
-        idx += 1;
-    }
-    return null;
-}
-
 fn argCompletionMatches(completion: []const u8, command_with_space_len: usize, query: []const u8) bool {
     const arg = completion[command_with_space_len..];
     return query.len == 0 or std.ascii.startsWithIgnoreCase(arg, query);
@@ -1663,7 +1630,7 @@ test "top-level help renders flags as compact aligned rows" {
 
     try std.testing.expect(lineContainsBoth(wide, "--context-limit <spec>", "Set name=bytes|off; repeatable"));
     try std.testing.expect(lineContainsBoth(wide, "--add-dir <path>", "Add a workspace directory; repeatable"));
-    try std.testing.expect(lineContainsBoth(wide, "-c, --continue", "Resume the latest workspace session"));
+    try std.testing.expect(lineContainsBoth(wide, "-c, --continue", "Resume the remembered workspace session"));
     try std.testing.expect(lineContainsBoth(wide, "-r", "Open the saved-session picker"));
     try std.testing.expect(lineContainsBoth(wide, "--resume [last|<id>]", "Resume the latest workspace session or an exact ID"));
     try std.testing.expect(lineContainsBoth(wide, "--resume-last", "Resume the latest workspace session"));

@@ -32,7 +32,7 @@ import { stdoutFrames } from "./render-lab/tape";
 const TIMEOUT = 30_000;
 const INPUT_SANITY_BUDGET_MS = 5_000;
 const BURST_NAVIGATION_EVENTS = 2_048;
-const FULL_FOOTER = "Full detail · ctrl o close";
+const FULL_FOOTER = "full detail · ctrl+o close";
 const HISTORY_DONE = "CTRL_O_BRUTAL_HISTORY_DONE";
 const LIVE_START = "CTRL_O_BRUTAL_LIVE_0001";
 const LIVE_DONE = "CTRL_O_BRUTAL_LIVE_DONE";

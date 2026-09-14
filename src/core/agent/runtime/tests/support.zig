@@ -886,7 +886,7 @@ pub const FakeAgentRuntimeDeps = struct {
     ) !worker_runtime.SteeringBoundaryResult {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         const source = switch (kind) {
-            .model => blk: {
+            .model, .finalizing => blk: {
                 self.steering_take_count += 1;
                 if (self.steering_take_count != self.steering_take_at) return .none;
                 break :blk self.steering_messages;
@@ -942,9 +942,9 @@ pub const FakeAgentRuntimeDeps = struct {
         }
     }
 
-    fn appendStaticContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
+    fn appendStaticContext(raw: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        if (self.static_context_text) |text| {
+        if (project_context orelse self.static_context_text) |text| {
             try messages.append(arena, .{ .role = .system, .content = try arena.dupe(u8, text) });
         }
     }
@@ -969,7 +969,6 @@ pub const FakeAgentRuntimeDeps = struct {
                 @as(u64, @intCast(self.parent_turn_prepare_count)),
             .delivery_id = try arena.dupe(u8, "delivery"),
             .start_offset = 0,
-            .end_offset = 0,
             .total_bytes = 0,
         };
         return .{

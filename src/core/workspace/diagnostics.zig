@@ -6,6 +6,7 @@
 
 const network_metrics = @import("network_metrics.zig");
 const tool_call_metrics = @import("tool_call_metrics.zig");
+const render_metrics = @import("render_metrics.zig");
 
 pub const NetworkCall = network_metrics.NetworkCall;
 pub const NetworkCallKind = network_metrics.NetworkCallKind;
@@ -14,6 +15,16 @@ pub const ToolCallRecord = tool_call_metrics.ToolCallRecord;
 pub const ToolCallOutcome = tool_call_metrics.ToolCallOutcome;
 pub const network_ring_capacity = network_metrics.ring_capacity;
 pub const tool_call_ring_capacity = tool_call_metrics.ring_capacity;
+pub const RenderEvent = render_metrics.Event;
+pub const render_ring_capacity = render_metrics.ring_capacity;
+
+pub fn recordRenderEvent(kind: render_metrics.Kind, comptime fmt: []const u8, args: anytype) void {
+    render_metrics.record(kind, fmt, args);
+}
+
+pub fn snapshotRenderEvents(out: []RenderEvent) usize {
+    return render_metrics.snapshot(out);
+}
 
 pub fn recordNetworkCall(call: NetworkCall) void {
     network_metrics.record(call);
@@ -38,6 +49,7 @@ pub fn snapshotToolCalls(out: []ToolCallMetric) usize {
 pub fn resetSession() void {
     network_metrics.reset();
     tool_call_metrics.reset();
+    render_metrics.reset();
 }
 
 pub fn resetForTest() void {

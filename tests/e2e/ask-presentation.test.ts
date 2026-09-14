@@ -863,7 +863,7 @@ describe("fx ask presentation", () => {
       expect(scrollback).toContain("1 tool call · 1 command");
       expect(scrollback).not.toContain("project instructions");
       expect(scrollback).not.toContain("Auto agent approved this request");
-      expect(scrollback).not.toContain("● System:");
+      expect(scrollback).not.toMatch(/[*✓!✗⊘i] system:/);
     },
     TIMEOUT,
   );

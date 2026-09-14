@@ -1,4 +1,5 @@
 const std = @import("std");
+const file_picker_path = @import("../input/file_picker_path.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const list_window = @import("../shared/list_window.zig");
@@ -1145,10 +1146,6 @@ pub fn skillSourceMatchesFilter(source: SkillSource, filter: SkillMenuSourceFilt
     return filter == .all or skillMenuFilterForSource(source) == filter;
 }
 
-pub fn skill_matches_menu_query(skill: Skill, query: []const u8) bool {
-    return skillMatchRank(skill, query) != null;
-}
-
 pub fn skillDisplaySource(skills: []const Skill, selected: Skill) ?SkillSource {
     var matching_names: usize = 0;
     for (skills) |skill| {
@@ -1159,10 +1156,6 @@ pub fn skillDisplaySource(skills: []const Skill, selected: Skill) ?SkillSource {
     return null;
 }
 
-pub fn skillMenuFilterCount(skills: []const Skill, filter: SkillMenuSourceFilter) usize {
-    return skillMenuFilterQueryCount(skills, filter, "");
-}
-
 pub fn skillMenuFilterQueryCount(skills: []const Skill, filter: SkillMenuSourceFilter, query: []const u8) usize {
     var count: usize = 0;
     var it = SkillMenuView.init(skills, filter, query);
@@ -1170,10 +1163,6 @@ pub fn skillMenuFilterQueryCount(skills: []const Skill, filter: SkillMenuSourceF
         count += 1;
     }
     return count;
-}
-
-pub fn skillMenuActualIndexAt(skills: []const Skill, filter: SkillMenuSourceFilter, display_index: usize) ?usize {
-    return skillMenuActualIndexAtQuery(skills, filter, "", display_index);
 }
 
 pub fn skillMenuActualIndexAtQuery(skills: []const Skill, filter: SkillMenuSourceFilter, query: []const u8, display_index: usize) ?usize {
@@ -2649,7 +2638,10 @@ pub fn collectExplicitSkillSelections(alloc: Allocator, prompt: []const u8, skil
     var selections: std.ArrayList(ExplicitSelection) = .empty;
     defer selections.deinit(alloc);
     const trimmed = std.mem.trimStart(u8, prompt, " \t\r\n");
-    const natural_end = std.mem.findScalar(u8, prompt, '$') orelse prompt.len;
+    var natural_end: usize = 0;
+    while (natural_end < prompt.len) : (natural_end += 1) {
+        if (file_picker_path.parse_at(prompt, natural_end) != null or prompt[natural_end] == '$') break;
+    }
     var natural = try parseNaturalLanguageSkillReference(alloc, prompt[0..natural_end]);
     defer if (natural) |*reference| reference.deinit(alloc);
     for (skills, 0..) |skill, index| {
@@ -2691,6 +2683,10 @@ pub fn collectExplicitSkillSelections(alloc: Allocator, prompt: []const u8, skil
         }
         if (quote) |active| {
             if (byte == active) quote = null;
+            continue;
+        }
+        if (file_picker_path.parse_at(prompt, index)) |path| {
+            index = path.end - 1;
             continue;
         }
         if (byte == '`' or byte == '~') {
@@ -3112,7 +3108,7 @@ fn renderSkillPrompt(
 
         var description: std.Io.Writer.Allocating = .init(alloc);
         defer description.deinit();
-        const safe_description = try tool_result_limits.prepareRedactedOutput(alloc, skill.description);
+        const safe_description = try tool_result_limits.prepareSanitizedOutput(alloc, skill.description);
         defer alloc.free(safe_description);
         var description_limited = false;
         if (limits.skill_description_bytes.source == .compiled_default) {
@@ -3981,6 +3977,33 @@ test "skill runtime replaces and frees owned discovery diagnostics" {
     try std.testing.expectEqual(@as(usize, 0), runtime.diagnostics.len);
 }
 
+test "explicit skill matching excludes at path regions in dollar and natural references" {
+    const alloc = std.testing.allocator;
+    const skills = [_]Skill{
+        staticSkill("review", "review", .workspace_shared),
+        staticSkill("release", "release", .global_fx),
+    };
+    for ([_][]const u8{
+        "@./$review.txt",
+        "@\"./$review.txt\"",
+        "@\"./a\\\"$review.txt\"",
+        "@\"./a\\\\$review.txt\"",
+        "Use @\"review skill\"",
+        "Use @review skill",
+        "@\"broken$review",
+        "@\"a.png\"invalid$review",
+    }) |prompt| {
+        const selected = try collectExplicitSkillSelections(alloc, prompt, &skills);
+        defer alloc.free(selected);
+        try std.testing.expectEqual(@as(usize, 0), selected.len);
+    }
+    for ([_][]const u8{ "$release @./$review.txt", "Use release skill @\"./$review.txt\"", "@./$review.txt use $release" }) |prompt| {
+        const selected = try matchExplicitSkillIndices(alloc, prompt, &skills);
+        defer alloc.free(selected);
+        try std.testing.expectEqualSlices(usize, &.{1}, selected);
+    }
+}
+
 test "explicit skill matching finds multiple mentions in request order" {
     const skills = [_]Skill{
         staticSkill("review", "review help", .workspace_shared),
@@ -4395,18 +4418,17 @@ test "skill catalog locations reject a changed identity mapping" {
     try std.testing.expectError(error.StaleSkillLocation, after.locations.resolve(alloc, location));
 }
 
-test "skill catalog does not expose sensitive descriptions or encoded locations" {
+test "skill catalog keeps secret-bearing descriptions and locations verbatim" {
     const alloc = std.testing.allocator;
     const skills = [_]Skill{
-        .{ .name = "safe", .description = "Release checks. API_KEY=description-secret", .path = "/root/safe", .source = .global_fx },
-        .{ .name = "hidden", .description = "Sensitive location", .path = "/root/TOKEN=location-secret", .source = .global_fx },
+        .{ .name = "safe", .description = "Release checks. API_KEY=description-secret-value", .path = "/root/safe", .source = .global_fx },
+        .{ .name = "hidden", .description = "Sensitive location", .path = "/root/TOKEN=location-secret-value", .source = .global_fx },
     };
     var section = try buildSkillPrompt(alloc, &skills, &.{}, .{}, 200_000);
     defer section.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, section.text, "- safe:") != null);
-    try std.testing.expect(std.mem.find(u8, section.text, "description-secret") == null);
-    try std.testing.expect(std.mem.find(u8, section.text, "location-secret") == null);
-    try std.testing.expect(std.mem.find(u8, section.text, "- hidden:") == null);
+    try std.testing.expect(std.mem.find(u8, section.text, "API_KEY=description-secret-value") != null);
+    try std.testing.expect(std.mem.find(u8, section.text, "- hidden:") != null);
 }
 
 fn checkSkillPromptAllocationFailures(alloc: Allocator) !void {

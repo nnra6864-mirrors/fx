@@ -264,7 +264,7 @@ async function selectReviewSkill(
   selectWorkspace = false,
 ): Promise<void> {
   await active.sendLiteralText("$review");
-  await active.waitForText("Enter Use", TIMEOUT);
+  await active.waitForText("enter use", TIMEOUT);
   if (selectWorkspace) await active.sendKeys("Down");
   await active.sendKeys("Enter");
 }
@@ -322,7 +322,7 @@ tmuxTest(
     await waitForTraceOrExit(active, "reason=unsafe_suffix");
 
     expect(gateway?.requestCount()).toBe(0);
-    expect(await active.captureFullScrollback()).not.toContain("● Version:");
+    expect(await active.captureFullScrollback()).not.toMatch(/[*✓!✗⊘i] version:/);
     await active.waitForText("PRESERVED_DRAFT", TIMEOUT);
 
     await active.sendKeys("Enter");

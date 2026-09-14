@@ -408,6 +408,7 @@ const max_static_status_activity_rows: u16 = 3;
 pub const RenderContext = struct {
     slash_registry: command_specs.SlashRegistry = .{},
     stream: StreamState,
+    compaction: @import("../../core/output/compaction_activity.zig").Snapshot = .{},
     pending_prompt_activity: bool = false,
     completed_assistant_presentation_tail: bool = false,
     // Pacer emitting visible text, including the post-finish tail drain.
@@ -418,7 +419,7 @@ pub const RenderContext = struct {
     composer_visible: bool = true,
     permission_mode: types.PermissionMode = .ask,
     steering_messages: []const []const u8 = &.{},
-    steering_waits_for_tool: bool = false,
+    steering_waits_for_boundary: bool = false,
     fast_indicator_active: bool = false,
     effort: types.ReasoningEffort = .auto,
     model_supports_effort: bool = false,
@@ -444,6 +445,8 @@ pub const RenderContext = struct {
     file_query_active: bool = false,
     file_completions: []const file_index.SearchResult = &.{},
     file_completion_index: usize = 0,
+    file_completion_has_selection: bool = true,
+    file_completion_status: ?[]const u8 = null,
     file_completion_window_start: usize = 0,
     file_completion_anchor: usize = 0,
     file_completions_loading: bool = false,
@@ -469,6 +472,7 @@ pub const RenderContext = struct {
     danger_status: []const u8 = "",
     danger_status_compact: []const u8 = "",
     esc_clear_armed: bool = false,
+    esc_interrupt_armed: bool = false,
     question: ?question_prompt.Projection = null,
     statusline: ui_render.StatuslineItems = .{},
     activity: ActivityProjection = .none,
@@ -514,11 +518,11 @@ fn steering_unit_width(raw: []const u8) usize {
 pub fn steering_message_layout(
     message: []const u8,
     width: u16,
-    waits_for_tool: bool,
+    waits_for_boundary: bool,
     row_limit: u16,
 ) SteeringMessageLayout {
     var layout: SteeringMessageLayout = .{
-        .content_width = if (waits_for_tool) width -| 2 else width,
+        .content_width = if (waits_for_boundary) width -| 2 else width,
     };
     const limit = @min(row_limit, max_steering_message_rows);
     var offset: usize = 0;
@@ -574,13 +578,13 @@ pub fn steering_message_layout(
 
 pub fn steeringBannerRowsForMessages(
     messages: []const []const u8,
-    waits_for_tool: bool,
+    waits_for_boundary: bool,
     width: u16,
 ) u16 {
-    if (messages.len == 0 or !waits_for_tool) return 0;
+    if (messages.len == 0 or !waits_for_boundary) return 0;
     var rows: u16 = 0;
     for (messages) |message| {
-        rows +|= steering_message_layout(message, width, waits_for_tool, max_steering_message_rows).row_count;
+        rows +|= steering_message_layout(message, width, waits_for_boundary, max_steering_message_rows).row_count;
     }
     return rows +| steering_composer_gap_rows;
 }
@@ -588,7 +592,7 @@ pub fn steeringBannerRowsForMessages(
 pub fn steeringBannerRows(ctx: RenderContext, width: u16) u16 {
     return steeringBannerRowsForMessages(
         ctx.steering_messages,
-        ctx.steering_waits_for_tool,
+        ctx.steering_waits_for_boundary,
         width,
     );
 }
@@ -699,7 +703,8 @@ pub fn frameOwnedActivityProjection(
     approval: ?approval_prompt.Projection,
 ) ActivityProjection {
     if (approval != null or ctx.question != null) return .none;
-    if (!ctx.stream.active and ctx.pending_prompt_activity) {
+    const compaction = activity_status.compactionProjection(buf, ctx.compaction, ctx.stream, ctx.now_ms);
+    if (compaction == .none and !ctx.stream.active and ctx.pending_prompt_activity) {
         return .{ .turn_thinking = .{ .label = "• Thinking" } };
     }
     switch (ctx.activity) {
@@ -709,7 +714,17 @@ pub fn frameOwnedActivityProjection(
         },
         .none => {},
     }
+    if (compaction != .none) return compaction;
     return turnActivityProjection(buf, shell, ctx);
+}
+
+pub fn frameActivityBlink(ctx: RenderContext) ?bool {
+    if (ctx.compaction.operation) |op| {
+        if (op.active() and op.visible(ctx.now_ms)) {
+            return activity_status.activityBlinkVisible(activity_status.compactionClock(ctx.stream, op), ctx.now_ms);
+        }
+    }
+    return activity_status.activityBlinkVisible(ctx.stream, ctx.now_ms);
 }
 
 fn turnActivityProjection(
@@ -930,6 +945,42 @@ test "frame-owned thinking activity projects the thinking label" {
         .turn_thinking => |thinking| try std.testing.expectEqualStrings("• Thinking", thinking.label),
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
+}
+
+test "frame compaction overrides idle and tool activity but not blocking feedback or questions" {
+    var input = InputRuntime{};
+    defer input.deinit(std.testing.allocator);
+    var shell = TranscriptRuntime{};
+    defer shell.deinit(std.testing.allocator);
+    var state: @import("../../core/output/compaction_activity.zig").State = .{};
+    const id = state.begin(.manual, null, 1_000);
+    state.running(id, .summary);
+    var ctx: RenderContext = .{
+        .stream = .{},
+        .compaction = state.snapshot,
+        .now_ms = 2_500,
+        .has_api_key = true,
+        .model = "test",
+        .input = &input,
+    };
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("• Compacting (1s)", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
+    try std.testing.expectEqual(@as(?bool, false), frameActivityBlink(ctx));
+    try std.testing.expect(!ctx.stream.active);
+    ctx.activity = .{ .tool_slot = .{ .entry_id = 1, .fallback_label = "reading", .active = true, .kind = .read } };
+    try std.testing.expectEqualStrings("• Compacting (1s)", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
+    ctx.activity = .{ .turn_thinking = .{ .label = "Blocking status", .tone = .danger } };
+    try std.testing.expectEqualStrings("Blocking status", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
+    ctx.question = .{ .current_entry = null, .current_index = 0, .entry_count = 0 };
+    try std.testing.expect(frameOwnedActivityProjection(&buf, &shell, ctx, null) == .none);
+    ctx.question = null;
+    state.settle(id, .{ .outcome = .cancelled }, 2_500);
+    ctx.compaction = state.snapshot;
+    ctx.activity = .none;
+    try std.testing.expectEqual(ActivityProjection.Tone.neutral, frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.tone);
+    try std.testing.expect(state.dismiss(id, state.snapshot.revision));
+    ctx.compaction = state.snapshot;
+    try std.testing.expect(frameOwnedActivityProjection(&buf, &shell, ctx, null) == .none);
 }
 
 test "pending prompt projects thinking before the worker stream starts" {

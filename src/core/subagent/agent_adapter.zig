@@ -172,6 +172,16 @@ pub fn run(
     routed_config.tool_context.model = admission.model;
     routed_config.tool_context.provider = admission.provider;
     routed_config.tool_context.provider_capabilities = config.provider_set.select(admission.provider).capabilities;
+    debug_trace.logf(
+        "subagent",
+        "child turn routed child_id={s} provider={s} model={s} effort={s}",
+        .{
+            turn.child_id orelse "unknown",
+            @tagName(admission.provider),
+            admission.model,
+            admission.effort.label(),
+        },
+    );
     if (!routed_config.tool_context.provider_capabilities.fx_search) {
         routed_config.tool_context.web_search_backend = null;
         routed_config.tool_context.web_search_runtime_ready = false;
@@ -381,6 +391,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .context_registry = context.config.context_registry,
         .context_enabled = context.config.context_enabled,
         .finalize_turn = finalizeTurn,
+        .take_steering_boundary = takeChildSteeringBoundary,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .live_tool_authority = context.turn.liveToolAuthorityProvider(),
         .tool_activity_recorder = context.turn.toolActivityRecorder(),
@@ -421,6 +432,17 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
     };
 }
 
+fn takeChildSteeringBoundary(
+    raw: *anyopaque,
+    arena: Allocator,
+    turn_id: u64,
+    kind: worker_runtime.SteeringBoundaryKind,
+) !worker_runtime.SteeringBoundaryResult {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    if (context.cancel.load(.seq_cst)) return if (kind == .cancelled) .interrupt else .none;
+    return context.turn.workerRuntime().takeSteeringBoundaryInto(context.turn.alloc, arena, turn_id, kind);
+}
+
 fn releaseAgentTerminalLease(raw: *anyopaque, session_id: []const u8) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
     return tool_runtime.release_agent_terminal_lease(context.toolContext(), session_id);
@@ -434,6 +456,10 @@ fn refreshGatewayCredential(
     expected_account_id: ?[]const u8,
 ) !?[]u8 {
     const context: *Context = @ptrCast(@alignCast(raw));
+    if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
+        debug_trace.logf("auth", "credential refresh skipped source={t} reason=verified_recently", .{source});
+        return null;
+    }
     var refreshed = (try auth_runtime.refreshCredentialForAccount(
         context.config.tool_context.oauth_transport,
         context.turn.alloc,
@@ -497,10 +523,10 @@ fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayL
     }, arena, messages);
 }
 
-fn appendStaticContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayList(types.ChatMessage)) !void {
+fn appendStaticContext(raw: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(types.ChatMessage)) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
     try context.config.context_registry.appendDefaultStatic(.{
-        .project_context = context.config.project_context,
+        .project_context = project_context orelse context.config.project_context,
     }, arena, messages);
     var snapshot = try snapshotModelCatalogForView(
         arena,
@@ -835,9 +861,9 @@ fn captureHttpError(
         detail,
     );
     defer context.turn.alloc.free(formatted);
-    const redacted = try execution_memory.redactText(context.turn.alloc, formatted);
-    defer context.turn.alloc.free(redacted);
-    context.turn.setFailureDiagnostic("provider_http_error", redacted);
+    const masked = try execution_memory.maskTextForDisplay(context.turn.alloc, formatted);
+    defer context.turn.alloc.free(masked);
+    context.turn.setFailureDiagnostic("provider_http_error", masked);
 }
 
 fn pushLiveEvent(raw: *anyopaque, event: worker_runtime.WorkerEvent) !void {
@@ -859,4 +885,3 @@ fn pushLiveOutputChunk(
         .text = @constCast(text),
     } });
 }
-fn discardBackgroundUrl(_: *anyopaque, _: u64, _: []const u8) void {}

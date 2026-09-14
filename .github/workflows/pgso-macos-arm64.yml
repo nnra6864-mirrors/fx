@@ -85,6 +85,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pgso-seed-${{ github.sha }}
+          overwrite: true
           path: |
             ${{ runner.temp }}/fx-pgso-seed/manifest.json
             ${{ runner.temp }}/fx-pgso-seed/control/bin/fx
@@ -147,6 +148,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pgso-training-${{ github.sha }}-${{ matrix.id }}
+          overwrite: true
           path: |
             ${{ runner.temp }}/fx-pgso-training-${{ matrix.id }}/manifest.json
             ${{ runner.temp }}/fx-pgso-training-${{ matrix.id }}/failure.json
@@ -202,6 +204,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pgso-candidate-${{ github.sha }}
+          overwrite: true
           path: |
             ${{ runner.temp }}/fx-pgso-candidate/manifest.json
             ${{ runner.temp }}/fx-pgso-candidate/failure.json
@@ -279,6 +282,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pgso-behavior-${{ github.sha }}-${{ matrix.id }}
+          overwrite: true
           path: |
             ${{ runner.temp }}/fx-pgso-behavior-${{ matrix.id }}/manifest.json
             ${{ runner.temp }}/fx-pgso-behavior-${{ matrix.id }}/failure.json
@@ -335,6 +339,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pgso-startup-${{ github.sha }}-${{ matrix.name }}
+          overwrite: true
           path: |
             ${{ runner.temp }}/fx-pgso-startup-${{ matrix.name }}/manifest.json
             ${{ runner.temp }}/fx-pgso-startup-${{ matrix.name }}/failure.json
@@ -392,6 +397,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pgso-heavy-${{ github.sha }}-${{ matrix.name }}
+          overwrite: true
           path: |
             ${{ runner.temp }}/fx-pgso-heavy-${{ matrix.name }}/manifest.json
             ${{ runner.temp }}/fx-pgso-heavy-${{ matrix.name }}/failure.json
@@ -454,6 +460,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pgso-evidence-macos-arm64-${{ github.sha }}
+          overwrite: true
           path: ${{ runner.temp }}/fx-pgso-aggregate
           if-no-files-found: error
           retention-days: 14

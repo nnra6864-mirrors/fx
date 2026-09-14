@@ -996,8 +996,7 @@ fn sanitizeServerInstructionsAlloc(alloc: Allocator, text: []const u8) ![]u8 {
     const arena = arena_state.allocator();
 
     const safe = try text_utils.sanitizeModelText(arena, text);
-    const masked = try text_utils.maskSecrets(arena, safe);
-    const trimmed = std.mem.trim(u8, masked, " \t\r\n");
+    const trimmed = std.mem.trim(u8, safe, " \t\r\n");
     return try alloc.dupe(u8, trimmed);
 }
 

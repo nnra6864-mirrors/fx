@@ -55,18 +55,11 @@ const buildToolsListRequest = protocol_messages.buildToolsListRequest;
 const writeModernRequestMetadata = protocol_messages.writeModernRequestMetadata;
 const buildToolCallRequest = protocol_messages.buildToolCallRequest;
 const buildToolCallRequestForProtocol = protocol_messages.buildToolCallRequestForProtocol;
-const writeModernRequestMetadataWithProgress = protocol_messages.writeModernRequestMetadataWithProgress;
-const writeModernRequestMetadataForm = protocol_messages.writeModernRequestMetadataForm;
-const writeModernRequestMetadataUrl = protocol_messages.writeModernRequestMetadataUrl;
-const writeModernRequestMetadataFormAndUrl = protocol_messages.writeModernRequestMetadataFormAndUrl;
 const buildLegacyInitializeRequest = protocol_messages.buildLegacyInitializeRequest;
 const buildCancellationNotification = protocol_messages.buildCancellationNotification;
-const parseToolsListChangedCapabilityFromResponse = protocol_messages.parseToolsListChangedCapabilityFromResponse;
 const parseServerCapabilitiesFromResponse = protocol_messages.parseServerCapabilitiesFromResponse;
 const parseServerIdentity = protocol_messages.parseServerIdentity;
-const parseToolsListChangedCapability = protocol_messages.parseToolsListChangedCapability;
 const parseServerCapabilities = protocol_messages.parseServerCapabilities;
-const optionalCapabilityBool = protocol_messages.optionalCapabilityBool;
 const featureProtocol = protocol_messages.featureProtocol;
 const docker_run = @import("docker_run.zig");
 const stdio_dispatcher = @import("stdio_dispatcher.zig");
@@ -85,7 +78,6 @@ const tools_feature = @import("features/tools.zig");
 const tool_result = @import("tool_result.zig");
 
 const Allocator = std.mem.Allocator;
-const legacy_protocol_version = protocol_negotiation.legacy_protocol_version;
 const legacy_2025_06_protocol_version = protocol_negotiation.legacy_2025_06_protocol_version;
 const legacy_2025_11_protocol_version = protocol_negotiation.legacy_2025_11_protocol_version;
 const modern_protocol_version = protocol_negotiation.modern_protocol_version;
@@ -95,11 +87,8 @@ const default_mcp_search_limit: usize = 8;
 const max_mcp_search_limit: usize = 20;
 const mcp_tool_description_search_bytes: usize = 2 * 1024;
 const mcp_tool_schema_search_bytes: usize = 4 * 1024;
-const max_pending_legacy_url_waiters = legacy_url_completion.max_pending_legacy_url_waiters;
 const max_early_legacy_url_completions_per_window = legacy_url_completion.max_early_legacy_url_completions_per_window;
 const max_legacy_url_completion_candidates = legacy_url_completion.max_legacy_url_completion_candidates;
-const max_legacy_url_completion_windows = legacy_url_completion.max_legacy_url_completion_windows;
-const early_legacy_url_completion_ttl_ms = legacy_url_completion.early_legacy_url_completion_ttl_ms;
 const allocateGeneration = @import("server_lifetime.zig").allocateIdentity;
 
 const lockRwSharedUntil = controlled_lock.rwSharedUntil;
@@ -107,7 +96,6 @@ const lockRwUntil = controlled_lock.rwUntil;
 const lockMutexUntil = controlled_lock.mutexUntil;
 const checkOperationControl = controlled_lock.checkOperation;
 const StdioProtocol = protocol_negotiation.Protocol;
-const ResponsePayload = protocol_negotiation.ResponsePayload;
 const DiscoveryOutcome = protocol_negotiation.DiscoveryOutcome;
 const LegacyStdioVersion = protocol_negotiation.LegacyStdioVersion;
 const LegacyInitializeObservation = protocol_negotiation.LegacyInitializeObservation;
@@ -137,13 +125,6 @@ const LegacyUrlWaiter = legacy_url_completion.Waiter;
 const LegacyUrlWireCompletionIdentity = legacy_url_completion.WireCompletionIdentity;
 const LegacyUrlCompletionCandidate = legacy_url_completion.Candidate;
 const LegacyUrlCompletionReplayStep = legacy_url_completion.ReplayStep;
-
-fn applyLegacyUrlCompletion(
-    waiter: *LegacyUrlWaiter,
-    completion: elicitation.LegacyUrlCompletionIdentity,
-) bool {
-    return legacy_url_completion.apply(waiter, completion, operation_control.awakeMillis(io_mod.getIo()));
-}
 
 fn awaitFeatureServer(
     runtime: *McpRuntime,
@@ -249,8 +230,6 @@ const healthFailureForState = server_views.healthFailureForState;
 
 const DetachedTransport = server_connection.DetachedTransport;
 pub const McpServer = server_connection.Server;
-
-const freeTools = catalog_state.freeTools;
 
 pub const McpRuntime = struct {
     alloc: Allocator,
@@ -7992,7 +7971,8 @@ test "MCP server instructions are captured from initialize and exposed only when
     try server_transport.parseAndStoreServerInstructions(alloc, &server, init_response);
     try std.testing.expect(server.instructions != null);
     try std.testing.expect(std.mem.find(u8, server.instructions.?, "GitHub issue workflows") != null);
-    try std.testing.expect(std.mem.find(u8, server.instructions.?, "github_pat_1234567890abcdef") == null);
+    try std.testing.expect(std.mem.find(u8, server.instructions.?, "github_pat_1234567890abcdef") != null);
+    try std.testing.expect(std.mem.find(u8, server.instructions.?, "[redacted]") == null);
 
     const tools_response =
         \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"create_issue","description":"Create issue","inputSchema":{"type":"object","properties":{}}},{"name":"close_issue","description":"Close issue","inputSchema":{"type":"object","properties":{}}}]}}

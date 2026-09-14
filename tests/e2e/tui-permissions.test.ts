@@ -252,11 +252,11 @@ function expectApprovalControls(
   expect(choiceRows[0]).toBeLessThan(choiceRows[1]!);
   expect(choiceRows[1]).toBeLessThan(choiceRows[2]!);
   expect(block.match(/^\s*❯\s+[123]\s+/mg)).toHaveLength(1);
-  expect(block).toContain("1–3 Choose");
-  expect(block).toContain("Enter Confirm");
-  expect(block).toContain("Esc Cancel");
-  expect(block).toContain("↑↓ Options");
-  if (opts.scrollable) expect(block).toContain("Wheel Scroll");
+  expect(block).toContain("1–3 choose");
+  expect(block).toContain("enter confirm");
+  expect(block).toContain("esc cancel");
+  expect(block).toContain("↑↓ options");
+  if (opts.scrollable) expect(block).toContain("wheel scroll");
 
   expect(block).not.toMatch(/^\s*[123][YAN]\b/m);
   for (const oldCopy of [
@@ -831,14 +831,14 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expectApprovalControls(approval, {
         scope: "workspace file access for this session",
       });
-      expect(approval).not.toContain("Wheel Scroll");
+      expect(approval).not.toContain("wheel scroll");
       const grid = await session.capturePaneGrid();
       expect(grid[0]).toContain("Run /help for commands");
       const bottomDividerRow = grid.findLastIndex((row) =>
         /^─+$/.test(row.trim()),
       );
       expect(bottomDividerRow).toBeGreaterThanOrEqual(0);
-      expect(grid[bottomDividerRow + 1]).toContain("1–3 Choose");
+      expect(grid[bottomDividerRow + 1]).toContain("1–3 choose");
       const rows = approval.split("\n");
       const headerRow = rows.findIndex((row) =>
         row.includes("Permission needed · Review change"),
@@ -846,7 +846,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       const questionRow = rows.findIndex((row) => row.includes(APPLY_QUESTION));
       const choiceOneRow = rows.findIndex((row) => row.includes("1  Apply once"));
       const choiceThreeRow = rows.findIndex((row) => row.includes("3  Don't apply"));
-      const hintRow = rows.findIndex((row) => row.includes("1–3 Choose"));
+      const hintRow = rows.findIndex((row) => row.includes("1–3 choose"));
       expect(rows[headerRow + 1]!.trim()).toBe("");
       expect(questionRow).toBe(headerRow + 2);
       expect(rows[questionRow + 1]!.trim()).toBe("");
@@ -1489,7 +1489,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(compactScrollback).not.toContain("CTRL_O_FIRST_060");
 
       await session.sendKeys("C-o");
-      await session.waitForText("Full detail · ctrl o close", TIMEOUT);
+      await session.waitForText("full detail · ctrl+o close", TIMEOUT);
       for (let page = 0; page < 20; page += 1) {
         await session.sendHexBytes(["1b", "5b", "36", "7e"]);
       }
@@ -1571,7 +1571,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(inline).not.toContain("NEW_WRAP_TAIL");
 
       await session.sendKeys("C-o");
-      await session.waitForText("Full detail · ctrl o close", TIMEOUT);
+      await session.waitForText("full detail · ctrl+o close", TIMEOUT);
       const full = await session.capturePane();
       expectDiffSentinelOnRail(full, "OLD_WRAP_TAIL");
       expectDiffSentinelOnRail(full, "NEW_WRAP_TAIL");

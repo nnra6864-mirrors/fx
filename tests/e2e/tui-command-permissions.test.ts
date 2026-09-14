@@ -22,9 +22,11 @@ import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   canonicalSubagentIdForStore,
   fakeGatewayPermissionDecision,
+  fakeGatewayTitleDefault,
   heldFakeGatewayFinalText,
   isVolatileTokenStatusRow,
   startDynamicFakeGateway,
+  TITLE_GENERATION_MARKER,
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
@@ -395,6 +397,7 @@ function startFakeGateway(
         }
         return permissionDecision(options.classifierDecision ?? "clear");
       }
+      if (body.includes(TITLE_GENERATION_MARKER)) return fakeGatewayTitleDefault();
       requests.push({ body, headers: req.headers });
       const response = responses.shift();
       if (!response) return new Response("unexpected request", { status: 500 });
@@ -403,7 +406,7 @@ function startFakeGateway(
   });
   const gateway = {
     baseUrl: `http://127.0.0.1:${server.port}`,
-    chatUrl: `http://127.0.0.1:${server.port}/v3/ai/language-model`,
+    chatUrl: `http://127.0.0.1:${server.port}/v4/ai/language-model`,
     requests,
     classifierRequests,
     stop() {
@@ -1222,7 +1225,7 @@ describe("effect-aware command permissions", () => {
       expectNoOutputRows(completed);
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("Full detail · ctrl o close", TIMEOUT);
+      await activeSession.waitForText("full detail · ctrl+o close", TIMEOUT);
       await activeSession.waitForText("FXC110_FAILED_STDERR", TIMEOUT);
       const full = await activeSession.capturePane();
       expect(full).toContain("FXC110_FAST_STDOUT");
@@ -1231,7 +1234,10 @@ describe("effect-aware command permissions", () => {
       expect(full).toContain("FXC110_FAILED_STDERR");
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("3 tool calls", TIMEOUT);
+      await activeSession.waitForPane(
+        pane => pane.includes("3 tool calls") && !pane.includes("full detail · ctrl+o close"),
+        TIMEOUT,
+      );
       expectNoOutputRows(await activeSession.captureFullScrollback());
       await activeSession.resizeWindow(64, 28);
       expectNoOutputRows(await activeSession.captureFullScrollback());
@@ -1253,7 +1259,7 @@ describe("effect-aware command permissions", () => {
       expectNoOutputRows(await activeSession.captureFullScrollback());
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("Full detail · ctrl o close", TIMEOUT);
+      await activeSession.waitForText("full detail · ctrl+o close", TIMEOUT);
       await activeSession.waitForText("FXC110_FAILED_STDERR", TIMEOUT);
       let resumedFull = await activeSession.capturePane();
       await activeSession.sendHexBytes(["1b", "5b", "35", "7e"]);
@@ -1407,14 +1413,14 @@ describe("effect-aware command permissions", () => {
       const losslessGrid = await activeSession.capturePaneGrid();
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("Full detail · ctrl o close", TIMEOUT);
+      await activeSession.waitForText("full detail · ctrl+o close", TIMEOUT);
       await activeSession.waitForText(losslessRows[6]!, TIMEOUT);
       const losslessFull = await activeSession.capturePane();
       const losslessFullOutput = commandOutputText(losslessFull);
       for (const row of losslessRows) expect(losslessFullOutput).toContain(`│ ${row}`);
       expect(losslessFullOutput).not.toContain("<stdout>");
       expect(losslessFullOutput).not.toContain("</stdout>");
-      expect(losslessFullOutput).not.toContain("lines more (ctrl o");
+      expect(losslessFullOutput).not.toContain("lines more (ctrl+o");
       await activeSession.sendKeys("C-o");
       await activeSession.waitForText("DIRECT_LOSSLESS_DONE", TIMEOUT);
       expect(normalizeVolatileStatusRows(await activeSession.capturePaneGrid())).toEqual(
@@ -1436,7 +1442,7 @@ describe("effect-aware command permissions", () => {
       const lossyGrid = await activeSession.capturePaneGrid();
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("Full detail · ctrl o close", TIMEOUT);
+      await activeSession.waitForText("full detail · ctrl+o close", TIMEOUT);
       await activeSession.sendHexBytes(["1b", "5b", "36", "7e"]);
       await activeSession.waitForText(lossyRows[7]!, TIMEOUT);
       const lossyFull = await activeSession.capturePane();
@@ -1506,7 +1512,7 @@ describe("effect-aware command permissions", () => {
       expect(resumedCompactOutput).toBe("");
       for (const row of lossyRows) expect(resumedCompact).not.toContain(`│ ${row}`);
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("Full detail · ctrl o close", TIMEOUT);
+      await activeSession.waitForText("full detail · ctrl+o close", TIMEOUT);
       await activeSession.sendHexBytes(["1b", "5b", "36", "7e"]);
       await activeSession.waitForText(lossyRows[7]!, TIMEOUT);
       const resumedFull = await activeSession.capturePane();
@@ -1573,7 +1579,7 @@ describe("effect-aware command permissions", () => {
       for (const row of commandRows) expect(compact).not.toContain(`│ ${row}`);
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("Full detail · ctrl o close", TIMEOUT);
+      await activeSession.waitForText("full detail · ctrl+o close", TIMEOUT);
       await activeSession.waitForText(commandRows.at(-1)!, TIMEOUT);
       const full = await activeSession.capturePane();
       for (const row of commandRows) expect(full).toContain(`│ ${row}`);
@@ -1586,19 +1592,19 @@ describe("effect-aware command permissions", () => {
       expect(extractResponses(beforeSlashCommands)).toEqual(responseRows);
 
       await activeSession.sendText("/sound on");
-      await activeSession.waitForText("● Sound: on", TIMEOUT);
+      await activeSession.waitForText("* sound: on", TIMEOUT);
       await activeSession.sendText("/settings");
-      await activeSession.waitForText("←→ Change", TIMEOUT);
+      await activeSession.waitForText("←→ change", TIMEOUT);
       await activeSession.sendKeys("Escape");
       await activeSession.waitForPane(
-        (pane) => !pane.includes("←→ Change"),
+        (pane) => !pane.includes("←→ change"),
         TIMEOUT,
       );
       await activeSession.waitForText(responseRows.at(-1)!, TIMEOUT);
 
       const afterSlashCommands = await activeSession.captureFullScrollback();
       expect(extractResponses(afterSlashCommands)).toEqual(responseRows);
-      expect(afterSlashCommands.indexOf("● Sound: on")).toBeGreaterThan(
+      expect(afterSlashCommands.indexOf("* sound: on")).toBeGreaterThan(
         afterSlashCommands.indexOf(responseRows.at(-1)!),
       );
       expect(afterSlashCommands).toContain("Ran printf");
@@ -1675,6 +1681,11 @@ describe("effect-aware command permissions", () => {
       writeFileSync(stderrPath, "");
       installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
       const gateway = startFakeGateway([
+        gatewayToolCall("subagent", {
+          request: { action: "run", task: "Run the prepared child diagnostic command." },
+        }, "trace_child"),
+        toolCall("printf child-trace-output", {}, "trace_child_command"),
+        finalText("child diagnostic complete"),
         gatewayToolCall("edit_file", {
           path: "duplicate.txt",
           old_string: "same",
@@ -1691,6 +1702,9 @@ describe("effect-aware command permissions", () => {
           PATH: hostilePath(root),
           TMPDIR: root.root,
           FX_PERMISSION_MODE: "yolo",
+          FX_TRACE: "0",
+          FX_TRACE_LOG: undefined,
+          FX_TRACE_STDERR: "0",
         }),
         stderrPath,
         width: 120,
@@ -1710,10 +1724,16 @@ describe("effect-aware command permissions", () => {
       );
       const report = readFileSync(latestTraceReportPath(root), "utf8");
 
-      expect(gateway.requests).toHaveLength(3);
+      expect(gateway.requests).toHaveLength(6);
       expect(report).toContain(
-        "last=2 succeeded=0 rejected=1 command_failed=1 tool_failed=0 runtime_failed=0",
+        "last=4 succeeded=2 rejected=1 command_failed=1 tool_failed=0 runtime_failed=0",
       );
+      const localCalls = report.split("## Tool Calls\n### Local\n")[1]?.split("### Web Search")[0];
+      expect(localCalls).toBeDefined();
+      expect(localCalls).toMatch(/name=shell outcome=succeeded duration=\d+ms source=subagent#1\n/);
+      expect(localCalls).toMatch(/name=subagent outcome=succeeded duration=\d+ms source=parent\n/);
+      expect(localCalls).toMatch(/name=shell outcome=command_failed duration=\d+ms source=parent\n/);
+      expect(localCalls).toMatch(/name=edit_file outcome=rejected duration=\d+ms source=parent\n/);
       expect(report).toContain("name=edit_file outcome=rejected");
       expect(report).toContain("name=shell outcome=command_failed");
       expect(report).not.toContain("name=edit_file outcome=runtime_failed");
@@ -1796,7 +1816,10 @@ describe("effect-aware command permissions", () => {
     "TUI creates a private Markdown trace without a feedback CTA",
     async () => {
       const root = createIsolatedRoot();
-      const gateway = startFakeGateway([]);
+      const gateway = startFakeGateway([finalText(
+        Array.from({ length: 80 }, (_, index) => `TRACE_RENDER_ROW_${index}\n`).join("") +
+          "TRACE_RENDER_DONE",
+      )]);
       const stderrPath = join(root.root, "trace-report-stderr.log");
       const clipboardPath = join(root.root, "trace-clipboard-path.txt");
       installClipboardFixture(
@@ -1812,12 +1835,20 @@ describe("effect-aware command permissions", () => {
           PATH: hostilePath(root),
           TMPDIR: root.root,
           FX_TRACE_CLIPBOARD_OUTPUT: clipboardPath,
+          FX_TRACE: "0",
+          FX_TRACE_LOG: undefined,
+          FX_TRACE_STDERR: "0",
         }),
         stderrPath,
         width: 120,
         height: 40,
       });
       await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("Render the trace fixture.");
+      await activeSession.waitForText("TRACE_RENDER_DONE", TIMEOUT);
+      await activeSession.waitForStableComposer(TIMEOUT);
+      await activeSession.resizeWindow(100, 32);
+      await activeSession.waitForStableComposer(TIMEOUT);
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
         process.platform === "darwin"
@@ -1836,6 +1867,16 @@ describe("effect-aware command permissions", () => {
       expect(report).toContain("# fx trace");
       expect(report).toContain("## Summary");
       expect(report).toContain(root.workspace);
+      expect(report).toContain("terminal_hosts: tmux=true");
+      expect(report).toContain("projection: view=");
+      const rendererEvents = report.split("## Recent Renderer Events\n")[1]?.split("## Transcript Timeline")[0];
+      expect(rendererEvents).toBeDefined();
+      expect(rendererEvents).toContain("kind=transition");
+      expect(rendererEvents).toContain("kind=commit");
+      expect(rendererEvents).toContain("kind=resize");
+      expect(rendererEvents).not.toContain("TRACE_RENDER_ROW_");
+      expect(rendererEvents).not.toContain("[truncated]");
+      expect(existsSync(join(root.home, ".fx", "logs", "trace.log"))).toBe(false);
       expect(statSync(reportPath).mode & 0o077).toBe(0);
       if (process.platform === "darwin") {
         expect(readFileSync(clipboardPath, "utf8")).toBe(reportPath);
@@ -1948,7 +1989,7 @@ describe("effect-aware command permissions", () => {
       const compactGrid = await activeSession.capturePaneGrid();
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("Full detail · ctrl o close", TIMEOUT);
+      await activeSession.waitForText("full detail · ctrl+o close", TIMEOUT);
       const fullTranscript = await activeSession.capturePane();
       expect(fullTranscript).not.toContain("Auto agent approved this request");
       expect(fullTranscript.indexOf("└ Ran")).toBeGreaterThanOrEqual(0);
@@ -2252,7 +2293,7 @@ describe("effect-aware command permissions", () => {
         expect(scrollback).not.toContain("FX_FOREGROUND_EXEC_FAILED");
 
         await activeSession.sendKeys("C-o");
-        await activeSession.waitForText("Full detail · ctrl o close", TIMEOUT);
+        await activeSession.waitForText("full detail · ctrl+o close", TIMEOUT);
         await activeSession.waitForText("TTY_SESSION_STDERR", TIMEOUT);
         const full = await activeSession.capturePane();
         expect(full).toContain("TTY_SESSION_STDOUT_BEGIN");
@@ -2548,7 +2589,7 @@ describe("effect-aware command permissions", () => {
       }
       expect(gateway.classifierRequests).toHaveLength(1);
 
-      await activeSession.sendKeys("Escape");
+      await activeSession.sendInterruptEscapePair(TIMEOUT);
       const cancelDeadline = Date.now() + TIMEOUT;
       while (
         (!existsSync(tracePath) || !readFileSync(tracePath, "utf8").includes("fallback_reason=Cancelled")) &&
@@ -2876,7 +2917,7 @@ describe("effect-aware command permissions", () => {
         toolCall("touch must-not-exist"),
         finalText("permission resume denial complete"),
       ]);
-      await resumed.session.waitForText("● Session resumed", TIMEOUT);
+      await resumed.session.waitForText("* session resumed", TIMEOUT);
       await resumed.session.waitForText("ask · gpt-5", TIMEOUT);
       await resumed.session.sendText("Create the marker after resuming.");
 
@@ -2896,7 +2937,7 @@ describe("effect-aware command permissions", () => {
 
       const resumedScrollback = await resumed.session.captureFullScrollback();
       expect(resumedScrollback).toContain("permission resume seed complete");
-      expect(resumedScrollback).toContain("● Session resumed");
+      expect(resumedScrollback).toContain("* session resumed");
     },
     90_000,
   );

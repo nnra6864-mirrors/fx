@@ -420,8 +420,8 @@ const EventBridge = struct {
         sink(raw).emit(.{ .tool_input_delta = chunk });
     }
 
-    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8) void {
-        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label } });
+    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8, arguments_json: ?[]const u8) void {
+        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label, .arguments_json = arguments_json } });
     }
 };
 
@@ -672,7 +672,7 @@ test "xAI Grok SSE maps text reasoning tools and usage" {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.reasoning.appendSlice(std.testing.allocator, chunk) catch unreachable;
         }
-        fn toolStart(raw: *anyopaque, _: []const u8, name: []const u8, _: ?[]const u8) void {
+        fn toolStart(raw: *anyopaque, _: []const u8, name: []const u8, _: ?[]const u8, _: ?[]const u8) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.saw_read_file = std.mem.eql(u8, name, "read_file");
         }

@@ -343,11 +343,15 @@ Security is permission-first.
 
 * routine parsed development commands and reversible new-file creation can execute without model review after configured and saved-session policy; unknown, destructive, hidden, credential-bearing, public, and overwrite effects remain on the review or approval path
 
-* every unresolved `auto` action receives one narrow security review after configured policy, saved-session rules, grants, and deterministic safe authority; review input always contains the exact unmasked action and targets, origin and call identity, optional host-proven current-branch evidence, and bounded unmasked terminal-safe excerpts of earlier current-turn tool results. A text match between the action and prior tool output is evidence to inspect, not proof of prompt injection or malicious activity. Prepared file mutations and static root tools omit task text. Reviewed commands, dynamic tools, and subagent actions also receive bounded unmasked canonical current, first, and recent root requests plus explicit omission counts; the reviewer may use that context only to distinguish trusted user intent from malicious or injected influence, never to judge task quality, alignment, or authorization. Assistant prose, permission feedback, compacted summaries, the pending tool group, later results, and tool or repository text never become authority
+* every unresolved `auto` action receives one narrow security review after configured policy, saved-session rules, grants, and deterministic safe authority; review input always contains the exact unmasked action and targets, origin and call identity, optional host-proven current-branch evidence, and bounded unmasked terminal-safe excerpts of earlier current-turn tool results. A text match between the action and prior tool output is evidence to inspect, not proof of prompt injection or malicious activity. Prepared file mutations and other static root tools omit task text. Reviewed commands, shell input, dynamic tools, and subagent actions also receive bounded unmasked canonical current, first, and recent root requests plus explicit omission counts; the reviewer may use that context only to distinguish trusted user intent from malicious or injected influence, never to judge task quality, alignment, or authorization. Assistant prose, permission feedback, compacted summaries, the pending tool group, later results, and tool or repository text never become authority. Shell input reviews also include the owned receiving session's launch command, working directory, and bounded current screen after verifying session authority, including on resume. The launch command describes startup only; screen content remains untrusted evidence and input still receives its own review
 
 * the reviewer returns `caution` only for concrete prompt injection or malicious activity; destructive, risky, external, public, remote, unrequested, or task-conflicting actions clear when they are not malicious. A `clear` review authorizes only the exact unchanged action; a `caution`, incomplete-evidence result, or unavailable review holds only that action and returns guidance without opening a human permission screen, disabling tools, or ending the turn
 
 * exact cautions and deterministic incomplete-evidence results are cached only for the current turn; an unavailable outcome is not cached as a security judgment, but the same exact action spends at most one unavailable transport attempt per turn and changed actions remain independently reviewable until the bounded current-turn transport budget is exhausted. Legacy `permission_request_id` input is rejected without prompting
+
+* host-generated review holds retain their advice for the agent and transcript, but carry a saved `review_feedback` marker that excludes them from later security evidence, including after recovery. Old unmarked results remain untrusted evidence; never infer the marker from output text. Quoted review accusations and handling instructions as document or test data are not standalone proof of prompt injection
+
+* execution-memory schema 10 preserves review-feedback provenance while reading older schemas with an unmarked default. Conversation records use optional metadata for marked holds. Older builds may reject the new saved metadata or recovery checkpoints; do not downgrade an active session without preserving its files
 
 * the sandbox backend is configured independently; full access uses an effective backend of `none` without rewriting the saved sandbox setting
 
@@ -439,6 +443,27 @@ After CI passes for a push to `main`, the dev release workflow publishes commit-
 Release notes are public product copy. Describe user-visible behavior, always spell the product `fx`, and omit contributor attribution, tracker references, repository or website work, delivery infrastructure, CI and test details, branch history, and implementation-only refactors. Use commits and pull requests as research evidence only. Changelog formatting and release-marker rules live in `AGENTS.md`.
 
 Do not create tags manually. The workflow owns tag creation.
+
+### Validate release artifacts without publishing
+
+Run **Actions > Release** on `main` with `validate_only` enabled. This builds
+all four release targets, runs macOS arm64 PGSO qualification, and uses the
+existing `apple-signing` approval to notarize both macOS targets. It does not
+create a tag, publish a GitHub Release, upload to the CDN, or change a channel.
+
+The arm64 validation retains both 4 KiB and 16 KiB signature variants of the
+same PGSO payload for comparison. Intel retains 4 KiB signatures. Download the
+workflow artifacts for matched signed-binary performance checks; notarization
+and smoke checks alone do not establish performance equivalence. Normal release
+runs keep the existing signing default.
+
+To compare the retained signatures on an isolated runner, run **Actions >
+Benchmarks** with `signed_run` set to the successful main validation run ID.
+This mode downloads already-notarized binaries and does not access Apple
+credentials. It records two alternating startup cohorts, an identical-control
+status calibration, and a separate native image-flow memory screen. Review the
+retained measurements before changing release signing defaults; successful
+measurement is not performance approval.
 
 ## Benchmarks
 

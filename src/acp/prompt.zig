@@ -7,6 +7,7 @@ const credentials = @import("../core/auth/credentials.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
+const session_title_generation = @import("../core/session/session_title_generation.zig");
 const js_host_tools = if (host_target.is_wasm)
     @import("../core/hosts/js_host_tools.zig")
 else
@@ -38,7 +39,6 @@ const session_usage = @import("../core/session/session_usage.zig");
 const subagent_agent_adapter = @import("../core/subagent/agent_adapter.zig");
 const subagent_domain = @import("../core/subagent/domain.zig");
 const subagent_execution = @import("../core/subagent/execution.zig");
-const subagent_resume_admission = @import("../core/subagent/resume_admission.zig");
 const usage_recovery = @import("../core/session/usage_recovery.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
 const skill_invocation = @import("../core/skills/skill_invocation.zig");
@@ -58,6 +58,7 @@ const tool_specs = @import("../core/tooling/tool_specs.zig");
 const tool_set_contract = @import("../core/tooling/tool_set.zig");
 const tool_mcp_runtime = @import("../core/tooling/tool_mcp_runtime.zig");
 const tool_presentation = @import("../core/tooling/tool_presentation.zig");
+const tool_call_presentation = @import("tool_call_presentation.zig");
 const tool_result_errors = @import("../core/tooling/tool_result_errors.zig");
 const tool_runtime = @import("../core/tooling/tool_runtime.zig");
 const command_output_content = @import("../core/tooling/command_output_content.zig");
@@ -154,7 +155,6 @@ const AcpContext = struct {
     /// session/set_mode changes never mutate a running turn.
     captured_mode: ?[]const u8 = null,
     captured_permission_mode: ?PermissionMode = null,
-    retain_external_root_user_turn: bool = false,
     current_prompt_input: ?*ParsedPromptInput = null,
 
     fn deinitPublishedToolCalls(self: *AcpContext) void {
@@ -430,9 +430,7 @@ const AcpContext = struct {
 };
 
 fn activeToolSet(state: *const server.ServerState) tool_set_contract.ToolSet {
-    if (state.host_tools.tools.len > 0) return state.host_tools.toolSet();
-    if (comptime host_target.is_wasm) return tool_set_contract.empty;
-    return if (state.cfg.allow_native_tools) builtin_tools.advertisement_set else tool_set_contract.empty;
+    return tool_call_presentation.activeToolSet(state);
 }
 
 fn hostToolProvider(state: *server.ServerState) ?tool_dispatch.HostToolProvider {
@@ -644,6 +642,11 @@ pub fn handlePrompt(
     const session = if (state.active_session) |*active| active else return .{
         .rpc_error = no_active_session_rpc_error,
     };
+    {
+        session.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer session.session_write_mutex.unlock(io_mod.getIo());
+        if (session.writable) |*loaded| try loaded.requireWritable();
+    }
     if (!try server.selectCredentialForProvider(state, session.provider)) {
         return .{ .rpc_error = .{
             .code = ErrorCode.invalid_request,
@@ -663,8 +666,15 @@ pub fn handlePrompt(
         },
     };
 
-    const prior_image_catalog = try session.session_rt.snapshotImageCatalog(alloc, &.{});
+    var prior_image_catalog = try session.session_rt.snapshotImageCatalog(alloc, &.{});
     defer types.freeImageAttachmentSlice(alloc, prior_image_catalog);
+    if (session.writable) |writable| {
+        if (writable.state.recovery_checkpoint) |checkpoint| {
+            const merged = try session_runtime.merge_image_catalog_history_turn(alloc, prior_image_catalog, checkpoint.interruptedTurn());
+            types.freeImageAttachmentSlice(alloc, prior_image_catalog);
+            prior_image_catalog = merged;
+        }
+    }
     const next_image_id = (try image_attachments.calculate_next_image_id(prior_image_catalog)).next_id;
     var prompt_input = parsePromptInputWithFirstImageId(alloc, params, next_image_id) catch |err|
         return promptInputFailure(err);
@@ -743,7 +753,7 @@ pub fn handlePrompt(
         if (writable.conversation_writer.turn_open) {
             const checkpoint = writable.state.recovery_checkpoint orelse
                 return error.InvalidRecoveryCheckpoint;
-            try persistAcpHistoryTurn(alloc, session, checkpoint.interruptedTurn(), false, null);
+            try persistAcpHistoryTurn(alloc, session, checkpoint.interruptedTurn(), null);
         }
     }
 
@@ -779,8 +789,11 @@ pub fn handlePrompt(
     defer alloc.free(root_user_intent_context);
 
     const current_images = if (recovery_checkpoint) |checkpoint| checkpoint.user.images else prompt_input.images;
-    const authorized_image_catalog = try session.session_rt.snapshotImageCatalog(alloc, current_images);
-    defer types.freeImageAttachmentSlice(alloc, authorized_image_catalog);
+    const authorized_image_catalog = if (recovery_checkpoint != null)
+        prior_image_catalog
+    else
+        try session.session_rt.snapshotImageCatalog(alloc, current_images);
+    defer if (recovery_checkpoint == null) types.freeImageAttachmentSlice(alloc, authorized_image_catalog);
 
     const job: worker_runtime.QueuedPrompt = .{
         .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else 0,
@@ -838,7 +851,6 @@ pub fn handlePrompt(
             recovery_checkpoint == null
     else
         false;
-    ctx.retain_external_root_user_turn = current_prompt_is_root_authority;
     var agent_config = buildAgentConfig(state, session, .{
         .skill_catalog = .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
         .host_instructions = host_instructions,
@@ -850,6 +862,8 @@ pub fn handlePrompt(
         writable.childCapability() catch null
     else
         null;
+    maybeStartAcpTitleTask(state, session, owned_prompt, recovery_checkpoint != null);
+    defer if (session.title_task != null) completeAcpTitleTask(state, session, alloc);
     agent_runtime.processAgentPrompt(&session.session_rt.agent, &deps, null, .{
         .view = state.lifecycle_view,
         .scope = .{
@@ -866,6 +880,7 @@ pub fn handlePrompt(
         }
     };
     prompt_input.retainImageSnapshots();
+    completeAcpTitleTask(state, session, alloc);
     try sessions.sendActiveSessionInfoUpdate(state, alloc);
     try sessions.sendActiveSessionUsageUpdate(state, alloc);
 
@@ -874,6 +889,73 @@ pub fn handlePrompt(
     }
 
     return .{ .stop_reason = ctx.stop_reason };
+}
+
+/// Starts background title generation for a fresh persisted ACP session. The
+/// task runs concurrently with the first prompt turn and is applied by
+/// `completeAcpTitleTask` before the session info update goes out. The locally
+/// derived title remains when generation is skipped or unavailable.
+fn maybeStartAcpTitleTask(
+    state: *server.ServerState,
+    session: *server.ActiveSessionState,
+    prompt_text: []const u8,
+    recovery: bool,
+) void {
+    // Unit tests share the real provider bundles; never spawn network side
+    // calls from a test process. Wiring is covered by e2e mock servers.
+    if (comptime @import("builtin").is_test) return;
+    if (comptime host_target.is_wasm) return;
+    if (!state.session_titles or recovery) return;
+    if (session.title_task != null) return;
+    if (session.session_rt.agent.history.items.len != 0) return;
+    const writable = if (session.writable) |*value| value else return;
+    const bundle = state.cfg.provider_set.select(session.provider);
+    const title_model = bundle.title_model orelse return;
+    const agent_stream = bundle.agent_stream orelse return;
+    const excerpt = session_title_generation.promptExcerpt(prompt_text) orelse return;
+    if (session.credential_source != .host_managed and session.api_key.len == 0) return;
+    const task = session_title_generation.Task.create(.{
+        .session_id = writable.active_id,
+        .model = title_model,
+        .prompt_excerpt = excerpt,
+        .api_key = if (session.api_key.len > 0) session.api_key else null,
+        .gateway_team = state.gateway_team,
+        .account_id = session.account_id,
+        .credential_source = session.credential_source,
+        .stream_provider = agent_stream,
+    }) catch return;
+    task.spawn() catch |err| {
+        debug_trace.logf("session", "event=title_generation result=unavailable reason=spawn err={s}", .{@errorName(err)});
+        task.destroy();
+        return;
+    };
+    session.title_task = task;
+}
+
+/// Joins the bounded title task and installs the generated title unless the
+/// session already carries a user-set title. No-op without a pending task.
+fn completeAcpTitleTask(state: *server.ServerState, session: *server.ActiveSessionState, alloc: Allocator) void {
+    _ = state;
+    const task = session.title_task orelse return;
+    session.title_task = null;
+    defer task.destroy();
+    task.join();
+    const title = task.takeTitle() orelse return;
+    defer std.heap.c_allocator.free(title);
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const writable = if (session.writable) |*value| value else return;
+    if (!std.mem.eql(u8, writable.active_id, task.session_id)) {
+        debug_trace.logf("session", "event=title_generation_apply result=dropped reason=session_changed session={s}", .{task.session_id});
+        return;
+    }
+    const installed = session_title_generation.installGeneratedTitle(alloc, writable, session.session_rt.agent.history.items, title) catch |err| {
+        debug_trace.logf("session", "event=title_generation_apply result=failed session={s} err={s}", .{ task.session_id, @errorName(err) });
+        return;
+    };
+    if (installed) {
+        debug_trace.logf("session", "event=title_generation_apply result=installed session={s}", .{task.session_id});
+    }
 }
 
 pub fn runSubagentChild(
@@ -1468,10 +1550,10 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
     }, arena, messages);
 }
 
-fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
+fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     try ctx.state.cfg.context_registry.appendDefaultStatic(.{
-        .project_context = ctx.modelVisibleProjectContext(),
+        .project_context = project_context orelse ctx.modelVisibleProjectContext(),
     }, arena, messages);
     if (ctx.state.cfg.minimal_kernel) return;
     const active_session = if (ctx.state.active_session) |*session| session else null;
@@ -1911,21 +1993,7 @@ fn recordToolCallRejected(
 }
 
 fn toolUpdateContentText(result: ToolExecutionResult) []const u8 {
-    if (!text_utils.isModelSafeText(result.model_output)) {
-        debug_trace.logf(
-            "acp",
-            "tool update omitted binary or non-utf8 output bytes={d}",
-            .{result.model_output.len},
-        );
-        return "binary or non-utf8 tool output omitted";
-    }
-    if (result.status == .failure and
-        (tool_result_errors.isToolPermissionDeniedOutput(result.model_output) or
-            tool_result_errors.isToolReviewHeldOutput(result.model_output)))
-    {
-        return result.model_output;
-    }
-    return text_utils.utf8PrefixByBytes(result.model_output, 200);
+    return tool_call_presentation.toolUpdateContentText(result.status == .failure, result.model_output);
 }
 
 fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
@@ -1935,7 +2003,6 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
             ctx.alloc,
             session,
             turn,
-            ctx.retain_external_root_user_turn,
             ctx.current_prompt_input,
         );
     }
@@ -1945,7 +2012,6 @@ fn persistAcpHistoryTurn(
     alloc: Allocator,
     session: *server.ActiveSessionState,
     turn: HistoryTurn,
-    prompt_is_root_authority: bool,
     current_prompt_input: ?*ParsedPromptInput,
 ) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
@@ -1967,14 +2033,7 @@ fn persistAcpHistoryTurn(
         return;
     };
     try writable.prepareHistoryTurnForCommit(alloc, &prepared);
-    try subagent_resume_admission.retainExternalRootUserTurn(
-        session.store,
-        alloc,
-        writable,
-        prepared,
-        prompt_is_root_authority,
-    );
-    _ = try writable.appendEvent(
+    _ = writable.appendEvent(
         alloc,
         .{ .history_turn_committed = .{
             .conversation_language = session.session_rt.languageSnapshot(),
@@ -1983,7 +2042,12 @@ fn persistAcpHistoryTurn(
             .turn = prepared,
         } },
         io_mod.milliTimestamp(),
-    );
+    ) catch |err| {
+        if (err == error.SessionPersistenceUncertain) {
+            if (current_prompt_input) |input| input.retainImageSnapshots();
+        }
+        return err;
+    };
     session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
     prepared_owned = false;
     if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
@@ -2003,7 +2067,12 @@ fn commitContextCompaction(
     var prepared_owned = true;
     defer if (prepared_owned) types.freeHistoryTurnSlice(ctx.alloc, prepared);
     if (session.writable) |*writable| {
-        _ = try writable.commitContextCompaction(ctx.alloc, summary, active_prefix, retained_from, io_mod.milliTimestamp());
+        _ = writable.commitContextCompaction(ctx.alloc, summary, active_prefix, retained_from, io_mod.milliTimestamp()) catch |err| {
+            if (err == error.SessionPersistenceUncertain and active_prefix != null) {
+                if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
+            }
+            return err;
+        };
         if (active_prefix != null) {
             if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
         }
@@ -2051,6 +2120,9 @@ fn setRecoveryCheckpoint(
     checkpoint: session_codec.RecoveryCheckpoint,
 ) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    errdefer |err| if (err == error.SessionPersistenceUncertain) {
+        if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
+    };
     const session = if (ctx.state.active_session) |*value| value else return error.SessionPersistenceUnavailable;
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -2061,6 +2133,7 @@ fn setRecoveryCheckpoint(
         .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
         now_ms,
     );
+    if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
 }
 
 /// Stores grants on the active ACP session without persisting them.
@@ -2662,26 +2735,11 @@ fn activeMcp(ctx: *AcpContext) ?*mcp_runtime.McpRuntime {
     return session.mcp;
 }
 
-pub fn mapToolKind(tool_name: []const u8) acp_types.ToolCallKind {
-    if (tool_presentation.isProviderSearchAlias(tool_name)) return .search;
-    if (std.mem.eql(u8, tool_name, "glob_files")) return .read;
-    if (std.mem.eql(u8, tool_name, "grep_files")) return .search;
-    if (std.mem.eql(u8, tool_name, "read_file")) return .read;
-    if (std.mem.eql(u8, tool_name, "web_fetch")) return .fetch;
-    if (std.mem.eql(u8, tool_name, "web_search")) return .search;
-    if (std.mem.eql(u8, tool_name, "write_file")) return .edit;
-    if (std.mem.eql(u8, tool_name, "edit_file")) return .edit;
-    if (std.mem.eql(u8, tool_name, "shell")) return .execute;
-    if (std.mem.eql(u8, tool_name, "terminal")) return .execute;
-    if (std.mem.eql(u8, tool_name, "run_command")) return .execute;
-    if (std.mem.eql(u8, tool_name, "skill")) return .other;
-    if (std.mem.eql(u8, tool_name, "install_skill")) return .other;
-    return .other;
-}
+pub const mapToolKind = tool_call_presentation.mapToolKind;
 
-fn acpToolName(tool_name: []const u8) []const u8 {
-    return if (tool_presentation.isProviderSearchAlias(tool_name)) "web_search" else tool_name;
-}
+const acpToolName = tool_call_presentation.acpToolName;
+
+const describeToolTitle = tool_call_presentation.describeToolTitle;
 
 fn providerTerminalStatus(outcome: types.ToolOutcomeKind) ?acp_types.ToolCallStatus {
     return switch (outcome) {
@@ -2689,22 +2747,6 @@ fn providerTerminalStatus(outcome: types.ToolOutcomeKind) ?acp_types.ToolCallSta
         .denied, .cancelled, .failed => .failed,
         .deferred => null,
     };
-}
-
-fn describeToolTitle(registry: tool_dispatch.Registry, arena: Allocator, call: ToolCall) ![]const u8 {
-    if (registry.lookup(call.name) != null) {
-        if (try tool_presentation.formatSubagentPlainAction(arena, call, .identity)) |title| return title;
-    }
-    if (tool_presentation.isProviderSearchAlias(call.name)) {
-        return tool_presentation.formatPlainAction(arena, .{
-            .tool_registry = registry,
-            .call = call,
-        });
-    }
-    if (tool_dispatch.toolCallPresentation(arena, registry, call)) |presentation| {
-        return std.fmt.allocPrint(arena, "{s}", .{presentation.action_label});
-    }
-    return std.fmt.allocPrint(arena, "{s}", .{call.name});
 }
 
 test "ACP subagent titles and terminal descriptions share request projection" {
@@ -4085,7 +4127,7 @@ test "ACP registry callbacks preserve snapshot bytes before transient context" {
     defer messages.deinit(arena);
     try messages.append(arena, .{ .role = .system, .content = "base system" });
 
-    try deps.append_static_context.?(deps.ctx, arena, &messages);
+    try deps.append_static_context.?(deps.ctx, arena, null, &messages);
     try deps.append_runtime_context(deps.ctx, arena, &messages);
 
     try std.testing.expectEqual(@as(usize, 4), messages.items.len);
@@ -4126,17 +4168,6 @@ fn testPermissionRuleSet(alloc: Allocator, permission: []const u8, pattern: []co
         .action = action,
     };
     return rules;
-}
-
-fn writeArgsJson(alloc: Allocator, path: []const u8, content: []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.writeAll("{\"path\":");
-    try std.json.Stringify.value(path, .{}, &out.writer);
-    try out.writer.writeAll(",\"content\":");
-    try std.json.Stringify.value(content, .{}, &out.writer);
-    try out.writer.writeByte('}');
-    return try out.toOwnedSlice();
 }
 
 fn createSymlinkOrSkip(dir: std.Io.Dir, target_path: []const u8, link_path: []const u8) !void {
@@ -4263,7 +4294,7 @@ test "ACP prompt projection configures web search then blocks native execution" 
     defer messages.deinit(arena);
     const deps = agentRuntimeDeps(&ctx);
     const append_static = deps.append_static_context orelse return error.TestExpectedEqual;
-    try append_static(deps.ctx, arena, &messages);
+    try append_static(deps.ctx, arena, null, &messages);
     try deps.append_runtime_context(deps.ctx, arena, &messages);
 
     try std.testing.expectEqualStrings("stale-key", state.web_search_runtime.api_key);

@@ -1051,24 +1051,6 @@ fn executeProcess(scratch: Allocator, cfg: Config, argv: []const []const u8, cwd
     return executeProcessWithInput(scratch, cfg, argv, cwd, false, true);
 }
 
-fn executeProcessWithClosedInput(
-    scratch: Allocator,
-    cfg: Config,
-    argv: []const []const u8,
-    cwd: []const u8,
-) !CollectedProcess {
-    if (comptime supports_foreground_session) {
-        return executeProcessWithDetachedSession(
-            scratch,
-            cfg,
-            argv,
-            cwd,
-            "",
-        );
-    }
-    return executeProcessWithInput(scratch, cfg, argv, cwd, true, true);
-}
-
 fn executeProcessWithInput(
     scratch: Allocator,
     cfg: Config,
@@ -1772,19 +1754,6 @@ test "zsh user profile reports natural SIGTERM after alias-safe startup" {
     );
     try std.testing.expectEqual(@as(?i64, 42), trapped.command_result.?.exit_code);
     try std.testing.expectEqual(@as(?u32, null), trapped.command_result.?.signal);
-}
-
-fn formatExitOutput(alloc: Allocator, command: []const u8, cwd: []const u8, exit_code: i64, stdout_raw: []const u8, stderr_raw: []const u8, duration_ms: ?u64) !command_contract.RunCommandResult {
-    return command_contract.formatCommandResult(alloc, .{
-        .command = command,
-        .cwd = cwd,
-        .status = .{ .exit_code = exit_code },
-        .stdout_display = stdout_raw,
-        .stderr_display = stderr_raw,
-        .stdout_bytes = stdout_raw.len,
-        .stderr_bytes = stderr_raw.len,
-        .duration_ms = duration_ms,
-    });
 }
 
 fn formatOutput(alloc: Allocator, command: []const u8, cwd: []const u8, term: std.process.Child.Term, stdout_raw: []const u8, stderr_raw: []const u8, duration_ms: ?u64) !command_contract.RunCommandResult {
@@ -3070,7 +3039,7 @@ test "foreground session bootstrap waits for release before executing target" {
     try std.testing.expectEqualStrings("released", marker);
 }
 
-test "foreground session owner loss kills the target and descendant" {
+test "foreground session owner loss kills the target and descendant before delayed effects" {
     if (comptime !supports_foreground_session) return;
 
     const alloc = std.testing.allocator;
@@ -3078,7 +3047,16 @@ test "foreground session owner loss kills the target and descendant" {
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const target_script = "sleep 30 & child=$!; printf '%s %s\\n' \"$$\" \"$child\"; wait";
+    const effect_path = try std.fs.path.join(alloc, &.{ workspace, "owner-loss.finished" });
+    defer alloc.free(effect_path);
+    const quoted_effect = try shellQuote(alloc, effect_path);
+    defer alloc.free(quoted_effect);
+    const target_script = try std.fmt.allocPrint(
+        alloc,
+        "sleep 30 & child=$!; printf '%s %s\\n' \"$$\" \"$child\"; sleep 3; printf FINISHED > {s}",
+        .{quoted_effect},
+    );
+    defer alloc.free(target_script);
 
     var child = try spawnForegroundSessionBootstrapForTest(workspace, target_script);
     defer child.kill(io_mod.getIo());
@@ -3086,6 +3064,11 @@ test "foreground session owner loss kills the target and descendant" {
 
     const owner_write = child.stdin orelse return error.TestUnexpectedResult;
     child.stdin = null;
+    var owner_open = true;
+    errdefer if (owner_open) {
+        owner_write.close(io_mod.getIo());
+        _ = child.wait(io_mod.getIo()) catch {};
+    };
     try writeForegroundSessionFrameForTest(
         owner_write,
         foreground_session_release_byte,
@@ -3111,9 +3094,11 @@ test "foreground session owner loss kills the target and descendant" {
     defer signalProcess(descendant_pid, std.posix.SIG.KILL) catch {};
 
     owner_write.close(io_mod.getIo());
+    owner_open = false;
     _ = try child.wait(io_mod.getIo());
     try expectProcessGone(target_pid);
     try expectProcessGone(descendant_pid);
+    try std.testing.expect(!absoluteFileExists(effect_path));
 }
 
 test "foreground session bootstrap EOF executes no target" {

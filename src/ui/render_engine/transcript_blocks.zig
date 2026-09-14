@@ -34,7 +34,6 @@ pub const Styles = struct {
     reset_style: []const u8 = "",
     dim_style: []const u8 = "",
     red_style: []const u8 = "",
-    cancelled_text_style: []const u8 = "",
     notice_information_style: []const u8 = "",
     notice_success_style: []const u8 = "",
     notice_warning_style: []const u8 = "",
@@ -171,6 +170,7 @@ pub const LineProvenance = union(enum) {
     entry: struct {
         entry_id: u32,
         entry_class: TranscriptEntryClass,
+        projection_part: enum { body, group_header, group_child, group_cancel } = .body,
     },
     block_separator,
     boundary_blank,
@@ -277,6 +277,7 @@ pub const EntryRenderOverride = struct {
     entry_id: u32,
     kind: TranscriptBlockKind,
     bytes: []const u8,
+    line_provenance: []const LineProvenance = &.{},
 };
 
 pub const EntryRenderAction = union(enum) {
@@ -285,6 +286,7 @@ pub const EntryRenderAction = union(enum) {
     override: struct {
         kind: TranscriptBlockKind,
         bytes: []const u8,
+        line_provenance: []const LineProvenance = &.{},
     },
 };
 
@@ -1474,11 +1476,11 @@ pub fn renderSemanticNotice(
 ) ![]u8 {
     var logical: std.ArrayList(u8) = .empty;
     defer logical.deinit(alloc);
-    try logical.appendSlice(alloc, "● ");
-    // An empty topic drops the "Topic:" label and renders the body alone.
+    try logical.appendSlice(alloc, types.noticeGlyph(notice.tone));
+    try logical.append(alloc, ' ');
+    // An empty topic drops the "topic:" label and renders the body alone.
     if (notice.topic.len > 0) {
-        try logical.append(alloc, std.ascii.toUpper(notice.topic[0]));
-        try logical.appendSlice(alloc, notice.topic[1..]);
+        try logical.appendSlice(alloc, notice.topic);
         try logical.append(alloc, ':');
     }
     const label_end = logical.items.len;
@@ -1764,7 +1766,7 @@ test "auto permission notice contributes content only to full presentation" {
     defer full.deinit(alloc);
     try std.testing.expectEqual(TranscriptBlockKind.system_notice, full.kind);
     try std.testing.expectEqualStrings(
-        "● System: Auto agent approved this request: Running command.",
+        "i system: Auto agent approved this request: Running command.",
         full.bytes,
     );
 }
@@ -1972,6 +1974,7 @@ const RenderEntriesOptions = struct {
                     .entry_id = entry.id(),
                     .kind = override.kind,
                     .bytes = override.bytes,
+                    .line_provenance = override.line_provenance,
                 },
                 .keep, .hide => null,
             };
@@ -2043,6 +2046,7 @@ const RenderEntriesBuilder = struct {
         entry: TranscriptEntry,
         block: RenderedBlock,
         options: RenderEntriesOptions,
+        block_provenance: []const LineProvenance,
         checkpoint: ?*build_checkpoint.BuildCheckpoint,
     ) !void {
         try self.appendSeparatorBefore(alloc, block.kind, options.line_provenance);
@@ -2063,7 +2067,12 @@ const RenderEntriesBuilder = struct {
         }
 
         try self.out.appendSlice(alloc, block.bytes);
-        try appendBlockProvenance(alloc, options.line_provenance, entry, block);
+        if (block_provenance.len > 0) {
+            if (options.line_provenance) |lines| {
+                std.debug.assert(block_provenance.len >= renderedHardLineCount(block.bytes));
+                try lines.appendSlice(alloc, block_provenance[0..renderedHardLineCount(block.bytes)]);
+            }
+        } else try appendBlockProvenance(alloc, options.line_provenance, entry, block);
         for (block.bytes) |byte| {
             try build_checkpoint.tick(checkpoint);
             if (byte == '\n') self.line_index += 1;
@@ -2123,7 +2132,7 @@ fn renderEntriesInterruptible(
             );
             defer block.deinit(alloc);
             if (!renderedBlockHasContent(block)) continue;
-            try builder.appendBlock(alloc, entry, block, options, checkpoint);
+            try builder.appendBlock(alloc, entry, block, options, override.line_provenance, checkpoint);
             continue;
         }
         const block = try renderEntryToBlockForPresentationInterruptible(
@@ -2137,7 +2146,7 @@ fn renderEntriesInterruptible(
         defer block.deinit(alloc);
         if (!renderedBlockHasContent(block)) continue;
 
-        try builder.appendBlock(alloc, entry, block, options, checkpoint);
+        try builder.appendBlock(alloc, entry, block, options, &.{}, checkpoint);
     }
 
     return builder.finish(alloc);
@@ -2673,14 +2682,6 @@ pub const RenderedBlock = struct {
     }
 };
 
-pub fn transcriptLineCount(text: []const u8) usize {
-    var total: usize = 1;
-    for (text) |byte| {
-        if (byte == '\n') total += 1;
-    }
-    return total;
-}
-
 fn deinitTestEntries(entries: *std.ArrayList(TranscriptEntry), alloc: Allocator) void {
     for (entries.items) |*entry| entry.deinit(alloc);
     entries.deinit(alloc);
@@ -2736,8 +2737,9 @@ test "semantic notice renders every tone and resets before following content" {
     };
     const tones = [_]types.NoticeTone{ .information, .success, .warning, .@"error", .cancelled };
     const label_styles = [_][]const u8{ "\x1b[36m", "\x1b[32m", "\x1b[33m", "\x1b[31m", "\x1b[90m" };
+    const glyphs = [_][]const u8{ "i", "✓", "!", "✗", "⊘" };
 
-    for (tones, label_styles) |tone, label_style| {
+    for (tones, label_styles, glyphs) |tone, label_style, glyph| {
         const rendered = try renderSemanticNotice(alloc, .{
             .topic = "topic",
             .tone = tone,
@@ -2747,11 +2749,12 @@ test "semantic notice renders every tone and resets before following content" {
 
         const expected = try std.fmt.allocPrint(
             alloc,
-            "{s}● Topic:\x1b[0m\x1b[37m body\x1b[0m",
-            .{label_style},
+            "{s}{s} topic:\x1b[0m\x1b[37m body\x1b[0m",
+            .{ label_style, glyph },
         );
         defer alloc.free(expected);
         try std.testing.expectEqualStrings(expected, rendered);
+        try std.testing.expect(std.mem.find(u8, rendered, "●") == null);
         try std.testing.expect(std.mem.find(u8, rendered, "[Topic]") == null);
 
         var feed: std.ArrayList(u8) = .empty;
@@ -2765,6 +2768,81 @@ test "semantic notice renders every tone and resets before following content" {
         try std.testing.expectEqual(@as(u21, 'Z'), following.codepoint);
         try std.testing.expect(following.style.fg.eql(.default));
         try std.testing.expect(following.style.bg.eql(.default));
+    }
+}
+
+test "semantic notice glyph grid regression locks tone markers and lowercase topic" {
+    const alloc = std.testing.allocator;
+    const styles: Styles = .{
+        .system_notice_text_style = "\x1b[37m",
+        .reset_style = "\x1b[0m",
+        .notice_information_style = "\x1b[36m",
+        .notice_success_style = "\x1b[32m",
+        .notice_warning_style = "\x1b[33m",
+        .notice_error_style = "\x1b[31m",
+        .notice_cancelled_style = "\x1b[90m",
+    };
+    const cases = [_]struct {
+        tone: types.NoticeTone,
+        topic: []const u8,
+        body: []const u8,
+        row_text: []const u8,
+        label_fg: u8,
+    }{
+        .{ .tone = .neutral, .topic = "session", .body = "renamed to \"custom models\"", .row_text = "* session: renamed to \"custom models\"", .label_fg = 7 },
+        .{ .tone = .information, .topic = "background", .body = "command #7 started", .row_text = "i background: command #7 started", .label_fg = 6 },
+        .{ .tone = .success, .topic = "upgrade", .body = "fx has been updated to v9.9.9", .row_text = "✓ upgrade: fx has been updated to v9.9.9", .label_fg = 2 },
+        .{ .tone = .warning, .topic = "skills", .body = "1 discovery issue", .row_text = "! skills: 1 discovery issue", .label_fg = 3 },
+        .{ .tone = .@"error", .topic = "session", .body = "usage: /rename <title>", .row_text = "✗ session: usage: /rename <title>", .label_fg = 1 },
+        .{ .tone = .cancelled, .topic = "system", .body = "cancelled", .row_text = "⊘ system: cancelled", .label_fg = 8 },
+    };
+
+    for (cases) |case| {
+        const rendered = try renderSemanticNotice(alloc, .{
+            .topic = case.topic,
+            .tone = case.tone,
+            .body = case.body,
+        }, styles, 80);
+        defer alloc.free(rendered);
+
+        var grid = try vt_emulator.Grid.init(alloc, 80, 2);
+        defer grid.deinit();
+        try grid.feed(rendered);
+
+        var row: std.ArrayList(u8) = .empty;
+        defer row.deinit(alloc);
+        try grid.rowTextTrimmed(1, &row);
+        try std.testing.expectEqualStrings(case.row_text, row.items);
+
+        // The glyph and lowercase topic carry the tone color; the body is grey.
+        // Columns are 1-based: glyph, space, topic cells, then the colon.
+        const colon_col: u16 = @intCast(3 + case.topic.len);
+        const fg_index = struct {
+            fn get(cell: vt_emulator.Cell) u8 {
+                return switch (cell.style.fg) {
+                    .indexed => |ix| ix,
+                    else => 255,
+                };
+            }
+        }.get;
+        try std.testing.expectEqual(case.label_fg, fg_index(grid.cellAt(1, 1).?));
+        try std.testing.expectEqual(case.label_fg, fg_index(grid.cellAt(1, colon_col).?));
+        try std.testing.expectEqual(@as(u8, 7), fg_index(grid.cellAt(1, colon_col + 2).?));
+    }
+}
+
+test "semantic notice topics never render the tool-activity bullet or forced capitalization" {
+    const alloc = std.testing.allocator;
+    for ([_]types.NoticeTone{ .neutral, .information, .success, .warning, .@"error", .cancelled }) |tone| {
+        const rendered = try renderSemanticNotice(alloc, .{
+            .topic = "mcp",
+            .tone = tone,
+            .body = "body",
+        }, .{}, 80);
+        defer alloc.free(rendered);
+        try std.testing.expect(std.mem.find(u8, rendered, "●") == null);
+        try std.testing.expect(std.mem.find(u8, rendered, "Mcp") == null);
+        try std.testing.expect(std.mem.find(u8, rendered, "mcp:") != null);
     }
 }
 
@@ -2790,7 +2868,7 @@ test "semantic notice keeps an OSC 8 target hidden and clickable" {
     var row: std.ArrayList(u8) = .empty;
     defer row.deinit(alloc);
     try grid.rowTextTrimmed(1, &row);
-    try std.testing.expectEqualStrings("● Feedback: Open feedback form.", row.items);
+    try std.testing.expectEqualStrings("* feedback: Open feedback form.", row.items);
 
     const link_cell = grid.cellAt(1, 13).?;
     try std.testing.expectEqual(@as(u21, 'O'), link_cell.codepoint);
@@ -2832,7 +2910,7 @@ test "background semantic notices render one topic for launch and failure" {
     }, .{}, 80);
     defer alloc.free(launch);
     try std.testing.expectEqualStrings(
-        "● Background: Command #1 started. Log: /tmp/run.log",
+        "i background: Command #1 started. Log: /tmp/run.log",
         launch,
     );
 
@@ -2843,23 +2921,23 @@ test "background semantic notices render one topic for launch and failure" {
     }, .{}, 80);
     defer alloc.free(failure);
     try std.testing.expectEqualStrings(
-        "● Background: Command #1 failed (exit 1).",
+        "✗ background: Command #1 failed (exit 1).",
         failure,
     );
 
     for ([_][]const u8{ launch, failure }) |rendered| {
-        try std.testing.expect(std.mem.find(u8, rendered, "System: Background") == null);
-        try std.testing.expect(std.mem.find(u8, rendered, "Background: Background") == null);
+        try std.testing.expect(std.mem.find(u8, rendered, "system: background") == null);
+        try std.testing.expect(std.mem.find(u8, rendered, "background: background") == null);
     }
 }
 
 test "semantic notice tree branches align with the header while wrapped prose stays indented" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { body: []const u8, cols: u16, expected: []const u8 }{
-        .{ .body = "2 skills loaded\n├ Loaded alpha\n└ Loaded beta", .cols = 40, .expected = "● 2 skills loaded\n├ Loaded alpha\n└ Loaded beta" },
-        .{ .body = "Ready\n└ alpha beta gamma", .cols = 12, .expected = "● Ready\n└ alpha beta\n  gamma" },
-        .{ .body = "alpha └ beta", .cols = 8, .expected = "● alpha\n  └ beta" },
-        .{ .body = "Ready\nordinary prose", .cols = 40, .expected = "● Ready\n  ordinary prose" },
+        .{ .body = "2 skills loaded\n├ Loaded alpha\n└ Loaded beta", .cols = 40, .expected = "* 2 skills loaded\n├ Loaded alpha\n└ Loaded beta" },
+        .{ .body = "Ready\n└ alpha beta gamma", .cols = 12, .expected = "* Ready\n└ alpha beta\n  gamma" },
+        .{ .body = "alpha └ beta", .cols = 8, .expected = "* alpha\n  └ beta" },
+        .{ .body = "Ready\nordinary prose", .cols = 40, .expected = "* Ready\n  ordinary prose" },
     };
     for (cases) |case| {
         const rendered = try renderSemanticNotice(alloc, .{ .topic = "", .tone = .neutral, .body = case.body }, .{}, case.cols);
@@ -2875,7 +2953,7 @@ test "semantic notice tree branches align with the header while wrapped prose st
     var grid = try vt_emulator.Grid.init(alloc, 40, 4);
     defer grid.deinit();
     try grid.feed(styled);
-    try std.testing.expectEqual(@as(u21, '●'), grid.cellAt(1, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, '*'), grid.cellAt(1, 1).?.codepoint);
     try std.testing.expectEqual(@as(u21, '├'), grid.cellAt(2, 1).?.codepoint);
     try std.testing.expectEqual(@as(u21, '└'), grid.cellAt(3, 1).?.codepoint);
 }
@@ -2885,7 +2963,7 @@ test "semantic notice wraps words paths UTF-8 and explicit newlines without trun
     const body = "alpha beta/gamma/delta\n東京🙂 final-token";
     var logical: std.ArrayList(u8) = .empty;
     defer logical.deinit(alloc);
-    try appendWithoutAsciiWhitespace(&logical, alloc, "● System: ");
+    try appendWithoutAsciiWhitespace(&logical, alloc, "i system: ");
     try appendWithoutAsciiWhitespace(&logical, alloc, body);
 
     for ([_]u16{ 0, 1, 2, 3, 6, 12, 18 }) |cols| {
@@ -2914,7 +2992,7 @@ test "semantic notice wraps words paths UTF-8 and explicit newlines without trun
         .body = "alpha/beta/gamma",
     }, .{}, 11);
     defer alloc.free(path);
-    try std.testing.expectEqualStrings("● X: alpha/\n  beta/\n  gamma", path);
+    try std.testing.expectEqualStrings("i x: alpha/\n  beta/\n  gamma", path);
 
     const words = try renderSemanticNotice(alloc, .{
         .topic = "x",
@@ -2922,7 +3000,7 @@ test "semantic notice wraps words paths UTF-8 and explicit newlines without trun
         .body = "one two\nthree",
     }, .{}, 9);
     defer alloc.free(words);
-    try std.testing.expectEqualStrings("● X: one\n  two\n  three", words);
+    try std.testing.expectEqualStrings("i x: one\n  two\n  three", words);
 }
 
 test "semantic notices are independent blocks with exact neighboring and footer gaps" {
@@ -2945,7 +3023,7 @@ test "semantic notices are independent blocks with exact neighboring and footer 
     const rendered = try renderEntriesToBytes(alloc, entries.items, 80, .{});
     defer alloc.free(rendered);
     try std.testing.expectEqualStrings(
-        "before\n\n● One: first\n\n● Two: second\n\nafter",
+        "before\n\ni one: first\n\n✓ two: second\n\nafter",
         rendered,
     );
     try std.testing.expectEqual(@as(u16, 1), footerBoundaryGapRowsForTail(.system_notice));
@@ -2979,7 +3057,7 @@ test "semantic notice visibility tail classification and provenance remain seman
         .{ .capture_provenance = true },
     );
     defer prepared.deinit(alloc);
-    try std.testing.expectEqualStrings("● Hidden: full only", prepared.bytes);
+    try std.testing.expectEqualStrings("✗ hidden: full only", prepared.bytes);
     try std.testing.expectEqual(@as(usize, 1), prepared.line_provenance.len);
     try std.testing.expectEqualDeep(
         LineProvenance{ .entry = .{ .entry_id = 41, .entry_class = .error_notice } },
@@ -3604,7 +3682,7 @@ test "compact presentation hides context notices while full presentation retains
 
     const compact = try renderEntriesToBytes(alloc, entries.items, 80, .{});
     defer alloc.free(compact);
-    try std.testing.expect(std.mem.indexOf(u8, compact, "Context:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, compact, "context:") == null);
     try std.testing.expect(std.mem.indexOf(u8, compact, "ordinary system notice") != null);
     try std.testing.expect(std.mem.indexOf(u8, compact, "ordinary error notice") != null);
 
@@ -3612,8 +3690,8 @@ test "compact presentation hides context notices while full presentation retains
     defer first_full.deinit(alloc);
     const second_full = try renderEntryToBlockForPresentation(alloc, entries.items[2], 80, .{}, .full);
     defer second_full.deinit(alloc);
-    try std.testing.expectEqualStrings("● Context: first warning", first_full.bytes);
-    try std.testing.expectEqualStrings("● Context: second warning", second_full.bytes);
+    try std.testing.expectEqualStrings("! context: first warning", first_full.bytes);
+    try std.testing.expectEqualStrings("! context: second warning", second_full.bytes);
     try std.testing.expectEqual(TranscriptEntryClass.context_notice, entryClassForEntry(entries.items[0]));
 }
 

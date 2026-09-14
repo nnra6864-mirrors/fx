@@ -127,7 +127,6 @@ pub const ResumeTarget = store_types.ResumeTarget;
 pub const SessionMigrationResult = store_types.SessionMigrationResult;
 pub const SessionMigrationStatus = store_types.SessionMigrationStatus;
 pub const SessionRecoveryResult = store_types.SessionRecoveryResult;
-pub const SessionRecoveryStatus = store_types.SessionRecoveryStatus;
 pub const SessionSummary = store_types.SessionSummary;
 pub const HistoryPage = store_types.HistoryPage;
 
@@ -246,7 +245,7 @@ fn latestCheckpointHistoryIndex(history: []const session.HistoryTurn) usize {
     return result;
 }
 
-fn historyPrefixDigest(turns: []const session.HistoryTurn) error{ WriteFailed, NoSpaceLeft }![32]u8 {
+fn historyPrefixDigest(turns: []const session.HistoryTurn) error{ WriteFailed, NoSpaceLeft, InvalidSessionFormat }![32]u8 {
     var buffer: [256]u8 = undefined;
     var hashing: std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256) = .init(&buffer);
     try hashing.writer.writeAll("fx.history-page-prefix.v2\x00");
@@ -335,7 +334,6 @@ const ResumableSessionScope = enum {
 };
 pub const StorageFormat = store_types.StorageFormat;
 const automatic_legacy_max_bytes = store_types.automatic_legacy_max_bytes;
-const max_session_bytes = store_types.max_session_bytes;
 const StoreContext = store_types.StoreContext;
 const freeSummaries = summary_codec.freeSummaries;
 const resumablePageFromSummaries = summary_codec.resumablePageFromSummaries;
@@ -589,6 +587,88 @@ pub const Store = struct {
         alloc.free(self.home_dir);
         alloc.free(self.workspace_root);
         self.* = undefined;
+    }
+
+    /// Returns an owned ID, or null when this workspace has no remembered selection.
+    /// Reading never creates profile state or enumerates sessions.
+    pub fn readRememberedSessionId(self: Store, alloc: Allocator) !?[]u8 {
+        var directory = (try self.openRememberedDirectory(false)) orelse return null;
+        defer directory.close();
+        const name = self.rememberedSessionFilename();
+        const path_stat = directory.dir.statFile(io_mod.getIo(), &name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        if (path_stat.kind != .file) return error.InvalidRememberedSession;
+        var file = directory.dir.openFile(io_mod.getIo(), &name, .{
+            .mode = .read_only,
+            .allow_directory = false,
+            .follow_symlinks = false,
+            .resolve_beneath = true,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer file.close(io_mod.getIo());
+        return try readRememberedSessionFile(alloc, &file);
+    }
+
+    fn readRememberedSessionFile(alloc: Allocator, file: *std.Io.File) ![]u8 {
+        const stat = try file.stat(io_mod.getIo());
+        // An atomic replacement can unlink the valid version already opened here.
+        if (stat.kind != .file or stat.nlink > 1 or stat.permissions.toMode() & 0o777 != 0o600 or stat.size > 256) {
+            return error.InvalidRememberedSession;
+        }
+        const bytes = try io_mod.readFileToEnd(alloc, file, 256);
+        defer alloc.free(bytes);
+        return try alloc.dupe(u8, try parseRememberedSessionId(bytes));
+    }
+
+    /// Publishes one interactive selection. Conversation writes retain their own lock.
+    pub fn rememberSessionId(self: Store, alloc: Allocator, session_id: []const u8) !void {
+        if (self.canonical_root.mode != .writable) return error.SessionStoreReadOnly;
+        try validateSessionId(session_id);
+        var directory = (try self.openRememberedDirectory(true)) orelse return error.SessionStoreUnavailable;
+        defer directory.close();
+        const name = self.rememberedSessionFilename();
+        var buffer: [256]u8 = undefined;
+        const bytes = try std.fmt.bufPrint(&buffer, "{s}\n", .{session_id});
+        try io_mod.durableReplaceVerified(alloc, &directory, &name, bytes);
+    }
+
+    fn rememberedSessionFilename(self: Store) [64]u8 {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(normalizeWorkspaceRoot(self.workspace_root), &digest, .{});
+        return std.fmt.bytesToHex(digest, .lower);
+    }
+
+    fn openRememberedDirectory(self: Store, create: bool) !?io_mod.VerifiedDir {
+        const zio = io_mod.getIo();
+        var home = std.Io.Dir.openDirAbsolute(zio, self.home_dir, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer home.close(zio);
+        var profile = home.openDir(zio, profile_paths.root_dir_name, .{
+            .iterate = true,
+            .follow_symlinks = false,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer profile.close(zio);
+        if ((try profile.stat(zio)).permissions.toMode() & 0o777 != 0o700) return error.SessionPathUnsafe;
+        if (create) return try io_mod.openOrCreateVerifiedPrivateDirFromDir(profile, "continue");
+        var directory = profile.openDir(zio, "continue", .{
+            .iterate = true,
+            .follow_symlinks = false,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        errdefer directory.close(zio);
+        if ((try directory.stat(zio)).permissions.toMode() & 0o777 != 0o700) return error.SessionPathUnsafe;
+        return .{ .dir = directory };
     }
 
     /// Starts a brand-new writable session from `state`, with default log options.
@@ -1093,7 +1173,7 @@ pub const Store = struct {
                 true,
                 options,
             ),
-            .last => try self.resumeLatestForWrite(alloc, workspace_root, options),
+            .last => try self.resumeLatestByDiscovery(alloc, workspace_root, options),
         };
         return self.finishResumedForWrite(alloc, loaded, options);
     }
@@ -1123,15 +1203,6 @@ pub const Store = struct {
         }
         try self.attachWritableChildCapability(alloc, &loaded);
         return loaded;
-    }
-
-    fn resumeLatestForWrite(
-        self: Store,
-        alloc: Allocator,
-        workspace_root: []const u8,
-        options: ResumeOptions,
-    ) !LoadedWritableSession {
-        return self.resumeLatestByDiscovery(alloc, workspace_root, options);
     }
 
     fn resumeLatestByDiscovery(
@@ -1165,15 +1236,6 @@ pub const Store = struct {
         options: ResumeOptions,
     ) !LoadedWritableSession {
         try options.log.test_controls.boundary(.latest_barrier_completed);
-        return self.resumeLatestDiscoveryAfterBarrier(alloc, workspace_root, options);
-    }
-
-    fn resumeLatestDiscoveryAfterBarrier(
-        self: Store,
-        alloc: Allocator,
-        workspace_root: []const u8,
-        options: ResumeOptions,
-    ) !LoadedWritableSession {
         const selected = try self.selectWritableLastId(
             alloc,
             workspace_root,
@@ -1218,12 +1280,13 @@ pub const Store = struct {
         try validateSessionId(session_id);
         var dir = try self.openSessionDir(session_id);
         defer dir.close();
-        var reader = try session_log.ConversationHistoryReader.init(alloc, &dir);
+        var buffer: [8192]u8 = undefined;
+        var reader = try session_log.ConversationHistoryReader.init(alloc, &dir, &buffer);
         defer reader.deinit();
         while (try reader.next()) |turn| {
             var turns = [_]session.HistoryTurn{turn};
             defer session.freeHistoryTurn(alloc, turns[0]);
-            try resolveSessionSnapshotLocators(alloc, &turns, self.sessions_dir, session_id);
+            try resolveSessionSnapshotLocators(alloc, &turns, null, self.sessions_dir, session_id);
             try visitor.append(turns[0]);
         }
     }
@@ -1298,6 +1361,7 @@ pub const Store = struct {
             resolveSessionSnapshotLocators(
                 alloc,
                 turns,
+                null,
                 self.sessions_dir,
                 session_id,
             ) catch |err| return mapHistoryPageLoadError(err);
@@ -1414,6 +1478,20 @@ pub const Store = struct {
     }
 
     /// Opens verified read-only storage restricted to subagent control files.
+    /// The caller has already classified the session; no history is replayed.
+    pub fn openListedSubagentControlReadOnly(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+    ) !?session_child_store.SessionChildCapability {
+        var session_dir = try self.openSessionDir(session_id);
+        defer session_dir.close();
+        const display = try sessionDirPath(alloc, self.sessions_dir, session_id);
+        defer alloc.free(display);
+        return session_child_store.SessionChildCapability.initLegacySubagentControl(alloc, session_dir.dir, display);
+    }
+
+    /// Opens verified read-only storage restricted to subagent control files.
     pub fn openSubagentControlCapabilityReadOnly(
         self: Store,
         alloc: Allocator,
@@ -1462,17 +1540,12 @@ pub const Store = struct {
             else => error.SessionStoreUnavailable,
         };
         defer session_dir.close();
-        var candidate = classifyReadOnlyCandidate(
-            alloc,
-            &session_dir,
-            session_id,
-        ) catch |err| return switch (err) {
+        validateSubagentControlSession(alloc, &session_dir, session_id) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.SessionNotFound => error.SessionNotFound,
             error.SessionPathUnsafe => error.SessionPathUnsafe,
             else => error.SessionStoreUnavailable,
         };
-        candidate.deinit(alloc);
         const display_path = sessionDirPath(
             alloc,
             self.sessions_dir,
@@ -1494,6 +1567,24 @@ pub const Store = struct {
             error.PrivateStatePermissionsUnsupported => error.PrivateStatePermissionsUnsupported,
             error.SessionChildStoreFailed => error.SessionChildStoreFailed,
         };
+    }
+
+    fn validateSubagentControlSession(
+        alloc: Allocator,
+        session_dir: *io_mod.VerifiedDir,
+        session_id: []const u8,
+    ) !void {
+        if (try session_log.readConversationMetadata(alloc, session_dir)) |value| {
+            var metadata = value;
+            defer metadata.deinit();
+            if (!std.mem.eql(u8, metadata.value.id, session_id)) return error.InvalidSessionFormat;
+            _ = try session.ConversationLanguage.fromSlice(metadata.value.conversation_language);
+            const event_stat = try session_dir.dir.statFile(io_mod.getIo(), "events.jsonl", .{ .follow_symlinks = false });
+            if (event_stat.kind != .file or event_stat.nlink != 1) return error.SessionPathUnsafe;
+            return;
+        }
+        var candidate = try classifyReadOnlyCandidate(alloc, session_dir, session_id);
+        candidate.deinit(alloc);
     }
 
     /// Returns owned session metadata needed to initialize a control record.
@@ -1672,12 +1763,37 @@ pub const Store = struct {
         session_id: []const u8,
         options: ResumeOptions,
     ) !ReadOnlyDetail {
+        return self.loadReadOnlyDetailWithHistoryErrors(alloc, session_id, options, false);
+    }
+
+    /// Loads detail with a distinct history error for external admission.
+    /// Supporting-file failures and ordinary read-only loads retain their errors.
+    pub fn loadReadOnlyAdmissionDetail(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+        options: ResumeOptions,
+    ) !ReadOnlyDetail {
+        return self.loadReadOnlyDetailWithHistoryErrors(alloc, session_id, options, true);
+    }
+
+    fn loadReadOnlyDetailWithHistoryErrors(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+        options: ResumeOptions,
+        comptime classify_history_errors: bool,
+    ) !ReadOnlyDetail {
         try validateSessionId(session_id);
         var session_dir = try self.openSessionDir(session_id);
         defer session_dir.close();
         if (try session_log.hasConversationMetadata(alloc, &session_dir)) {
-            var root = self.canonical_root;
-            var state = try root.loadReadOnly(alloc, session_id, options.log);
+            var state = if (classify_history_errors)
+                try session_log.loadConversationDetailState(alloc, &session_dir, session_id)
+            else blk: {
+                var root = self.canonical_root;
+                break :blk try root.loadReadOnly(alloc, session_id, options.log);
+            };
             errdefer state.deinit(alloc);
             const archive = try session_log.loadConversationArchive(
                 alloc,
@@ -1689,6 +1805,7 @@ pub const Store = struct {
             try resolveSessionSnapshotLocators(
                 alloc,
                 state.history,
+                if (state.recovery_checkpoint) |*checkpoint| checkpoint else null,
                 self.sessions_dir,
                 session_id,
             );
@@ -1714,6 +1831,7 @@ pub const Store = struct {
                 try resolveSessionSnapshotLocators(
                     alloc,
                     state.history,
+                    if (state.recovery_checkpoint) |*checkpoint| checkpoint else null,
                     self.sessions_dir,
                     session_id,
                 );
@@ -1803,6 +1921,7 @@ pub const Store = struct {
         writable: *const LoadedWritableSession,
         snapshot: session_usage.Snapshot,
     ) !UsageRecoveryCheckpoint {
+        try writable.requireWritable();
         const now_ms = @max(io_mod.milliTimestamp(), 0);
         const timestamp_ms = if (now_ms > writable.state.updated_at_ms)
             now_ms
@@ -2564,6 +2683,7 @@ pub const Store = struct {
         try resolveSessionSnapshotLocators(
             alloc,
             state.history,
+            if (state.recovery_checkpoint) |*checkpoint| checkpoint else null,
             self.sessions_dir,
             session_id,
         );
@@ -2667,6 +2787,7 @@ pub const Store = struct {
         try resolveSessionSnapshotLocators(
             alloc,
             loaded.state.history,
+            if (loaded.state.recovery_checkpoint) |*checkpoint| checkpoint else null,
             self.sessions_dir,
             loaded.active_id,
         );
@@ -2767,6 +2888,7 @@ pub const Store = struct {
         var scan = RankingScan{ .cache = try catalog_cache.Loaded.load(alloc, sessions, null) };
         defer scan.deinit(alloc);
         var selected: ?WritableCandidate = null;
+        var candidate_error: ?anyerror = null;
         defer if (selected) |*candidate| candidate.deinit(alloc);
         var dir = try sessions.dir.openDir(io_mod.getIo(), ".", .{ .iterate = true, .follow_symlinks = false });
         defer dir.close(io_mod.getIo());
@@ -2791,7 +2913,9 @@ pub const Store = struct {
                     null,
                     err,
                 );
-                return err;
+                if (err == error.OutOfMemory or err == error.Cancelled) return err;
+                candidate_error = err;
+                continue;
             } orelse continue;
             if (!std.mem.eql(u8, candidate.workspace_root, workspace_root)) {
                 logDiscovery(
@@ -2803,6 +2927,27 @@ pub const Store = struct {
                     .skipped,
                     null,
                 );
+                candidate.deinit(alloc);
+                continue;
+            }
+            const child_identity = candidate.subagent_child orelse switch (candidate.storage) {
+                .legacy_v1, .legacy_v2 => false,
+                .schema_v3, .conversation => null,
+            };
+            const internal = subagent_child_state.isDiscoveredManagedChildSession(
+                self,
+                alloc,
+                candidate.id,
+                child_identity,
+            ) catch |err| {
+                logDiscoveryError(.workspace_writable_last, candidate.id, candidate.storage, candidate.projection_state, err);
+                candidate.deinit(alloc);
+                if (err == error.OutOfMemory or err == error.Cancelled) return err;
+                candidate_error = err;
+                continue;
+            };
+            if (internal) {
+                debug_trace.logf("session", "latest selection excluded internal child id={s}", .{candidate.id});
                 candidate.deinit(alloc);
                 continue;
             }
@@ -2822,8 +2967,7 @@ pub const Store = struct {
                 candidate.deinit(alloc);
             }
         }
-        // No cache publication is reachable from an incomplete or failed scan.
-        scan.publish(self, alloc);
+        if (candidate_error == null) scan.publish(self, alloc);
         if (selected) |candidate| {
             logDiscovery(
                 .workspace_writable_last,
@@ -2836,6 +2980,7 @@ pub const Store = struct {
             );
             return try alloc.dupe(u8, candidate.id);
         }
+        if (candidate_error) |err| return err;
         return null;
     }
 
@@ -2890,6 +3035,10 @@ pub const Store = struct {
         if (try session_log.readConversationMetadata(alloc, &session_dir)) |value| {
             var metadata = value;
             defer metadata.deinit();
+            if (metadata.value.subagent_child and std.mem.eql(u8, metadata.value.id, session_id)) {
+                debug_trace.logf("session", "latest selection excluded internal child id={s}", .{session_id});
+                return null;
+            }
             if (std.mem.eql(u8, metadata.value.id, session_id) and
                 try only_unpublished_creation(&session_dir, true))
             {
@@ -3361,11 +3510,20 @@ pub const Store = struct {
         };
         defer if (metadata) |*current| current.deinit();
         var current_boundary: ?session_log.ConversationRecoveryBoundary = null;
+        var usage_incomplete = false;
         var recovered = recovery_state: {
             if (metadata) |current| {
                 if (!std.mem.eql(u8, current.value.id, session_id)) return error.SessionRecoveryBoundaryInvalid;
                 if (current.value.subagent_child) return error.SessionNotFound;
-                current_boundary = try session_log.find_conversation_recovery_boundary(alloc, &source.dir);
+                const recovery = session_log.classify_conversation_recovery(alloc, &source.dir, session_id) catch |err| {
+                    if (err == error.SessionRecoveryNotNeeded) {
+                        var healthy = try self.loadReadOnly(alloc, session_id);
+                        healthy.deinit(alloc);
+                    }
+                    return err;
+                };
+                current_boundary = recovery.boundary;
+                usage_incomplete = recovery.usage_incomplete;
                 break :recovery_state try session_log.load_conversation_recovery_state(alloc, &source.dir, session_id, current_boundary.?);
             }
             const authority = try classifyAuthority(
@@ -3439,6 +3597,7 @@ pub const Store = struct {
         try resolveSessionSnapshotLocators(
             alloc,
             recovered.history,
+            if (recovered.recovery_checkpoint) |*checkpoint| checkpoint else null,
             self.sessions_dir,
             session_id,
         );
@@ -3590,6 +3749,7 @@ pub const Store = struct {
                 .source_session_id = source_id,
                 .recovered_session_id = recovered_id,
                 .history_len = recovered.history.len,
+                .usage_incomplete = usage_incomplete,
                 .status = .indeterminate,
             };
         }
@@ -3606,6 +3766,7 @@ pub const Store = struct {
                 .source_session_id = source_id,
                 .recovered_session_id = recovered_id,
                 .history_len = recovered.history.len,
+                .usage_incomplete = usage_incomplete,
                 .status = .indeterminate,
             };
         };
@@ -3615,6 +3776,7 @@ pub const Store = struct {
                 .source_session_id = source_id,
                 .recovered_session_id = recovered_id,
                 .history_len = recovered.history.len,
+                .usage_incomplete = usage_incomplete,
                 .status = .indeterminate,
             };
         }
@@ -3623,6 +3785,7 @@ pub const Store = struct {
             .source_session_id = source_id,
             .recovered_session_id = recovered_id,
             .history_len = recovered.history.len,
+            .usage_incomplete = usage_incomplete,
             .status = if (contains_unverified_artifacts)
                 .recovered_with_unverified_artifacts
             else
@@ -4051,6 +4214,7 @@ fn canonicalSnapshotLeaf(image: session.ImageAttachment, stored: []const u8) ![]
 fn resolveSessionSnapshotLocators(
     alloc: Allocator,
     history: []session.HistoryTurn,
+    checkpoint: ?*session_codec.RecoveryCheckpoint,
     sessions_dir: []const u8,
     session_id: []const u8,
 ) !void {
@@ -4065,35 +4229,22 @@ fn resolveSessionSnapshotLocators(
             .assistant => |*entry| entry.user.images,
             .interrupted => |*entry| entry.user.images,
         };
-        for (images) |*image| {
-            const stored = image.snapshot_path orelse continue;
-            const leaf = try canonicalSnapshotLeaf(image.*, stored);
-            const resolved = try std.fs.path.join(alloc, &.{ image_dir, leaf });
-            alloc.free(stored);
-            image.snapshot_path = resolved;
-        }
+        try resolveImageSnapshotLocators(alloc, images, image_dir);
     }
+    if (checkpoint) |value| try resolveImageSnapshotLocators(alloc, value.user.images, image_dir);
 }
 
-fn deleteSnapshotFilesAddedByMigration(
-    candidate: []const session.HistoryTurn,
-    original: []const session.HistoryTurn,
-) void {
-    for (candidate, original) |candidate_turn, original_turn| {
-        const candidate_images = switch (candidate_turn) {
-            .compacted_summary => &.{},
-            .assistant => |entry| entry.user.images,
-            .interrupted => |entry| entry.user.images,
-        };
-        const original_images = switch (original_turn) {
-            .compacted_summary => &.{},
-            .assistant => |entry| entry.user.images,
-            .interrupted => |entry| entry.user.images,
-        };
-        image_attachments.deleteUnreferencedImageSnapshots(
-            candidate_images,
-            original_images,
-        );
+fn resolveImageSnapshotLocators(
+    alloc: Allocator,
+    images: []session.ImageAttachment,
+    image_dir: []const u8,
+) !void {
+    for (images) |*image| {
+        const stored = image.snapshot_path orelse continue;
+        const leaf = try canonicalSnapshotLeaf(image.*, stored);
+        const resolved = try std.fs.path.join(alloc, &.{ image_dir, leaf });
+        alloc.free(stored);
+        image.snapshot_path = resolved;
     }
 }
 
@@ -4128,6 +4279,7 @@ test "session snapshot locators resolve through their owning store" {
     try resolveSessionSnapshotLocators(
         alloc,
         history,
+        null,
         "/new/fx-home/sessions",
         "id",
     );
@@ -4161,6 +4313,7 @@ test "current session snapshot locators reject absolute paths" {
         resolveSessionSnapshotLocators(
             alloc,
             history,
+            null,
             "/new/fx-home/sessions",
             "id",
         ),
@@ -4200,6 +4353,7 @@ test "session snapshot locator resolver rejects noncanonical tampering" {
             resolveSessionSnapshotLocators(
                 alloc,
                 history,
+                null,
                 "/new/fx-home/sessions",
                 "id",
             ),
@@ -4323,6 +4477,7 @@ test "session snapshot locator resolver rejects symlink leaves and directories" 
         try resolveSessionSnapshotLocators(
             alloc,
             history,
+            null,
             sessions_path,
             "session",
         );
@@ -4430,6 +4585,13 @@ fn initWithHome(alloc: Allocator, home: []const u8, workspace_root: []const u8, 
         .canonical_root = canonical_root,
     };
 }
+fn parseRememberedSessionId(bytes: []const u8) ![]const u8 {
+    if (bytes.len < 2 or bytes.len > 256 or bytes[bytes.len - 1] != '\n') return error.InvalidRememberedSession;
+    const id = bytes[0 .. bytes.len - 1];
+    validateSessionId(id) catch return error.InvalidRememberedSession;
+    return id;
+}
+
 const TempStore = struct {
     home: []u8,
     workspace: []u8,
@@ -4481,6 +4643,82 @@ fn makeSessionDir(alloc: Allocator, store: Store, id: []const u8) !void {
     const dir = try sessionDirPath(alloc, store.sessions_dir, id);
     defer alloc.free(dir);
     try config_runtime.makeAbsolutePath(dir);
+}
+
+test "native subagent control opens do not decode conversation payloads" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    var initial = try testDurableState(alloc, "control-only", ctx.workspace);
+    defer initial.deinit(alloc);
+    {
+        var writer = try ctx.store.startWritableSession(alloc, initial);
+        defer writer.deinit(alloc);
+        try io_mod.durableReplaceVerified(alloc, &writer.log.dir, "events.jsonl", "invalid conversation\n");
+    }
+    var writable = try ctx.store.openSubagentControlCapabilityWritable(alloc, initial.id, .{});
+    defer writable.deinit();
+    var entry = try writable.atomicReplace(alloc, .subagent_control, "owner.json", "control sentinel");
+    defer entry.deinit(alloc);
+    var readonly = try ctx.store.openSubagentControlCapabilityReadOnly(alloc, initial.id, .{});
+    defer readonly.deinit();
+    var file = try readonly.openFileReadOnly(alloc, .subagent_control, "owner.json");
+    defer file.deinit();
+    const bytes = try file.readToEnd(alloc, 64);
+    defer alloc.free(bytes);
+    try std.testing.expectEqualStrings("control sentinel", bytes);
+    try std.testing.expectError(error.InvalidConversationFrame, ctx.store.resumeForWrite(alloc, initial.id));
+}
+
+test "native subagent control admission preserves identity and path checks" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    var initial = try testDurableState(alloc, "control-identity", ctx.workspace);
+    defer initial.deinit(alloc);
+    var writer = try ctx.store.startWritableSession(alloc, initial);
+    defer writer.deinit(alloc);
+    var metadata = (try session_log.readConversationMetadata(alloc, &writer.log.dir)).?;
+    defer metadata.deinit();
+    metadata.value.id = "different-id";
+    const mismatched = try session_codec.encodeSessionMetadata(alloc, metadata.value);
+    defer alloc.free(mismatched);
+    try io_mod.durableReplaceVerified(alloc, &writer.log.dir, "session.json", mismatched);
+    try std.testing.expectError(error.SessionStoreUnavailable, ctx.store.openSubagentControlCapabilityReadOnly(alloc, initial.id, .{}));
+    metadata.value.id = initial.id;
+    const valid = try session_codec.encodeSessionMetadata(alloc, metadata.value);
+    defer alloc.free(valid);
+    try io_mod.durableReplaceVerified(alloc, &writer.log.dir, "session.json", valid);
+    try writer.log.dir.dir.deleteFile(io_mod.getIo(), "events.jsonl");
+    try writer.log.dir.dir.symLink(io_mod.getIo(), "session.json", "events.jsonl", .{});
+    try std.testing.expectError(error.SessionPathUnsafe, ctx.store.openSubagentControlCapabilityWritable(alloc, initial.id, .{}));
+}
+
+test "recovery no-op validates supporting state before advising normal resume" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "permissions.json", "recovery.json" }) |name| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var ctx = try initTempStore(alloc, &tmp);
+        defer ctx.deinit(alloc);
+        var initial = try testDurableState(alloc, "recovery-supporting-state", ctx.workspace);
+        defer initial.deinit(alloc);
+        {
+            var writer = try ctx.store.startWritableSession(alloc, initial);
+            defer writer.deinit(alloc);
+            try io_mod.durableReplaceVerified(alloc, &writer.log.dir, name, "{broken");
+        }
+        const expected_error = if (std.mem.eql(u8, name, "permissions.json"))
+            error.InvalidPermissionState
+        else
+            error.InvalidRecoveryCheckpoint;
+        try std.testing.expectError(expected_error, ctx.store.loadReadOnly(alloc, initial.id));
+        try std.testing.expectError(expected_error, ctx.store.recoverSessionCopy(alloc, initial.id, .{}));
+    }
 }
 
 fn makeRawSessionsEntry(store: Store, name: []const u8) !void {
@@ -4841,12 +5079,10 @@ fn writeFixtureEntry(
 const LatestBarrierFailure = struct {
     injected_error: anyerror,
     completed_count: usize = 0,
-    contended_count: usize = 0,
 
     fn callback(context: ?*anyopaque, boundary: session_log.Boundary) !void {
         const self: *LatestBarrierFailure = @ptrCast(@alignCast(context.?));
         switch (boundary) {
-            .latest_barrier_contended => self.contended_count += 1,
             .latest_barrier_completed => {
                 self.completed_count += 1;
                 return self.injected_error;
@@ -4881,7 +5117,6 @@ fn waitForTestFlagInCallback(flag: *const std.atomic.Value(bool)) bool {
 
 const ResumeInterleavingControl = struct {
     pause_on_session: bool = false,
-    barrier_contended: std.atomic.Value(bool) = .init(false),
     barrier_completed_count: std.atomic.Value(usize) = .init(0),
     session_opened: std.atomic.Value(bool) = .init(false),
     release_session: std.atomic.Value(bool) = .init(false),
@@ -4890,7 +5125,6 @@ const ResumeInterleavingControl = struct {
     fn boundary(context: ?*anyopaque, point: session_log.Boundary) !void {
         const self: *ResumeInterleavingControl = @ptrCast(@alignCast(context.?));
         switch (point) {
-            .latest_barrier_contended => self.barrier_contended.store(true, .seq_cst),
             .latest_barrier_completed => _ = self.barrier_completed_count.fetchAdd(1, .seq_cst),
         }
     }
@@ -6043,7 +6277,6 @@ test "latest discovery retries only one namespace loss" {
             ),
         );
         try std.testing.expectEqual(@as(usize, 2), failure.completed_count);
-        try std.testing.expectEqual(@as(usize, 0), failure.contended_count);
     }
 
     const non_retryable = [_]anyerror{
@@ -6067,7 +6300,6 @@ test "latest discovery retries only one namespace loss" {
             ),
         );
         try std.testing.expectEqual(@as(usize, 1), failure.completed_count);
-        try std.testing.expectEqual(@as(usize, 0), failure.contended_count);
     }
 
     var empty_control = ResumeInterleavingControl{};
@@ -7179,7 +7411,7 @@ test "classifies conversation and legacy candidates" {
     );
 }
 
-test "writable last skips only unpublished lock directories" {
+test "writable last preserves unidentified data without blocking a healthy session" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7195,13 +7427,15 @@ test "writable last skips only unpublished lock directories" {
         try std.testing.expectEqualStrings("local", resumed.active_id);
     }
     try writeFixtureEntry(alloc, ctx.store, "lock-only", "events.jsonl", "unidentified saved data\n");
-    try std.testing.expectError(error.FileNotFound, ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{}));
+    var resumed = try ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqualStrings("local", resumed.active_id);
     const retained = try readFixtureFile(alloc, ctx.store, "lock-only", "events.jsonl", 1024);
     defer alloc.free(retained);
     try std.testing.expectEqualStrings("unidentified saved data\n", retained);
 }
 
-test "writable last skips retained incomplete creation without weakening saved-data checks" {
+test "writable last preserves incomplete creation and exact resume diagnostics" {
     const alloc = std.testing.allocator;
     for ([_]struct { metadata: bool, temporary: bool }{
         .{ .metadata = false, .temporary = true },
@@ -7249,10 +7483,63 @@ test "writable last skips retained incomplete creation without weakening saved-d
             return error.IncompleteSessionWasResumed;
         } else |err| try std.testing.expect(err == error.FileNotFound or err == error.SessionNotFound);
         try writeFixtureEntry(alloc, ctx.store, "failed-start", "permissions.json", "{}");
-        try std.testing.expectError(error.FileNotFound, ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{}));
+        var resumed = try ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{});
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqualStrings("healthy", resumed.active_id);
         const controls = try readFixtureFile(alloc, ctx.store, "failed-start", "permissions.json", 1024);
         defer alloc.free(controls);
         try std.testing.expectEqualStrings("{}", controls);
+    }
+}
+
+test "writable last retains a pending authority directory without a manifest" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    try createHistoryPageFixture(alloc, ctx.store, "healthy", ctx.workspace, 1, "saved");
+    try ctx.store.canonical_root.sessions.?.dir.createDir(std.testing.io, "pending", .fromMode(0o700));
+    try writeFixtureEntry(alloc, ctx.store, "pending", "authority.pending.json", "pending authority");
+    try writeFixtureEntry(alloc, ctx.store, "pending", "events.jsonl", "retained event data\n");
+    var resumed = try ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqualStrings("healthy", resumed.active_id);
+    const retained = try readFixtureFile(alloc, ctx.store, "pending", "events.jsonl", 1024);
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings("retained event data\n", retained);
+}
+
+test "writable last excludes newer child metadata and legacy owner markers" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |legacy_marker| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var ctx = try initTempStore(alloc, &tmp);
+        defer ctx.deinit(alloc);
+        try createHistoryPageFixture(alloc, ctx.store, "parent", ctx.workspace, 1, "parent");
+        if (legacy_marker) {
+            try writeLegacyFixture(alloc, ctx.store, "child", ctx.workspace, std.math.maxInt(i64) - 1);
+            var dir = try ctx.store.openSessionDir("child");
+            defer dir.close();
+            try dir.dir.createDir(std.testing.io, "subagent", .fromMode(0o700));
+            try dir.dir.writeFile(std.testing.io, .{ .sub_path = "subagent/owner.json", .data = "{}", .flags = .{ .permissions = .fromMode(0o600) } });
+        } else {
+            try createHistoryPageFixture(alloc, ctx.store, "child", ctx.workspace, 1, "child");
+            var dir = try ctx.store.openSessionDir("child");
+            defer dir.close();
+            var decoded = (try session_log.readConversationMetadata(alloc, &dir)).?;
+            defer decoded.deinit();
+            var metadata = decoded.value;
+            metadata.subagent_child = true;
+            metadata.updated_at_ms = std.math.maxInt(i64) - 1;
+            const bytes = try session_codec.encodeSessionMetadata(alloc, metadata);
+            defer alloc.free(bytes);
+            try writeFixtureEntry(alloc, ctx.store, "child", "session.json", bytes);
+        }
+        var resumed = try ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{});
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqualStrings("parent", resumed.active_id);
     }
 }
 
@@ -8375,6 +8662,31 @@ test "history page streaming digest has fixed memory and cursor parser fuzz cove
     }
 }
 
+test "history page digest rejects invalid review feedback" {
+    var calls = [_]session.ToolCall{.{ .id = "review", .name = "shell", .arguments_json = "{}" }};
+    var results = [_]session.PersistedToolResult{.{
+        .tool_call_id = @constCast("review"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast("held"),
+        .output_bytes = 4,
+        .stored_output_bytes = 4,
+        .review_feedback = true,
+    }};
+    var steps = [_]session.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    const turns = [_]session.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("inspect") },
+        .assistant = @constCast("held"),
+        .execution = .{ .tool_steps = &steps },
+    } }};
+    try std.testing.expectError(error.InvalidSessionFormat, historyPrefixDigest(&turns));
+    results[0].status = .failure;
+    const marked = try historyPrefixDigest(&turns);
+    results[0].review_feedback = false;
+    const ordinary = try historyPrefixDigest(&turns);
+    try std.testing.expect(!std.mem.eql(u8, &marked, &ordinary));
+}
+
 test "conversation visitation releases turns on consumer and allocation failure" {
     const backing = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -8467,4 +8779,122 @@ test "history page allocation failure sweep frees replay and page ownership" {
         try std.testing.expect(failing.has_induced_failure);
         try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     }
+}
+
+test "recovery checkpoint images resolve on read-only and writable resume" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    var state = try testDurableState(alloc, "checkpoint-images", ctx.workspace);
+    defer state.deinit(alloc);
+    var writable = try ctx.store.startWritableSession(alloc, state);
+    var writable_owned = true;
+    defer if (writable_owned) writable.deinit(alloc);
+    var temp_dir: ?[]u8 = null;
+    const image_dir = try imageSnapshotStorageDir(alloc, ctx.store.sessions_dir, state.id, &temp_dir);
+    defer alloc.free(image_dir);
+    const image = try image_attachments.captureInlineImageBytes(alloc, 7, "image/png", "\x89PNG\r\n\x1a\ncheckpoint", image_dir);
+    defer core_types.freeImageAttachment(alloc, image);
+    var images = [_]session.ImageAttachment{image};
+    const checkpoint = session_codec.RecoveryCheckpoint{
+        .turn_id = 1,
+        .user = .{ .text = @constCast("recover"), .images = &images },
+        .assistant_source = @constCast(""),
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 10,
+        .consumed_provider_attempts = 1,
+    };
+    _ = try writable.appendEvent(alloc, .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } }, 20);
+    writable.deinit(alloc);
+    writable_owned = false;
+    var detail = try ctx.store.loadReadOnlyDetail(alloc, state.id, .{});
+    defer detail.deinit(alloc);
+    const restored = detail.state.recovery_checkpoint.?.user.images[0];
+    try std.testing.expectEqual(@as(usize, 7), restored.id);
+    try std.testing.expectEqualStrings(image.snapshot_path.?, restored.snapshot_path.?);
+    var verified = try image_attachments.loadVerifiedSnapshot(alloc, restored, .{});
+    defer verified.deinit(alloc);
+    var resumed = try ctx.store.resumeTargetForWrite(alloc, .{ .id = state.id }, ctx.workspace, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqualStrings(image.snapshot_path.?, resumed.state.recovery_checkpoint.?.user.images[0].snapshot_path.?);
+    _ = try resumed.appendEvent(alloc, .{ .recovery_checkpoint_cleared = .{} }, 30);
+    try std.Io.Dir.accessAbsolute(std.testing.io, image.snapshot_path.?, .{});
+}
+
+test "remembered session IDs are bounded and unambiguous" {
+    try std.testing.expectEqualStrings("session-1", try parseRememberedSessionId("session-1\n"));
+    for ([_][]const u8{ "", "\n", "../other\n", "session-1", "one\ntwo\n", "one\r\n", " one\n" }) |bytes| {
+        try std.testing.expectError(error.InvalidRememberedSession, parseRememberedSessionId(bytes));
+    }
+    var bytes: [257]u8 = @splat('a');
+    bytes[255] = '\n';
+    try std.testing.expectEqual(@as(usize, 255), (try parseRememberedSessionId(bytes[0..256])).len);
+    try std.testing.expectError(error.InvalidRememberedSession, parseRememberedSessionId(&bytes));
+}
+
+test "remembered session selection is private per workspace and read-only lookup creates nothing" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    try std.testing.expect((try ctx.store.readRememberedSessionId(alloc)) == null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io_mod.getIo(), "home/.fx/continue", .{}));
+    try ctx.store.rememberSessionId(alloc, "first");
+    try ctx.store.rememberSessionId(alloc, "second");
+    var reader = try Store.initReadOnlyFromHome(alloc, ctx.home, ctx.workspace);
+    defer reader.deinit(alloc);
+    const selected = (try reader.readRememberedSessionId(alloc)).?;
+    defer alloc.free(selected);
+    try std.testing.expectEqualStrings("second", selected);
+    try std.testing.expectError(error.SessionStoreReadOnly, reader.rememberSessionId(alloc, "third"));
+    var other = try Store.initReadOnlyFromHome(alloc, ctx.home, "/other-workspace");
+    defer other.deinit(alloc);
+    try std.testing.expect((try other.readRememberedSessionId(alloc)) == null);
+    var directory = (try ctx.store.openRememberedDirectory(false)).?;
+    defer directory.close();
+    const name = ctx.store.rememberedSessionFilename();
+    const stat = try directory.dir.statFile(io_mod.getIo(), &name, .{});
+    try std.testing.expectEqual(@as(u32, 0o600), stat.permissions.toMode() & 0o777);
+    var file = try directory.dir.openFile(io_mod.getIo(), &name, .{ .mode = .read_write });
+    defer file.close(io_mod.getIo());
+    try file.setPermissions(io_mod.getIo(), .fromMode(0o400));
+    try std.testing.expectError(error.AccessDenied, ctx.store.rememberSessionId(alloc, "third"));
+    try file.setPermissions(io_mod.getIo(), .fromMode(0o600));
+    const preserved = (try reader.readRememberedSessionId(alloc)).?;
+    defer alloc.free(preserved);
+    try std.testing.expectEqualStrings("second", preserved);
+    try directory.dir.deleteFile(io_mod.getIo(), &name);
+    try directory.dir.symLink(io_mod.getIo(), "elsewhere", &name, .{});
+    if (ctx.store.readRememberedSessionId(alloc)) |value| {
+        if (value) |id| alloc.free(id);
+        return error.TestExpectedError;
+    } else |_| {}
+}
+
+test "remembered session reader retains an opened version across atomic replacement" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    try ctx.store.rememberSessionId(alloc, "before");
+    var directory = (try ctx.store.openRememberedDirectory(false)).?;
+    defer directory.close();
+    const name = ctx.store.rememberedSessionFilename();
+    var opened = try directory.dir.openFile(io_mod.getIo(), &name, .{ .follow_symlinks = false });
+    defer opened.close(io_mod.getIo());
+    try ctx.store.rememberSessionId(alloc, "after");
+    const prior = try Store.readRememberedSessionFile(alloc, &opened);
+    defer alloc.free(prior);
+    try std.testing.expectEqualStrings("before", prior);
+    const current = (try ctx.store.readRememberedSessionId(alloc)).?;
+    defer alloc.free(current);
+    try std.testing.expectEqualStrings("after", current);
 }

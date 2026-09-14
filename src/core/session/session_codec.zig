@@ -394,26 +394,6 @@ pub fn encodeRecoveryCheckpoint(
     return out.toOwnedSlice() catch return error.OutOfMemory;
 }
 
-pub fn decodeRecoveryCheckpoint(
-    alloc: Allocator,
-    bytes: []const u8,
-) !RecoveryCheckpoint {
-    if (bytes.len == 0 or bytes.len > max_recovery_checkpoint_bytes) {
-        return error.RecoveryCheckpointTooLarge;
-    }
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{
-        .max_value_len = max_recovery_checkpoint_bytes,
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidRecoveryCheckpoint,
-    };
-    defer parsed.deinit();
-    return parseRecoveryCheckpoint(alloc, parsed.value) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidRecoveryCheckpoint,
-    };
-}
-
 fn validateSessionMetadata(metadata: SessionMetadata) !void {
     if (metadata.schema_version != session_metadata_schema_version) {
         return error.UnsupportedSessionSchema;
@@ -525,7 +505,17 @@ pub fn encodeState(state: DurableSessionState, writer: *std.Io.Writer) !EncodeSu
 }
 
 pub fn decodeState(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimits) !DurableSessionState {
-    return decodeStateImpl(alloc, source, limits) catch |err| switch (err) {
+    return decodeStateWithUsageContract(alloc, source, limits, false);
+}
+
+/// Reads an old persisted state without requiring modern cache-token totals.
+/// Caller owns the state; all non-usage validation remains unchanged.
+pub fn decodeLegacyState(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimits) !DurableSessionState {
+    return decodeStateWithUsageContract(alloc, source, limits, true);
+}
+
+fn decodeStateWithUsageContract(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimits, legacy_usage: bool) !DurableSessionState {
+    return decodeStateImpl(alloc, source, limits, legacy_usage) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidDurableField => return error.InvalidDurableField,
         error.InvalidDurableBytes => return error.InvalidDurableBytes,
@@ -574,6 +564,9 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writer.writeByte(']');
             try writer.writeAll(",\"terminal_reason\":");
             try writeJsonString(writer, @tagName(entry.terminal_reason));
+            if (entry.cancellation_origin == .compaction) {
+                try writer.writeAll(",\"cancellation_origin\":\"compaction\"");
+            }
             if (hasDurableExecutionMemory(entry.execution)) {
                 try writer.writeAll(",\"execution\":");
                 try writeExecutionMemory(writer, entry.execution);
@@ -723,11 +716,13 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
         const has_execution = source.get("execution") != null;
         const has_presentation = source.get("cancelled_command") != null;
         const has_terminal_reason = source.get("terminal_reason") != null;
+        const has_cancellation_origin = source.get("cancellation_origin") != null;
         const object = try exactInterruptedHistoryObject(
             value,
             has_execution,
             has_presentation,
             has_terminal_reason,
+            has_cancellation_origin,
         );
         const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat);
         errdefer session.freeUserTurn(alloc, user);
@@ -744,6 +739,11 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
             try parseInterruptedTerminalReason(object, "terminal_reason")
         else
             types.InterruptedTerminalReason.cancelled;
+        const cancellation_origin: types.CancellationOrigin = if (has_cancellation_origin)
+            std.meta.stringToEnum(types.CancellationOrigin, try requireString(object, "cancellation_origin")) orelse
+                return error.InvalidSessionFormat
+        else
+            .turn;
         const execution = if (has_execution)
             try parseExecutionMemory(alloc, object.get("execution") orelse return error.InvalidSessionFormat)
         else
@@ -774,6 +774,7 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
             .execution = execution,
             .cancelled_command = cancelled_command,
             .terminal_reason = terminal_reason,
+            .cancellation_origin = cancellation_origin,
         } };
     }
     return error.InvalidSessionFormat;
@@ -1047,7 +1048,7 @@ pub fn writeRecoveryCheckpoint(writer: *std.Io.Writer, checkpoint: RecoveryCheck
     });
 }
 
-fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimits) !DurableSessionState {
+fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimits, legacy_usage: bool) !DurableSessionState {
     var json_reader = std.json.Reader.init(alloc, source);
     defer json_reader.deinit();
 
@@ -1117,6 +1118,7 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
     errdefer permission_state.deinit(alloc);
     var permission_state_seen = false;
     var usage: ?session_usage.Snapshot = null;
+    errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
     var usage_seen = false;
     var last_subagent_work_id: ?[]u8 = null;
     errdefer if (last_subagent_work_id) |work_id| alloc.free(work_id);
@@ -1162,7 +1164,10 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
                 .allocate = .alloc_always,
                 .parse_numbers = false,
             });
-            usage = try session_usage.parseSnapshotValue(alloc, value);
+            usage = if (legacy_usage)
+                try session_usage.parseLegacySnapshotValue(alloc, value)
+            else
+                try session_usage.parseSnapshotValue(alloc, value);
             usage_seen = true;
         } else if (std.mem.eql(u8, key, "last_subagent_work_id")) {
             if (last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
@@ -1184,7 +1189,6 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
             recovery_checkpoint = try parseRecoveryCheckpoint(alloc, value);
         } else return error.InvalidSessionFormat;
     }
-    errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
     try expectToken(try json_reader.next(), .object_end);
     try expectToken(try json_reader.next(), .end_of_document);
 
@@ -1438,7 +1442,7 @@ fn writeSnapshotLocator(writer: *std.Io.Writer, value: ?[]const u8) !void {
 }
 
 fn writeExecutionMemory(writer: *std.Io.Writer, execution: session.ExecutionMemory) !void {
-    try writer.writeAll("{\"schema_version\":9,\"tool_steps\":[");
+    try writer.writeAll("{\"schema_version\":10,\"tool_steps\":[");
     for (execution.tool_steps, 0..) |step, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.writeAll("{\"assistant\":");
@@ -1513,6 +1517,9 @@ fn writeToolCall(writer: *std.Io.Writer, tool_call: session.ToolCall) !void {
 }
 
 fn writePersistedToolResult(writer: *std.Io.Writer, result: session.PersistedToolResult) !void {
+    if (result.review_feedback and (result.status != .failure or result.provider_native)) {
+        return error.InvalidSessionFormat;
+    }
     try writer.writeAll("{\"tool_call_id\":");
     try writeDurableBytes(writer, result.tool_call_id);
     try writer.writeAll(",\"tool_name\":");
@@ -1526,12 +1533,13 @@ fn writePersistedToolResult(writer: *std.Io.Writer, result: session.PersistedToo
     try writer.writeAll(",\"preview\":");
     try writeOptionalDurableBytes(writer, result.preview);
     try writer.print(
-        ",\"output_bytes\":{d},\"stored_output_bytes\":{d},\"truncated\":{s},\"provider_native\":{s},\"created_at_ms\":{d}",
+        ",\"output_bytes\":{d},\"stored_output_bytes\":{d},\"truncated\":{s},\"provider_native\":{s},\"review_feedback\":{s},\"created_at_ms\":{d}",
         .{
             result.output_bytes,
             result.stored_output_bytes,
             if (result.truncated) "true" else "false",
             if (result.provider_native) "true" else "false",
+            if (result.review_feedback) "true" else "false",
             result.created_at_ms,
         },
     );
@@ -1842,7 +1850,7 @@ fn parseExecutionMemory(alloc: Allocator, value: std.json.Value) !session.Execut
         1...4 => try exactObject(value, &.{ "schema_version", "tool_steps", "files" }),
         5 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "turn_summary" }),
         6 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
-        7...9 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
+        7...10 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
         else => return error.InvalidSessionFormat,
     };
     const tool_steps = try parseToolSteps(
@@ -2205,9 +2213,25 @@ fn parseToolResult(
             try exactObject(value, &(v4_keys.* ++ [_][]const u8{"tool_image_handle"}))
         else
             try exactObject(value, v4_keys), .extended = true },
+        10 => blk: {
+            const keys = v4_keys.* ++ [_][]const u8{"review_feedback"};
+            break :blk .{ .object = if (value == .object and value.object.contains("tool_images"))
+                try exactObject(value, &(keys ++ [_][]const u8{"tool_images"}))
+            else if (value == .object and value.object.contains("tool_image_handle"))
+                try exactObject(value, &(keys ++ [_][]const u8{"tool_image_handle"}))
+            else
+                try exactObject(value, &keys), .extended = true };
+        },
         else => return error.InvalidSessionFormat,
     };
     const object = result_shape.object;
+    const status = std.meta.stringToEnum(
+        session.PersistedToolStatus,
+        try requireString(object, "status"),
+    ) orelse return error.InvalidSessionFormat;
+    const provider_native = try requireBool(object, "provider_native");
+    const review_feedback = if (schema_version >= 10) try requireBool(object, "review_feedback") else false;
+    if (review_feedback and (status != .failure or provider_native)) return error.InvalidSessionFormat;
     const tool_call_id = try parseRequiredDurableBytes(alloc, object, "tool_call_id");
     errdefer alloc.free(tool_call_id);
     const tool_name = try parseRequiredDurableBytes(alloc, object, "tool_name");
@@ -2290,17 +2314,15 @@ fn parseToolResult(
         .tool_image_handle = tool_image_handle,
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
-        .status = std.meta.stringToEnum(
-            session.PersistedToolStatus,
-            try requireString(object, "status"),
-        ) orelse return error.InvalidSessionFormat,
+        .status = status,
         .output = output,
         .output_handle = output_handle,
         .preview = preview,
         .output_bytes = try requireUsize(object, "output_bytes"),
         .stored_output_bytes = try requireUsize(object, "stored_output_bytes"),
         .truncated = try requireBool(object, "truncated"),
-        .provider_native = try requireBool(object, "provider_native"),
+        .provider_native = provider_native,
+        .review_feedback = review_feedback,
         .created_at_ms = try requireI64(object, "created_at_ms"),
         .permission_feedback = permission_feedback,
         .committed_file_presentation = committed_file_presentation,
@@ -2651,16 +2673,6 @@ fn writeOptionalU32(writer: *std.Io.Writer, value: ?u32) !void {
     }
 }
 
-fn writeHexString(writer: *std.Io.Writer, bytes: []const u8) !void {
-    try writer.writeByte('"');
-    const alphabet = "0123456789abcdef";
-    for (bytes) |byte| {
-        try writer.writeByte(alphabet[byte >> 4]);
-        try writer.writeByte(alphabet[byte & 0x0f]);
-    }
-    try writer.writeByte('"');
-}
-
 noinline fn writeJsonString(writer: *std.Io.Writer, bytes: []const u8) !void {
     try std.json.Stringify.value(bytes, .{}, writer);
 }
@@ -2815,8 +2827,9 @@ fn exactInterruptedHistoryObject(
     has_execution: bool,
     has_presentation: bool,
     has_terminal_reason: bool,
+    has_cancellation_origin: bool,
 ) !std.json.ObjectMap {
-    var keys: [8][]const u8 = undefined;
+    var keys: [9][]const u8 = undefined;
     keys[0] = "kind";
     keys[1] = "user";
     keys[2] = "assistant";
@@ -2833,6 +2846,10 @@ fn exactInterruptedHistoryObject(
     }
     if (has_terminal_reason) {
         keys[len] = "terminal_reason";
+        len += 1;
+    }
+    if (has_cancellation_origin) {
+        keys[len] = "cancellation_origin";
         len += 1;
     }
     return exactObject(value, keys[0..len]);
@@ -3429,6 +3446,99 @@ test "durable state rejects invalid metadata fields before returning" {
     }
 }
 
+test "review feedback survives durable execution memory round trip" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |review_feedback| {
+        var calls = [_]session.ToolCall{.{
+            .id = "call-review",
+            .name = "shell",
+            .arguments_json = "{}",
+        }};
+        var results = [_]session.PersistedToolResult{.{
+            .tool_call_id = @constCast("call-review"),
+            .tool_name = @constCast("shell"),
+            .status = .failure,
+            .output = @constCast("Security review held this action."),
+            .output_bytes = "Security review held this action.".len,
+            .stored_output_bytes = "Security review held this action.".len,
+            .review_feedback = review_feedback,
+        }};
+        var steps = [_]session.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+        var encoded: std.Io.Writer.Allocating = .init(alloc);
+        defer encoded.deinit();
+        try writeExecutionMemory(&encoded.writer, .{ .tool_steps = &steps });
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+        defer parsed.deinit();
+        const decoded = try parseExecutionMemory(alloc, parsed.value);
+        defer session.freeExecutionMemory(alloc, decoded);
+        const result = decoded.tool_steps[0].tool_results[0];
+        try std.testing.expectEqual(review_feedback, result.review_feedback);
+        try std.testing.expectEqualStrings("Security review held this action.", result.output);
+        try std.testing.expectEqual(session.PersistedToolStatus.failure, result.status);
+    }
+}
+
+test "review feedback durable codec rejects invalid provenance and unknown fields" {
+    const alloc = std.testing.allocator;
+    var result = persistedResultForTest("call-review", "shell");
+    result.status = .failure;
+    result.review_feedback = true;
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try writePersistedToolResult(&encoded.writer, result);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+    defer parsed.deinit();
+    const cases = [_]struct { status: []const u8, provider_native: bool, marker: std.json.Value }{
+        .{ .status = "success", .provider_native = false, .marker = .{ .bool = true } },
+        .{ .status = "failure", .provider_native = true, .marker = .{ .bool = true } },
+        .{ .status = "failure", .provider_native = false, .marker = .null },
+        .{ .status = "failure", .provider_native = false, .marker = .{ .integer = 1 } },
+        .{ .status = "failure", .provider_native = false, .marker = .{ .string = "true" } },
+    };
+    for (cases) |case| {
+        parsed.value.object.getPtr("status").?.* = .{ .string = case.status };
+        parsed.value.object.getPtr("provider_native").?.* = .{ .bool = case.provider_native };
+        parsed.value.object.getPtr("review_feedback").?.* = case.marker;
+        try std.testing.expectError(error.InvalidSessionFormat, parseToolResult(alloc, parsed.value, 10));
+    }
+    parsed.value.object.getPtr("status").?.* = .{ .string = "failure" };
+    parsed.value.object.getPtr("review_feedback").?.* = .{ .bool = true };
+    try parsed.value.object.put(parsed.arena.allocator(), "unknown_feedback", .{ .bool = true });
+    try std.testing.expectError(error.InvalidSessionFormat, parseToolResult(alloc, parsed.value, 10));
+    for ([_]bool{ false, true }) |native| {
+        var invalid = result;
+        invalid.status = if (native) .failure else .success;
+        invalid.provider_native = native;
+        try std.testing.expectError(error.InvalidSessionFormat, writePersistedToolResult(&encoded.writer, invalid));
+    }
+}
+
+test "review feedback defaults old durable results without inspecting output" {
+    const alloc = std.testing.allocator;
+    var result = persistedResultForTest("call-review", "shell");
+    result.status = .failure;
+    result.output = @constCast("Security review held this action.");
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try writePersistedToolResult(&encoded.writer, result);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.swapRemove("review_feedback"));
+    for ([_]u64{ 8, 9 }) |version| {
+        const decoded = try parseToolResult(alloc, parsed.value, version);
+        defer {
+            alloc.free(decoded.tool_call_id);
+            alloc.free(decoded.tool_name);
+            alloc.free(decoded.output);
+            types.freeToolImages(alloc, decoded.tool_images);
+        }
+        try std.testing.expect(!decoded.review_feedback);
+        try std.testing.expectEqualStrings("Security review held this action.", decoded.output);
+    }
+    try parsed.value.object.put(parsed.arena.allocator(), "review_feedback", .{ .bool = true });
+    try std.testing.expectError(error.InvalidSessionFormat, parseToolResult(alloc, parsed.value, 9));
+}
+
 test "execution memory codec preserves feedback and reads v1 results without it" {
     const alloc = std.testing.allocator;
     const provider_state = types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"kept\"}]" };
@@ -3500,7 +3610,7 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     var encoded: std.Io.Writer.Allocating = .init(alloc);
     defer encoded.deinit();
     try writeHistoryTurn(&encoded.writer, turn);
-    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"schema_version\":9") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"schema_version\":10") != null);
     try std.testing.expect(std.mem.find(u8, encoded.written(), "\"text\":\"focus on persistence\"") != null);
     try std.testing.expect(std.mem.find(u8, encoded.written(), "\"assistant_prefix\":\"partial assistant\"") != null);
     try std.testing.expect(std.mem.find(u8, encoded.written(), "\"after_tool_step_count\":1") != null);
@@ -3562,6 +3672,7 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     const legacy_execution = parsed.value.object.getPtr("execution").?;
     legacy_execution.object.getPtr("schema_version").?.* = .{ .integer = 8 };
     try std.testing.expect(legacy_execution.object.getPtr("tool_steps").?.array.items[0].object.swapRemove("provider_replay"));
+    try std.testing.expect(legacy_execution.object.getPtr("tool_steps").?.array.items[0].object.getPtr("tool_results").?.array.items[0].object.swapRemove("review_feedback"));
     const v8_decoded = try parseHistoryTurn(alloc, parsed.value);
     defer session.freeHistoryTurn(alloc, v8_decoded);
     try std.testing.expect(v8_decoded.assistant.provider_replay == null);
@@ -3710,6 +3821,78 @@ test "terminal action presentation codec preserves return and failure causes" {
             case,
             (try parseOptionalTerminalActionPresentation(parsed.value)).?,
         );
+    }
+}
+
+test "durable cancellation provenance defaults old records and preserves ordinary bytes" {
+    const alloc = std.testing.allocator;
+    const old = "{\"kind\":\"interrupted\",\"user\":{\"text\":\"request\",\"images\":[]},\"assistant\":\"partial\",\"tool_call\":null,\"completed_tool_names\":[]}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, old, .{});
+    defer parsed.deinit();
+    const turn = try parseHistoryTurn(alloc, parsed.value);
+    defer session.freeHistoryTurn(alloc, turn);
+    try std.testing.expectEqual(types.CancellationOrigin.turn, turn.interrupted.cancellation_origin);
+    try std.testing.expectEqual(types.InterruptedTerminalReason.cancelled, turn.interrupted.terminal_reason);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeHistoryTurn(&out.writer, turn);
+    try std.testing.expectEqualStrings(old[0 .. old.len - 1] ++ ",\"terminal_reason\":\"cancelled\"}", out.written());
+}
+
+test "durable cancellation provenance roundtrips and cleans allocation failures" {
+    const Case = struct {
+        fn run(alloc: Allocator, origin: types.CancellationOrigin, reason: types.InterruptedTerminalReason) !void {
+            const turn: session.HistoryTurn = .{ .interrupted = .{
+                .user = .{ .text = @constCast("request") },
+                .assistant = @constCast("partial"),
+                .terminal_reason = reason,
+                .cancellation_origin = origin,
+            } };
+            const copy = try session.dupeHistoryTurn(alloc, turn);
+            defer session.freeHistoryTurn(alloc, copy);
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            defer out.deinit();
+            // This in-memory writer reports injected allocation failure as WriteFailed.
+            writeHistoryTurn(&out.writer, copy) catch |err|
+                return if (err == error.WriteFailed) error.OutOfMemory else err;
+            try std.testing.expectEqual(origin == .compaction, std.mem.find(u8, out.written(), "\"cancellation_origin\"") != null);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+            defer parsed.deinit();
+            const decoded = try parseHistoryTurn(alloc, parsed.value);
+            defer session.freeHistoryTurn(alloc, decoded);
+            try std.testing.expectEqual(origin, decoded.interrupted.cancellation_origin);
+            try std.testing.expectEqual(reason, decoded.interrupted.terminal_reason);
+            try std.testing.expectEqualStrings("request", decoded.interrupted.user.text);
+            try std.testing.expectEqualStrings("partial", decoded.interrupted.assistant.?);
+            var again: std.Io.Writer.Allocating = .init(alloc);
+            defer again.deinit();
+            writeHistoryTurn(&again.writer, decoded) catch |err|
+                return if (err == error.WriteFailed) error.OutOfMemory else err;
+            try std.testing.expectEqualStrings(out.written(), again.written());
+        }
+    };
+    for (std.enums.values(types.CancellationOrigin)) |origin| {
+        for (std.enums.values(types.InterruptedTerminalReason)) |reason| {
+            try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{ origin, reason });
+        }
+    }
+}
+
+test "durable cancellation provenance accepts explicit turn and rejects invalid or unknown fields" {
+    const alloc = std.testing.allocator;
+    const prefix = "{\"kind\":\"interrupted\",\"user\":{\"text\":\"request\",\"images\":[]},\"assistant\":\"partial\",\"tool_call\":null,\"completed_tool_names\":[\"read_file\"],\"cancellation_origin\":";
+    for ([_][]const u8{ "\"turn\"", "\"compaction\"", "\"unknown\"", "null", "0", "true", "{}", "[]", "\"compaction\",\"unknown_field\":true" }, 0..) |value, i| {
+        const bytes = try std.fmt.allocPrint(alloc, "{s}{s}}}", .{ prefix, value });
+        defer alloc.free(bytes);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+        defer parsed.deinit();
+        if (i < 2) {
+            const turn = try parseHistoryTurn(alloc, parsed.value);
+            defer session.freeHistoryTurn(alloc, turn);
+            try std.testing.expectEqual(if (i == 0) types.CancellationOrigin.turn else .compaction, turn.interrupted.cancellation_origin);
+        } else {
+            try std.testing.expectError(error.InvalidSessionFormat, parseHistoryTurn(alloc, parsed.value));
+        }
     }
 }
 
@@ -4133,6 +4316,7 @@ fn expectExecutionMemoryEqual(expected: session.ExecutionMemory, actual: session
             try std.testing.expectEqual(result.stored_output_bytes, got_result.stored_output_bytes);
             try std.testing.expectEqual(result.truncated, got_result.truncated);
             try std.testing.expectEqual(result.provider_native, got_result.provider_native);
+            try std.testing.expectEqual(result.review_feedback, got_result.review_feedback);
             try std.testing.expectEqual(result.created_at_ms, got_result.created_at_ms);
         }
     }
@@ -4471,6 +4655,31 @@ test "permission state schema two round trips before activation" {
     try std.testing.expectEqual(session_permission_state.schema_version, decoded.version);
     try std.testing.expectEqual(@as(usize, 1), decoded.rules.items.len);
     try std.testing.expectEqual(session_permission_state.StateDecision.deny, session_permission_state.decide(decoded, key));
+}
+
+test "durable state usage remains strict and releases partial allocations" {
+    const alloc = std.testing.allocator;
+    const state_json =
+        \\{"id":"usage-state","origin_workspace_root":"/workspace","workspace_root":"/workspace","created_at_ms":1,"updated_at_ms":2,
+        \\"conversation_language":"en","preferences":{"model":"test/model","effort":"auto","fast_mode":false},"history":[],"total_input_tokens":0,"total_output_tokens":0,
+        \\"usage":{"billing":"complete","api_duration_complete":true,"wall_duration_complete":true,"code_complete":true,"next_sequence":2,"settled_through_sequence":1,
+        \\"api_duration_ms":10,"wall_duration_ms":20,"total_cost":1,"input_tokens":10,"output_tokens":3,"cache_read_tokens":2,"cache_write_tokens":0,"billable_web_search_calls":0,"lines_added":0,"lines_removed":0,
+        \\"models":[{"model":"test/model","first_sequence":1,"total_cost":1,"input_tokens":10,"output_tokens":3,"cache_read_tokens":2,"cache_write_tokens":0,"billable_web_search_calls":0}],"pending":[]},
+        \\"last_subagent_work_id":"legacy-work"}
+    ;
+    try std.testing.checkAllAllocationFailures(alloc, struct {
+        fn check(a: Allocator, bytes: []const u8) !void {
+            var source = std.Io.Reader.fixed(bytes);
+            var decoded = try decodeState(a, &source, .{});
+            defer decoded.deinit(a);
+            try std.testing.expectEqual(@as(u64, 10), decoded.usage.?.input_tokens);
+            try std.testing.expectEqualStrings("legacy-work", decoded.last_subagent_work_id.?);
+        }
+    }.check, .{state_json});
+    const incompatible = try std.mem.replaceOwned(u8, alloc, state_json, "\"cache_read_tokens\":2", "\"cache_read_tokens\":11");
+    defer alloc.free(incompatible);
+    var strict_source = std.Io.Reader.fixed(incompatible);
+    try std.testing.expectError(error.InvalidSessionFormat, decodeState(alloc, &strict_source, .{}));
 }
 
 test "durable session optional fields handle fuzzed ownership paths" {

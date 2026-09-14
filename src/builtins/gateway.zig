@@ -42,7 +42,8 @@ const Response = web_search_contract.ProviderResponse;
 const ProgressFn = web_search_contract.ProgressFn;
 
 pub const default_model = "moonshotai/kimi-k3";
-pub const default_chat_url = "https://ai-gateway.vercel.sh/v3/ai/language-model";
+pub const title_model = "openai/gpt-5.6-luna";
+pub const default_chat_url = "https://ai-gateway.vercel.sh/v4/ai/language-model";
 pub const models_path = "/coding-agent/v1/models";
 const credits_path = "/coding-agent/v1/credits";
 pub const retry_count: usize = 3;
@@ -157,6 +158,7 @@ pub const provider_bundle = provider_set.Bundle{
     .capabilities = .{ .fx_search = true, .vision_fallback = true },
     .presentation = provider_catalog.find(.gateway),
     .auth_strategy = .vercel,
+    .title_model = title_model,
     .fallback_model_capabilities_fn = vercel_model_policy.capabilitiesForModel,
     .agent_stream = agent_stream_provider,
     .cli_model_catalog = cli_model_catalog_provider,
@@ -671,8 +673,8 @@ const EventBridge = struct {
         sink(raw).emit(.{ .tool_input_delta = chunk });
     }
 
-    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8) void {
-        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label } });
+    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8, arguments_json: ?[]const u8) void {
+        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label, .arguments_json = arguments_json } });
     }
 };
 
@@ -1456,10 +1458,6 @@ fn writeParallelDomains(writer: *std.Io.Writer, name: []const u8, domains: []con
     try writer.writeAll("]}");
 }
 
-fn boundedDupe(alloc: Allocator, text: []const u8, max_len: usize) ![]u8 {
-    return try alloc.dupe(u8, text[0..@min(text.len, max_len)]);
-}
-
 fn hasValues(values: ?[]const []const u8) bool {
     return if (values) |actual| actual.len > 0 else false;
 }
@@ -1633,7 +1631,7 @@ fn expectGatewayWorkerAdapterExecutes(backend: web_search_contract.SearchBackend
         .team = "team_123",
         .model = "provider/model",
         .retry_count = 1,
-        .chat_url = "https://ai-gateway.vercel.sh/v3/ai/language-model",
+        .chat_url = "https://ai-gateway.vercel.sh/v4/ai/language-model",
         .usage = &usage,
         .usage_allocator = alloc,
         .stream_ctx = @ptrCast(&fake),
@@ -1863,7 +1861,7 @@ test "cancelled gateway worker performs zero stream requests" {
         .api_key = "key",
         .model = "provider/model",
         .retry_count = 1,
-        .chat_url = "https://ai-gateway.vercel.sh/v3/ai/language-model",
+        .chat_url = "https://ai-gateway.vercel.sh/v4/ai/language-model",
         .stream_ctx = @ptrCast(&fake),
         .stream_fn = FakeStream.execute,
     }, .{
@@ -1979,7 +1977,7 @@ test "pre-send web search failure stays unbilled" {
         .api_key = "key",
         .model = "provider/model",
         .retry_count = 1,
-        .chat_url = "https://ai-gateway.vercel.sh/v3/ai/language-model",
+        .chat_url = "https://ai-gateway.vercel.sh/v4/ai/language-model",
         .usage = &usage,
         .usage_allocator = alloc,
         .stream_ctx = @ptrCast(&fake),
@@ -2008,7 +2006,7 @@ test "possibly sent web search failure marks billing incomplete" {
         .api_key = "key",
         .model = "provider/model",
         .retry_count = 1,
-        .chat_url = "https://ai-gateway.vercel.sh/v3/ai/language-model",
+        .chat_url = "https://ai-gateway.vercel.sh/v4/ai/language-model",
         .usage = &usage,
         .usage_allocator = alloc,
         .stream_ctx = @ptrCast(&fake),
@@ -2028,7 +2026,7 @@ test "possibly sent web search failure marks billing incomplete" {
 
 test "built-in gateway defaults preserve active provider policy" {
     try std.testing.expectEqualStrings("moonshotai/kimi-k3", default_model);
-    try std.testing.expectEqualStrings("https://ai-gateway.vercel.sh/v3/ai/language-model", default_chat_url);
+    try std.testing.expectEqualStrings("https://ai-gateway.vercel.sh/v4/ai/language-model", default_chat_url);
     try std.testing.expectEqualStrings("/coding-agent/v1/models", models_path);
     try std.testing.expectEqual(@as(usize, 3), retry_count);
     try std.testing.expectEqualStrings("FX_GATEWAY_CHAT_URL", chat_url_env);
@@ -2312,7 +2310,7 @@ test "built-in gateway chat url honors loopback override before fallback" {
 }
 
 test "built-in gateway chat url ignores untrusted overrides and falls back" {
-    const fallback = "https://ai-gateway.vercel.sh/v3/ai/language-model";
+    const fallback = "https://ai-gateway.vercel.sh/v4/ai/language-model";
     for ([_][]const u8{
         "https://evil.example/chat",
         "http://evil.example/chat",
@@ -2355,41 +2353,6 @@ pub fn fetchModelIdsCancellable(
     cancel_flag: *std.atomic.Value(bool),
 ) !std.ArrayList([]u8) {
     return fetchModelIdsForView(alloc, access, path, cancel_flag, .full);
-}
-
-pub fn fetchPickerModelIdsCancellable(
-    alloc: std.mem.Allocator,
-    access: credentials.CatalogAccess,
-    path: []const u8,
-    cancel_flag: *std.atomic.Value(bool),
-) !std.ArrayList([]u8) {
-    return fetchModelIdsForView(alloc, access, path, cancel_flag, .picker);
-}
-
-pub fn fetchModelCatalog(alloc: std.mem.Allocator, access: credentials.CatalogAccess, path: []const u8) !std.ArrayList(ModelCatalogEntry) {
-    return fetchModelCatalogForView(alloc, access, path, null, .full);
-}
-
-pub fn fetchModelCatalogCancellable(
-    alloc: std.mem.Allocator,
-    access: credentials.CatalogAccess,
-    path: []const u8,
-    cancel_flag: *std.atomic.Value(bool),
-) !std.ArrayList(ModelCatalogEntry) {
-    return fetchModelCatalogForView(alloc, access, path, cancel_flag, .full);
-}
-
-pub fn fetchPickerModelCatalog(alloc: std.mem.Allocator, access: credentials.CatalogAccess, path: []const u8) !std.ArrayList(ModelCatalogEntry) {
-    return fetchModelCatalogForView(alloc, access, path, null, .picker);
-}
-
-pub fn fetchPickerModelCatalogCancellable(
-    alloc: std.mem.Allocator,
-    access: credentials.CatalogAccess,
-    path: []const u8,
-    cancel_flag: *std.atomic.Value(bool),
-) !std.ArrayList(ModelCatalogEntry) {
-    return fetchModelCatalogForView(alloc, access, path, cancel_flag, .picker);
 }
 
 pub const model_catalog_provider = model_catalog.Provider{
@@ -2823,10 +2786,6 @@ fn parseSortedModelCatalog(alloc: std.mem.Allocator, json_text: []const u8) !std
 
 fn parsePickerModelIds(alloc: std.mem.Allocator, json_text: []const u8) !std.ArrayList([]u8) {
     return parseModelIdsForView(alloc, json_text, .picker);
-}
-
-fn parsePickerModelCatalog(alloc: std.mem.Allocator, json_text: []const u8) !std.ArrayList(ModelCatalogEntry) {
-    return parseModelCatalogForView(alloc, json_text, .picker);
 }
 
 fn parseModelCatalogEntry(alloc: std.mem.Allocator, entry: std.json.Value) !?ModelCatalogEntry {

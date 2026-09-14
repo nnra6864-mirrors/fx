@@ -61,6 +61,11 @@ binary, candidate, assignment, or shard identity mismatch. The aggregate
 command requires all 36 training scenarios, all 53 behavior scenarios, and all
 12 performance gates exactly once before it emits `eligible: true`.
 
+Rerunning a workflow job replaces its previous named artifact, including
+failed evidence. Consumers therefore read the latest result for each shard;
+a failed retry cannot fall back to an earlier pass. Source and artifact hashes
+must still match before aggregation can qualify a release.
+
 ## Corpus
 
 [`corpus.json`](corpus.json) references existing test owners instead of copying their behavior. Training contains six direct CLI commands and thirty deterministic E2E files covering CLI, configuration, tools, Gateway lifecycle, fake web and vision routes, ACP, modern and legacy MCP, sessions, terminal hosting, TUI startup, resizing, rendering, permissions, interruption, subagents, and recovery. A bounded `profile_runs` count can weight a direct training command without duplicating manifest entries or final behavior checks. Seventeen additional deterministic E2E files verify the final candidate without influencing LLVM's hot and cold classification.
