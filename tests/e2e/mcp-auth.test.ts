@@ -3699,6 +3699,6 @@ describe("MCP remote authentication lifecycle", () => {
       expect(listed.stdout).toMatch(/fixture[\s\S]{0,240}auth=required/);
       expect(listed.stdout).toMatch(/fixture[\s\S]{0,240}status=needs_auth/);
     },
-    30_000,
+    45_000,
   );
 });

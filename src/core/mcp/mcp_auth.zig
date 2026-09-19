@@ -919,7 +919,14 @@ fn refreshCredentialsCore(
         auth.headers(),
     );
     defer response.deinit(alloc);
-    if (response.status != .ok) return error.McpRefreshRejected;
+    if (response.status != .ok) {
+        // Only OAuth's terminal grant rejection means re-authenticate; a 429
+        // or 5xx from the token endpoint is transient and retries as-is.
+        if (response.status == .bad_request and try refreshRejectionIsFinal(alloc, response.body)) {
+            return error.McpRefreshRejected;
+        }
+        return error.McpRefreshUnavailable;
+    }
     try validateJsonContentType(response.content_type);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.body, .{});
@@ -971,6 +978,15 @@ fn waitForRefreshCancellation(
 
 fn waitForRefreshDeadline(deadline: std.Io.Clock.Timestamp) anyerror!void {
     try deadline.wait(io_mod.getIo());
+}
+
+/// RFC 6749 §5.2: only invalid_grant marks the grant permanently dead.
+fn refreshRejectionIsFinal(alloc: Allocator, body: []const u8) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const error_value = parsed.value.object.get("error") orelse return false;
+    return error_value == .string and std.mem.eql(u8, error_value.string, "invalid_grant");
 }
 
 pub fn revokeCredentials(alloc: Allocator, credentials: Credentials) !void {
@@ -2900,4 +2916,12 @@ test "interactive callback wait observes caller and lifecycle cancellation" {
         );
         try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
     }
+}
+
+test "refresh rejection is final only for invalid_grant" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try refreshRejectionIsFinal(alloc, "{\"error\":\"invalid_grant\"}"));
+    try std.testing.expect(!(try refreshRejectionIsFinal(alloc, "{\"error\":\"temporarily_unavailable\"}")));
+    try std.testing.expect(!(try refreshRejectionIsFinal(alloc, "<html>502</html>")));
+    try std.testing.expect(!(try refreshRejectionIsFinal(alloc, "{}")));
 }
