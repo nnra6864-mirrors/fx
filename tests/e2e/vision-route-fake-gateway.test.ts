@@ -20,7 +20,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
-import { imagePixelSize, solidPng } from "./fixtures/image-encoding";
+import { pngPixelSize, solidPng } from "./fixtures/image-encoding";
 import { fakeGatewaySse, fakeGatewayTitleDefault, hasEmptyComposer, TITLE_GENERATION_MARKER, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 const TIMEOUT = 15_000;
@@ -1199,12 +1199,11 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "fx ask downsizes native images over the model pixel limit on macOS and keeps them elsewhere",
+    "fx ask downscales native PNG images over the model pixel limit",
     async () => {
       const root = createIsolatedRoot();
       const widePath = join(root.workspace, "wide-screenshot.png");
-      const wide = solidPng(3420, 2224);
-      writeFileSync(widePath, wide);
+      writeFileSync(widePath, solidPng(3420, 2224));
       const gateway = startImageGateway([sseText("Wide native image answer")]);
       try {
         const result = await runFx(
@@ -1230,15 +1229,9 @@ describe("Vision route fake Gateway", () => {
         expect(gateway.chatRequests).toHaveLength(1);
         const parts = nativeFileParts(gateway.chatRequests[0]!.body);
         expect(parts).toHaveLength(1);
+        expect(parts[0]!.mediaType).toBe("image/png");
         const sent = Buffer.from(parts[0]!.data.data, "base64");
-        if (process.platform === "darwin") {
-          expect(parts[0]!.mediaType).toBe("image/jpeg");
-          const size = imagePixelSize(sent);
-          expect(Math.max(size.width, size.height)).toBe(2000);
-        } else {
-          expect(parts[0]!.mediaType).toBe("image/png");
-          expect(sent.equals(wide)).toBe(true);
-        }
+        expect(pngPixelSize(sent)).toEqual({ width: 2000, height: 1301 });
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });

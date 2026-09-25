@@ -248,14 +248,16 @@ fn imageToolResult(
             .{ rel, mime_type, file_size, max_attach_image_bytes },
         ) };
     }
+    // Oversized PNGs are downscaled when the result enters history; other
+    // formats cannot be, so they are reported here instead of attached.
     if (image_data.imageDimensions(bytes)) |dimensions| {
-        if (dimensions.exceedsModelLimit()) {
+        if (dimensions.exceedsModelLimit() and !std.mem.eql(u8, mime_type, "image/png")) {
             tool_dispatch.reportToolResultMemory(ctx, .{
                 .model_view_covers_full_file = false,
             });
             return .{ .success = try std.fmt.allocPrint(
                 ctx.allocator,
-                "<path>{s}</path>\n<content>image not attached: {s} is {d}x{d} pixels, over the {d}-pixel limit per side. Downscale or crop it to at most {d} pixels per side, then read the smaller file.</content>",
+                "<path>{s}</path>\n<content>image not attached: {s} is {d}x{d} pixels, over the {d}-pixel limit per side, and only PNG images are downscaled automatically. Downscale or crop it to at most {d} pixels per side, then read the smaller file.</content>",
                 .{ rel, mime_type, dimensions.width, dimensions.height, image_data.max_image_dimension, image_data.max_image_dimension },
             ) };
         }
@@ -808,7 +810,7 @@ fn writeTestPngHeader(dir: std.Io.Dir, name: []const u8, width: u32, height: u32
     try file.writeStreamingAll(io_mod.getIo(), &header);
 }
 
-test "read_file withholds images wider or taller than the model pixel limit" {
+test "read_file attaches oversized PNG images for downscaling" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try writeTestPngHeader(tmp.dir, "frame.png", 3420, 2224);
@@ -821,7 +823,31 @@ test "read_file withholds images wider or taller than the model pixel limit" {
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(.success, result.status);
-    try std.testing.expect(std.mem.find(u8, result.body, "image not attached: image/png is 3420x2224 pixels, over the 2000-pixel limit per side") != null);
+    try std.testing.expect(std.mem.find(u8, result.body, "image attached (image/png") != null);
+    try std.testing.expectEqual(@as(usize, 1), result.images.len);
+}
+
+test "read_file withholds non-PNG images over the model pixel limit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var header = "\xff\xd8\xff\xc0\x00\x11\x08\x00\x00\x00\x00\x03\x01\x22\x00\x02\x11\x01\x03\x11\x01".*;
+        std.mem.writeInt(u16, header[7..9], 3024, .big);
+        std.mem.writeInt(u16, header[9..11], 4032, .big);
+        var file = try tmp.dir.createFile(std.testing.io, "photo.jpg", .{});
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), &header);
+    }
+    const path = try tmpPath(std.testing.allocator, tmp, "photo.jpg");
+    defer std.testing.allocator.free(path);
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+    defer std.testing.allocator.free(args);
+
+    const result = try dispatchReadFile(std.testing.allocator, args);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expect(std.mem.find(u8, result.body, "image not attached: image/jpeg is 4032x3024 pixels, over the 2000-pixel limit per side, and only PNG images are downscaled automatically") != null);
     try std.testing.expectEqual(@as(usize, 0), result.images.len);
     try std.testing.expect(!result.tool_result_memory.?.model_view_covers_full_file.?);
 }

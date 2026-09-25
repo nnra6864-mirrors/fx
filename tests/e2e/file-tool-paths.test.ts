@@ -12,7 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EVAL_MODEL, HAS_API_KEY, runFx } from "../evals/eval-helpers";
-import { solidPng } from "./fixtures/image-encoding";
+import { pngPixelSize, solidPng } from "./fixtures/image-encoding";
 import { fakeGatewayTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 
 const TIMEOUT = 20_000;
@@ -528,12 +528,11 @@ describe("filesystem path handling", () => {
   );
 
   test(
-    "read_file withholds a frame over the model pixel limit and still sends smaller images",
+    "read_file downscales a frame over the model pixel limit and keeps smaller images unchanged",
     async () => {
       const root = createIsolatedRoot();
       const smallBase64 =
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
-      const frame = solidPng(3420, 2224);
       const gateway = startFakeGateway(
         [
           sse([
@@ -547,7 +546,7 @@ describe("filesystem path handling", () => {
       );
       try {
         writeFileSync(join(root.workspace, "small.png"), Buffer.from(smallBase64, "base64"));
-        writeFileSync(join(root.workspace, "frame.png"), frame);
+        writeFileSync(join(root.workspace, "frame.png"), solidPng(3420, 2224));
         const result = await runFx(
           ["ask", "--auto", "--json", "--no-save", "Read small.png and frame.png once, then stop."],
           {
@@ -564,7 +563,7 @@ describe("filesystem path handling", () => {
         expect(gateway.requests).toHaveLength(2);
         const body = gateway.requests[1].body;
         expect(toolResultOutput(body, "read_frame")).toContain(
-          "image not attached: image/png is 3420x2224 pixels, over the 2000-pixel limit per side",
+          "[Image downscaled from 3420x2224 to 2000x1301 pixels to fit the 2000-pixel limit per side. Multiply coordinates in this image by 1.71 to get original pixels.]",
         );
         expect(toolResultOutput(body, "read_small")).toContain("image attached");
         const request = JSON.parse(body) as {
@@ -574,9 +573,11 @@ describe("filesystem path handling", () => {
           .filter((message) => message.role === "user" && Array.isArray(message.content))
           .flatMap((message) => message.content as Array<Record<string, unknown>>)
           .filter((entry) => entry.type === "file");
-        expect(files).toHaveLength(1);
-        expect((files[0].data as Record<string, unknown>).data).toBe(smallBase64);
-        expect(body).not.toContain(frame.toString("base64").slice(0, 64));
+        const sent = files.map((entry) => (entry.data as Record<string, unknown>).data as string);
+        expect(sent).toHaveLength(2);
+        expect(sent).toContain(smallBase64);
+        const shrunk = sent.find((data) => data !== smallBase64)!;
+        expect(pngPixelSize(Buffer.from(shrunk, "base64"))).toEqual({ width: 2000, height: 1301 });
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });

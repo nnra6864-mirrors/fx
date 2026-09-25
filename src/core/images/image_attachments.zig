@@ -7,6 +7,7 @@ const entity_spans = @import("../shared/entity_spans.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const image_data = @import("image_data.zig");
 const io_mod = @import("../shared/io.zig");
+const png_downscale = @import("png_downscale.zig");
 const types = @import("../shared/types.zig");
 const pathing = @import("../workspace/pathing.zig");
 
@@ -694,15 +695,16 @@ fn captureImageSnapshotFromOpenFileWithBudget(
         );
     };
 
-    // Byte-oversized sources can never be sent, so other platforms reject
-    // them. Pixel-oversized sources are only normalized where a resizer exists.
+    // Pixel-oversized PNGs shrink in process on every platform. Other sources
+    // need the platform resizer: byte-oversized ones can never be sent, so
+    // they fail without it, and pixel-oversized ones are kept as they are.
     const can_normalize = comptime builtin.os.tag == .macos;
-    const needs_normalization = !fitsEncodedLimit(source_metadata.size_bytes) or
-        (can_normalize and
-            try snapshotExceedsModelDimensions(alloc, snapshot_dir_handle, source_temp_name, budget));
-    if (needs_normalization) {
-        if (!can_normalize) return error.ImagePreparationFailed;
-
+    const over_bytes = !fitsEncodedLimit(source_metadata.size_bytes);
+    const over_pixels = !over_bytes and
+        try snapshotExceedsModelDimensions(alloc, snapshot_dir_handle, source_temp_name, budget);
+    const shrink_in_process = over_pixels and std.mem.eql(u8, source_metadata.media_type, "image/png");
+    if (over_bytes and !can_normalize) return error.ImagePreparationFailed;
+    if (over_bytes or shrink_in_process or (over_pixels and can_normalize)) {
         var candidate_suffix: u64 = undefined;
         io_mod.getIo().random(std.mem.asBytes(&candidate_suffix));
         candidate_temp_name = try std.fmt.allocPrint(
@@ -734,19 +736,33 @@ fn captureImageSnapshotFromOpenFileWithBudget(
         );
         defer alloc.free(candidate_temp_path);
 
-        prepareImageCandidate(source_temp_path, candidate_temp_path, budget) catch |err| switch (err) {
-            error.FileNotFound => return error.ImagePreparationFailed,
-            else => return err,
-        };
-        metadata = try inspectImageCandidate(
+        const shrunk = shrink_in_process and try downscalePngSnapshot(
+            alloc,
             snapshot_dir_handle,
+            source_temp_name,
+            source_metadata.size_bytes,
             candidate_temp_name.?,
             budget,
         );
-        if (try snapshotExceedsModelDimensions(alloc, snapshot_dir_handle, candidate_temp_name.?, budget)) {
-            return error.ImagePreparationFailed;
+        if (!shrunk and can_normalize) {
+            prepareImageCandidate(source_temp_path, candidate_temp_path, budget) catch |err| switch (err) {
+                error.FileNotFound => return error.ImagePreparationFailed,
+                else => return err,
+            };
         }
-        selected_temp_name = candidate_temp_name.?;
+        // A PNG that cannot shrink in process, with no platform resizer, keeps
+        // its source; the unused candidate is removed on return.
+        if (shrunk or can_normalize) {
+            metadata = try inspectImageCandidate(
+                snapshot_dir_handle,
+                candidate_temp_name.?,
+                budget,
+            );
+            if (try snapshotExceedsModelDimensions(alloc, snapshot_dir_handle, candidate_temp_name.?, budget)) {
+                return error.ImagePreparationFailed;
+            }
+            selected_temp_name = candidate_temp_name.?;
+        }
     }
 
     const media_type = try alloc.dupe(u8, metadata.media_type);
@@ -885,6 +901,54 @@ fn snapshotExceedsModelDimensions(
     const probe_len = try reader.interface.readSliceShort(probe);
     const dimensions = image_data.imageDimensions(probe[0..probe_len]) orelse return false;
     return dimensions.exceedsModelLimit();
+}
+
+/// Writes a copy of a PNG snapshot, shrunk to the model pixel limit, into
+/// `candidate_name`. Returns false when the PNG cannot be decoded here or the
+/// copy would exceed the encoded size limit, leaving the caller to fall back.
+fn downscalePngSnapshot(
+    alloc: std.mem.Allocator,
+    dir: std.Io.Dir,
+    source_name: []const u8,
+    source_size: usize,
+    candidate_name: []const u8,
+    budget: CaptureBudget,
+) !bool {
+    try budget.check();
+    const source_bytes = try alloc.alloc(u8, source_size);
+    defer alloc.free(source_bytes);
+    {
+        var source = dir.openFile(io_mod.getIo(), source_name, .{
+            .allow_directory = false,
+            .follow_symlinks = false,
+            .resolve_beneath = true,
+        }) catch |err| switch (err) {
+            error.FileNotFound, error.IsDir, error.NotDir, error.SymLinkLoop => return error.ImagePreparationFailed,
+            else => return err,
+        };
+        defer source.close(io_mod.getIo());
+        var read_buffer: [8192]u8 = undefined;
+        var reader = source.readerStreaming(io_mod.getIo(), &read_buffer);
+        reader.interface.readSliceAll(source_bytes) catch return error.ImagePreparationFailed;
+    }
+    const smaller = png_downscale.downscale(alloc, source_bytes, image_data.max_image_dimension) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidPng, error.UnsupportedPng => {
+            debug_trace.logf("images", "event=png_downscale_skipped reason={s}", .{@errorName(err)});
+            return false;
+        },
+    };
+    defer alloc.free(smaller.png);
+    if (!fitsEncodedLimit(smaller.png.len)) return false;
+    try budget.check();
+    var candidate = try dir.createFile(io_mod.getIo(), candidate_name, .{
+        .truncate = true,
+        .resolve_beneath = true,
+    });
+    defer candidate.close(io_mod.getIo());
+    try candidate.writeStreamingAll(io_mod.getIo(), smaller.png);
+    try candidate.sync(io_mod.getIo());
+    return true;
 }
 
 fn fitsEncodedLimit(raw_bytes: usize) bool {
@@ -3269,67 +3333,11 @@ test "capture normalizes an oversized encoded image on macOS or rejects locally"
     try std.testing.expectEqual(@as(usize, 1), try countSnapshotFiles(snapshot_dir));
 }
 
-fn writeTestPngChunk(writer: *std.Io.Writer, kind: *const [4]u8, data: []const u8) !void {
-    var len: [4]u8 = undefined;
-    std.mem.writeInt(u32, &len, @intCast(data.len), .big);
-    var crc = std.hash.Crc32.init();
-    crc.update(kind);
-    crc.update(data);
-    var checksum: [4]u8 = undefined;
-    std.mem.writeInt(u32, &checksum, crc.final(), .big);
-    try writer.writeAll(&len);
-    try writer.writeAll(kind);
-    try writer.writeAll(data);
-    try writer.writeAll(&checksum);
-}
-
-/// Encodes a decodable grayscale PNG using stored deflate blocks, so platform
-/// image tools can process it without a compressor in the test.
-fn testGrayscalePng(alloc: std.mem.Allocator, width: u32, height: u32) ![]u8 {
-    const row_len = 1 + @as(usize, width);
-    const raw = try alloc.alloc(u8, row_len * height);
-    defer alloc.free(raw);
-    @memset(raw, 0x80);
-    for (0..height) |row| raw[row * row_len] = 0;
-
-    var zlib: std.Io.Writer.Allocating = .init(alloc);
-    defer zlib.deinit();
-    try zlib.writer.writeAll("\x78\x01");
-    var offset: usize = 0;
-    while (offset < raw.len) {
-        const block_len: u16 = @intCast(@min(raw.len - offset, std.math.maxInt(u16)));
-        const final = offset + block_len == raw.len;
-        try zlib.writer.writeByte(if (final) 1 else 0);
-        var lengths: [4]u8 = undefined;
-        std.mem.writeInt(u16, lengths[0..2], block_len, .little);
-        std.mem.writeInt(u16, lengths[2..4], ~block_len, .little);
-        try zlib.writer.writeAll(&lengths);
-        try zlib.writer.writeAll(raw[offset..][0..block_len]);
-        offset += block_len;
-    }
-    var adler: [4]u8 = undefined;
-    std.mem.writeInt(u32, &adler, std.hash.Adler32.hash(raw), .big);
-    try zlib.writer.writeAll(&adler);
-
-    var ihdr: [13]u8 = undefined;
-    std.mem.writeInt(u32, ihdr[0..4], width, .big);
-    std.mem.writeInt(u32, ihdr[4..8], height, .big);
-    @memcpy(ihdr[8..13], "\x08\x00\x00\x00\x00");
-
-    var png: std.Io.Writer.Allocating = .init(alloc);
-    errdefer png.deinit();
-    try png.writer.writeAll("\x89PNG\r\n\x1a\n");
-    try writeTestPngChunk(&png.writer, "IHDR", &ihdr);
-    try writeTestPngChunk(&png.writer, "IDAT", zlib.written());
-    try writeTestPngChunk(&png.writer, "IEND", "");
-    return png.toOwnedSlice();
-}
-
-test "capture normalizes an image over the model pixel limit on macOS and keeps it elsewhere" {
+test "capture downscales a PNG over the model pixel limit on every platform" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const png = try testGrayscalePng(alloc, 2400, 8);
+    const png = try png_downscale.testSolidGrayPng(alloc, 2400, 8, 128);
     defer alloc.free(png);
     try std.testing.expect(fitsEncodedLimit(png.len));
     {
@@ -3352,15 +3360,11 @@ test "capture normalizes an image over the model pixel limit on macOS and keeps 
 
     var verified = try loadVerifiedSnapshot(alloc, attachment, .{});
     defer verified.deinit(alloc);
-    const dimensions = image_data.imageDimensions(verified.bytes).?;
-    if (comptime builtin.os.tag == .macos) {
-        try std.testing.expectEqualStrings("image/jpeg", attachment.media_type);
-        try std.testing.expectEqual(image_data.max_image_dimension, dimensions.width);
-        try std.testing.expect(!dimensions.exceedsModelLimit());
-    } else {
-        try std.testing.expectEqualStrings("image/png", attachment.media_type);
-        try std.testing.expectEqualSlices(u8, png, verified.bytes);
-    }
+    try std.testing.expectEqualStrings("image/png", attachment.media_type);
+    try std.testing.expectEqual(
+        @as(?image_data.Dimensions, .{ .width = 2000, .height = 7 }),
+        image_data.imageDimensions(verified.bytes),
+    );
     try std.testing.expectEqual(@as(usize, 1), try countSnapshotFiles(snapshot_dir));
 }
 

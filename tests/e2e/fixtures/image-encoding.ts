@@ -37,22 +37,10 @@ export function solidPng(width: number, height: number): Buffer {
   ]);
 }
 
-// Pixel size of a PNG or JPEG, read from its header.
-export function imagePixelSize(image: Buffer): { width: number; height: number } {
-  if (image.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex"))) {
-    return { width: image.readUInt32BE(16), height: image.readUInt32BE(20) };
-  }
-  assert.equal(image.readUInt16BE(0), 0xffd8, "expected a PNG or JPEG");
-  let offset = 2;
-  while (offset + 9 <= image.length) {
-    assert.equal(image[offset], 0xff, "malformed JPEG marker");
-    const marker = image[offset + 1];
-    if (marker === 0xff) { offset += 1; continue; }
-    const isFrame = marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker);
-    if (isFrame) return { width: image.readUInt16BE(offset + 7), height: image.readUInt16BE(offset + 5) };
-    offset += 2 + image.readUInt16BE(offset + 2);
-  }
-  throw new Error("JPEG frame header not found");
+// Pixel size of a PNG, read from its header.
+export function pngPixelSize(png: Buffer): { width: number; height: number } {
+  assert.ok(png.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex")), "expected a PNG");
+  return { width: png.readUInt32BE(16), height: png.readUInt32BE(20) };
 }
 
 function pngChunk(type: string, data: Buffer): Buffer {
