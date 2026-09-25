@@ -1198,8 +1198,9 @@ pub const Store = struct {
     /// and counted as unreadable. A session without turns that another process
     /// has open, such as a fresh one in another terminal, is passed over
     /// without waiting for its lock; one nobody holds, such as a first turn
-    /// cut off by a crash, is still resumed. A candidate that disappears or
-    /// moves to another workspace between selection and open yields to the
+    /// cut off by a crash, is still resumed. When nothing else can be resumed,
+    /// such a session is still reported as busy. A candidate that disappears
+    /// or moves to another workspace between selection and open yields to the
     /// next newest, up to `max_latest_selection_retries`. Every other
     /// failure, including a busy session with turns, is returned.
     fn resumeLatestByDiscovery(
@@ -1222,6 +1223,7 @@ pub const Store = struct {
         );
         defer catalog.deinit(alloc);
         var vanished: usize = 0;
+        var passed_busy: usize = 0;
         var unreadable = catalog.skipped_invalid;
         for (catalog.summaries.items) |summary| {
             const summary_workspace = summary.workspace_root orelse continue;
@@ -1244,6 +1246,7 @@ pub const Store = struct {
                 },
                 error.SessionBusy => if (empty) {
                     debug_trace.logf("session", "latest selection passed over busy empty id={s}", .{summary.id});
+                    passed_busy += 1;
                 } else {
                     logDiscoveryError(.workspace_writable_last, summary.id, null, null, err);
                     return err;
@@ -1254,6 +1257,9 @@ pub const Store = struct {
                 },
             }
         }
+        // The user may have suspended that fx, so say it is busy rather than
+        // that nothing is saved.
+        if (passed_busy > 0) return session_log.failLoadedWritableSession(error.SessionBusy);
         if (unreadable > 0) return session_log.failLoadedWritableSession(error.NoReadableSessions);
         return session_log.failLoadedWritableSession(error.NoSavedSessions);
     }
@@ -7982,6 +7988,33 @@ test "a schema-v3 session with a lost manifest lists and resumes from its commit
     }
 }
 
+test "doctor reports a lost manifest of a managed child as invalid, since it cannot be resumed" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    try writeSchemaV3Fixture(alloc, ctx.store, "kid", .{
+        .projected_workspace = ctx.workspace,
+        .workspace = ctx.workspace,
+        .updated_at_ms = 50,
+        .stale_projection = false,
+        .subagent_child = true,
+    });
+    {
+        var dir = try ctx.store.openSessionDir("kid");
+        defer dir.close();
+        try dir.dir.deleteFile(std.testing.io, "session.json");
+    }
+    // The warning's advice, `fx --resume <id>`, is refused for a child.
+    var inspection = try ctx.store.inspectForDoctorBounded(alloc, 10);
+    defer inspection.deinit(alloc);
+    const reported: ?DoctorIssueKind = for (inspection.diagnostics.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.session_id, "kid")) break diagnostic.kind;
+    } else null;
+    try std.testing.expectEqual(@as(?DoctorIssueKind, .canonical_state_invalid), reported);
+}
+
 test "latest resume passes over an empty session that another terminal has open" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -8012,6 +8045,22 @@ test "latest resume passes over an empty session that another terminal has open"
         defer resumed.deinit(alloc);
         try std.testing.expectEqualStrings("conversation", resumed.active_id);
         try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1000);
+    }
+    // With nothing else to resume, the held session is reported as busy, not
+    // as missing.
+    {
+        try tmp.dir.createDirPath(io_mod.getIo(), "alone");
+        const alone = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "alone");
+        defer alloc.free(alone);
+        var alone_state = try testDurableState(alloc, "alone-fresh", alone);
+        defer alone_state.deinit(alloc);
+        var alone_writable = try ctx.store.startWritableSession(alloc, alone_state);
+        alone_writable.deinit(alloc);
+        var alone_dir = try ctx.store.openSessionDir("alone-fresh");
+        defer alone_dir.close();
+        var lock = try io_mod.acquireTimedAdvisoryLock(&alone_dir, "session.lock", 2000);
+        defer lock.release();
+        try std.testing.expectError(error.SessionBusy, ctx.store.resumeTargetForWrite(alloc, .last, alone, .{}));
     }
     // Once nobody holds it, it is the session to resume: a first turn cut off
     // by a crash leaves no turns either.
@@ -8060,6 +8109,18 @@ test "a read-only listing saves the index only after replaying a committed log" 
     defer saved.deinit(alloc);
     try std.testing.expect(saved.contains("stale"));
     try std.testing.expect(saved.contains("current"));
+
+    // The next listing reuses the saved row, so nothing is replayed and the
+    // index is not rewritten.
+    const sessions = ctx.store.canonical_root.sessions.?;
+    const before = try sessions.dir.statFile(std.testing.io, ".resume-catalog", .{ .follow_symlinks = false });
+    {
+        var catalog = try catalog_cache.listActionableCatalogReadOnly(reader, alloc);
+        defer catalog.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 2), catalog.summaries.items.len);
+    }
+    const after = try sessions.dir.statFile(std.testing.io, ".resume-catalog", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(before.inode, after.inode);
 }
 
 test "a FIFO usage recovery marker is rejected without blocking" {

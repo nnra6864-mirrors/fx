@@ -207,15 +207,17 @@ pub fn inspectDoctorSession(
     };
     const stale_schema_v3 = candidate.storage == .schema_v3 and candidate.projection_state == .stale;
     const manifest_loss = candidate.manifest_loss;
+    const subagent_child = candidate.subagent_child orelse false;
     candidate.deinit(alloc);
     // The conversation survives a lost manifest: listing and resume read the
-    // committed log, and resuming rewrites the summary.
+    // committed log, and resuming rewrites the summary. A managed child cannot
+    // be resumed directly, so its lost manifest is still reported as invalid.
     if (manifest_loss) |loss| {
         try appendDoctorDiagnostic(
             diagnostics,
             alloc,
             session_id,
-            switch (loss) {
+            if (subagent_child) .canonical_state_invalid else switch (loss) {
                 .missing => .projection_missing,
                 .invalid => .projection_invalid,
             },

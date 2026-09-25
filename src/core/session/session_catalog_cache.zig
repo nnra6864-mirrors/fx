@@ -1,8 +1,9 @@
 //! The session index: the single derived owner of "which saved sessions exist
 //! and how they summarize". Every listing surface (the resume picker,
 //! `fx sessions`, `fx session last`, ACP listing, and latest-session resume)
-//! reads it through `listActionableCatalog`, so no listing surface scans
-//! session directories on its own.
+//! reads it through `listActionableCatalog` or, for read-only surfaces,
+//! `listActionableCatalogReadOnly`, so no listing surface scans session
+//! directories on its own.
 //!
 //! Rows are bound to stat fingerprints of each session's classification
 //! inputs. A matching fingerprint reuses the row without opening the session;
@@ -249,7 +250,9 @@ pub const Loaded = struct {
     }
 };
 
-/// A narrow cache-writing handle obtained only from a writable app store.
+/// A narrow handle that writes only the index file. `init` returns one only
+/// for a writable app store; read-only listings open one internally, and only
+/// after replaying a committed log.
 pub const Writer = struct {
     dir: io_mod.VerifiedDir,
 
