@@ -1195,14 +1195,15 @@ pub const Store = struct {
     /// candidates in the order and with the workspace filter of the index
     /// page `fx session last` reads. A listed session whose stale schema-v3
     /// log failed to replay in this listing is skipped without a second replay
-    /// and counted as unreadable. A session without turns that another process
-    /// has open, such as a fresh one in another terminal, is passed over
-    /// without waiting for its lock; one nobody holds, such as a first turn
-    /// cut off by a crash, is still resumed. When nothing else can be resumed,
-    /// such a session is still reported as busy. A candidate that disappears
-    /// or moves to another workspace between selection and open yields to the
+    /// and counted as unreadable. A session without resumable content (no
+    /// turns, checkpoint, or managed children) that another process has open,
+    /// such as a fresh one in another terminal, is passed over without waiting
+    /// for its lock; one nobody holds, such as a first turn cut off by a
+    /// crash, is still resumed. When nothing else can be resumed, such a
+    /// session is still reported as busy. A candidate that disappears or
+    /// moves to another workspace between selection and open yields to the
     /// next newest, up to `max_latest_selection_retries`. Every other
-    /// failure, including a busy session with turns, is returned.
+    /// failure, including a busy session with resumable content, is returned.
     fn resumeLatestByDiscovery(
         self: Store,
         alloc: Allocator,
@@ -4644,7 +4645,7 @@ fn testDurableState(
 }
 
 /// A fixture state with one saved turn. Latest selection passes over a busy
-/// session only when it has no turns.
+/// session only when it has no resumable content.
 fn testDurableStateWithTurn(
     alloc: Allocator,
     id: []const u8,
@@ -7990,29 +7991,39 @@ test "a schema-v3 session with a lost manifest lists and resumes from its commit
 
 test "doctor reports a lost manifest of a managed child as invalid, since it cannot be resumed" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var ctx = try initTempStore(alloc, &tmp);
-    defer ctx.deinit(alloc);
-    try writeSchemaV3Fixture(alloc, ctx.store, "kid", .{
-        .projected_workspace = ctx.workspace,
-        .workspace = ctx.workspace,
-        .updated_at_ms = 50,
-        .stale_projection = false,
-        .subagent_child = true,
-    });
-    {
-        var dir = try ctx.store.openSessionDir("kid");
-        defer dir.close();
-        try dir.dir.deleteFile(std.testing.io, "session.json");
+    // Older releases marked a child only with a file under subagent/.
+    const Marking = enum { first_event, owner_marker, legacy_control };
+    for (std.enums.values(Marking)) |marking| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var ctx = try initTempStore(alloc, &tmp);
+        defer ctx.deinit(alloc);
+        try writeSchemaV3Fixture(alloc, ctx.store, "kid", .{
+            .projected_workspace = ctx.workspace,
+            .workspace = ctx.workspace,
+            .updated_at_ms = 50,
+            .stale_projection = false,
+            .subagent_child = marking == .first_event,
+        });
+        {
+            var dir = try ctx.store.openSessionDir("kid");
+            defer dir.close();
+            try dir.dir.deleteFile(std.testing.io, "session.json");
+            if (marking != .first_event) try dir.dir.createDir(std.testing.io, "subagent", .fromMode(0o700));
+            switch (marking) {
+                .first_event => {},
+                .owner_marker => try dir.dir.writeFile(std.testing.io, .{ .sub_path = "subagent/owner.json", .data = "{}", .flags = .{ .permissions = .fromMode(0o600) } }),
+                .legacy_control => try dir.dir.writeFile(std.testing.io, .{ .sub_path = "subagent/control.json", .data = "{\"parent_id\":\"parent\"}", .flags = .{ .permissions = .fromMode(0o600) } }),
+            }
+        }
+        // The warning's advice, `fx --resume <id>`, is refused for a child.
+        var inspection = try ctx.store.inspectForDoctorBounded(alloc, 10);
+        defer inspection.deinit(alloc);
+        const reported: ?DoctorIssueKind = for (inspection.diagnostics.items) |diagnostic| {
+            if (std.mem.eql(u8, diagnostic.session_id, "kid")) break diagnostic.kind;
+        } else null;
+        try std.testing.expectEqual(@as(?DoctorIssueKind, .canonical_state_invalid), reported);
     }
-    // The warning's advice, `fx --resume <id>`, is refused for a child.
-    var inspection = try ctx.store.inspectForDoctorBounded(alloc, 10);
-    defer inspection.deinit(alloc);
-    const reported: ?DoctorIssueKind = for (inspection.diagnostics.items) |diagnostic| {
-        if (std.mem.eql(u8, diagnostic.session_id, "kid")) break diagnostic.kind;
-    } else null;
-    try std.testing.expectEqual(@as(?DoctorIssueKind, .canonical_state_invalid), reported);
 }
 
 test "latest resume passes over an empty session that another terminal has open" {

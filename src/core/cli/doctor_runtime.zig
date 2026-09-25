@@ -463,7 +463,7 @@ fn recoveryActionForSessionDiagnostic(
         .projection_invalid,
         => std.fmt.bufPrint(
             buffer,
-            "the conversation is intact in its log; run fx --resume {s} once to rewrite its summary",
+            "the conversation is intact in its log; from its workspace, run fx --resume {s} once to rewrite its summary",
             .{session_id},
         ),
 

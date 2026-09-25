@@ -12,6 +12,7 @@ const migration = @import("session_migration.zig");
 const session_projection = @import("session_projection.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
 const session_replay = @import("session_replay.zig");
+const child_state = @import("../subagent/child_state.zig");
 const Allocator = std.mem.Allocator;
 
 const authority = @import("session_authority.zig");
@@ -210,14 +211,20 @@ pub fn inspectDoctorSession(
     const subagent_child = candidate.subagent_child orelse false;
     candidate.deinit(alloc);
     // The conversation survives a lost manifest: listing and resume read the
-    // committed log, and resuming rewrites the summary. A managed child cannot
-    // be resumed directly, so its lost manifest is still reported as invalid.
+    // committed log, and resuming rewrites the summary. Resume refuses a
+    // managed child, marked in its first event or, from older releases, only
+    // by a marker file, so its lost manifest is still reported as invalid.
     if (manifest_loss) |loss| {
+        const managed_child = subagent_child or hasManagedChildMarker(ctx, alloc, session_dir, session_id) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // An unreadable marker cannot rule a child out.
+            else => true,
+        };
         try appendDoctorDiagnostic(
             diagnostics,
             alloc,
             session_id,
-            if (subagent_child) .canonical_state_invalid else switch (loss) {
+            if (managed_child) .canonical_state_invalid else switch (loss) {
                 .missing => .projection_missing,
                 .invalid => .projection_invalid,
             },
@@ -251,6 +258,27 @@ pub fn inspectDoctorSession(
         session_dir,
         session_id,
     );
+}
+
+/// Reports whether the session carries a managed-child marker file, the
+/// check resume admission makes before refusing a session.
+fn hasManagedChildMarker(
+    ctx: StoreContext,
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+) !bool {
+    const display_path = try sessionDirPath(alloc, ctx.sessions_dir, session_id);
+    defer alloc.free(display_path);
+    var capability = try session_child_store.SessionChildCapability.initSubagentControl(
+        alloc,
+        session_dir.dir,
+        display_path,
+        .read_only,
+        .{},
+    );
+    defer capability.deinit();
+    return child_state.capabilityHasManagedChildMarker(alloc, &capability);
 }
 
 fn inspectDoctorManagedChildren(

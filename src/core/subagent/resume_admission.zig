@@ -56,8 +56,9 @@ pub fn listVisiblePage(
 
 /// Returns the newest listed session in this workspace from the index page
 /// `--resume last` reads. `--resume last` also skips a session whose stale log
-/// failed to replay in that listing, and a session without turns that another
-/// process has open, so the two can differ. Caller owns the summary.
+/// failed to replay in that listing, and a session without resumable content
+/// that another process has open, so the two can differ. Caller owns the
+/// summary.
 pub fn latestVisibleWorkspaceSummary(
     store: session_store.Store,
     alloc: Allocator,
