@@ -57,11 +57,17 @@ pub const DiscoveryCandidateMetadata = struct {
     projection_state: ProjectionState,
 };
 
+/// Why a schema-v3 summary came from the committed log instead of its manifest.
+pub const ManifestLoss = enum { missing, invalid };
+
 pub const ReadOnlyCandidate = struct {
     summary: SessionSummary,
     storage: CandidateStorage,
     projection_state: ProjectionState,
     subagent_child: ?bool = null,
+    /// Set only when the manifest was missing or invalid and the session was
+    /// recovered from its committed log.
+    manifest_loss: ?ManifestLoss = null,
 
     pub fn deinit(self: *ReadOnlyCandidate, alloc: Allocator) void {
         self.summary.deinit(alloc);
@@ -179,10 +185,11 @@ pub fn inspectDoctorSession(
         return;
     }
 
-    var candidate = classifyReadOnlyCandidate(
+    var candidate = classifyOrRecoverReadOnlyCandidate(
         alloc,
         session_dir,
         session_id,
+        null,
     ) catch |err| {
         try appendDoctorDiagnostic(
             diagnostics,
@@ -199,7 +206,23 @@ pub fn inspectDoctorSession(
         return;
     };
     const stale_schema_v3 = candidate.storage == .schema_v3 and candidate.projection_state == .stale;
+    const manifest_loss = candidate.manifest_loss;
     candidate.deinit(alloc);
+    // The conversation survives a lost manifest: listing and resume read the
+    // committed log, and resuming rewrites the summary.
+    if (manifest_loss) |loss| {
+        try appendDoctorDiagnostic(
+            diagnostics,
+            alloc,
+            session_id,
+            switch (loss) {
+                .missing => .projection_missing,
+                .invalid => .projection_invalid,
+            },
+            null,
+        );
+        return;
+    }
     // A stale schema-v3 session resumes from its committed log, so a log that
     // cannot be replayed leaves the session unreadable even though its
     // manifest is valid; latest resume skips it for the same reason.
@@ -275,13 +298,26 @@ pub fn classifyReadOnlyCandidate(
     return classifyReadOnlyCandidateWithCancellation(alloc, session_dir, session_id, null);
 }
 
-pub fn classifyReadOnlyCandidateCancellable(
+/// Classifies a session for read-only use and recovers a schema-v3 session
+/// whose manifest is missing or invalid from its committed log, so every
+/// read-only surface agrees on which sessions exist. Every other
+/// classification error is returned. The caller owns the candidate.
+pub fn classifyOrRecoverReadOnlyCandidate(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,
     session_id: []const u8,
-    cancelled: *const std.atomic.Value(bool),
+    cancelled: ?*const std.atomic.Value(bool),
 ) !ReadOnlyCandidate {
-    return classifyReadOnlyCandidateWithCancellation(alloc, session_dir, session_id, cancelled);
+    return classifyReadOnlyCandidateWithCancellation(alloc, session_dir, session_id, cancelled) catch |err| {
+        const loss: ManifestLoss = switch (err) {
+            error.SessionNotFound => .missing,
+            error.InvalidSessionFormat => .invalid,
+            else => return err,
+        };
+        var recovered = (try recoverSchemaV3Candidate(alloc, session_dir, session_id, cancelled)) orelse return err;
+        recovered.manifest_loss = loss;
+        return recovered;
+    };
 }
 
 fn classifyReadOnlyCandidateWithCancellation(
@@ -478,13 +514,13 @@ fn classifySchemaV3Candidate(
     };
 }
 
-/// Listing's recovery of a schema-v3 session whose manifest is missing or
-/// cannot be read: its committed log is the authority, so the summary is
-/// replayed from it, as latest selection always did. Returns null when the
-/// session is not schema-v3, sits behind an interrupted upgrade (the route
-/// classification refuses it), or its log cannot be replayed either, leaving
-/// the caller to report the classification error.
-pub fn recoverSchemaV3Candidate(
+/// Recovers a schema-v3 session whose manifest is missing or cannot be read:
+/// its committed log is the authority, so the summary is replayed from it, as
+/// latest selection always did. Returns null when the session is not
+/// schema-v3, sits behind an interrupted upgrade (the route classification
+/// refuses it), or its log cannot be replayed either, leaving the caller to
+/// report the classification error.
+fn recoverSchemaV3Candidate(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,
     session_id: []const u8,
@@ -545,15 +581,23 @@ pub fn summarizeStaleProjection(
     _ = try replayCommittedLog(alloc, session_dir, candidate, cancelled);
 }
 
+/// Serializes summary replays in this process: each replay holds a full
+/// session state, so parallel listing workers would otherwise hold one per
+/// stale log at once.
+var summary_replay_gate: std.Io.Mutex = .init;
+
 /// Replaces the log-derived fields of a schema-v3 candidate with a replay of
 /// its committed log and marks it replayed. Returns false, leaving the
-/// candidate unchanged, when the log cannot be replayed.
+/// candidate unchanged, when the log cannot be replayed. One replay runs at a
+/// time; a waiting caller observes cancellation once it enters.
 fn replayCommittedLog(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,
     candidate: *ReadOnlyCandidate,
     cancelled: ?*const std.atomic.Value(bool),
 ) !bool {
+    summary_replay_gate.lockUncancelable(io_mod.getIo());
+    defer summary_replay_gate.unlock(io_mod.getIo());
     if (cancelled) |stop| {
         if (stop.load(.acquire)) return error.Cancelled;
     }

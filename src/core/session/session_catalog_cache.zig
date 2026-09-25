@@ -255,6 +255,12 @@ pub const Writer = struct {
 
     pub fn init(store: session_store.Store) !?Writer {
         if (store.canonical_root.mode != .writable) return null;
+        return initIndexOnly(store);
+    }
+
+    /// Opens the index of any store, read-only ones included. It writes only
+    /// the index file, never session state.
+    fn initIndexOnly(store: session_store.Store) !?Writer {
         const root = store.canonical_root.sessions orelse return null;
         return .{ .dir = .{ .dir = try root.dir.openDir(io_mod.getIo(), ".", .{ .iterate = true, .follow_symlinks = false }) } };
     }
@@ -421,6 +427,8 @@ const CatalogRead = struct {
     changed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     reused: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     skipped_invalid: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// Cacheable rows this listing summarized by replaying a committed log.
+    replayed: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     fn nextId(self: *CatalogRead, alloc: Allocator) !?[]u8 {
         self.iterator_mutex.lockUncancelable(io_mod.getIo());
@@ -513,6 +521,7 @@ const CatalogWorker = struct {
             errdefer entry.deinit(self.alloc);
             try self.entries.append(self.alloc, entry);
             if (stable or self.read.cache.contains(id)) self.read.changed.store(true, .release);
+            if (stable and candidate.projection_state == .replayed) _ = self.read.replayed.fetchAdd(1, .monotonic);
         }
     }
 };
@@ -528,6 +537,36 @@ pub fn listActionableCatalog(
     active_id: ?[]const u8,
     cancelled: ?*std.atomic.Value(bool),
     cache_writer: ?*Writer,
+) !ActionableSessionCatalog {
+    return listCatalog(store, alloc, active_id, cancelled, if (cache_writer) |writer| .{ .writer = writer } else .none);
+}
+
+/// Lists for a read-only surface such as `fx sessions` or ACP. It changes no
+/// session, and it saves the index only after it had to replay a committed
+/// log, so each stale or lost manifest is replayed once rather than on every
+/// listing. A failed save is traced and the listing still succeeds. Caller
+/// owns the returned catalog.
+pub fn listActionableCatalogReadOnly(
+    store: session_store.Store,
+    alloc: Allocator,
+) !ActionableSessionCatalog {
+    return listCatalog(store, alloc, null, null, .after_replay);
+}
+
+const CacheSave = union(enum) {
+    none,
+    /// Persist a changed index through the caller's writer.
+    writer: *Writer,
+    /// Persist the index only when this listing replayed a committed log.
+    after_replay,
+};
+
+fn listCatalog(
+    store: session_store.Store,
+    alloc: Allocator,
+    active_id: ?[]const u8,
+    cancelled: ?*std.atomic.Value(bool),
+    cache_save: CacheSave,
 ) !ActionableSessionCatalog {
     if (cancelled) |stop| {
         if (stop.load(.acquire)) return error.Cancelled;
@@ -598,17 +637,34 @@ pub fn listActionableCatalog(
             .excluded => {},
         }
     }
-    if (cache_writer) |writer| {
-        if (read.changed.load(.acquire) or cacheable != cached.count()) {
-            writer.save(alloc, entries.items, stop_requested) catch |err| {
-                if (stop_requested.load(.acquire)) return error.Cancelled;
+    switch (cache_save) {
+        .none => {},
+        .writer => |writer| if (read.changed.load(.acquire) or cacheable != cached.count()) {
+            try saveIndex(writer, alloc, entries.items, stop_requested);
+        },
+        .after_replay => if (read.replayed.load(.monotonic) > 0) {
+            var opened = Writer.initIndexOnly(store) catch |err| blk: {
                 debug_trace.logf("core", "session catalog cache not saved err={s}", .{@errorName(err)});
+                break :blk null;
             };
-        }
+            if (opened) |*writer| {
+                defer writer.deinit();
+                try saveIndex(writer, alloc, entries.items, stop_requested);
+            }
+        },
     }
     debug_trace.logf("core", "session catalog cache reused={d} records={d} skipped_invalid={d}", .{ read.reused.load(.monotonic), cacheable, catalog.skipped_invalid });
     summary_codec.sortSummariesNewestFirst(catalog.summaries.items);
     return catalog;
+}
+
+/// Saves refreshed rows. Only cancellation fails the listing; any other save
+/// error is traced, and the next listing reclassifies what it could not reuse.
+fn saveIndex(writer: *Writer, alloc: Allocator, entries: []const Entry, cancelled: *const std.atomic.Value(bool)) error{Cancelled}!void {
+    writer.save(alloc, entries, cancelled) catch |err| {
+        if (cancelled.load(.acquire)) return error.Cancelled;
+        debug_trace.logf("core", "session catalog cache not saved err={s}", .{@errorName(err)});
+    };
 }
 
 test "actionable catalog preserves discovery and child visibility" {
