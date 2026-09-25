@@ -103,9 +103,9 @@ fn detectFormat(bytes: []const u8) ?ImageFormat {
 }
 
 /// Longest side, in pixels, of any image fx sends to a model. Gateway provider
-/// routes reject larger images once a request carries many images (2000 on
-/// Anthropic and Bedrock, 2576 on Vertex). Images stay in conversation history,
-/// so one conservative bound keeps every later request valid.
+/// routes reject larger images once a request carries many images (2000 on the
+/// strictest routes, 2576 on others). Images stay in conversation history, so
+/// one conservative bound keeps every later request valid.
 pub const max_image_dimension: u32 = 2000;
 
 pub const Dimensions = struct {
