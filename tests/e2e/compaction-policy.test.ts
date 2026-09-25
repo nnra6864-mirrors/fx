@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 process.env.FX_E2E_DISABLE_DOTENV = "1";
-const { fakeGatewayFinalText, startDynamicFakeGateway } = await import("./tmux-helpers");
+const { fakeGatewayFinalText, fakeShellRun, startDynamicFakeGateway } = await import("./tmux-helpers");
 const binary = resolve(import.meta.dir, "../../zig-out/bin/fx");
 const digest = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
 
@@ -198,3 +198,101 @@ for (const shortenedFits of [true, false]) test(`automatic compaction fits an ov
     else { writeFileSync(join(root, "requests.json"), JSON.stringify(bodies, null, 2)); console.error(`compaction evidence retained: ${root}`); }
   }
 }, 90_000);
+
+test("mid-turn compaction saves a large current prompt and re-sends it once", async () => {
+  const root = mkdtempSync(join(tmpdir(), "fx-policy-midturn-")), home = join(root, "home"), cwd = join(root, "workspace");
+  mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+  mkdirSync(cwd, { mode: 0o700 });
+  const model = "fixture/compaction";
+  writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({ model, auto_upgrade: false }), { mode: 0o600 });
+  for (let file = 1; file <= 3; file++) {
+    writeFileSync(join(cwd, `big-${file}.txt`), Array.from({ length: 700 }, (_, n) => `file${file} row ${n}: ${"x".repeat(40)} value=${(n * 7919 + file) % 100000}\n`).join(""));
+  }
+  // About 48.7 KB, the pasted build log that failed on a 200K window.
+  const logEnd = "PASTE-END digest=LOGDIGEST-4417";
+  const prompt = "Here is the failing build log. Investigate it using the big-*.txt files, then report.\n\nPASTE-START\n" +
+    Array.from({ length: 750 }, (_, n) => `2026-09-25T10:${String(n % 60).padStart(2, "0")}:00Z build step ${n} ok checksum=${digest(Buffer.from(String(n))).slice(0, 16)}\n`).join("") +
+    logEnd + "\n";
+  let phase = "seed", step = 0, summaryCalls = 0;
+  const requests: { phase: string; summary: boolean; body: any }[] = [];
+  const messageText = (message: { content: string | { text?: string }[] }) =>
+    typeof message.content === "string" ? message.content : message.content.map(part => part.text ?? "").join("");
+  const gateway = startDynamicFakeGateway((body: string) => {
+    const request = JSON.parse(body);
+    const system = request.prompt.filter((message: { role: string }) => message.role === "system").map((message: { content: unknown }) => JSON.stringify(message.content)).join("\n");
+    const toolless = request.tools?.length === 0 && request.toolChoice?.type === "none";
+    const summary = toolless && system.includes("task-continuation memory");
+    requests.push({ phase, summary, body: request });
+    if (summary) {
+      summaryCalls++;
+      return fakeGatewayFinalText("Standing rules and constraints:\n- The release region is ap-south-9.\nKey facts:\n- The build log ends with LOGDIGEST-4417.\nWork remaining:\n- Report on the build log.");
+    }
+    if (toolless) return fakeGatewayFinalText("ok");
+    if (phase === "seed") return fakeGatewayFinalText("ACK");
+    // Keep reading large files in the same turn until compaction runs, then finish it.
+    if (summaryCalls === 0 && step < 60) {
+      step++;
+      return fakeShellRun(`read_${step}`, `/bin/cat big-${(step % 3) + 1}.txt`);
+    }
+    return fakeGatewayFinalText("PASTE_TURN_DONE");
+  }, { models: [{ id: model, type: "language", tags: ["tool-use"], context_window: 200000, max_tokens: 8192 }] });
+  const env = {
+    PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
+    AI_GATEWAY_API_KEY: "synthetic-compaction-policy", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
+    FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: model,
+    FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+  };
+  async function ask(args: string[], label: string) {
+    const stdout = join(root, `${label}.stdout`), stderr = join(root, `${label}.stderr`);
+    // Tool turns echo command output on stderr, so success is the exit code and JSON result.
+    const child = Bun.spawn([binary, "ask", "--json", "--full-access", ...args], { cwd, env, stdin: "ignore", stdout: Bun.file(stdout), stderr: Bun.file(stderr) });
+    const timer = setTimeout(() => child.kill("SIGKILL"), 60_000);
+    try {
+      const code = await child.exited;
+      const result = JSON.parse(readFileSync(stdout, "utf8"));
+      expect({ label, code, error: result.error ?? null }).toEqual({ label, code: 0, error: null });
+      return result;
+    } finally { clearTimeout(timer); }
+  }
+  let passed = false;
+  try {
+    const seed = await ask(["Remember: the release region is ap-south-9. Reply ACK."], "seed");
+    phase = "paste";
+    const result = await ask(["--resume-id", seed.session_id, prompt], "paste");
+    expect(result.output).toBe("PASTE_TURN_DONE");
+    expect(step).toBeGreaterThan(0);
+    expect(summaryCalls).toBeGreaterThan(0);
+    const summarySource = requests.filter(request => request.summary).flatMap(request => request.body.prompt.map(messageText)).join("\n");
+    expect(summarySource).toContain("USER_TO_SUMMARIZE:");
+    expect(summarySource).toContain(logEnd);
+
+    const sessionDir = join(home, ".fx/sessions", seed.session_id);
+    const rows = readFileSync(join(sessionDir, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const checkpoints = rows.filter(row => row.event?.context_checkpoint);
+    expect(checkpoints.length).toBe(1);
+    const handoff: string = checkpoints[0].event.context_checkpoint.summary;
+    expect(handoff).not.toContain(logEnd);
+    const match = /> fx-compaction-state-v1 (\S+) (\d+) ([a-f0-9]{64})\n/.exec(handoff);
+    const state = JSON.parse(readFileSync(join(sessionDir, "tool-results", match![1]!)).toString());
+    const stubs: { position: number; artifact: { handle: string; bytes: number; sha256: string } }[] = state.stubs ?? [];
+    expect(stubs).toHaveLength(1);
+    const saved = readFileSync(join(sessionDir, "tool-results", stubs[0]!.artifact.handle));
+    expect(saved.length).toBe(stubs[0]!.artifact.bytes); expect(digest(saved)).toBe(stubs[0]!.artifact.sha256);
+    expect(saved.toString()).toBe(prompt);
+    expect(handoff).toContain(`[user ${stubs[0]!.position} pasted `);
+    expect(handoff).toContain(`full text saved as ${stubs[0]!.artifact.handle}; key facts are in the summary]`);
+
+    // The rebuilt request carries the handoff and the verbatim prompt exactly once.
+    const post = requests.filter(request => request.phase === "paste" && !request.summary).at(-1)!.body;
+    const texts: string[] = post.prompt.map(messageText);
+    expect(texts.some(text => text.includes(`full text saved as ${stubs[0]!.artifact.handle}`))).toBe(true);
+    expect(texts.filter(text => text === prompt)).toHaveLength(1);
+    expect(texts.join("\n").split(logEnd).length - 1).toBe(1);
+    passed = true;
+  } finally {
+    gateway.stop();
+    if (passed) rmSync(root, { recursive: true, force: true });
+    else { writeFileSync(join(root, "requests.json"), JSON.stringify(requests.map(request => ({ phase: request.phase, summary: request.summary })), null, 2)); console.error(`compaction evidence retained: ${root}`); }
+  }
+}, 120_000);

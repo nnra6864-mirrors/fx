@@ -53,9 +53,6 @@ pub const Request = struct {
     usage: ?*session_usage.Usage = null,
     usage_allocator: Allocator = std.heap.c_allocator,
     policy: enum { legacy, assistant_first } = .legacy,
-    /// The source ends inside the active turn, so its last non-steering user message
-    /// is the current prompt, which stays verbatim in the handoff.
-    current_prompt_in_source: bool = false,
     result_storage: compaction_policy.Storage = .unavailable,
     trace_ctx: debug_trace.TraceContext,
 };
@@ -153,9 +150,9 @@ pub fn compact(
     }
     const compactable = source_messages;
     const policy: ?compaction_policy.Prepared = if (request.policy == .assistant_first)
-        compaction_policy.prepare(scratch, compactable, request.result_storage, request.accepted_tokens, request.current_prompt_in_source) catch |err| {
+        compaction_policy.prepare(scratch, compactable, request.result_storage, request.accepted_tokens) catch |err| {
             if (err == error.CompactionHandoffTooLarge) {
-                diagnostics.traceCompactionLog(true, "reason=minimal_handoff_exceeds_capacity accepted_tokens={d} current_prompt_in_source={}", .{ request.accepted_tokens, request.current_prompt_in_source });
+                diagnostics.traceCompactionLog(true, "reason=minimal_handoff_exceeds_capacity accepted_tokens={d}", .{request.accepted_tokens});
             }
             return @as(@TypeOf(err)!Result, err);
         }
@@ -412,8 +409,6 @@ const SummaryCall = struct {
 /// What a call does when the model stops at its output-token limit.
 const OutputLimit = enum { reject, keep_complete_lines };
 
-const output_limit_marker = "[summary cut off at the model's output limit; later details may be missing]";
-
 fn runSummaryCall(
     alloc: Allocator,
     request: Request,
@@ -437,8 +432,8 @@ fn runSummaryCall(
 
 /// Assistant-first summary call that states its numeric size target. The output-token
 /// limit stays at the model's normal value because some providers count reasoning
-/// toward it. A summary cut off at that limit keeps its complete lines and a visible
-/// marker, then goes through the same fitting as an overlong one.
+/// toward it. A summary cut off at that limit or at the capture limit keeps its complete
+/// lines and a visible marker, then goes through the same fitting as an overlong one.
 fn runTargetedSummaryCall(
     alloc: Allocator,
     request: Request,
@@ -456,13 +451,7 @@ fn runTargetedSummaryCall(
         summary_target_close,
         summary_task_reminder_tail,
     }, max_bytes, .keep_complete_lines);
-    traceKeptPrefix(request, call, max_bytes);
-    if (call.cut_at_output_limit) {
-        diagnostics.traceCompactionEvent(request.trace_ctx, .summary_incomplete, "model={s} finish_reason=length kept_bytes={d}", .{ request.model, call.text.len });
-        const marked = try std.mem.concat(alloc, u8, &.{ call.text, "\n", output_limit_marker });
-        alloc.free(call.text);
-        call.text = marked;
-    }
+    try markKeptPrefix(alloc, request, &call, max_bytes);
     return call;
 }
 
@@ -476,25 +465,35 @@ fn runShorteningCall(
 ) !SummaryCall {
     var buffer: [24]u8 = undefined;
     const target = std.fmt.bufPrint(&buffer, "{d}", .{target_tokens}) catch unreachable;
-    const call = try runTextCall(alloc, request, compaction_policy.shorten_instructions, &.{
+    var call = try runTextCall(alloc, request, compaction_policy.shorten_instructions, &.{
         shorten_open,
         summary,
         shorten_target_open,
         target,
         shorten_target_close,
     }, max_bytes, .reject);
-    traceKeptPrefix(request, call, max_bytes);
+    try markKeptPrefix(alloc, request, &call, max_bytes);
     return call;
 }
 
-fn traceKeptPrefix(request: Request, call: SummaryCall, max_bytes: usize) void {
-    const observed = call.truncated_bytes orelse return;
-    diagnostics.traceCompactionEvent(
-        request.trace_ctx,
-        .summary_truncated,
-        "model={s} observed_bytes={d} kept_bytes={d} limit_bytes={d}",
-        .{ request.model, observed, call.text.len, max_bytes },
-    );
+/// Ends a call that kept only a prefix of the model's output with a visible marker, so
+/// the missing later sections are never silent. The capture limit cuts first when both apply.
+fn markKeptPrefix(alloc: Allocator, request: Request, call: *SummaryCall, max_bytes: usize) !void {
+    if (call.truncated_bytes) |observed| {
+        diagnostics.traceCompactionEvent(request.trace_ctx, .summary_truncated, "model={s} observed_bytes={d} kept_bytes={d} limit_bytes={d}", .{ request.model, observed, call.text.len, max_bytes });
+    }
+    if (call.cut_at_output_limit) {
+        diagnostics.traceCompactionEvent(request.trace_ctx, .summary_incomplete, "model={s} finish_reason=length kept_bytes={d}", .{ request.model, call.text.len });
+    }
+    const marker = if (call.truncated_bytes != null)
+        compaction_policy.capture_limit_marker
+    else if (call.cut_at_output_limit)
+        compaction_policy.output_limit_marker
+    else
+        return;
+    const marked = try std.mem.concat(alloc, u8, &.{ call.text, "\n", marker });
+    alloc.free(call.text);
+    call.text = marked;
 }
 
 /// The captured prefix up to its last complete line, or its longest valid UTF-8
@@ -851,10 +850,10 @@ test "assistant first compaction fits an overlong summary without reselecting us
         .{ .role = .user, .context_origin = .user_turn, .content = "Latest request stays exact." },
     };
     const storage = ResultStorage{ .legacy_dir = dir };
-    const measured = try compaction_policy.prepare(arena.allocator(), &source, storage, 100_000, false);
+    const measured = try compaction_policy.prepare(arena.allocator(), &source, storage, 100_000);
     // Verbatim users take half the handoff, more than the guaranteed summary share needs.
     const accepted = measured.fixed_tokens * 2;
-    const initial = try compaction_policy.prepare(arena.allocator(), &source, storage, accepted, false);
+    const initial = try compaction_policy.prepare(arena.allocator(), &source, storage, accepted);
     try std.testing.expectEqual(@as(usize, 2), initial.retained_users);
     try std.testing.expectEqual(@as(usize, 0), initial.summarized_users);
     const budget = initial.summary_budget_tokens;
@@ -921,7 +920,7 @@ test "assistant first summary requests state their numeric target per chunk" {
     };
     const storage = ResultStorage{ .legacy_dir = dir };
     const accepted: usize = 4_096;
-    const prepared = try compaction_policy.prepare(arena.allocator(), &source, storage, accepted, false);
+    const prepared = try compaction_policy.prepare(arena.allocator(), &source, storage, accepted);
     for ([_]usize{ 1_000_000, 700 }) |compactor_input_tokens| {
         var provider = FakeProvider{ .response = "Standing rules and constraints:\n- Region ap-south-9." };
         var cancel = std.atomic.Value(bool).init(false);
@@ -980,6 +979,57 @@ test "assistant first compaction keeps a runaway summary's complete lines instea
         try std.testing.expect(std.mem.find(u8, result.handoff, "> - Codename heron.\n") != null);
         try runtime_prompt_context.validateCompactionHandoff(result.handoff, accepted);
     }
+}
+
+test "assistant first compaction marks a summary kept at the capture limit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+    const source = [_]types.ChatMessage{
+        .{ .role = .user, .context_origin = .user_turn, .content = "Keep the codename heron." },
+        .{ .role = .assistant, .content = "Noted." },
+    };
+    const accepted: usize = 2_048;
+    const max_bytes = accepted * 8 + 1;
+    // Work remaining lies past the accepted_tokens * 8 byte capture limit.
+    const runaway = "Standing rules and constraints:\n- Codename heron.\nWork done:\n" ++ ("- repeated detail\n" ** 2_000) ++ "Work remaining:\n- Ship TASK-F.";
+    comptime std.debug.assert(runaway.len > max_bytes);
+    // The shortening call sees the marker, and its own runaway output is no shorter,
+    // so the trimmed summary still says where it was cut.
+    var provider = FakeProvider{ .response = runaway, .source_marker = compaction_policy.capture_limit_marker };
+    var cancel = std.atomic.Value(bool).init(false);
+    const request: Request = .{
+        .stream_provider = provider.provider(),
+        .model = "fixture/model",
+        .api_key = "fixture-key",
+        .retry_count = 0,
+        .cancel_flag = &cancel,
+        .accepted_tokens = accepted,
+        .compactor_input_tokens = 1_000_000,
+        .policy = .assistant_first,
+        .result_storage = .{ .legacy_dir = dir },
+        .trace_ctx = .{},
+    };
+    var result = try compact(alloc, &source, request);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), provider.request_count);
+    try std.testing.expect(provider.later_saw_source);
+    try std.testing.expect(std.mem.find(u8, result.handoff, "> - Codename heron.\n") != null);
+    try std.testing.expect(std.mem.find(u8, result.handoff, "> " ++ compaction_policy.capture_limit_marker ++ "\n") != null);
+    try std.testing.expect(std.mem.find(u8, result.handoff, "> [trimmed ") != null);
+    try std.testing.expect(std.mem.find(u8, result.handoff, "Ship TASK-F") == null);
+    try runtime_prompt_context.validateCompactionHandoff(result.handoff, accepted);
+
+    // A shortening reply kept at the capture limit is marked the same way.
+    var shortener = FakeProvider{ .response = runaway };
+    var shorten_request = request;
+    shorten_request.stream_provider = shortener.provider();
+    const shortened = try runShorteningCall(alloc, shorten_request, "Standing rules and constraints:\n- Codename heron.", 1_000, max_bytes);
+    defer alloc.free(shortened.text);
+    try std.testing.expect(shortened.truncated_bytes != null);
+    try std.testing.expect(std.mem.endsWith(u8, shortened.text, "\n- repeated detail\n" ++ compaction_policy.capture_limit_marker));
 }
 
 test "compaction activity forwards cooperative pulse through summary retry and cancellation" {
@@ -1185,7 +1235,7 @@ test "assistant first compaction keeps a summary cut off at the output limit" {
         var result = try compact(alloc, &source, request);
         defer result.deinit(alloc);
         try std.testing.expectEqual(@as(usize, 1), provider.request_count);
-        try std.testing.expect(std.mem.find(u8, result.handoff, "> - Codename heron.\n> Work done:\n> " ++ output_limit_marker ++ "\n") != null);
+        try std.testing.expect(std.mem.find(u8, result.handoff, "> - Codename heron.\n> Work done:\n> " ++ compaction_policy.output_limit_marker ++ "\n") != null);
         try std.testing.expect(std.mem.find(u8, result.handoff, "Half of a sente") == null);
         try runtime_prompt_context.validateCompactionHandoff(result.handoff, 4_096);
     }

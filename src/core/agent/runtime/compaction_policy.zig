@@ -65,8 +65,6 @@ const User = struct {
     line: []const u8 = "",
     /// The exact original is available now, so it can be saved and summarized.
     original: bool = true,
-    /// The current turn's prompt, which never becomes a placeholder.
-    current: bool = false,
     tokens: usize = 0,
 
     fn span(self: User) usize {
@@ -351,7 +349,7 @@ fn save_range(alloc: Allocator, storage: Storage, members: []const User) !Stub {
 fn largest_verbatim(users: []const User, start: usize) ?usize {
     var largest: ?usize = null;
     for (users[start..], start..) |user, index| {
-        if (user.current or user.stub != null or user.tokens <= short_user_tokens) continue;
+        if (user.stub != null or user.tokens <= short_user_tokens) continue;
         if (largest == null or user.tokens > users[largest.?].tokens) largest = index;
     }
     return largest;
@@ -366,11 +364,11 @@ const Selection = struct {
 /// Replaces users with saved placeholders until the handoff outside the summary fits
 /// `limit`: every oversized paste first, then the largest remaining message, and
 /// instruction-sized messages only as a last resort, oldest first, as one saved range.
-/// The current prompt never becomes a placeholder; failing to fit then is a genuine
-/// capacity failure.
+/// An active turn's prompt follows the same rules because the rebuilt request re-sends
+/// it verbatim. Failing to fit after collapsing every user is a genuine capacity failure.
 fn select(alloc: Allocator, storage: Storage, users: []User, references: []const Artifact, limit: usize) !Selection {
     for (users) |*user| {
-        if (!user.current and user.stub == null and user.tokens > stub_user_tokens) try save_user(alloc, storage, user);
+        if (user.stub == null and user.tokens > stub_user_tokens) try save_user(alloc, storage, user);
     }
     const empty = try render(alloc, "", &.{}, null, 0, references, null);
     const framing = tokens(empty) +| state_handle_allowance +| (if (users.len > 0) tokens(users_header) +| 2 else 0);
@@ -396,23 +394,20 @@ fn select(alloc: Allocator, storage: Storage, users: []User, references: []const
         }
         if (largest_verbatim(users, collapsed_users)) |index| {
             try save_user(alloc, storage, &users[index]);
-        } else if (collapsed_users < users.len and !users[collapsed_users].current) {
+        } else if (collapsed_users < users.len) {
             collapsed_users += 1;
         } else return error.CompactionHandoffTooLarge;
     }
 }
 
 /// Caller supplies an operation arena; source records remain borrowed and unchanged.
-/// When `current_prompt_in_source` is set, the last non-steering user message is the
-/// current turn's prompt and stays verbatim.
-pub fn prepare(alloc: Allocator, source: []const types.ChatMessage, storage: Storage, accepted: usize, current_prompt_in_source: bool) !Prepared {
+pub fn prepare(alloc: Allocator, source: []const types.ChatMessage, storage: Storage, accepted: usize) !Prepared {
     if (source.len > max_records) return error.CompactionSourceTooLarge;
     var users: std.ArrayList(User) = .empty;
     var messages: std.ArrayList(types.ChatMessage) = .empty;
     var archives: std.ArrayList(Artifact) = .empty;
     var original: std.Io.Writer.Allocating = .init(alloc);
     var next_position: usize = 1;
-    var current_prompt: ?usize = null;
     for (source) |message| {
         if (message.role == .system) continue;
         if (message.context_origin == .handoff) {
@@ -427,7 +422,6 @@ pub fn prepare(alloc: Allocator, source: []const types.ChatMessage, storage: Sto
         }
         if (message.role == .user and message.context_origin == .user_turn) {
             const text = message.content orelse "";
-            if (!message.restored_steering) current_prompt = users.items.len;
             try append_user(alloc, &users, &messages, .{ .position = next_position, .text = text });
             next_position +|= 1;
             try original.writer.print("### Original user\n{s}\n", .{text});
@@ -454,9 +448,6 @@ pub fn prepare(alloc: Allocator, source: []const types.ChatMessage, storage: Sto
         };
         if (original.written().len > max_artifact_bytes) return error.CompactionSourceTooLarge;
     }
-    if (current_prompt_in_source) if (current_prompt) |index| {
-        users.items[index].current = true;
-    };
     for (users.items) |*user| user.tokens = user_tokens(user.*);
     if (original.written().len > 0) try archives.append(alloc, try store_artifact(alloc, storage, "source", original.written()));
     if (archives.items.len > max_records) return error.CompactionSourceTooLarge;
@@ -518,11 +509,18 @@ pub fn finish(alloc: Allocator, scratch: Allocator, prepared: Prepared, summary:
     return render(alloc, summary, prepared.users, prepared.collapsed, prepared.collapsed_users, prepared.references, artifact);
 }
 
+/// Lines that record summary text lost before fitting; trimming never removes them.
+pub const output_limit_marker = "[summary cut off at the model's output limit; later details may be missing]";
+pub const capture_limit_marker = "[summary cut off at the handoff size limit; later details may be missing]";
+
 const Line = struct {
     text: []const u8,
     rank: usize,
     group: usize,
-    label: bool,
+    /// A bare section label or a cut marker, which trimming keeps.
+    fixed: bool,
+    /// Content written on its label's line; when kept, it continues that line.
+    inline_content: bool = false,
     tokens: usize,
     dropped: bool = false,
 };
@@ -535,6 +533,15 @@ fn section_rank(line: []const u8) ?usize {
         if (rest.len == 0 or rest[0] == ':') return rank;
     }
     return null;
+}
+
+/// End of a label line's bare label: past its colon and any closing emphasis, or the
+/// whole line when it has no colon. `section_rank` guarantees no earlier colon.
+fn label_end(line: []const u8) usize {
+    const colon = std.mem.findScalar(u8, line, ':') orelse return line.len;
+    var end = colon + 1;
+    while (end < line.len and (line[end] == '*' or line[end] == '_')) end += 1;
+    return end;
 }
 
 fn write_trim_marker(writer: *std.Io.Writer, lines: usize) !void {
@@ -551,8 +558,10 @@ fn trim_marker_tokens(lines: usize) usize {
 
 /// Cuts a summary to `budget` handoff tokens at line boundaries: unlabeled text first,
 /// then the least durable sections, leaving Work remaining, Decisions and chosen values,
-/// and Standing rules and constraints for last. Each trimmed section keeps its label and
-/// gains a visible marker. Returns null when the labels alone exceed the budget. Pure.
+/// and Standing rules and constraints for last. Content written on a label's line trims
+/// like the lines below it. Each trimmed section keeps its bare label and gains a visible
+/// marker, and cut markers always stay. Returns null when the bare labels and markers
+/// alone exceed the budget. Pure.
 pub fn trim_summary(alloc: Allocator, summary: []const u8, budget: usize) !?[]u8 {
     if (summary_tokens(summary) <= budget) return try alloc.dupe(u8, summary);
     var lines: std.ArrayList(Line) = .empty;
@@ -561,12 +570,18 @@ pub fn trim_summary(alloc: Allocator, summary: []const u8, budget: usize) !?[]u8
     var group: usize = 0;
     var split = std.mem.splitScalar(u8, summary, '\n');
     while (split.next()) |text| {
-        const label = section_rank(text);
-        if (label) |value| {
+        if (section_rank(text)) |value| {
             rank = value;
             group += 1;
+            const end = label_end(text);
+            const has_content = std.mem.trim(u8, text[end..], " \t\r").len > 0;
+            const label = if (has_content) text[0..end] else text;
+            try lines.append(alloc, .{ .text = label, .rank = rank, .group = group, .fixed = true, .tokens = tokens(label) +| 1 });
+            if (has_content) try lines.append(alloc, .{ .text = text[end..], .rank = rank, .group = group, .fixed = false, .inline_content = true, .tokens = tokens(text[end..]) });
+            continue;
         }
-        try lines.append(alloc, .{ .text = text, .rank = rank, .group = group, .label = label != null, .tokens = tokens(text) +| 1 });
+        const cut_marker = std.mem.eql(u8, text, output_limit_marker) or std.mem.eql(u8, text, capture_limit_marker);
+        try lines.append(alloc, .{ .text = text, .rank = rank, .group = group, .fixed = cut_marker, .tokens = tokens(text) +| 1 });
     }
     const dropped = try alloc.alloc(usize, group + 1);
     defer alloc.free(dropped);
@@ -578,7 +593,7 @@ pub fn trim_summary(alloc: Allocator, summary: []const u8, budget: usize) !?[]u8
         while (total > budget and index > 0) {
             index -= 1;
             const line = &lines.items[index];
-            if (line.rank != target or line.label or line.dropped) continue;
+            if (line.rank != target or line.fixed or line.dropped) continue;
             line.dropped = true;
             const count = dropped[line.group];
             total = (total -| line.tokens -| trim_marker_tokens(count)) +| trim_marker_tokens(count + 1);
@@ -591,7 +606,8 @@ pub fn trim_summary(alloc: Allocator, summary: []const u8, budget: usize) !?[]u8
     var first = true;
     for (lines.items, 0..) |line, index| {
         if (!line.dropped) {
-            if (!first) try out.writer.writeByte('\n');
+            // Kept inline content follows its label, which is never dropped.
+            if (!first and !line.inline_content) try out.writer.writeByte('\n');
             try out.writer.writeAll(line.text);
             first = false;
         }
@@ -640,10 +656,15 @@ const TestFixture = struct {
 
 /// About 28 KB of build-log text, like the pastes in the measured sessions.
 fn test_paste(alloc: Allocator, which: u8) ![]u8 {
+    return test_log(alloc, which, 28_000);
+}
+
+/// Build-log text of at least `min_bytes`.
+fn test_log(alloc: Allocator, which: u8, min_bytes: usize) ![]u8 {
     var text: std.Io.Writer.Allocating = .init(alloc);
     errdefer text.deinit();
     var step: usize = 0;
-    while (text.written().len < 28_000) : (step += 1) {
+    while (text.written().len < min_bytes) : (step += 1) {
         try text.writer.print("2026-09-2{d} 12:{d:0>2}:{d:0>2}.{d:0>3} [INFO] step {d}: compiling ledger/ledger_{d}.zig ... ok ({d} ms)\n", .{ which, step / 60 % 60, step % 60, step * 7 % 1000, step, step % 90 + 10, step * 13 % 900 + 100 });
     }
     return text.toOwnedSlice();
@@ -669,7 +690,7 @@ test "compaction policy keeps users normally and saves the largest users only wh
         assistant_message("Noted."),
         user_message("Latest short request."),
     };
-    const roomy = try prepare(a, &source, fixture.storage(), 100_000, false);
+    const roomy = try prepare(a, &source, fixture.storage(), 100_000);
     try std.testing.expectEqual(@as(usize, 3), roomy.retained_users);
     try std.testing.expectEqual(@as(usize, 0), roomy.stubbed_users);
     try std.testing.expectEqual(@as(usize, 0), roomy.summarized_users);
@@ -677,7 +698,7 @@ test "compaction policy keeps users normally and saves the largest users only wh
     // Just too small for everything verbatim: the larger middle message is saved,
     // not the oldest one.
     const accepted = (roomy.fixed_tokens - 100) * 100 / 60;
-    const tight = try prepare(a, &source, fixture.storage(), accepted, false);
+    const tight = try prepare(a, &source, fixture.storage(), accepted);
     try std.testing.expect(tight.users[0].stub == null);
     try std.testing.expect(tight.users[1].stub != null);
     try std.testing.expect(tight.users[2].stub == null);
@@ -723,7 +744,7 @@ test "compaction policy keeps restored steering as exact user text" {
     try source.append(arena, .{ .role = .user, .content = "Original task.", .context_origin = .user_turn });
     try session.appendExecutionMemoryChatMessages(arena, &source, .{ .steering = &steering });
 
-    const prepared = try prepare(arena, source.items, .{ .legacy_dir = dir }, 100_000, false);
+    const prepared = try prepare(arena, source.items, .{ .legacy_dir = dir }, 100_000);
     try std.testing.expectEqual(@as(usize, 2), prepared.users.len);
     try std.testing.expectEqualStrings("Original task.", prepared.users[0].text);
     try std.testing.expectEqualStrings(correction, prepared.users[1].text);
@@ -747,7 +768,7 @@ test "compaction policy source selection never edits source messages" {
     const a = fixture.arena();
     const paste = try test_paste(a, 1);
     const source = [_]types.ChatMessage{ user_message("original user"), user_message(paste), assistant_message("noted") };
-    const prepared = try prepare(a, &source, fixture.storage(), 16_800, false);
+    const prepared = try prepare(a, &source, fixture.storage(), 16_800);
     try std.testing.expect(prepared.users[1].stub != null);
     try std.testing.expectEqualStrings("original user", source[0].content.?);
     try std.testing.expectEqual(paste.ptr, source[1].content.?.ptr);
@@ -774,7 +795,7 @@ test "compaction policy saves pasted logs as placeholders and keeps short rules 
     };
     // The 200K-window budget where two verbatim pastes left 525 summary tokens.
     const accepted: usize = 16_800;
-    const prepared = try prepare(a, &source, fixture.storage(), accepted, false);
+    const prepared = try prepare(a, &source, fixture.storage(), accepted);
     try std.testing.expectEqual(@as(usize, accepted * 40 / 100), prepared.summary_floor_tokens);
     try std.testing.expect(prepared.summary_budget_tokens >= prepared.summary_floor_tokens);
     try std.testing.expectEqual(@as(usize, 2), prepared.retained_users);
@@ -822,7 +843,7 @@ test "compaction policy never lets verbatim users push the summary below its flo
     for (0..400) |_| try source.append(a, user_message("Keep going."));
     try source.append(a, user_message(try test_paste(a, 3)));
     for ([_]usize{ 1_000, 2_500, 4_000, 12_000, 16_800, 100_000 }) |accepted| {
-        const prepared = try prepare(a, source.items, fixture.storage(), accepted, false);
+        const prepared = try prepare(a, source.items, fixture.storage(), accepted);
         try std.testing.expect(prepared.summary_budget_tokens >= prepared.summary_floor_tokens);
         try std.testing.expectEqual(accepted, prepared.fixed_tokens + prepared.summary_budget_tokens);
         const base = try render(a, "", prepared.users, prepared.collapsed, prepared.collapsed_users, prepared.references, null);
@@ -852,7 +873,7 @@ test "compaction policy keeps placeholders across consecutive compactions" {
         user_message(paste),
         assistant_message("Log noted."),
     };
-    const initial = try prepare(a, &initial_source, fixture.storage(), 16_800, false);
+    const initial = try prepare(a, &initial_source, fixture.storage(), 16_800);
     const saved = initial.users[1].stub.?;
     const summary = "Standing rules and constraints:\nNever modify vendor/.";
     var handoff = try finish(a, a, initial, summary, fixture.storage());
@@ -862,7 +883,7 @@ test "compaction policy keeps placeholders across consecutive compactions" {
             user_message("Continue with the next task."),
             assistant_message("Continuing."),
         };
-        const next = try prepare(a, &source, fixture.storage(), 16_800, false);
+        const next = try prepare(a, &source, fixture.storage(), 16_800);
         try std.testing.expectEqual(3 + round, next.users.len);
         const kept = next.users[1];
         try std.testing.expect(!kept.original);
@@ -893,16 +914,15 @@ test "compaction policy applies the same placeholder rules to steering" {
     var source: std.ArrayList(types.ChatMessage) = .empty;
     try source.append(a, user_message("Original task."));
     try session.appendExecutionMemoryChatMessages(a, &source, .{ .steering = &steering });
-    const prepared = try prepare(a, source.items, fixture.storage(), 16_800, true);
+    const prepared = try prepare(a, source.items, fixture.storage(), 16_800);
     try std.testing.expectEqual(@as(usize, 3), prepared.users.len);
-    try std.testing.expect(prepared.users[0].current);
-    try std.testing.expect(!prepared.users[1].current and !prepared.users[2].current);
+    try std.testing.expect(prepared.users[0].stub == null);
     try std.testing.expect(prepared.users[1].stub == null);
     const stub = prepared.users[2].stub.?;
     try std.testing.expectEqualSlices(u8, paste, try load_artifact(a, fixture.storage(), stub.artifact));
 }
 
-test "compaction policy never replaces the current prompt with a placeholder" {
+test "compaction policy treats the active turn's prompt like any other user message" {
     var fixture = try TestFixture.init();
     defer fixture.deinit();
     const a = fixture.arena();
@@ -913,19 +933,66 @@ test "compaction policy never replaces the current prompt with a placeholder" {
         user_message(prompt),
         assistant_message("Working."),
     };
-    const current = try prepare(a, &source, fixture.storage(), 16_800, true);
-    try std.testing.expect(current.users[1].current);
-    try std.testing.expect(current.users[1].tokens > stub_user_tokens);
-    try std.testing.expect(current.users[1].stub == null);
-    for (current.messages) |message| {
+    // A long prompt becomes a placeholder with an exact saved original, and the
+    // summarizer still receives its full text. The rebuilt request re-sends it verbatim.
+    try std.testing.expect(user_tokens(.{ .position = 2, .text = prompt }) > stub_user_tokens);
+    const long = try prepare(a, &source, fixture.storage(), 16_800);
+    try std.testing.expectEqualSlices(u8, prompt, try load_artifact(a, fixture.storage(), long.users[1].stub.?.artifact));
+    try std.testing.expect(long.users[0].stub == null);
+    var summarized: usize = 0;
+    for (long.messages) |message| {
         const content = message.content orelse continue;
-        if (std.mem.endsWith(u8, content, prompt)) try std.testing.expect(std.mem.startsWith(u8, content, "USER_RETAINED:"));
+        if (!std.mem.endsWith(u8, content, prompt)) continue;
+        try std.testing.expect(std.mem.startsWith(u8, content, "USER_TO_SUMMARIZE:"));
+        summarized += 1;
     }
-    // The same message is saved once it is no longer the current prompt.
-    const earlier = try prepare(a, &source, fixture.storage(), 16_800, false);
-    try std.testing.expect(earlier.users[1].stub != null);
-    // A current prompt that cannot fit beside the summary floor is a capacity failure.
-    try std.testing.expectError(error.CompactionHandoffTooLarge, prepare(a, &source, fixture.storage(), 4_000, true));
+    try std.testing.expectEqual(@as(usize, 1), summarized);
+    // The budget that failed while the prompt had to stay verbatim now fits.
+    const small = try prepare(a, &source, fixture.storage(), 4_000);
+    try std.testing.expect(small.users[1].stub != null);
+    try std.testing.expect(small.fixed_tokens <= 4_000 - 4_000 * summary_floor_percent / 100);
+
+    // A short prompt stays verbatim. Older users collapse first, so a saved range
+    // reaches the prompt only after every earlier message.
+    var short_source: std.ArrayList(types.ChatMessage) = .empty;
+    for (0..400) |_| try short_source.append(a, user_message("Keep going."));
+    try short_source.append(a, user_message("Current task: rename the ledger module."));
+    const roomy = try prepare(a, short_source.items, fixture.storage(), 16_800);
+    try std.testing.expectEqual(@as(usize, 0), roomy.collapsed_users);
+    try std.testing.expect(roomy.users[400].stub == null);
+    const tight = try prepare(a, short_source.items, fixture.storage(), 1_000);
+    try std.testing.expect(tight.collapsed_users > 0 and tight.collapsed_users < tight.users.len);
+    try std.testing.expect(tight.users[tight.users.len - 1].stub == null);
+    // Only a handoff that cannot fit with every user collapsed is a capacity failure.
+    try std.testing.expectError(error.CompactionHandoffTooLarge, prepare(a, short_source.items, fixture.storage(), 200));
+}
+
+test "compaction policy saves a large active-turn paste at the measured failing budget" {
+    var fixture = try TestFixture.init();
+    defer fixture.deinit();
+    const a = fixture.arena();
+    // A 200K window left 19,180 accepted tokens when a 48.7 KB build log was the active
+    // turn's prompt; kept verbatim, it alone exceeded the 11,508 tokens beside the floor.
+    const accepted: usize = 19_180;
+    const limit = accepted - accepted * summary_floor_percent / 100;
+    const prompt = try std.mem.concat(a, u8, &.{ "Here is the failing build log. Investigate it, then report.\n\n", try test_log(a, 5, 48_600) });
+    try std.testing.expect(user_tokens(.{ .position = 2, .text = prompt }) > limit);
+    const source = [_]types.ChatMessage{
+        user_message("Remember: the release region is ap-south-9. Reply ACK."),
+        assistant_message("ACK."),
+        user_message(prompt),
+        assistant_message("Investigating the log."),
+    };
+    const prepared = try prepare(a, &source, fixture.storage(), accepted);
+    try std.testing.expect(prepared.fixed_tokens <= limit);
+    try std.testing.expect(prepared.users[0].stub == null);
+    const saved = prepared.users[1];
+    try std.testing.expectEqualSlices(u8, prompt, try load_artifact(a, fixture.storage(), saved.stub.?.artifact));
+    try std.testing.expectEqual(@as(usize, 1), prepared.summarized_users);
+    const handoff = try finish(a, a, prepared, "Key facts:\nThe build log reports step failures.", fixture.storage());
+    try std.testing.expect(tokens(handoff) <= accepted);
+    try std.testing.expect(std.mem.find(u8, handoff, saved.line) != null);
+    try std.testing.expect(std.mem.find(u8, handoff, "step 3: compiling") == null);
 }
 
 test "compaction policy trims summaries by section priority at line boundaries" {
@@ -957,6 +1024,45 @@ test "compaction policy trims summaries by section priority at line boundaries" 
     try std.testing.expect((try trim_summary(a, summary, 20)) == null);
 }
 
+test "compaction policy trims content written on label lines" {
+    const a = std.testing.allocator;
+    const items = "a1; a2; a3; a4; a5; a6; a7; a8; a9; a10; " ** 40;
+    const rules = "Standing rules and constraints: R1: never modify vendor/.";
+    const decisions = "**Decisions and chosen values:** codename heron.";
+    const summary = rules ++ "\n" ++ decisions ++ "\n" ++
+        "Key facts: " ++ items ++ "\n" ++
+        "Work done: " ++ items ++ "\n" ++
+        "Work remaining: TASK-F.\n" ++
+        "Saved files and handles: " ++ items;
+    const budget = summary_tokens(summary) / 2;
+    const trimmed = (try trim_summary(a, summary, budget)).?;
+    defer a.free(trimmed);
+    try std.testing.expect(summary_tokens(trimmed) <= budget);
+    // Kept label lines stay byte-exact; trimmed ones keep the bare label and a marker.
+    try std.testing.expectEqualStrings(rules ++ "\n" ++ decisions ++ "\n" ++
+        "Key facts: " ++ items ++ "\n" ++
+        "Work done:\n[trimmed 1 line here to fit the handoff budget]\n" ++
+        "Work remaining: TASK-F.\n" ++
+        "Saved files and handles:\n[trimmed 1 line here to fit the handoff budget]", trimmed);
+    // Failing is left for budgets below the bare labels themselves.
+    try std.testing.expect((try trim_summary(a, summary, 30)) == null);
+}
+
+test "compaction policy trimming keeps cut markers" {
+    const a = std.testing.allocator;
+    const summary = "Standing rules and constraints:\n- Keep the release region at ap-south-9.\nWork done:\n" ++
+        ("- repeated historical detail line\n" ** 200) ++ capture_limit_marker;
+    const budget = summary_tokens(summary) / 4;
+    const trimmed = (try trim_summary(a, summary, budget)).?;
+    defer a.free(trimmed);
+    try std.testing.expect(summary_tokens(trimmed) <= budget);
+    try std.testing.expect(std.mem.startsWith(u8, trimmed, "Standing rules and constraints:\n- Keep the release region at ap-south-9.\nWork done:\n- repeated historical detail line\n"));
+    // Trimming starts at the end of the section but steps over the marker.
+    const tail = "- repeated historical detail line\n" ++ capture_limit_marker ++ "\n[trimmed ";
+    try std.testing.expect(std.mem.find(u8, trimmed, tail) != null);
+    try std.testing.expect(std.mem.endsWith(u8, trimmed, " lines here to fit the handoff budget]"));
+}
+
 test "compaction policy reads version 1 state and rejects unknown versions" {
     var fixture = try TestFixture.init();
     defer fixture.deinit();
@@ -968,7 +1074,7 @@ test "compaction policy reads version 1 state and rejects unknown versions" {
         user_message("New request."),
         assistant_message("Done."),
     };
-    const prepared = try prepare(a, &source, fixture.storage(), 16_800, false);
+    const prepared = try prepare(a, &source, fixture.storage(), 16_800);
     try std.testing.expectEqual(@as(usize, 3), prepared.retained_users);
     for (prepared.users, [_][]const u8{ "First rule.", "Second request.", "New request." }, 1..) |user, text, position| {
         try std.testing.expectEqualStrings(text, user.text);
