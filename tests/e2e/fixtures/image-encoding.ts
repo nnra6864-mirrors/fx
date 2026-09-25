@@ -37,6 +37,14 @@ export function solidPng(width: number, height: number): Buffer {
   ]);
 }
 
+// A JPEG signature and frame header: enough for type and pixel-size checks.
+export function jpegHeader(width: number, height: number): Buffer {
+  const header = Buffer.from("ffd8ffc0001108000000000301220002110103110100", "hex");
+  header.writeUInt16BE(height, 7);
+  header.writeUInt16BE(width, 9);
+  return header;
+}
+
 // Pixel size of a PNG, read from its header.
 export function pngPixelSize(png: Buffer): { width: number; height: number } {
   assert.ok(png.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex")), "expected a PNG");

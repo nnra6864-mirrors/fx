@@ -7353,7 +7353,13 @@ fn processQueuedPromptLoop(
                     break;
                 }
             }
-            const materialized_messages = if (request_capabilities.image_input_support == .native) try runtime_execution_memory.materializeToolImages(overlay_arena, config, result_request_messages) else result_request_messages;
+            const materialized_messages = if (request_capabilities.image_input_support == .native)
+                try image_attachments.withholdOversizedAttachments(
+                    overlay_arena,
+                    try runtime_execution_memory.materializeToolImages(overlay_arena, config, result_request_messages),
+                )
+            else
+                result_request_messages;
             const image_projection = try runtime_gateway_step.projectToolImageMessages(overlay_arena, materialized_messages, request_capabilities.image_input_support, vision_policy.route == .fallback, config.max_tool_result_bytes);
             const request_messages = try with_replyable_conversation_tail(overlay_arena, image_projection.messages);
             if (request_messages.ptr != image_projection.messages.ptr) {

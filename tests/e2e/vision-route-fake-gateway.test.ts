@@ -20,7 +20,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
-import { pngPixelSize, solidPng } from "./fixtures/image-encoding";
+import { jpegHeader, pngPixelSize, solidPng } from "./fixtures/image-encoding";
 import { fakeGatewaySse, fakeGatewayTitleDefault, hasEmptyComposer, TITLE_GENERATION_MARKER, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 const TIMEOUT = 15_000;
@@ -1232,6 +1232,35 @@ describe("Vision route fake Gateway", () => {
         expect(parts[0]!.mediaType).toBe("image/png");
         const sent = Buffer.from(parts[0]!.data.data, "base64");
         expect(pngPixelSize(sent)).toEqual({ width: 2000, height: 1301 });
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  // macOS converts other formats with sips during capture, so only other
+  // platforms keep an oversized JPEG attachment for request building.
+  test.skipIf(process.platform === "darwin")(
+    "fx ask leaves out attachments it cannot downscale and names their saved file",
+    async () => {
+      const root = createIsolatedRoot();
+      const photoPath = join(root.workspace, "photo.jpg");
+      writeFileSync(photoPath, jpegHeader(4032, 3024));
+      const gateway = startImageGateway([sseText("Photo note answer")]);
+      try {
+        const result = await runFx(
+          ["ask", "--json", "--no-save", "--image", photoPath, "Describe the attached image."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GEMINI_MODEL), timeoutMs: TIMEOUT },
+        );
+        expect(parseFxJson(result).output).toContain("Photo note answer");
+        expect(gateway.chatRequests).toHaveLength(1);
+        const body = gateway.chatRequests[0]!.body;
+        expect(nativeFileParts(body)).toHaveLength(0);
+        expect(body).toContain(
+          "[Image #1 not sent: image/jpeg is 4032x3024 pixels, over the 2000-pixel limit per side. It is saved at ",
+        );
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });

@@ -744,8 +744,8 @@ fn fitToolImagesToModelLimit(arena: Allocator, scratch: Allocator, images: []con
         } else {
             fitted.withheld += 1;
             try notice.writer.print(
-                "[Image not sent: {d}x{d} pixels is over the {d}-pixel limit per side and this format cannot be downscaled here, so it is not visible in this conversation. Downscale or crop it, then load the smaller image.]\n",
-                .{ original.width, original.height, image_data.max_image_dimension },
+                "[Image not sent: {s} is {d}x{d} pixels, over the {d}-pixel limit per side, and fx could not downscale it, so it is not visible in this conversation. Downscale or crop it, then load the smaller image.]\n",
+                .{ image.mime_type, original.width, original.height, image_data.max_image_dimension },
             );
         }
     }
@@ -903,7 +903,7 @@ test "oversized tool images are downscaled or withheld before the result enters 
     try std.testing.expectEqualStrings(images[2].data, prepared.memory.tool_images[1].data);
     try std.testing.expectEqualStrings(
         "[Image downscaled from 2400x2 to 2000x2 pixels to fit the 2000-pixel limit per side. Multiply coordinates in this image by 1.20 to get original pixels.]\n" ++
-            "[Image not sent: 3420x2224 pixels is over the 2000-pixel limit per side and this format cannot be downscaled here, so it is not visible in this conversation. Downscale or crop it, then load the smaller image.]\n" ++
+            "[Image not sent: image/jpeg is 3420x2224 pixels, over the 2000-pixel limit per side, and fx could not downscale it, so it is not visible in this conversation. Downscale or crop it, then load the smaller image.]\n" ++
             "captured three frames",
         prepared.model_output,
     );
