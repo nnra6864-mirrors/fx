@@ -23,6 +23,38 @@ export function equivalentPngEncodings(): Buffer[] {
   });
 }
 
+// A decodable solid gray RGB PNG with a small byte size at any pixel size.
+export function solidPng(width: number, height: number): Buffer {
+  const stride = width * 3 + 1;
+  const pixels = Buffer.alloc(stride * height, 0x80);
+  for (let y = 0; y < height; y++) pixels[y * stride] = 0;
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0); header.writeUInt32BE(height, 4);
+  header[8] = 8; header[9] = 2;
+  return Buffer.concat([
+    Buffer.from("89504e470d0a1a0a", "hex"),
+    pngChunk("IHDR", header), pngChunk("IDAT", deflateSync(pixels)), pngChunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+// Pixel size of a PNG or JPEG, read from its header.
+export function imagePixelSize(image: Buffer): { width: number; height: number } {
+  if (image.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex"))) {
+    return { width: image.readUInt32BE(16), height: image.readUInt32BE(20) };
+  }
+  assert.equal(image.readUInt16BE(0), 0xffd8, "expected a PNG or JPEG");
+  let offset = 2;
+  while (offset + 9 <= image.length) {
+    assert.equal(image[offset], 0xff, "malformed JPEG marker");
+    const marker = image[offset + 1];
+    if (marker === 0xff) { offset += 1; continue; }
+    const isFrame = marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker);
+    if (isFrame) return { width: image.readUInt16BE(offset + 7), height: image.readUInt16BE(offset + 5) };
+    offset += 2 + image.readUInt16BE(offset + 2);
+  }
+  throw new Error("JPEG frame header not found");
+}
+
 function pngChunk(type: string, data: Buffer): Buffer {
   const tag = Buffer.from(type), length = Buffer.alloc(4), checksum = Buffer.alloc(4);
   length.writeUInt32BE(data.length);

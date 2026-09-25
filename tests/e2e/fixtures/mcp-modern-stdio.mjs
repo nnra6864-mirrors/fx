@@ -56,6 +56,18 @@ function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
 }
 
+// PNG signature and IHDR for a 3420x2224 frame: enough for MCP media-type
+// validation and pixel-size checks without carrying real pixel data.
+function widePngHeaderBase64() {
+  const header = Buffer.alloc(33);
+  Buffer.from("89504e470d0a1a0a0000000d49484452", "hex").copy(header, 0);
+  header.writeUInt32BE(3420, 16);
+  header.writeUInt32BE(2224, 20);
+  header[24] = 8;
+  header[25] = 2;
+  return header.toString("base64");
+}
+
 function sendCatalogResponse(message) {
   if (catalogDelayMs === 0) {
     send(message);
@@ -558,7 +570,7 @@ function handle(message) {
   }
   if (message.method === "tools/call") {
     if (mode === "stall_operation") return;
-    if (mode === "image_result") {
+    if (mode === "image_result" || mode === "wide_image_result") {
       send({
         jsonrpc: "2.0",
         id: message.id,
@@ -567,7 +579,9 @@ function handle(message) {
           content: [{
             type: "image",
             mimeType: "image/png",
-            data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=",
+            data: mode === "wide_image_result"
+              ? widePngHeaderBase64()
+              : "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=",
           }],
         },
       });

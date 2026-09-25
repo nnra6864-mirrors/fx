@@ -90,6 +90,7 @@ type RootOptions = {
     | "stall_startup"
     | "tool_failure"
     | "image_result"
+    | "wide_image_result"
     | "response_missing_jsonrpc"
     | "response_wrong_jsonrpc"
     | "response_missing_payload"
@@ -2133,6 +2134,34 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       await expectFixtureProcessesExited(readWire(root.wireLogPath));
     }, 30_000);
   }
+
+  test("MCP images over the model pixel limit are withheld with a notice", async () => {
+    const root = createRoot("wide-image-output", MODERN_FIXTURE, { mode: "wide_image_result" });
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("image_select", "mcp_select_tool", { name: TOOL_NAME }),
+      fakeGatewayToolCall("image_call", TOOL_NAME, { text: "screenshot" }),
+      fakeGatewayFinalText("Wide image result observed."),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use", "vision", "file-input"] }] });
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Get an image from the fixture"], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway),
+      timeoutMs: 20_000,
+    });
+    expect(result.code).toBe(0);
+    const request = JSON.parse(gateway.requests.at(-1)!.body);
+    const part = request.prompt.flatMap((message: { content?: unknown[] }) => message.content ?? [])
+      .find((value: { type?: string; toolCallId?: string }) => value.type === "tool-result" && value.toolCallId === "image_call");
+    expect(part).toBeDefined();
+    expect(part.output.type).toBe("text");
+    expect(part.output.value).toContain(
+      "[Image not sent: 3420x2224 pixels is over the 2000-pixel limit per side, so it is not visible in this conversation.",
+    );
+    const imageMessage = request.prompt.find((message: { role?: string; content?: unknown[] }) =>
+      message.role === "user" && Array.isArray(message.content) &&
+      (message.content as Array<{ type?: string }>).some((entry) => entry.type === "file"));
+    expect(imageMessage).toBeUndefined();
+    await expectFixtureProcessesExited(readWire(root.wireLogPath));
+  }, 30_000);
 
   for (const action of ["resource_read", "prompt_get"] as const) {
     test(`MCP ${action} carries images through the shared result path`, async () => {
