@@ -56,6 +56,9 @@ fx ask "explain the changes in this repository"
 
 Inside the shell, run `/help` to browse interactive commands.
 
+In tmux, use your usual prefix bindings to switch sessions or enter copy mode.
+fx preserves those tmux views while resizing, including when the switcher zooms a split pane.
+
 ## Otty integration
 
 Run `fx` inside [Otty](https://otty.sh) with its CLI on `PATH` to report processing, waiting for input, completion, and errors automatically. Install the CLI from Otty Settings → Shell → Install CLI. Reports include only lifecycle state, fx's process ID, and session ID, never prompts or tool output. Reporting is best-effort and does not block your conversation if Otty is unavailable.
@@ -112,6 +115,8 @@ fx builds as a native binary or WebAssembly. Applications embedding fx can provi
 | `fx acp` | Connect the native agent to editors and other Agent Client Protocol clients. |
 | `createFxAgent()` | Embed the agent core in a JavaScript host with `fx-core.wasm`. |
 | `createFxTerminal()` | Embed the interactive terminal with `fx-term.wasm`. |
+
+ACP clients can keep their MCP tools loaded on every turn, steer a running turn, supply a session system prompt, serve MCP servers over the ACP connection, and choose each session's workspace. See [ACP embedding](CONTRIBUTING.md#acp-embedding).
 
 The SDK is published to npm as [libfx](https://www.npmjs.com/package/libfx). See the [WebAssembly SDK](sdk/README.md) and the runnable Node.js, browser, Next.js, and Nuxt [examples](examples/README.md). The WebAssembly SDK is experimental.
 

@@ -689,11 +689,10 @@ const DownscaledToolImage = struct {
 /// limit. Temporary buffers use `scratch`; the returned image is owned by `arena`.
 fn downscaleToolImage(arena: Allocator, scratch: Allocator, image: types.ToolImage) Allocator.Error!?DownscaledToolImage {
     if (!png_downscale.supportsMediaType(image.mime_type)) return null;
-    const decoder = std.base64.standard.Decoder;
-    const png_len = decoder.calcSizeForSlice(image.data) catch return null;
+    const png_len = std.base64.standard.Decoder.calcSizeForSlice(image.data) catch return null;
     const png = try scratch.alloc(u8, png_len);
     defer scratch.free(png);
-    decoder.decode(png, image.data) catch return null;
+    std.base64.standard.Decoder.decode(png, image.data) catch return null;
     const smaller = try png_downscale.downscaleOversized(scratch, image.mime_type, png) orelse return null;
     defer scratch.free(smaller.png);
     const encoded_len = std.base64.standard.Encoder.calcSize(smaller.png.len);

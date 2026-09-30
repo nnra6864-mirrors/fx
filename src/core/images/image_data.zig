@@ -74,11 +74,10 @@ pub fn supportedMediaType(mime_type: []const u8) bool {
 
 pub fn validateImage(alloc: Allocator, encoded: []const u8, mime_type: []const u8) Error!void {
     if (encoded.len == 0 or encoded.len > max_encoded_image_bytes) return error.ImageLimitExceeded;
-    const decoder = std.base64.standard.Decoder;
-    const size = decoder.calcSizeForSlice(encoded) catch return error.InvalidImage;
+    const size = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return error.InvalidImage;
     const bytes = try alloc.alloc(u8, size);
     defer alloc.free(bytes);
-    decoder.decode(bytes, encoded) catch return error.InvalidImage;
+    std.base64.standard.Decoder.decode(bytes, encoded) catch return error.InvalidImage;
     const detected = detectMediaTypeFromBytes(bytes) orelse return error.UnsupportedImageType;
     if (!std.mem.eql(u8, detected, mime_type)) return error.InvalidImage;
 }
@@ -187,7 +186,6 @@ const ImageBytes = union(enum) {
 };
 
 fn readBase64(encoded: []const u8, offset: usize, buffer: []u8) []const u8 {
-    const decoder = std.base64.standard.Decoder;
     var written: usize = 0;
     var group = offset / 3;
     var skip = offset % 3;
@@ -196,8 +194,8 @@ fn readBase64(encoded: []const u8, offset: usize, buffer: []u8) []const u8 {
         if (start >= encoded.len or encoded.len - start < 4) break;
         const quad = encoded[start..][0..4];
         var decoded: [3]u8 = undefined;
-        const decoded_len = decoder.calcSizeForSlice(quad) catch break;
-        decoder.decode(decoded[0..decoded_len], quad) catch break;
+        const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(quad) catch break;
+        std.base64.standard.Decoder.decode(decoded[0..decoded_len], quad) catch break;
         if (skip < decoded_len) {
             const count = @min(decoded_len - skip, buffer.len - written);
             @memcpy(buffer[written..][0..count], decoded[skip..][0..count]);

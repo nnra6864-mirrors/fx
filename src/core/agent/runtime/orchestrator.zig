@@ -2630,6 +2630,55 @@ fn prepareAvailabilityTerminal(
     };
 }
 
+/// Advertises live MCP tools the model called without loading them first, so
+/// those calls reach normal validation and MCP permission instead of failing
+/// as unselected. Names that do not resolve, including lookups that fail or
+/// are cancelled, keep the unsupported-tool path, where the turn's normal
+/// cancellation handling still applies.
+fn advertiseUnselectedMcpCalls(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    calls: []const ToolCall,
+    selected: *std.ArrayList(agent_stream_provider.DynamicFunctionTool),
+    advertised_tools: *[]const agent_stream_provider.DynamicFunctionTool,
+    advertised_names: *[][]const u8,
+) !void {
+    const resolve = deps.resolve_unselected_mcp_tool orelse return;
+    for (calls) |call| {
+        if (deps.tool_registry.lookup(call.name) != null) continue;
+        if (containsToolName(advertised_names.*, call.name)) continue;
+        const resolved = resolve(deps.ctx, arena, call.name) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                debug_trace.logf("mcp", "unselected MCP tool lookup failed tool={s} err={s}", .{ call.name, @errorName(err) });
+                continue;
+            },
+        };
+        const definition = resolved orelse continue;
+        if (!std.mem.eql(u8, definition.name, call.name) or definition.mcp_binding == null) continue;
+        try runtime_gateway_step.recordSelectedDynamicTool(arena, selected, definition);
+        const tool = for (selected.items) |item| {
+            if (std.mem.eql(u8, item.name, call.name)) break item;
+        } else unreachable;
+        const tools = try arena.alloc(agent_stream_provider.DynamicFunctionTool, advertised_tools.len + 1);
+        @memcpy(tools[0..advertised_tools.len], advertised_tools.*);
+        tools[advertised_tools.len] = tool;
+        const names = try arena.alloc([]const u8, advertised_names.len + 1);
+        @memcpy(names[0..advertised_names.len], advertised_names.*);
+        names[advertised_names.len] = tool.name;
+        advertised_tools.* = tools;
+        advertised_names.* = names;
+        debug_trace.logf("mcp", "loaded unselected MCP tool for direct call tool={s}", .{call.name});
+    }
+}
+
+fn containsToolName(names: []const []const u8, name: []const u8) bool {
+    for (names) |candidate| {
+        if (std.mem.eql(u8, candidate, name)) return true;
+    }
+    return false;
+}
+
 fn prepareDeferredDynamicCandidate(
     raw_ctx: ?*anyopaque,
     alloc: Allocator,
@@ -7118,8 +7167,8 @@ fn processQueuedPromptLoop(
             restore_recovery_source = false;
         }
 
-        const advertised_dynamic_tools = try runtime_gateway_step.snapshotDynamicTools(arena, deps, &selected_dynamic_tools);
-        const advertised_dynamic_tool_names = try arena.alloc([]const u8, advertised_dynamic_tools.len);
+        var advertised_dynamic_tools = try runtime_gateway_step.snapshotDynamicTools(arena, deps, &selected_dynamic_tools);
+        var advertised_dynamic_tool_names = try arena.alloc([]const u8, advertised_dynamic_tools.len);
         for (advertised_dynamic_tools, 0..) |tool, index| advertised_dynamic_tool_names[index] = tool.name;
         var stream_result: runtime_gateway_step.StreamResult = undefined;
         var stream_result_set = false;
@@ -9645,6 +9694,14 @@ fn processQueuedPromptLoop(
             }
         }
 
+        try advertiseUnselectedMcpCalls(
+            deps,
+            arena,
+            completion.tool_calls,
+            &selected_dynamic_tools,
+            &advertised_dynamic_tools,
+            &advertised_dynamic_tool_names,
+        );
         const prepared_tool_calls = try arena.alloc(
             PreparedToolCall,
             completion.tool_calls.len,
