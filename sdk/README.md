@@ -214,9 +214,9 @@ instance still loads the catalog.
 
 Cached catalogs are fresh for five minutes and usable for up to one hour. A
 usable snapshot serves requests immediately; agents refresh stale data after
-first text or turn completion. Concurrent lookups share one request, and a
-cancelled waiter does not cancel another agent's lookup. Credentials, team,
-endpoint, and transport scopes stay separate.
+first text, turn completion, or failed agent creation. Concurrent lookups share
+one request, and a cancelled waiter does not cancel another agent's lookup.
+Credentials, team, endpoint, and transport scopes stay separate.
 
 A custom `fetch` callback keeps catalog data local to each agent by default.
 Set `cacheModels: true` on discovery and agent options to share it when the same

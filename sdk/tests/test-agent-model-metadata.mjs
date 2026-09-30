@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createFxAgent, listModels } from "../node.js";
 import { createFxAgent as createHostAgent } from "../fx-sdk.js";
+import { createCatalogReader } from "../model-catalog.js";
 
 const backend = process.argv[2] ?? "native";
 const root = fileURLToPath(new URL("../..", import.meta.url));
@@ -20,7 +21,7 @@ const options = { backend, nativeAddon: resolve(root, "zig-out/lib/libfx.node"),
   ...(backend === "wasm" ? { wasm: resolve(root, "zig-out/bin/fx-core.wasm") } : {}),
   apiKey: "selected-metadata-fixture" };
 
-globalThis.fetch = async (input, init = {}) => {
+const fixtureFetch = async (input, init = {}) => {
   assert.equal(new URL(String(input)).origin, "https://ai-gateway.vercel.sh");
   if (init.method === "GET") {
     catalogReads++;
@@ -36,6 +37,7 @@ globalThis.fetch = async (input, init = {}) => {
     'data: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":1}}}\n\ndata: [DONE]\n\n'
   ), { headers: { "content-type": "text/event-stream" } });
 };
+globalThis.fetch = fixtureFetch;
 
 async function prompt(agent) {
   const turn = agent.prompt("say ok");
@@ -91,6 +93,31 @@ try {
   try { await prompt(missing); } finally { await missing.close(); }
   assert.equal(catalogReads, 1, "selection, default, controls and restoration must reuse complete discovery");
 } finally { globalThis.fetch = originalFetch; }
+{
+  const tasks = [];
+  const apiKey = "initialization-refresh-fixture";
+  expectedModel = "catalog/refresh-controls";
+  expectedLimit = 2048;
+  data = [{ id: expectedModel, type: "language", context_window: 128000, max_tokens: 1024, tags: ["tool-use"] }];
+  globalThis.fetch = fixtureFetch;
+  try {
+    const before = catalogReads;
+    const seeded = createCatalogReader(globalThis.fetch, { shared: true, now: () => performance.now() - 6 * 60 * 1000 });
+    await seeded.models("https://ai-gateway.vercel.sh/coding-agent/v1/models", {
+      method: "GET", headers: { authorization: "Bearer " + apiKey },
+    });
+    seeded.release();
+    data = [{ ...data[0], max_tokens: 2048, tags: ["tool-use", "reasoning"],
+      reasoning_options: [{ type: "effort", values: ["high"] }] }];
+    await assert.rejects(createFxAgent({ ...options, apiKey, model: expectedModel, effort: "high",
+      onBackgroundTask: task => tasks.push(task) }), /reasoning/i);
+    assert.equal(tasks.length, 1, "a stale capability rejection must schedule refresh without waiting for first text");
+    await Promise.all(tasks);
+    const recovered = await createFxAgent({ ...options, apiKey, model: expectedModel, effort: "high" });
+    try { await prompt(recovered); } finally { await recovered.close(); }
+    assert.equal(catalogReads - before, 2, "recovery must reuse the one refreshed snapshot");
+  } finally { globalThis.fetch = originalFetch; }
+}
 {
   let handler, finish;
   let writes = 0;

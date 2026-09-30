@@ -1713,6 +1713,7 @@ export async function createFxAgent(options = {}) {
     try { runtime.abortHostEffects(); } catch {}
     try { runtime.closeStdin(); } catch {}
     try { await runtime.exited; } catch {}
+    catalog.refresh();
     catalog.release();
     throw error;
   }
