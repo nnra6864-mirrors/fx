@@ -711,6 +711,9 @@ pub fn Runtime(comptime App: type) type {
         ) void {
             const snapshot = app.worker.snapshotState(app.alloc) catch return;
             defer snapshot.deinit(app.alloc);
+            if (comptime @hasField(App, "otty")) {
+                app.otty.sync_session(app_session_runtime.Runtime(App).activeSessionId(app));
+            }
 
             const was_approval_active = app.approval_prompt.isActive();
             const worker_pending_request = if (snapshot.pending_permission_request) |*request|

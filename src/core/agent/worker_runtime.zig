@@ -538,6 +538,15 @@ pub const WorkerEventBatch = struct {
 };
 
 pub const WorkerRuntime = struct {
+    /// Installed before execution starts; invoked on the execution thread and
+    /// outside worker_mutex when foreground work starts or resumes after input.
+    pub const ForegroundObserver = struct {
+        context: *anyopaque,
+        working: *const fn (*anyopaque) void,
+        settled: *const fn (*anyopaque, types.TurnPresentationOutcome) void,
+    };
+
+    foreground_observer: ?ForegroundObserver = null,
     worker_mutex: std.Io.Mutex = .init,
     worker_cond: std.Io.Condition = .init,
     /// One admission-ordered queue for ordinary prompts and steering. Steering
@@ -2302,6 +2311,14 @@ pub const WorkerRuntime = struct {
         for (self.queued_prompts.items) |*prompt| try appendGrantToQueuedPrompt(alloc, prompt, tool_name, target_path);
     }
 
+    pub fn notify_foreground_work(self: *WorkerRuntime) void {
+        if (self.foreground_observer) |observer| observer.working(observer.context);
+    }
+
+    pub fn notify_foreground_outcome(self: *WorkerRuntime, outcome: types.TurnPresentationOutcome) void {
+        if (self.foreground_observer) |observer| observer.settled(observer.context, outcome);
+    }
+
     pub fn requestPermissionBlocking(
         self: *WorkerRuntime,
         alloc: std.mem.Allocator,
@@ -2354,6 +2371,8 @@ pub const WorkerRuntime = struct {
             );
         errdefer if (shared_request) |*owned| owned.deinit(alloc);
 
+        var resumed = false;
+        defer if (resumed) self.notify_foreground_work();
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
 
@@ -2386,6 +2405,8 @@ pub const WorkerRuntime = struct {
             self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex) catch break;
         }
 
+        resumed = self.pending_permission_response != null and
+            !self.worker_stop_requested and !self.isCancelRequested();
         const response = self.pending_permission_response orelse
             permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
         self.pending_permission_waiting = false;
@@ -2542,6 +2563,8 @@ pub const WorkerRuntime = struct {
         var owns_pending_question = true;
         errdefer if (owns_pending_question) freeOwnedQuestionBatch(alloc, owned);
 
+        var resumed = false;
+        defer if (resumed) self.notify_foreground_work();
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
 
@@ -2567,6 +2590,8 @@ pub const WorkerRuntime = struct {
         }
 
         const response = self.pending_question_response;
+        resumed = response != .pending and
+            !self.worker_stop_requested and !self.isCancelRequested();
         self.pending_question_response = .pending;
         return switch (response) {
             .answered => |labels| labels,
