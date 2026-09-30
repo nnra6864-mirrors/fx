@@ -4,6 +4,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../../core/shared/io.zig");
+const debug_trace = @import("../../core/shared/debug_trace.zig");
 const hooks = @import("../../core/hooks/hooks.zig");
 const types = @import("../../core/shared/types.zig");
 const app_session_runtime = @import("../../core/app/app_session_runtime.zig");
@@ -239,19 +240,21 @@ const Runtime = struct {
             self.last = event;
             self.mutex.unlock(self.io);
 
-            var argv_buffer: [8][]const u8 = undefined;
+            var argv_buffer: [9][]const u8 = undefined;
             send(self.io, report_argv(&argv_buffer, event, self.pid_arg));
         }
     }
 };
 
 // The returned argv borrows the buffer, event, and runtime PID argument.
-fn report_argv(buffer: *[8][]const u8, event: Event, pid_arg: []const u8) []const []const u8 {
+fn report_argv(buffer: *[9][]const u8, event: Event, pid_arg: []const u8) []const []const u8 {
     const state_arg = switch (event.state) {
         inline else => |state| "state=" ++ @tagName(state),
     };
-    buffer[0..6].* = .{ "otty", "--timeout", "200", "state:fx", state_arg, pid_arg };
-    var len: usize = 6;
+    // The colon shorthand is not recognized after global options.
+    // Use the regular subcommand so the global IPC timeout is honored.
+    buffer[0..7].* = .{ "otty", "--timeout", "200", "state", "fx", state_arg, pid_arg };
+    var len: usize = 7;
     if (event.session_arg) |arg| {
         buffer[len] = arg;
         len += 1;
@@ -293,7 +296,10 @@ fn send(io: std.Io, argv: []const []const u8) void {
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
-    }) catch return;
+    }) catch |err| {
+        debug_trace.logf("otty", "report spawn failed err={s}", .{@errorName(err)});
+        return;
+    };
     defer child.kill(io);
     const pid = child.id.?;
     var select_buffer: [2]ChildEvent = undefined;
@@ -308,8 +314,21 @@ fn send(io: std.Io, argv: []const []const u8) void {
         return;
     };
     switch (event) {
-        .wait => select.cancelDiscard(),
-        .timeout => stop_child(&select, pid),
+        .wait => |result| {
+            select.cancelDiscard();
+            const term = result catch |err| {
+                debug_trace.logf("otty", "report wait failed err={s}", .{@errorName(err)});
+                return;
+            };
+            switch (term) {
+                .exited => |code| debug_trace.logf("otty", "report exit status={d}", .{code}),
+                else => debug_trace.logf("otty", "report terminated unexpectedly", .{}),
+            }
+        },
+        .timeout => {
+            debug_trace.logf("otty", "report timed out", .{});
+            stop_child(&select, pid);
+        },
     }
 }
 
@@ -324,9 +343,9 @@ test "otty enablement requires its terminal and respects explicit opt-out" {
 }
 
 test "otty argv uses fixed arguments and an optional literal session" {
-    var buffer: [8][]const u8 = undefined;
+    var buffer: [9][]const u8 = undefined;
     const without_session = report_argv(&buffer, .{ .state = .@"error", .session_arg = null }, "agent-pid=42");
-    const expected = [_][]const u8{ "otty", "--timeout", "200", "state:fx", "state=error", "agent-pid=42", "label=fx" };
+    const expected = [_][]const u8{ "otty", "--timeout", "200", "state", "fx", "state=error", "agent-pid=42", "label=fx" };
     try std.testing.expectEqual(expected.len, without_session.len);
     for (expected, without_session) |want, actual| try std.testing.expectEqualStrings(want, actual);
 
@@ -334,10 +353,10 @@ test "otty argv uses fixed arguments and an optional literal session" {
     defer std.testing.allocator.free(session_arg);
     const event: Event = .{ .state = .awaiting, .session_arg = session_arg };
     const with_session = report_argv(&buffer, event, "agent-pid=42");
-    try std.testing.expectEqual(@as(usize, 8), with_session.len);
-    try std.testing.expectEqualStrings("state=awaiting", with_session[4]);
-    try std.testing.expectEqualStrings(session_arg, with_session[6]);
-    try std.testing.expectEqualStrings("label=fx", with_session[7]);
+    try std.testing.expectEqual(@as(usize, 9), with_session.len);
+    try std.testing.expectEqualStrings("state=awaiting", with_session[5]);
+    try std.testing.expectEqualStrings(session_arg, with_session[7]);
+    try std.testing.expectEqualStrings("label=fx", with_session[8]);
     try std.testing.expect(event.matches(.awaiting, "a b;$(ignored)"));
     try std.testing.expect(!event.matches(.awaiting, null));
     try std.testing.expect(!event.matches(.idle, "a b;$(ignored)"));

@@ -97,7 +97,7 @@ function readReports(path: string): OttyReport[] {
 }
 
 function states(path: string) {
-  return readReports(path).map((report) => report.argv[3]);
+  return readReports(path).map((report) => report.argv[4]);
 }
 
 async function waitUntil(
@@ -229,7 +229,7 @@ test.skipIf(SKIP)(
           expect(reportedSession).toBe(sessionArg);
         }
         expect(report.argv).toEqual([
-          "--timeout", "200", "state:fx", report.argv[3]!, `agent-pid=${fxPid}`,
+          "--timeout", "200", "state", "fx", report.argv[4]!, `agent-pid=${fxPid}`,
           ...(reportedSession === undefined ? [] : [reportedSession]), "label=fx",
         ]);
         expect(report.pid).not.toBe(fxPid);
