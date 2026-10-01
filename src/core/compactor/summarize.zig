@@ -426,8 +426,13 @@ fn compactPart(alloc: Allocator, request: Request, users: []const []const u8, mo
         if (turn.number > 0) if (store) |saved| try saveRecord(scratch, saved, .{ .kind = .turn, .number = turn.number }, text);
         try turn_records.append(scratch, .{ .number = turn.number, .text = text, .first_tool = turn.first_tool, .last_tool = turn.last_tool });
     }
-    // The turn in progress is turn zero, so it goes first.
-    std.mem.sort(lint.Record, turn_records.items, {}, byNumber);
+    // Completed records are already ordered; only turn zero sits at the tail.
+    if (open_index != null and turn_records.items.len > 1) {
+        const last = turn_records.items.len - 1;
+        const open = turn_records.items[last];
+        @memmove(turn_records.items[1..], turn_records.items[0..last]);
+        turn_records.items[0] = open;
+    }
 
     var written: ledger.Written = .{};
     if (plan.needsModel()) notes: {
@@ -616,10 +621,6 @@ fn merged(out: Allocator, first: ledger.Written, more: ledger.Written) Allocator
         .renumbered = first.renumbered + more.renumbered,
         .unknown = first.unknown + more.unknown,
     };
-}
-
-fn byNumber(_: void, a: lint.Record, b: lint.Record) bool {
-    return a.number < b.number;
 }
 
 /// A copy of `turn` made with `alloc`.
@@ -1338,6 +1339,51 @@ const sample = [_]Turn{
     } },
     .{ .user = "thanks", .items = &.{.{ .assistant = "You're welcome." }} },
 };
+
+test "an unfinished tail keeps completed-turn facts checked" {
+    const turns = [_]Turn{
+        .{ .user = "first message", .items = &.{ .{ .assistant = "first work" }, .{ .assistant = "first final" } } },
+        .{ .user = "second message", .items = &.{.{ .assistant = "second final" }} },
+        .{ .user = "third message", .items = &.{.{ .assistant = "third final" }} },
+        .{ .user = "fourth message", .items = &.{.{ .assistant = "fourth final" }} },
+        .{ .user = "last message", .items = &.{ .{ .assistant = "last work" }, .{ .assistant = "last final" } } },
+        .{ .user = "active message", .items = &.{.{ .assistant = "active work" }} },
+    };
+    var model = FakeModel{ .reply =
+        \\Turn 1
+        \\In between: first work
+        \\Turn 5
+        \\In between: last work
+        \\Turn in progress
+        \\In between: active work
+        \\
+        \\Facts:
+        \\F1 (M1): first message
+        \\F2 (M5): `invented.rs` exists
+    };
+    defer model.deinit();
+    var store = MemoryStore{ .alloc = testing.allocator };
+    defer store.deinit();
+
+    var result = try compact(testing.allocator, .{
+        .model = "fixture/model",
+        .turns = &turns,
+        .last_turn_open = true,
+    }, model.model(), store.store());
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 5), result.compacted.turns.len);
+    for (result.compacted.turns, turns[0..5], 0..) |saved, original, index| {
+        try testing.expectEqual(index + 1, saved.number);
+        try testing.expectEqualStrings(original.user, saved.users[0]);
+        try testing.expectEqualStrings(original.items[original.items.len - 1].assistant, saved.final);
+    }
+    try testing.expectEqualStrings("active work", result.compacted.open.?.work);
+    try testing.expectEqual(@as(usize, 2), result.compacted.entries.len);
+    try testing.expectEqualStrings("F1 (M1): first message", result.compacted.entries[0].text);
+    try testing.expect(std.mem.startsWith(u8, result.compacted.entries[1].text, "F2 (M5): `invented.rs` exists"));
+    try testing.expect(std.mem.find(u8, result.compacted.entries[1].text, checkpoint.check_mark) != null);
+}
 
 test "user messages and final replies stay exact, beside notes and a line per tool call" {
     var model = FakeModel{};
