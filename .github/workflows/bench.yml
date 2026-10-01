@@ -400,10 +400,10 @@ jobs:
           mkdir -p "$FX_REPLAY_INPUT"
           for lane in control candidate; do
             artifact_id="$CONTROL_ARTIFACT"
-            source_sha="73308320925d5c31b4f57b875f07e77eb8b051d6"
+            source_sha="34f1ed14de47760b44d628ec2d5eb28055b9adf0"
             if [[ "$lane" == candidate ]]; then
               artifact_id="$CANDIDATE_ARTIFACT"
-              source_sha="08f9970413ff9375b5e1a2562c5123ed8f7034ff"
+              source_sha="3cfd35837af1539dd33ae58f0df0071302508a80"
             fi
             [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]]
             gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" > "$FX_REPLAY_INPUT/$lane-artifact.json"
