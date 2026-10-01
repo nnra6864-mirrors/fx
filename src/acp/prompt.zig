@@ -17,12 +17,14 @@ const js_host_steering = if (host_target.is_wasm)
 else
     struct {};
 const io_mod = @import("../core/shared/io.zig");
+const host_attachments = @import("../core/hosts/host_attachments.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const server = @import("server.zig");
 const sessions = @import("sessions.zig");
 const client_instructions = @import("client_instructions.zig");
+const tool_call_identities = @import("tool_call_identities.zig");
 const agent_runtime = @import("../core/agent/agent_runtime.zig");
 const agent_execution_memory = @import("../core/agent/execution_memory.zig");
 const diff_mod = @import("../core/output/diff.zig");
@@ -39,6 +41,8 @@ const permission_request = @import("../core/permissions/permission_request.zig")
 const session_codec = @import("../core/session/session_codec.zig");
 const session_log = @import("../core/session/session_log.zig");
 const session_store = @import("../core/session/session_store.zig");
+const session_adapter = @import("../core/session/session_adapter.zig");
+const session_child_store = @import("../core/session/session_child_store.zig");
 const session_runtime = @import("../core/session/session.zig");
 const session_usage = @import("../core/session/session_usage.zig");
 const subagent_agent_adapter = @import("../core/subagent/agent_adapter.zig");
@@ -75,6 +79,7 @@ const test_builtin_gateway = if (std_builtin.is_test)
 else
     struct {};
 const types = @import("../core/shared/types.zig");
+const history_range = @import("../core/shared/history_range.zig");
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
 const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const runtime_gateway_step = @import("../core/agent/runtime/gateway_step.zig");
@@ -238,11 +243,16 @@ const AcpContext = struct {
     /// before its server reconnects. A failure costs only replay detail.
     fn rememberToolIdentity(self: *AcpContext, name: []const u8, identity: mcp_runtime.McpRuntime.ToolIdentity) void {
         const session = if (self.state.active_session) |*active| active else return;
-        const capability = if (session.writable) |*writable| writable.childCapability() catch |err| blk: {
-            debug_trace.logf("acp", "tool identity kept in memory only tool={s} err={s}", .{ name, @errorName(err) });
-            break :blk null;
-        } else null;
-        session.tool_identities.remember(self.state.alloc, capability, name, identity) catch |err| {
+        // A v2 session keeps the record as a setting (D46).
+        const target: tool_call_identities.Target = if (session.v2) |v2| .{ .v2 = v2 } else blk: {
+            const writable = if (session.writable) |*value| value else break :blk .none;
+            const capability = writable.childCapability() catch |err| {
+                debug_trace.logf("acp", "tool identity kept in memory only tool={s} err={s}", .{ name, @errorName(err) });
+                break :blk .none;
+            };
+            break :blk .{ .capability = capability };
+        };
+        session.tool_identities.remember(self.state.alloc, target, name, identity) catch |err| {
             debug_trace.logf("acp", "tool identity not recorded for replay tool={s} err={s}", .{ name, @errorName(err) });
         };
     }
@@ -376,6 +386,7 @@ const AcpContext = struct {
             .max_read_file_line_len = self.state.cfg.max_read_file_line_len,
             .max_command_output_bytes = self.state.cfg.max_command_output_bytes,
             .max_tool_result_bytes = session.max_tool_result_bytes,
+            .auto_compact_percent = self.state.auto_compact_percent,
             .api_key = session.api_key,
             .agent_stream_provider = server.streamProviderFor(self.state, session.provider),
             .credential_source = session.credential_source,
@@ -419,10 +430,7 @@ const AcpContext = struct {
             .on_output_chunk = onCommandOutputChunk,
             .mcp_progress_ctx = @ptrCast(self),
             .on_mcp_progress = onMcpProgress,
-            .session_child_capability = if (session.writable) |*writable|
-                writable.childCapability() catch null
-            else
-                null,
+            .session_child_capability = sessionChildCapability(session),
             .terminal_client = &self.state.terminal_client,
             .managed_executions = &self.state.managed_executions,
             .ephemeral_command_replay = self.state.managed_executions.replayStore(),
@@ -719,11 +727,15 @@ pub fn handlePrompt(
         }
     }
     const next_image_id = (try image_attachments.calculate_next_image_id(prior_image_catalog)).next_id;
-    var prompt_input = parsePromptInputWithFirstImageId(alloc, params, next_image_id) catch |err|
-        return promptInputFailure(err);
+    var prompt_input = parsePromptInputWithFirstImageId(
+        alloc,
+        params,
+        next_image_id,
+        state.cfg.host_attachments,
+    ) catch |err| return promptInputFailure(err);
     defer prompt_input.deinit(alloc);
     if (prompt_input.pending_images.len > 0) {
-        if (session.store == null and session.wasm_state == null) {
+        if (session.store == null and session.wasm_state == null and session.v2 == null) {
             // libfx kernel session: images stay in memory and ride the kernel
             // checkpoint, so no filesystem snapshot backend is needed.
             prompt_input.captureImagesInline(alloc) catch |err|
@@ -732,14 +744,18 @@ pub fn handlePrompt(
             if (comptime host_target.is_wasm) return promptInputFailure(error.UnsupportedPromptImage);
             var temporary_snapshot_dir: ?[]u8 = null;
             defer if (temporary_snapshot_dir) |path| alloc.free(path);
+            // A v2 session captures into a temporary folder, then keeps the
+            // bytes inside the turn (D44).
             const snapshot_dir = try session_store.imageSnapshotStorageDir(
                 alloc,
-                if (session.store) |store| store.sessions_dir else null,
-                if (session.store != null) session.session_id else null,
+                if (session.v2 != null) null else if (session.store) |store| store.sessions_dir else null,
+                if (session.v2 == null and session.store != null) session.session_id else null,
                 &temporary_snapshot_dir,
             );
             defer alloc.free(snapshot_dir);
             prompt_input.captureImages(alloc, snapshot_dir) catch |err|
+                return promptInputFailure(err);
+            if (session.v2 != null) image_attachments.inlineCapturedSnapshots(alloc, prompt_input.images) catch |err|
                 return promptInputFailure(err);
         }
     }
@@ -873,7 +889,7 @@ pub fn handlePrompt(
     };
 
     session.session_rt.usage.configureCheckpointSink(
-        if (session.writable != null)
+        if (session.writable != null or session.v2 != null)
             .{
                 .context = @ptrCast(&ctx),
                 .allocator = alloc,
@@ -918,10 +934,7 @@ pub fn handlePrompt(
         .advertised_functions = tool_projection.advertised_functions,
         .custom_tool_guidance = tool_projection.custom_guidance,
     }, current_prompt_is_root_authority);
-    agent_config.session_child_capability = if (session.writable) |*writable|
-        writable.childCapability() catch null
-    else
-        null;
+    agent_config.session_child_capability = sessionChildCapability(session);
     maybeStartAcpTitleTask(state, session, owned_prompt, recovery_checkpoint != null);
     defer if (session.title_task != null) completeAcpTitleTask(state, session, alloc);
     agent_runtime.processAgentPrompt(&session.session_rt.agent, &deps, null, .{
@@ -968,14 +981,14 @@ fn maybeStartAcpTitleTask(
     if (!state.session_titles or recovery) return;
     if (session.title_task != null) return;
     if (session.session_rt.agent.history.items.len != 0) return;
-    const writable = if (session.writable) |*value| value else return;
+    const session_id = if (session.writable) |*value| value.active_id else if (session.v2) |v2| v2.id() else return;
     const bundle = state.cfg.provider_set.select(session.provider);
     const title_model = bundle.title_model orelse return;
     const agent_stream = bundle.agent_stream orelse return;
     const excerpt = session_title_generation.promptExcerpt(prompt_text) orelse return;
     if (session.credential_source != .host_managed and session.api_key.len == 0) return;
     const task = session_title_generation.Task.create(.{
-        .session_id = writable.active_id,
+        .session_id = session_id,
         .model = title_model,
         .prompt_excerpt = excerpt,
         .api_key = if (session.api_key.len > 0) session.api_key else null,
@@ -1004,6 +1017,18 @@ fn completeAcpTitleTask(state: *server.ServerState, session: *server.ActiveSessi
     defer std.heap.c_allocator.free(title);
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
+    if (session.v2) |v2| {
+        if (!std.mem.eql(u8, v2.id(), task.session_id)) {
+            debug_trace.logf("session", "event=title_generation_apply result=dropped reason=session_changed session={s}", .{task.session_id});
+            return;
+        }
+        const installed = v2.installGeneratedTitle(session.session_rt.agent.history.items, title) catch |err| {
+            debug_trace.logf("session", "event=title_generation_apply result=failed session={s} err={s}", .{ task.session_id, @errorName(err) });
+            return;
+        };
+        if (installed) debug_trace.logf("session", "event=title_generation_apply result=installed session={s}", .{task.session_id});
+        return;
+    }
     const writable = if (session.writable) |*value| value else return;
     if (!std.mem.eql(u8, writable.active_id, task.session_id)) {
         debug_trace.logf("session", "event=title_generation_apply result=dropped reason=session_changed session={s}", .{task.session_id});
@@ -1167,6 +1192,7 @@ fn buildAgentConfig(
         .custom_tool_guidance = sections.custom_tool_guidance,
         .agent_step_limit = session.agent_step_limit,
         .max_tool_result_bytes = session.max_tool_result_bytes,
+        .auto_compact_percent = state.auto_compact_percent,
         .cancel_flag = &session.cancel_flag,
         .fast_mode = session.fast_mode,
         .effort = session.effort,
@@ -1289,13 +1315,59 @@ const ParsedPromptInput = struct {
 };
 
 fn parsePromptInput(alloc: Allocator, params_json: []const u8) !ParsedPromptInput {
-    return parsePromptInputWithFirstImageId(alloc, params_json, 1);
+    return parsePromptInputWithFirstImageId(alloc, params_json, 1, null);
+}
+
+/// Decodes a standard ACP image block's canonical base64 `data`. Caller owns
+/// the returned bytes.
+fn decodePromptImageData(alloc: Allocator, data_value: std.json.Value) ![]u8 {
+    if (data_value != .string) return error.InvalidPromptImage;
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(data_value.string) catch
+        return error.InvalidPromptImage;
+    if (decoded_len == 0) return error.InvalidPromptImage;
+    if (decoded_len > image_attachments.max_image_bytes) {
+        return error.ImageTooLarge;
+    }
+    const decoded = try alloc.alloc(u8, decoded_len);
+    errdefer alloc.free(decoded);
+    std.base64.standard.Decoder.decode(decoded, data_value.string) catch
+        return error.InvalidPromptImage;
+    const canonical_len = std.base64.standard.Encoder.calcSize(decoded.len);
+    if (canonical_len != data_value.string.len) return error.InvalidPromptImage;
+    const canonical = try alloc.alloc(u8, canonical_len);
+    defer alloc.free(canonical);
+    const encoded = std.base64.standard.Encoder.encode(canonical, decoded);
+    if (!std.mem.eql(u8, encoded, data_value.string)) return error.InvalidPromptImage;
+    return decoded;
+}
+
+/// Takes the raw image bytes a libfx host attached beside the prompt frame.
+/// Hosts without an attachment store cannot reference one. Caller owns the
+/// returned bytes.
+fn takePromptImageAttachment(
+    alloc: Allocator,
+    attachments: ?host_attachments.Store,
+    value: std.json.Value,
+) ![]u8 {
+    const store = attachments orelse return error.UnsupportedPromptImage;
+    const id = host_attachments.idFromJson(value) orelse return error.InvalidPromptImage;
+    const bytes = store.take(alloc, id, image_attachments.max_image_bytes) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.AttachmentTooLarge => error.ImageTooLarge,
+        error.AttachmentUnavailable => error.InvalidPromptImage,
+    };
+    if (bytes.len == 0) {
+        alloc.free(bytes);
+        return error.InvalidPromptImage;
+    }
+    return bytes;
 }
 
 fn parsePromptInputWithFirstImageId(
     alloc: Allocator,
     params_json: []const u8,
     first_image_id: usize,
+    attachments: ?host_attachments.Store,
 ) !ParsedPromptInput {
     if (first_image_id == 0) return error.InvalidImageId;
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, params_json, .{}) catch
@@ -1342,27 +1414,15 @@ fn parsePromptInputWithFirstImageId(
                 }
             }
         } else if (std.mem.eql(u8, block_type.string, "image")) {
-            const data_value = block.object.get("data") orelse return error.InvalidPromptImage;
             const media_type_value = block.object.get("mimeType") orelse return error.InvalidPromptImage;
-            if (data_value != .string or media_type_value != .string or media_type_value.string.len == 0) {
+            if (media_type_value != .string or media_type_value.string.len == 0) {
                 return error.InvalidPromptImage;
             }
-            const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(data_value.string) catch
-                return error.InvalidPromptImage;
-            if (decoded_len == 0) return error.InvalidPromptImage;
-            if (decoded_len > image_attachments.max_image_bytes) {
-                return error.ImageTooLarge;
-            }
-            const decoded = try alloc.alloc(u8, decoded_len);
+            const decoded = if (acp_types.fxMetaField(block.object, "attachment")) |attachment| decoded: {
+                if (block.object.get("data") != null) return error.InvalidPromptImage;
+                break :decoded try takePromptImageAttachment(alloc, attachments, attachment);
+            } else try decodePromptImageData(alloc, block.object.get("data") orelse return error.InvalidPromptImage);
             errdefer alloc.free(decoded);
-            std.base64.standard.Decoder.decode(decoded, data_value.string) catch
-                return error.InvalidPromptImage;
-            const canonical_len = std.base64.standard.Encoder.calcSize(decoded.len);
-            if (canonical_len != data_value.string.len) return error.InvalidPromptImage;
-            const canonical = try alloc.alloc(u8, canonical_len);
-            defer alloc.free(canonical);
-            const encoded = std.base64.standard.Encoder.encode(canonical, decoded);
-            if (!std.mem.eql(u8, encoded, data_value.string)) return error.InvalidPromptImage;
 
             const image_id = std.math.add(usize, first_image_id, pending_images.items.len) catch
                 return error.ImageIdOverflow;
@@ -1525,6 +1585,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .publish_deferred_tool_completion = publishDeferredToolCompletion,
         .propagate_history_turn = propagateHistoryTurn,
+        .append_turn_piece = if (session.v2 != null) appendTurnPiece else null,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
         .recovery_checkpoint = if (session.writable != null)
             .{
@@ -1641,6 +1702,7 @@ fn persistUsageCheckpoint(
     }
     active.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer active.session_write_mutex.unlock(io_mod.getIo());
+    if (active.v2) |v2| return v2.persistUsage(snapshot);
     const writable = if (active.writable) |*value|
         value
     else
@@ -2248,6 +2310,26 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
     }
 }
 
+/// `AgentRuntimeDeps.append_turn_piece` on v2: the pieces finished so far,
+/// and the tool calls about to run, reach the log before the next request.
+/// A failed write only defers them to the turn's commit.
+fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*value| value else return;
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const v2 = session.v2 orelse return;
+    v2.appendProgress(progress.user, progress.execution, progress.running_calls) catch |err| {
+        debug_trace.logf("session", "event=sessions_v2_stream_failed session={s} err={s} deferred=commit", .{ v2.id(), @errorName(err) });
+    };
+}
+
+fn sessionChildCapability(session: *server.ActiveSessionState) ?*session_child_store.SessionChildCapability {
+    if (session.writable) |*writable| return writable.childCapability() catch null;
+    if (session.v2) |v2| return v2.childCapability() catch null;
+    return null;
+}
+
 fn persistAcpHistoryTurn(
     alloc: Allocator,
     session: *server.ActiveSessionState,
@@ -2264,6 +2346,18 @@ fn persistAcpHistoryTurn(
         prepared_owned = false;
         if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
         if (session.wasm_state != null) try sessions.commitWasmSessionLocked(alloc, session);
+        return;
+    }
+    if (session.v2) |v2| {
+        try v2.prepareTurn(&prepared);
+        v2.commitTurn(prepared, session.session_rt.languageSnapshot()) catch |err| {
+            // A failed write may still have reached the log: keep its images.
+            if (session_adapter.writeMayHaveLanded(err)) if (current_prompt_input) |input| input.retainImageSnapshots();
+            return err;
+        };
+        session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
+        prepared_owned = false;
+        if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
         return;
     }
     const writable = if (session.writable) |*value| value else {
@@ -2303,9 +2397,20 @@ fn commitContextCompaction(
     const session = if (ctx.state.active_session) |*value| value else return error.SessionPersistenceUnavailable;
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
-    const prepared = try session_runtime.prepareCompactedHistory(ctx.alloc, session.session_rt.agent.history.items, summary, retained_from orelse .{ .turns = session_runtime.rawHistoryTurnCount(session.session_rt.agent.history.items) });
+    const prepared = try session_runtime.prepareCompactedHistory(ctx.alloc, session.session_rt.agent.history.items, summary, retained_from orelse .{ .turns = history_range.rawHistoryTurnCount(session.session_rt.agent.history.items) });
     var prepared_owned = true;
     defer if (prepared_owned) types.freeHistoryTurnSlice(ctx.alloc, prepared);
+    if (session.v2) |v2| {
+        v2.commitCompaction(summary, active_prefix != null, retained_from) catch |err| {
+            if (session_adapter.writeMayHaveLanded(err) and active_prefix != null) {
+                if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
+            }
+            return err;
+        };
+        if (active_prefix != null) {
+            if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
+        }
+    }
     if (session.writable) |*writable| {
         _ = writable.commitContextCompaction(ctx.alloc, summary, active_prefix, retained_from, io_mod.milliTimestamp()) catch |err| {
             if (err == error.SessionPersistenceUncertain and active_prefix != null) {
@@ -3159,6 +3264,7 @@ test "ACP usage checkpoints honor the active session write boundary" {
     defer snapshot.deinit(alloc);
 
     var active: server.ActiveSessionState = undefined;
+    active.v2 = null;
     active.session_id = @constCast("session-test");
     active.writable = null;
     active.session_write_mutex = .init;
@@ -3270,6 +3376,7 @@ test "ACP usage checkpoints maintain the profile recovery marker" {
     defer pending.deinit(alloc);
 
     var active: server.ActiveSessionState = undefined;
+    active.v2 = null;
     active.session_id = writable.active_id;
     active.store = store;
     active.writable = writable;
@@ -3386,7 +3493,7 @@ test "parsePromptInput accepts explicit recovery continuation metadata" {
 test "parsePromptInput accepts image blocks as owned pending images" {
     const alloc = std.testing.allocator;
     const params = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"text\",\"text\":\"Only text\"},{\"type\":\"image\",\"data\":\"aGVsbG8=\",\"mimeType\":\"image/png\"}]}";
-    var parsed = try parsePromptInputWithFirstImageId(alloc, params, 7);
+    var parsed = try parsePromptInputWithFirstImageId(alloc, params, 7, null);
     defer parsed.deinit(alloc);
 
     try std.testing.expectEqualStrings("Only text\n[Image #7]", parsed.text);
@@ -3400,7 +3507,7 @@ test "captureImagesInline retains validated bytes on the attachment" {
     const alloc = std.testing.allocator;
     const png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR42mNkAAAAAgAB4iG8MwAAAABJRU5ErkJggg==";
     const params = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"text\",\"text\":\"describe\"},{\"type\":\"image\",\"data\":\"" ++ png_b64 ++ "\",\"mimeType\":\"image/png\"}]}";
-    var parsed = try parsePromptInputWithFirstImageId(alloc, params, 4);
+    var parsed = try parsePromptInputWithFirstImageId(alloc, params, 4, null);
     defer parsed.deinit(alloc);
 
     try parsed.captureImagesInline(alloc);
@@ -3440,6 +3547,78 @@ test "parsePromptInput rejects empty image data" {
     const alloc = std.testing.allocator;
     const params = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"data\":\"\",\"mimeType\":\"image/png\"}]}";
     try std.testing.expectError(error.InvalidPromptImage, parsePromptInput(alloc, params));
+}
+
+const TestAttachmentStore = struct {
+    id: host_attachments.Id,
+    bytes: ?[]const u8,
+    too_large: bool = false,
+    taken: usize = 0,
+
+    fn store(self: *TestAttachmentStore) host_attachments.Store {
+        return .{ .context = self, .take_fn = take, .put_fn = put };
+    }
+
+    fn take(
+        raw: ?*anyopaque,
+        alloc: Allocator,
+        id: host_attachments.Id,
+        max_bytes: usize,
+    ) host_attachments.TakeError![]u8 {
+        const self: *TestAttachmentStore = @ptrCast(@alignCast(raw.?));
+        if (id != self.id) return error.AttachmentUnavailable;
+        const bytes = self.bytes orelse return error.AttachmentUnavailable;
+        self.bytes = null;
+        self.taken += 1;
+        if (self.too_large or bytes.len > max_bytes) return error.AttachmentTooLarge;
+        return alloc.dupe(u8, bytes);
+    }
+
+    fn put(_: ?*anyopaque, _: []const u8) host_attachments.PutError!host_attachments.Id {
+        return error.AttachmentStoreFull;
+    }
+};
+
+test "parsePromptInput takes raw image bytes from a host attachment" {
+    const alloc = std.testing.allocator;
+    var attachments = TestAttachmentStore{ .id = 3, .bytes = "\x89PNG\r\n\x1a\nraw" };
+    const params = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"text\",\"text\":\"look\"},{\"type\":\"image\",\"mimeType\":\"image/png\",\"_meta\":{\"fx\":{\"attachment\":3}}}]}";
+    var parsed = try parsePromptInputWithFirstImageId(alloc, params, 2, attachments.store());
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectEqualStrings("look\n[Image #2]", parsed.text);
+    try std.testing.expectEqual(@as(usize, 1), parsed.pending_images.len);
+    try std.testing.expectEqual(@as(usize, 2), parsed.pending_images[0].id);
+    try std.testing.expectEqualStrings("\x89PNG\r\n\x1a\nraw", parsed.pending_images[0].bytes);
+    try std.testing.expectEqualStrings("image/png", parsed.pending_images[0].media_type);
+    try std.testing.expectEqual(@as(usize, 1), attachments.taken);
+}
+
+test "parsePromptInput rejects unusable image attachment references" {
+    const alloc = std.testing.allocator;
+    const reference = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"_meta\":{\"fx\":{\"attachment\":3}}}]}";
+
+    // Standard ACP hosts have no attachment store.
+    try std.testing.expectError(error.UnsupportedPromptImage, parsePromptInput(alloc, reference));
+
+    var missing = TestAttachmentStore{ .id = 4, .bytes = "x" };
+    try std.testing.expectError(error.InvalidPromptImage, parsePromptInputWithFirstImageId(alloc, reference, 1, missing.store()));
+
+    var empty = TestAttachmentStore{ .id = 3, .bytes = "" };
+    try std.testing.expectError(error.InvalidPromptImage, parsePromptInputWithFirstImageId(alloc, reference, 1, empty.store()));
+
+    var oversized = TestAttachmentStore{ .id = 3, .bytes = "x", .too_large = true };
+    try std.testing.expectError(error.ImageTooLarge, parsePromptInputWithFirstImageId(alloc, reference, 1, oversized.store()));
+
+    const zero_id = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"_meta\":{\"fx\":{\"attachment\":0}}}]}";
+    var unused = TestAttachmentStore{ .id = 0, .bytes = "x" };
+    try std.testing.expectError(error.InvalidPromptImage, parsePromptInputWithFirstImageId(alloc, zero_id, 1, unused.store()));
+    try std.testing.expectEqual(@as(usize, 0), unused.taken);
+
+    const ambiguous = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"data\":\"aGVsbG8=\",\"_meta\":{\"fx\":{\"attachment\":3}}}]}";
+    var stored = TestAttachmentStore{ .id = 3, .bytes = "x" };
+    try std.testing.expectError(error.InvalidPromptImage, parsePromptInputWithFirstImageId(alloc, ambiguous, 1, stored.store()));
+    try std.testing.expectEqual(@as(usize, 0), stored.taken);
 }
 
 test "parsePromptInput preserves resource text and accepts only local absolute file targets" {

@@ -20,7 +20,7 @@ import {
 
 export { encodeXtermKeyEvent, fxSdkApiVersion, listModels, supportsJspi, xtermAdapter };
 export const libfxApiVersion = 2;
-const nativeCoreApiVersion = 3;
+const nativeCoreApiVersion = 4;
 
 const fetchOperationStale = 0;
 const fetchOperationApplied = 1;
@@ -391,7 +391,7 @@ function createNativeCoreRuntime(addon, options) {
     readySocket.destroy();
     void readyClosed.then(() => exitedResolve(code));
   };
-  const pumpFetch = async (request) => {
+  const pumpFetch = async (request, body) => {
     const controller = new AbortController();
     const state = { handle: request.handle, controller };
     fetchState = state;
@@ -399,7 +399,7 @@ function createNativeCoreRuntime(addon, options) {
       const response = await (options.fetch ?? globalThis.fetch)(request.url, {
         method: request.method,
         headers: new Headers(JSON.parse(request.headers).map(({ name, value }) => [name, value])),
-        body: request.body?.length ? Buffer.from(request.body, "base64") : undefined,
+        body: body.length ? body : undefined,
         signal: controller.signal,
       });
       const started = addon.startCoreFetchResponse(core, state.handle, response.status);
@@ -448,8 +448,9 @@ function createNativeCoreRuntime(addon, options) {
           fetchState.controller.abort();
         }
       } else {
+        // The core hands over JSON metadata and the raw request body separately.
         const fetchRequest = addon.takeCoreFetch(core);
-        if (fetchRequest) void pumpFetch(JSON.parse(fetchRequest.toString("utf8")));
+        if (fetchRequest) void pumpFetch(JSON.parse(fetchRequest.request.toString("utf8")), fetchRequest.body);
       }
       if (addon.coreExitCode(core) !== 0) {
         finish(1, new Error("native output delivery failed"));
@@ -494,6 +495,12 @@ function createNativeCoreRuntime(addon, options) {
     exited,
     get error() { return outputError; },
     write(data) { addon.writeCore(core, Buffer.from(data)); },
+    // The addon copies attachment bytes before returning.
+    writeAttachment(id, bytes) {
+      addon.writeCoreAttachment(core, id, Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength));
+    },
+    takeAttachment(id) { return addon.takeCoreAttachment(core, id); },
+    discardAttachments() { addon.discardCoreAttachments(core); },
     closeStdin() { addon.closeCore(core); },
     abortHostEffects,
     abort(error) {

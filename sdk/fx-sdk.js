@@ -19,11 +19,18 @@ const streamReadsPerTaskYield = 32;
 const transportActivityIntervalMs = 250;
 const maxUnreadEventBytes = 1024 * 1024;
 const maxUnreadEvents = 256;
-// Prompt image limits mirror the host tool result image contract: the kernel
-// validates content, the SDK bounds the frame before it reaches the core.
+// Prompt images travel as raw bytes beside the ACP frame and are base64
+// encoded only in the model request. An image may use 5 MiB of encoded
+// request data, and a prompt's images 8 MiB, so the raw limits are 3/4 of that.
+// The kernel still validates content and media type.
 const maxPromptImages = 8;
-const maxPromptImageDataBytes = 5 * 1024 * 1024;
-const maxPromptImagesBytes = 8 * 1024 * 1024;
+const maxPromptImageBytes = (5 * 1024 * 1024 / 4) * 3;
+const maxPromptImagesBytes = (8 * 1024 * 1024 / 4) * 3;
+// Matches the native attachment table: one prompt's images or one checkpoint.
+const maxPendingAttachments = 8;
+const maxOutboundAttachments = 4;
+// Matches the core's kernel checkpoint limit (max_checkpoint_bytes).
+const maxCheckpointBytes = 4 * 1024 * 1024;
 // The core's ACP reader drops frames over 8 MiB without a request id to answer
 // (jsonrpc frame_resource_byte_limit), so the SDK must never emit one. The
 // envelope allowance covers the method key and request id.
@@ -112,6 +119,9 @@ export function normalizeAgentOptions(value) {
     options.fast = normalizeFast(options.fast);
   }
   validateGatewayChatUrl(options.gatewayChatUrl);
+  if (options.resizeImage !== undefined && typeof options.resizeImage !== "function") {
+    throw new TypeError("resizeImage must be a function");
+  }
   return options;
 }
 
@@ -465,6 +475,11 @@ function createRuntime(options) {
   const steering = [];
   let steeringBytes = 0;
   let steeringOpen = false;
+  // Raw payloads beside ACP frames: the core copies inbound bytes into its
+  // own memory and publishes outbound bytes for the agent to take.
+  const inboundAttachments = new Map();
+  const outboundAttachments = new Map();
+  let nextOutboundAttachment = 1;
   const workspaceExecs = new Set();
   const workspace = prepareWorkspaceAdapter(options.workspace);
   const args = ["fx", ...(options.args || [])];
@@ -759,6 +774,38 @@ function createRuntime(options) {
     steering.shift();
     steeringBytes -= value.length;
     return value.length;
+  }
+
+  function writeAttachment(id, data) {
+    if (inboundAttachments.size >= maxPendingAttachments) throw new Error("attachment table is full");
+    inboundAttachments.set(id, data.slice());
+  }
+
+  function attachmentSize(id) {
+    return inboundAttachments.get(id >>> 0)?.length ?? -1;
+  }
+
+  function attachmentTake(id, outputPtr, outputCap) {
+    const key = id >>> 0;
+    const value = inboundAttachments.get(key);
+    if (!value) return -1;
+    // An empty payload needs no output buffer, whose pointer may be arbitrary.
+    if (value.length > 0) {
+      const output = checkedBytes(outputPtr, outputCap);
+      if (!output || value.length > output.length) return -1;
+      output.set(value);
+    }
+    inboundAttachments.delete(key);
+    return value.length;
+  }
+
+  function attachmentPut(inputPtr, inputLen) {
+    const input = checkedBytes(inputPtr, inputLen);
+    if (!input || outboundAttachments.size >= maxOutboundAttachments) return -1;
+    const id = nextOutboundAttachment;
+    nextOutboundAttachment = id === 0x7fffffff ? 1 : id + 1;
+    outboundAttachments.set(id, input.slice());
+    return id;
   }
 
   let pendingHostToolResult = null;
@@ -1132,6 +1179,9 @@ function createRuntime(options) {
     fx_host_tool_result_release() { pendingHostToolResult = null; },
     fx_steering_take: steeringTake,
     fx_steering_close() { steeringOpen = false; clearSteering(); },
+    fx_attachment_size: attachmentSize,
+    fx_attachment_take: attachmentTake,
+    fx_attachment_put: attachmentPut,
     fx_open_url: new WebAssembly.Suspending(openUrl),
     fx_oauth_session_load: new WebAssembly.Suspending(oauthSessionLoad),
     fx_oauth_session_commit: new WebAssembly.Suspending(oauthSessionCommit),
@@ -1158,6 +1208,13 @@ function createRuntime(options) {
     imports: { wasi_snapshot_preview1: wasi, fx }, exited,
     setInstance(value) { instance = value; },
     write(data) { stdin.push(typeof data === "string" ? encoder.encode(data) : data); },
+    writeAttachment,
+    takeAttachment(id) {
+      const value = outboundAttachments.get(id) ?? null;
+      outboundAttachments.delete(id);
+      return value;
+    },
+    discardAttachments() { inboundAttachments.clear(); },
     wake() { stdin.wake(); },
     closeStdin() { steeringOpen = false; clearSteering(); stdin.close(); },
     openSteering() { clearSteering(); steeringOpen = true; },
@@ -1299,7 +1356,77 @@ function blobByteLength(value) {
   }
 }
 
-function normalizePromptInput(input) {
+// Returns a Uint8Array view of an ArrayBuffer or typed array, or null.
+function byteView(value) {
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  return null;
+}
+
+const base64Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// Returns the decoded length of canonical, unwrapped base64, or -1.
+function canonicalBase64ByteLength(value) {
+  if (value.length === 0 || value.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) return -1;
+  const groups = value.length / 4;
+  if (value.endsWith("==")) {
+    return (base64Alphabet.indexOf(value[value.length - 3]) & 0x0f) === 0 ? groups * 3 - 2 : -1;
+  }
+  if (value.endsWith("=")) {
+    return (base64Alphabet.indexOf(value[value.length - 2]) & 0x03) === 0 ? groups * 3 - 1 : -1;
+  }
+  return groups * 3;
+}
+
+function requireImageMimeType(mimeType, index) {
+  if (typeof mimeType !== "string" || mimeType.length === 0 || mimeType.length > 128) {
+    throw new TypeError(`image prompt block ${index} requires a mimeType`);
+  }
+}
+
+function checkImageByteLength(byteLength, index) {
+  if (byteLength > maxPromptImageBytes) {
+    throw new RangeError(`image prompt block ${index} exceeds the ${maxPromptImageBytes} byte per-image libfx limit`);
+  }
+}
+
+function checkPromptImagesByteLength(byteLength) {
+  if (byteLength > maxPromptImagesBytes) {
+    throw new RangeError(`prompt images exceed the ${maxPromptImagesBytes} byte libfx limit`);
+  }
+}
+
+// Normalizes one image block to { type, source, data, mimeType, byteLength },
+// where source is "blob", "base64", or "bytes".
+function normalizePromptImage(block, index) {
+  const size = blobByteLength(block.data);
+  if (size !== null) {
+    const mimeType = block.data.type;
+    if (block.mimeType !== undefined && block.mimeType !== mimeType) {
+      throw new TypeError(`image prompt block ${index} mimeType disagrees with Blob.type`);
+    }
+    requireImageMimeType(mimeType, index);
+    if (!Number.isSafeInteger(size) || size <= 0) {
+      throw new TypeError(`image prompt block ${index} requires a non-empty Blob with a valid size`);
+    }
+    return { type: "image", source: "blob", data: block.data, mimeType, byteLength: size };
+  }
+  if (typeof block.data === "string" && block.data.length > 0) {
+    requireImageMimeType(block.mimeType, index);
+    const byteLength = canonicalBase64ByteLength(block.data);
+    if (byteLength <= 0) throw new TypeError(`image prompt block ${index} requires canonical base64 data`);
+    return { type: "image", source: "base64", data: block.data, mimeType: block.mimeType, byteLength };
+  }
+  const bytes = typeof block.data === "string" ? null : byteView(block.data);
+  if (!bytes || bytes.byteLength === 0) {
+    throw new TypeError(`image prompt block ${index} requires base64 data, bytes, or a Blob`);
+  }
+  requireImageMimeType(block.mimeType, index);
+  return { type: "image", source: "bytes", data: bytes, mimeType: block.mimeType, byteLength: bytes.byteLength };
+}
+
+// With deferImageLimits, byte limits apply after resizeImage instead.
+function normalizePromptInput(input, { deferImageLimits = false } = {}) {
   if (typeof input === "string") return [{ type: "text", text: input }];
   if (!Array.isArray(input)) throw new TypeError("prompt input must be a string or an array of prompt blocks");
   let imageCount = 0;
@@ -1307,34 +1434,17 @@ function normalizePromptInput(input) {
   return input.map((block, index) => {
     if (!block || typeof block !== "object") throw new TypeError(`prompt block ${index} must be an object`);
     if (block.type === "image") {
-      const size = blobByteLength(block.data);
-      const blob = size !== null;
-      if (!blob && (typeof block.data !== "string" || block.data.length === 0)) {
-        throw new TypeError(`image prompt block ${index} requires base64 data or a Blob`);
-      }
-      const mimeType = blob ? block.data.type : block.mimeType;
-      if (blob && block.mimeType !== undefined && block.mimeType !== mimeType) {
-        throw new TypeError(`image prompt block ${index} mimeType disagrees with Blob.type`);
-      }
-      if (typeof mimeType !== "string" || mimeType.length === 0 || mimeType.length > 128) {
-        throw new TypeError(`image prompt block ${index} requires a mimeType`);
-      }
-      if (blob && (!Number.isSafeInteger(size) || size <= 0)) {
-        throw new TypeError(`image prompt block ${index} requires a non-empty Blob with a valid size`);
-      }
-      const encodedLength = blob ? Math.ceil(size / 3) * 4 : block.data.length;
-      if (encodedLength > maxPromptImageDataBytes) {
-        throw new RangeError(`image prompt block ${index} exceeds the ${maxPromptImageDataBytes} byte per-image libfx limit`);
-      }
+      const image = normalizePromptImage(block, index);
       imageCount += 1;
       if (imageCount > maxPromptImages) {
         throw new RangeError(`prompt cannot contain more than ${maxPromptImages} images`);
       }
-      imageBytes += encodedLength;
-      if (imageBytes > maxPromptImagesBytes) {
-        throw new RangeError(`prompt images exceed the ${maxPromptImagesBytes} byte libfx frame limit`);
+      if (!deferImageLimits) {
+        checkImageByteLength(image.byteLength, index);
+        imageBytes += image.byteLength;
+        checkPromptImagesByteLength(imageBytes);
       }
-      return { type: "image", data: block.data, mimeType };
+      return image;
     }
     if (block.type === "text") {
       if (typeof block.text !== "string") throw new TypeError(`text prompt block ${index} requires text`);
@@ -1350,48 +1460,73 @@ function normalizePromptInput(input) {
   });
 }
 
-function promptFrameSize(prompt) {
-  let blobDataBytes = 0;
+// Image bytes travel beside the frame as attachment references, but the model
+// request carries them base64 encoded and the native host caps that request at
+// 8 MiB. Images therefore count at their encoded size, the same budget they
+// had inside the frame. With countImages false, only the frame counts.
+function promptFrameSize(prompt, countImages = true) {
+  let encodedImageBytes = 0;
   const projected = prompt.map((block) => {
-    if (block.type !== "image" || typeof block.data === "string") return block;
-    const size = blobByteLength(block.data);
-    if (!Number.isSafeInteger(size)) throw new TypeError("image prompt requires a valid Blob size");
-    blobDataBytes += Math.ceil(size / 3) * 4;
-    return { type: "image", data: "", mimeType: block.mimeType };
+    if (block.type !== "image") return block;
+    if (countImages) encodedImageBytes += Math.ceil((block.bytes?.byteLength ?? block.byteLength) / 3) * 4;
+    return { type: "image", mimeType: block.mimeType, _meta: { fx: { attachment: 0xffffffff } } };
   });
-  return encoder.encode(JSON.stringify({ sessionId: "", prompt: projected })).length + blobDataBytes + promptFrameEnvelopeBytes;
+  return encoder.encode(JSON.stringify({ sessionId: "", prompt: projected })).length +
+    encodedImageBytes + promptFrameEnvelopeBytes;
 }
 
-async function materializePromptBlobs(blocks, isCancelled) {
-  const encoded = [];
+function checkPromptFrameSize(prompt, countImages) {
+  if (promptFrameSize(prompt, countImages) > maxPromptFrameBytes) {
+    throw new RangeError(`prompt exceeds the ${maxPromptFrameBytes} byte libfx frame limit`);
+  }
+}
+
+// Returns prompt blocks whose images carry { mimeType, bytes }. Synchronous
+// sources only: base64 is decoded and caller bytes are used in place.
+function preparePromptImages(blocks) {
+  return blocks.map((block) => block.type !== "image" ? block : {
+    type: "image",
+    mimeType: block.mimeType,
+    bytes: block.source === "base64" ? base64ToBytes(block.data) : block.data,
+  });
+}
+
+function resizedPromptImage(value, index) {
+  const bytes = byteView(value?.bytes);
+  if (!bytes || bytes.byteLength === 0 || typeof value.mimeType !== "string" ||
+    value.mimeType.length === 0 || value.mimeType.length > 128) {
+    throw new TypeError(`resizeImage must return non-empty bytes and a mimeType for image prompt block ${index}`);
+  }
+  // Copied because a hook may reuse its output buffer for the next image.
+  return { bytes: bytes.slice(), mimeType: value.mimeType };
+}
+
+// Reads Blob images and applies resizeImage, then checks the final byte and
+// frame limits. Returns null when the turn is cancelled first.
+async function materializePromptImages(blocks, isCancelled, resizeImage) {
+  const prepared = [];
   let imageBytes = 0;
   for (const [index, block] of blocks.entries()) {
     if (isCancelled()) return null;
     if (block.type !== "image") {
-      encoded.push(block);
+      prepared.push(block);
       continue;
     }
-    if (typeof block.data === "string") {
-      imageBytes += block.data.length;
-      if (imageBytes > maxPromptImagesBytes) {
-        throw new RangeError(`prompt images exceed the ${maxPromptImagesBytes} byte libfx frame limit`);
-      }
-      encoded.push(block);
-      continue;
-    }
-    const bytes = new Uint8Array(await block.data.arrayBuffer());
+    let image = block.source === "blob"
+      ? { mimeType: block.mimeType, bytes: new Uint8Array(await block.data.arrayBuffer()) }
+      : preparePromptImages([block])[0];
     if (isCancelled()) return null;
-    const encodedLength = Math.ceil(bytes.length / 3) * 4;
-    if (encodedLength > maxPromptImageDataBytes) {
-      throw new RangeError(`image prompt block ${index} exceeds the ${maxPromptImageDataBytes} byte per-image libfx limit`);
+    if (resizeImage) {
+      image = resizedPromptImage(await resizeImage({ bytes: image.bytes, mimeType: image.mimeType }), index);
+      if (isCancelled()) return null;
     }
-    imageBytes += encodedLength;
-    if (imageBytes > maxPromptImagesBytes) {
-      throw new RangeError(`prompt images exceed the ${maxPromptImagesBytes} byte libfx frame limit`);
-    }
-    encoded.push({ type: "image", data: bytesToBase64(bytes), mimeType: block.mimeType });
+    checkImageByteLength(image.bytes.byteLength, index);
+    imageBytes += image.bytes.byteLength;
+    checkPromptImagesByteLength(imageBytes);
+    prepared.push({ type: "image", mimeType: image.mimeType, bytes: image.bytes });
   }
-  return normalizePromptInput(encoded);
+  checkPromptFrameSize(prepared, true);
+  return prepared;
 }
 
 function normalizeSteeringInput(input) {
@@ -1495,14 +1630,6 @@ function checkpointBytes(value) {
   throw new TypeError("checkpoint must be an ArrayBuffer or typed array");
 }
 
-function bytesToBase64(value) {
-  let binary = "";
-  for (let offset = 0; offset < value.length; offset += 0x8000) {
-    binary += String.fromCharCode(...value.subarray(offset, offset + 0x8000));
-  }
-  return btoa(binary);
-}
-
 function base64ToBytes(value) {
   const binary = atob(value);
   const bytes = new Uint8Array(binary.length);
@@ -1515,6 +1642,11 @@ export async function createFxAgent(options = {}) {
   const hostTools = normalizeHostTools(options.tools);
   const instructions = normalizeInstructions(options.instructions);
   const initialCheckpoint = checkpointBytes(options.checkpoint);
+  // Checked before the core starts, and with the core's message, so both
+  // backends report it the same way.
+  if (initialCheckpoint && initialCheckpoint.byteLength > maxCheckpointBytes) {
+    throw new Error("libfx checkpoint is too large");
+  }
   const pending = new Map();
   let nextId = 1;
   let sessionId = null;
@@ -1659,11 +1791,46 @@ export async function createFxAgent(options = {}) {
     pending.set(id, { resolve, reject });
     try { send({ jsonrpc: "2.0", id, method, params }); } catch (error) { pending.delete(id); reject(error); }
   });
+  // Raw payloads ride beside the next frame instead of inside it. Payloads
+  // left by an earlier frame that never reached the core are dropped first.
+  let nextAttachmentId = 1;
+  const attachBytes = (payloads) => {
+    if (typeof runtime.writeAttachment !== "function") throw new Error("fx runtime does not accept binary attachments");
+    runtime.discardAttachments?.();
+    return payloads.map((bytes) => {
+      const id = nextAttachmentId;
+      nextAttachmentId = id === 0x7fffffff ? 1 : id + 1;
+      runtime.writeAttachment(id, bytes);
+      return id;
+    });
+  };
+  let checkpointTail = null;
+  let pendingCheckpoints = 0;
+  async function takeCheckpoint() {
+    if (closing) throw new Error("fx agent is closed");
+    if (activeTurn) throw new Error("cannot checkpoint while a prompt is active");
+    const response = await request("libfx/checkpoint", { sessionId });
+    const id = response?.checkpointAttachment;
+    const bytes = Number.isSafeInteger(id) && id > 0 ? runtime.takeAttachment?.(id) : null;
+    if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) throw new Error("fx returned an invalid checkpoint");
+    return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  }
+  const sendPrompt = (blocks) => {
+    const images = blocks.filter((block) => block.type === "image");
+    const ids = images.length ? attachBytes(images.map((block) => block.bytes)) : [];
+    let next = 0;
+    const prompt = blocks.map((block) => block.type !== "image" ? block : {
+      type: "image",
+      mimeType: block.mimeType,
+      _meta: { fx: { attachment: ids[next++] } },
+    });
+    return request("session/prompt", { sessionId, prompt });
+  };
   runtime.exited.then((code) => {
     closing = true;
     const error = runtime.error ?? new Error(`fx-core exited with code ${code} before completing the ACP request`);
     coreExitError = error;
-    activeTurn?.failPendingBlob(error);
+    activeTurn?.failImagePrep(error);
     for (const waiter of pending.values()) waiter.reject(error);
     pending.clear();
     emit("runtime.exit", { code });
@@ -1720,10 +1887,8 @@ export async function createFxAgent(options = {}) {
     const sessionResult = await request("libfx/new");
     sessionId = sessionResult.sessionId;
     if (initialCheckpoint) {
-      await request("libfx/restore", {
-        sessionId,
-        checkpoint: bytesToBase64(initialCheckpoint),
-      });
+      const [checkpointAttachment] = attachBytes([initialCheckpoint]);
+      await request("libfx/restore", { sessionId, checkpointAttachment });
     }
   } catch (error) {
     closing = true;
@@ -1739,12 +1904,21 @@ export async function createFxAgent(options = {}) {
       if (activeTurn) throw new Error("a prompt is already in progress for this session");
       return normalizeTurn(startTurn(input, promptOptions));
     },
-    async checkpoint() {
-      if (closing) throw new Error("fx agent is closed");
-      if (activeTurn) throw new Error("cannot checkpoint while a prompt is active");
-      const response = await request("libfx/checkpoint", { sessionId });
-      if (typeof response?.checkpoint !== "string") throw new Error("fx returned an invalid checkpoint");
-      return base64ToBytes(response.checkpoint);
+    checkpoint() {
+      // One checkpoint runs at a time: each holds an outbound attachment until
+      // it is taken, and the native table holds only a few. An idle call still
+      // sends its request before returning, ahead of a later prompt(). The slot
+      // is claimed before that send, so a call from an event handler during it
+      // still waits. The count drops before the caller's own reaction to `run`,
+      // so a call made right after awaiting the previous one is idle.
+      const previous = pendingCheckpoints > 0 ? checkpointTail : null;
+      pendingCheckpoints++;
+      let release;
+      checkpointTail = new Promise((resolve) => { release = resolve; });
+      const run = previous ? previous.then(takeCheckpoint) : takeCheckpoint();
+      const settle = () => { pendingCheckpoints--; release(); };
+      run.then(settle, settle);
+      return run;
     },
     async close() {
       if (closing) { await runtime.exited; return; }
@@ -1846,11 +2020,18 @@ export async function createFxAgent(options = {}) {
   }
 
   function startTurn(input, promptOptions) {
-    const prompt = normalizePromptInput(input);
-    const hasBlobs = prompt.some((block) => block.type === "image" && typeof block.data !== "string");
-    if (promptFrameSize(prompt) > maxPromptFrameBytes) {
-      throw new RangeError(`prompt exceeds the ${maxPromptFrameBytes} byte libfx frame limit`);
-    }
+    const resizeImage = options.resizeImage;
+    const normalized = normalizePromptInput(input, { deferImageLimits: resizeImage !== undefined });
+    const hasImages = normalized.some((block) => block.type === "image");
+    // Blob reads and resizeImage run before the prompt frame is sent.
+    const asyncImages = hasImages && (resizeImage !== undefined ||
+      normalized.some((block) => block.type === "image" && block.source === "blob"));
+    // resizeImage decides the final image sizes, so they are counted after it runs.
+    checkPromptFrameSize(normalized, resizeImage === undefined);
+    // Snapshot caller-owned bytes, which could change before an async send.
+    const prompt = asyncImages
+      ? normalized.map((block) => block.type === "image" && block.source === "bytes" ? { ...block, data: block.data.slice() } : block)
+      : preparePromptImages(normalized);
     const signal = promptOptions.signal;
     if (signal !== undefined && (typeof signal?.addEventListener !== "function" || typeof signal?.removeEventListener !== "function")) throw new TypeError("prompt signal must be an AbortSignal");
     const queue = [];
@@ -1861,10 +2042,10 @@ export async function createFxAgent(options = {}) {
     let terminalError;
     let reportedPressure = false;
     let discardedBytes = 0;
-    let cancelBlobRead = null;
-    let rejectBlobRead = null;
+    let cancelImagePrep = null;
+    let rejectImagePrep = null;
     let resolvePromptStart = null;
-    const promptStarted = hasBlobs ? new Promise((resolve) => { resolvePromptStart = resolve; }) : null;
+    const promptStarted = asyncImages ? new Promise((resolve) => { resolvePromptStart = resolve; }) : null;
     let pendingSteeringCount = 0;
     let pendingSteeringBytes = 0;
     const toolControllers = new Set();
@@ -1891,10 +2072,10 @@ export async function createFxAgent(options = {}) {
       transportBytes: 0,
       lastTransportActivityAt: null,
       get cancelled() { return cancelled; },
-      failPendingBlob(error) {
-        rejectBlobRead?.(error);
-        rejectBlobRead = null;
-        cancelBlobRead = null;
+      failImagePrep(error) {
+        rejectImagePrep?.(error);
+        rejectImagePrep = null;
+        cancelImagePrep = null;
       },
       promptWritten() {
         resolvePromptStart?.(true);
@@ -1939,9 +2120,9 @@ export async function createFxAgent(options = {}) {
       cancel() {
         if (finished || cancelled) return;
         cancelled = true;
-        cancelBlobRead?.();
-        cancelBlobRead = null;
-        rejectBlobRead = null;
+        cancelImagePrep?.();
+        cancelImagePrep = null;
+        rejectImagePrep = null;
         resolvePromptStart?.(false);
         resolvePromptStart = null;
         runtime.closeSteering?.();
@@ -1982,34 +2163,34 @@ export async function createFxAgent(options = {}) {
     runtime.openSteering?.();
     const abort = () => turn.cancel();
     signal?.addEventListener("abort", abort, { once: true });
-    const blobReadCancelled = hasBlobs ? new Promise((resolve, reject) => {
-      cancelBlobRead = () => resolve(null);
-      rejectBlobRead = reject;
+    const imagePrepCancelled = asyncImages ? new Promise((resolve, reject) => {
+      cancelImagePrep = () => resolve(null);
+      rejectImagePrep = reject;
     }) : null;
-    const response = hasBlobs
-      ? Promise.race([
-        Promise.resolve().then(() => materializePromptBlobs(prompt, () => cancelled || closing)),
-        blobReadCancelled,
-      ]).then((encodedPrompt) => {
-        cancelBlobRead = null;
-        rejectBlobRead = null;
+    let response;
+    if (asyncImages) {
+      response = Promise.race([
+        Promise.resolve().then(() => materializePromptImages(prompt, () => cancelled || closing, resizeImage)),
+        imagePrepCancelled,
+      ]).then((prepared) => {
+        cancelImagePrep = null;
+        rejectImagePrep = null;
         if (coreExitError && !cancelled) throw coreExitError;
-        if (encodedPrompt === null || cancelled || closing) {
+        if (prepared === null || cancelled || closing) {
           resolvePromptStart?.(false);
           resolvePromptStart = null;
           return { stopReason: "cancelled" };
         }
-        if (promptFrameSize(encodedPrompt) > maxPromptFrameBytes) {
-          throw new RangeError(`prompt exceeds the ${maxPromptFrameBytes} byte libfx frame limit`);
-        }
-        return request("session/prompt", { sessionId, prompt: encodedPrompt });
-      })
-      : request("session/prompt", { sessionId, prompt });
+        return sendPrompt(prepared);
+      });
+    } else {
+      try { response = sendPrompt(prompt); } catch (error) { response = Promise.reject(error); }
+    }
     turn.result = response
       .then((value) => ({ stopReason: cancelled ? "cancelled" : value.stopReason, usage: value.usage }))
       .catch((error) => {
-        cancelBlobRead = null;
-        rejectBlobRead = null;
+        cancelImagePrep = null;
+        rejectImagePrep = null;
         resolvePromptStart?.(error);
         resolvePromptStart = null;
         if (cancelled && error.message === "Cancelled") return { stopReason: "cancelled" };

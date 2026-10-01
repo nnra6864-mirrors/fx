@@ -10,6 +10,7 @@ const session_child_store = @import("session_child_store.zig");
 const session_codec = @import("session_codec.zig");
 const session_compaction = @import("session_compaction.zig");
 const types = @import("../shared/types.zig");
+const history_range = @import("../shared/history_range.zig");
 const session_event = @import("session_event.zig");
 const history_snapshot = @import("history_snapshot.zig");
 const session_layout = @import("session_layout.zig");
@@ -385,7 +386,7 @@ pub const ConversationWriter = struct {
         const unwritten = if (self.turn_open) blk: {
             var progress: ConversationProgress = .{};
             try self.scanContext(alloc, &progress, null);
-            const view = try session.contextHistoryRange(arena.allocator(), &.{turn}, .{
+            const view = try history_range.contextHistoryRange(arena.allocator(), &.{turn}, .{
                 .tool_steps = progress.point.tool_steps,
                 .steering = progress.point.steering,
             }, null);
@@ -2355,7 +2356,7 @@ fn findConversationReplayWindow(
     return scan.finish(alloc, source);
 }
 
-const ConversationTurnBuilder = struct {
+pub const ConversationTurnBuilder = struct {
     alloc: Allocator,
     user: ?types.UserTurn = null,
     pending_assistant: ?[]u8 = null,
@@ -2365,11 +2366,11 @@ const ConversationTurnBuilder = struct {
     steps: std.ArrayList(types.ToolExecutionStep) = .empty,
     steering: std.ArrayList(types.PersistedSteering) = .empty,
 
-    fn init(alloc: Allocator) ConversationTurnBuilder {
+    pub fn init(alloc: Allocator) ConversationTurnBuilder {
         return .{ .alloc = alloc };
     }
 
-    fn deinit(self: *ConversationTurnBuilder) void {
+    pub fn deinit(self: *ConversationTurnBuilder) void {
         if (self.user) |user| types.freeUserTurn(self.alloc, user);
         if (self.pending_assistant) |text| self.alloc.free(text);
         if (self.pending_replay) |replay| types.freeProviderReplay(self.alloc, replay);
@@ -2392,7 +2393,7 @@ const ConversationTurnBuilder = struct {
         self.* = undefined;
     }
 
-    fn isIdle(self: *const ConversationTurnBuilder) bool {
+    pub fn isIdle(self: *const ConversationTurnBuilder) bool {
         return self.user == null and
             self.pending_assistant == null and
             self.calls.items.len == 0 and
@@ -2401,7 +2402,7 @@ const ConversationTurnBuilder = struct {
             self.steering.items.len == 0;
     }
 
-    fn begin(
+    pub fn begin(
         self: *ConversationTurnBuilder,
         value: session_event.ConversationUser,
     ) !void {
@@ -2413,7 +2414,7 @@ const ConversationTurnBuilder = struct {
         });
     }
 
-    fn appendAssistant(self: *ConversationTurnBuilder, value: session_event.ConversationAssistant) !void {
+    pub fn appendAssistant(self: *ConversationTurnBuilder, value: session_event.ConversationAssistant) !void {
         if (self.calls.items.len == 0 and self.results.items.len == 0) try self.finishStandalone();
         if (self.user == null or self.pending_assistant != null or self.calls.items.len != 0) {
             return error.InvalidConversationFrame;
@@ -2427,7 +2428,7 @@ const ConversationTurnBuilder = struct {
         if (value.standalone_response) try self.finishStep();
     }
 
-    fn appendToolCall(
+    pub fn appendToolCall(
         self: *ConversationTurnBuilder,
         value: session_event.ConversationToolCall,
     ) !void {
@@ -2451,7 +2452,7 @@ const ConversationTurnBuilder = struct {
         try self.calls.append(self.alloc, call);
     }
 
-    fn appendToolResult(
+    pub fn appendToolResult(
         self: *ConversationTurnBuilder,
         value: session_event.ConversationToolResult,
     ) !void {
@@ -2480,7 +2481,7 @@ const ConversationTurnBuilder = struct {
         if (self.results.items.len == self.calls.items.len) try self.finishStep();
     }
 
-    fn finishStandalone(self: *ConversationTurnBuilder) !void {
+    pub fn finishStandalone(self: *ConversationTurnBuilder) !void {
         if (self.calls.items.len != 0 or self.results.items.len != 0) return error.InvalidConversationFrame;
         const text = self.pending_assistant orelse return;
         if (text.len == 0 and self.pending_replay == null) {
@@ -2491,7 +2492,7 @@ const ConversationTurnBuilder = struct {
         try self.finishStep();
     }
 
-    fn finishStep(self: *ConversationTurnBuilder) !void {
+    pub fn finishStep(self: *ConversationTurnBuilder) !void {
         try self.steps.ensureUnusedCapacity(self.alloc, 1);
         const calls = try self.calls.toOwnedSlice(self.alloc);
         errdefer types.freeToolCallSlice(self.alloc, calls);
@@ -2507,7 +2508,7 @@ const ConversationTurnBuilder = struct {
         self.pending_replay = null;
     }
 
-    fn appendSteering(self: *ConversationTurnBuilder, text: []const u8) !void {
+    pub fn appendSteering(self: *ConversationTurnBuilder, text: []const u8) !void {
         if (self.user == null or self.calls.items.len != 0 or self.results.items.len != 0) {
             return error.InvalidConversationFrame;
         }
@@ -2522,7 +2523,7 @@ const ConversationTurnBuilder = struct {
         self.pending_assistant = null;
     }
 
-    fn finishAssistant(
+    pub fn finishAssistant(
         self: *ConversationTurnBuilder,
         completed: session_event.ConversationTurnCompleted,
     ) !session.HistoryTurn {
@@ -2550,7 +2551,7 @@ const ConversationTurnBuilder = struct {
         } };
     }
 
-    fn finishInterrupted(
+    pub fn finishInterrupted(
         self: *ConversationTurnBuilder,
         value: session_event.ConversationInterruption,
     ) !session.HistoryTurn {
@@ -2620,7 +2621,7 @@ const ConversationTurnBuilder = struct {
         } };
     }
 
-    fn takeExecution(
+    pub fn takeExecution(
         self: *ConversationTurnBuilder,
         files_source: []const types.FileEvidence,
         turn_summary: ?types.TurnSummary,
@@ -2927,7 +2928,7 @@ fn externalizeConversationResults(
     };
 }
 
-fn externalizeConversationTurnResults(
+pub fn externalizeConversationTurnResults(
     alloc: Allocator,
     turn: *session.HistoryTurn,
     capability: ?*session_child_store.SessionChildCapability,

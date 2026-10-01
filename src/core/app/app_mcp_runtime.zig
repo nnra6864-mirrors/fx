@@ -115,6 +115,7 @@ const ReloadPolicy = enum {
 
 pub const PresentationOrigin = union(enum) {
     command,
+    slack_setup,
     menu: u64,
 };
 
@@ -2150,6 +2151,29 @@ pub const State = struct {
             registry,
             captured_at_ms,
             .command,
+            spawnPendingReload,
+        );
+    }
+
+    pub fn beginSlackSetup(
+        self: *State,
+        alloc: Allocator,
+        workspace_root: []const u8,
+        elicitation_capabilities: elicitation.Capabilities,
+        loader: mcp_runtime.LoadRuntimeFn,
+        preview_workspace_authority: mcp_runtime.PreviewNativeWorkspaceAuthorityFn,
+        registry: tool_dispatch.Registry,
+        captured_at_ms: u64,
+    ) !void {
+        return self.beginReloadWithOriginAndSpawner(
+            alloc,
+            workspace_root,
+            elicitation_capabilities,
+            loader,
+            preview_workspace_authority,
+            registry,
+            captured_at_ms,
+            .slack_setup,
             spawnPendingReload,
         );
     }

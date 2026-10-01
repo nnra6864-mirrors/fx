@@ -9,14 +9,24 @@ const std = @import("std");
 const io_mod = @import("../core/shared/io.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const session_child_store = @import("../core/session/session_child_store.zig");
+const session_adapter = @import("../core/session/session_adapter.zig");
 
 const Allocator = std.mem.Allocator;
 const Identity = mcp_runtime.McpRuntime.ToolIdentity;
 
-const file_name = "mcp-tool-identities.json";
+/// The side file a v1 session keeps its record in.
+pub const file_name = "mcp-tool-identities.json";
 const max_bytes: usize = 256 * 1024;
 /// Names past this bound replay without MCP identity.
 const max_entries: usize = 1024;
+
+/// Where a session keeps its record: a v1 session's side file, or a v2
+/// session's `tool_identities` setting (D46).
+pub const Target = union(enum) {
+    none,
+    capability: *session_child_store.SessionChildCapability,
+    v2: *session_adapter.Session,
+};
 
 pub const Record = struct {
     mutex: std.Io.Mutex = .init,
@@ -44,7 +54,7 @@ pub const Record = struct {
     pub fn remember(
         self: *Record,
         alloc: Allocator,
-        capability: ?*session_child_store.SessionChildCapability,
+        target: Target,
         name: []const u8,
         identity: Identity,
     ) !void {
@@ -57,9 +67,13 @@ pub const Record = struct {
         defer alloc.free(bytes);
         // The stored record stays within what `load` accepts.
         if (bytes.len > max_bytes) return error.ToolIdentityRecordFull;
-        if (capability) |target| {
-            var entry = try target.atomicReplace(alloc, .client_context, file_name, bytes);
-            entry.deinit(alloc);
+        switch (target) {
+            .none => {},
+            .capability => |capability| {
+                var entry = try capability.atomicReplace(alloc, .client_context, file_name, bytes);
+                entry.deinit(alloc);
+            },
+            .v2 => |session| try session.setToolIdentities(bytes),
         }
         // Memory follows the stored copy, so a failed write changes neither.
         try self.put(alloc, name, identity);
@@ -124,7 +138,9 @@ pub fn load(alloc: Allocator, capability: *session_child_store.SessionChildCapab
     return parse(alloc, bytes);
 }
 
-fn parse(alloc: Allocator, bytes: []const u8) !Record {
+/// A record from its stored JSON; `load` reads a v1 side file through it, and
+/// a v2 session hands it its setting.
+pub fn parse(alloc: Allocator, bytes: []const u8) !Record {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidToolIdentityRecord;
@@ -176,16 +192,16 @@ test "tool identity record round-trips and skips unchanged names" {
     const alloc = std.testing.allocator;
     var record: Record = .{};
     defer record.deinit(alloc);
-    try record.remember(alloc, null, "mcp_mini_browser_navigate", .{
+    try record.remember(alloc, .none, "mcp_mini_browser_navigate", .{
         .server = @constCast("mini"),
         .tool = @constCast("browser_navigate"),
         .title = @constCast("Navigate"),
     });
-    try record.remember(alloc, null, "mcp_mini_browser_read", .{
+    try record.remember(alloc, .none, "mcp_mini_browser_read", .{
         .server = @constCast("mini"),
         .tool = @constCast("browser_read"),
     });
-    try record.remember(alloc, null, "mcp_mini_browser_read", .{
+    try record.remember(alloc, .none, "mcp_mini_browser_read", .{
         .server = @constCast("mini"),
         .tool = @constCast("browser_read"),
     });
@@ -232,7 +248,7 @@ test "tool identity record refuses names that would outgrow the stored record" {
     var accepted: usize = 0;
     const full = for (0..max_entries) |index| {
         const name = try std.fmt.bufPrint(&name_buf, "mcp_s_tool_{d}", .{index});
-        record.remember(alloc, null, name, .{ .server = server_name, .tool = @constCast("tool") }) catch |err| {
+        record.remember(alloc, .none, name, .{ .server = server_name, .tool = @constCast("tool") }) catch |err| {
             try std.testing.expectEqual(error.ToolIdentityRecordFull, err);
             break name;
         };

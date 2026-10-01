@@ -10,6 +10,7 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  statSync,
   truncateSync,
   writeFileSync,
 } from "node:fs";
@@ -212,6 +213,13 @@ function fakeGatewayEnv(
     FX_MCP_PROTOCOL_VERSION: "2026-07-28",
   };
 }
+
+// The session backends a test runs on. v2 sits behind FX_SESSIONS_V2 and
+// keeps a session in one folder, ~/.fx/sessions/v2/{id} (D48).
+const SESSION_BACKENDS = [
+  { suffix: "", env: { FX_SESSIONS_V2: undefined }, v2: false },
+  { suffix: " on sessions v2", env: { FX_SESSIONS_V2: "1" }, v2: true },
+] as const;
 
 function acpContentText(content: unknown): string {
   if (typeof content === "string") return content;
@@ -2048,6 +2056,45 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP compacts automatically at the configured percent",
+    async () => {
+      // Replies without provider usage, so fx sizes the conversation by its
+      // own estimate.
+      const reply = (text: string) => fakeGatewaySse([
+        { type: "text-delta", id: "answer_1", delta: text },
+        { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
+      ]);
+      // About 30,000 estimated tokens: past 20 percent of the model's input,
+      // well short of the default 80 percent.
+      const large = "ACP_LARGE_REPLY\n" + "historical reference line, not new completed work.\n".repeat(2_400);
+      for (const percent of [undefined, "20"]) {
+        const root = createIsolatedRoot("fx-acp-compact-percent-");
+        const gateway = startFakeGateway([reply(large), reply("ACP_AFTER_REPLY")], {
+          models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 128_000 }],
+        });
+        try {
+          client = await AcpClient.create({
+            cwd: root.workspace,
+            env: { ...fakeGatewayEnv(root, gateway), ...(percent ? { FX_AUTO_COMPACT_PERCENT: percent } : {}) },
+          });
+          await startCodeSession(client);
+          expect((await runPrompt(client, "Write the large reply.", TIMEOUT)).promptResult.result.stopReason).toBe("end_turn");
+          expect((await runPrompt(client, "Continue.", TIMEOUT)).promptResult.result.stopReason).toBe("end_turn");
+          // A plain turn has nothing to note, so compacting it needs no model call.
+          expect(gateway.requests).toHaveLength(2);
+          expect(gateway.requests[1]!.body.includes("compacted_conversation"), `percent ${percent ?? "default"}`).toBe(percent !== undefined);
+          expect(client.stderr).toBe("");
+        } finally {
+          await client?.close();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "ACP session/load replays structured tool call frames",
     async () => {
       const root = createIsolatedRoot("fx-acp-load-tool-replay-");
@@ -3175,196 +3222,211 @@ describe("acp: model-independent", () => {
     LIVE_TIMEOUT,
   );
 
-  test(
-    "ACP delivers a client system prompt in the system slot and restores it on load",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-system-prompt-");
-      const marker = "MINI_BROWSER_SYSTEM_PROMPT";
-      const gateway = startFakeGateway([
-        finalText("I am the browser assistant."),
-        finalText("Still the browser assistant."),
-        finalText("The other session still works."),
-      ]);
-      const systemText = (body: string) => acpGatewayRequest(body).prompt
-        .filter((message) => message.role === "system")
-        .map((message) => acpContentText(message.content))
-        .join("\n");
-      const userText = (body: string) => acpGatewayRequest(body).prompt
-        .filter((message) => message.role === "user")
-        .map((message) => acpContentText(message.content))
-        .join("\n");
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        const init = await client.request("initialize", {
-          protocolVersion: 1,
-          _meta: { fx: { terminal: false } },
-        }, 1) as any;
-        expect(init.result.agentCapabilities.sessionCapabilities.systemPrompt).toEqual({});
+  for (const backend of SESSION_BACKENDS) {
+    test(
+      `ACP delivers a client system prompt in the system slot and restores it on load${backend.suffix}`,
+      async () => {
+        const root = createIsolatedRoot("fx-acp-system-prompt-");
+        const marker = "MINI_BROWSER_SYSTEM_PROMPT";
+        const gateway = startFakeGateway([
+          finalText("I am the browser assistant."),
+          finalText("Still the browser assistant."),
+          finalText("The other session still works."),
+        ]);
+        const systemText = (body: string) => acpGatewayRequest(body).prompt
+          .filter((message) => message.role === "system")
+          .map((message) => acpContentText(message.content))
+          .join("\n");
+        const userText = (body: string) => acpGatewayRequest(body).prompt
+          .filter((message) => message.role === "user")
+          .map((message) => acpContentText(message.content))
+          .join("\n");
+        try {
+          client = await AcpClient.create({
+            cwd: root.workspace,
+            env: { ...fakeGatewayEnv(root, gateway), ...backend.env },
+          });
+          const init = await client.request("initialize", {
+            protocolVersion: 1,
+            _meta: { fx: { terminal: false } },
+          }, 1) as any;
+          expect(init.result.agentCapabilities.sessionCapabilities.systemPrompt).toEqual({});
 
-        for (const [id, params, message] of [
-          [20, { systemPrompt: [] }, "systemPrompt must contain at least one content block"],
-          [21, { systemPromptMode: "append" }, "systemPromptMode requires systemPrompt"],
-          [22, {
-            systemPrompt: [{ type: "text", text: "x" }],
-            systemPromptMode: "override",
-          }, 'systemPromptMode supports only "append"'],
-          [23, { systemPrompt: [{ type: "image", data: "AA==", mimeType: "image/png" }] },
-            "systemPrompt supports text content blocks only"],
-        ] as const) {
-          const rejected = await client.request("session/new", {
+          for (const [id, params, message] of [
+            [20, { systemPrompt: [] }, "systemPrompt must contain at least one content block"],
+            [21, { systemPromptMode: "append" }, "systemPromptMode requires systemPrompt"],
+            [22, {
+              systemPrompt: [{ type: "text", text: "x" }],
+              systemPromptMode: "override",
+            }, 'systemPromptMode supports only "append"'],
+            [23, { systemPrompt: [{ type: "image", data: "AA==", mimeType: "image/png" }] },
+              "systemPrompt supports text content blocks only"],
+          ] as const) {
+            const rejected = await client.request("session/new", {
+              cwd: root.workspace,
+              mcpServers: [],
+              ...params,
+            }, id) as any;
+            expect(rejected.error.code).toBe(-32602);
+            expect(rejected.error.message).toBe(message);
+          }
+          expect(existsSync(join(root.home, ".fx", "sessions"))
+            ? readdirSync(join(root.home, ".fx", "sessions")).filter((name) => !name.startsWith("."))
+            : []).toEqual([]);
+
+          const created = await client.request("session/new", {
             cwd: root.workspace,
             mcpServers: [],
-            ...params,
-          }, id) as any;
-          expect(rejected.error.code).toBe(-32602);
-          expect(rejected.error.message).toBe(message);
+            systemPrompt: [
+              { type: "text", text: `You are the assistant inside Mini, a macOS browser. ${marker}` },
+              { type: "text", text: "Use the browser tools for navigation." },
+            ],
+            systemPromptMode: "append",
+          }, 2) as any;
+          expect(created.error).toBeUndefined();
+          const sessionId = created.result.sessionId as string;
+          await client.readLine();
+          const first = await runPrompt(client, "Who are you?", TIMEOUT);
+          expect(first.promptResult.result.stopReason).toBe("end_turn");
+          const firstSystem = systemText(gateway.requests[0]!.body);
+          expect(firstSystem).toContain(
+            `<client_instructions>\nYou are the assistant inside Mini, a macOS browser. ${marker}\n\nUse the browser tools for navigation.\n</client_instructions>`,
+          );
+          expect(firstSystem.indexOf("# Identity and context")).toBeLessThan(firstSystem.indexOf(marker));
+          expect(firstSystem).toContain("A client application hosts this conversation");
+          expect(firstSystem).not.toContain("which fx renders in the terminal");
+          expect(userText(gateway.requests[0]!.body)).not.toContain(marker);
+          await client.close();
+
+          client = await AcpClient.create({
+            cwd: root.workspace,
+            env: { ...fakeGatewayEnv(root, gateway), ...backend.env },
+          });
+          await client.request("initialize", { protocolVersion: 1 }, 10);
+          const loaded = await client.request("session/load", {
+            sessionId,
+            cwd: root.workspace,
+            mcpServers: [],
+          }, 11) as any;
+          expect(loaded.error).toBeUndefined();
+          const second = await runPrompt(client, "And now?", TIMEOUT);
+          expect(second.promptResult.result.stopReason).toBe("end_turn");
+          const secondSystem = systemText(gateway.requests[1]!.body);
+          expect(secondSystem).toContain(`<client_instructions>\nYou are the assistant inside Mini, a macOS browser. ${marker}`);
+          // This client did not opt out of the terminal prompt.
+          expect(secondSystem).toContain("which fx renders in the terminal");
+
+          expect(client.stderr).toBe("");
+          await client.close();
+
+          if (backend.v2) {
+            // v2 keeps the prompt as one setting in the session's own log
+            // (D46): nothing beside the log can go bad on its own.
+            const log = readFileSync(join(root.home, ".fx", "sessions", "v2", sessionId, "log.jsonl"), "utf8");
+            const prompts = log.trimEnd().split("\n").map((line) => JSON.parse(line))
+              .filter((line) => line.kind === "set" && line.key === "client_prompt");
+            expect(prompts).toHaveLength(1);
+            expect(JSON.stringify(prompts[0].value)).toContain(marker);
+            expect(existsSync(join(root.home, ".fx", "session-files"))).toBe(false);
+          } else {
+            // A stored prompt that cannot be read fails the load instead of
+            // running the session without the client's instructions. A fresh
+            // process reads it from disk; an already active session keeps its own.
+            writeFileSync(
+              join(root.home, ".fx", "sessions", sessionId, "client", "system-prompt.txt"),
+              "corrupt\u0000prompt",
+            );
+            client = await AcpClient.create({
+              cwd: root.workspace,
+              env: { ...fakeGatewayEnv(root, gateway), ...backend.env },
+            });
+            await client.request("initialize", { protocolVersion: 1 }, 10);
+            const other = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 11) as any;
+            expect(other.error).toBeUndefined();
+            await client.readLine();
+            const unreadable = await client.request("session/load", {
+              sessionId,
+              cwd: root.workspace,
+              mcpServers: [],
+            }, 12) as any;
+            expect(unreadable.error.code).toBe(-32603);
+            expect(unreadable.error.message).toBe("Session client system prompt could not be restored");
+            // The session that was active before the failed load still runs.
+            const third = await runPrompt(client, "Still there?", TIMEOUT);
+            expect(third.promptResult.result.stopReason).toBe("end_turn");
+            expect(gateway.requests).toHaveLength(3);
+            expect(client.stderr).toBe("");
+          }
+        } finally {
+          await client?.close();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
         }
-        expect(existsSync(join(root.home, ".fx", "sessions"))
-          ? readdirSync(join(root.home, ".fx", "sessions")).filter((name) => !name.startsWith("."))
-          : []).toEqual([]);
+      },
+      LIVE_TIMEOUT,
+    );
+  }
 
-        const created = await client.request("session/new", {
-          cwd: root.workspace,
-          mcpServers: [],
-          systemPrompt: [
-            { type: "text", text: `You are the assistant inside Mini, a macOS browser. ${marker}` },
-            { type: "text", text: "Use the browser tools for navigation." },
-          ],
-          systemPromptMode: "append",
-        }, 2) as any;
-        expect(created.error).toBeUndefined();
-        const sessionId = created.result.sessionId as string;
-        await client.readLine();
-        const first = await runPrompt(client, "Who are you?", TIMEOUT);
-        expect(first.promptResult.result.stopReason).toBe("end_turn");
-        const firstSystem = systemText(gateway.requests[0]!.body);
-        expect(firstSystem).toContain(
-          `<client_instructions>\nYou are the assistant inside Mini, a macOS browser. ${marker}\n\nUse the browser tools for navigation.\n</client_instructions>`,
-        );
-        expect(firstSystem.indexOf("# Identity and context")).toBeLessThan(firstSystem.indexOf(marker));
-        expect(firstSystem).toContain("A client application hosts this conversation");
-        expect(firstSystem).not.toContain("which fx renders in the terminal");
-        expect(userText(gateway.requests[0]!.body)).not.toContain(marker);
-        await client.close();
+  for (const backend of SESSION_BACKENDS) {
+    test(
+      `ACP session/new cwd selects the session workspace${backend.suffix}`,
+      async () => {
+        const root = createIsolatedRoot("fx-acp-session-cwd-");
+        writeFileSync(join(root.workspace, "AGENTS.md"), "PROCESS_RULES_MARKER\n");
+        writeFileSync(join(root.external, "AGENTS.md"), "EXTERNAL_RULES_MARKER\n");
+        writeFileSync(join(root.external, "note.txt"), "EXTERNAL_NOTE_CONTENT\n");
+        const gateway = startFakeGateway([
+          fakeGatewayToolCall("cwd_read", "read_file", { path: "note.txt" }),
+          finalText("read the external note"),
+          finalText("back in the process workspace"),
+        ]);
+        try {
+          client = await AcpClient.create({
+            cwd: root.workspace,
+            env: { ...fakeGatewayEnv(root, gateway), ...backend.env },
+          });
+          await client.request("initialize", { protocolVersion: 1 }, 1);
+          const relative = await client.request("session/new", { cwd: "relative/dir", mcpServers: [] }, 2) as any;
+          expect(relative.error.code).toBe(-32602);
+          expect(relative.error.message).toBe("cwd must be an absolute path");
+          const missing = await client.request("session/new", {
+            cwd: join(root.root, "missing"),
+            mcpServers: [],
+          }, 3) as any;
+          expect(missing.error.code).toBe(-32602);
+          expect(missing.error.message).toBe("cwd must name an existing directory");
 
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 10);
-        const loaded = await client.request("session/load", {
-          sessionId,
-          cwd: root.workspace,
-          mcpServers: [],
-        }, 11) as any;
-        expect(loaded.error).toBeUndefined();
-        const second = await runPrompt(client, "And now?", TIMEOUT);
-        expect(second.promptResult.result.stopReason).toBe("end_turn");
-        const secondSystem = systemText(gateway.requests[1]!.body);
-        expect(secondSystem).toContain(`<client_instructions>\nYou are the assistant inside Mini, a macOS browser. ${marker}`);
-        // This client did not opt out of the terminal prompt.
-        expect(secondSystem).toContain("which fx renders in the terminal");
+          const external = await client.request("session/new", { cwd: root.external, mcpServers: [] }, 4) as any;
+          expect(external.error).toBeUndefined();
+          await client.readLine();
+          const first = await runPrompt(client, "Read note.txt.", TIMEOUT);
+          expect(first.promptResult.result.stopReason).toBe("end_turn");
+          const firstBody = gateway.requests[0]!.body;
+          expect(firstBody).toContain("EXTERNAL_RULES_MARKER");
+          expect(firstBody).not.toContain("PROCESS_RULES_MARKER");
+          expect(acpToolResultText(gateway.requests[1]!.body, "cwd_read")).toContain("EXTERNAL_NOTE_CONTENT");
 
-        expect(client.stderr).toBe("");
-        await client.close();
+          const listed = await client.request("session/list", { cwd: root.external }, 5) as any;
+          expect(listed.result.sessions.map((session: any) => session.sessionId))
+            .toContain(external.result.sessionId);
 
-        // A stored prompt that cannot be read fails the load instead of
-        // running the session without the client's instructions. A fresh
-        // process reads it from disk; an already active session keeps its own.
-        writeFileSync(
-          join(root.home, ".fx", "sessions", sessionId, "client", "system-prompt.txt"),
-          "corrupt\u0000prompt",
-        );
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 10);
-        const other = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 11) as any;
-        expect(other.error).toBeUndefined();
-        await client.readLine();
-        const unreadable = await client.request("session/load", {
-          sessionId,
-          cwd: root.workspace,
-          mcpServers: [],
-        }, 12) as any;
-        expect(unreadable.error.code).toBe(-32603);
-        expect(unreadable.error.message).toBe("Session client system prompt could not be restored");
-        // The session that was active before the failed load still runs.
-        const third = await runPrompt(client, "Still there?", TIMEOUT);
-        expect(third.promptResult.result.stopReason).toBe("end_turn");
-        expect(gateway.requests).toHaveLength(3);
-        expect(client.stderr).toBe("");
-      } finally {
-        await client?.close();
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    LIVE_TIMEOUT,
-  );
-
-  test(
-    "ACP session/new cwd selects the session workspace",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-session-cwd-");
-      writeFileSync(join(root.workspace, "AGENTS.md"), "PROCESS_RULES_MARKER\n");
-      writeFileSync(join(root.external, "AGENTS.md"), "EXTERNAL_RULES_MARKER\n");
-      writeFileSync(join(root.external, "note.txt"), "EXTERNAL_NOTE_CONTENT\n");
-      const gateway = startFakeGateway([
-        fakeGatewayToolCall("cwd_read", "read_file", { path: "note.txt" }),
-        finalText("read the external note"),
-        finalText("back in the process workspace"),
-      ]);
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 1);
-        const relative = await client.request("session/new", { cwd: "relative/dir", mcpServers: [] }, 2) as any;
-        expect(relative.error.code).toBe(-32602);
-        expect(relative.error.message).toBe("cwd must be an absolute path");
-        const missing = await client.request("session/new", {
-          cwd: join(root.root, "missing"),
-          mcpServers: [],
-        }, 3) as any;
-        expect(missing.error.code).toBe(-32602);
-        expect(missing.error.message).toBe("cwd must name an existing directory");
-
-        const external = await client.request("session/new", { cwd: root.external, mcpServers: [] }, 4) as any;
-        expect(external.error).toBeUndefined();
-        await client.readLine();
-        const first = await runPrompt(client, "Read note.txt.", TIMEOUT);
-        expect(first.promptResult.result.stopReason).toBe("end_turn");
-        const firstBody = gateway.requests[0]!.body;
-        expect(firstBody).toContain("EXTERNAL_RULES_MARKER");
-        expect(firstBody).not.toContain("PROCESS_RULES_MARKER");
-        expect(acpToolResultText(gateway.requests[1]!.body, "cwd_read")).toContain("EXTERNAL_NOTE_CONTENT");
-
-        const listed = await client.request("session/list", { cwd: root.external }, 5) as any;
-        expect(listed.result.sessions.map((session: any) => session.sessionId))
-          .toContain(external.result.sessionId);
-
-        const processWorkspace = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 6) as any;
-        expect(processWorkspace.error).toBeUndefined();
-        await client.readLine();
-        const second = await runPrompt(client, "Where are we?", TIMEOUT);
-        expect(second.promptResult.result.stopReason).toBe("end_turn");
-        expect(gateway.requests[2]!.body).toContain("PROCESS_RULES_MARKER");
-        expect(gateway.requests[2]!.body).not.toContain("EXTERNAL_RULES_MARKER");
-        expect(client.stderr).toBe("");
-      } finally {
-        await client?.close();
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    LIVE_TIMEOUT,
-  );
+          const processWorkspace = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 6) as any;
+          expect(processWorkspace.error).toBeUndefined();
+          await client.readLine();
+          const second = await runPrompt(client, "Where are we?", TIMEOUT);
+          expect(second.promptResult.result.stopReason).toBe("end_turn");
+          expect(gateway.requests[2]!.body).toContain("PROCESS_RULES_MARKER");
+          expect(gateway.requests[2]!.body).not.toContain("EXTERNAL_RULES_MARKER");
+          expect(client.stderr).toBe("");
+        } finally {
+          await client?.close();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      },
+      LIVE_TIMEOUT,
+    );
+  }
 
   test(
     "ACP includes profile MCP servers only when the session opts in",
@@ -3656,111 +3718,113 @@ describe("acp: model-independent", () => {
     TIMEOUT,
   );
 
-  test(
-    "ACP session/load replays client MCP tool calls and absorbed steering",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-load-client-mcp-");
-      const firstRequest = deferred<void>();
-      const releaseFirst = deferred<void>();
-      const gateway = startFakeGateway([
-        async () => {
-          firstRequest.resolve();
-          await releaseFirst.promise;
-          return fakeGatewayToolCall("load_read", "mcp_mini_browser_read", {});
-        },
-        finalText("Example Domain"),
-      ]);
-      const mini = [{ type: "acp", name: "mini", serverId: "mini:load" }];
-      const serveMini = (params: any) => {
-        if (params.method === "server/discover") {
-          return {
-            result: {
-              resultType: "complete",
-              supportedVersions: [MODERN_MCP_VERSION],
-              capabilities: { tools: {} },
-            },
-          };
-        }
-        if (params.method === "tools/list") {
-          return {
-            result: {
-              resultType: "complete",
-              ttlMs: 60_000,
-              tools: [{
-                name: "browser_read",
-                title: "Read page",
-                description: "Read the page",
-                inputSchema: { type: "object" },
-              }],
-            },
-          };
-        }
-        if (params.method === "tools/call") {
-          return { result: { resultType: "complete", content: [{ type: "text", text: "PAGE_TEXT" }] } };
-        }
-        return { error: { code: -32601, message: "Method not found" } };
-      };
-      try {
-        const env = fakeGatewayEnv(root, gateway);
-        client = await AcpClient.create({ cwd: root.workspace, env });
-        client.setMcpMessageHandler(serveMini);
-        await client.request("initialize", { protocolVersion: 1 }, 1);
-        const created = await client.request("session/new", { cwd: root.workspace, mcpServers: mini }, 2) as any;
-        expect(created.error).toBeUndefined();
-        const sessionId = created.result.sessionId;
-        await client.readLine();
-        client.setPermissionOption("allow_once");
+  for (const backend of SESSION_BACKENDS) {
+    test(
+      `ACP session/load replays client MCP tool calls and absorbed steering${backend.suffix}`,
+      async () => {
+        const root = createIsolatedRoot("fx-acp-load-client-mcp-");
+        const firstRequest = deferred<void>();
+        const releaseFirst = deferred<void>();
+        const gateway = startFakeGateway([
+          async () => {
+            firstRequest.resolve();
+            await releaseFirst.promise;
+            return fakeGatewayToolCall("load_read", "mcp_mini_browser_read", {});
+          },
+          finalText("Example Domain"),
+        ]);
+        const mini = [{ type: "acp", name: "mini", serverId: "mini:load" }];
+        const serveMini = (params: any) => {
+          if (params.method === "server/discover") {
+            return {
+              result: {
+                resultType: "complete",
+                supportedVersions: [MODERN_MCP_VERSION],
+                capabilities: { tools: {} },
+              },
+            };
+          }
+          if (params.method === "tools/list") {
+            return {
+              result: {
+                resultType: "complete",
+                ttlMs: 60_000,
+                tools: [{
+                  name: "browser_read",
+                  title: "Read page",
+                  description: "Read the page",
+                  inputSchema: { type: "object" },
+                }],
+              },
+            };
+          }
+          if (params.method === "tools/call") {
+            return { result: { resultType: "complete", content: [{ type: "text", text: "PAGE_TEXT" }] } };
+          }
+          return { error: { code: -32601, message: "Method not found" } };
+        };
+        try {
+          const env = { ...fakeGatewayEnv(root, gateway), ...backend.env };
+          client = await AcpClient.create({ cwd: root.workspace, env });
+          client.setMcpMessageHandler(serveMini);
+          await client.request("initialize", { protocolVersion: 1 }, 1);
+          const created = await client.request("session/new", { cwd: root.workspace, mcpServers: mini }, 2) as any;
+          expect(created.error).toBeUndefined();
+          const sessionId = created.result.sessionId;
+          await client.readLine();
+          client.setPermissionOption("allow_once");
 
-        sendPrompt(client, 10, "Read the page.");
-        // The client answers discovery only while it reads.
-        while (client.mcpMessages.length < 2) await client.readLine();
-        await firstRequest.promise;
-        sendSteeringPrompt(client, 11, "Just the title.");
-        releaseFirst.resolve();
-        const live = await readUntilResponses(client, [10, 11]);
-        expect(live.responses.get(11)!.result._meta.fx.steering).toBe("absorbed");
-        await client.close();
+          sendPrompt(client, 10, "Read the page.");
+          // The client answers discovery only while it reads.
+          while (client.mcpMessages.length < 2) await client.readLine();
+          await firstRequest.promise;
+          sendSteeringPrompt(client, 11, "Just the title.");
+          releaseFirst.resolve();
+          const live = await readUntilResponses(client, [10, 11]);
+          expect(live.responses.get(11)!.result._meta.fx.steering).toBe("absorbed");
+          await client.close();
 
-        client = await AcpClient.create({ cwd: root.workspace, env });
-        client.setMcpMessageHandler(serveMini);
-        await client.request("initialize", { protocolVersion: 1 }, 1);
-        client.send({
-          jsonrpc: "2.0",
-          id: 2,
-          method: "session/load",
-          params: { sessionId, cwd: root.workspace, mcpServers: mini },
-        });
-        const loaded = await readUntilResponses(client, [2]);
-        expect(loaded.responses.get(2)!.error).toBeUndefined();
-        const updates = loaded.messages
-          .filter((message) => message.method === "session/update")
-          .map((message) => message.params.update);
-        const readIndex = updates.findIndex((update) =>
-          update.sessionUpdate === "tool_call" && update.name === "mcp_mini_browser_read"
-        );
-        expect(readIndex).toBeGreaterThanOrEqual(0);
-        expect(updates[readIndex].title).toBe("Read page");
-        expect(updates[readIndex]._meta.fx.toolCall).toEqual({
-          internal: false,
-          mcp: { server: "mini", tool: "browser_read" },
-        });
-        const steerIndex = updates.findIndex((update) =>
-          update.sessionUpdate === "user_message_chunk" && update.content?.text === "Just the title."
-        );
-        expect(steerIndex).toBeGreaterThan(readIndex);
-        expect(updates[steerIndex]._meta.fx.steering).toEqual({ requestId: null });
-        // Replay needs no connection to the client MCP server.
-        expect(client.mcpMessages).toHaveLength(0);
-        expect(client.stderr).toBe("");
-      } finally {
-        releaseFirst.resolve();
-        await client?.close();
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    LIVE_TIMEOUT,
-  );
+          client = await AcpClient.create({ cwd: root.workspace, env });
+          client.setMcpMessageHandler(serveMini);
+          await client.request("initialize", { protocolVersion: 1 }, 1);
+          client.send({
+            jsonrpc: "2.0",
+            id: 2,
+            method: "session/load",
+            params: { sessionId, cwd: root.workspace, mcpServers: mini },
+          });
+          const loaded = await readUntilResponses(client, [2]);
+          expect(loaded.responses.get(2)!.error).toBeUndefined();
+          const updates = loaded.messages
+            .filter((message) => message.method === "session/update")
+            .map((message) => message.params.update);
+          const readIndex = updates.findIndex((update) =>
+            update.sessionUpdate === "tool_call" && update.name === "mcp_mini_browser_read"
+          );
+          expect(readIndex).toBeGreaterThanOrEqual(0);
+          expect(updates[readIndex].title).toBe("Read page");
+          expect(updates[readIndex]._meta.fx.toolCall).toEqual({
+            internal: false,
+            mcp: { server: "mini", tool: "browser_read" },
+          });
+          const steerIndex = updates.findIndex((update) =>
+            update.sessionUpdate === "user_message_chunk" && update.content?.text === "Just the title."
+          );
+          expect(steerIndex).toBeGreaterThan(readIndex);
+          expect(updates[steerIndex]._meta.fx.steering).toEqual({ requestId: null });
+          // Replay needs no connection to the client MCP server.
+          expect(client.mcpMessages).toHaveLength(0);
+          expect(client.stderr).toBe("");
+        } finally {
+          releaseFirst.resolve();
+          await client?.close();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      },
+      LIVE_TIMEOUT,
+    );
+  }
 
   test(
     "ACP retries a client MCP server after a cancelled first turn",
@@ -4496,11 +4560,15 @@ describe("acp: model-independent", () => {
           "call_http_auth",
           `${MODERN_HTTP_TOOL_RESULT}:authenticated`,
         );
-        const session = readFileSync(
-          join(root.home, ".fx", "sessions", sessionId, "session.json"),
-          "utf8",
-        );
-        expect(session).not.toContain(bearer);
+        // Every saved file, on either session backend: the scan must see the
+        // saved tool result, and nothing may hold the credential.
+        const fxDir = join(root.home, ".fx");
+        const saved = (readdirSync(fxDir, { recursive: true }) as string[])
+          .map((name) => join(fxDir, name))
+          .filter((path) => statSync(path).isFile())
+          .map((path) => readFileSync(path, "utf8"));
+        expect(saved.some((text) => text.includes(`${MODERN_HTTP_TOOL_RESULT}:authenticated`))).toBe(true);
+        for (const text of saved) expect(text).not.toContain(bearer);
         expect(client.stderr).not.toContain(bearer);
       } finally {
         await client?.close();

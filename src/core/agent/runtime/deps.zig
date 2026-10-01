@@ -32,6 +32,16 @@ const ToolExecutionResult = tool_contracts.ToolExecutionResult;
 const TransportPublicationOutcome = tool_contracts.TransportPublicationOutcome;
 pub const LiveToolAuthority = tool_contracts.LiveToolAuthority;
 
+/// The turn so far: the user's message and every piece completed since.
+/// Borrowed only for the call; a sink copies or serializes what it keeps.
+pub const TurnProgress = struct {
+    user: types.UserTurn,
+    execution: types.ExecutionMemory,
+    /// Tool calls the model issued that have no result yet, in their saved
+    /// form, so a crash while they run leaves them in the session (D28).
+    running_calls: []const types.ToolCall = &.{},
+};
+
 /// Borrows checkpoint slices only for the call. A sink must synchronously copy
 /// or serialize anything it retains, including when a save fails.
 pub const RecoveryCheckpointEffect = struct {
@@ -240,6 +250,9 @@ pub const AgentRuntimeDeps = struct {
     /// Call-scoped output for the exact error returned through compaction, never retained.
     compaction_failure: ?*?compaction_activity.ErrorProvenance = null,
     recovery_checkpoint: ?RecoveryCheckpointEffect = null,
+    /// Called at every model-request boundary with the turn so far, so each
+    /// completed piece is saved as it happens rather than at the turn's end.
+    append_turn_piece: ?*const fn (ctx: *anyopaque, progress: TurnProgress) anyerror!void = null,
     propagate_grant: *const fn (ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) anyerror!void,
     push_event: *const fn (ctx: *anyopaque, event: WorkerEvent) anyerror!void,
     push_text: *const fn (ctx: *anyopaque, emission: TextEmission) anyerror!void,

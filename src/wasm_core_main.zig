@@ -7,6 +7,7 @@ const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const provider_set = @import("core/gateway/provider_set.zig");
 const agent_steps = @import("core/config/agent_steps.zig");
 const host = @import("core/hosts/host.zig");
+const js_host_attachments = @import("core/hosts/js_host_attachments.zig");
 const io_mod = @import("core/shared/io.zig");
 const model_catalog = @import("core/gateway/model_catalog.zig");
 const js_host_model_catalog = @import("gateway/js_host_model_catalog.zig");
@@ -58,6 +59,7 @@ pub fn main(init: std.process.Init) !void {
         .allow_acp_mcp = false,
         .allow_native_tools = false,
         .minimal_kernel = true,
+        .host_attachments = js_host_attachments.store,
     });
 }
 

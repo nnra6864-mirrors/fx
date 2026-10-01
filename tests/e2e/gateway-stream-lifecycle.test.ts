@@ -184,7 +184,11 @@ for (const action of ["run", "message"] as const) for (const stop of [false, tru
       await tui.waitForPane(() => tui!.paneStatus().dead, 10000);
       expect(tui.paneStatus().status).toBe(0);
       expect(readFileSync(join(root.root, "stderr.log"), "utf8")).toBe("");
-      const frames = readFileSync(join(root.home, ".fx/sessions", registry().id, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      const events = readFileSync(join(root.home, ".fx/sessions", registry().id, "events.jsonl"), "utf8");
+      const frames = events.trim().split("\n").map(line => JSON.parse(line));
+      // The saved turn keeps what the user typed while the child ran, whether
+      // the turn finished or was cancelled.
+      expect(events.split("STEERING_FIRST").length - 1).toBe(1);
       expect(frames.filter(frame => frame.event?.tool_result?.call_id === "steering-delegation")).toHaveLength(1);
       const trace = readFileSync(join(root.root, "trace.log"), "utf8");
       expect(trace).toContain("event=steering_wait_yielded ");
@@ -218,6 +222,22 @@ function compactionEventsPath(root: FixtureRoot): string {
 function checkpointCount(events: string): number {
   return events.split("\n").slice(0, -1)
     .filter((line) => JSON.parse(line).event?.context_checkpoint).length;
+}
+
+// Automatic compaction first asks right after the conversation, which keeps
+// the agent's instructions and tools so the provider can reuse its cache.
+const NOTES_AFTER_CONVERSATION = "Write the compaction notes for the turns of the conversation above";
+
+/// A compaction request after the conversation, the agent's own request
+/// with the notes request appended.
+function isNotesAfterConversation(body: string): boolean {
+  return body.includes(NOTES_AFTER_CONVERSATION);
+}
+
+/// Any compaction request: after the conversation, or the turns written out
+/// with no tools.
+function isSummaryRequest(body: string): boolean {
+  return isNotesAfterConversation(body) || JSON.parse(body).tools.length === 0;
 }
 
 async function compactAndWait(tui: TmuxSession, root: FixtureRoot, timeoutMs: number) {
@@ -6107,17 +6127,26 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     let ordinary = 0;
     let summaries = 0;
     const gateway = startDynamicFakeGateway((body) => {
-      const request = JSON.parse(body);
-      if (request.tools.length === 0) {
+      if (isSummaryRequest(body)) {
         summaries++;
-        expect(body).not.toContain("LARGE_REASONING_");
-        expect(body).not.toContain("RECENT_REASONING_SIGNATURE");
+        if (isNotesAfterConversation(body)) {
+          // The agent's own request, reasoning included, as it was about to
+          // send it.
+          expect(summaries).toBe(1);
+          expect(body).toContain("LARGE_REASONING_5");
+        } else {
+          expect(body).not.toContain("LARGE_REASONING_");
+          expect(body).not.toContain("RECENT_REASONING_SIGNATURE");
+        }
         expect(body).toContain("REPLAY_RESULT_SENTINEL");
+        // The manual compaction folds the first one away, and these notes
+        // leave out its summary, so the summary is asked for once more.
+        if (summaries === 3) expect(body).toContain("Your notes left out the summary of the earlier compacted conversation.");
         return fakeGatewayFinalText("The prior reads completed. Preserve REPLAY_RESULT_SENTINEL and continue without repeating completed reads.");
       }
       ordinary++;
       if (ordinary === 6) {
-        expect(body).toContain("context_handoff");
+        expect(body).toContain("compacted_conversation");
         expect(body).toContain("REPLAY_RESULT_SENTINEL");
         expect(body).not.toContain("LARGE_REASONING_");
       }
@@ -6157,7 +6186,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       await tui.waitForText("RECENT_TURN_DONE", 15_000);
       await tui.waitForComposer(15_000);
       await compactAndWait(tui, root, 20_000);
-      expect(summaries).toBe(2);
+      expect(summaries).toBe(3);
       expect(readFileSync(tracePath, "utf8")).not.toContain("ContextCapacityExceeded");
       await tui.sendText("/quit");
       expect(await tui.waitForSessionEnd(15_000)).toBe(true);
@@ -6166,11 +6195,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const latest = await runFx(["session", "last", "--json"], { cwd: root.workspace, env });
       expect(latest.code).toBe(0);
       const id = JSON.parse(latest.stdout).id;
+      // Asked for only the summary, the reply without its heading is the
+      // summary of the folded compaction.
+      const compacted = await runFx(["session", "--id", id, "--json"], { cwd: root.workspace, env });
+      expect(compacted.code).toBe(0);
+      expect(JSON.parse(compacted.stdout).history.at(-1)?.summary).toContain("\"earlier\":\"The prior reads completed.");
       const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", id, "Continue with the saved result."], { cwd: root.workspace, env, timeoutMs: 30_000 });
       expect(resumed.code, resumed.stderr || resumed.stdout).toBe(0);
       expect(JSON.parse(resumed.stdout).final_output).toBe("COLD_REPLAY_DONE");
       expect(ordinary).toBe(9);
-      expect(summaries).toBe(2);
+      expect(summaries).toBe(3);
       expect(readFileSync(join(root.workspace, "sentinel.txt"), "utf8")).toBe("REPLAY_RESULT_SENTINEL\n");
     } finally {
       await tui?.kill();
@@ -6194,16 +6228,18 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         writeFileSync(join(root.workspace, "small.txt"), "small follow-up\n");
         let step = 0;
         let compactions = 0;
-        let snapshotHandle = "";
+        let sourceHandle = "";
         const gateway = startDynamicFakeGateway((body) => {
-          const request = JSON.parse(body);
-          if (request.tools.length === 0) {
-            expect(body).not.toContain(replaySignature);
+          if (isSummaryRequest(body)) {
+            // Only a request after the conversation carries its reasoning.
+            if (isNotesAfterConversation(body)) expect(body).toContain(replaySignature);
+            else expect(body).not.toContain(replaySignature);
             compactions++;
-            snapshotHandle = body.match(/result-read_tool_result-[a-f0-9-]+\.txt/)?.[0] ?? "";
-            expect(snapshotHandle).not.toBe("");
+            // The compacted command keeps the handle of its whole output.
+            expect(sourceHandle).not.toBe("");
+            expect(body).toContain(sourceHandle);
             if (compactions === 1) return fakeGatewayFinalText("");
-            return fakeGatewayFinalText(`The command ran once. Read ${snapshotHandle} at byte 65300 to recover the clipped tail. Do not repeat the command.`);
+            return fakeGatewayFinalText(`The command ran once. Read ${sourceHandle} at byte 65300 to recover the clipped tail. Do not repeat the command.`);
           }
           switch (step++) {
             case 0:
@@ -6214,6 +6250,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
               const source = JSON.parse(toolResultOutput(body, "retrieval-source"));
               expect(source.exit_code).toBe(0);
               expect(source.full_output_handle).toBeString();
+              sourceHandle = source.full_output_handle;
               return fakeGatewayToolCall("retrieval-page", "read_tool_result", {
                 request: { handle: source.full_output_handle, query: "RETRIEVAL_MATCH" },
               });
@@ -6234,14 +6271,14 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
               expect(body).toContain(replaySignature);
               if (trigger === "automatic") {
                 expect(compactions).toBe(2);
-                expect(body).toContain("context_handoff");
+                expect(body).toContain("compacted_conversation");
               }
               return fakeGatewayFinalText("RETRIEVAL_TURN_COMPLETE");
             case 4:
               expect(body).toContain(replaySignature);
-              expect(body).toContain(snapshotHandle);
+              expect(body).toContain(sourceHandle);
               return fakeGatewayToolCall("retrieval-tail", "read_tool_result", {
-                request: { handle: snapshotHandle, start_byte: 65300, byte_count: 1024 },
+                request: { handle: sourceHandle, start_byte: 65300, byte_count: 1024 },
               });
             case 5:
               expect(toolResultOutput(body, "retrieval-tail")).toContain(tail);
@@ -6263,9 +6300,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             await compactAndWait(tui, root, 20000);
           }
           expect(compactions).toBe(2);
-          const summaryRequests = gateway.requests.filter((entry) => JSON.parse(entry.body).tools.length === 0);
+          const summaryRequests = gateway.requests.filter((entry) => isSummaryRequest(entry.body));
           expect(summaryRequests).toHaveLength(2);
-          expect(summaryRequests[1]!.body).toBe(summaryRequests[0]!.body);
+          if (trigger === "automatic") {
+            // After the empty reply to the request after the conversation,
+            // the turns are written out instead.
+            expect(isNotesAfterConversation(summaryRequests[0]!.body)).toBe(true);
+            expect(JSON.parse(summaryRequests[1]!.body).tools).toHaveLength(0);
+          } else {
+            expect(summaryRequests[1]!.body).toBe(summaryRequests[0]!.body);
+          }
           await tui.sendText("/quit");
           expect(await tui.waitForSessionEnd(15000)).toBe(true);
           tui = null;
@@ -6274,18 +6318,24 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(latest.code).toBe(0);
           const sessionId = JSON.parse(latest.stdout).id;
           const sessionDir = join(root.home, ".fx", "sessions", sessionId);
-          const snapshot = readFileSync(join(sessionDir, "tool-results", snapshotHandle), "utf8");
+          const toolResults = join(sessionDir, "tool-results");
+          // The clipped page keeps its whole copy on disk.
+          const snapshotHandle = readdirSync(toolResults).find((name) => /^result-read_tool_result-[a-f0-9-]+\.txt$/.test(name)) ?? "";
+          expect(snapshotHandle).not.toBe("");
+          const snapshot = readFileSync(join(toolResults, snapshotHandle), "utf8");
           expect(Buffer.byteLength(snapshot)).toBeGreaterThan(65536);
           expect(snapshot).toContain(token);
           expect(snapshot).toContain(tail);
           expect(readFileSync(join(sessionDir, "events.jsonl"), "utf8")).toContain(snapshotHandle);
+          // The compacted command is saved as T1 with the handle of its whole output.
+          expect(readFileSync(join(toolResults, "compacted-T1.txt"), "utf8")).toContain(sourceHandle);
           const resumed = await runFx(["ask", "--json", "--resume-id", sessionId, "Recover the clipped tail from the saved retrieval without rerunning the command."], { cwd: root.workspace, env, timeoutMs: 30000 });
           expect(resumed.code).toBe(0);
           expect(resumed.stderr).toBe("Reading tool result\n");
           expect(JSON.parse(resumed.stdout).final_output).toBe("RETRIEVAL_RESTART_COMPLETE");
           expect(gateway.requests).toHaveLength(8);
           expect(readFileSync(join(root.workspace, "effects.txt"), "utf8")).toBe("once\n");
-          expect(readFileSync(tracePath, "utf8")).not.toContain("IncompleteCompactionResult");
+          expect(readFileSync(tracePath, "utf8")).not.toContain("event=transaction_failed");
         } finally {
           await tui?.kill();
           gateway.stop();
@@ -6327,7 +6377,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           "Continue the compacted session. Preserve FIRST_PROMPT_COMPACTION_SENTINEL and SECOND_PROMPT_COMPACTION_SENTINEL.",
         ),
         fakeGatewayFinalText("compaction restart complete"),
-        fakeGatewayFinalText("Second compaction preserved the restored session."),
+        fakeGatewayFinalText("Turn 2\nIn between: Second compaction preserved the restored session.\n\nEarlier:\nThe user sent two sentinel prompts and restarted fx."),
       ];
       const gateway = startGateway(() =>
         responses.shift() ?? new Response("unexpected request", { status: 500 })
@@ -6425,9 +6475,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(compactRequest.toolChoice).toEqual({ type: "none" });
         expect(compactRequest.responseFormat).toBeUndefined();
         const compactSource = JSON.stringify(compactRequest.prompt);
-        expect(compactSource).toContain(callId);
-        expect(compactSource).not.toContain(inlineCallId);
-        expect(compactSource).toContain("Result handle:");
+        // The older turn's tool call is compacted as T1; the newest turn stays unchanged.
+        expect(compactSource).toContain("[Tool call T1: read_file]");
+        expect(compactSource).toContain("manual-compaction-large.txt");
+        expect(compactSource).not.toContain("manual-compaction-inline.txt");
+        expect(compactSource).toContain(bodySentinel);
         expect(gateway.requests[4].headers.get("ai-language-model-id")).toBe(MODEL);
 
         const resumed = await runFx(
@@ -6456,11 +6508,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           .filter((message) => message.role === "user")
           .map((message) => contentText(message.content));
         expect(userTexts.at(-1)).toBe("compaction restart probe");
-        expect(userTexts.some((text) => text.includes("context_handoff"))).toBe(
+        expect(userTexts.some((text) => text.includes("compacted_conversation"))).toBe(
           true,
         );
         const requestText = JSON.stringify(request);
-        expect(requestText).toContain("context_handoff");
+        expect(requestText).toContain("compacted_conversation");
         expect(requestText).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
         expect(requestText).toContain("SECOND_PROMPT_COMPACTION_SENTINEL");
         expect(requestText).not.toContain(bodySentinel);
@@ -6504,10 +6556,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         await tui.waitForComposer(15_000);
         const resumedTranscript = await tui.captureFullScrollback();
         expect(resumedTranscript).toContain("compaction restart complete");
-        expect(resumedTranscript).not.toContain("context_handoff");
+        expect(resumedTranscript).not.toContain("compacted_conversation");
         expect(resumedTranscript).not.toContain("Recent conversation turns are preserved verbatim");
         await compactAndWait(tui, root, 15_000);
-        expect(await tui.captureFullScrollback()).not.toContain("context_handoff");
+        expect(await tui.captureFullScrollback()).not.toContain("compacted_conversation");
         await tui.sendText("/quit");
         await tui.waitForSessionEnd(15_000);
         tui = null;
@@ -6519,11 +6571,14 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         };
         expect(secondCompactRequest.tools).toEqual([]);
         const secondCompactText = JSON.stringify(secondCompactRequest.prompt);
-        expect(secondCompactText).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
         expect(secondCompactText).toContain("SECOND_PROMPT_COMPACTION_SENTINEL");
-        expect(secondCompactText).toContain("PREVIOUS_DERIVED_SUMMARY (not original user text)");
+        expect(secondCompactText).toContain("Write the compaction notes for the new turns above");
+        // The first compaction is shown whole so the model can summarize it,
+        // since it is saved as L1 and leaves what the agent sees.
+        expect(secondCompactText).toContain("[The earlier compacted conversation, to summarize; it is saved whole as L1]");
+        expect(secondCompactText).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
         expect(secondCompactText).toContain("Continue the compacted session.");
-        expect(secondCompactText).not.toContain("context_handoff");
+        expect(secondCompactText).toContain("\\nEarlier:\\nthree to five sentences");
         expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
 
         const afterSecondCompact = await runFx(
@@ -6537,6 +6592,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         const secondSummary = secondCanonical.history.at(-1)?.summary ?? "";
         expect(secondSummary).toContain("Second compaction preserved the restored session.");
         expect(secondSummary).not.toContain("operation sequence");
+        expect(secondSummary).toContain("\"ledger_count\":1");
+        expect(secondSummary).toContain("The user sent two sentinel prompts and restarted fx.");
+        // The first compaction, its notes included, is saved whole as L1.
+        expect(secondSummary).not.toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
+        const firstLedger = readFileSync(join(root.home, ".fx", "sessions", sessionId, "tool-results", "compacted-L1.txt"), "utf8");
+        expect(firstLedger).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
+        expect(firstLedger).toContain("Continue the compacted session.");
       } finally {
         if (tui) await tui.kill();
         gateway.stop();
@@ -6562,10 +6624,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           const request = JSON.parse(body);
           if (request.tools.length === 0) {
             compactions++;
-            expect(body).toContain("Tool subagent (failure)");
+            // The cancelled call reaches the summarizer as it happened and is saved as T1.
+            expect(body).toContain("[Tool result T1: subagent]");
             expect(body).toContain("aborted by user");
-            diagnosticHandle = body.match(/result-subagent-[a-f0-9-]+\.txt/)?.[0] ?? "";
-            expect(diagnosticHandle).not.toBe("");
+            diagnosticHandle = "T1";
             return fakeGatewayFinalText(`The subagent was cancelled, not completed. Its diagnostic is ${diagnosticHandle}. Continue without repeating it.`);
           }
           switch (step++) {
@@ -6586,8 +6648,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
               expect(compactions).toBe(trigger === "automatic" ? 1 : 0);
               return fakeGatewayFinalText("CANCEL_FOLLOWUP_COMPLETE");
             case 4:
-              expect(body).toContain("context_handoff");
-              expect(body).toContain(diagnosticHandle);
+              expect(body).toContain("compacted_conversation");
+              expect(body).toContain(`Its diagnostic is ${diagnosticHandle}.`);
+              expect(body).toContain("with read_tool_result");
               return fakeGatewayFinalText("CANCEL_RESTART_COMPLETE");
             default:
               return new Response("unexpected request", { status: 500 });
@@ -6631,7 +6694,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           const saved = readFileSync(eventsPath, "utf8");
           expect(saved.startsWith(before)).toBe(true);
           expect(saved.match(/"context_checkpoint":/g)).toHaveLength(1);
-          expect(readFileSync(join(sessionDir, "tool-results", diagnosticHandle), "utf8")).toBe("aborted by user");
+          const savedTool = readFileSync(join(sessionDir, "tool-results", `compacted-${diagnosticHandle}.txt`), "utf8");
+          expect(savedTool.startsWith("T1 subagent: run Wait for further input without tools.\n")).toBe(true);
+          expect(savedTool).toContain("\nResult:\naborted by user\n");
           expect(await tui.captureFullScrollback()).not.toContain("IncompleteCompactionResult");
           await tui.sendText("/quit");
           await tui.waitForPane(() => paneExitMatches(tui!.paneStatus(), 0), 15000);
@@ -6667,7 +6732,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const tracePath = join(root.root, "trace.log");
       const stderrPath = join(root.root, "stderr.log");
       const held = heldFakeGatewayFinalText();
+      // The first turn reads a file, so compaction has work to summarize and
+      // asks the model; the summary is request 3.
+      writeFileSync(join(root.workspace, "manual-cancel-notes.txt"), "notes\n");
       const responses = [
+        fakeGatewayToolCall("manual-cancel-read", "read_file", { path: "manual-cancel-notes.txt" }),
         fakeGatewayFinalText("MANUAL_CANCEL_FIRST_READY"),
         fakeGatewayFinalText("MANUAL_CANCEL_SECOND_READY"),
         () => held.response,
@@ -6708,7 +6777,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(checkpointCount(originalHistory)).toBe(0);
         await tui.sendText("/compact");
         const requestDeadline = Date.now() + 15_000;
-        while (gateway.requests.length < 3) {
+        while (gateway.requests.length < 4) {
           if (Date.now() >= requestDeadline) throw new Error("compactor request did not start");
           await Bun.sleep(10);
         }
@@ -6719,16 +6788,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           await Bun.sleep(10);
         }
         await tui.waitForText(COMPACTION_ACTIVITY, Math.max(1, requestDeadline - Date.now()));
-        expect(gateway.requests).toHaveLength(3);
-        expect(JSON.parse(gateway.requests[2]!.body).tools).toEqual([]);
-        expect(JSON.parse(gateway.requests[2]!.body).toolChoice).toEqual({ type: "none" });
+        expect(gateway.requests).toHaveLength(4);
+        expect(JSON.parse(gateway.requests[3]!.body).tools).toEqual([]);
+        expect(JSON.parse(gateway.requests[3]!.body).toolChoice).toEqual({ type: "none" });
         expect(readFileSync(eventsPath, "utf8")).toBe(originalHistory);
         await tui.sendInterruptEscapePair(5_000);
         await tui.waitForPane(
           (pane) => pane.includes("Compaction cancelled. Try /compact again when ready.") && compactionIdle(pane),
           5_000,
         );
-        expect(gateway.requests).toHaveLength(3);
+        expect(gateway.requests).toHaveLength(4);
         expect(readFileSync(eventsPath, "utf8")).toBe(originalHistory);
 
         const latest = await runFx(["session", "last", "--json"], {
@@ -6754,11 +6823,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           (pane) => pane.includes("MANUAL_CANCEL_RECOVERY_OK") && hasEmptyComposer(pane),
           15_000,
         );
-        expect(gateway.requests).toHaveLength(4);
-        const followUpRequest = gateway.requests[3]!.body;
+        expect(gateway.requests).toHaveLength(5);
+        const followUpRequest = gateway.requests[4]!.body;
         expect(followUpRequest).toContain("MANUAL_CANCEL_FIRST_READY");
         expect(followUpRequest).toContain("MANUAL_CANCEL_SECOND_READY");
-        expect(followUpRequest).not.toContain("context_handoff");
+        expect(followUpRequest).not.toContain("compacted_conversation");
         const beforeFailure = readFileSync(eventsPath, "utf8");
         expect(beforeFailure.startsWith(originalHistory)).toBe(true);
         expect(checkpointCount(beforeFailure)).toBe(0);
@@ -6771,8 +6840,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           (pane) => pane.includes("Compaction failed. Try /compact again.") && compactionIdle(pane),
           15_000,
         );
-        expect(gateway.requests).toHaveLength(6);
-        expect(gateway.requests[5]!.body).toBe(gateway.requests[4]!.body);
+        // An empty summary is retried once on the fallback model with the same prompt.
+        expect(gateway.requests).toHaveLength(7);
+        expect(JSON.parse(gateway.requests[6]!.body).prompt).toEqual(JSON.parse(gateway.requests[5]!.body).prompt);
+        expect(gateway.requests[5]!.headers.get("ai-language-model-id")).toBe(MODEL);
+        expect(gateway.requests[6]!.headers.get("ai-language-model-id")).toBe("anthropic/claude-sonnet-5");
         expect(readFileSync(eventsPath, "utf8")).toBe(beforeFailure);
         const afterFailure = await runFx(["session", "--id", sessionId, "--json"], {
           cwd: root.workspace, env: { HOME: root.home },
@@ -6884,8 +6956,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(compactionRequest).toContain(bodySentinel);
         expect(compactionRequest).toContain(tailSentinel);
         expect(compactionRequest).toContain("<skill_content");
-        expect(compactionRequest).toContain("Result handle:");
-        expect(postCompactionRequest).toContain("context_handoff");
+        expect(compactionRequest).toMatch(/\[Tool result T\d+: skill\]/);
+        expect(postCompactionRequest).toContain("compacted_conversation");
         expect(postCompactionRequest).not.toContain(bodySentinel);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
@@ -7288,15 +7360,20 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const serializedError = JSON.stringify(output);
       expect(result.code).toBe(1);
       expect(output.exit_code).toBe(1);
-      expect(serializedError).toContain("ContextCompactionUnavailable");
+      // The summary and its fallback are both rejected, so the turn fails
+      // without running the completed tool again.
+      expect(serializedError).toContain("ModelFailed");
       expect(output.tool_calls).toHaveLength(1);
       expect(output.tool_calls[0]?.name).toBe("shell");
       expect(output.tool_calls[0]?.status).toBe("success");
       expect(readFileSync(sideEffectPath, "utf8")).toBe("once\n");
-      expect(gateway.requestCount()).toBe(3);
-      const summaryRequest = JSON.parse(gateway.requests[2]!.body);
-      expect(summaryRequest.tools).toEqual([]);
-      expect(summaryRequest.toolChoice).toEqual({ type: "none" });
+      expect(gateway.requestCount()).toBe(4);
+      for (const index of [2, 3]) {
+        const summaryRequest = JSON.parse(gateway.requests[index]!.body);
+        expect(summaryRequest.tools).toEqual([]);
+        expect(summaryRequest.toolChoice).toEqual({ type: "none" });
+      }
+      expect(gateway.requests[3]!.headers.get("ai-language-model-id")).toBe("anthropic/claude-sonnet-5");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });

@@ -1569,6 +1569,22 @@ pub fn loadVerifiedSnapshot(
     };
 }
 
+/// Keeps a captured snapshot's verified bytes on the attachment itself, as
+/// an in-memory capture does, so durable serializers save them with the
+/// turn: a v2 session keeps its prompt images inside the user's item (D44).
+/// The capture still went through the platform resizer; its temporary
+/// snapshot file stays until the process's snapshot folder is removed.
+pub fn inlineCapturedSnapshot(alloc: std.mem.Allocator, attachment: *types.ImageAttachment) !void {
+    if (attachment.inline_data != null) return;
+    const verified = try loadVerifiedSnapshot(alloc, attachment.*, .{});
+    attachment.inline_data = verified.bytes;
+}
+
+/// `inlineCapturedSnapshot` for each attachment.
+pub fn inlineCapturedSnapshots(alloc: std.mem.Allocator, attachments: []types.ImageAttachment) !void {
+    for (attachments) |*attachment| try inlineCapturedSnapshot(alloc, attachment);
+}
+
 /// Returns a new attachment with independently owned snapshot bytes for `new_id`.
 /// The source snapshot remains owned by the caller.
 pub fn cloneVerifiedImageAttachment(

@@ -411,6 +411,14 @@ pub fn Handlers(comptime App: type) type {
             {
                 switch (app.mcpReloadCompletionOrigin()) {
                     .command => {},
+                    .slack_setup => {
+                        if (comptime @hasDecl(App, "acquireMcpRuntime")) {
+                            if (completion == .outcome and completion.outcome == .published) {
+                                try connectSlackAfterReload(app);
+                                return;
+                            }
+                        }
+                    },
                     .menu => |generation| {
                         try app.applyMcpMenuReloadCompletion(generation, &completion);
                         return;
@@ -503,7 +511,7 @@ pub fn Handlers(comptime App: type) type {
                 @hasDecl(App, "applyMcpMenuAuthenticationCompletion"))
             {
                 switch (app.mcpAuthenticationCompletionOrigin()) {
-                    .command => {},
+                    .command, .slack_setup => {},
                     .menu => |generation| {
                         try app.applyMcpMenuAuthenticationCompletion(generation, &completion);
                         return;
@@ -514,7 +522,9 @@ pub fn Handlers(comptime App: type) type {
             if (completion.result) |authentication| {
                 switch (authentication) {
                     .authenticated => |authenticated| {
-                        const success = if (authenticated.repaired_entries == 0)
+                        const success = if (std.mem.eql(u8, completion.server_name, "slack") and completion.reconnect_error == null)
+                            try app.alloc.dupe(u8, "Slack connected. You can now use Slack.")
+                        else if (authenticated.repaired_entries == 0)
                             try std.fmt.allocPrint(
                                 app.alloc,
                                 "Authenticated MCP server '{s}'.",
@@ -1257,6 +1267,25 @@ pub fn Handlers(comptime App: type) type {
             }, true);
         }
 
+        pub fn addSlack(app: *App) !void {
+            try commandHandleMcp(@ptrCast(app), "add slack");
+        }
+
+        fn connectSlackAfterReload(app: *App) !void {
+            var lease = app.acquireMcpRuntime() orelse return error.McpServerNotFound;
+            defer lease.deinit();
+            var snapshot = try lease.runtime.snapshotHealth(app.alloc, @intCast(@max(io_mod.milliTimestamp(), 0)));
+            defer snapshot.deinit(app.alloc);
+            for (snapshot.servers) |server| {
+                if (!std.mem.eql(u8, server.identity(), "slack")) continue;
+                if (server.connection == .ready) {
+                    try app.writeDomainNotice(.{ .topic = "mcp", .tone = .neutral, .body = "Slack connected. You can now use Slack." }, true);
+                    return;
+                }
+            }
+            try commandHandleMcp(@ptrCast(app), "auth slack --open");
+        }
+
         fn commandHandleMcp(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             const command = std.mem.trim(u8, rest, " \t");
@@ -1278,6 +1307,14 @@ pub fn Handlers(comptime App: type) type {
                 try app.openMcpMenu();
                 app.shell.render_requests.request(.footer);
                 return;
+            }
+            if (std.mem.eql(u8, std.mem.trim(u8, rest, " \t"), "add slack")) {
+                if (comptime @hasDecl(App, "mcpAuthenticationPending")) {
+                    if (app.mcpAuthenticationPending("slack")) {
+                        try app.writeDomainNotice(.{ .topic = "mcp", .tone = .neutral, .body = "Slack authorization is already in progress. Finish it in your browser." }, true);
+                        return;
+                    }
+                }
             }
             const result = try app.mcpCommandProvider().handle(app.alloc, rest, .{
                 .home = io_mod.getenv("HOME"),
@@ -1310,7 +1347,11 @@ pub fn Handlers(comptime App: type) type {
                 return;
             }
             if (result.reload) {
-                app.beginMcpReload() catch |err| {
+                const reload = if (result.connect_slack) reload: {
+                    if (comptime @hasDecl(App, "beginMcpSlackSetup")) break :reload app.beginMcpSlackSetup();
+                    break :reload error.McpAuthenticationUnavailable;
+                } else app.beginMcpReload();
+                reload catch |err| {
                     reload_warning = true;
                     reload_notice = if (result.report_reload)
                         try app.alloc.dupe(
@@ -4555,6 +4596,7 @@ test "trace notice distinguishes Markdown file outcomes without a feedback CTA" 
 }
 
 test "trace compaction summary renders recorded events without file tracing" {
+    const compactor = @import("../compactor/compactor.zig");
     const alloc = std.testing.allocator;
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();
@@ -4564,8 +4606,8 @@ test "trace compaction summary renders recorded events without file tracing" {
     try writeCompactionSummary(&empty.writer, alloc);
     try std.testing.expect(std.mem.find(u8, empty.written(), "\n## Context Compaction\n(none recorded)\n") != null);
 
-    diagnostics.traceCompactionEvent(.{ .turn_id = 10, .step_id = 176 }, .decision, "decision=compact estimated_tokens={d}", .{279466});
-    diagnostics.traceCompactionFailure(.{ .turn_id = 10 }, .retention_exhausted, "estimated_tokens={d}", .{59000});
+    compactor.traceEvent(.{ .turn_id = 10, .step_id = 176 }, .decision, "decision=compact estimated_tokens={d}", .{279466});
+    compactor.traceFailure(.{ .turn_id = 10 }, .retention_exhausted, "estimated_tokens={d}", .{59000});
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -4576,7 +4618,7 @@ test "trace compaction summary renders recorded events without file tracing" {
 
     diagnostics.resetForTest();
     for (0..diagnostics.compaction_ring_capacity + 3) |index| {
-        diagnostics.traceCompactionEvent(.{ .turn_id = 11 }, .decision, "decision=compact index={d}", .{index});
+        compactor.traceEvent(.{ .turn_id = 11 }, .decision, "decision=compact index={d}", .{index});
     }
     var wrapped: std.Io.Writer.Allocating = .init(alloc);
     defer wrapped.deinit();

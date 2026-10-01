@@ -11,7 +11,8 @@ const session_child_store = @import("../core/session/session_child_store.zig");
 const Allocator = std.mem.Allocator;
 
 pub const max_bytes: usize = 64 * 1024;
-const file_name = "system-prompt.txt";
+/// The side file a v1 session keeps the prompt in.
+pub const file_name = "system-prompt.txt";
 const block_separator = "\n\n";
 
 pub const ParseError = Allocator.Error || error{

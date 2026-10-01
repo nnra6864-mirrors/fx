@@ -20,6 +20,8 @@ const encoded = new TextEncoder();
 // A real 1x1 PNG, plus a helper that builds a PNG-sniffable payload with an
 // exact base64 length for limit probing (the kernel sniffs magic bytes only).
 const pngData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=";
+// A different real 1x1 PNG, used as resizeImage output.
+const resizedPng = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR42mNkAAAAAgAB4iG8MwAAAABJRU5ErkJggg==";
 function pngWithEncodedLength(encodedLength) {
   assert.equal(encodedLength % 4, 0);
   const raw = Buffer.alloc((encodedLength / 4) * 3);
@@ -119,6 +121,146 @@ function fileParts(body) {
   await agent.close();
 }
 
+// Every input form reaches the core as raw bytes beside the ACP frame. The
+// session/prompt frame carries only an attachment reference, and the model
+// request carries the image once, as base64.
+for (const [label, toData] of [
+  ["base64", () => pngData],
+  ["Uint8Array", (bytes) => new Uint8Array(bytes)],
+  ["ArrayBuffer", (bytes) => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)],
+  ["Buffer", (bytes) => Buffer.from(bytes)],
+]) {
+  const gateway = mockGateway();
+  const frames = [];
+  const agent = await createAgent(gateway, {
+    model: "sdk/vision-model",
+    onEvent(event) {
+      if (event.type === "acp.send" && event.message?.method === "session/prompt") frames.push(event.message);
+    },
+  });
+  const result = await runPrompt(agent, [
+    { type: "text", text: `describe this ${label} image` },
+    { type: "image", data: toData(Buffer.from(pngData, "base64")), mimeType: "image/png" },
+  ]);
+  assert.equal(result.stopReason, "end_turn", label);
+  assert.deepEqual(fileParts(gateway.state.chatBodies[0]), [
+    { type: "file", mediaType: "image/png", data: { type: "data", data: pngData } },
+  ], label);
+  const image = frames[0].params.prompt.find((block) => block.type === "image");
+  assert.equal(image.data, undefined, `${label} image bytes must not ride the ACP frame`);
+  assert.ok(Number.isInteger(image._meta?.fx?.attachment), `${label} image must reference an attachment`);
+  assert.ok(!JSON.stringify(frames[0]).includes(pngData), `${label} frame must not contain base64 image data`);
+  await agent.close();
+}
+
+// Caller-owned bytes are captured when prompt() returns, on the synchronous
+// path and on the asynchronous resizeImage path alike.
+for (const resizeImage of [undefined, (image) => image]) {
+  const gateway = mockGateway();
+  const agent = await createAgent(gateway, { model: "sdk/vision-model", ...(resizeImage ? { resizeImage } : {}) });
+  const bytes = new Uint8Array(Buffer.from(pngData, "base64"));
+  const turn = agent.prompt([{ type: "image", data: bytes, mimeType: "image/png" }]);
+  bytes.fill(0);
+  for await (const _ of turn) {}
+  assert.equal((await turn.result).stopReason, "end_turn");
+  assert.equal(fileParts(gateway.state.chatBodies[0])[0].data.data, pngData);
+  await agent.close();
+}
+
+// resizeImage takes and returns raw bytes. Its output replaces the image, may
+// change the media type, and the byte limits apply to it instead of the input.
+{
+  const gateway = mockGateway();
+  const calls = [];
+  const agent = await createAgent(gateway, {
+    model: "sdk/vision-model",
+    async resizeImage({ bytes, mimeType }) {
+      calls.push({ type: bytes.constructor.name, length: bytes.byteLength, mimeType });
+      return { bytes: Buffer.from(resizedPng, "base64"), mimeType: "image/png" };
+    },
+  });
+  const oversized = new Uint8Array(5 * 1024 * 1024);
+  Buffer.from(pngData, "base64").copy(oversized);
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4]);
+  const result = await runPrompt(agent, [
+    { type: "text", text: "resize these first" },
+    { type: "image", data: new Blob([oversized], { type: "image/png" }) },
+    { type: "image", data: jpeg, mimeType: "image/jpeg" },
+  ]);
+  assert.equal(result.stopReason, "end_turn");
+  assert.deepEqual(calls, [
+    { type: "Uint8Array", length: oversized.byteLength, mimeType: "image/png" },
+    { type: "Uint8Array", length: jpeg.byteLength, mimeType: "image/jpeg" },
+  ]);
+  assert.deepEqual(fileParts(gateway.state.chatBodies[0]), [
+    { type: "file", mediaType: "image/png", data: { type: "data", data: resizedPng } },
+    { type: "file", mediaType: "image/png", data: { type: "data", data: resizedPng } },
+  ]);
+  await agent.close();
+}
+
+// A failing or invalid resizeImage rejects only that turn, before the prompt
+// is sent, and the agent stays usable.
+{
+  const gateway = mockGateway();
+  let mode;
+  const agent = await createAgent(gateway, {
+    model: "sdk/vision-model",
+    resizeImage({ bytes, mimeType }) {
+      if (mode === "throw") throw new Error("resize failed");
+      if (mode === "invalid") return { bytes: "not bytes", mimeType };
+      if (mode === "oversized") return { bytes: new Uint8Array(4 * 1024 * 1024), mimeType };
+      if (mode === "fill") return { bytes: new Uint8Array(3 * 1024 * 1024), mimeType };
+      return { bytes, mimeType };
+    },
+  });
+  const image = [{ type: "image", data: pngData, mimeType: "image/png" }];
+  // Hook output within the image budgets still counts toward the frame bound.
+  mode = "fill";
+  await assert.rejects(
+    agent.prompt([...image, ...image]).result,
+    (error) => error instanceof RangeError && /frame limit/.test(error.message),
+  );
+  mode = "throw";
+  await assert.rejects(agent.prompt(image).result, /resize failed/);
+  mode = "invalid";
+  await assert.rejects(
+    agent.prompt(image).result,
+    (error) => error instanceof TypeError && /resizeImage must return/.test(error.message),
+  );
+  mode = "oversized";
+  await assert.rejects(
+    agent.prompt(image).result,
+    (error) => error instanceof RangeError && /per-image libfx limit/.test(error.message),
+  );
+  assert.equal(gateway.state.chatBodies.length, 0);
+  mode = "keep";
+  assert.equal((await runPrompt(agent, image)).stopReason, "end_turn");
+  await agent.close();
+  await assert.rejects(createAgent(mockGateway(), { resizeImage: "nope" }), /resizeImage must be a function/);
+}
+
+// A resizeImage that reuses one output buffer for every image still sends
+// each image with the bytes the hook returned for it.
+{
+  const gateway = mockGateway();
+  const scratch = new Uint8Array(4096);
+  const agent = await createAgent(gateway, {
+    model: "sdk/vision-model",
+    resizeImage({ bytes, mimeType }) {
+      scratch.set(bytes);
+      return { bytes: scratch.subarray(0, bytes.byteLength), mimeType };
+    },
+  });
+  const result = await runPrompt(agent, [
+    { type: "image", data: pngData, mimeType: "image/png" },
+    { type: "image", data: resizedPng, mimeType: "image/png" },
+  ]);
+  assert.equal(result.stopReason, "end_turn");
+  assert.deepEqual(fileParts(gateway.state.chatBodies[0]).map((part) => part.data.data), [pngData, resizedPng]);
+  await agent.close();
+}
+
 // A pure-image prompt is valid; the placeholder keeps the turn non-empty.
 {
   const gateway = mockGateway();
@@ -162,7 +304,13 @@ function fileParts(body) {
   ]);
   assert.equal(initial.stopReason, "end_turn");
   const checkpoint = await first.checkpoint();
+  // More concurrent checkpoints than the native outbound table holds all succeed.
+  const concurrent = await Promise.all(Array.from({ length: 16 }, () => first.checkpoint()));
+  for (const bytes of concurrent) assert.deepEqual(Buffer.from(bytes), Buffer.from(checkpoint));
   await first.close();
+  const stored = Buffer.from(checkpoint);
+  assert.ok(stored.includes(Buffer.from(pngData, "base64")), "checkpoint must store the image bytes raw");
+  assert.ok(!stored.includes(Buffer.from(pngData)), "checkpoint must not store the image as base64");
 
   const restored = await createAgent(gateway, { model: "sdk/vision-model", checkpoint });
   const followup = await runPrompt(restored, "describe it again");
@@ -171,6 +319,63 @@ function fileParts(body) {
   const files = fileParts(gateway.state.chatBodies[1]);
   assert.deepEqual(files, [{ type: "file", mediaType: "image/png", data: { type: "data", data: pngData } }]);
   await restored.close();
+
+  // Oversized and empty restore checkpoints fail with the same errors on both backends.
+  await assert.rejects(
+    createAgent(mockGateway(), { model: "sdk/vision-model", checkpoint: new Uint8Array(4 * 1024 * 1024 + 1) }),
+    (error) => error.message === "libfx checkpoint is too large",
+  );
+  await assert.rejects(
+    createAgent(mockGateway(), { model: "sdk/vision-model", checkpoint: new Uint8Array(0) }),
+    (error) => error.message === "Invalid or non-fresh libfx checkpoint",
+  );
+}
+
+// An idle checkpoint is sent before a later prompt, while one queued behind it
+// follows the direct-call rule once that prompt is active.
+{
+  const gateway = mockGateway();
+  const agent = await createAgent(gateway, { model: "sdk/vision-model" });
+  await runPrompt(agent, "first");
+  const expected = Buffer.from(await agent.checkpoint());
+  const idle = agent.checkpoint();
+  const queued = agent.checkpoint();
+  const turn = agent.prompt("second");
+  assert.deepEqual(Buffer.from(await idle), expected);
+  await assert.rejects(queued, /cannot checkpoint while a prompt is active/);
+  for await (const _ of turn) {}
+  assert.equal((await turn.result).stopReason, "end_turn");
+  // The rejected call released its place, so the next call is idle again.
+  const afterRejected = agent.checkpoint();
+  const third = agent.prompt("third");
+  assert.ok((await afterRejected).byteLength > 0);
+  for await (const _ of third) {}
+  await agent.close();
+}
+
+// A checkpoint requested from an event handler while another checkpoint's
+// request is being sent waits for it instead of running beside it.
+{
+  const gateway = mockGateway();
+  const nested = [];
+  let agent;
+  agent = await createAgent(gateway, {
+    model: "sdk/vision-model",
+    onEvent(event) {
+      if (event.type === "acp.send" && event.message.method === "libfx/checkpoint" && nested.length < 8) {
+        nested.push(agent.checkpoint());
+      }
+    },
+  });
+  await runPrompt(agent, "first");
+  const expected = Buffer.from(await agent.checkpoint());
+  for (let settled = -1; settled !== nested.length;) {
+    settled = nested.length;
+    await Promise.all(nested);
+  }
+  assert.equal(nested.length, 8);
+  for (const bytes of await Promise.all(nested)) assert.deepEqual(Buffer.from(bytes), expected);
+  await agent.close();
 }
 
 // SDK-side limits reject synchronously with typed errors naming the bound,
@@ -213,7 +418,20 @@ function fileParts(body) {
   const budgetBlob = new Blob([Buffer.alloc(3.5 * 1024 * 1024)], { type: "image/png" });
   assert.throws(
     () => agent.prompt(Array.from({ length: 2 }, () => ({ type: "image", data: budgetBlob }))),
-    (error) => error instanceof RangeError && /frame limit/.test(error.message),
+    (error) => error instanceof RangeError && /prompt images exceed/.test(error.message),
+  );
+  // Raw bytes follow the same raw-byte budgets as Blob and base64 input.
+  assert.throws(
+    () => agent.prompt([{ type: "image", data: new Uint8Array(4 * 1024 * 1024), mimeType: "image/png" }]),
+    (error) => error instanceof RangeError && /per-image libfx limit/.test(error.message),
+  );
+  assert.throws(
+    () => agent.prompt([{ type: "image", data: new Uint8Array(0), mimeType: "image/png" }]),
+    (error) => error instanceof TypeError && /requires base64 data, bytes, or a Blob/.test(error.message),
+  );
+  assert.throws(
+    () => agent.prompt([{ type: "image", data: Buffer.from(pngData, "base64") }]),
+    (error) => error instanceof TypeError && /requires a mimeType/.test(error.message),
   );
 
   const overSized = pngWithEncodedLength(5 * 1024 * 1024 + 4);
@@ -234,22 +452,24 @@ function fileParts(body) {
       { type: "image", data: half, mimeType: "image/png" },
       { type: "image", data: half, mimeType: "image/png" },
     ]),
-    (error) => error instanceof RangeError && /frame limit/.test(error.message),
+    (error) => error instanceof RangeError && /prompt images exceed/.test(error.message),
   );
 
-  // Exactly 8 MiB of image data passes the image budgets but crosses the
-  // core's 8 MiB ACP frame limit once the envelope is added, so the SDK
-  // rejects the prompt itself instead of emitting a frame the core must drop.
+  // The model request carries images base64 encoded, so text and encoded
+  // images share the 8 MiB frame bound on both backends. Exactly 8 MiB of
+  // encoded image data passes the image budgets but not that bound once text
+  // and the envelope are added, as base64 or as raw bytes.
   const quarter = pngWithEncodedLength(4 * 1024 * 1024);
-  assert.throws(
-    () => agent.prompt([
-      { type: "text", text: "boundary" },
-      { type: "image", data: quarter, mimeType: "image/png" },
-      { type: "image", data: quarter, mimeType: "image/png" },
-    ]),
-    (error) => error instanceof RangeError && /frame limit/.test(error.message),
-  );
-  // The same frame bound applies to text-only prompts on both backends.
+  for (const data of [quarter, Buffer.from(quarter, "base64")]) {
+    assert.throws(
+      () => agent.prompt([
+        { type: "text", text: "boundary" },
+        { type: "image", data, mimeType: "image/png" },
+        { type: "image", data, mimeType: "image/png" },
+      ]),
+      (error) => error instanceof RangeError && /frame limit/.test(error.message),
+    );
+  }
   assert.throws(
     () => agent.prompt("x".repeat(9 * 1024 * 1024)),
     (error) => error instanceof RangeError && /frame limit/.test(error.message),
@@ -267,7 +487,8 @@ function fileParts(body) {
   );
   assert.equal(readMixed, false);
 
-  // The projected data fits the image budgets but its ACP envelope does not.
+  // Two Blobs that fill the image budget exactly also fill the frame bound
+  // once encoded, so they fail before any Blob read.
   const boundaryBlob = new Blob([Buffer.alloc(3 * 1024 * 1024)], { type: "image/png" });
   assert.throws(
     () => agent.prompt([
@@ -289,14 +510,19 @@ function fileParts(body) {
   await agent.close();
 }
 
-// Kernel-side content validation stays authoritative: non-canonical base64 and
-// a sniffed media type that contradicts the declaration fail the turn with a
-// typed error rather than reaching the model.
+// The SDK decodes base64 itself, so non-canonical base64 throws before the
+// turn starts. Kernel-side content validation stays authoritative: a sniffed
+// media type that contradicts the declaration fails the turn with a typed error
+// rather than reaching the model.
 {
   const gateway = mockGateway();
   const agent = await createAgent(gateway, { model: "sdk/vision-model" });
-  const badBase64 = agent.prompt([{ type: "image", data: "aGVsbG8", mimeType: "image/png" }]);
-  await assert.rejects(badBase64.result, /Invalid image prompt block/);
+  for (const data of ["aGVsbG8", "aGVsbG9=", "aGVs\nbG8=", "aGVsbG8*"]) {
+    assert.throws(
+      () => agent.prompt([{ type: "image", data, mimeType: "image/png" }]),
+      (error) => error instanceof TypeError && /requires canonical base64 data/.test(error.message),
+    );
+  }
   const jpegBytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4]).toString("base64");
   const mismatch = agent.prompt([{ type: "image", data: jpegBytes, mimeType: "image/png" }]);
   await assert.rejects(mismatch.result, /Invalid image prompt block/);
@@ -525,6 +751,8 @@ for (const failure of ["write", "exit"]) {
       }
     },
     steer(text) { sentMethods.push(`steer:${text}`); },
+    writeAttachment(id) { sentMethods.push(`attachment:${id}`); },
+    discardAttachments() {},
     abortHostEffects() {},
     closeStdin() { finishRuntime(0); },
   };

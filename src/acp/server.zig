@@ -11,6 +11,7 @@ const prompt_handler = @import("prompt.zig");
 const prompt_test_controls = @import("prompt_test_controls.zig");
 const app_lifecycle = @import("../core/app/app_lifecycle.zig");
 const app_runtime_setup = @import("../core/app/app_runtime_setup.zig");
+const compactor = @import("../core/compactor/compactor.zig");
 const builtin_skills = @import("../builtins/skills.zig");
 const builtin_tools = @import("../builtins/tools.zig");
 const credentials = @import("../core/auth/credentials.zig");
@@ -28,11 +29,13 @@ const skill_runtime = @import("../core/skills/skill_runtime.zig");
 const session_codec = @import("../core/session/session_codec.zig");
 const session_log = @import("../core/session/session_log.zig");
 const session_store = @import("../core/session/session_store.zig");
+const session_adapter = @import("../core/session/session_adapter.zig");
 const session_runtime = @import("../core/session/session.zig");
 const session_title_generation = @import("../core/session/session_title_generation.zig");
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
 const terminal_client_runtime = @import("../core/terminal/client.zig");
 const subagent_tool_host = @import("../core/subagent/tool_host.zig");
+const subagent_child_state = @import("../core/subagent/child_state.zig");
 const subagent_authority = @import("../core/subagent/authority.zig");
 const types = @import("../core/shared/types.zig");
 const context_contract = @import("../core/workspace/context_contract.zig");
@@ -45,6 +48,7 @@ const permissions = @import("../core/permissions/permissions.zig");
 const host_tool_runtime = @import("../core/tooling/host_tool_runtime.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const agent_checkpoint = @import("../core/agent/runtime/checkpoint.zig");
+const host_attachments = @import("../core/hosts/host_attachments.zig");
 const libfx_steering = @import("libfx_steering.zig");
 const tool_call_identities = @import("tool_call_identities.zig");
 
@@ -198,6 +202,9 @@ pub const ActiveSessionState = struct {
     session_id: []u8,
     store: ?session_store.Store = null,
     writable: ?session_store.LoadedWritableSession = null,
+    /// The session on v2 (`FX_SESSIONS_V2`); `store` and `writable` stay
+    /// null then, as one process uses one backend.
+    v2: ?*session_adapter.Session = null,
     wasm_state: ?session_codec.DurableSessionState = null,
     wasm_revision: ?[]u8 = null,
     session_write_mutex: std.Io.Mutex = .init,
@@ -293,6 +300,7 @@ pub const ServerState = struct {
     permission_rules: types.PermissionRuleSet = .{},
     agent_step_limit: usize = 0,
     max_tool_result_bytes: usize = 64 * 1024,
+    auto_compact_percent: u8 = compactor.default_percent,
     context_limits: config_runtime.context_limits.Values = .{},
     fast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
@@ -308,7 +316,14 @@ pub const ServerState = struct {
     terminal_client: terminal_client_runtime.Runtime = .{},
     managed_executions: managed_execution.Runtime = managed_execution.Runtime.init(std.heap.c_allocator),
     subagent_store: ?session_store.Store = null,
+    /// A v2 session's children (D22), borrowed by `subagent_host`.
+    subagent_v2_children: ?*subagent_child_state.V2Children = null,
     subagent_host: ?*subagent_tool_host.Runtime = null,
+    /// Open for the whole connection when sessions are on v2.
+    sessions_v2: ?session_adapter.Store = null,
+    /// v2 was asked for; with no store, sessions are unavailable rather
+    /// than on v1, as one process uses one backend.
+    sessions_v2_requested: bool = false,
     capability_resolver: gateway_provider.CapabilityResolver = .{},
     terminate_connection: bool = false,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
@@ -337,6 +352,7 @@ pub const ServerState = struct {
                 .{@errorName(err)},
             );
         };
+        if (self.sessions_v2) |*store| store.deinit(self.alloc);
         self.workspace_access.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
         if (self.api_key.len > 0) secret.zeroAndFree(self.alloc, self.api_key);
@@ -605,6 +621,19 @@ fn publishRefreshedCredential(
     adoptServerCredential(state, refreshed);
 }
 
+pub const SessionsBackend = union(enum) {
+    v1,
+    v2: *session_adapter.Store,
+    /// v2 was asked for but its store could not open (no `HOME`).
+    v2_unavailable,
+};
+
+/// Where this connection keeps its sessions.
+pub fn sessionsBackend(state: *ServerState) SessionsBackend {
+    if (state.sessions_v2) |*store| return .{ .v2 = store };
+    return if (state.sessions_v2_requested) .v2_unavailable else .v1;
+}
+
 pub fn releaseActiveSession(state: *ServerState) !void {
     clearPendingLegacyUrls(state);
     const active = if (state.active_session) |*session| session else return;
@@ -672,6 +701,7 @@ fn destroyActiveSession(state: *ServerState) void {
     active.session_rt.deinit(state.alloc);
     if (active.writable) |*writable| writable.deinit(state.alloc);
     if (active.store) |*store| store.deinit(state.alloc);
+    if (active.v2) |v2| v2.close();
     if (active.wasm_state) |*wasm_state| wasm_state.deinit(state.alloc);
     if (active.wasm_revision) |revision| state.alloc.free(revision);
     state.active_session = null;
@@ -680,6 +710,7 @@ fn destroyActiveSession(state: *ServerState) void {
 pub fn enableSubagentHost(state: *ServerState) void {
     disableSubagentHost(state);
     const active = if (state.active_session) |*session| session else return;
+    if (active.v2) |v2| return enableSubagentHostV2(state, active, v2);
     if (active.writable == null) return;
     state.subagent_store = session_store.Store.init(state.alloc, state.workspace_root) catch |err| {
         debug_trace.logf("acp", "subagent host store unavailable session={s} err={s}", .{ active.session_id, @errorName(err) });
@@ -697,6 +728,28 @@ pub fn enableSubagentHost(state: *ServerState) void {
         state.subagent_store = null;
         return;
     };
+}
+
+/// Subagents on v2 keep their state in the session's log (D22). A host that
+/// cannot start leaves them off and says why, as on v1.
+fn enableSubagentHostV2(state: *ServerState, active: *ActiveSessionState, v2: *session_adapter.Session) void {
+    const children = state.alloc.create(subagent_child_state.V2Children) catch |err| {
+        debug_trace.logf("acp", "subagent host unavailable session={s} err={s}", .{ active.session_id, @errorName(err) });
+        return;
+    };
+    children.* = subagent_child_state.V2Children.init(state.alloc, v2, active.workspace_root);
+    state.subagent_host = subagent_tool_host.Runtime.createV2(
+        state.alloc,
+        children,
+        .{ .context = state, .resolve_fn = resolveSubagentAuthority },
+        .{ .context = state, .run_fn = prompt_handler.runSubagentChild },
+    ) catch |err| {
+        debug_trace.logf("acp", "subagent host unavailable session={s} err={s}", .{ active.session_id, @errorName(err) });
+        children.deinit();
+        state.alloc.destroy(children);
+        return;
+    };
+    state.subagent_v2_children = children;
 }
 
 fn resolveSubagentAuthority(
@@ -756,10 +809,17 @@ fn resolveSubagentAuthority(
     );
 }
 
+/// Joins the child threads before the session they append to can close
+/// (`tla/Wiring.tla` ParentOutlivesChildren).
 pub fn disableSubagentHost(state: *ServerState) void {
     if (state.subagent_host) |host| {
         host.deinit();
         state.subagent_host = null;
+    }
+    if (state.subagent_v2_children) |children| {
+        children.deinit();
+        state.alloc.destroy(children);
+        state.subagent_v2_children = null;
     }
     if (state.subagent_store) |*store| {
         store.deinit(state.alloc);
@@ -769,6 +829,14 @@ pub fn disableSubagentHost(state: *ServerState) void {
 
 fn flushActiveSessionUsage(state: *ServerState) !void {
     const active = if (state.active_session) |*session| session else return;
+    if (active.v2) |v2| {
+        if (!active.session_rt.usage.isDirty()) return;
+        var usage_snapshot = try active.session_rt.usage.snapshot(state.alloc);
+        defer usage_snapshot.deinit(state.alloc);
+        try v2.persistUsage(usage_snapshot);
+        active.session_rt.usage.markClean(usage_snapshot);
+        return;
+    }
     const writable = if (active.writable) |*value| value else return;
     if (!active.session_rt.usage.isDirty()) return;
 
@@ -829,6 +897,17 @@ pub fn runWithTransport(
         .lifecycle_view = lifecycle_view,
     };
     defer state.deinit();
+    // One backend per process; the wasm host stays on v1.
+    if (comptime !host_target.is_wasm) if (session_adapter.enabled(false)) {
+        state.sessions_v2_requested = true;
+        state.sessions_v2 = (if (cfg.home_override) |home|
+            session_adapter.Store.open(alloc, home)
+        else
+            session_adapter.Store.openFromEnv(alloc)) catch |err| blk: {
+            debug_trace.logf("acp", "event=sessions_v2_store_unavailable err={s}", .{@errorName(err)});
+            break :blk null;
+        };
+    };
 
     var reader = reader_value;
     while (!state.terminate_connection) {
@@ -1533,21 +1612,22 @@ fn handleKernelCheckpoint(
             .code = ErrorCode.invalid_params,
             .message = "Unknown libfx session",
         });
+    const unavailable: jsonrpc.RpcError = .{
+        .code = ErrorCode.invalid_request,
+        .message = "libfx checkpoint is unavailable",
+    };
+    const store = state.cfg.host_attachments orelse return state.writer.writeError(alloc, msg.id, unavailable);
     const bytes = active.session_rt.agent.checkpoint(alloc) catch
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_request,
-            .message = "libfx checkpoint is unavailable",
-        });
+        return state.writer.writeError(alloc, msg.id, unavailable);
     defer alloc.free(bytes);
-    const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
-    defer alloc.free(encoded);
-    _ = std.base64.standard.Encoder.encode(encoded, bytes);
-    var response: std.Io.Writer.Allocating = .init(alloc);
-    defer response.deinit();
-    try response.writer.writeAll("{\"checkpoint\":");
-    try std.json.Stringify.value(encoded, .{}, &response.writer);
-    try response.writer.writeByte('}');
-    try state.writer.writeResponse(alloc, msg.id, response.written());
+    // The checkpoint leaves as raw bytes beside the response frame.
+    const attachment = store.put(bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.AttachmentStoreFull => return state.writer.writeError(alloc, msg.id, unavailable),
+    };
+    var response: [64]u8 = undefined;
+    const written = std.fmt.bufPrint(&response, "{{\"checkpointAttachment\":{d}}}", .{attachment}) catch unreachable;
+    try state.writer.writeResponse(alloc, msg.id, written);
 }
 
 fn handleKernelRestore(
@@ -1565,33 +1645,27 @@ fn handleKernelRestore(
             .code = ErrorCode.invalid_params,
             .message = "Unknown libfx session",
         });
-    const checkpoint = parsed.value.object.get("checkpoint") orelse
+    const reference = parsed.value.object.get("checkpointAttachment") orelse
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
             .message = "Missing libfx checkpoint",
         });
-    if (checkpoint != .string) return state.writer.writeError(alloc, msg.id, .{
+    const invalid: jsonrpc.RpcError = .{
         .code = ErrorCode.invalid_params,
         .message = "Invalid libfx checkpoint",
-    });
-    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(checkpoint.string) catch
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Invalid libfx checkpoint",
-        });
-    if (decoded_len > agent_checkpoint.max_checkpoint_bytes) {
-        return state.writer.writeError(alloc, msg.id, .{
+    };
+    const attachment = host_attachments.idFromJson(reference) orelse
+        return state.writer.writeError(alloc, msg.id, invalid);
+    const store = state.cfg.host_attachments orelse return state.writer.writeError(alloc, msg.id, invalid);
+    const bytes = store.take(alloc, attachment, agent_checkpoint.max_checkpoint_bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.AttachmentUnavailable => return state.writer.writeError(alloc, msg.id, invalid),
+        error.AttachmentTooLarge => return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
             .message = "libfx checkpoint is too large",
-        });
-    }
-    const bytes = try alloc.alloc(u8, decoded_len);
+        }),
+    };
     defer alloc.free(bytes);
-    std.base64.standard.Decoder.decode(bytes, checkpoint.string) catch
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Invalid libfx checkpoint",
-        });
     active.session_rt.agent.restoreCheckpoint(alloc, bytes) catch
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
@@ -1761,7 +1835,11 @@ fn promptWorkerMain(active: *ActivePrompt) void {
     ) catch |err| .{
         .rpc_error = .{
             .code = ErrorCode.internal_error,
-            .message = @errorName(err),
+            // v2 names a storage fault (D29); v1 keeps the error name.
+            .message = if (active.state.sessions_v2 != null)
+                sessions.v2StorageFaultMessage("Session could not be saved", err) orelse @errorName(err)
+            else
+                @errorName(err),
         },
     };
     const finished_steering: ?libfx_steering.Finished = if (active.state.active_session) |*session|
@@ -2160,6 +2238,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.permission_rules = startup.takePermissionRules();
     state.agent_step_limit = startup.agent_step_limit;
     state.max_tool_result_bytes = startup.max_tool_result_bytes;
+    state.auto_compact_percent = startup.auto_compact_percent;
     state.context_limits = startup.context_limits;
     state.context_limits.applyCommandLine(state.cfg.context_limit_overrides);
     state.fast_mode = startup.fast_mode and
@@ -2845,23 +2924,44 @@ fn commitActiveSessionProvider(
 ) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
-    const writable = if (session.writable) |*active|
-        active
-    else
-        return error.SessionPersistenceUnavailable;
     const staged_model = try alloc.dupe(u8, model);
     errdefer alloc.free(staged_model);
-    _ = try writable.appendEvent(
-        alloc,
-        .{ .preferences_changed = .{
-            .provider = provider,
-            .model = @constCast(model),
-        } },
-        io_mod.milliTimestamp(),
-    );
+    if (session.v2) |v2| {
+        try setV2Preferences(v2, session, provider, model, session.effort);
+    } else {
+        const writable = if (session.writable) |*active|
+            active
+        else
+            return error.SessionPersistenceUnavailable;
+        _ = try writable.appendEvent(
+            alloc,
+            .{ .preferences_changed = .{
+                .provider = provider,
+                .model = @constCast(model),
+            } },
+            io_mod.milliTimestamp(),
+        );
+    }
     alloc.free(session.model);
     session.model = staged_model;
     session.provider = provider;
+}
+
+/// A v2 session stores its preferences as one value, so every change
+/// writes the whole set.
+fn setV2Preferences(
+    v2: *session_adapter.Session,
+    session: *const ActiveSessionState,
+    provider: model_provider.ProviderId,
+    model: []const u8,
+    effort: types.ReasoningEffort,
+) !void {
+    try v2.setPreferences(.{
+        .provider = provider,
+        .model = @constCast(model),
+        .effort = effort,
+        .fast_mode = session.fast_mode,
+    });
 }
 
 fn commitActiveSessionModel(
@@ -2871,6 +2971,14 @@ fn commitActiveSessionModel(
 ) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
+    if (session.v2) |v2| {
+        const staged_model = try alloc.dupe(u8, value);
+        errdefer alloc.free(staged_model);
+        try setV2Preferences(v2, session, session.provider, value, session.effort);
+        alloc.free(session.model);
+        session.model = staged_model;
+        return;
+    }
     const writable = if (session.writable) |*active|
         active
     else
@@ -2916,6 +3024,11 @@ fn commitActiveSessionEffort(
     }
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
+    if (session.v2) |v2| {
+        try setV2Preferences(v2, session, session.provider, session.model, effort);
+        session.effort = effort;
+        return;
+    }
     const writable = if (session.writable) |*active|
         active
     else
@@ -3416,6 +3529,7 @@ fn acpModelTestState(
 test "ACP model commits honor the active session write boundary" {
     const alloc = std.testing.allocator;
     var active: ActiveSessionState = undefined;
+    active.v2 = null;
     active.writable = null;
     active.session_write_mutex = .init;
     active.model = try alloc.dupe(u8, "old-model");
@@ -3470,6 +3584,7 @@ test "ACP publishes an account-bound refreshed Codex token for later prompts" {
     state.credential_refresh_after_ms = 1;
     state.gateway_team = null;
     var active: ActiveSessionState = undefined;
+    active.v2 = null;
     active.api_key = state.api_key;
     active.account_id = state.account_id;
     active.credential_source = .chatgpt_subscription;
@@ -3568,6 +3683,7 @@ test "ACP usage flush preserves snapshot ownership on allocation failure" {
     writable.state = durable;
     durable_owned = false;
     var active: ActiveSessionState = undefined;
+    active.v2 = null;
     active.writable = writable;
     active.session_rt = runtime;
     runtime_owned = false;

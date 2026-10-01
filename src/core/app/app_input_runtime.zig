@@ -1332,6 +1332,14 @@ pub fn Runtime(comptime App: type) type {
                     '\t' => _ = try cycleMcpMenuSection(app, 1),
                     '\r' => _ = try submitMcpMenuSelection(app),
                     'a', 'A' => _ = try handleMcpMenuPrimaryAction(app),
+                    's', 'S' => {
+                        if (comptime @hasDecl(App, "addMcpSlack") and @hasField(App, "mcp")) {
+                            if (app.mcp.menu.screen == .browse and app.mcp.menu.section == .servers) {
+                                if (comptime @hasDecl(App, "closeMcpMenu")) app.closeMcpMenu();
+                                try app.addMcpSlack();
+                            }
+                        }
+                    },
                     'd', 'D' => _ = confirmMcpMenuAction(app, .remove),
                     'l', 'L' => _ = confirmMcpMenuAction(app, .logout),
                     'x', 'X' => _ = confirmMcpMenuAction(app, .trust_reject),

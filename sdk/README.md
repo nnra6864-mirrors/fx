@@ -122,36 +122,67 @@ that threshold when the queue is empty; an individual encoded ACP message is
 limited to 64 MiB on both backends. These are transport bounds, not a total
 answer-size limit or a bound on retained conversation history.
 
-Image blocks accept a `Blob` or `File` with a non-empty `type`, or the
-existing canonical base64 (no line wrapping) and explicit `mimeType` of a PNG,
-JPEG, GIF, or WebP payload:
+Image blocks accept a `Blob` or `File` with a non-empty `type`, raw bytes
+(`Uint8Array`, `Buffer`, `ArrayBuffer`, or another typed array) with an
+explicit `mimeType`, or canonical base64 (no line wrapping) with an explicit
+`mimeType`. The payload must be PNG, JPEG, GIF, or WebP:
 
 ```js
 const turn = agent.prompt([
   { type: "text", text: "What does this screenshot show?" },
   { type: "image", data: file }, // File or Blob, with file.type
+  // Or: { type: "image", data: pngBytes, mimeType: "image/png" }
   // Or: { type: "image", data: base64Png, mimeType: "image/png" }
 ]);
 ```
 
-A prompt may contain up to 8 images, each with up to 5 MiB of base64 data,
-with at most 8 MiB of image data per prompt. The SDK checks Blob size before
-reading it, encodes it for the same ACP wire format, and rejects larger input
-with typed `RangeError`s. The total frame size is checked before reading a
-Blob, and the actual byte count is checked before encoding it. Blob reads are
-asynchronous: `prompt()` returns a turn, and read failures reject
-`turn.result`. Cancelling or closing while a Blob is being read settles the
-turn without sending its prompt. For base64 input, size errors still throw
-synchronously from `prompt()`.
+Image bytes reach the agent core beside the prompt message rather than inside
+it, so the only base64 encoding is the one the model request requires. A prompt
+may contain up to 8 images, each with up to 3.75 MiB (3,932,160 bytes), with at
+most 6 MiB of image data per prompt. Once encoded for the model request, those
+limits are 5 MiB per image and 8 MiB per prompt, and the prompt's text and
+encoded images must fit in 8 MiB together. The SDK checks Blob size
+before reading it and the actual byte count after reading it, and rejects
+larger input with typed `RangeError`s. Base64 that is not canonical throws a
+`TypeError` from `prompt()`. Raw bytes are copied before `prompt()` returns, so
+the caller can reuse its buffer. Blob reads are asynchronous: `prompt()`
+returns a turn, and read failures reject `turn.result`. Cancelling or closing
+while a Blob is being read settles the turn without sending its prompt. For
+base64 and byte input, size errors still throw synchronously from `prompt()`.
 
-The kernel sniffs decoded bytes and compares them with the claimed MIME type
-for both input forms; a mismatch fails the turn with
+To downscale or convert images before they are sent, pass `resizeImage` when
+creating the agent. It receives `{ bytes, mimeType }`, where `bytes` is a
+`Uint8Array`, and returns `{ bytes, mimeType }` directly or as a promise.
+`bytes` may be any typed array or `ArrayBuffer`:
+
+```js
+import sharp from "sharp";
+
+const agent = await createFxAgent({
+  apiKey,
+  model,
+  async resizeImage({ bytes }) {
+    const png = await sharp(bytes).resize({ width: 1568, withoutEnlargement: true }).png().toBuffer();
+    return { bytes: png, mimeType: "image/png" };
+  },
+});
+```
+
+In a browser, the bytes from `OffscreenCanvas.convertToBlob()` and
+`Blob.arrayBuffer()` can be returned as is. The returned bytes are copied, so
+the hook may reuse its buffer. With `resizeImage`, the size limits
+apply to its output rather than its input, image prompts are prepared
+asynchronously like a Blob prompt, and a failure inside the hook rejects
+`turn.result`.
+
+The kernel sniffs the final bytes and compares them with the claimed MIME type
+for every input form; a mismatch fails the turn with
 `Invalid image prompt block`. Images are routed only to models that advertise
 image input; for any other model the turn fails with
 `Image prompts are unavailable for the selected model` and no image bytes
-leave the process. Prompt images are retained in checkpoints within the
-existing 4 MiB checkpoint bound, so a restored agent can refer to earlier
-images on either backend.
+leave the process. Prompt images are retained in checkpoints as raw bytes
+within the existing 4 MiB checkpoint bound, so a restored agent can refer to
+earlier images on either backend.
 
 Only one top-level prompt may run at a time. While it runs,
 `await turn.steer(text)` appends guidance at the next safe model boundary
@@ -159,9 +190,9 @@ without discarding the in-flight response or completed tool work. Steering also
 accepts an array of text blocks; image and resource steering blocks are rejected.
 Each message is limited to 64 KiB, with at most 64 queued messages and 1 MiB of
 queued steering text. Accepted steering appears as a `user_message` event before
-the model's continued output. For a Blob prompt, steering during the read
-waits for the prompt to be sent; cancelling before then rejects the pending
-steering. Calling `steer()` after the turn settles rejects with
+the model's continued output. For a Blob prompt or one prepared by
+`resizeImage`, steering during that preparation waits for the prompt to be
+sent; cancelling before then rejects the pending steering. Calling `steer()` after the turn settles rejects with
 `no prompt is running`.
 
 ```js
@@ -176,8 +207,11 @@ for await (const event of turn) {
 Cancelling a steered turn drops any guidance that has not reached a safe
 boundary and releases its queue. Applied guidance is part of the same history
 turn, so an idle `checkpoint()` includes the full steered conversation.
-`checkpoint()` returns opaque, bounded, versioned bytes. Restore them only when
-creating a fresh agent:
+`checkpoint()` returns opaque, bounded, versioned bytes. Concurrent calls run
+one at a time, and a call still waiting for an earlier one fails the same way a
+direct call would if a prompt starts or the agent closes first. A newer libfx
+restores checkpoints from older versions, but an older libfx cannot restore one
+written by a newer version. Restore them only when creating a fresh agent:
 
 ```js
 const restored = await createFxAgent({ apiKey, model, checkpoint });

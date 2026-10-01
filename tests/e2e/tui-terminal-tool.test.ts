@@ -147,8 +147,12 @@ function schemaFromRequest(body: string): Record<string, unknown> {
   return shell.inputSchema as Record<string, unknown>;
 }
 
+/// Set when this run exercises sessions v2, whose sessions are folders under
+/// `sessions/v2` and whose terminal state lives under `~/.fx/terminal`.
+const SESSIONS_V2 = process.env.FX_SESSIONS_V2 === "1";
+
 function terminalRecords(home: string): Array<Record<string, unknown>> {
-  const sessionsRoot = join(home, ".fx", "sessions");
+  const sessionsRoot = join(home, ".fx", SESSIONS_V2 ? "terminal" : "sessions");
   if (!existsSync(sessionsRoot)) return [];
   return readdirSync(sessionsRoot).flatMap((sessionId) => {
     const terminalRoot = join(sessionsRoot, sessionId, "terminal", "state");
@@ -689,9 +693,9 @@ test.skipIf(!tmuxAvailable())(
     await session.sendText("/quit");
     await session.waitForText("RESUME_SHELL>", TIMEOUT);
 
-    const sessionsRoot = join(fixture.home, ".fx", "sessions");
+    const sessionsRoot = join(fixture.home, ".fx", "sessions", ...(SESSIONS_V2 ? ["v2"] : []));
     const fxSessionIds = readdirSync(sessionsRoot, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() && entry.name !== "latest")
+      .filter((entry) => entry.isDirectory() && entry.name !== "latest" && entry.name !== "v2" && !entry.name.startsWith("."))
       .map((entry) => entry.name);
     expect(fxSessionIds).toHaveLength(1);
 
