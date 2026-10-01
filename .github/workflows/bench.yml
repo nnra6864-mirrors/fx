@@ -15,6 +15,14 @@ on:
         description: Qualified PR merge PGSO artifact ID
         type: string
         default: ""
+      replay_control_artifact:
+        description: Qualified pre-change PGSO artifact for saved-history replay
+        type: string
+        default: ""
+      replay_candidate_artifact:
+        description: Qualified replay PGSO artifact
+        type: string
+        default: ""
   push:
     branches: [main]
   pull_request:
@@ -28,7 +36,7 @@ permissions:
 
 jobs:
   bench:
-    if: inputs.signed_run == '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == ''
+    if: inputs.signed_run == '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == '' && inputs.replay_control_artifact == '' && inputs.replay_candidate_artifact == ''
     name: Startup Latency
     runs-on: ubuntu-latest
     steps:
@@ -78,7 +86,7 @@ jobs:
           if-no-files-found: warn
 
   long-turn-memory:
-    if: inputs.signed_run == '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == ''
+    if: inputs.signed_run == '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == '' && inputs.replay_control_artifact == '' && inputs.replay_candidate_artifact == ''
     name: Long-turn memory
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -111,7 +119,7 @@ jobs:
           if-no-files-found: warn
 
   libfx-ttft:
-    if: inputs.signed_run == '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == ''
+    if: inputs.signed_run == '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == '' && inputs.replay_control_artifact == '' && inputs.replay_candidate_artifact == ''
     name: libfx Runtime
     runs-on: ubuntu-latest
     steps:
@@ -351,5 +359,102 @@ jobs:
             ${{ env.FX_PGSO_COMPARE_OUTPUT }}/*.json
             ${{ env.FX_PGSO_COMPARE_OUTPUT }}/*/samples.json
             ${{ env.FX_PGSO_COMPARE_OUTPUT }}/*/*/*.json
+          if-no-files-found: error
+          retention-days: 14
+
+  session-replay:
+    name: Paired saved-history replay
+    if: github.event_name == 'workflow_dispatch' && inputs.replay_control_artifact != '' && inputs.replay_candidate_artifact != ''
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
+    env:
+      AI_GATEWAY_API_KEY: ""
+      AI_GATEWAY_TEST_API_KEY: ""
+      VERCEL_OIDC_TOKEN: ""
+      FX_SOUND: "0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set replay directories
+        run: |
+          echo "FX_REPLAY_INPUT=$RUNNER_TEMP/replay-input" >> "$GITHUB_ENV"
+          echo "FX_REPLAY_OUTPUT=$RUNNER_TEMP/replay-comparison" >> "$GITHUB_ENV"
+
+      - name: Resolve immutable qualified artifacts
+        id: artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONTROL_ARTIFACT: ${{ inputs.replay_control_artifact }}
+          CANDIDATE_ARTIFACT: ${{ inputs.replay_candidate_artifact }}
+        run: |
+          mkdir -p "$FX_REPLAY_INPUT"
+          for lane in control candidate; do
+            artifact_id="$CONTROL_ARTIFACT"
+            source_sha="73308320925d5c31b4f57b875f07e77eb8b051d6"
+            if [[ "$lane" == candidate ]]; then
+              artifact_id="$CANDIDATE_ARTIFACT"
+              source_sha="08f9970413ff9375b5e1a2562c5123ed8f7034ff"
+            fi
+            [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]]
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" > "$FX_REPLAY_INPUT/$lane-artifact.json"
+            jq -e --argjson id "$artifact_id" --arg sha "$source_sha" '
+              .id == $id and .expired == false and .size_in_bytes > 0 and
+              .size_in_bytes <= 67108864 and
+              (.name | startswith("pgso-evidence-macos-arm64-" + $sha + "-attempt-"))
+            ' "$FX_REPLAY_INPUT/$lane-artifact.json"
+            run_id=$(jq -er .workflow_run.id "$FX_REPLAY_INPUT/$lane-artifact.json")
+            [[ "$run_id" =~ ^[1-9][0-9]*$ ]]
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" > "$FX_REPLAY_INPUT/$lane-run.json"
+            jq -e --arg repo "$GITHUB_REPOSITORY" --arg sha "$source_sha" '
+              .status == "completed" and .conclusion == "success" and
+              .path == ".github/workflows/pgso-macos-arm64.yml" and
+              .head_sha == $sha and .repository.full_name == $repo and
+              .head_repository.full_name == $repo
+            ' "$FX_REPLAY_INPUT/$lane-run.json"
+            echo "${lane}_run=$run_id" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Download control
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.artifacts.outputs.control_run }}
+          artifact-ids: ${{ inputs.replay_control_artifact }}
+          merge-multiple: true
+          path: ${{ env.FX_REPLAY_INPUT }}/control
+
+      - name: Download candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.artifacts.outputs.candidate_run }}
+          artifact-ids: ${{ inputs.replay_candidate_artifact }}
+          merge-multiple: true
+          path: ${{ env.FX_REPLAY_INPUT }}/candidate
+
+      - name: Compare saved-history replay
+        run: |
+          chmod +x "$FX_REPLAY_INPUT/control/candidate/fx" "$FX_REPLAY_INPUT/candidate/candidate/fx"
+          python3 benchmarks/session_replay_compare.py \
+            --control "$FX_REPLAY_INPUT/control/candidate/fx" \
+            --candidate "$FX_REPLAY_INPUT/candidate/candidate/fx" \
+            --control-manifest "$FX_REPLAY_INPUT/control/manifest.json" \
+            --candidate-manifest "$FX_REPLAY_INPUT/candidate/manifest.json" \
+            --output "$FX_REPLAY_OUTPUT"
+
+      - name: Retain replay evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: saved-history-replay-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ env.FX_REPLAY_INPUT }}/*.json
+            ${{ env.FX_REPLAY_INPUT }}/*/manifest.json
+            ${{ env.FX_REPLAY_OUTPUT }}
           if-no-files-found: error
           retention-days: 14
