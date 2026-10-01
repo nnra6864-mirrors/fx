@@ -23,6 +23,11 @@ on:
         description: Qualified replay PGSO artifact
         type: string
         default: ""
+      replay_mode:
+        description: Saved-history comparison or resident-memory diagnostic
+        type: choice
+        options: [compare, memory-map]
+        default: compare
   push:
     branches: [main]
   pull_request:
@@ -438,14 +443,18 @@ jobs:
           path: ${{ env.FX_REPLAY_INPUT }}/candidate
 
       - name: Compare saved-history replay
+        env:
+          REPLAY_MODE: ${{ inputs.replay_mode }}
         run: |
           chmod +x "$FX_REPLAY_INPUT/control/candidate/fx" "$FX_REPLAY_INPUT/candidate/candidate/fx"
+          mode_args=()
+          if [[ "$REPLAY_MODE" == memory-map ]]; then mode_args=(--memory-map --sizes 64); fi
           python3 benchmarks/session_replay_compare.py \
             --control "$FX_REPLAY_INPUT/control/candidate/fx" \
             --candidate "$FX_REPLAY_INPUT/candidate/candidate/fx" \
             --control-manifest "$FX_REPLAY_INPUT/control/manifest.json" \
             --candidate-manifest "$FX_REPLAY_INPUT/candidate/manifest.json" \
-            --output "$FX_REPLAY_OUTPUT"
+            --output "$FX_REPLAY_OUTPUT" "${mode_args[@]}"
 
       - name: Retain replay evidence
         if: always()

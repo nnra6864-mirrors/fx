@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import array
+import fcntl
 import hashlib
 import json
 import math
@@ -14,6 +16,7 @@ import signal
 import statistics
 import subprocess
 import tempfile
+import termios
 import threading
 import time
 
@@ -180,6 +183,53 @@ def quantile(values: list[float], fraction: float) -> float:
     return sorted(values)[max(0, math.ceil(len(values) * fraction) - 1)]
 
 
+def memory_map(binary: Path, case: dict, output: Path, label: str) -> dict:
+    """Hold a completed JSON response under pipe backpressure for vmmap."""
+    read_fd, write_fd = os.pipe()
+    child = None
+    try:
+        os.set_blocking(write_fd, False)
+        filled = 0
+        while True:
+            try:
+                filled += os.write(write_fd, b"x" * 131072)
+            except BlockingIOError:
+                break
+        os.set_blocking(write_fd, True)
+        assert filled >= 8192
+        with tempfile.TemporaryFile() as stderr:
+            child = subprocess.Popen([str(binary), "session", case["id"], "--json"], cwd=case["workspace"], env=environment(case), stdin=subprocess.DEVNULL, stdout=write_fd, stderr=stderr, start_new_session=True)
+            os.close(write_fd)
+            write_fd = -1
+            os.read(read_fd, 4096)
+            queued = array.array("i", [0])
+            deadline = time.monotonic() + 10
+            while True:
+                fcntl.ioctl(read_fd, termios.FIONREAD, queued, True)
+                if queued[0] >= filled:
+                    break
+                assert time.monotonic() < deadline, "response did not reach backpressure"
+                time.sleep(.005)
+            capture = subprocess.run(["/usr/bin/vmmap", "-wide", str(child.pid)], capture_output=True, timeout=30)
+            (output / f"{label}.vmmap.txt").write_bytes(capture.stdout + capture.stderr)
+            os.killpg(child.pid, signal.SIGKILL)
+            _, status, usage = os.wait4(child.pid, 0)
+            child.returncode = os.waitstatus_to_exitcode(status)
+            stderr.seek(0)
+            (output / f"{label}.stderr").write_bytes(stderr.read())
+            return {"capture_status": "captured" if capture.returncode == 0 else "not_run", "capture_exit": capture.returncode, "peak_rss_bytes": usage.ru_maxrss, "minor_faults": usage.ru_minflt, "major_faults": usage.ru_majflt, "stdout_pipe_bytes": filled, "stopping_condition": "complete response blocked on stdout"}
+    finally:
+        if child is not None and child.returncode is None:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.wait()
+        os.close(read_fd)
+        if write_fd != -1:
+            os.close(write_fd)
+
+
 def effect(pairs: list[dict], field: str, statistic) -> dict:
     control = [pair["control"][field] for pair in pairs]
     candidate = [pair["candidate"][field] for pair in pairs]
@@ -210,6 +260,7 @@ def main():
     parser.add_argument("--sizes", default="64,1024,10000")
     parser.add_argument("--samples", type=int, default=50)
     parser.add_argument("--qualify-only", action="store_true")
+    parser.add_argument("--memory-map", action="store_true")
     args = parser.parse_args()
     assert crc32c(b"123456789") == 0xE3069283
     assert args.samples >= 50
@@ -233,7 +284,8 @@ def main():
         for key in ("target", "update_channel", "zig_version", "llvm_version", "corpus_sha256"):
             assert sources["control"][key] == sources["candidate"][key], f"mismatched {key}"
     cpu = subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"], text=True).strip() if platform.system() == "Darwin" else platform.processor()
-    identity = {"sources": sources, "binary_sha256": binary_hashes, "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), "platform": platform.platform(), "architecture": platform.machine(), "cpu": cpu, "mode": "harness-qualification" if args.qualify_only else "paired-replay", "cases": cases, "samples_per_lane_per_cohort": args.samples, "warmups": 3, "timeout_seconds": 60, "seed": SEED, "bootstraps": BOOTSTRAPS, "budget": "No statistically resolved latency, CPU, or peak-RSS increase; calibration must show no resolved change.", "source": "user requirement"}
+    mode = "harness-qualification" if args.qualify_only else "resident-memory-diagnostic" if args.memory_map else "paired-replay"
+    identity = {"sources": sources, "binary_sha256": binary_hashes, "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), "platform": platform.platform(), "architecture": platform.machine(), "cpu": cpu, "mode": mode, "cases": cases, "samples_per_lane_per_cohort": args.samples, "warmups": 3, "timeout_seconds": 60, "seed": SEED, "bootstraps": BOOTSTRAPS, "budget": "No statistically resolved latency, CPU, or peak-RSS increase; calibration must show no resolved change.", "source": "user requirement"}
     (args.output / "manifest.json").write_text(json.dumps(identity, indent=2))
     results = []
     qualifications = []
@@ -246,6 +298,17 @@ def main():
             print(f"qualified {case['turns']} turns, {case['records']} records, {lane}", flush=True)
         assert outputs[0] == outputs[1], "binary outputs differ"
         (args.output / "qualifications.json").write_text(json.dumps(qualifications, indent=2))
+        if args.memory_map:
+            for index in range(3):
+                order = (("control", args.control), ("candidate", args.candidate))
+                if index % 2:
+                    order = tuple(reversed(order))
+                for lane, binary in order:
+                    observation = memory_map(binary, case, args.output, f"{case['turns']}-{index}-{lane}")
+                    results.append({"turns": case["turns"], "lane": lane, "index": index, **observation})
+            assert hashlib.sha256(Path(case["log"]).read_bytes()).hexdigest() == case["sha256"]
+            (args.output / "results.json").write_text(json.dumps({"status": "diagnostic_complete", "results": results}, indent=2))
+            continue
         # An oracle that accepts a dropped turn cannot qualify the harness.
         with tempfile.TemporaryFile() as out:
             subprocess.run([str(args.control), "session", case["id"], "--json"], cwd=case["workspace"], env=environment(case), stdout=out, check=True)
@@ -280,6 +343,8 @@ def main():
             (args.output / "results.json").write_text(json.dumps({"status": "in_progress", "results": results}, indent=2))
             print(f"measured {case['turns']} turns, {cohort}, passed={result['passed']}", flush=True)
         assert hashlib.sha256(Path(case["log"]).read_bytes()).hexdigest() == case["sha256"], "read-only fixture changed"
+    if args.memory_map:
+        return
     passed = all(row["passed"] for row in results)
     (args.output / "results.json").write_text(json.dumps({"status": "qualified" if args.qualify_only else "passed" if passed else "failed", "results": results}, indent=2))
     raise SystemExit(0 if passed else 1)
