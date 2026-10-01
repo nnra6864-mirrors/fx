@@ -91,6 +91,14 @@ function normalizeFast(value) {
   return value;
 }
 
+function normalizeUltrafast(value) {
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") {
+    throw new TypeError("ultrafast must be a boolean");
+  }
+  return value;
+}
+
 export function normalizeAgentOptions(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new TypeError("createFxAgent() options must be an object");
@@ -101,22 +109,24 @@ export function normalizeAgentOptions(value) {
   }
   options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, true);
   if (options.model !== null && typeof options.model === "object" && !Array.isArray(options.model)) {
-    if (Object.hasOwn(options, "effort") || Object.hasOwn(options, "fast")) {
-      throw new TypeError("model options cannot be mixed with top-level effort or fast");
+    if (Object.hasOwn(options, "effort") || Object.hasOwn(options, "fast") || Object.hasOwn(options, "ultrafast")) {
+      throw new TypeError("model options cannot be mixed with top-level effort, fast, or ultrafast");
     }
     const model = options.model;
     for (const name of Object.keys(model)) {
-      if (name !== "id" && name !== "effort" && name !== "fast") {
+      if (name !== "id" && name !== "effort" && name !== "fast" && name !== "ultrafast") {
         throw new TypeError(`unsupported model option: ${name}`);
       }
     }
     options.model = boundedString(model.id, "model.id", maxModelBytes, true);
     options.effort = normalizeEffort(model.effort);
     options.fast = normalizeFast(model.fast);
+    options.ultrafast = normalizeUltrafast(model.ultrafast);
   } else {
     options.model = boundedString(options.model, "model", maxModelBytes, false);
     options.effort = normalizeEffort(options.effort);
     options.fast = normalizeFast(options.fast);
+    options.ultrafast = normalizeUltrafast(options.ultrafast);
   }
   validateGatewayChatUrl(options.gatewayChatUrl);
   if (options.resizeImage !== undefined && typeof options.resizeImage !== "function") {
@@ -131,6 +141,7 @@ function agentEnvironment(options) {
     ...(options.model === undefined ? {} : { FX_MODEL: options.model }),
     ...(options.effort === undefined ? {} : { FX_EFFORT: options.effort }),
     ...(options.fast === undefined ? {} : { FX_FAST: options.fast ? "true" : "false" }),
+    ...(options.ultrafast === undefined ? {} : { FX_ULTRAFAST: options.ultrafast ? "true" : "false" }),
     ...(options.gatewayChatUrl === undefined ? {} : { FX_GATEWAY_CHAT_URL: options.gatewayChatUrl }),
   };
 }
@@ -138,9 +149,9 @@ function agentEnvironment(options) {
 function agentRpcError(response) {
   const error = new Error(response.message);
   const data = response.data;
-  if (data && ["LIBFX_MODEL_UNSUPPORTED_EFFORT", "LIBFX_MODEL_UNSUPPORTED_FAST"].includes(data.code) &&
+  if (data && ["LIBFX_MODEL_UNSUPPORTED_EFFORT", "LIBFX_MODEL_UNSUPPORTED_FAST", "LIBFX_MODEL_UNSUPPORTED_ULTRAFAST"].includes(data.code) &&
     typeof data.model === "string" &&
-    data.capability === (data.code === "LIBFX_MODEL_UNSUPPORTED_FAST" ? "fast" : "effort")) {
+    data.capability === (data.code === "LIBFX_MODEL_UNSUPPORTED_FAST" ? "fast" : data.code === "LIBFX_MODEL_UNSUPPORTED_ULTRAFAST" ? "ultrafast" : "effort")) {
     error.code = data.code;
     error.model = data.model;
     error.capability = data.capability;

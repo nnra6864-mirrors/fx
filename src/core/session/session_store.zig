@@ -1708,6 +1708,7 @@ pub const Store = struct {
             .effort = core_types.ReasoningEffort.parse(metadata.value.effort) orelse
                 return error.InvalidSessionMetadata,
             .fast_mode = metadata.value.fast_mode,
+            .ultrafast_mode = metadata.value.ultrafast_mode orelse false,
         };
     }
 
@@ -1754,6 +1755,7 @@ pub const Store = struct {
             ),
             .effort = detailed.settings.effort orelse .auto,
             .fast_mode = detailed.settings.fast_mode orelse false,
+            .ultrafast_mode = detailed.settings.ultrafast_mode orelse false,
         };
     }
 

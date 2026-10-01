@@ -583,11 +583,7 @@ fn runOne(slot: *Slot) OneOutcome {
         .child_id = slot.child_id,
         .parent_id = owner.state_store.parent_id,
         .source_id = owner.state_store.parent_id,
-        .preferences = .{
-            .provider = child.preferences().provider,
-            .model = child.preferences().model,
-            .effort = child.preferences().effort,
-        },
+        .preferences = turnPreferencesForDurable(child.preferences()),
     }) catch |err| return if (err == error.Cancelled) .{
         .work_id = work_id,
         .outcome = .cancelled,
@@ -829,6 +825,35 @@ fn loadRunSnapshot(owner: *Owner, child_id: []const u8) !RunSnapshot {
         .active = owned_active,
         .instructions = instructions,
     };
+}
+
+/// Borrows the child's durable preferences; a persisted disable stays disabled.
+fn turnPreferencesForDurable(
+    preferences: session_codec.DurableSessionPreferences,
+) execution.TurnPreferences {
+    return .{
+        .provider = preferences.provider,
+        .model = preferences.model,
+        .effort = preferences.effort,
+        .ultrafast_mode = preferences.ultrafast_mode,
+    };
+}
+
+test "resumed child turn preferences preserve explicit ultrafast disable" {
+    const enabled = turnPreferencesForDurable(.{
+        .model = @constCast("child"),
+        .effort = .auto,
+        .fast_mode = false,
+        .ultrafast_mode = true,
+    });
+    const disabled = turnPreferencesForDurable(.{
+        .model = @constCast("child"),
+        .effort = .auto,
+        .fast_mode = false,
+        .ultrafast_mode = false,
+    });
+    try std.testing.expect(enabled.ultrafast_mode);
+    try std.testing.expect(!disabled.ultrafast_mode);
 }
 
 fn fallbackOutcome(alloc: Allocator, work_id: []const u8, outcome: child_state.Outcome) OneOutcome {

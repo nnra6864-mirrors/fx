@@ -354,6 +354,7 @@ const AskOptions = struct {
     model_override: ?[]u8 = null,
     effort_override: ?types.ReasoningEffort = null,
     fast_override: ?bool = null,
+    ultrafast_override: ?bool = null,
     provider_order_override: ?[][]const u8 = null,
     provider_strict_override: ?bool = null,
     image_paths: std.ArrayList([]u8) = .empty,
@@ -499,6 +500,7 @@ const RunOptions = struct {
     model_override: ?[]const u8 = null,
     effort_override: ?types.ReasoningEffort = null,
     fast_override: ?bool = null,
+    ultrafast_override: ?bool = null,
     provider_order_override: ?[]const []const u8 = null,
     provider_strict_override: ?bool = null,
     deps: RunDeps,
@@ -585,6 +587,10 @@ const AskContext = struct {
     auto_compact_percent: u8 = compactor.default_percent,
     context_limits: config_runtime.context_limits.Values = .{},
     fast_mode: bool = false,
+    /// Profile preference used only when creating a new durable session.
+    /// Process and CLI overrides remain per-run and never rewrite this value.
+    persisted_ultrafast_mode: bool = false,
+    ultrafast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
     /// Borrowed gateway provider routing for this run; startup state owns the
     /// backing memory.
@@ -969,6 +975,7 @@ const AskContext = struct {
             .model = @constCast(self.seed_model),
             .effort = self.effort,
             .fast_mode = self.fast_mode,
+            .ultrafast_mode = self.persisted_ultrafast_mode,
         };
         var writable = if (self.requested_resume) |target|
             try subagent_resume_admission.resumeForExternalPrompt(
@@ -1027,6 +1034,7 @@ const AskContext = struct {
             self.model = preferences.model;
             self.effort = preferences.effort;
             self.fast_mode = preferences.fast_mode;
+            self.ultrafast_mode = preferences.ultrafast_mode;
         }
         self.subagent_host = subagent_tool_host.Runtime.create(
             self.alloc,
@@ -1092,6 +1100,7 @@ const AskContext = struct {
             .model = @constCast(self.seed_model),
             .effort = self.effort,
             .fast_mode = self.fast_mode,
+            .ultrafast_mode = self.persisted_ultrafast_mode,
         };
         const v2 = if (self.requested_resume) |target|
             try session_adapter.Session.resumeSession(self.alloc, store, switch (target) {
@@ -1131,6 +1140,7 @@ const AskContext = struct {
                 self.model = preferences.model;
                 self.effort = preferences.effort;
                 self.fast_mode = preferences.fast_mode;
+                self.ultrafast_mode = preferences.ultrafast_mode;
             }
         }
         self.session.configureWebFetchArtifactBlobs(self.alloc, try v2.childCapability(), v2.id());
@@ -1201,6 +1211,7 @@ const AskContext = struct {
             .gateway_models_path = self.cfg.gateway_models_path,
             .agent_step_limit = self.agent_step_limit,
             .fast_mode = self.fast_mode,
+            .ultrafast_mode = self.ultrafast_mode,
             .effort = self.effort,
             .provider_order = if (self.provider == .gateway) self.provider_order else &.{},
             .provider_strict = self.provider == .gateway and self.provider_strict,
@@ -1510,6 +1521,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         .model_override = options.model_override,
         .effort_override = options.effort_override,
         .fast_override = options.fast_override,
+        .ultrafast_override = options.ultrafast_override,
         .provider_order_override = options.provider_order_override,
         .provider_strict_override = options.provider_strict_override,
         .deps = deps,
@@ -1760,6 +1772,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.context_limits = startup.context_limits;
     ctx.context_limits.applyCommandLine(cfg.context_limit_overrides);
     ctx.fast_mode = startup.fast_mode;
+    ctx.persisted_ultrafast_mode = startup.configured_ultrafast_mode;
+    ctx.ultrafast_mode = startup.ultrafast_mode;
     ctx.provider_order = startup.provider_order;
     ctx.provider_strict = startup.provider_strict;
     ctx.effort = toCoreReasoningEffort(startup.effort);
@@ -1795,6 +1809,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             owned_resumed_model = try alloc.dupe(u8, ctx.model);
             ctx.model = owned_resumed_model.?;
         }
+        // Environment precedence survives resume without rewriting the saved
+        // profile preference. CLI flags below remain the final per-run layer.
+        if (startup.ultrafast_process_override) |ultrafast| ctx.ultrafast_mode = ultrafast;
         ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
     }
 
@@ -1808,12 +1825,22 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     }
     if (options.fast_override) |fast| {
         ctx.fast_mode = fast;
+        if (fast) ctx.ultrafast_mode = false;
     } else if (options.model_override != null and ctx.requested_resume == null and
         startup.fast_mode_source == .compiled_default)
     {
         // Default fast mode applies to the compiled default model only; an
         // explicit model override drops it unless --fast restores it.
         ctx.fast_mode = false;
+    }
+    if (options.ultrafast_override) |ultrafast| {
+        ctx.ultrafast_mode = ultrafast;
+        if (ultrafast) ctx.fast_mode = false;
+    } else if (options.model_override != null and ctx.requested_resume == null and
+        startup.ultrafast_mode_source == .compiled_default)
+    {
+        // Ultra mode must never follow an explicit model override by default.
+        ctx.ultrafast_mode = false;
     }
     if (options.provider_order_override) |order| {
         ctx.provider_order = order;
@@ -2081,6 +2108,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .auto_compact_percent = startup.auto_compact_percent,
         .cancel_flag = ctx.cancelFlag(),
         .fast_mode = ctx.fast_mode,
+        .ultrafast_mode = ctx.ultrafast_mode,
         .effort = ctx.effort,
         .provider_order = if (ctx.provider == .gateway) ctx.provider_order else &.{},
         .provider_strict = ctx.provider == .gateway and ctx.provider_strict,
@@ -4149,6 +4177,13 @@ fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: St
             if (opts.fast_override != null and opts.fast_override.? != enabled)
                 return error.InvalidAskArgs;
             opts.fast_override = enabled;
+            if (enabled) opts.ultrafast_override = false;
+        } else if (std.mem.eql(u8, arg, "--ultrafast") or std.mem.eql(u8, arg, "--no-ultrafast")) {
+            const enabled = std.mem.eql(u8, arg, "--ultrafast");
+            if (opts.ultrafast_override != null and opts.ultrafast_override.? != enabled)
+                return error.InvalidAskArgs;
+            opts.ultrafast_override = enabled;
+            if (enabled) opts.fast_override = false;
         } else if (std.mem.eql(u8, arg, "--provider-order")) {
             i += 1;
             if (i >= args.len) return error.InvalidAskArgs;

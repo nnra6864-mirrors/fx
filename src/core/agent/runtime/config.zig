@@ -50,6 +50,7 @@ pub const Config = struct {
     cancel_flag: *std.atomic.Value(bool),
     review_enabled: bool = false,
     fast_mode: bool = false,
+    ultrafast_mode: bool = false,
     effort: ReasoningEffort = .auto,
     /// Borrowed gateway provider slugs in preference order; empty leaves
     /// routing to the gateway. Backing memory is owned by the caller and must

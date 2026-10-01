@@ -80,6 +80,20 @@ await assert.rejects(
     !String(error.cause).includes("high-level createFxAgent invoked"),
 );
 
+await assert.rejects(
+  createFxAgent({
+    backend: "native",
+    nativeAddon: {
+      libfxApiVersion: 4,
+      createCore() { throw new Error("old addon must not receive ultrafast"); },
+    },
+    apiKey: "loader-key",
+    ultrafast: true,
+  }),
+  (error) => error?.code === "LIBFX_NATIVE_CAPABILITY_UNAVAILABLE" &&
+    !String(error.cause).includes("old addon must not receive ultrafast"),
+);
+
 for (const gatewayChatUrl of [
   "http://attacker.example/chat",
   "https://[redacted]@example.com/chat",

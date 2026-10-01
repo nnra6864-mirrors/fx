@@ -598,6 +598,7 @@ const Runtime = struct {
     model: ?[]u8,
     effort: ?[]u8,
     fast: ?bool,
+    ultrafast: ?bool,
     home: []u8,
     workspace_root: []u8,
     gateway_chat_url: []u8,
@@ -662,6 +663,7 @@ const Runtime = struct {
                 .model_override = self.model,
                 .effort_override = self.effort,
                 .fast_override = self.fast,
+                .ultrafast_override = self.ultrafast,
                 .home_override = self.home,
                 .workspace_root_override = self.workspace_root,
                 .allow_acp_mcp = false,
@@ -858,6 +860,7 @@ const CreateError = error{
     InvalidModel,
     InvalidEffort,
     InvalidFast,
+    InvalidUltrafast,
     InvalidHome,
     InvalidWorkspaceRoot,
     InvalidGatewayUrl,
@@ -893,6 +896,10 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         error.JavaScriptException => return error.JavaScriptException,
         else => return error.InvalidFast,
     };
+    const ultrafast = getNamedBool(env, options, "ultrafast") catch |err| switch (err) {
+        error.JavaScriptException => return error.JavaScriptException,
+        else => return error.InvalidUltrafast,
+    };
     const home = (getNamedString(env, options, "home", alloc, max_path_bytes) catch |err| switch (err) {
         error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
@@ -927,6 +934,7 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         .model = model,
         .effort = effort,
         .fast = fast,
+        .ultrafast = ultrafast,
         .home = home,
         .workspace_root = workspace_root,
         .gateway_chat_url = gateway_chat_url,
@@ -954,6 +962,7 @@ fn throwCreateError(env: c.napi_env, err: CreateError) c.napi_value {
         error.InvalidModel => throw(env, "LIBFX_INVALID_ARGUMENT", "model must be a bounded string"),
         error.InvalidEffort => throw(env, "LIBFX_INVALID_ARGUMENT", "effort must be a bounded string"),
         error.InvalidFast => throw(env, "LIBFX_INVALID_ARGUMENT", "fast must be a boolean"),
+        error.InvalidUltrafast => throw(env, "LIBFX_INVALID_ARGUMENT", "ultrafast must be a boolean"),
         error.InvalidHome => throw(env, "LIBFX_INVALID_ARGUMENT", "home is required and must be a bounded string"),
         error.InvalidWorkspaceRoot => throw(env, "LIBFX_INVALID_ARGUMENT", "workspaceRoot is required and must be a bounded string"),
         error.InvalidGatewayUrl => throw(env, "LIBFX_INVALID_ARGUMENT", "gatewayChatUrl must be a bounded string"),
@@ -1324,6 +1333,9 @@ export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) callco
     var api_version: c.napi_value = undefined;
     if (!statusOk(env, c.napi_create_uint32(env, 4, &api_version), "could not create API version")) return null;
     if (!statusOk(env, c.napi_set_named_property(env, exports, "libfxApiVersion", api_version), "could not export API version")) return null;
+    var supports_ultrafast: c.napi_value = undefined;
+    if (!statusOk(env, c.napi_get_boolean(env, true, &supports_ultrafast), "could not create ultrafast capability")) return null;
+    if (!statusOk(env, c.napi_set_named_property(env, exports, "supportsUltrafast", supports_ultrafast), "could not export ultrafast capability")) return null;
     if (!exportFunction(env, exports, "createCore", createCore)) return null;
     if (!exportFunction(env, exports, "takeCoreReadyFd", takeCoreReadyFd)) return null;
     if (!exportFunction(env, exports, "writeCore", writeCore)) return null;

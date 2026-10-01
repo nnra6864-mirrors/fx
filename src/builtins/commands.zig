@@ -29,7 +29,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .ask,
         .token = "ask",
-        .usage = "ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--sessions-v2] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>",
+        .usage = "ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--sessions-v2] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>",
         .summary = "Run one noninteractive request",
         .options = &.{
             .{ .flag = "--auto", .description = "Automatically review unresolved permission requests" },
@@ -39,6 +39,8 @@ pub const top_level_specs = [_]TopLevelSpec{
             .{ .flag = "--effort <level>", .description = "Override the reasoning effort for this request" },
             .{ .flag = "--fast", .description = "Enable Fast mode for this request when the model supports it" },
             .{ .flag = "--no-fast", .description = "Disable Fast mode for this request" },
+            .{ .flag = "--ultrafast", .description = "Request Ultra mode for this request when the model supports it" },
+            .{ .flag = "--no-ultrafast", .description = "Disable Ultra mode for this request" },
             .{ .flag = "--provider-order <a,b,...>", .description = "Prefer these gateway providers in order for this request" },
             .{ .flag = "--provider-strict", .description = "Restrict this request to only the providers in --provider-order" },
             .{ .flag = "--no-provider-strict", .description = "Clear the provider restriction for this request" },
@@ -67,10 +69,12 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .acp,
         .token = "acp",
-        .usage = "acp [--model <id>] [--log-file <path>]",
+        .usage = "acp [--model <id>] [--ultrafast|--no-ultrafast] [--log-file <path>]",
         .summary = "Start an ACP server over stdio",
         .options = &.{
             .{ .flag = "--model <id>", .description = "Override the default model" },
+            .{ .flag = "--ultrafast", .description = "Request Ultra mode when the model supports it" },
+            .{ .flag = "--no-ultrafast", .description = "Disable Ultra mode" },
             .{ .flag = "--log-file <path>", .description = "Write ACP logs to a file" },
         },
     },
@@ -366,6 +370,10 @@ pub const top_level_flags = [_]TopLevelFlag{
         .description = "Turn Fast mode on or off for an interactive session",
     },
     .{
+        .usage = "--ultrafast, --no-ultrafast",
+        .description = "Request Ultra mode on or off for an interactive session",
+    },
+    .{
         .usage = "-c, --continue",
         .description = "Resume the remembered workspace session",
     },
@@ -482,6 +490,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .credits, .command = "/credits", .aliases = &.{"/balance"}, .help_entry = "/credits (/balance)", .completion_description = "show gateway credits balance", .presentation_category = .account, .requires_prompt_credential = true },
     .{ .kind = .paste, .command = "/paste", .help_entry = "/paste", .completion_description = "attach an image from the clipboard when supported", .presentation_category = .media },
     .{ .kind = .fast, .command = "/fast", .help_entry = "/fast", .completion_description = "toggle Fast mode when supported", .presentation_category = .model },
+    .{ .kind = .ultrafast, .command = "/ultrafast", .help_entry = "/ultrafast [on|off|status]", .completion_description = "request Ultra mode when supported", .presentation_category = .model, .has_args = true, .accepts_payload = true },
     .{ .kind = .statusline, .command = "/statusline", .help_entry = "/statusline [context|session|workspace]", .completion_description = "toggle status line segments", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .notifications, .command = "/sound", .help_entry = "/sound [on|off|max]", .completion_description = "toggle sounds and terminal bells", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .workspace, .command = "/workspace", .help_entry = "/workspace [list|add PATH|remove PATH|clear]", .completion_description = "manage additional workspace directories", .presentation_category = .workspace, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
@@ -568,6 +577,7 @@ test "built-in slash commands register exact active order" {
         "/credits",
         "/paste",
         "/fast",
+        "/ultrafast",
         "/statusline",
         "/sound",
         "/workspace",

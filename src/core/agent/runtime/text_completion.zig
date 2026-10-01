@@ -182,7 +182,7 @@ fn onEvent(raw: *anyopaque, event: agent_stream_provider.Event) void {
 /// options and output limit apply to its own model; another model keeps the
 /// provider routing and prompt caching but gets only the reasoning asked for
 /// and its own output limit. A request after the conversation keeps the
-/// conversation's options as they are.
+/// conversation's options except Ultrafast, which is reserved for agent turns.
 pub const CompactorCaller = struct {
     stream_provider: agent_stream_provider.Provider,
     cooperative_transport_pulse: ?agent_stream_provider.CooperativePulse = null,
@@ -243,6 +243,7 @@ pub const CompactorCaller = struct {
             .provider_strict = self.provider_options.provider_strict,
         };
         if (conversation == null) options.reasoning = call.reasoning;
+        options.ultrafast = false;
         var usage: types.Usage = .{};
         const outcome = try complete(alloc, .{
             .stream_provider = self.stream_provider,
@@ -298,11 +299,13 @@ test "a compactor request after the conversation sends it unchanged, then the re
         tools: usize = 0,
         tool_choice: types.ToolChoice = .required,
         reasoning: ?types.ReasoningEffort = null,
+        ultrafast: bool = true,
 
         fn stream(raw: ?*anyopaque, alloc: Allocator, request: agent_stream_provider.ModelRequest) !runtime_gateway_step.StreamResult {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             try request.admission.admit();
             self.reasoning = request.provider_options.reasoning;
+            self.ultrafast = request.provider_options.ultrafast;
             self.instructions = request.instructions.len;
             self.instruction = request.instructions[0].content.?;
             self.messages = request.messages.len;
@@ -330,7 +333,8 @@ test "a compactor request after the conversation sends it unchanged, then the re
         .retry_count = 1,
         .capabilities_context = &fake,
         .capabilities_fn = Fake.capabilities,
-        .conversation = .{ .model = "m", .instructions = &instructions, .messages = &history, .tools = .{ .advertised_names = &.{"shell"} }, .tool_choice = .auto, .provider_options = .{ .reasoning = types.ReasoningEffort.literal("high") } },
+        .provider_options = .{ .ultrafast = true },
+        .conversation = .{ .model = "m", .instructions = &instructions, .messages = &history, .tools = .{ .advertised_names = &.{"shell"} }, .tool_choice = .auto, .provider_options = .{ .reasoning = types.ReasoningEffort.literal("high"), .ultrafast = true } },
     };
     const caller = summary_model.caller();
     try testing.expect(caller.sends_after_conversation);
@@ -345,6 +349,7 @@ test "a compactor request after the conversation sends it unchanged, then the re
     try testing.expectEqualStrings("write the notes", fake.last_message);
     try testing.expectEqual(@as(usize, 1), fake.tools);
     try testing.expectEqual(types.ToolChoice.auto, fake.tool_choice);
+    try testing.expect(!fake.ultrafast);
     // The provider reuses its cache only for the agent's own reasoning.
     try testing.expect(fake.reasoning.?.eql(types.ReasoningEffort.literal("high")));
 
@@ -357,6 +362,7 @@ test "a compactor request after the conversation sends it unchanged, then the re
     try testing.expectEqual(@as(usize, 1), fake.messages);
     try testing.expectEqual(@as(usize, 0), fake.tools);
     try testing.expectEqual(types.ToolChoice.none, fake.tool_choice);
+    try testing.expect(!fake.ultrafast);
     try testing.expect(fake.reasoning.?.eql(types.ReasoningEffort.literal("none")));
 
     // Another model never reads the conversation.

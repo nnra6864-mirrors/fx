@@ -350,6 +350,14 @@ test "an unreadable checkpoint numbers new turns, tool calls and ledgers after t
     try std.testing.expectEqual(@as(usize, 2), earlier.ledger_count);
     // Without a store nothing was saved, so numbering starts at one.
     try std.testing.expectEqual(@as(usize, 0), (try earlierFrom(arena, null, broken)).?.turn_count);
+
+    // A count no session reaches is damage too, as is a record numbered past
+    // it; numbering on from either would overflow.
+    const impossible = std.fmt.comptimePrint("fx-compactor-v1\n{{\"tool_count\":{d}}}", .{std.math.maxInt(usize)});
+    try store.write(arena, std.fmt.comptimePrint("compacted-T{d}.txt", .{std.math.maxInt(usize)}), "damaged");
+    const recovered = (try earlierFrom(arena, store, impossible)).?;
+    try std.testing.expectEqualStrings(impossible, recovered.earlier);
+    try std.testing.expectEqual(@as(usize, 7), recovered.tool_count);
 }
 
 test {

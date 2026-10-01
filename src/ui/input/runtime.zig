@@ -885,7 +885,7 @@ test "model picker flow stores pending model and selections" {
     var runtime = InputRuntime{};
     defer runtime.deinit(std.testing.allocator);
 
-    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "openai/gpt-5", 4, true, .effort);
+    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "openai/gpt-5", 4, true, false, .effort);
 
     try std.testing.expectEqual(picker_state.ModelPickerStage.effort, runtime.picker.model_picker_stage);
     try std.testing.expectEqualStrings("openai/gpt-5", runtime.picker.model_picker_pending_model.items);
@@ -897,10 +897,10 @@ test "model picker flow accepts aliased pending model slice" {
     var runtime = InputRuntime{};
     defer runtime.deinit(std.testing.allocator);
 
-    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "anthropic/claude-opus-4.6", 2, false, .effort);
+    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "anthropic/claude-opus-4.6", 2, false, false, .effort);
     const aliased_model = runtime.picker.model_picker_pending_model.items;
 
-    try runtime.picker.beginModelPickerFlow(std.testing.allocator, aliased_model, 3, true, .fast);
+    try runtime.picker.beginModelPickerFlow(std.testing.allocator, aliased_model, 3, true, false, .fast);
 
     try std.testing.expectEqual(picker_state.ModelPickerStage.fast, runtime.picker.model_picker_stage);
     try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", runtime.picker.model_picker_pending_model.items);
@@ -912,7 +912,7 @@ test "editing input clears model picker flow" {
     var runtime = InputRuntime{};
     defer runtime.deinit(std.testing.allocator);
 
-    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "openai/gpt-5", 3, false, .fast);
+    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "openai/gpt-5", 3, false, false, .fast);
     try runtime.edit_state.input.appendSlice(std.testing.allocator, "/model ");
     runtime.edit_state.cursor = runtime.edit_state.input.items.len;
 
@@ -928,7 +928,7 @@ test "preserving picker edit keeps effort flow" {
 
     try runtime.edit_state.input.appendSlice(std.testing.allocator, "/model openai/gpt-5 ");
     runtime.edit_state.cursor = runtime.edit_state.input.items.len;
-    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "openai/gpt-5", 2, false, .effort);
+    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "openai/gpt-5", 2, false, false, .effort);
 
     try runtime.insertionState().insertByte(std.testing.allocator, 'h', .preserve);
 
@@ -944,7 +944,7 @@ test "active model picker query tracks fast token start" {
 
     try runtime.edit_state.input.appendSlice(std.testing.allocator, "/model anthropic/claude-opus-4.6 high f");
     runtime.edit_state.cursor = runtime.edit_state.input.items.len;
-    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "anthropic/claude-opus-4.6", 3, true, .fast);
+    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "anthropic/claude-opus-4.6", 3, true, false, .fast);
 
     const query = runtime.picker.activeModelPickerQuery(&runtime.edit_state).?;
     try std.testing.expectEqual(picker_state.ModelPickerStage.fast, query.stage);
@@ -4402,7 +4402,7 @@ test "line deletion no-op preserves input state and metadata" {
     try runtime.kill_ring.text.appendSlice(alloc, "existing kill");
     try appendPastedBlockForTest(&runtime, alloc, 7, "pasted");
     try appendImageBlockForTest(&runtime, &images, alloc, 8);
-    try runtime.picker.beginModelPickerFlow(alloc, "openai/gpt-5", 3, true, .effort);
+    try runtime.picker.beginModelPickerFlow(alloc, "openai/gpt-5", 3, true, false, .effort);
     runtime.picker.slash_completion_index = 4;
     runtime.picker.model_completion_index = 5;
     runtime.picker.file_completion_index = 6;
@@ -4459,7 +4459,7 @@ test "successful line deletion resets picker state and preserves history draft" 
     try primeComposerHistoryDraftForTest(&runtime, alloc, "draft");
     try runtime.textReplacementState().replace(alloc, "alpha\nleftMIDright\ngamma");
     runtime.edit_state.cursor = "alpha\nleftMID".len;
-    try runtime.picker.beginModelPickerFlow(alloc, "openai/gpt-5", 3, true, .fast);
+    try runtime.picker.beginModelPickerFlow(alloc, "openai/gpt-5", 3, true, false, .fast);
     runtime.picker.file_completion_index = 6;
     try std.testing.expect(try runtime.killRingState(null).delete(alloc, .line_start));
     try std.testing.expectEqual(picker_state.ModelPickerStage.model, runtime.picker.model_picker_stage);

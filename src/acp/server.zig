@@ -219,6 +219,7 @@ pub const ActiveSessionState = struct {
     agent_step_limit: usize,
     max_tool_result_bytes: usize,
     fast_mode: bool,
+    ultrafast_mode: bool = false,
     effort: types.ReasoningEffort,
     first_call_tool_choice: types.ToolChoice,
     permission_mode: types.PermissionMode,
@@ -303,6 +304,9 @@ pub const ServerState = struct {
     auto_compact_percent: u8 = compactor.default_percent,
     context_limits: config_runtime.context_limits.Values = .{},
     fast_mode: bool = false,
+    ultrafast_mode: bool = false,
+    configured_ultrafast_mode: bool = false,
+    process_ultrafast_override: ?bool = null,
     effort: types.ReasoningEffort = .auto,
     first_call_tool_choice: types.ToolChoice = .auto,
     context_enabled: bool = true,
@@ -2097,6 +2101,12 @@ fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_
     );
 }
 
+fn configureUltrafastStartup(state: *ServerState, startup: *const app_lifecycle.StartupState) void {
+    state.configured_ultrafast_mode = startup.configured_ultrafast_mode;
+    state.process_ultrafast_override = state.cfg.ultrafast_override orelse startup.ultrafast_process_override;
+    state.ultrafast_mode = state.process_ultrafast_override orelse state.configured_ultrafast_mode;
+}
+
 fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     if (state.initialized) {
         return state.writer.writeError(alloc, msg.id, .{
@@ -2243,6 +2253,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.context_limits.applyCommandLine(state.cfg.context_limit_overrides);
     state.fast_mode = startup.fast_mode and
         (state.cfg.model_override == null or startup.fast_mode_source != .compiled_default);
+    configureUltrafastStartup(state, &startup);
     state.effort = startup.effort;
     state.first_call_tool_choice = startup.first_call_tool_choice;
     state.context_enabled = startup.context_enabled;
@@ -2298,6 +2309,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     if (state.cfg.fast_override) |fast| {
         if (!try applyFastOverride(state, alloc, msg, fast)) return;
     }
+    if (!try applyUltrafastOverride(state, alloc, msg, state.ultrafast_mode)) return;
 
     state.terminal_ui = request.terminal_ui;
     state.client_fs_read = request.client_fs_read;
@@ -2532,6 +2544,81 @@ test "fastOverrideRejection names models without a fast path" {
     const rejection = (try fastOverrideRejection(alloc, .{}, "provider/plain")).?;
     defer alloc.free(rejection);
     try std.testing.expectEqualStrings("Fast mode is not available for model \"provider/plain\"", rejection);
+}
+
+/// Applies a host-supplied ultrafast override before session creation. Unlike
+/// fast mode, enabling it requires a verified Gateway catalog capability; a
+/// catalog failure cannot silently send an unverified ultrafast request.
+fn applyUltrafastOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message, ultrafast: bool) !bool {
+    if (!ultrafast) {
+        state.ultrafast_mode = false;
+        return true;
+    }
+    if (state.provider != .gateway) {
+        return writeUltrafastOverrideFailure(state, alloc, msg, "Ultrafast mode is unavailable for the selected provider");
+    }
+    const catalog_provider = catalogProviderFor(state, state.provider) orelse
+        return writeUltrafastOverrideFailure(state, alloc, msg, "Ultrafast mode is unavailable for the selected provider");
+    var catalog_cancel_flag = std.atomic.Value(bool).init(false);
+    const bundle = state.cfg.provider_set.select(state.provider);
+    const capabilities = try state.capability_resolver.resolve(alloc, catalog_provider, .{
+        .access = if (state.cfg.auth_mode == .host_managed)
+            .host_managed
+        else
+            credentials.catalogAccessForCredentialAndAccount(
+                state.credential_source,
+                state.api_key,
+                state.gateway_team,
+                state.account_id,
+            ),
+        .endpoint = state.cfg.gateway_models_path,
+        .cancel_flag = &catalog_cancel_flag,
+    }, state.selected_model, bundle.fallbackModelCapabilities(state.selected_model));
+    if (state.capability_resolver.state == .failed) {
+        return writeUltrafastOverrideFailure(state, alloc, msg, "Ultrafast mode requires a verified Gateway model catalog");
+    }
+    const rejection = try ultrafastOverrideRejection(alloc, state.provider, capabilities, state.selected_model);
+    if (rejection) |message| {
+        defer alloc.free(message);
+        return writeUltrafastOverrideFailure(state, alloc, msg, message);
+    }
+    state.ultrafast_mode = true;
+    return true;
+}
+
+fn writeUltrafastOverrideFailure(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message, message: []const u8) !bool {
+    try state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = message,
+        .data = .{
+            .code = "LIBFX_MODEL_UNSUPPORTED_ULTRAFAST",
+            .model = state.selected_model,
+            .capability = "ultrafast",
+        },
+    });
+    return false;
+}
+
+/// Pure capability policy: ultrafast is an opt-in Gateway OpenAI catalog lane.
+/// Caller frees a non-null rejection message.
+fn ultrafastOverrideRejection(
+    alloc: Allocator,
+    provider: model_provider.ProviderId,
+    capabilities: model_capabilities.Capabilities,
+    model: []const u8,
+) Allocator.Error!?[]u8 {
+    if (provider == .gateway and capabilities.supports_ultrafast_mode) return null;
+    return try std.fmt.allocPrint(alloc, "Ultrafast mode is not available for model \"{s}\"", .{model});
+}
+
+test "ultrafastOverrideRejection accepts only Gateway models with the catalog capability" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqual(@as(?[]u8, null), try ultrafastOverrideRejection(alloc, .gateway, .{ .supports_ultrafast_mode = true }, "openai/model"));
+    const rejection = (try ultrafastOverrideRejection(alloc, .codex, .{ .supports_ultrafast_mode = true }, "openai/model")).?;
+    defer alloc.free(rejection);
+    try std.testing.expect(std.mem.find(u8, rejection, "openai/model") != null);
+    const unavailable = (try ultrafastOverrideRejection(alloc, .gateway, .{}, "openai/model")).?;
+    defer alloc.free(unavailable);
 }
 
 fn handleCancel(state: *ServerState, notify_client: bool) void {
@@ -2834,6 +2921,17 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             defer state.subagent_authority_mutex.unlock(io_mod.getIo());
             applySessionMode(state.cfg.mode_registry, session, value);
         }
+    } else if (std.mem.eql(u8, config_id, "ultrafast")) {
+        const session = if (state.active_session) |*active| active else return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "No active session",
+        });
+        const ultrafast = parseConfigBool(value) orelse
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = "Ultrafast mode must be true or false",
+            });
+        if (!try applyActiveSessionUltrafast(state, alloc, msg, session, ultrafast)) return;
     } else if (std.mem.eql(u8, config_id, "effort")) {
         const session = if (state.active_session) |*active| active else return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
@@ -2888,6 +2986,10 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
     if (sessions.effortConfigState(state)) |config| {
         try out.writer.writeAll(",");
         try sessions.writeEffortConfigOption(&out.writer, config.efforts, config.current);
+    }
+    if (sessions.ultrafastConfigState(state)) |current| {
+        try out.writer.writeAll(",");
+        try sessions.writeUltrafastConfigOption(&out.writer, current);
     }
     try out.writer.writeAll("]}");
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
@@ -2956,11 +3058,14 @@ fn setV2Preferences(
     model: []const u8,
     effort: types.ReasoningEffort,
 ) !void {
+    var durable = try v2.currentPreferences(v2.alloc);
+    defer durable.deinit(v2.alloc);
     try v2.setPreferences(.{
         .provider = provider,
         .model = @constCast(model),
         .effort = effort,
         .fast_mode = session.fast_mode,
+        .ultrafast_mode = durable.ultrafast_mode,
     });
 }
 
@@ -3039,6 +3144,105 @@ fn commitActiveSessionEffort(
         io_mod.milliTimestamp(),
     );
     session.effort = effort;
+}
+
+fn parseConfigBool(value: []const u8) ?bool {
+    if (std.mem.eql(u8, value, "true")) return true;
+    if (std.mem.eql(u8, value, "false")) return false;
+    return null;
+}
+
+/// Applies a strict ultrafast-mode transition to the active session. Every
+/// enabled request is admitted against its current provider/model capability.
+fn applyActiveSessionUltrafast(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+    session: *ActiveSessionState,
+    ultrafast: bool,
+) !bool {
+    if (ultrafast) {
+        const bundle = state.cfg.provider_set.select(session.provider);
+        const capabilities = state.capability_resolver.available(
+            session.model,
+            bundle.fallbackModelCapabilities(session.model),
+        );
+        const rejection = try ultrafastOverrideRejection(alloc, session.provider, capabilities, session.model);
+        if (rejection) |message| {
+            defer alloc.free(message);
+            try state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = message,
+                .data = .{
+                    .code = "LIBFX_MODEL_UNSUPPORTED_ULTRAFAST",
+                    .model = session.model,
+                    .capability = "ultrafast",
+                },
+            });
+            return false;
+        }
+    }
+    if (state.cfg.minimal_kernel and session.writable == null and session.v2 == null and session.wasm_state == null) {
+        session.ultrafast_mode = ultrafast;
+    } else {
+        commitActiveSessionUltrafast(alloc, session, ultrafast) catch {
+            try state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.internal_error,
+                .message = "Failed to persist session ultrafast preference",
+            });
+            return false;
+        };
+    }
+    return true;
+}
+
+test "ACP ultrafast disable applies to volatile SDK sessions without a durable store" {
+    var state = ServerState{
+        .alloc = std.testing.allocator,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.init(),
+        .configured_ultrafast_mode = true,
+        .process_ultrafast_override = true,
+    };
+    state.cfg.minimal_kernel = true;
+    var active: ActiveSessionState = undefined;
+    active.writable = null;
+    active.v2 = null;
+    active.wasm_state = null;
+    active.ultrafast_mode = true;
+    var msg = jsonrpc.Message{ .id = .{ .integer = 1 }, .method = "session/set_config_option" };
+    try std.testing.expect(try applyActiveSessionUltrafast(&state, std.testing.allocator, &msg, &active, false));
+    try std.testing.expect(!active.ultrafast_mode);
+    try std.testing.expect(state.configured_ultrafast_mode);
+    try std.testing.expectEqual(@as(?bool, true), state.process_ultrafast_override);
+}
+
+fn commitActiveSessionUltrafast(
+    alloc: Allocator,
+    session: *ActiveSessionState,
+    ultrafast: bool,
+) !void {
+    if (comptime host_target.is_wasm) {
+        return sessions.commitWasmUltrafastPreference(alloc, session, ultrafast);
+    }
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    if (session.v2) |v2| {
+        var preferences = try v2.currentPreferences(alloc);
+        defer preferences.deinit(alloc);
+        preferences.ultrafast_mode = ultrafast;
+        try v2.setPreferences(preferences);
+    } else {
+        const writable = if (session.writable) |*active| active else return error.SessionPersistenceUnavailable;
+        if (ultrafast or writable.state.preferences.ultrafast_mode) {
+            _ = try writable.appendEvent(
+                alloc,
+                .{ .preferences_changed = .{ .ultrafast_mode = ultrafast } },
+                io_mod.milliTimestamp(),
+            );
+        }
+    }
+    session.ultrafast_mode = ultrafast;
 }
 
 fn handleSetMode(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
@@ -3524,6 +3728,88 @@ fn acpModelTestState(
         .total_input_tokens = 0,
         .total_output_tokens = 0,
     };
+}
+
+test "ACP ultrafast writes preserve v2 baselines across other preference changes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var store = try session_adapter.Store.open(alloc, home);
+    defer store.deinit(alloc);
+    const v2 = try session_adapter.Session.create(alloc, &store, home, .acp, .{
+        .preferences = .{ .model = @constCast("old-model"), .effort = .auto, .fast_mode = false },
+        .language = types.ConversationLanguage.default(),
+        .permission_state = .{},
+    });
+    defer v2.close();
+    var active: ActiveSessionState = undefined;
+    active.session_write_mutex = .init;
+    active.wasm_state = null;
+    active.writable = null;
+    active.v2 = v2;
+    active.model = try alloc.dupe(u8, "old-model");
+    defer alloc.free(active.model);
+    active.provider = .gateway;
+    active.effort = .auto;
+    active.fast_mode = false;
+    active.ultrafast_mode = false;
+    try commitActiveSessionUltrafast(alloc, &active, true);
+    try std.testing.expect(active.ultrafast_mode);
+    active.ultrafast_mode = false;
+    try commitActiveSessionModel(alloc, &active, "new-model");
+    try commitActiveSessionProvider(alloc, &active, .codex, "child-model");
+    try commitActiveSessionEffort(alloc, &active, .literal("high"));
+    {
+        var preferences = try v2.currentPreferences(alloc);
+        defer preferences.deinit(alloc);
+        try std.testing.expect(preferences.ultrafast_mode);
+        try std.testing.expectEqualStrings("child-model", preferences.model);
+        try std.testing.expectEqual(model_provider.ProviderId.codex, preferences.provider);
+        try std.testing.expectEqualStrings("high", preferences.effort.label());
+    }
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, commitActiveSessionUltrafast(failing.allocator(), &active, false));
+    try std.testing.expect(!active.ultrafast_mode);
+    {
+        var preferences = try v2.currentPreferences(alloc);
+        defer preferences.deinit(alloc);
+        try std.testing.expect(preferences.ultrafast_mode);
+    }
+    try commitActiveSessionUltrafast(alloc, &active, false);
+    var preferences = try v2.currentPreferences(alloc);
+    defer preferences.deinit(alloc);
+    try std.testing.expect(!preferences.ultrafast_mode);
+    try std.testing.expect(!active.ultrafast_mode);
+}
+
+test "ACP ultrafast v1 writes omit default-off changes and persist explicit disable" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var store = try session_store.Store.initFromHome(alloc, home, home);
+    defer store.deinit(alloc);
+    var seed = try acpModelTestState(alloc, "acp-ultrafast", home);
+    defer seed.deinit(alloc);
+    var active: ActiveSessionState = undefined;
+    active.session_write_mutex = .init;
+    active.wasm_state = null;
+    active.v2 = null;
+    active.writable = try store.startWritableSession(alloc, seed);
+    defer active.writable.?.deinit(alloc);
+    active.ultrafast_mode = false;
+    const sequence = active.writable.?.conversation_writer.last_seq;
+    try commitActiveSessionUltrafast(alloc, &active, false);
+    try std.testing.expectEqual(sequence, active.writable.?.conversation_writer.last_seq);
+    try commitActiveSessionUltrafast(alloc, &active, true);
+    try std.testing.expect(active.ultrafast_mode);
+    try std.testing.expect(active.writable.?.state.preferences.ultrafast_mode);
+    try commitActiveSessionUltrafast(alloc, &active, false);
+    try std.testing.expect(!active.ultrafast_mode);
+    try std.testing.expect(!active.writable.?.state.preferences.ultrafast_mode);
 }
 
 test "ACP model commits honor the active session write boundary" {

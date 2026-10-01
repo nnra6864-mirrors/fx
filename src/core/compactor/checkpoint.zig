@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const trace = @import("trace.zig");
+const records = @import("records.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
@@ -251,18 +252,23 @@ pub fn parseLegacyState(arena: Allocator, ref: LegacyStateRef, bytes: []const u8
 /// damaged payload, which is traced. `arena` owns everything returned.
 pub fn parse(arena: Allocator, summary: []const u8) Allocator.Error!?Payload {
     if (!isPayload(summary)) return null;
-    return std.json.parseFromSliceLeaky(Payload, arena, summary[marker.len..], .{
+    const payload = std.json.parseFromSliceLeaky(Payload, arena, summary[marker.len..], .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     }) catch |err| switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => {
-            // Every prompt parses the checkpoint, so this stays out of the
-            // bounded /trace ring.
-            debug_trace.logf("context_compaction", "checkpoint payload unreadable bytes={d} err={s}; using its raw text", .{ summary.len, @errorName(err) });
-            return null;
-        },
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return unreadable(summary, @errorName(err)),
     };
+    const counts = [_]usize{ payload.turn_count, payload.tool_count, payload.ledger_count };
+    if (std.mem.max(usize, &counts) > records.max_number) return unreadable(summary, "CountOutOfRange");
+    return payload;
+}
+
+fn unreadable(summary: []const u8, reason: []const u8) ?Payload {
+    // Every prompt parses the checkpoint, so this stays out of the bounded
+    // /trace ring.
+    debug_trace.logf("context_compaction", "checkpoint payload unreadable bytes={d} err={s}; using its raw text", .{ summary.len, reason });
+    return null;
 }
 
 /// What the model reads for a payload checkpoint. Caller owns it.

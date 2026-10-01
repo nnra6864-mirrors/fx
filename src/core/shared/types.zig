@@ -1658,6 +1658,39 @@ pub const ProviderFailureCause = enum {
     rate_limited,
 };
 
+pub const ProviderServiceTier = enum {
+    standard,
+    flex,
+    priority,
+    ultrafast,
+
+    pub fn parse(raw: []const u8) ?ProviderServiceTier {
+        if (std.mem.eql(u8, raw, "default") or std.mem.eql(u8, raw, "standard")) return .standard;
+        if (std.mem.eql(u8, raw, "priority") or std.mem.eql(u8, raw, "fast")) return .priority;
+        if (std.mem.eql(u8, raw, "flex")) return .flex;
+        if (std.mem.eql(u8, raw, "ultrafast")) return .ultrafast;
+        return null;
+    }
+};
+
+test "Provider service tier parser recognizes Gateway tiers" {
+    const cases = [_]struct {
+        raw: []const u8,
+        expected: ?ProviderServiceTier,
+    }{
+        .{ .raw = "default", .expected = .standard },
+        .{ .raw = "standard", .expected = .standard },
+        .{ .raw = "priority", .expected = .priority },
+        .{ .raw = "fast", .expected = .priority },
+        .{ .raw = "flex", .expected = .flex },
+        .{ .raw = "ultrafast", .expected = .ultrafast },
+        .{ .raw = "unknown", .expected = null },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, ProviderServiceTier.parse(case.raw));
+    }
+}
+
 pub const ModelCompletion = struct {
     content: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
@@ -1667,6 +1700,8 @@ pub const ModelCompletion = struct {
     /// provider did not report routing metadata.
     resolved_provider: ?[]const u8 = null,
     billing: ?ProviderBilling = null,
+    /// Gateway-applied service tier. Null when the provider did not confirm it.
+    service_tier: ?ProviderServiceTier = null,
     /// Gateway generation or resolved-model metadata was malformed or conflicting.
     generation_metadata_invalid: bool = false,
     /// An earlier delivery may have billed outside this generation identity.

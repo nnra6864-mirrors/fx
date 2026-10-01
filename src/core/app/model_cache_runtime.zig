@@ -1457,6 +1457,7 @@ test "model menu owns resolved catalog state and filters without changing catalo
             .has_file_input = true,
             .has_web_search = true,
             .supports_fast_mode = true,
+            .supports_ultrafast_mode = true,
         },
         .{
             .id = @constCast("private/blue-hornbill"),
@@ -1479,6 +1480,7 @@ test "model menu owns resolved catalog state and filters without changing catalo
     try std.testing.expect(runtime.menu.itemAt(0).?.capabilities.supports_vision);
     try std.testing.expectEqual(@as(?u32, 256_000), runtime.menu.itemAt(0).?.capabilities.context_window);
     try std.testing.expect(runtime.menu.itemAt(1).?.capabilities.supports_fast_mode);
+    try std.testing.expect(runtime.menu.itemAt(1).?.capabilities.supports_ultrafast_mode);
     try std.testing.expect(runtime.menu.itemAt(1).?.capabilities.supports_file_input);
     try std.testing.expect(runtime.menu.itemAt(1).?.capabilities.supports_web_search);
 

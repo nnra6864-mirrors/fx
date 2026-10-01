@@ -66,12 +66,23 @@ Omitting effort or using `"default"` leaves the model default in place.
 fx CLI's `--fast` flag. A model without a fast path rejects at creation with
 `code: "LIBFX_MODEL_UNSUPPORTED_FAST"`, `model`, and `capability: "fast"`.
 Omitting fast or setting it to `false` leaves the model default in place.
+
+`model.ultrafast` requests Ultra mode. It is off by default and maps to
+`openai.serviceTier: "ultrafast"` through the Vercel AI Gateway for models
+whose metadata advertises Ultra eligibility. It uses the higher-cost service tier.
+Set it to `true` only after the host has selected an eligible model; an
+unsupported request rejects with `code: "LIBFX_MODEL_UNSUPPORTED_ULTRAFAST"`,
+`model`, and `capability: "ultrafast"`. Set it to `false` to explicitly disable
+an inherited request. Ultra and Fast are mutually exclusive, so `ultrafast:
+true` disables Fast for the agent. Gateway metadata currently marks Astra
+eligible; libfx does not select Ultra automatically.
+
 The new codes replace `LIBFX_UNSUPPORTED_EFFORT` and `LIBFX_UNSUPPORTED_FAST`
 for both nested and legacy top-level settings. Callers that check the old codes
 must update their error handling.
 
 The host selects the model. Agent creation does not fetch the Gateway model
-catalog unless effort requests a named level or fast is enabled. Prompting
+catalog unless effort requests a named level, fast is enabled, or ultrafast is enabled. Prompting
 can resolve model capabilities and context capacity through the supplied
 `fetch`; fx caches that metadata for the agent.
 
@@ -222,10 +233,10 @@ or a history change. The next prompt can run normally.
 
 The checkpoint contains conversation history and usage only. The host owns
 durable storage and must resupply models, credentials, instructions, tools,
-MCP clients, and skill records. Reasoning effort and fast mode are
+MCP clients, and skill records. Reasoning effort, Fast mode, and Ultra mode are
 agent-creation options and are not stored in a checkpoint: recreate the agent
-with new `model.effort` or `model.fast` values to change them, the same path as
-switching models.
+with new `model.effort`, `model.fast`, or `model.ultrafast` values to change
+them, the same path as switching models.
 
 ## Models
 

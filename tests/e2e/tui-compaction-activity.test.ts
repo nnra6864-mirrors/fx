@@ -283,7 +283,9 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         if (trigger === "manual") {
           await terminal.waitForPane((pane) => !ACTIVITY.test(pane) && hasEmptyComposer(pane), 10_000);
           expect(f.counts().ordinary).toBe(f.seedTurns);
-          expect(f.counts().summaries).toBe(1);
+          // The reply holds only facts, so fx asks once more for the notes
+          // of the turn that did work.
+          expect(f.counts().summaries).toBe(2);
         } else {
           await until(() => f.counts().ordinary === f.seedTurns + (trigger === "overflow" ? 2 : 1), "ordinary request after compaction");
           const pane = await terminal.waitForText(/Thinking \(/, 10_000);

@@ -82,6 +82,32 @@ FX_PROVIDER=openrouter FX_MODEL=openai/gpt-4.1 fx ask "review this change"
 
 See [Custom model connections](https://fx.sh/docs/configure-fx/custom-model-connections) for connection JSON, model metadata, and behavior details.
 
+## Ultrafast mode
+
+Ultrafast mode is off by default. It requests OpenAI's higher-cost Gateway service tier with `openai.serviceTier: "ultrafast"` for models whose Gateway metadata advertises Ultra eligibility. `ultrafast_requested` in `fx status --json` and `/status` reports the request, not a guarantee that a provider served the tier.
+
+Set a profile default in `~/.fx/settings.json`:
+
+```jsonc
+{
+  "provider": "gateway",
+  "models": { "gateway": "openai/gpt-6-astra" },
+  "ultrafast_mode": true
+}
+```
+
+Use it explicitly in an interactive session, a one-shot request, or ACP:
+
+```bash
+fx --ultrafast
+fx ask --ultrafast "review this change"
+fx acp --ultrafast
+```
+
+Use `/ultrafast on`, `/ultrafast off`, or `/ultrafast status` in the shell. The Settings menu includes an Ultra mode row. `FX_ULTRAFAST=1` and `--ultrafast` are process-local opt-ins and are not persisted. `FX_ULTRAFAST=0`, `--no-ultrafast`, and `/ultrafast off` explicitly disable it. A resumed session keeps its saved request unless a higher-precedence explicit disable applies.
+
+Ultra mode is available only through the Vercel AI Gateway's OpenAI service tier. Gateway metadata currently marks Astra eligible. fx does not select Ultra automatically, and switching models clears an existing Ultra request. Subagents inherit the parent turn's request; an explicit parent disable and capability checks override an existing child preference. Background side calls, including titles, reviews, and compaction, do not use Ultra mode.
+
 ## Gateway provider routing
 
 When the active model goes through the Vercel AI Gateway, one model is often served by several providers (for example Anthropic directly, AWS Bedrock, or Google Vertex). fx can tell the gateway which providers to use, in what order:

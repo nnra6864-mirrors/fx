@@ -375,7 +375,7 @@ pub const Written = struct {
     /// The new entries, in the order written.
     entries: []const checkpoint.Entry = &.{},
     /// The complete turns the reply wrote an in-between line for, even
-    /// `none`.
+    /// `none`, or kept a reply in none of the asked form as the notes of.
     noted: []const usize = &.{},
     /// The summary of the earlier compacted conversation, when asked for.
     earlier: []const u8 = "",
@@ -507,8 +507,10 @@ pub fn read(arena: Allocator, reply: []const u8, known: Known, earlier: []const 
     if (works.items.len == 0 and tool_notes.items.len == 0 and sections.items.len == 0 and earlier_summary.items.len == 0 and unknown == 0) {
         const newest: ?usize = if (known.open) 0 else if (known.turns.len > 0) known.turns[known.turns.len - 1] else null;
         if (newest) |number| {
+            const text = std.mem.trim(u8, reply, " \t\r\n");
             try works.append(arena, .{ .number = number, .limit = max_unread_bytes });
-            try works.items[0].text.appendSlice(arena, std.mem.trim(u8, reply, " \t\r\n"));
+            try works.items[0].text.appendSlice(arena, text);
+            if (number > 0 and text.len > 0) try noted.append(arena, number);
         } else {
             try earlier_summary.appendSlice(arena, reply);
         }

@@ -2980,28 +2980,20 @@ fn encodePreferences(alloc: Allocator, preferences: session_codec.DurableSession
         model: []const u8,
         effort: []const u8,
         fast_mode: bool,
+        ultrafast_mode: ?bool,
+        instructions: ?[]const u8,
     };
-    const saved: Saved = .{
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try std.json.Stringify.value(Saved{
         .provider = preferences.provider,
         .model = preferences.model,
         .effort = preferences.effort.label(),
         .fast_mode = preferences.fast_mode,
-    };
-    const text = instructions orelse return jsonValue(alloc, saved);
-    const ChildSaved = struct {
-        provider: model_provider.ProviderId,
-        model: []const u8,
-        effort: []const u8,
-        fast_mode: bool,
-        instructions: []const u8,
-    };
-    return jsonValue(alloc, ChildSaved{
-        .provider = saved.provider,
-        .model = saved.model,
-        .effort = saved.effort,
-        .fast_mode = saved.fast_mode,
-        .instructions = text,
-    });
+        .ultrafast_mode = if (preferences.ultrafast_mode) true else null,
+        .instructions = instructions,
+    }, .{ .emit_null_optional_fields = false }, &out.writer);
+    return out.toOwnedSlice();
 }
 
 fn decodePreferences(alloc: Allocator, raw: []const u8) !session_codec.DurableSessionPreferences {
@@ -3083,15 +3075,22 @@ test "preferences round trip through v1's decoder" {
     var model = "vendor/model-1".*;
     const efforts = [_]types.ReasoningEffort{ .auto, types.ReasoningEffort.parse("high").? };
     for (efforts) |effort| {
-        const raw = try encodePreferences(arena.allocator(), .{ .model = &model, .effort = effort, .fast_mode = true }, null);
+        const raw = try encodePreferences(arena.allocator(), .{ .model = &model, .effort = effort, .fast_mode = true, .ultrafast_mode = true }, null);
         try testing.expect((try decodeInstructions(testing.allocator, raw)) == null);
         var decoded = try decodePreferences(testing.allocator, raw);
         defer decoded.deinit(testing.allocator);
         try testing.expectEqualStrings("vendor/model-1", decoded.model);
         try testing.expectEqualStrings(effort.label(), decoded.effort.label());
         try testing.expect(decoded.fast_mode);
+        try testing.expect(decoded.ultrafast_mode);
         try testing.expectEqual(model_provider.ProviderId.gateway, decoded.provider);
     }
+
+    const off = try encodePreferences(arena.allocator(), .{ .model = &model, .effort = .auto, .fast_mode = false }, null);
+    try testing.expectEqualStrings("{\"provider\":\"gateway\",\"model\":\"vendor/model-1\",\"effort\":\"auto\",\"fast_mode\":false}", off);
+    var decoded_off = try decodePreferences(testing.allocator, off);
+    defer decoded_off.deinit(testing.allocator);
+    try testing.expect(!decoded_off.ultrafast_mode);
 }
 
 test "the switch is the flag or FX_SESSIONS_V2" {
@@ -3270,6 +3269,50 @@ test "the manager guards child lines, and a child without a log reopens under it
     defer child.close();
     try testing.expectEqualStrings(child_id, child.id());
     try testing.expectEqualStrings("", child.childInstructions());
+}
+
+test "v2 child ultrafast preferences survive instruction changes and resume" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    const alloc = testing.allocator;
+    var model = "test-model".*;
+    const parent = try Session.create(alloc, &t.store, "/w", .ask, testSeed(&model));
+    defer parent.close();
+    try parent.commitTurn(assistantTurn("delegate", "ok"), types.ConversationLanguage.default());
+    const child_id = "1786460757753-ultra";
+    try parent.appendChildLines(&.{.{ .spawned = .{ .child = child_id, .work_id = "w1" } }});
+    var seed = childSeed(&model, "Be brief.");
+    seed.preferences.ultrafast_mode = true;
+    {
+        const child = try Session.openChild(alloc, &t.store, parent.id(), child_id, "/w", seed);
+        defer child.close();
+        try child.commitTurn(assistantTurn("task", "done"), types.ConversationLanguage.default());
+        var preferences = try child.currentPreferences(alloc);
+        defer preferences.deinit(alloc);
+        try testing.expect(preferences.ultrafast_mode);
+    }
+    seed.instructions = "Be thorough.";
+    {
+        const child = try Session.openChild(alloc, &t.store, parent.id(), child_id, "/w", seed);
+        defer child.close();
+        var preferences = try child.currentPreferences(alloc);
+        defer preferences.deinit(alloc);
+        try testing.expect(preferences.ultrafast_mode);
+        preferences.ultrafast_mode = false;
+        try child.setPreferences(preferences);
+        try testing.expectEqualStrings("Be thorough.", child.childInstructions());
+    }
+    seed.instructions = "Answer in one line.";
+    const child = try Session.openChild(alloc, &t.store, parent.id(), child_id, "/w", seed);
+    defer child.close();
+    var preferences = try child.currentPreferences(alloc);
+    defer preferences.deinit(alloc);
+    try testing.expect(!preferences.ultrafast_mode);
+    try testing.expectEqualStrings("Answer in one line.", child.childInstructions());
+    var state = try child.handle.state(alloc);
+    defer state.deinit(alloc);
+    try testing.expect(std.mem.find(u8, state.prefs.?, "\"ultrafast_mode\"") == null);
 }
 
 test "a copy of a parent's children frees every part when memory runs out" {

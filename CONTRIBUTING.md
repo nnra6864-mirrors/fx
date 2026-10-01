@@ -384,7 +384,10 @@ progress are not delivered to operations yet.
 ## ACP Embedding
 
 `fx acp` extends ACP v1 for clients that embed it. Extensions are read and
-written under `_meta.fx`.
+written under `_meta.fx`. Start the server with `fx acp --ultrafast` or
+`fx acp --no-ultrafast` to set a process-local default request for sessions
+created by that server; the request still requires a model that advertises
+Ultra eligibility.
 
 * **Client MCP tools stay loaded:** tool schemas from servers in `mcpServers`
   are advertised on every turn within the `mcp_selected_schema_bytes` budget.

@@ -447,7 +447,7 @@ fn compactPart(alloc: Allocator, request: Request, users: []const []const u8, mo
         // compaction, is asked once more for just those. Everything before
         // the request is the same, so the provider has it cached.
         const missing = try plan.headings(scratch, .{ .noted = read.noted, .findable = first.prompt.after_conversation });
-        const turns_missing = read.noted.len > 0 and missing.len > 0;
+        const turns_missing = missing.len > 0;
         const summary_missing = plan.fold != null and read.earlier.len == 0;
         if (turns_missing or summary_missing) {
             const so_far = try std.mem.concat(scratch, checkpoint.Entry, &.{ earlier.entries, read.entries });
@@ -1423,12 +1423,39 @@ test "a reply that skips turns with work is asked once more for just those" {
     try testing.expectEqual(@as(usize, 2), result.compacted.entries.len);
     try testing.expectEqualStrings("F2", result.compacted.entries[1].id);
 
-    // A reply in another form entirely is not asked again.
+    // A reply with entries but no turn notes at all is asked once more for
+    // every turn with work.
+    var facts = FakeModel{ .replies = &.{
+        "Facts:\nF1 (T1): the first build printed one",
+        "Turn 1\nIn between: Ran make.\n\nTurn 2\nIn between: Ran make again.\n\nTurn 3\nIn between: Ran make a third time.",
+    } };
+    defer facts.deinit();
+    var only_facts = try compact(testing.allocator, .{ .model = "m", .turns = &turns }, facts.model(), null);
+    defer only_facts.deinit();
+    try testing.expectEqual(@as(usize, 2), facts.calls);
+    try testing.expect(std.mem.endsWith(u8, facts.seen_user.items, "\n\nTurn 1 (T1)\nTurn 2 (T2)\nTurn 3 (T3)\n\nUnder each heading, In between: with what the assistant did before its final reply, then a line for every tool call, starting with its ID, on why it was used and what it showed.\n\n" ++
+        "Then any new entries from those turns under the same sections, each starting with its ID and the turn or tool call it comes from. The highest IDs so far: F1. Number new entries after them. Write only these notes."));
+    try testing.expectEqualStrings("Ran make again.", only_facts.compacted.turns[1].work);
+    try testing.expectEqualStrings("F1", only_facts.compacted.entries[0].id);
+
+    // A reply in another form entirely stays the newest turn's notes, and
+    // the turns with work it did not note are asked once more.
     var prose = FakeModel{ .reply = "The builds ran." };
     defer prose.deinit();
     var other = try compact(testing.allocator, .{ .model = "m", .turns = &turns }, prose.model(), null);
     defer other.deinit();
-    try testing.expectEqual(@as(usize, 1), prose.calls);
+    try testing.expectEqual(@as(usize, 2), prose.calls);
+    try testing.expectEqualStrings("The builds ran.", other.compacted.turns[3].work);
+    try testing.expectEqualStrings("The builds ran.", other.compacted.turns[2].work);
+
+    // When that newest turn is the only one with work, it is noted already.
+    const single = [_]Turn{workedTurn("first", "call-1", "one")};
+    var once = FakeModel{ .reply = "The build ran." };
+    defer once.deinit();
+    var kept = try compact(testing.allocator, .{ .model = "m", .turns = &single }, once.model(), null);
+    defer kept.deinit();
+    try testing.expectEqual(@as(usize, 1), once.calls);
+    try testing.expectEqualStrings("The build ran.", kept.compacted.turns[0].work);
 }
 
 test "after the conversation the model reads only the request, with every turn findable" {
@@ -1504,7 +1531,7 @@ test "a follow-up after the conversation lists only the skipped turns, findable"
 test "the conversation serves only a request for every turn" {
     const output = "x" ** 4000;
     const turns = [_]Turn{ workedTurn("first", "call-1", output), workedTurn("second", "call-2", output) };
-    var model = FakeModel{};
+    var model = FakeModel{ .replies = &.{ "Turn 1\nIn between: Ran the first build.", "Turn 2\nIn between: Ran the second build." } };
     defer model.deinit();
     const one = turnTokens(turns[0]);
     const room = request_overhead_tokens + tokens(&.{system_prompt}) + one + one / 2;
@@ -1512,6 +1539,7 @@ test "the conversation serves only a request for every turn" {
     defer result.deinit();
     try testing.expectEqual(@as(usize, 2), model.calls);
     try testing.expectEqual(@as(usize, 0), model.after_conversation_calls);
+    try testing.expectEqualStrings("Ran the second build.", result.compacted.turns[1].work);
 }
 
 test "the model's notes are checked against the turns and tool calls they name" {

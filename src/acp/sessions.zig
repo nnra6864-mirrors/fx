@@ -83,6 +83,7 @@ pub fn handleNewLibfxSession(
         .agent_step_limit = state.agent_step_limit,
         .max_tool_result_bytes = state.max_tool_result_bytes,
         .fast_mode = state.fast_mode,
+        .ultrafast_mode = state.ultrafast_mode,
         .effort = state.effort,
         .first_call_tool_choice = state.first_call_tool_choice,
         .permission_mode = state.permission_mode,
@@ -138,6 +139,7 @@ pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *
         .agent_step_limit = state.agent_step_limit,
         .max_tool_result_bytes = state.max_tool_result_bytes,
         .fast_mode = state.fast_mode,
+        .ultrafast_mode = state.ultrafast_mode,
         .effort = state.effort,
         .first_call_tool_choice = state.first_call_tool_choice,
         .permission_mode = state.permission_mode,
@@ -169,11 +171,13 @@ pub fn commitWasmSessionLocked(alloc: Allocator, session: *server.ActiveSessionS
     next.context_history_start = 0;
     next.conversation_language = session.session_rt.languageSnapshot();
     next.updated_at_ms = io_mod.milliTimestamp();
+    const model = try alloc.dupe(u8, session.model);
     alloc.free(next.preferences.model);
-    next.preferences.model = try alloc.dupe(u8, session.model);
+    next.preferences.model = model;
     next.preferences.provider = session.provider;
     next.preferences.effort = session.effort;
     next.preferences.fast_mode = session.fast_mode;
+    // Ultrafast keeps its durable baseline, not the process-local request.
     const usage = try session.session_rt.usage.snapshot(alloc);
     if (next.usage) |*old| old.deinit(alloc);
     next.usage = usage;
@@ -190,6 +194,117 @@ pub fn commitWasmSession(alloc: Allocator, session: *server.ActiveSessionState) 
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
     try commitWasmSessionLocked(alloc, session);
+}
+
+pub fn commitWasmUltrafastPreference(alloc: Allocator, session: *server.ActiveSessionState, ultrafast: bool) !void {
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const durable = if (session.wasm_state) |*value| value else return error.SessionPersistenceUnavailable;
+    const previous = durable.preferences.ultrafast_mode;
+    durable.preferences.ultrafast_mode = ultrafast;
+    commitWasmSessionLocked(alloc, session) catch |err| {
+        durable.preferences.ultrafast_mode = previous;
+        return err;
+    };
+    session.ultrafast_mode = ultrafast;
+}
+
+test "ACP ultrafast WASM saves preserve baselines and failed preference writes roll back" {
+    if (comptime host_target.is_wasm) return error.SkipZigTest;
+    const Host = struct {
+        var status: i32 = 0;
+        var stored_ultrafast: bool = false;
+        var expected_revision_matched: bool = false;
+
+        fn commit(
+            _: [*]const u8,
+            _: usize,
+            bytes: [*]const u8,
+            length: usize,
+            expected: [*]const u8,
+            expected_len: usize,
+            revision: [*]u8,
+            capacity: usize,
+            revision_len: *usize,
+        ) callconv(.c) i32 {
+            expected_revision_matched = std.mem.eql(u8, expected[0..expected_len], "next");
+            if (status != 0) return status;
+            var reader = std.Io.Reader.fixed(bytes[0..length]);
+            var saved = session_codec.decodeState(std.testing.allocator, &reader, .{}) catch return -1;
+            defer saved.deinit(std.testing.allocator);
+            stored_ultrafast = saved.preferences.ultrafast_mode;
+            if (capacity < 4) return -1;
+            @memcpy(revision[0..4], "next");
+            revision_len.* = 4;
+            return 0;
+        }
+    };
+    @export(&Host.commit, .{ .name = "fx_session_commit" });
+    Host.status = 0;
+    Host.stored_ultrafast = false;
+    Host.expected_revision_matched = false;
+    const alloc = std.testing.allocator;
+    var state = server.ServerState{
+        .alloc = alloc,
+        .cfg = acpSessionTestConfig(),
+        .writer = jsonrpc.Writer.init(),
+        .configured_model = @constCast("openai/test"),
+        .configured_ultrafast_mode = true,
+    };
+    var active = server.ActiveSessionState{
+        .session_id = @constCast("wasm-test"),
+        .wasm_state = try freshAcpState(&state, alloc, "/workspace"),
+        .model = @constCast("openai/test"),
+        .mode = "default",
+        .workspace_root = "/workspace",
+        .api_key = "",
+        .agent_step_limit = 1,
+        .max_tool_result_bytes = 1024,
+        .fast_mode = false,
+        .ultrafast_mode = false,
+        .effort = .auto,
+        .first_call_tool_choice = .auto,
+        .permission_mode = .ask,
+        .permission_rules = .{},
+        .session_rt = session_runtime.SessionRuntime.initWithProviders(4, state.cfg.provider_set.deferredUsageProviders()),
+        .cancel_flag = .init(false),
+        .pending_prompt_id = null,
+    };
+    defer active.session_rt.deinit(alloc);
+    defer active.wasm_state.?.deinit(alloc);
+    defer if (active.wasm_revision) |revision| alloc.free(revision);
+    try commitWasmSession(alloc, &active);
+    try std.testing.expect(Host.stored_ultrafast);
+    try std.testing.expect(active.wasm_state.?.preferences.ultrafast_mode);
+    try std.testing.expect(!active.ultrafast_mode);
+    try commitWasmUltrafastPreference(alloc, &active, false);
+    try std.testing.expect(!Host.stored_ultrafast);
+    try std.testing.expect(!active.wasm_state.?.preferences.ultrafast_mode);
+    for ([_]i32{ -2, -1 }) |status| {
+        Host.status = status;
+        try std.testing.expectError(
+            if (status == -2) error.SessionRevisionConflict else error.SessionStoreUnavailable,
+            commitWasmUltrafastPreference(alloc, &active, true),
+        );
+        try std.testing.expect(!active.ultrafast_mode);
+        try std.testing.expect(!active.wasm_state.?.preferences.ultrafast_mode);
+        try std.testing.expect(!Host.stored_ultrafast);
+        try std.testing.expect(Host.expected_revision_matched);
+        try std.testing.expectEqualStrings("next", active.wasm_revision.?);
+    }
+    Host.status = 0;
+    try commitWasmUltrafastPreference(alloc, &active, true);
+    try std.testing.expect(active.ultrafast_mode);
+    try std.testing.expect(active.wasm_state.?.preferences.ultrafast_mode);
+    Host.status = -2;
+    try std.testing.expectError(error.SessionRevisionConflict, commitWasmUltrafastPreference(alloc, &active, false));
+    try std.testing.expect(active.ultrafast_mode);
+    try std.testing.expect(active.wasm_state.?.preferences.ultrafast_mode);
+    try std.testing.expect(Host.stored_ultrafast);
+    Host.status = 0;
+    active.ultrafast_mode = false;
+    try commitWasmSession(alloc, &active);
+    try std.testing.expect(Host.stored_ultrafast);
 }
 
 pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
@@ -337,6 +452,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         .model = model_copy,
         .provider = state.provider,
         .fast_mode = state.fast_mode,
+        .ultrafast_mode = state.ultrafast_mode,
         .effort = state.effort,
         .session_rt = session_rt,
         .mcp = session_mcp,
@@ -397,6 +513,7 @@ fn startV2Session(
             .model = state.configured_model,
             .effort = state.effort,
             .fast_mode = state.fast_mode,
+            .ultrafast_mode = state.configured_ultrafast_mode,
         },
         .language = session_runtime.ConversationLanguage.default(),
         .permission_state = .{},
@@ -435,6 +552,7 @@ fn startV2Session(
         .model = model_copy,
         .provider = state.provider,
         .fast_mode = state.fast_mode,
+        .ultrafast_mode = state.ultrafast_mode,
         .effort = state.effort,
         .session_rt = session_rt,
         .mcp = session_mcp,
@@ -485,6 +603,10 @@ fn writeNewSessionResponse(
     if (effortConfigState(state)) |config| {
         try out.writer.writeAll(",");
         try writeEffortConfigOption(&out.writer, config.efforts, config.current);
+    }
+    if (ultrafastConfigState(state)) |current| {
+        try out.writer.writeAll(",");
+        try writeUltrafastConfigOption(&out.writer, current);
     }
     try out.writer.writeAll("],\"modes\":{\"currentModeId\":");
     try writeJsonStr(state.cfg.mode_registry.default_mode_id, &out.writer);
@@ -565,6 +687,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
         .agent_step_limit = state.agent_step_limit,
         .max_tool_result_bytes = state.max_tool_result_bytes,
         .fast_mode = loaded.state.preferences.fast_mode,
+        .ultrafast_mode = restoredUltrafastMode(state, loaded.state.preferences.ultrafast_mode),
         .effort = loaded.state.preferences.effort,
         .first_call_tool_choice = state.first_call_tool_choice,
         .permission_mode = state.permission_mode,
@@ -804,6 +927,7 @@ fn handleRestoreSession(
             .model = state.configured_model,
             .effort = state.effort,
             .fast_mode = state.fast_mode,
+            .ultrafast_mode = state.configured_ultrafast_mode,
         };
         writable = subagent_resume_admission.resumeForExternalPrompt(
             store.?,
@@ -902,6 +1026,7 @@ fn handleRestoreSession(
         .provider = effective_provider,
         .credential = if (staged_credential) |*credential| credential else null,
         .fast_mode = durable.preferences.fast_mode,
+        .ultrafast_mode = restoredUltrafastMode(state, durable.preferences.ultrafast_mode),
         .effort = durable.preferences.effort,
         .session_rt = session_rt,
         .mcp = session_mcp,
@@ -1139,6 +1264,10 @@ fn writeLoadSessionResponse(
         try out.writer.writeAll(",");
         try writeEffortConfigOption(&out.writer, config.efforts, config.current);
     }
+    if (ultrafastConfigState(state)) |current| {
+        try out.writer.writeAll(",");
+        try writeUltrafastConfigOption(&out.writer, current);
+    }
     try out.writer.writeAll("],\"modes\":{\"currentModeId\":");
     try writeJsonStr(state.cfg.mode_registry.default_mode_id, &out.writer);
     try out.writer.writeAll(",\"availableModes\":");
@@ -1176,11 +1305,16 @@ fn freshAcpState(
             .model = model,
             .effort = state.effort,
             .fast_mode = state.fast_mode,
+            .ultrafast_mode = state.configured_ultrafast_mode,
         },
         .history = history,
         .total_input_tokens = 0,
         .total_output_tokens = 0,
     };
+}
+
+fn restoredUltrafastMode(state: *const server.ServerState, preference: bool) bool {
+    return state.process_ultrafast_override orelse preference;
 }
 
 const SessionActivation = struct {
@@ -1192,6 +1326,7 @@ const SessionActivation = struct {
     provider: model_provider.ProviderId,
     credential: ?*credentials.Credential = null,
     fast_mode: bool,
+    ultrafast_mode: bool,
     effort: types.ReasoningEffort,
     session_rt: session_runtime.SessionRuntime,
     mcp: ?*mcp_runtime.McpRuntime,
@@ -1334,6 +1469,7 @@ fn activateSession(
         .agent_step_limit = state.agent_step_limit,
         .max_tool_result_bytes = state.max_tool_result_bytes,
         .fast_mode = activation.fast_mode,
+        .ultrafast_mode = activation.ultrafast_mode,
         .effort = activation.effort,
         .first_call_tool_choice = state.first_call_tool_choice,
         .permission_mode = state.permission_mode,
@@ -2229,6 +2365,26 @@ pub fn effortConfigState(state: *server.ServerState) ?EffortConfigState {
     return .{ .efforts = capabilities.reasoning_efforts, .current = active.effort };
 }
 
+/// Active-session ultrafast selector state. The option is exposed only for a
+/// verified Gateway catalog model with the explicit capability.
+pub fn ultrafastConfigState(state: *server.ServerState) ?bool {
+    const active = if (state.active_session) |*session| session else return null;
+    if (active.provider != .gateway) return null;
+    const bundle = state.cfg.provider_set.select(active.provider);
+    const capabilities = state.capability_resolver.available(
+        active.model,
+        bundle.fallbackModelCapabilities(active.model),
+    );
+    if (!capabilities.supports_ultrafast_mode) return null;
+    return active.ultrafast_mode;
+}
+
+pub fn writeUltrafastConfigOption(w: *std.Io.Writer, current: bool) !void {
+    try w.writeAll("{\"id\":\"ultrafast\",\"name\":\"Ultrafast Mode\",\"description\":\"Uses the model's ultrafast Gateway lane\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":");
+    try writeJsonStr(if (current) "true" else "false", w);
+    try w.writeAll(",\"options\":[{\"value\":\"false\",\"name\":\"off\"},{\"value\":\"true\",\"name\":\"on\"}]}");
+}
+
 pub fn effortSupportedBy(efforts: model_capabilities.ReasoningEffortOptions, effort: types.ReasoningEffort) bool {
     if (effort == .auto) return true;
     for (efforts.slice()) |option| {
@@ -2886,6 +3042,76 @@ test "ACP project MCP loading expands workspace environment templates" {
     try std.testing.expectEqualStrings("node", config.command.?);
     try std.testing.expectEqualStrings("fallback", config.args[0]);
     try std.testing.expectEqualStrings("secret-value", config.env[0].value);
+}
+
+test "ACP ultrafast new load and resume preserve configured baselines on both backends" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_path);
+    const env = try AcpSessionTestHome.install(alloc, home_path);
+    defer env.deinit();
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "ultrafast.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    for ([_]bool{ false, true }) |v2_backend| {
+        for ([_]bool{ false, true }) |baseline| {
+            for ([_]?bool{ null, false, true }) |process| {
+                var arena_state = std.heap.ArenaAllocator.init(alloc);
+                defer arena_state.deinit();
+                const arena = arena_state.allocator();
+                var state = try initAcpSessionTestState(arena, workspace_path, capture);
+                defer state.deinit();
+                state.cfg.auth_mode = .host_managed;
+                state.credential_source = .host_managed;
+                state.cfg.minimal_kernel = true;
+                state.cfg.allow_acp_mcp = false;
+                state.cfg.home_override = home_path;
+                state.configured_ultrafast_mode = baseline;
+                state.process_ultrafast_override = process;
+                state.ultrafast_mode = process orelse baseline;
+                if (v2_backend) {
+                    state.sessions_v2_requested = true;
+                    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+                }
+                var msg = jsonrpc.Message{
+                    .id = .{ .integer = 1 },
+                    .method = "session/new",
+                    .params_raw = "{\"mcpServers\":[]}",
+                };
+                try handleNewSession(&state, arena, &msg);
+                const active = &state.active_session.?;
+                try std.testing.expectEqual(process orelse baseline, active.ultrafast_mode);
+                if (active.v2) |v2| {
+                    const preferences = try v2.currentPreferences(arena);
+                    try std.testing.expectEqual(baseline, preferences.ultrafast_mode);
+                    try v2.commitTurn(.{ .assistant = .{
+                        .user = .{ .text = @constCast("saved request") },
+                        .assistant = @constCast("saved answer"),
+                    } }, types.ConversationLanguage.default());
+                } else {
+                    try std.testing.expectEqual(baseline, active.writable.?.state.preferences.ultrafast_mode);
+                }
+                const id = try arena.dupe(u8, active.session_id);
+                inline for (.{ handleLoadSession, handleResumeSession }) |restore| {
+                    try server.releaseActiveSession(&state);
+                    msg.params_raw = try std.fmt.allocPrint(arena, "{{\"sessionId\":\"{s}\",\"mcpServers\":[]}}", .{id});
+                    try restore(&state, arena, &msg);
+                    const resumed = &state.active_session.?;
+                    try std.testing.expectEqual(process orelse baseline, resumed.ultrafast_mode);
+                    const saved = if (resumed.v2) |v2|
+                        (try v2.currentPreferences(arena)).ultrafast_mode
+                    else
+                        resumed.writable.?.state.preferences.ultrafast_mode;
+                    try std.testing.expectEqual(baseline, saved);
+                }
+            }
+        }
+    }
 }
 
 test "ACP host-disabled new load and resume skip project MCP effects" {

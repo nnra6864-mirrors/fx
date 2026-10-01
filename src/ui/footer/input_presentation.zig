@@ -1613,6 +1613,23 @@ test "compose hint row prioritizes the armed interrupt hint and shrinks it on na
     try std.testing.expect(std.mem.find(u8, clear_only.items, "esc again to clear") != null);
 }
 
+test "compose hint row carries the Ultrafast marker projection" {
+    var input = InputRuntime{};
+    defer input.deinit(std.testing.allocator);
+    const ctx: RenderContext = .{
+        .stream = .{},
+        .has_api_key = true,
+        .model = "openai/gpt-6-astra",
+        .effort = types.ReasoningEffort.literal("xhigh"),
+        .model_supports_effort = true,
+        .statusline = .{ .ultrafast_indicator_active = true },
+        .input = &input,
+    };
+    var row = try composeHintRow(std.testing.allocator, false, ctx, 80);
+    defer row.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, row.items, "gpt-6-astra · xhigh · \x1b[38;2;255;204;0m⚡︎") != null);
+}
+
 test "compose hint row keeps model in left hint text" {
     var input = InputRuntime{};
     defer input.deinit(std.testing.allocator);

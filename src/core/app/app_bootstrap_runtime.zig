@@ -121,6 +121,8 @@ fn BootstrapDeps(comptime App: type) type {
             types.ReasoningEffort,
             bool,
             bool,
+            bool,
+            ?bool,
             ?types.ReasoningEffort,
             ?bool,
             ?model_provider.ProviderId,
@@ -154,6 +156,7 @@ pub fn Runtime(comptime App: type) type {
             model: ?[]const u8 = null,
             effort: ?types.ReasoningEffort = null,
             fast: ?bool = null,
+            ultrafast: ?bool = null,
             /// Borrowed from the launch arguments; StartupState dupes on apply.
             provider_order: ?[]const []const u8 = null,
             provider_strict: ?bool = null,
@@ -217,6 +220,8 @@ pub fn Runtime(comptime App: type) type {
             effort: types.ReasoningEffort,
             fast_mode: bool,
             fast_mode_model_bound: bool,
+            configured_ultrafast_mode: bool,
+            ultrafast_process_override: ?bool,
             effort_process_override: ?types.ReasoningEffort,
             fast_process_override: ?bool,
             provider_process_override: ?model_provider.ProviderId,
@@ -230,6 +235,8 @@ pub fn Runtime(comptime App: type) type {
                 effort,
                 fast_mode,
                 fast_mode_model_bound,
+                configured_ultrafast_mode,
+                ultrafast_process_override,
                 effort_process_override,
                 fast_process_override,
                 provider_process_override,
@@ -436,7 +443,8 @@ pub fn Runtime(comptime App: type) type {
             // configured and stored preferences keep their pre-flag values.
             const persisted_effort = startup.effort;
             const persisted_fast_mode = startup.fast_mode;
-            startup.applyLaunchTurnOverrides(launch_overrides.effort, launch_overrides.fast);
+            const persisted_ultrafast_mode = startup.configured_ultrafast_mode;
+            startup.applyLaunchTurnOverrides(launch_overrides.effort, launch_overrides.fast, launch_overrides.ultrafast);
             if (launch_overrides.provider_order != null or launch_overrides.provider_strict != null) {
                 try startup.applyLaunchProviderRouting(app.alloc, launch_overrides.provider_order, launch_overrides.provider_strict);
             }
@@ -449,6 +457,8 @@ pub fn Runtime(comptime App: type) type {
                 persisted_effort,
                 persisted_fast_mode,
                 startup.fast_mode_model_bound,
+                persisted_ultrafast_mode,
+                startup.ultrafast_process_override,
                 launch_overrides.effort,
                 launch_overrides.fast,
                 launch_overrides.provider,
@@ -461,6 +471,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "context_limits")) app.context_limits = startup.context_limits;
             app.worker.agent_turn_settings.first_call_tool_choice = startup.first_call_tool_choice;
             app.worker.agent_turn_settings.fast_mode = startup.fast_mode;
+            app.worker.agent_turn_settings.ultrafast_mode = startup.ultrafast_mode;
             app.worker.agent_turn_settings.effort = startup.effort;
             // Worker-owned memory uses the C allocator, matching worker deinit.
             try app.worker.setProviderRouting(std.heap.c_allocator, startup.provider_order, startup.provider_strict);
@@ -674,6 +685,8 @@ const TestCapture = struct {
     configured_effort: types.ReasoningEffort = .auto,
     configured_fast_mode: bool = false,
     configured_fast_mode_model_bound: bool = false,
+    configured_ultrafast_mode: bool = false,
+    ultrafast_process_override: ?bool = null,
     effort_process_override: ?types.ReasoningEffort = null,
     fast_process_override: ?bool = null,
     provider_process_override: ?model_provider.ProviderId = null,
@@ -905,6 +918,9 @@ fn makeStartupState(alloc: Allocator) !app_lifecycle.StartupState {
     state.context_enabled = false;
     state.fast_mode = true;
     state.fast_mode_model_bound = true;
+    state.configured_ultrafast_mode = true;
+    state.ultrafast_mode = false;
+    state.ultrafast_process_override = false;
     state.auto_upgrade = false;
     state.update_channel = .dev;
     state.effort = types.ReasoningEffort.literal("high");
@@ -973,6 +989,8 @@ fn configureSessionPreferencesForTest(
     effort: types.ReasoningEffort,
     fast_mode: bool,
     fast_mode_model_bound: bool,
+    configured_ultrafast_mode: bool,
+    ultrafast_process_override: ?bool,
     effort_process_override: ?types.ReasoningEffort,
     fast_process_override: ?bool,
     provider_process_override: ?model_provider.ProviderId,
@@ -998,6 +1016,8 @@ fn configureSessionPreferencesForTest(
     capture.configured_effort = effort;
     capture.configured_fast_mode = fast_mode;
     capture.configured_fast_mode_model_bound = fast_mode_model_bound;
+    capture.configured_ultrafast_mode = configured_ultrafast_mode;
+    capture.ultrafast_process_override = ultrafast_process_override;
     capture.effort_process_override = effort_process_override;
     capture.fast_process_override = fast_process_override;
     capture.provider_process_override = provider_process_override;
@@ -1078,17 +1098,21 @@ test "app_bootstrap_runtime applies interactive launch flag overrides" {
         .model = "launch-model",
         .effort = types.ReasoningEffort.literal("low"),
         .fast = true,
+        .ultrafast = false,
     });
 
     try std.testing.expectEqualStrings("launch-model", capture.runtimeModel());
     try std.testing.expectEqualStrings("launch-model", app.selected_model.items);
     try std.testing.expect(app.fast_mode);
+    try std.testing.expect(!app.worker.agent_turn_settings.ultrafast_mode);
     try std.testing.expect(app.effort.eql(types.ReasoningEffort.literal("low")));
     // Stored preferences keep the configured values; the flags stay per-launch.
     try std.testing.expect(capture.configured_effort.eql(types.ReasoningEffort.literal("high")));
     try std.testing.expect(!capture.configured_fast_mode);
     // --fast binds to the launch model so the footer indicator reflects it.
     try std.testing.expect(capture.configured_fast_mode_model_bound);
+    try std.testing.expect(capture.configured_ultrafast_mode);
+    try std.testing.expectEqual(@as(?bool, false), capture.ultrafast_process_override);
     try std.testing.expectEqualStrings("configured-model", capture.configuredModel());
     // The process overrides carry the flag values so a resume re-applies them.
     try std.testing.expect(capture.effort_process_override.?.eql(types.ReasoningEffort.literal("low")));
@@ -1178,6 +1202,8 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
     );
     try std.testing.expect(capture.configured_fast_mode);
     try std.testing.expect(capture.configured_fast_mode_model_bound);
+    try std.testing.expect(capture.configured_ultrafast_mode);
+    try std.testing.expectEqual(@as(?bool, false), capture.ultrafast_process_override);
     try std.testing.expectEqual(
         update_target.Channel.dev,
         app.upgrader.channel(),
@@ -1211,6 +1237,7 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
     try std.testing.expectEqual(@as(usize, 131072), app.worker.agent_turn_settings.max_tool_result_bytes);
     try std.testing.expectEqual(types.ToolChoice.none, app.worker.agent_turn_settings.first_call_tool_choice);
     try std.testing.expect(app.worker.agent_turn_settings.fast_mode);
+    try std.testing.expect(!app.worker.agent_turn_settings.ultrafast_mode);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.worker.agent_turn_settings.effort);
     try std.testing.expect(!app.context_enabled);
     try std.testing.expect(app.fast_mode);

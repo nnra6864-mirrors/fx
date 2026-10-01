@@ -386,6 +386,7 @@ pub fn Handlers(comptime App: type) type {
                 .show_credits = commandShowCredits,
                 .paste_clipboard = commandPasteClipboard,
                 .toggle_fast = commandToggleFast,
+                .handle_ultrafast = commandHandleUltrafast,
                 .handle_statusline = commandHandleStatusline,
                 .rename_session = commandRenameSession,
                 .handle_notifications = commandHandleNotifications,
@@ -2057,6 +2058,11 @@ pub fn Handlers(comptime App: type) type {
         fn commandToggleFast(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try session_commands.Commands(App).toggleFast(app);
+        }
+
+        fn commandHandleUltrafast(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try session_commands.Commands(App).handleUltrafast(app, rest);
         }
 
         fn commandHandleStatusline(ctx: *anyopaque, rest: []const u8) !void {
@@ -3997,10 +4003,16 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
     if (comptime provider_runtime.supported(App)) snapshot.model = provider_runtime.model(app);
     if (comptime @hasField(App, "effort")) snapshot.effort = app.effort.displayLabel();
     if (comptime @hasField(App, "fast_mode")) snapshot.fast_mode = app.fast_mode;
+    if (comptime @hasField(App, "worker") and
+        @hasField(@TypeOf(app.worker), "agent_turn_settings"))
+    {
+        snapshot.ultrafast_mode = app.worker.agent_turn_settings.ultrafast_mode;
+    }
     if (comptime @hasDecl(App, "resolvedModelCapabilities") and provider_runtime.supported(App)) {
         const capabilities = app.resolvedModelCapabilities(provider_runtime.model(app));
         snapshot.reasoning_efforts = capabilities.reasoning_efforts;
         snapshot.supports_fast_mode = capabilities.supports_fast_mode;
+        snapshot.supports_ultrafast_mode = capabilities.supports_ultrafast_mode;
     }
     if (comptime @hasField(App, "permission_engine")) snapshot.permission_mode = @tagName(app.permission_engine.mode);
     if (comptime @hasField(App, "input_runtime")) {
@@ -4140,6 +4152,15 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
         .fast_mode => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
             if (enabled != app.fast_mode) try session_commands.Commands(@TypeOf(app.*)).toggleFast(app);
+        },
+        .ultrafast_mode => {
+            const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
+            if (enabled != app.worker.agent_turn_settings.ultrafast_mode) {
+                try session_commands.Commands(@TypeOf(app.*)).handleUltrafast(
+                    app,
+                    if (enabled) "on" else "off",
+                );
+            }
         },
         .permission_mode => try session_commands.Commands(@TypeOf(app.*)).handlePermissions(app, change.value),
         .sound_level => try handleNotificationsCommand(app, change.value),

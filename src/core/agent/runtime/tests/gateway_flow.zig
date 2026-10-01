@@ -3327,7 +3327,7 @@ fn expectNotesAfterConversation(gateway: *FakeGateway, index: usize, agent_index
 fn compactBehindSystemPrompt(comptime system_bytes: usize) !usize {
     const alloc = std.testing.allocator;
     var gateway = FakeGateway.init(alloc, &.{
-        .{ .content = "The earlier work is complete. Preserve the recent facts." },
+        .{ .content = "Turn 1\nIn between: The earlier work is complete. Preserve the recent facts." },
         .{ .content = "Continued after compaction." },
     });
     defer gateway.deinit();
@@ -3815,7 +3815,7 @@ test "retained context automatic compaction archives oversized parallel results 
     };
     var gateway = FakeGateway.init(alloc, &.{
         .{ .tool_calls = &calls },
-        .{ .content = "Earlier work established the project facts." },
+        .{ .content = "Turn 1\nIn between: Earlier work established the project facts." },
         .{ .content = "Continued from the observed results." },
     });
     defer gateway.deinit();

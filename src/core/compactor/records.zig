@@ -145,6 +145,10 @@ pub fn save(alloc: Allocator, store: Store, id: Id, content: []const u8) Store.E
     return store.write(alloc, fileName(&buffer, id), content);
 }
 
+/// No session numbers this many turns, tool calls or compactions. A saved
+/// number above it is damage, and numbering on from it would overflow.
+pub const max_number: usize = 1 << 30;
+
 /// The highest turn, tool call and ledger numbers saved; zero when there are
 /// none.
 pub const Highest = struct { turns: usize = 0, tools: usize = 0, ledgers: usize = 0 };
@@ -153,6 +157,10 @@ pub fn highestSaved(arena: Allocator, store: Store) Store.Error!Highest {
     var highest: Highest = .{};
     for (try store.list(arena)) |name| {
         const id = parseFileName(name) orelse continue;
+        if (id.number > max_number) {
+            trace.log(true, "a saved record numbered past every session is left out of the numbering name={s}", .{name});
+            continue;
+        }
         switch (id.kind) {
             .turn => highest.turns = @max(highest.turns, id.number),
             .tool => highest.tools = @max(highest.tools, id.number),

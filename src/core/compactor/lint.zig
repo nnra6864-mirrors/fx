@@ -9,7 +9,8 @@
 //!   compaction has them;
 //! - what an entry replaces is an earlier entry;
 //! - a rule quotes the user word for word;
-//! - a note does not call a failed tool call a success.
+//! - a note, or an entry about one tool call, does not call a failed tool
+//!   call a success.
 //! What fails a check stays, marked `[check: ...]`, so the agent confirms it
 //! before relying on it. Nothing is dropped or rewritten.
 
@@ -93,12 +94,7 @@ pub fn check(arena: Allocator, written: ledger.Written, earlier: []const checkpo
         // and may speak of calls that worked and calls that failed.
         const cited = try citations(arena, note.text);
         const shared = cited.len > 0 and cited[0].first == note.number and cited[0].last > note.number;
-        if (!shared) if (findRecord(sources.tools, note.number)) |record| {
-            if (record.failed and callsSuccess(note.text)) {
-                counts.failed_as_success += 1;
-                try problems.add(arena, "T{d} failed", .{note.number});
-            }
-        };
+        if (!shared) try checkFailedCall(arena, &problems, note.text, note.number, sources.tools, counts);
         slot.* = .{ .number = note.number, .text = try problems.mark(arena, note.text, counts) };
     }
     result.tools = tools;
@@ -107,14 +103,16 @@ pub fn check(arena: Allocator, written: ledger.Written, earlier: []const checkpo
     for (entries, written.entries, 0..) |*slot, entry, index| {
         var problems: Problems = .{};
         const cited = try citations(arena, entry.text);
-        // Rules and facts claim exact words and values, so they must say
-        // where they come from. The turn in progress has no ID yet.
+        // Every entry says where it comes from, as the request asks. The
+        // turn in progress has no ID yet.
         const sourced = cited.len > 0 or std.ascii.findIgnoreCase(entry.text, "turn in progress") != null;
-        if (!sourced and (entry.id[0] == 'R' or entry.id[0] == 'F')) {
+        if (!sourced) {
             counts.no_source += 1;
             try problems.add(arena, "no source", .{});
         }
         try checkCitations(arena, &problems, entry.text, sources, counts);
+        // An entry about one tool call states its result, like a note on it.
+        if (entry.id[0] != 'R') if (onlyTool(cited)) |number| try checkFailedCall(arena, &problems, entry.text, number, sources.tools, counts);
         if (entry.id[0] == 'R') {
             try checkQuote(arena, &problems, entry.text, users.items, counts);
         } else if (namesThisCompaction(cited, sources)) {
@@ -447,6 +445,26 @@ fn numericPart(arena: Allocator, value: []const u8) Allocator.Error!?[]const u8 
 const success_words = [_][]const u8{ "pass", "passed", "passes", "passing", "succeeded", "success", "successful", "successfully", "works", "worked", "green" };
 const failure_words = [_][]const u8{ "fail", "failed", "fails", "failing", "failure", "error", "errors", "broke", "broken", "crash", "crashed", "not", "no", "timeout", "rejected", "denied", "missing", "exit", "nonzero" };
 
+/// Marks `text` about tool call `number` when the call failed and the text
+/// calls it a success.
+fn checkFailedCall(arena: Allocator, problems: *Problems, text: []const u8, number: usize, tools: []const Record, counts: *Counts) Allocator.Error!void {
+    const record = findRecord(tools, number) orelse return;
+    if (!record.failed or !callsSuccess(text)) return;
+    counts.failed_as_success += 1;
+    try problems.add(arena, "T{d} failed", .{number});
+}
+
+/// The tool call `cited` names, when it names exactly one and not a run.
+fn onlyTool(cited: []const Citation) ?usize {
+    var found: ?usize = null;
+    for (cited) |citation| {
+        if (citation.kind != 'T') continue;
+        if (found != null or citation.last != citation.first) return null;
+        found = citation.first;
+    }
+    return found;
+}
+
 /// `note` says a call worked and says nothing of it failing.
 fn callsSuccess(note: []const u8) bool {
     var saw_success = false;
@@ -588,6 +606,34 @@ test "what an entry gets wrong is marked, and the entry stays" {
     try testing.expectEqual(@as(usize, 2), counts.unfound_values);
     try testing.expectEqual(@as(usize, 1), counts.bad_replaces);
     try testing.expectEqual(@as(usize, 2), counts.unquoted);
+}
+
+test "every entry names its source, and one about a failed call does not call it a success" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const entries = [_]checkpoint.Entry{
+        .{ .id = "D1", .text = "D1: keep the fix small" },
+        .{ .id = "S1", .text = "S1: the tests run" },
+        .{ .id = "O1", .text = "O1: which branch ships it?" },
+        .{ .id = "F1", .text = "F1 (T7): the tests passed" },
+        .{ .id = "S2", .text = "S2 (M4, T7): the suite is green" },
+        // Several calls, or a run of them, may have failed and then worked.
+        .{ .id = "S3", .text = "S3 (T7, T8): the suite passes after the fix" },
+        .{ .id = "S4", .text = "S4 (T7\u{2013}T9): tests pass" },
+    };
+    var counts: Counts = .{};
+    const result = try checked(arena, .{ .entries = &entries }, &.{}, &counts);
+    try testing.expectEqualStrings("D1: keep the fix small [check: no source]", result.entries[0].text);
+    try testing.expectEqualStrings("S1: the tests run [check: no source]", result.entries[1].text);
+    try testing.expectEqualStrings("O1: which branch ships it? [check: no source]", result.entries[2].text);
+    try testing.expectEqualStrings("F1 (T7): the tests passed [check: T7 failed]", result.entries[3].text);
+    try testing.expectEqualStrings("S2 (M4, T7): the suite is green [check: T7 failed]", result.entries[4].text);
+    try testing.expectEqualStrings(entries[5].text, result.entries[5].text);
+    try testing.expectEqualStrings(entries[6].text, result.entries[6].text);
+    try testing.expectEqual(@as(usize, 5), counts.marked);
+    try testing.expectEqual(@as(usize, 3), counts.no_source);
+    try testing.expectEqual(@as(usize, 2), counts.failed_as_success);
 }
 
 test "an entry may replace one written before it in the same reply" {

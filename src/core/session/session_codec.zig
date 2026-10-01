@@ -19,6 +19,7 @@ pub const DurableSessionPreferences = struct {
     model: []u8,
     effort: types.ReasoningEffort,
     fast_mode: bool,
+    ultrafast_mode: bool = false,
 
     pub fn deinit(self: *DurableSessionPreferences, alloc: Allocator) void {
         alloc.free(self.model);
@@ -31,6 +32,7 @@ pub const DurableSessionPreferences = struct {
             .model = try alloc.dupe(u8, self.model),
             .effort = self.effort,
             .fast_mode = self.fast_mode,
+            .ultrafast_mode = self.ultrafast_mode,
         };
     }
 };
@@ -39,10 +41,19 @@ pub const DurableSessionPreferences = struct {
 pub fn parse_preferences(alloc: Allocator, value: std.json.Value) !DurableSessionPreferences {
     const raw = try requireObject(value);
     const legacy = raw.contains("connection_id") or raw.contains("model_id");
+    const has_ultrafast_mode = raw.contains("ultrafast_mode");
     const object = if (legacy)
-        try exactObject(value, &.{ "connection_id", "model_id", "effort", "fast_mode" })
+        if (has_ultrafast_mode)
+            try exactObject(value, &.{ "connection_id", "model_id", "effort", "fast_mode", "ultrafast_mode" })
+        else
+            try exactObject(value, &.{ "connection_id", "model_id", "effort", "fast_mode" })
     else if (raw.contains("provider"))
-        try exactObject(value, &.{ "provider", "model", "effort", "fast_mode" })
+        if (has_ultrafast_mode)
+            try exactObject(value, &.{ "provider", "model", "effort", "fast_mode", "ultrafast_mode" })
+        else
+            try exactObject(value, &.{ "provider", "model", "effort", "fast_mode" })
+    else if (has_ultrafast_mode)
+        try exactObject(value, &.{ "model", "effort", "fast_mode", "ultrafast_mode" })
     else
         try exactObject(value, &.{ "model", "effort", "fast_mode" });
     const provider: model_provider.ProviderId = if (legacy) blk: {
@@ -56,7 +67,8 @@ pub fn parse_preferences(alloc: Allocator, value: std.json.Value) !DurableSessio
     try validateModel(model);
     const effort = types.ReasoningEffort.parse(try requireString(object, "effort")) orelse return error.InvalidDurableField;
     const fast_mode = try requireBool(object, "fast_mode");
-    return .{ .provider = provider, .model = try alloc.dupe(u8, model), .effort = effort, .fast_mode = fast_mode };
+    const ultrafast_mode = if (has_ultrafast_mode) try requireBool(object, "ultrafast_mode") else false;
+    return .{ .provider = provider, .model = try alloc.dupe(u8, model), .effort = effort, .fast_mode = fast_mode, .ultrafast_mode = ultrafast_mode };
 }
 
 test "legacy connection preferences decode through the shared state codec" {
@@ -134,6 +146,8 @@ pub const RecoveryCheckpoint = struct {
     authority: TurnAuthority,
     requested_fast_mode: bool,
     fast_mode: bool,
+    requested_ultrafast_mode: bool = false,
+    ultrafast_mode: bool = false,
     max_provider_attempts: usize,
     consumed_provider_attempts: usize,
     outstanding_reservation: bool = false,
@@ -177,6 +191,8 @@ pub const RecoveryCheckpoint = struct {
             .authority = authority,
             .requested_fast_mode = self.requested_fast_mode,
             .fast_mode = self.fast_mode,
+            .requested_ultrafast_mode = self.requested_ultrafast_mode,
+            .ultrafast_mode = self.ultrafast_mode,
             .max_provider_attempts = self.max_provider_attempts,
             .consumed_provider_attempts = self.consumed_provider_attempts,
             .outstanding_reservation = self.outstanding_reservation,
@@ -307,6 +323,8 @@ pub const SessionMetadata = struct {
     model: []const u8,
     effort: []const u8,
     fast_mode: bool,
+    /// Omitted when false so schema-v4 headers remain readable by old binaries.
+    ultrafast_mode: ?bool = null,
     title: ?[]const u8 = null,
     subagent_child: bool = false,
 };
@@ -322,7 +340,11 @@ pub fn encodeSessionMetadata(
     try validateSessionMetadata(metadata);
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    try std.json.Stringify.value(metadata, .{}, &out.writer);
+    try std.json.Stringify.value(
+        metadata,
+        .{ .emit_null_optional_fields = false },
+        &out.writer,
+    );
     if (out.written().len == 0 or out.written().len > max_session_metadata_bytes) {
         return error.SessionMetadataTooLarge;
     }
@@ -481,15 +503,21 @@ pub fn parseDurableBytes(alloc: Allocator, value: std.json.Value) ![]u8 {
                 return error.InvalidDurableBytes;
             if (std.unicode.utf8ValidateSlice(decoded)) return error.InvalidDurableBytes;
 
-            const canonical_len = std.base64.standard.Encoder.calcSize(decoded.len);
-            const canonical = try alloc.alloc(u8, canonical_len);
-            defer alloc.free(canonical);
-            const written = std.base64.standard.Encoder.encode(canonical, decoded);
-            if (!std.mem.eql(u8, written, encoded)) return error.InvalidDurableBytes;
             return decoded;
         },
         else => return error.InvalidDurableBytes,
     }
+}
+
+test "durable binary decoding uses only decoded storage" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"encoding\":\"base64\",\"data\":\"/w==\"}", .{});
+    defer parsed.deinit();
+    var storage: [1]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const alloc = fixed.allocator();
+    const decoded = try parseDurableBytes(alloc, parsed.value);
+    defer alloc.free(decoded);
+    try std.testing.expectEqualSlices(u8, "\xff", decoded);
 }
 
 pub fn encodeState(state: DurableSessionState, writer: *std.Io.Writer) !EncodeSummary {
@@ -926,9 +954,13 @@ fn writeState(writer: *std.Io.Writer, state: DurableSessionState) !void {
     try writeJsonString(writer, state.preferences.model);
     try writer.writeAll(",\"effort\":");
     try writeJsonString(writer, state.preferences.effort.label());
-    try writer.print(",\"fast_mode\":{s},\"provider\":", .{
+    try writer.print(",\"fast_mode\":{s}", .{
         if (state.preferences.fast_mode) "true" else "false",
     });
+    if (state.preferences.ultrafast_mode) {
+        try writer.writeAll(",\"ultrafast_mode\":true");
+    }
+    try writer.writeAll(",\"provider\":");
     try std.json.Stringify.value(state.preferences.provider, .{}, writer);
     try writer.writeAll("},\"history\":[");
     for (state.history, 0..) |turn, i| {
@@ -1093,9 +1125,20 @@ pub fn writeRecoveryCheckpoint(writer: *std.Io.Writer, checkpoint: RecoveryCheck
         try writer.writeAll("null");
     }
     try writer.writeByte('}');
-    try writer.print(",\"requested_fast_mode\":{s},\"fast_mode\":{s},\"max_provider_attempts\":{d},\"consumed_provider_attempts\":{d},\"outstanding_reservation\":{s}}}", .{
+    try writer.print(",\"requested_fast_mode\":{s},\"fast_mode\":{s}", .{
         if (checkpoint.requested_fast_mode) "true" else "false",
         if (checkpoint.fast_mode) "true" else "false",
+    });
+    // Old readers exact-match the v2 checkpoint keys. Keep the optional pair
+    // absent at its all-false default, but preserve both values once either
+    // reports an Ultra selection.
+    if (checkpoint.requested_ultrafast_mode or checkpoint.ultrafast_mode) {
+        try writer.print(",\"requested_ultrafast_mode\":{s},\"ultrafast_mode\":{s}", .{
+            if (checkpoint.requested_ultrafast_mode) "true" else "false",
+            if (checkpoint.ultrafast_mode) "true" else "false",
+        });
+    }
+    try writer.print(",\"max_provider_attempts\":{d},\"consumed_provider_attempts\":{d},\"outstanding_reservation\":{s}}}", .{
         checkpoint.max_provider_attempts,
         checkpoint.consumed_provider_attempts,
         if (checkpoint.outstanding_reservation) "true" else "false",
@@ -1343,11 +1386,17 @@ pub fn parseRecoveryCheckpoint(alloc: Allocator, value: std.json.Value) !Recover
                 "cause",     "action",                "tool_state",                 "route_model",             "requested_fast_mode",
                 "fast_mode", "max_provider_attempts", "consumed_provider_attempts", "outstanding_reservation",
             }),
-        2 => try exactObject(value, &.{
-            "version",   "turn_id",               "user",                       "assistant_source",        "execution",
-            "cause",     "action",                "tool_state",                 "authority",               "requested_fast_mode",
-            "fast_mode", "max_provider_attempts", "consumed_provider_attempts", "outstanding_reservation",
-        }),
+        2 => if (raw_object.contains("requested_ultrafast_mode") or raw_object.contains("ultrafast_mode"))
+            try exactObject(value, &.{
+                "version",             "turn_id",   "user",                     "assistant_source", "execution",             "cause",                      "action",                  "tool_state", "authority",
+                "requested_fast_mode", "fast_mode", "requested_ultrafast_mode", "ultrafast_mode",   "max_provider_attempts", "consumed_provider_attempts", "outstanding_reservation",
+            })
+        else
+            try exactObject(value, &.{
+                "version",   "turn_id",               "user",                       "assistant_source",        "execution",
+                "cause",     "action",                "tool_state",                 "authority",               "requested_fast_mode",
+                "fast_mode", "max_provider_attempts", "consumed_provider_attempts", "outstanding_reservation",
+            }),
         else => return error.InvalidDurableField,
     };
     const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat, null);
@@ -1393,6 +1442,8 @@ pub fn parseRecoveryCheckpoint(alloc: Allocator, value: std.json.Value) !Recover
         .authority = authority,
         .requested_fast_mode = try requireBool(object, "requested_fast_mode"),
         .fast_mode = try requireBool(object, "fast_mode"),
+        .requested_ultrafast_mode = if (object.contains("requested_ultrafast_mode")) try requireBool(object, "requested_ultrafast_mode") else false,
+        .ultrafast_mode = if (object.contains("ultrafast_mode")) try requireBool(object, "ultrafast_mode") else false,
         .max_provider_attempts = max_provider_attempts,
         .consumed_provider_attempts = consumed_provider_attempts,
         .outstanding_reservation = try requireBool(object, "outstanding_reservation"),
@@ -4947,6 +4998,35 @@ test "codec structural helpers enforce exact objects and required strings" {
     try std.testing.expectEqualStrings("value", try requireString(valid_object, "known"));
 }
 
+test "default ultrafast state writes the legacy-compatible preference shape" {
+    const alloc = std.testing.allocator;
+    const state = DurableSessionState{
+        .id = @constCast("legacy-compatible"),
+        .origin_workspace_root = @constCast("/workspace"),
+        .workspace_root = @constCast("/workspace"),
+        .created_at_ms = 1,
+        .updated_at_ms = 2,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .preferences = .{
+            .model = @constCast("test/model"),
+            .effort = .auto,
+            .fast_mode = false,
+        },
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+    };
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    _ = try encodeState(state, &encoded.writer);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"ultrafast_mode\"") == null);
+
+    var source = std.Io.Reader.fixed(encoded.written());
+    var decoded = try decodeState(alloc, &source, .{});
+    defer decoded.deinit(alloc);
+    try std.testing.expect(!decoded.preferences.ultrafast_mode);
+}
+
 test "recovery checkpoint round trips while legacy state stays absent" {
     const alloc = std.testing.allocator;
     const checkpoint = RecoveryCheckpoint{
@@ -4967,6 +5047,8 @@ test "recovery checkpoint round trips while legacy state stays absent" {
         },
         .requested_fast_mode = true,
         .fast_mode = true,
+        .requested_ultrafast_mode = true,
+        .ultrafast_mode = true,
         .max_provider_attempts = 10,
         .consumed_provider_attempts = 4,
         .outstanding_reservation = true,
@@ -4983,6 +5065,7 @@ test "recovery checkpoint round trips while legacy state stays absent" {
             .model = @constCast("gpt-5.4-mini"),
             .effort = .auto,
             .fast_mode = false,
+            .ultrafast_mode = true,
         },
         .history = &.{},
         .total_input_tokens = 0,
@@ -4993,6 +5076,8 @@ test "recovery checkpoint round trips while legacy state stays absent" {
     var encoded: std.Io.Writer.Allocating = .init(alloc);
     defer encoded.deinit();
     _ = try encodeState(state, &encoded.writer);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"requested_ultrafast_mode\":true") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"ultrafast_mode\":true") != null);
     var source = std.Io.Reader.fixed(encoded.written());
     var decoded = try decodeState(alloc, &source, .{});
     defer decoded.deinit(alloc);
@@ -5011,6 +5096,9 @@ test "recovery checkpoint round trips while legacy state stays absent" {
     try std.testing.expectEqual(model_provider.ProviderId.codex, decoded.preferences.provider);
     try std.testing.expect(restored.requested_fast_mode);
     try std.testing.expect(restored.fast_mode);
+    try std.testing.expect(restored.requested_ultrafast_mode);
+    try std.testing.expect(restored.ultrafast_mode);
+    try std.testing.expect(decoded.preferences.ultrafast_mode);
     try std.testing.expectEqual(@as(usize, 4), restored.consumed_provider_attempts);
     try std.testing.expect(restored.outstanding_reservation);
 
@@ -5020,6 +5108,7 @@ test "recovery checkpoint round trips while legacy state stays absent" {
     var legacy_state = try decodeState(alloc, &legacy_source, .{});
     defer legacy_state.deinit(alloc);
     try std.testing.expectEqual(model_provider.ProviderId.gateway, legacy_state.preferences.provider);
+    try std.testing.expect(!legacy_state.preferences.ultrafast_mode);
     try std.testing.expectEqual(@as(?RecoveryCheckpoint, null), legacy_state.recovery_checkpoint);
 }
 
@@ -5044,6 +5133,14 @@ test "recovery checkpoint accepts the exact composer byte limit" {
     defer alloc.free(encoded);
     try std.testing.expect(encoded.len > prompt.len);
     try std.testing.expect(encoded.len <= max_recovery_checkpoint_bytes);
+    try std.testing.expect(std.mem.find(u8, encoded, "\"requested_ultrafast_mode\"") == null);
+    try std.testing.expect(std.mem.find(u8, encoded, "\"ultrafast_mode\"") == null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+    defer parsed.deinit();
+    var decoded = try parseRecoveryCheckpoint(alloc, parsed.value);
+    defer decoded.deinit(alloc);
+    try std.testing.expect(!decoded.requested_ultrafast_mode);
+    try std.testing.expect(!decoded.ultrafast_mode);
 }
 
 test "session permission state round trips while legacy state stays empty" {
@@ -5271,11 +5368,53 @@ test "session metadata round trips without conversation or control state" {
     try std.testing.expect(std.mem.find(u8, encoded, "usage") == null);
     try std.testing.expect(std.mem.find(u8, encoded, "permission") == null);
     try std.testing.expect(std.mem.find(u8, encoded, "checkpoint") == null);
+    try std.testing.expect(std.mem.find(u8, encoded, "ultrafast_mode") == null);
 
     var decoded = try decodeSessionMetadata(alloc, encoded);
     defer decoded.deinit();
     try std.testing.expectEqualStrings("session-1", decoded.value.id);
     try std.testing.expectEqualStrings("/tmp/current", decoded.value.workspace_root);
     try std.testing.expectEqualStrings("openai/gpt-5.6", decoded.value.model);
+    try std.testing.expect(decoded.value.ultrafast_mode == null);
     try std.testing.expectEqualStrings("Compaction work", decoded.value.title.?);
+}
+
+test "session metadata persists opted-in ultrafast mode" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeSessionMetadata(alloc, .{
+        .id = "session-ultrafast",
+        .origin_workspace_root = "/tmp/origin",
+        .workspace_root = "/tmp/current",
+        .created_at_ms = 10,
+        .updated_at_ms = 20,
+        .conversation_language = "en",
+        .provider = .gateway,
+        .model = "openai/gpt-5.6",
+        .effort = "high",
+        .fast_mode = false,
+        .ultrafast_mode = true,
+    });
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.find(u8, encoded, "\"ultrafast_mode\":true") != null);
+    var decoded = try decodeSessionMetadata(alloc, encoded);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(?bool, true), decoded.value.ultrafast_mode);
+}
+
+test "ultrafast durable preference requires a bool when present" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"provider\":\"gateway\",\"model\":\"test/model\",\"effort\":\"auto\",\"fast_mode\":false,\"ultrafast_mode\":\"true\"}",
+        .{},
+    );
+    defer parsed.deinit();
+    if (parse_preferences(alloc, parsed.value)) |preferences| {
+        var owned = preferences;
+        owned.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expect(err == error.InvalidSessionFormat or err == error.InvalidDurableField);
+    }
 }

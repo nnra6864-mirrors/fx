@@ -157,6 +157,9 @@ pub const TurnPreferences = struct {
     provider: @import("../config/model_provider.zig").ProviderId = .gateway,
     model: []const u8,
     effort: types.ReasoningEffort,
+    /// The durable child preference wins when work resumes. Parent defaults are
+    /// used only while creating a new child session.
+    ultrafast_mode: bool = false,
 };
 
 pub const CaptureRequest = struct {
