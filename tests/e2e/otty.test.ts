@@ -16,6 +16,7 @@ import {
   fakeGatewayFinalText,
   fakeGatewayToolCall,
   fakeShellRun,
+  startDynamicFakeGateway,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -235,6 +236,111 @@ test.skipIf(SKIP)(
         expect(report.pid).not.toBe(fxPid);
         expect(report.ppid).toBe(fxPid);
       }
+    } finally {
+      writeFileSync(toolGate, "resume\n");
+      initial.release();
+      if (session) await session.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT,
+);
+
+test.skipIf(SKIP)(
+  "otty resumes processing after child approval before the child tool completes",
+  async () => {
+    const fixture = createFixture();
+    const marker = join(fixture.workspace, "child-permission-marker.txt");
+    const toolGate = join(fixture.workspace, "resume-child-tool.txt");
+    const initial = holdResponse(fakeGatewayToolCall("otty_child_start", "subagent", {
+      request: {
+        action: "message",
+        agent: "worker",
+        message: "Run the prepared child command and report its result.",
+      },
+    }));
+    let parentCalls = 0;
+    let childCalls = 0;
+    const gateway = startDynamicFakeGateway((raw) => {
+      if (!raw.includes('"name":"subagent"')) {
+        childCalls++;
+        if (childCalls === 1) {
+          return fakeShellRun(
+            "otty_child_permission",
+            "touch child-permission-marker.txt; while [ ! -f resume-child-tool.txt ]; do sleep 0.05; done; printf OTTY_CHILD_TOOL_COMPLETE",
+            { timeout_ms: TIMEOUT },
+          );
+        }
+        return fakeGatewayFinalText("OTTY_CHILD_COMPLETE");
+      }
+      parentCalls++;
+      if (parentCalls === 1) return initial.next();
+      return fakeGatewayFinalText("OTTY_PARENT_COMPLETE");
+    });
+    let session: TmuxSession | null = null;
+    try {
+      session = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: fixture.workspace,
+        env: fixtureEnv(fixture, gateway),
+        stderrPath: fixture.stderrPath,
+        remainOnExit: true,
+        isolated: true,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await waitUntil(() => readReports(fixture.logPath).length >= 1, "startup idle");
+      expect(states(fixture.logPath)).toEqual(["state=idle"]);
+
+      await session.sendText("Start a child to run the prepared command and wait for its result.");
+      await waitUntil(
+        () => parentCalls === 1 && readReports(fixture.logPath).length >= 2,
+        "parent processing before starting the child",
+      );
+      expect(states(fixture.logPath)).toEqual(["state=idle", "state=processing"]);
+      initial.release();
+
+      await session.waitForText(APPROVAL_PROMPT, TIMEOUT);
+      await waitUntil(() => readReports(fixture.logPath).length >= 3, "child permission awaiting");
+      expect(states(fixture.logPath)).toEqual([
+        "state=idle", "state=processing", "state=awaiting",
+      ]);
+      expect(childCalls).toBe(1);
+      expect(parentCalls).toBe(1);
+      expect(existsSync(marker)).toBe(false);
+      session.sendKeysImmediate(["1"]);
+      await waitUntil(() => existsSync(marker), "approved child command running");
+      await waitUntil(
+        () => states(fixture.logPath).at(-1) === "state=processing",
+        "processing after child approval while the child command is gated",
+        RESPONSIVENESS_TIMEOUT,
+      ).catch((error) => {
+        throw new Error(`${error}\nOtty states: ${JSON.stringify(states(fixture.logPath))}`);
+      });
+      expect(states(fixture.logPath)).toEqual([
+        "state=idle", "state=processing", "state=awaiting", "state=processing",
+      ]);
+      expect(existsSync(toolGate)).toBe(false);
+      expect(childCalls).toBe(1);
+      expect(parentCalls).toBe(1);
+
+      writeFileSync(toolGate, "resume\n");
+      await session.waitForText("OTTY_PARENT_COMPLETE", TIMEOUT);
+      await waitUntil(() => states(fixture.logPath).at(-1) === "state=idle", "successful idle");
+      await session.waitForStableComposer(TIMEOUT);
+      expect(childCalls).toBe(2);
+      expect(parentCalls).toBe(2);
+      expect(gateway.requests.find(({ body }) => body.includes('"toolCallId":"otty_child_permission"'))?.body)
+        .toContain("OTTY_CHILD_TOOL_COMPLETE");
+      expect(gateway.requests.at(-1)!.body).toContain("OTTY_CHILD_COMPLETE");
+
+      await session.sendText("/quit");
+      await waitUntil(() => session!.paneStatus().dead, "/quit exit", RESPONSIVENESS_TIMEOUT);
+      expect(session.paneStatus()).toEqual({ dead: true, status: 0 });
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      expect(states(fixture.logPath)).toEqual([
+        "state=idle", "state=processing", "state=awaiting", "state=processing", "state=idle",
+      ]);
     } finally {
       writeFileSync(toolGate, "resume\n");
       initial.release();
