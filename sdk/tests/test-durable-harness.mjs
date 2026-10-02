@@ -144,12 +144,10 @@ for (const backend of ["native", "wasm"]) {
     assert.ok(cell.completed && cell.rememberedSetup, `step ${cell.k}: restore finished the turn and kept history`);
   }
   // With a journal, no crash step may run send_email twice or lose the
-  // setup turn, with or without snapshots.
-  for (const extra of [[], ["--snapshots"]]) {
-    const journaled = run("crash-matrix.mjs", ["--backends", backend, "--workloads", "one-never", "--mode", "journal", "--require-clean", ...extra], backend);
-    assert.ok(journaled.cells >= 5, "one cell per crash step");
-    assert.equal(journaled.failing_cells, 0, `journal crash matrix ${extra.join(" ")} on ${backend}`);
-  }
+  // setup turn.
+  const journaled = run("crash-matrix.mjs", ["--backends", backend, "--workloads", "one-never", "--mode", "journal", "--require-clean"], backend);
+  assert.ok(journaled.cells >= 5, "one cell per crash step");
+  assert.equal(journaled.failing_cells, 0, `journal crash matrix on ${backend}`);
   console.log(`${backend}: durable harnesses passed; today's crash matrix: ${crash.failing_cells}/${crash.cells} one-never cells ran send_email twice; journaled: none`);
 }
 console.log("durable harness checks passed");

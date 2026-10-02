@@ -302,10 +302,10 @@ journal holds it. With a journal, a follow-up survives a crash. After a
 restore, the follow-ups the journal held have no caller, so each waits for
 `agent.resume()`: every call continues the open turn first, then starts the
 next held follow-up, and returns `null` once none is left. Follow-ups this
-agent queues run on their own and do not wait behind held ones. libfx takes no
-snapshot while a held follow-up waits, so call `resume()` until it returns
-`null` whenever a session opens, before this agent queues follow-ups of its
-own: one queued during a resumed turn starts when that turn ends, and
+agent queues run on their own and do not wait behind held ones. Call
+`resume()` until it returns `null` whenever a session opens, before this
+agent queues follow-ups of its own: one queued during a resumed turn starts
+when that turn ends, and
 `resume()` throws while it runs. A follow-up whose turn ends before libfx
 records its first `turn_progress` is withdrawn, and one that ends after it is
 recorded like any other turn, so a follow-up never runs twice. `close()` rejects
@@ -340,8 +340,8 @@ them, the same path as switching models.
 
 ### Journal
 
-A journal records the session as it runs instead of in snapshots you request.
-Pass an object with `append(events, options)` and `load()`, and libfx sends it
+A journal records the session as it runs instead of in checkpoints you request.
+Pass an object with `append(events)` and `load()`, and libfx sends it
 each state change as an event:
 
 ```js
@@ -382,41 +382,22 @@ started while the failed append was in flight can still complete; a
 `replay: "never"` call never starts before its stored intent.
 
 `createFxAgent()` calls `load()` once. It must resolve to `{ events }` with
-every stored event, oldest first, or to `{ snapshot, events }` as described
-below. Each `turn_progress` event repeats its turn so far, so a turn with many
-large tool results stores more than its final entry, and libfx reads only the
+every stored event, oldest first. Each `turn_progress` event repeats its turn
+so far, so a turn with many large tool results stores more than its final
+entry, and libfx reads only the
 newest progress of the open turn. The events it reads must fit in 4 MiB of
 JSON, and the history at most 1,024 turns; otherwise `createFxAgent()`
 rejects with an error whose `code` is `FX_JOURNAL_TOO_LARGE`. libfx refuses a
 journal whose events repeat, skip a `seq`, or do not parse, and
 `createFxAgent()` rejects with the reason and the `code` `FX_JOURNAL_INVALID`.
-For a journal or snapshot written by a newer libfx, it
-rejects with an `FxJournalVersionError`, whose `code` is `FX_JOURNAL_VERSION`.
-Each libfx release resumes the journals, snapshots, and checkpoints that the
-release before it saved, so upgrade the processes that read a session before
+For a journal written by a newer libfx, it rejects with an
+`FxJournalVersionError`, whose `code` is `FX_JOURNAL_VERSION`.
+Each libfx release resumes the journals and checkpoints that the release
+before it saved, so upgrade the processes that read a session before
 the ones that write it.
 
-A journal without snapshots grows with every turn, and `load()` returns all of
-it. Give the journal a `snapshot(bytes, atSeq)` method and libfx calls it about
-every 100 events or 1 MiB of events, between turns, with opaque bytes that
-stand for every event up to and including `atSeq`. libfx calls it only after
-those events are stored. A snapshot holds the session's whole history, within
-a checkpoint's bounds of 4 MiB and 1,024 turns. A session past them gets no
-snapshot, and libfx emits a `journal.snapshot_skipped` event with the `reason`
-(`too_large`, `too_many_turns`, or `invalid`). Snapshots resume once compaction
-brings the session back within the bounds; until one is stored, a journal whose
-events no longer fit in one load cannot be restored. Keep the latest snapshot and return it from `load()` as
-`{ snapshot, events }` with only the events after `atSeq`; the events it covers
-can be deleted. Snapshots only move forward: store one only if its `atSeq` is
-greater than the stored snapshot's. A snapshot can arrive late, even from an
-agent that another one has since replaced, but it still summarizes exactly the
-events it covers, so a newer one is safe to keep and an older one is safe to
-ignore. A snapshot that fails to store is not an error: the journal is
-still complete, libfx emits a `journal.snapshot_error` event, and it tries
-again after a later turn. `createMemoryJournal(events, { snapshots: true })`
-keeps the latest snapshot as `journal.latestSnapshot`, `{ bytes, atSeq }`, and
-drops the events it covers; `createMemoryJournal(events, { snapshot })` starts
-from a stored one.
+A journal grows with every turn, and `load()` returns all of it, so a session
+opens only while its events fit in one load.
 
 Give the journal a `close()` method to release what it holds, such as a timer
 or a connection. libfx calls it once, after the last append settles, when
@@ -476,53 +457,55 @@ stops instead of interleaving. `FxFencedError` is exported by `libfx`; its
 `FxJournalVersionError` and `FxConfigMismatchError` are exported by `libfx`
 too.
 
-### Workflow
+### Worlds
 
-`libfx/workflow` stores a journal in a Workflow World and resumes a session after the process running it stops, without a
-caller. Pass the World your app already uses, such as `createWorld()` from
-`@workflow/world-vercel` or `@workflow/world-local`; libfx itself depends on
-no Workflow package.
+Pass a Workflow World as `world`, and libfx stores the session in it and
+resumes the session after the process running it stops, without a caller. Use
+the World your app already uses, such as `createWorld()` from
+`@workflow/world-vercel` or `@workflow/world-local`; libfx itself depends on no
+Workflow package. Without `world`, nothing changes.
 
 ```js
-import { createFxAgent } from "libfx";
-import { workflow } from "libfx/workflow";
+import { createFxAgent, worldHandler } from "libfx";
+import { createWorld } from "@workflow/world-vercel";
 
-const createAgent = (durable) => createFxAgent({ apiKey, model, tools, ...durable });
+const world = createWorld();
+const createAgent = ({ sessionId } = {}) => createFxAgent({ apiKey, model, tools, world, sessionId });
 
 // Start a session, or pass sessionId to open an existing one.
-const durable = workflow({ world, createAgent });
-const agent = await createAgent(durable);
+const agent = await createAgent();
 const turn = agent.prompt("Summarize the open issues");
-// durable.sessionId is the session's run id.
+// agent.sessionId is the session's run id.
 
 // The queue route, for example app/.well-known/workflow/v1/flow/route.js.
-export const POST = workflow({ world, createAgent }).handler;
+export const POST = worldHandler({ world, createAgent });
 ```
 
-Each session is a World run, and each journal append is one event in it. When
-a turn starts, libfx queues a delayed wake for the session, and while the turn
-is open it writes a heartbeat if `wakeAfterSeconds` (default 300) would
-otherwise pass without a write. When a wake arrives, `handler` reads the
-session: a closed turn needs nothing, a turn written to within
-`wakeAfterSeconds` is checked again later, and only a turn silent for longer
-is opened with `createAgent` and resumed with `agent.resume()`, which the
-route calls until it returns `null` so that follow-ups the session held run
-too. Define `createAgent` at module scope so the route builds the same agent
-as the app. When the session cannot open or resume however often it is asked,
-because `resume()` throws an `FxConfigMismatchError` after a deploy or the
-journal fails with `FX_JOURNAL_TOO_LARGE` or `FX_JOURNAL_INVALID`, the route
-answers the wake with status 200 and the reason, so the queue does not deliver
-it again; after a config change, the session's next `prompt()` ends the turn.
-The World journal keeps no snapshots, so a session opens only while its
-events fit in one load. The heartbeat stops when the agent closes, so a turn
-handed off with `turn.cancel({ reason: "handoff" })` goes silent and the route
-resumes it.
+Each session is a World run, and libfx writes its journal there, one event in
+the run per append. `world` takes the place of `journal` and cannot be combined
+with it or with `checkpoint`. When a turn starts, libfx queues a delayed wake
+for the session, and while the turn is open it writes a heartbeat if
+`wakeAfterSeconds` (default 300) would otherwise pass without a write. When a
+wake arrives, `worldHandler` reads the session: a closed turn needs nothing, a
+turn written to within `wakeAfterSeconds` is checked again later, and only a
+turn silent for longer is opened with `createAgent({ sessionId })` and resumed
+with `agent.resume()`, which the route calls until it returns `null` so that
+follow-ups the session held run too. Define `createAgent` at module scope so
+the route builds the same agent as the app, and give `createFxAgent()` and
+`worldHandler()` the same `wakeAfterSeconds`. When the session cannot open or
+resume however often it is asked, because `resume()` throws an
+`FxConfigMismatchError` after a deploy or the journal fails with
+`FX_JOURNAL_TOO_LARGE` or `FX_JOURNAL_INVALID`, the route answers the wake with
+status 200 and the reason, so the queue does not deliver it again; after a
+config change, the session's next `prompt()` ends the turn. The heartbeat stops
+when the agent closes, so a turn handed off with
+`turn.cancel({ reason: "handoff" })` goes silent and the route resumes it.
 
 A session's run id is also its session id for AI Gateway, so affinity and
 prompt caching survive the move to another process. Only one process writes to
 a session. When another process has written to it since this one loaded it, the
 append fails with `FX_JOURNAL_APPEND_FAILED` and its `cause` is an
-`FxFencedError`, also exported by `libfx/workflow`, and the turn stops.
+`FxFencedError`, and the turn stops.
 
 ## Models
 

@@ -21,10 +21,11 @@
 // invariants apply: JournalFolds (every reopen succeeds) and
 // NeverStartsWithoutDurableIntent (checked as each never call starts).
 //
-// "world" mode is journal mode with the session in a world-local World
-// through libfx/workflow (--world-root holds @workflow/world-local). The
-// restorer delivers the session's queue message to `handler`, which resumes
-// an open turn with no caller, and then opens the session itself.
+// "world" mode is journal mode with the session in a world-local World,
+// through `createFxAgent({ world })` (--world-root holds
+// @workflow/world-local). The restorer delivers the session's queue message
+// to `worldHandler`, which resumes an open turn with no caller, and then
+// opens the session itself.
 //
 // --race (journal or world mode) holds the worker at step k instead of
 // killing it, runs the restorer while it waits, then releases it: a second
@@ -36,26 +37,13 @@
 // follow-up when its first tool runs, each acknowledgement a step of its
 // own. AckedAreDurable: an acknowledged steer or follow-up reaches the model
 // after the restore; PlacedOnce: neither reaches it twice.
-//
-// --snapshots (journal mode) runs 66 setup turns so libfx snapshots the
-// session, which the file journal stores beside the events (a temp file and
-// a rename, with a step on each side) when it moves forward; loads return
-// the snapshot and the events after it. Every invariant above must still
-// hold, and three more apply: SnapshotNotAhead (no snapshot covers an event
-// the journal has not stored), SnapshotMatchesPrefix (the session restored
-// from the final snapshot and its tail sends the same request as the one
-// restored from every event), and, with --race, SnapshotsMoveForward (a
-// snapshot the released worker stores replaces only an older one). With
-// snapshots, FencedNeverWrites compares the events alone: a late snapshot
-// still summarizes exactly the events it covers.
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { createFxAgent, FxFencedError } from "../../sdk/node.js";
-import { workflow, workflowQueuePrefix } from "../../sdk/workflow.js";
+import { createFxAgent, FxFencedError, worldHandler } from "../../sdk/node.js";
 import { checkCrashCell, durableTools, durableWorkloads, promptDirectives, toolResultIds } from "./durable.mjs";
 import { agentOptions, hostTools, listOption, parseArgs, scriptedFetch } from "./durable-host.mjs";
 
@@ -71,7 +59,6 @@ const options = parseArgs(process.argv.slice(2), {
   "world-root": "/tmp/libfx-world",
   race: false,
   inputs: false,
-  snapshots: false,
   "require-clean": false,
   "timeout-ms": "20000",
 });
@@ -80,10 +67,7 @@ const worldMode = options.mode === "world";
 const journaled = options.mode !== "today";
 if (options.race && !journaled) throw new Error("--race needs --mode journal or world");
 if (options.inputs && !journaled) throw new Error("--inputs needs --mode journal or world");
-if (options.snapshots && options.mode !== "journal") throw new Error("--snapshots needs --mode journal");
-// Snapshots come every 100 events at a commit: 66 setup turns end at seq
-// 199, so the crash turn's commit takes the second one while stepping.
-const setupTurns = options.snapshots ? 66 : 1;
+const setupTurns = 1;
 const steerText = "steer=keep";
 const followUpText = "workload=no-tool follow";
 
@@ -134,10 +118,6 @@ function intentStored(path, callId) {
 // a process whose session was taken over cannot interleave with the new one.
 // `step` brackets the write when the worker is stepping.
 // Declarations, not consts: the child roles run before this point.
-function snapshotSeqOf(bytes) {
-  return Number(Buffer.from(bytes).readBigUInt64LE(5));
-}
-
 function readEvents(path) {
   const text = existsSync(path) ? readFileSync(path, "utf8") : "";
   return text.split("\n").filter(Boolean).map((line) => JSON.parse(line));
@@ -145,8 +125,7 @@ function readEvents(path) {
 
 function fileJournal(path, step = null) {
   let previous = Promise.resolve();
-  const snapshotPath = `${path}.snapshot`;
-  const journal = {
+  return {
     append(batch) {
       const written = previous.then(async () => {
         if (step) await step(`journal_before:${batch.map((event) => event.type).join("+")}`);
@@ -160,32 +139,9 @@ function fileJournal(path, step = null) {
       return written;
     },
     async load() {
-      const events = readEvents(path);
-      if (!options.snapshots || !existsSync(snapshotPath)) return { events };
-      const snapshot = new Uint8Array(readFileSync(snapshotPath));
-      const atSeq = snapshotSeqOf(snapshot);
-      return { snapshot, events: events.filter((event) => event.seq > atSeq) };
+      return { events: readEvents(path) };
     },
   };
-  if (options.snapshots) {
-    journal.snapshot = async (bytes, atSeq) => {
-      if (step) await step("snapshot_before");
-      if (snapshotSeqOf(bytes) !== atSeq) throw new Error("snapshot header does not match atSeq");
-      const last = readEvents(path).at(-1)?.seq ?? 0;
-      if (atSeq > last) {
-        writeFileSync(`${path}.snapshot-ahead`, `${atSeq} > ${last}\n`);
-        throw new Error("a snapshot covers events the journal has not stored");
-      }
-      // Snapshots only move forward.
-      const stored = existsSync(snapshotPath) ? snapshotSeqOf(readFileSync(snapshotPath)) : 0;
-      if (atSeq > stored) {
-        writeFileSync(`${snapshotPath}.tmp`, bytes);
-        renameSync(`${snapshotPath}.tmp`, snapshotPath);
-      }
-      if (step) await step("snapshot_after");
-    };
-  }
-  return journal;
 }
 
 function openWorld() {
@@ -202,21 +158,38 @@ async function closeWorld(world) {
   }
 }
 
-// The same steps as fileJournal, around another journal's appends.
-function steppedJournal(inner, step) {
-  let previous = Promise.resolve();
-  return {
-    append(batch) {
-      const written = previous.then(async () => {
-        await step(`journal_before:${batch.map((event) => event.type).join("+")}`);
-        await inner.append(batch);
-        await step("journal_after");
-      });
-      previous = written.catch(() => {});
-      return written;
-    },
-    load: () => inner.load(),
+// The World, with the same steps as fileJournal around each journal write.
+// libfx writes a session's events one at a time, in order.
+function steppedWorld(world, step) {
+  const create = async (runId, request, params) => {
+    const events = request?.eventData?.stepName === "libfx.journal" ? request.eventData.input?.events : null;
+    if (!Array.isArray(events)) return world.events.create(runId, request, params);
+    await step(`journal_before:${events.map((event) => event.type).join("+")}`);
+    const result = await world.events.create(runId, request, params);
+    await step("journal_after");
+    return result;
   };
+  return {
+    ...world,
+    queue: world.queue.bind(world),
+    events: { ...world.events, create, list: world.events.list.bind(world.events) },
+  };
+}
+
+// Every journal event a World session holds, by the rule libfx loads with: a
+// batch counts only if it continues the events before it.
+async function worldEvents(world, runId) {
+  const events = [];
+  for (let cursor; ;) {
+    const page = await world.events.list({ runId, pagination: { sortOrder: "asc", limit: 1000, ...(cursor ? { cursor } : {}) }, resolveData: "all" });
+    for (const event of page.data) {
+      const batch = event.eventData?.stepName === "libfx.journal" ? event.eventData.input?.events : null;
+      if (Array.isArray(batch) && batch[0]?.seq === events.length + 1) events.push(...batch);
+    }
+    if (!page.hasMore) break;
+    cursor = page.cursor;
+  }
+  return events;
 }
 
 async function worker() {
@@ -262,7 +235,7 @@ async function worker() {
     if (stepping) await step(`before_effect:${name}`);
     // NeverStartsWithoutDurableIntent: the journal already holds this call.
     const stored = worldMode
-      ? (await workflow({ world, sessionId: durable.sessionId }).journal.load()).events
+      ? (await worldEvents(world, agent.sessionId))
         .some((event) => event.type === "tool_intent" && event.data.some((call) => call.id === context?.toolCallId))
       : intentStored(join(options.dir, "journal.jsonl"), context?.toolCallId);
     if (journaled && neverTools.has(name) && !stored) {
@@ -275,21 +248,15 @@ async function worker() {
   const stepWhenStepping = (name) => (stepping ? step(name) : undefined);
   const world = worldMode ? openWorld() : null;
   await world?.start?.();
-  const durable = worldMode ? workflow({ world }) : null;
-  const journal = worldMode
-    ? steppedJournal(durable.journal, stepWhenStepping)
-    : journaled ? fileJournal(join(options.dir, "journal.jsonl"), stepWhenStepping) : undefined;
-  // With --snapshots, the worker waits for the snapshot the crash turn's
-  // commit takes, so its write is stepped like every other.
-  let snapshotTaken = null;
-  const onEvent = (event) => {
-    if (event.type === "journal.snapshot" || event.type === "journal.snapshot_error") snapshotTaken?.();
-  };
-  const agent = await createFxAgent({
-    ...await agentOptions({ backend: options.backend, fetch: scriptedFetch({ stepsFor }), tools: hostTools(run), journal }),
-    onEvent,
-  });
-  if (worldMode) writeFileSync(join(options.dir, "session.txt"), durable.sessionId);
+  const journal = !worldMode && journaled ? fileJournal(join(options.dir, "journal.jsonl"), stepWhenStepping) : undefined;
+  const agent = await createFxAgent(await agentOptions({
+    backend: options.backend,
+    fetch: scriptedFetch({ stepsFor }),
+    tools: hostTools(run),
+    journal,
+    world: worldMode ? steppedWorld(world, stepWhenStepping) : undefined,
+  }));
+  if (worldMode) writeFileSync(join(options.dir, "session.txt"), agent.sessionId);
   for (let index = 0; index < setupTurns; index += 1) {
     const setup = agent.prompt(`workload=no-tool setup ${index}`);
     for await (const _ of setup) {}
@@ -297,7 +264,6 @@ async function worker() {
   }
   if (!journaled) writeFileSync(join(options.dir, "checkpoint.bin"), await agent.checkpoint());
   process.stdout.write(`${JSON.stringify({ ready: true })}\n`);
-  const crashSnapshot = new Promise((resolveSnapshot) => { snapshotTaken = resolveSnapshot; });
   stepping = true;
   try {
     const turn = agent.prompt(`workload=${options.workload} crash`);
@@ -313,7 +279,6 @@ async function worker() {
     }
     await turn.result;
     await step("result");
-    if (options.snapshots) await Promise.race([crashSnapshot, new Promise((resolveWait) => setTimeout(resolveWait, 3000))]);
     if (followed) {
       const next = await followed;
       for await (const _ of next) {}
@@ -334,48 +299,19 @@ async function worker() {
   }
 }
 
-// The first model request a session restored from `loaded` sends.
-async function firstRequest(loaded) {
-  let first = null;
-  const capture = (prompt) => {
-    first ??= JSON.stringify(prompt);
-    return stepsFor(prompt);
-  };
-  const journal = { async append() {}, async load() { return loaded; } };
-  const agent = await createFxAgent(await agentOptions({ backend: options.backend, fetch: scriptedFetch({ stepsFor: capture }), tools: hostTools(async () => "inspected"), journal }));
-  const turn = agent.prompt("workload=no-tool inspect");
-  for await (const _ of turn) {}
-  await turn.result;
-  await agent.close();
-  return first;
-}
-
-// The session's journal as its contiguous events, for comparing two points;
-// with snapshots, every stored event, the snapshot's seq, and whether the
-// snapshot and its tail restore the session every event restores.
+// The session's journal as its contiguous events, for comparing two points.
 async function inspect() {
   let events;
-  let snapshotAt = null;
-  let snapshotMatches = null;
-  let snapshotAhead = false;
   if (worldMode) {
     const world = openWorld();
     await world.start?.();
-    events = (await workflow({ world, sessionId: readFileSync(join(options.dir, "session.txt"), "utf8") }).journal.load()).events;
+    events = await worldEvents(world, readFileSync(join(options.dir, "session.txt"), "utf8"));
     await closeWorld(world);
   } else {
-    const path = join(options.dir, "journal.jsonl");
-    events = options.snapshots ? readEvents(path) : (await fileJournal(path).load()).events;
-    snapshotAhead = existsSync(`${path}.snapshot-ahead`);
-    if (options.snapshots && existsSync(`${path}.snapshot`)) {
-      const snapshot = new Uint8Array(readFileSync(`${path}.snapshot`));
-      snapshotAt = snapshotSeqOf(snapshot);
-      const viaSnapshot = await firstRequest({ snapshot, events: events.filter((event) => event.seq > snapshotAt) });
-      snapshotMatches = viaSnapshot !== null && viaSnapshot === await firstRequest({ events });
-    }
+    events = (await fileJournal(join(options.dir, "journal.jsonl")).load()).events;
   }
   const fingerprint = events.map((event) => `${event.seq}:${event.type}:${event.turn}`).join(",");
-  process.stdout.write(`${JSON.stringify({ summary: { fingerprint, lastSeq: events.at(-1)?.seq ?? 0, snapshotAt, snapshotMatches, snapshotAhead } })}\n`);
+  process.stdout.write(`${JSON.stringify({ summary: { fingerprint, lastSeq: events.at(-1)?.seq ?? 0 } })}\n`);
 }
 
 async function restorer() {
@@ -445,7 +381,6 @@ async function restorer() {
       resultCounts,
       journalFolds,
       committedBeforeOpen,
-      loadedSnapshot: opened[0]?.snapshot === true,
       ...inputCounts(prompt),
     },
   })}\n`);
@@ -463,14 +398,14 @@ async function worldRestorer() {
   const world = openWorld();
   await world.start?.();
   // Wakes queued while the restorer runs are absorbed; the route is called below.
-  world.registerHandler(workflowQueuePrefix, async () => new Response(null, { status: 204 }));
-  const createAgent = async (durable) => createFxAgent(await agentOptions({
+  world.registerHandler("__wkf_workflow_", async () => new Response(null, { status: 204 }));
+  const createAgent = async () => createFxAgent(await agentOptions({
     backend: options.backend,
     fetch: scriptedFetch({ stepsFor, onRequest: (request) => requests.push(request) }),
     tools: hostTools(run),
-    journal: durable.journal,
-  }));
-  const stored = async () => (await workflow({ world, sessionId }).journal.load()).events;
+    world,
+  }).then((settings) => ({ ...settings, sessionId })));
+  const stored = () => worldEvents(world, sessionId);
   // Turn 1 is the setup turn and turn 2 the crash turn. The setup turn's
   // result does not wait for its last appends, so a kill can leave either
   // turn open, and the route resumes whichever one is.
@@ -480,15 +415,15 @@ async function worldRestorer() {
     const before = await stored();
     summary.committedBeforeOpen = before.some((event) => event.type === "turn_committed" && event.turn === crashTurn);
     let routed = 0;
-    const route = workflow({ world, wakeAfterSeconds: 0.001, createAgent: (durable) => { routed += 1; return createAgent(durable); } });
+    const route = worldHandler({ world, wakeAfterSeconds: 0.001, createAgent: () => { routed += 1; return createAgent(); } });
     await new Promise((resolveWait) => setTimeout(resolveWait, 5));
-    const response = await route.handler(new Request("http://localhost/queue", { method: "POST", body: JSON.stringify({ runId: sessionId }) }));
+    const response = await route(new Request("http://localhost/queue", { method: "POST", body: JSON.stringify({ runId: sessionId }) }));
     if (response.status !== 204) throw new Error(`the route answered ${response.status}`);
     summary.resumedByHandler = routed > 0;
     const after = (await stored()).filter((event) => event.type === "turn_committed");
     summary.commits = after.map((event) => `${event.turn}:${event.data.kind}`);
     const crashCommit = after.find((event) => event.turn === crashTurn);
-    const agent = await createAgent(workflow({ world, sessionId }));
+    const agent = await createAgent();
     if (crashCommit) summary.completed = crashCommit.data.kind === "assistant";
     else if (!before.some((event) => event.turn === crashTurn)) {
       // No trace of the crash turn reached the World: the host sends it again.
@@ -502,7 +437,7 @@ async function worldRestorer() {
     await check.result;
     await agent.close();
     try {
-      await (await createAgent(workflow({ world, sessionId }))).close();
+      await (await createAgent()).close();
     } catch {
       summary.journalFolds = false;
     }
@@ -528,7 +463,7 @@ function runChild(role, settings) {
 // every step it printed meanwhile and every later one.
 function startChild(role, { backend, workload, dir, killAt = Infinity, holdAt = Infinity }) {
   const execArgs = !process.versions.bun && backend === "wasm" ? ["--experimental-wasm-jspi"] : [];
-  const child = spawn(process.execPath, [...execArgs, scriptPath, "--child", role, "--mode", options.mode, "--world-root", options["world-root"], ...(options.inputs ? ["--inputs"] : []), ...(options.snapshots ? ["--snapshots"] : []), "--backend", backend, "--workload", workload, "--dir", dir], {
+  const child = spawn(process.execPath, [...execArgs, scriptPath, "--child", role, "--mode", options.mode, "--world-root", options["world-root"], ...(options.inputs ? ["--inputs"] : []), "--backend", backend, "--workload", workload, "--dir", dir], {
     stdio: ["pipe", "pipe", "pipe"],
   });
   const steps = [];
@@ -589,7 +524,6 @@ async function parent() {
     mode: options.mode,
     race: options.race,
     inputs: options.inputs,
-    snapshots: options.snapshots,
     runtime: process.versions.bun ? "bun" : "node",
     runtime_version: process.versions.bun ?? process.version,
     groups: [],
@@ -665,15 +599,6 @@ async function parent() {
             const { before, after } = race;
             if (crashed.code !== 0) cell.violations.push(`Harness: the released worker failed (${crashed.code} ${crashed.signal}): ${crashed.stderr.slice(-300)}`);
             if (!before || before.fingerprint !== after?.fingerprint) cell.violations.push("FencedNeverWrites: the released worker changed the session");
-            if (before && after && after.snapshotAt !== before.snapshotAt
-              && !(after.snapshotAt > (before.snapshotAt ?? 0) && after.snapshotAt <= after.lastSeq)) {
-              cell.violations.push(`SnapshotsMoveForward: the snapshot went from ${before.snapshotAt} to ${after.snapshotAt}`);
-            }
-          }
-          if (options.snapshots) {
-            const final = race?.after ?? (await runChild("inspect", { backend, workload, dir })).summary;
-            if (final?.snapshotAhead) cell.violations.push("SnapshotNotAhead: a snapshot covered events the journal had not stored");
-            if (final?.snapshotMatches === false) cell.violations.push("SnapshotMatchesPrefix: the snapshot and its tail restore a different session");
           }
           if (journaled) {
             const missing = effects.filter((name) => name.startsWith("intent_missing:")).length;

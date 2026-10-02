@@ -416,11 +416,6 @@ test("a journal that does not fold is refused", async () => {
   await assert.rejects(createFxAgent(options(targetBackend, newer)), /libfx journal was written by a newer fx/);
   const garbled = createMemoryJournal([{ v: 1, seq: 1, turn: 1, type: "turn_committed", data: { kind: "nope" } }]);
   await assert.rejects(createFxAgent(options(targetBackend, garbled)), invalid(/Invalid libfx journal/));
-  const oversized = createMemoryJournal(journal.events, { snapshot: new Uint8Array(4 * 1024 * 1024 + 1) });
-  await assert.rejects(
-    createFxAgent(options(targetBackend, oversized)),
-    (error) => /libfx journal snapshot is too large/.test(error.message) && error.code === "FX_JOURNAL_TOO_LARGE",
-  );
   const huge = createMemoryJournal([{ ...journal.events.at(-1), seq: 1, turn: 1, padding: "x".repeat(4 * 1024 * 1024) }]);
   await assert.rejects(
     createFxAgent(options(targetBackend, huge)),
@@ -449,8 +444,6 @@ test("journal options are checked before the core starts", async () => {
     createFxAgent(options(sourceBackend, createMemoryJournal(), { checkpoint: new Uint8Array(64) })),
     /journal cannot be combined with checkpoint/,
   );
-  const snapshotted = { append() {}, async load() { return { snapshot: "not bytes", events: [] }; } };
-  await assert.rejects(createFxAgent(options(sourceBackend, snapshotted)), /journal.load\(\) snapshot must be a Uint8Array/);
 });
 
 // A laptop runs a turn; while its tool runs, a function opens the same
@@ -758,119 +751,6 @@ test("a follow-up on an idle agent runs at once", async () => {
 const sleepMs = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 const userTexts = (prompt) => prompt.filter((message) => message.role === "user").map(textOf);
 
-test("a journal with snapshots stores one at a quiet point and restores from it", async () => {
-  const journal = createMemoryJournal([], { snapshots: true });
-  const seen = [];
-  const onEvent = (event) => { if (event.type.startsWith("journal.snapshot")) seen.push(event.type); };
-  const agent = await createFxAgent(options(sourceBackend, journal, { onEvent }));
-  for (let index = 0; index < 60; index += 1) await run(agent, `turn ${index}`);
-  await agent.close();
-  assert.ok(seen.includes("journal.snapshot"), JSON.stringify(seen));
-  assert.ok(!seen.includes("journal.snapshot_error"), JSON.stringify(seen));
-  const latest = journal.latestSnapshot;
-  assert.ok(latest.atSeq > 0);
-  assert.equal(journal.events[0]?.seq ?? latest.atSeq + 1, latest.atSeq + 1, "the journal keeps only the events after it");
-
-  const restored = await createFxAgent(options(targetBackend, createMemoryJournal(journal.events, { snapshot: latest.bytes })));
-  requests.length = 0;
-  await run(restored, "what did I say");
-  await restored.close();
-  const users = userTexts(requests[0]);
-  for (let index = 0; index < 60; index += 1) assert.ok(users.includes(`turn ${index}`), `turn ${index} survived the snapshot`);
-});
-
-test("a snapshot never covers an event the journal has not stored", async () => {
-  const inner = createMemoryJournal([], { snapshots: true });
-  let previous = Promise.resolve();
-  const calls = [];
-  const slow = {
-    append(batch) {
-      previous = previous.then(async () => { await sleepMs(2); await inner.append(batch); });
-      return previous;
-    },
-    load: () => inner.load(),
-    async snapshot(bytes, atSeq) {
-      calls.push({ atSeq, stored: inner.events.at(-1)?.seq ?? inner.latestSnapshot?.atSeq ?? 0 });
-      return inner.snapshot(bytes, atSeq);
-    },
-  };
-  const agent = await createFxAgent(options(sourceBackend, slow));
-  for (let index = 0; index < 50; index += 1) {
-    await run(agent, `turn ${index}`);
-    // A closing agent takes no snapshot, so let each turn's appends land.
-    await previous;
-  }
-  await agent.close();
-  assert.ok(calls.length > 0, "a snapshot was taken");
-  for (const call of calls) assert.ok(call.atSeq <= call.stored, `snapshot at ${call.atSeq} with ${call.stored} stored`);
-});
-
-test("a late snapshot older than the stored one is ignored", async () => {
-  // An agent replaced by another can still offer a snapshot it took earlier.
-  const inner = createMemoryJournal([], { snapshots: true });
-  const offered = [];
-  const recording = {
-    append: (batch) => inner.append(batch),
-    load: () => inner.load(),
-    async snapshot(bytes, atSeq) { offered.push({ bytes, atSeq }); return inner.snapshot(bytes, atSeq); },
-  };
-  const agent = await createFxAgent(options(sourceBackend, recording));
-  // Snapshots come about every 100 events, later when one is still in flight.
-  let turns = 0;
-  while (offered.length < 2 && turns < 200) await run(agent, `turn ${turns++}`);
-  await agent.close();
-  assert.ok(offered.length >= 2, `two snapshots were taken, not ${offered.length}`);
-  const newest = inner.latestSnapshot.atSeq;
-  await inner.snapshot(offered[0].bytes, offered[0].atSeq);
-  assert.equal(inner.latestSnapshot.atSeq, newest, "the older snapshot did not replace the newer one");
-
-  const restored = await createFxAgent(options(targetBackend, createMemoryJournal(inner.events, { snapshot: inner.latestSnapshot.bytes })));
-  requests.length = 0;
-  await run(restored, "what did I say");
-  await restored.close();
-  const users = userTexts(requests[0]);
-  for (let index = 0; index < turns; index += 1) assert.ok(users.includes(`turn ${index}`), `turn ${index} survived`);
-});
-
-test("resuming from a snapshot and its tail sends what resuming from every event sends", async () => {
-  // The same session twice, with and without snapshots, crashing at the same point.
-  const crashed = async (journal) => {
-    const quiet = await createFxAgent(options(sourceBackend, journal));
-    for (let index = 0; index < 45; index += 1) await run(quiet, `turn ${index}`);
-    await quiet.close();
-    const { agent, turn, drained, releaseTool } = await steeredTurn(journal);
-    const cut = journal.events.at(-1).seq;
-    releaseTool();
-    await drained;
-    await turn.result;
-    await agent.close();
-    return cut;
-  };
-  const full = createMemoryJournal();
-  const fullCut = await crashed(full);
-  const snapshotted = createMemoryJournal([], { snapshots: true });
-  const snapCut = await crashed(snapshotted);
-  assert.ok(snapshotted.latestSnapshot, "a snapshot was taken before the crash turn");
-  assert.ok(snapshotted.latestSnapshot.atSeq < snapCut);
-
-  const resumeFrom = async (journal) => {
-    const agent = await createFxAgent(options(targetBackend, journal));
-    requests.length = 0;
-    const resumed = agent.resume();
-    assert.ok(resumed);
-    for await (const _ of resumed) {}
-    await resumed.result;
-    await agent.close();
-    return JSON.stringify(requests[0]);
-  };
-  const fromEvents = await resumeFrom(createMemoryJournal(full.events.filter((event) => event.seq <= fullCut)));
-  const fromSnapshot = await resumeFrom(createMemoryJournal(
-    snapshotted.events.filter((event) => event.seq <= snapCut),
-    { snapshot: snapshotted.latestSnapshot.bytes },
-  ));
-  assert.equal(fromSnapshot, fromEvents);
-});
-
 test("a turn left open under other tools is not resumed under these", async () => {
   const journal = createMemoryJournal();
   const { agent, turn, drained, releaseTool } = await steeredTurn(journal);
@@ -910,13 +790,12 @@ test("a journal from a newer libfx and the deprecated checkpoint are reported", 
   assert.deepEqual(deprecations, ["checkpoint"]);
 });
 
-// Written by the first libfx with journals (format v1): a plain journal whose
-// last turn stopped while its tool ran, holding a steer and a follow-up, and a
-// snapshot whose tail stopped the same way. Later releases must keep resuming
-// both; a new format adds a fixture beside this one.
+// Written by the first libfx with journals (format v1): a journal whose last
+// turn stopped while its tool ran, holding a steer and a follow-up. Later
+// releases must keep resuming it; a new format adds a fixture beside this one.
 const fixture = JSON.parse(await readFile(resolve(scriptDir, "fixtures/libfx-journal-v1.json"), "utf8"));
 
-test("a v1 journal and snapshot from the first journaled libfx still resume", async () => {
+test("a v1 journal from the first journaled libfx still resumes", async () => {
   assert.equal(fixture.format, "libfx-journal-v1");
   const plain = await createFxAgent(options(targetBackend, createMemoryJournal(fixture.plain.events)));
   requests.length = 0;
@@ -933,17 +812,6 @@ test("a v1 journal and snapshot from the first journaled libfx still resume", as
   assert.equal(lastUserText(requests.at(-1)), "then summarize");
   assert.equal(plain.resume(), null);
   await plain.close();
-
-  const snapshot = new Uint8Array(Buffer.from(fixture.snapshotted.snapshot, "base64"));
-  const snapshotted = await createFxAgent(options(targetBackend, createMemoryJournal(fixture.snapshotted.events, { snapshot })));
-  requests.length = 0;
-  const again = snapshotted.resume();
-  assert.ok(again, "the turn after the snapshot resumes");
-  for await (const _ of again) {}
-  assert.equal((await again.result).stopReason, "end_turn");
-  await snapshotted.close();
-  const users = userTexts(requests[0]);
-  for (const text of ["turn 0", "turn 33", "use the tool"]) assert.ok(users.includes(text), `${text} survived`);
 });
 
 // No published libfx wrote journals before this one; the sessions the
@@ -1047,11 +915,10 @@ test("a turn that fails ends in the journal and is not resumed", async () => {
   }
 });
 
-test("a follow-up cancelled as its turn starts never runs again, and snapshots go on", async () => {
+test("a follow-up cancelled as its turn starts never runs again", async () => {
   for (const backend of [sourceBackend, targetBackend]) {
-    const journal = createMemoryJournal([], { snapshots: true });
-    const tools = [lookup, bulky];
-    const agent = await createFxAgent(options(backend, journal, { tools }));
+    const journal = createMemoryJournal();
+    const agent = await createFxAgent(options(backend, journal));
     await run(agent, "one");
     // On an idle agent the follow-up starts at once; the cancel lands before
     // its first model request.
@@ -1060,14 +927,9 @@ test("a follow-up cancelled as its turn starts never runs again, and snapshots g
     cancelled.cancel();
     for await (const _ of cancelled) {}
     await cancelled.result;
-    // More than 1 MiB in fewer than 100 events earns a snapshot by its bytes.
-    assert.equal((await run(agent, "gather everything")).text, "gathered");
-    for (let waited = 0; !journal.latestSnapshot && waited < 3000; waited += 20) await sleepMs(20);
     await agent.close();
-    assert.ok(journal.latestSnapshot, `a snapshot follows the cancelled follow-up on ${backend}`);
-    assert.ok(journal.latestSnapshot.atSeq < 100, `snapshot at ${journal.latestSnapshot.atSeq}`);
 
-    const reopened = await createFxAgent(options(backend, createMemoryJournal(journal.events, { snapshot: journal.latestSnapshot.bytes }), { tools }));
+    const reopened = await createFxAgent(options(backend, createMemoryJournal(journal.events)));
     assert.equal(reopened.resume(), null, "the cancelled follow-up is not run again");
     await reopened.close();
   }
@@ -1176,23 +1038,6 @@ test("a journal past the turn limit is refused by name", async () => {
     createFxAgent(options(targetBackend, createMemoryJournal(turns))),
     (error) => error.message === "libfx journal holds more than 1024 turns" && error.code === "FX_JOURNAL_TOO_LARGE",
   );
-});
-
-test("a session too large for a snapshot reports why", async () => {
-  for (const backend of [sourceBackend, targetBackend]) {
-    const journal = createMemoryJournal([], { snapshots: true });
-    const skipped = [];
-    const agent = await createFxAgent(options(backend, journal, {
-      onEvent: (event) => { if (event.type === "journal.snapshot_skipped") skipped.push(event.reason); },
-    }));
-    // A history no checkpoint holds.
-    await run(agent, "x".repeat(2_200_000));
-    for (let waited = 0; skipped.length === 0 && waited < 3000; waited += 20) await sleepMs(20);
-    await run(agent, "and more");
-    await agent.close();
-    assert.deepEqual(skipped, ["too_large"], `${backend}: reported once`);
-    assert.equal(journal.latestSnapshot, null);
-  }
 });
 
 test("a journal's close() runs once, whether the agent closes or never opens", async () => {

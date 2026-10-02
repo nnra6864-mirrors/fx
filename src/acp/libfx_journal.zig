@@ -10,7 +10,6 @@ const session_codec = @import("../core/session/session_codec.zig");
 const types = @import("../core/shared/types.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const session_adapter = @import("../core/session/session_adapter.zig");
-const checkpoint_codec = @import("../core/agent/runtime/checkpoint.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -44,8 +43,6 @@ pub const Journal = struct {
     /// Follow-ups the journal holds that no turn ran, until the host takes
     /// them. Owned by the session's allocator.
     pending_follow_ups: []journal.PendingInput = &.{},
-    /// Accepted follow-ups no turn has placed yet. A snapshot waits for none.
-    follow_ups_waiting: usize = 0,
     /// The follow-up the running turn runs, until a progress places it.
     /// Owned by the session's allocator.
     placing_follow_up: ?[]u8 = null,
@@ -133,7 +130,6 @@ pub const Journal = struct {
         if (self.placing_follow_up) |id| {
             try self.append(alloc, session_id, .{ .input_withdrawn = id });
             debug_trace.logf("session", "event=libfx_journal_follow_up_withdrawn reason=turn_ended_before_request", .{});
-            self.follow_ups_waiting -|= 1;
             session_alloc.free(id);
             self.placing_follow_up = null;
         }
@@ -167,7 +163,6 @@ pub const Journal = struct {
             .model = model,
         } });
         if (self.placing_follow_up) |id| {
-            self.follow_ups_waiting -|= 1;
             session_alloc.free(id);
             self.placing_follow_up = null;
         }
@@ -191,10 +186,7 @@ pub const Journal = struct {
         switch (event) {
             .turn_progress => self.progress_open = true,
             .turn_committed, .turn_progress_cleared => self.progress_open = false,
-            .input_accepted => |input| if (input.kind == .follow_up) {
-                self.follow_ups_waiting += 1;
-            },
-            .tool_intent, .history_replaced, .input_withdrawn, .session_config => {},
+            .tool_intent, .history_replaced, .input_accepted, .input_withdrawn, .session_config => {},
         }
     }
 
@@ -205,13 +197,6 @@ pub const Journal = struct {
         try self.notePlaced(alloc, &.{id});
         if (self.placing_follow_up) |old| alloc.free(old);
         self.placing_follow_up = owned;
-    }
-
-    /// Whether the session is at a point a snapshot can stand for: no turn
-    /// open or waiting to resume, and no follow-up waiting for its turn.
-    pub fn quiet(self: *const Journal) bool {
-        return !self.progress_open and self.pending_resume == null and
-            self.follow_ups_waiting == 0 and self.cursor.next_seq > 1;
     }
 
     /// Records that the open turn ended without a history entry. A turn
@@ -250,8 +235,8 @@ fn dupePendingInputs(alloc: Allocator, inputs: []const journal.PendingInput) All
     return owned;
 }
 
-/// Rebuilds a fresh session from the host's events, after `snapshot` when
-/// the host stored one, and starts its journal after them. A turn a crash
+/// Rebuilds a fresh session from the host's events and starts its journal
+/// after them. A turn a crash
 /// left open becomes the pending resume, with every call it left running
 /// answered as possibly run; `session_alloc` owns it.
 pub fn open(
@@ -260,36 +245,17 @@ pub fn open(
     writer: *jsonrpc.Writer,
     runtime: *session_runtime.SessionRuntime,
     events_json: []const u8,
-    snapshot: ?[]const u8,
     config_hash: ?[]const u8,
 ) !struct { Journal, Opened } {
     if (!runtime.agent.fresh or runtime.agent.history.items.len != 0) return error.AgentNotFresh;
-    var base: journal.Base = .{};
-    var decoded: ?checkpoint_codec.Decoded = null;
-    defer if (decoded) |*value| value.deinit(alloc);
-    if (snapshot) |bytes| {
-        const parsed = try journal.parseSnapshot(bytes);
-        decoded = checkpoint_codec.decode(alloc, parsed.checkpoint) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.UnsupportedCheckpointVersion => return error.UnsupportedJournalVersion,
-            else => return error.InvalidJournal,
-        };
-        base = .{
-            .history = decoded.?.history,
-            .cursor = .{ .next_seq = parsed.seq + 1, .turn = parsed.turn },
-            .config_hash = parsed.config_hash,
-        };
-    }
-    var folded = try journal.foldFrom(alloc, events_json, base);
+    var folded = try journal.fold(alloc, events_json);
     defer folded.deinit(alloc);
     if (folded.history.len > 0) try runtime.agent.restoreHistory(alloc, folded.history);
-    if (decoded) |value| runtime.agent.turn_usage = value.usage;
     var state: Journal = .{
         .writer = writer,
         .cursor = folded.cursor,
         .progress_open = folded.open_turn != null,
         .pending_follow_ups = try dupePendingInputs(session_alloc, folded.pending_follow_ups),
-        .follow_ups_waiting = folded.pending_follow_ups.len,
     };
     errdefer state.deinit(session_alloc);
     if (config_hash) |hash| state.host_config = try session_alloc.dupe(u8, hash);
@@ -416,15 +382,13 @@ test "a follow-up stops waiting when a progress places it" {
     var capture: TestCapture = .{};
     defer capture.frames.deinit(alloc);
     var writer = jsonrpc.Writer.initCallback(&capture, TestCapture.write);
-    var session: Journal = .{ .writer = &writer, .follow_ups_waiting = 1, .cursor = .{ .next_seq = 3, .turn = 2 } };
+    var session: Journal = .{ .writer = &writer, .cursor = .{ .next_seq = 3, .turn = 2 } };
     defer session.deinit(alloc);
     var progress = try testProgress(alloc);
     defer progress.deinit(alloc);
 
     try session.placeFollowUp(alloc, "follow-1");
-    try std.testing.expectEqual(@as(usize, 1), session.follow_ups_waiting);
     try session.appendProgress(alloc, alloc, "session", progress, "fake/model");
-    try std.testing.expectEqual(@as(usize, 0), session.follow_ups_waiting);
     try std.testing.expect(std.mem.find(u8, capture.frames.items, "\"inputs\":[\"follow-1\"]") != null);
     // Nothing is left to settle when the turn ends.
     try session.endUnplaced(alloc, alloc, "session");
@@ -436,13 +400,10 @@ test "a follow-up whose turn ended before its request is withdrawn, so it never 
     var capture: TestCapture = .{};
     defer capture.frames.deinit(alloc);
     var writer = jsonrpc.Writer.initCallback(&capture, TestCapture.write);
-    var session: Journal = .{ .writer = &writer, .follow_ups_waiting = 1, .cursor = .{ .next_seq = 3, .turn = 2 } };
+    var session: Journal = .{ .writer = &writer, .cursor = .{ .next_seq = 3, .turn = 2 } };
     defer session.deinit(alloc);
 
     try session.placeFollowUp(alloc, "follow-1");
-    try std.testing.expect(!session.quiet());
     try session.endUnplaced(alloc, alloc, "session");
-    try std.testing.expectEqual(@as(usize, 0), session.follow_ups_waiting);
-    try std.testing.expect(session.quiet());
     try std.testing.expect(std.mem.find(u8, capture.frames.items, "\"type\":\"input_withdrawn\",\"data\":{\"id\":\"follow-1\"}") != null);
 }

@@ -38,14 +38,9 @@ const compactor = @import("../../compactor/compactor.zig");
 const Allocator = std.mem.Allocator;
 
 pub const version: u8 = 1;
-/// The most event bytes one load accepts, and the most bytes one snapshot
-/// holds: each travels as one host attachment, and an attachment holds at
-/// most one kernel checkpoint. Longer sessions need snapshots.
+/// The most event bytes one load accepts: they travel as one host
+/// attachment, and an attachment holds at most one kernel checkpoint.
 pub const max_load_bytes: usize = checkpoint_codec.max_checkpoint_bytes;
-pub const max_snapshot_bytes: usize = checkpoint_codec.max_checkpoint_bytes;
-/// The largest `seq` or turn a host can carry: hosts in JavaScript hold them
-/// as numbers.
-const max_safe_position: u64 = (1 << 53) - 1;
 pub const max_history_turns = checkpoint_codec.max_history_turns;
 
 const EventType = enum {
@@ -165,66 +160,6 @@ pub const Cursor = struct {
 /// The longest config hash a host may record.
 pub const max_config_hash_bytes = 128;
 
-/// A snapshot of a quiet prefix: `FXSN`, a version byte, the last `seq` it
-/// covers and the turn after it (each a little-endian u64), the recorded
-/// config hash (a length byte, zero for none, then its bytes), then a
-/// checkpoint of the history. Hosts store it as opaque bytes.
-const snapshot_magic = "FXSN";
-const snapshot_version: u8 = 1;
-const snapshot_header_bytes = snapshot_magic.len + 1 + 8 + 8 + 1;
-
-pub const Snapshot = struct {
-    /// The last event the snapshot covers; the tail starts after it.
-    seq: u64,
-    turn: u64,
-    /// The config the session had recorded. Borrowed from the snapshot bytes.
-    config_hash: ?[]const u8,
-    /// Borrowed from the snapshot bytes.
-    checkpoint: []const u8,
-};
-
-/// Returns caller-owned snapshot bytes for a checkpoint taken after `seq`.
-/// `config_hash` is at most `max_config_hash_bytes` long.
-pub fn encodeSnapshot(
-    alloc: Allocator,
-    seq: u64,
-    turn: u64,
-    config_hash: ?[]const u8,
-    checkpoint: []const u8,
-) Allocator.Error![]u8 {
-    const hash = config_hash orelse "";
-    std.debug.assert(hash.len <= max_config_hash_bytes);
-    const bytes = try alloc.alloc(u8, snapshot_header_bytes + hash.len + checkpoint.len);
-    @memcpy(bytes[0..snapshot_magic.len], snapshot_magic);
-    bytes[snapshot_magic.len] = snapshot_version;
-    std.mem.writeInt(u64, bytes[snapshot_magic.len + 1 ..][0..8], seq, .little);
-    std.mem.writeInt(u64, bytes[snapshot_magic.len + 9 ..][0..8], turn, .little);
-    bytes[snapshot_header_bytes - 1] = @intCast(hash.len);
-    @memcpy(bytes[snapshot_header_bytes..][0..hash.len], hash);
-    @memcpy(bytes[snapshot_header_bytes + hash.len ..], checkpoint);
-    return bytes;
-}
-
-pub fn parseSnapshot(bytes: []const u8) LoadError!Snapshot {
-    if (bytes.len < snapshot_header_bytes or !std.mem.eql(u8, bytes[0..snapshot_magic.len], snapshot_magic)) {
-        return error.InvalidJournal;
-    }
-    const found_version = bytes[snapshot_magic.len];
-    if (found_version > snapshot_version) return error.UnsupportedJournalVersion;
-    if (found_version != snapshot_version) return error.InvalidJournal;
-    const seq = std.mem.readInt(u64, bytes[snapshot_magic.len + 1 ..][0..8], .little);
-    const turn = std.mem.readInt(u64, bytes[snapshot_magic.len + 9 ..][0..8], .little);
-    if (seq == 0 or turn == 0 or seq > max_safe_position or turn > max_safe_position) return error.InvalidJournal;
-    const hash_len = bytes[snapshot_header_bytes - 1];
-    if (hash_len > max_config_hash_bytes or bytes.len - snapshot_header_bytes < hash_len) return error.InvalidJournal;
-    return .{
-        .seq = seq,
-        .turn = turn,
-        .config_hash = if (hash_len == 0) null else bytes[snapshot_header_bytes..][0..hash_len],
-        .checkpoint = bytes[snapshot_header_bytes + hash_len ..],
-    };
-}
-
 pub const LoadError = Allocator.Error || error{
     /// An event is not the shape this version writes.
     InvalidJournal,
@@ -313,24 +248,9 @@ fn stringField(value: std.json.Value, name: []const u8) LoadError![]const u8 {
     return field.string;
 }
 
-/// Where a fold starts: an empty session, or a snapshot of a quiet prefix
-/// (no open turn, no follow-up waiting) and the cursor after it.
-pub const Base = struct {
-    history: []const types.HistoryTurn = &.{},
-    cursor: Cursor = .{},
-    /// The config the prefix had recorded; turns in the tail inherit it.
-    config_hash: ?[]const u8 = null,
-};
-
 /// Rebuilds a session from `events_json`, a JSON array of events in order.
 pub fn fold(alloc: Allocator, events_json: []const u8) LoadError!Folded {
-    return foldFrom(alloc, events_json, .{});
-}
-
-/// Rebuilds a session from `base` and the events after it.
-pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError!Folded {
     if (events_json.len > max_load_bytes) return error.JournalTooLarge;
-    if (base.history.len > max_history_turns) return error.JournalTooManyTurns;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), events_json, .{}) catch |err| switch (err) {
@@ -344,8 +264,6 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
         for (history.items) |turn| types.freeHistoryTurn(alloc, turn);
         history.deinit(alloc);
     }
-    try history.ensureTotalCapacity(alloc, base.history.len);
-    for (base.history) |turn| history.appendAssumeCapacity(try types.dupeHistoryTurn(alloc, turn));
     var open: ?std.json.Value = null;
     // The open turn's announced calls; the ones its progress answers are
     // dropped at the end.
@@ -353,9 +271,9 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
     defer running.deinit(alloc);
     var inputs: std.ArrayList(InputState) = .empty;
     defer inputs.deinit(alloc);
-    var config: ?[]const u8 = base.config_hash;
+    var config: ?[]const u8 = null;
     var open_config: ?[]const u8 = null;
-    var cursor = base.cursor;
+    var cursor: Cursor = .{};
     for (parsed.array.items) |value| {
         const event = try envelope(value, cursor);
         switch (event.kind) {
@@ -1003,61 +921,6 @@ test "a follow-up waits across turns until the turn that runs it places it" {
     try std.testing.expectEqual(@as(usize, 0), running.pending_follow_ups.len);
 }
 
-test "a snapshot and the events after it fold into the same session as every event" {
-    const alloc = std.testing.allocator;
-    const first = try testTurn(alloc, "list files", "two files");
-    defer types.freeHistoryTurn(alloc, first);
-    const second = try testTurn(alloc, "read one", "it says hi");
-    defer types.freeHistoryTurn(alloc, second);
-    var progress = try testProgress(alloc, "read the other");
-    defer progress.deinit(alloc);
-    const events = [_]Event{
-        .{ .turn_committed = first },
-        .{ .turn_committed = second },
-        .{ .turn_progress = .{ .checkpoint = progress } },
-    };
-
-    const full = try testJournal(alloc, &events);
-    defer alloc.free(full);
-    var replayed = try fold(alloc, full);
-    defer replayed.deinit(alloc);
-
-    // A snapshot after the first commit, then the tail from seq 2.
-    const snapshot = try encodeSnapshot(alloc, 1, 2, null, "checkpoint-bytes");
-    defer alloc.free(snapshot);
-    const parsed = try parseSnapshot(snapshot);
-    try std.testing.expectEqual(@as(u64, 1), parsed.seq);
-    try std.testing.expectEqual(@as(u64, 2), parsed.turn);
-    try std.testing.expect(parsed.config_hash == null);
-    try std.testing.expectEqualStrings("checkpoint-bytes", parsed.checkpoint);
-    var tail_out: std.Io.Writer.Allocating = .init(alloc);
-    defer tail_out.deinit();
-    var cursor: Cursor = .{ .next_seq = parsed.seq + 1, .turn = parsed.turn };
-    try tail_out.writer.writeByte('[');
-    for (events[1..], 0..) |event, index| {
-        if (index > 0) try tail_out.writer.writeByte(',');
-        cursor = try cursor.write(&tail_out.writer, event);
-    }
-    try tail_out.writer.writeByte(']');
-    var resumed = try foldFrom(alloc, tail_out.written(), .{
-        .history = &.{first},
-        .cursor = .{ .next_seq = parsed.seq + 1, .turn = parsed.turn },
-    });
-    defer resumed.deinit(alloc);
-
-    try std.testing.expectEqual(replayed.history.len, resumed.history.len);
-    try std.testing.expectEqualStrings(replayed.history[1].assistant.assistant, resumed.history[1].assistant.assistant);
-    try std.testing.expectEqual(replayed.cursor, resumed.cursor);
-    try std.testing.expect(resumed.open_turn != null);
-    try std.testing.expectEqualStrings("read the other", resumed.open_turn.?.user.text);
-
-    // The tail must continue the snapshot.
-    try std.testing.expectError(error.OutOfOrderJournalEvent, foldFrom(alloc, full, .{
-        .history = &.{first},
-        .cursor = .{ .next_seq = parsed.seq + 1, .turn = parsed.turn },
-    }));
-}
-
 test "a superseded progress may leave out its state, the open turn's last may not" {
     const alloc = std.testing.allocator;
     var first = try testProgress(alloc, "first state");
@@ -1091,62 +954,6 @@ test "a progress event names the model its request goes to" {
     var folded = try fold(alloc, written);
     defer folded.deinit(alloc);
     try std.testing.expectEqualStrings("look at this", folded.open_turn.?.user.text);
-}
-
-test "a snapshot carries the recorded config to the turns after it" {
-    const alloc = std.testing.allocator;
-    const snapshot = try encodeSnapshot(alloc, 4, 3, "cfg-1", "checkpoint-bytes");
-    defer alloc.free(snapshot);
-    const parsed = try parseSnapshot(snapshot);
-    try std.testing.expectEqualStrings("cfg-1", parsed.config_hash.?);
-    try std.testing.expectEqualStrings("checkpoint-bytes", parsed.checkpoint);
-
-    // A turn opened after the snapshot, with no session_config of its own,
-    // was recorded under the snapshot's config.
-    var progress = try testProgress(alloc, "keep going");
-    defer progress.deinit(alloc);
-    var tail_out: std.Io.Writer.Allocating = .init(alloc);
-    defer tail_out.deinit();
-    const cursor: Cursor = .{ .next_seq = parsed.seq + 1, .turn = parsed.turn };
-    try tail_out.writer.writeByte('[');
-    _ = try cursor.write(&tail_out.writer, .{ .turn_progress = .{ .checkpoint = progress } });
-    try tail_out.writer.writeByte(']');
-    var folded = try foldFrom(alloc, tail_out.written(), .{ .cursor = cursor, .config_hash = parsed.config_hash });
-    defer folded.deinit(alloc);
-    try std.testing.expectEqualStrings("cfg-1", folded.config_hash.?);
-    try std.testing.expectEqualStrings("cfg-1", folded.open_turn_config.?);
-
-    // A hash length that runs past the bytes is refused.
-    const cut = try alloc.dupe(u8, snapshot[0 .. snapshot_header_bytes + 2]);
-    defer alloc.free(cut);
-    cut[snapshot_header_bytes - 1] = 3;
-    try std.testing.expectError(error.InvalidJournal, parseSnapshot(cut));
-}
-
-test "a snapshot past the positions a JavaScript host can hold is refused" {
-    const alloc = std.testing.allocator;
-    const far = try encodeSnapshot(alloc, max_safe_position + 1, 2, null, "");
-    defer alloc.free(far);
-    try std.testing.expectError(error.InvalidJournal, parseSnapshot(far));
-    const late = try encodeSnapshot(alloc, 3, max_safe_position + 1, null, "");
-    defer alloc.free(late);
-    try std.testing.expectError(error.InvalidJournal, parseSnapshot(late));
-    const edge = try encodeSnapshot(alloc, max_safe_position, max_safe_position, null, "");
-    defer alloc.free(edge);
-    _ = try parseSnapshot(edge);
-}
-
-test "a snapshot that is not one, or comes from a newer fx, is refused" {
-    const alloc = std.testing.allocator;
-    try std.testing.expectError(error.InvalidJournal, parseSnapshot("FXCP"));
-    try std.testing.expectError(error.InvalidJournal, parseSnapshot("FXSN"));
-    const zero = try encodeSnapshot(alloc, 0, 1, null, "");
-    defer alloc.free(zero);
-    try std.testing.expectError(error.InvalidJournal, parseSnapshot(zero));
-    const newer = try encodeSnapshot(alloc, 3, 2, null, "");
-    defer alloc.free(newer);
-    newer[snapshot_magic.len] = snapshot_version + 1;
-    try std.testing.expectError(error.UnsupportedJournalVersion, parseSnapshot(newer));
 }
 
 test "the open turn keeps the config hash it started under" {

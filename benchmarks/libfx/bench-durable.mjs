@@ -12,13 +12,12 @@
 // append calls instead of awaited writes. The restore section
 // measures checkpoint and journal size and restore time against history
 // length. With --world-root (a directory holding @workflow/world-local),
-// "world-local" gives libfx a libfx/workflow journal on a world-local World.
+// "world-local" runs libfx with `world` on a world-local World.
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createFxAgent, supportsJspi } from "../../sdk/node.js";
-import { workflow } from "../../sdk/workflow.js";
 import { durableWorkloads, promptDirectives, todayAdapterWrites, toolCallsIn } from "./durable.mjs";
 import { agentOptions, hostTools, listOption, parseArgs, scriptedFetch, sleep } from "./durable-host.mjs";
 import { sampleStats } from "./workload.mjs";
@@ -57,9 +56,7 @@ const stepsFor = (prompt) => durableWorkloads[promptDirectives(prompt).workload]
 
 // A journal on a remote log: each append lands one round trip after its
 // call, and never before the call ahead of it.
-// With `snapshots`, it keeps every snapshot libfx offers in that array and
-// still keeps every event, so one session can be restored both ways.
-function remoteJournal(roundTrip, events = [], { snapshots = null } = {}) {
+function remoteJournal(roundTrip, events = []) {
   const stored = [...events];
   let previous = Promise.resolve();
   const journal = {
@@ -75,28 +72,31 @@ function remoteJournal(roundTrip, events = [], { snapshots = null } = {}) {
     },
     async load() { return { events: stored.slice() }; },
   };
-  if (snapshots) journal.snapshot = async (bytes, atSeq) => { snapshots.push({ bytes: bytes.slice(), atSeq }); };
   return journal;
 }
 
-const snapshotJournal = (snapshot, events) => ({ async append() {}, async load() { return { snapshot, events }; } });
 const turnBytes = (events, turn) => events
   .filter((event) => event.turn === turn)
   .reduce((sum, event) => sum + JSON.stringify(event).length, 0);
 
 // Counts another journal's appends the way remoteJournal does.
-function countingJournal(inner) {
-  const journal = {
-    appends: 0,
-    bytes: 0,
-    append(batch) {
-      journal.appends += 1;
-      journal.bytes += JSON.stringify(batch).length;
-      return inner.append(batch);
-    },
-    load: () => inner.load(),
+// A World that counts libfx's journal writes as a journal counts appends.
+function countingWorld(inner) {
+  const counter = { appends: 0, bytes: 0 };
+  const create = (runId, request, params) => {
+    const events = request?.eventData?.stepName === "libfx.journal" ? request.eventData.input?.events : null;
+    if (Array.isArray(events)) {
+      counter.appends += 1;
+      counter.bytes += JSON.stringify(events).length;
+    }
+    return inner.events.create(runId, request, params);
   };
-  return journal;
+  counter.world = {
+    ...inner,
+    queue: inner.queue.bind(inner),
+    events: { ...inner.events, create, list: inner.events.list.bind(inner.events) },
+  };
+  return counter;
 }
 
 // world-local's queue teardown calls undici's Agent.close(), which Bun's
@@ -110,7 +110,7 @@ async function closeWorld(world) {
 }
 
 // One agent whose tools record their real start and end times on `active`.
-async function openAgent({ roundTrip = null, checkpoint, journal } = {}) {
+async function openAgent({ roundTrip = null, checkpoint, journal, world } = {}) {
   let active = null;
   const run = async (name, input, { signal }) => {
     const row = active;
@@ -137,8 +137,9 @@ async function openAgent({ roundTrip = null, checkpoint, journal } = {}) {
     tools: hostTools(run),
     checkpoint,
     journal,
+    world: world?.world,
   }));
-  return { agent, journal, setActive: (row) => { active = row; } };
+  return { agent, journal: journal ?? world, setActive: (row) => { active = row; } };
 }
 
 async function runTurn(handle, workload, index, roundTrip) {
@@ -200,12 +201,13 @@ function summarize(rows) {
   };
 }
 
-async function measure(workload, roundTrip, journal) {
-  const handle = journal ? await openAgent({ journal }) : await openAgent({ roundTrip });
+async function measure(workload, roundTrip, journal, world) {
+  const durable = journal !== undefined || world !== undefined;
+  const handle = durable ? await openAgent({ journal, world }) : await openAgent({ roundTrip });
   try {
     const rows = [];
     for (let index = -warmups; index < samples; index += 1) {
-      const row = await runTurn(handle, workload, index, journal ? null : roundTrip);
+      const row = await runTurn(handle, workload, index, durable ? null : roundTrip);
       if (index >= 0) rows.push(row);
     }
     return summarize(rows);
@@ -235,7 +237,7 @@ for (const workload of workloads) {
     const world = createWorld({ dataDir: mkdtempSync(join(tmpdir(), "libfx-bench-world-")), recoverActiveRuns: false });
     await world.start?.();
     try {
-      modes["world-local"] = await measure(workload, null, countingJournal(workflow({ world }).journal));
+      modes["world-local"] = await measure(workload, null, undefined, countingWorld(world));
     } finally {
       await closeWorld(world);
     }
@@ -244,8 +246,7 @@ for (const workload of workloads) {
 }
 
 for (const history of histories) {
-  const snapshots = [];
-  const journal = remoteJournal(0, [], { snapshots });
+  const journal = remoteJournal(0);
   const handle = await openAgent({ journal });
   let checkpoint;
   let lastTurnJournalBytes = 0;
@@ -267,11 +268,7 @@ for (const history of histories) {
   }
   const restoreMs = [];
   const journalRestoreMs = [];
-  const snapshotRestoreMs = [];
   const createMs = [];
-  // The newest snapshot that leaves at least 100 events after it.
-  const chosen = snapshots.findLast((snapshot) => journal.stored.length - snapshot.atSeq >= 100) ?? null;
-  const tail = chosen ? journal.stored.filter((event) => event.seq > chosen.atSeq) : [];
   for (let index = 0; index < restoreSamples; index += 1) {
     let startedAt = performance.now();
     const restored = await openAgent({ checkpoint });
@@ -281,12 +278,6 @@ for (const history of histories) {
     const replayed = await openAgent({ journal: remoteJournal(0, journal.stored) });
     journalRestoreMs.push(performance.now() - startedAt);
     await replayed.agent.close();
-    if (chosen) {
-      startedAt = performance.now();
-      const fromSnapshot = await openAgent({ journal: snapshotJournal(chosen.bytes, tail) });
-      snapshotRestoreMs.push(performance.now() - startedAt);
-      await fromSnapshot.agent.close();
-    }
     startedAt = performance.now();
     const fresh = await openAgent();
     createMs.push(performance.now() - startedAt);
@@ -303,10 +294,6 @@ for (const history of histories) {
     restore_create_ms: sampleStats(restoreMs),
     journal_restore_create_ms: sampleStats(journalRestoreMs),
     one_tool_turn_journal_bytes: turnBytes(journal.stored, history + 1),
-    snapshots: snapshots.length,
-    snapshot_bytes: chosen?.bytes.byteLength ?? null,
-    snapshot_tail_events: chosen ? tail.length : null,
-    snapshot_restore_create_ms: chosen ? sampleStats(snapshotRestoreMs) : null,
     fresh_create_ms: sampleStats(createMs),
   });
 }

@@ -82,7 +82,6 @@ const AcpMethod = enum {
     libfx_steer,
     libfx_withdraw,
     libfx_follow_up,
-    libfx_snapshot,
     libfx_journal_open,
     mcp_message,
     unknown,
@@ -106,7 +105,6 @@ const AcpMethod = enum {
         if (std.mem.eql(u8, method, "libfx/steer")) return .libfx_steer;
         if (std.mem.eql(u8, method, "libfx/withdraw")) return .libfx_withdraw;
         if (std.mem.eql(u8, method, "libfx/follow_up")) return .libfx_follow_up;
-        if (std.mem.eql(u8, method, "libfx/snapshot")) return .libfx_snapshot;
         if (std.mem.eql(u8, method, "libfx/journal_open")) return .libfx_journal_open;
         if (std.mem.eql(u8, method, "mcp/message")) return .mcp_message;
         return .unknown;
@@ -133,7 +131,6 @@ const AcpMethod = enum {
             .session_set_config_option,
             .libfx_checkpoint,
             .libfx_restore,
-            .libfx_snapshot,
             .libfx_journal_open,
             .mcp_message,
             .unknown,
@@ -143,7 +140,7 @@ const AcpMethod = enum {
 
     fn isLibfx(self: AcpMethod) bool {
         return switch (self) {
-            .libfx_checkpoint, .libfx_restore, .libfx_new, .libfx_steer, .libfx_withdraw, .libfx_follow_up, .libfx_snapshot, .libfx_journal_open => true,
+            .libfx_checkpoint, .libfx_restore, .libfx_new, .libfx_steer, .libfx_withdraw, .libfx_follow_up, .libfx_journal_open => true,
             else => false,
         };
     }
@@ -1439,7 +1436,6 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
             .libfx_steer => handleKernelSteer(state, alloc, msg),
             .libfx_withdraw => handleKernelWithdraw(state, alloc, msg),
             .libfx_follow_up => handleKernelFollowUp(state, alloc, msg),
-            .libfx_snapshot => handleKernelSnapshot(state, alloc, msg),
             .libfx_journal_open => handleKernelJournalOpen(state, alloc, msg),
             else => state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.method_not_found,
@@ -1463,7 +1459,6 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         .libfx_steer => handleKernelSteer(state, alloc, msg),
         .libfx_withdraw => handleKernelWithdraw(state, alloc, msg),
         .libfx_follow_up => handleKernelFollowUp(state, alloc, msg),
-        .libfx_snapshot => handleKernelSnapshot(state, alloc, msg),
         .libfx_journal_open => handleKernelJournalOpen(state, alloc, msg),
         .initialize,
         .request_cancel,
@@ -1805,19 +1800,6 @@ fn handleKernelJournalOpen(
         };
     }
 
-    var snapshot: ?[]u8 = null;
-    defer if (snapshot) |bytes| alloc.free(bytes);
-    if (parsed.value.object.get("snapshotAttachment")) |reference| {
-        const attachment = host_attachments.idFromJson(reference) orelse
-            return state.writer.writeError(alloc, msg.id, invalid);
-        const store = state.cfg.host_attachments orelse return state.writer.writeError(alloc, msg.id, invalid);
-        snapshot = store.take(alloc, attachment, journal_events.max_snapshot_bytes) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.AttachmentUnavailable => return state.writer.writeError(alloc, msg.id, invalid),
-            error.AttachmentTooLarge => return state.writer.writeError(alloc, msg.id, too_large),
-        };
-    }
-
     const config_hash: ?[]const u8 = if (parsed.value.object.get("configHash")) |value| switch (value) {
         .string => |hash| if (hash.len > 0 and hash.len <= journal_events.max_config_hash_bytes) hash else return state.writer.writeError(alloc, msg.id, invalid),
         .null => null,
@@ -1836,7 +1818,6 @@ fn handleKernelJournalOpen(
         &state.writer,
         &active.session_rt,
         events orelse "[]",
-        snapshot,
         config_hash,
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -1880,65 +1861,6 @@ fn handleKernelJournalOpen(
     }
     try response.writer.writeAll("]}");
     try state.writer.writeResponse(alloc, msg.id, response.written());
-}
-
-/// A snapshot of the session for its journal to store, when it is quiet: no
-/// turn open and no follow-up waiting. `null` otherwise; the host asks again
-/// after a later turn. The snapshot covers every event through `atSeq`.
-fn handleKernelSnapshot(
-    state: *ServerState,
-    alloc: Allocator,
-    msg: *const jsonrpc.Message,
-) !void {
-    var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, .{
-        .code = ErrorCode.invalid_params,
-        .message = "Invalid libfx snapshot params",
-    });
-    defer parsed.deinit();
-    const active = activeLibfxSession(state, parsed.value) orelse
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Unknown libfx session",
-        });
-    const store = state.cfg.host_attachments orelse return state.writer.writeError(alloc, msg.id, .{
-        .code = ErrorCode.invalid_request,
-        .message = "libfx snapshot is unavailable",
-    });
-    const none = "{\"snapshotAttachment\":null}";
-    active.session_write_mutex.lockUncancelable(io_mod.getIo());
-    defer active.session_write_mutex.unlock(io_mod.getIo());
-    const journal = if (active.journal) |*value| value else return state.writer.writeResponse(alloc, msg.id, none);
-    if (!journal.quiet()) return state.writer.writeResponse(alloc, msg.id, none);
-    // A session past a snapshot's bounds gets none until compaction brings it
-    // back within them; the host learns why.
-    const checkpoint = active.session_rt.agent.checkpoint(alloc) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.CheckpointTooLarge => return writeSnapshotSkipped(state, alloc, msg.id, if (active.session_rt.agent.history.items.len > journal_events.max_history_turns) .too_many_turns else .too_large),
-        else => return writeSnapshotSkipped(state, alloc, msg.id, .invalid),
-    };
-    defer alloc.free(checkpoint);
-    const at_seq = journal.cursor.next_seq - 1;
-    const bytes = try journal_events.encodeSnapshot(alloc, at_seq, journal.cursor.turn, journal.recorded_config, checkpoint);
-    defer alloc.free(bytes);
-    // A snapshot travels back as one host attachment.
-    if (bytes.len > journal_events.max_snapshot_bytes) return writeSnapshotSkipped(state, alloc, msg.id, .too_large);
-    const attachment = store.put(bytes) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.AttachmentStoreFull => return state.writer.writeResponse(alloc, msg.id, none),
-    };
-    const written = try std.fmt.allocPrint(alloc, "{{\"snapshotAttachment\":{d},\"atSeq\":{d}}}", .{ attachment, at_seq });
-    defer alloc.free(written);
-    try state.writer.writeResponse(alloc, msg.id, written);
-}
-
-/// Why a session past a snapshot's bounds gets none.
-const SnapshotSkip = enum { too_large, too_many_turns, invalid };
-
-fn writeSnapshotSkipped(state: *ServerState, alloc: Allocator, id: ?jsonrpc.RequestId, reason: SnapshotSkip) !void {
-    debug_trace.logf("session", "event=libfx_snapshot_skipped reason={s}", .{@tagName(reason)});
-    const body = try std.fmt.allocPrint(alloc, "{{\"snapshotAttachment\":null,\"skipped\":\"{s}\"}}", .{@tagName(reason)});
-    defer alloc.free(body);
-    try state.writer.writeResponse(alloc, id, body);
 }
 
 /// Records a follow-up the host queued behind the running turn, so a journal

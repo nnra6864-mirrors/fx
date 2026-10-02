@@ -19,10 +19,11 @@ import {
   listModels,
   normalizeAgentOptions,
   supportsJspi,
+  worldHandler,
   xtermAdapter,
 } from "./fx-sdk.js";
 
-export { createMemoryJournal, encodeXtermKeyEvent, FxConfigMismatchError, FxFencedError, FxJournalVersionError, fxSdkApiVersion, listModels, supportsJspi, xtermAdapter };
+export { createMemoryJournal, encodeXtermKeyEvent, FxConfigMismatchError, FxFencedError, FxJournalVersionError, fxSdkApiVersion, listModels, supportsJspi, worldHandler, xtermAdapter };
 export const libfxApiVersion = 2;
 const nativeCoreApiVersion = 4;
 

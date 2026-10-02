@@ -168,7 +168,7 @@ jobs:
           bun sdk/tests/test-libfx-benchmark.mjs
           bun sdk/tests/test-durable-harness.mjs
 
-      - name: Test libfx/workflow on a World
+      - name: Test libfx on a World
         run: |
           world_root="$(mktemp -d "$RUNNER_TEMP/libfx-world.XXXXXX")"
           npm install --prefix "$world_root" --no-audit --no-fund @workflow/world@5.0.0-beta.39 @workflow/world-local@5.0.0-beta.48

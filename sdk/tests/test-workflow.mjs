@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// libfx/workflow on a real World (@workflow/world-local): a session stored
-// in a run, fencing between two processes, and a killed process whose session
-// the queue route resumes with no caller.
+// libfx on a real World (@workflow/world-local), through
+// `createFxAgent({ world })` and `worldHandler`: a session stored in a run,
+// fencing between two processes, and a killed process whose session the queue
+// route resumes with no caller.
 //
 //   node sdk/tests/test-workflow.mjs <world-root> [native|wasm]
 //
@@ -15,8 +16,10 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { createFxAgent } from "../node.js";
-import { FxFencedError, workflow, workflowQueuePrefix } from "../workflow.js";
+import { createFxAgent, FxFencedError, worldHandler } from "../node.js";
+
+// The Workflow queue topic prefix libfx's runs use.
+const queuePrefix = "__wkf_workflow_";
 
 const args = process.argv.slice(2);
 const child = args[0] === "--child" ? Object.fromEntries(args.slice(1).map((value, index, all) => index % 2 === 0 ? [value.replace(/^--/, ""), all[index + 1]] : null).filter(Boolean)) : null;
@@ -79,7 +82,8 @@ async function startGateway() {
   return { server, requests, sessionIds, port: server.address().port };
 }
 
-// The app's agent definition, the same in every process.
+// The app's agent definition, the same in every process. `settings` carries
+// the World options: `world`, and `sessionId` or `wakeAfterSeconds`.
 function defineAgent(port, onSend, description = "Sends an email.") {
   const send = {
     description,
@@ -88,7 +92,7 @@ function defineAgent(port, onSend, description = "Sends an email.") {
     writes: true,
     execute: (input) => onSend(input),
   };
-  return (durable) => createFxAgent({
+  return (settings) => createFxAgent({
     backend,
     nativeAddon: addon,
     ...(wasm ? { wasm } : {}),
@@ -100,8 +104,61 @@ function defineAgent(port, onSend, description = "Sends an email.") {
     gatewayChatUrl: `http://127.0.0.1:${port}/chat`,
     model: "workflow/model",
     tools: { send_email: send },
-    ...durable,
+    ...settings,
   });
+}
+
+// The queue route over `world`, building agents with `build`, counting each.
+function route(world, build, onAgent = () => {}) {
+  return worldHandler({
+    world,
+    wakeAfterSeconds: 1,
+    createAgent: ({ sessionId }) => {
+      onAgent();
+      return build({ world, sessionId, wakeAfterSeconds: 1 });
+    },
+  });
+}
+
+// The journal events a run holds, by the rule libfx loads with: a batch
+// counts only if it continues the events before it.
+async function storedEvents(world, runId) {
+  const events = [];
+  for (let cursor; ;) {
+    const page = await world.events.list({ runId, pagination: { sortOrder: "asc", limit: 1000, ...(cursor ? { cursor } : {}) }, resolveData: "all" });
+    for (const event of page.data) {
+      const batch = event.eventData?.stepName === "libfx.journal" ? event.eventData.input?.events : null;
+      if (Array.isArray(batch) && batch[0]?.seq === events.length + 1) events.push(...batch);
+    }
+    if (!page.hasMore) break;
+    cursor = page.cursor;
+  }
+  return events;
+}
+
+// A run the way libfx writes one, holding `events` as one journal batch.
+async function seedRun(world, events) {
+  const created = await world.events.create(null, {
+    eventType: "run_created",
+    ...(world.specVersion === undefined ? {} : { specVersion: world.specVersion }),
+    eventData: { deploymentId: "libfx", workflowName: "libfx", input: { format: "libfx-journal-v1" } },
+  });
+  const runId = created.run?.runId ?? created.event?.runId;
+  if (events.length > 0) {
+    await world.events.create(runId, {
+      eventType: "step_created",
+      correlationId: `fxj_1_${crypto.randomUUID()}`,
+      eventData: { stepName: "libfx.journal", input: { format: "libfx-journal-v1", events } },
+    }, { eventCount: 1 });
+  }
+  return runId;
+}
+
+async function until(check, message, ms = 5000) {
+  for (const deadline = Date.now() + ms; !(await check());) {
+    if (Date.now() > deadline) throw new Error(message);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+  }
 }
 
 // world-local's queue teardown calls undici's Agent.close(), which Bun's
@@ -123,8 +180,8 @@ async function run(agent, input) {
 // Starts "send it", hands the turn off once send_email has started, and
 // closes the agent, leaving the turn open for the queue route.
 async function handOff(world, build, sending) {
-  const session = workflow({ world, wakeAfterSeconds: 1 });
-  const owner = await build(session);
+  const owner = await build({ world, wakeAfterSeconds: 1 });
+  const sessionId = owner.sessionId;
   const turn = owner.prompt("send it");
   const drained = (async () => { for await (const _ of turn) {} })().catch(() => {});
   await sending;
@@ -132,7 +189,7 @@ async function handOff(world, build, sending) {
   await turn.result.catch(() => {});
   await drained;
   await owner.close();
-  return session.sessionId;
+  return sessionId;
 }
 
 const within = (promise, ms, message) => Promise.race([
@@ -150,7 +207,7 @@ if (child) {
     process.stdout.write("effect\n");
     await new Promise(() => {});
   });
-  const agent = await createAgent(workflow({ world, sessionId: child.session }));
+  const agent = await createAgent({ world, sessionId: child.session });
   await run(agent, "send it");
   throw new Error("the child should have been killed inside send_email");
 }
@@ -163,21 +220,21 @@ test("a session stored in a World restores in a new agent", async () => {
   const world = createWorld({ dataDir: mkdtempSync(join(tmpdir(), "libfx-world-")), recoverActiveRuns: false });
   await world.start?.();
   const createAgent = defineAgent(gateway.port, () => "sent");
-  const first = workflow({ world });
   gateway.sessionIds.length = 0;
-  const agent = await createAgent(first);
+  const agent = await createAgent({ world });
+  const sessionId = agent.sessionId;
   assert.equal((await run(agent, "remember plums")).stopReason, "end_turn");
   await agent.close();
-  assert.match(first.sessionId, /^wrun_/);
+  assert.match(sessionId, /^wrun_/);
 
-  const again = await createAgent(workflow({ world, sessionId: first.sessionId }));
+  const again = await createAgent({ world, sessionId });
   gateway.requests.length = 0;
   await run(again, "what did I say");
   await again.close();
   const users = gateway.requests[0].filter((message) => message.role === "user").map(textOf);
   assert.ok(users.includes("remember plums"), "the restored session holds the earlier turn");
   // The run id is the session id in every gateway request, before and after the restore.
-  assert.ok(gateway.sessionIds.length >= 2 && gateway.sessionIds.every((id) => id === first.sessionId), JSON.stringify(gateway.sessionIds));
+  assert.ok(gateway.sessionIds.length >= 2 && gateway.sessionIds.every((id) => id === sessionId), JSON.stringify(gateway.sessionIds));
   await closeWorld(world);
 });
 
@@ -185,21 +242,14 @@ test("a second process on the session fences the first", async () => {
   const world = createWorld({ dataDir: mkdtempSync(join(tmpdir(), "libfx-world-")), recoverActiveRuns: false });
   await world.start?.();
   const createAgent = defineAgent(gateway.port, () => "sent");
-  const session = workflow({ world });
-  // turn.result does not wait for the turn's last appends, so the takeover
-  // below waits for them itself.
-  const appends = new Set();
-  const append = session.journal.append;
-  session.journal.append = (batch) => {
-    const written = append(batch);
-    appends.add(written);
-    return written;
-  };
-  const first = await createAgent(session);
+  const first = await createAgent({ world });
+  const sessionId = first.sessionId;
   await run(first, "one");
-  await Promise.all([...appends]);
+  // turn.result does not wait for the turn's last appends, so the takeover
+  // waits for the commit to reach the World.
+  await until(async () => (await storedEvents(world, sessionId)).some((event) => event.type === "turn_committed"), "the first turn never committed");
 
-  const second = await createAgent(workflow({ world, sessionId: session.sessionId }));
+  const second = await createAgent({ world, sessionId });
   await run(second, "two");
   await second.close();
   const fenced = (error) => error.code === "FX_JOURNAL_APPEND_FAILED" && error.cause instanceof FxFencedError;
@@ -207,7 +257,7 @@ test("a second process on the session fences the first", async () => {
   // The failure was reported once, so close() has nothing left to report.
   await first.close();
 
-  const { events } = await workflow({ world, sessionId: session.sessionId }).journal.load();
+  const events = await storedEvents(world, sessionId);
   const commits = events.filter((event) => event.type === "turn_committed").map((event) => event.data.user.text);
   assert.deepEqual(commits, ["one", "two"]);
   await closeWorld(world);
@@ -218,13 +268,12 @@ test("a killed process's session resumes from the queue with no caller", async (
   const effects = join(data, "effects.log");
   const setup = createWorld({ dataDir: data, recoverActiveRuns: false });
   await setup.start?.();
-  const created = workflow({ world: setup });
-  await created.journal.load();
+  const sessionId = await seedRun(setup, []);
   await closeWorld(setup);
 
   const execArgs = backend === "wasm" && !process.versions.bun ? ["--experimental-wasm-jspi"] : [];
   const worker = spawn(process.execPath, [...execArgs, fileURLToPath(import.meta.url), "--child",
-    "--world", worldRoot, "--backend", backend, "--data", data, "--session", created.sessionId,
+    "--world", worldRoot, "--backend", backend, "--data", data, "--session", sessionId,
     "--port", String(gateway.port), "--effects", effects], { stdio: ["ignore", "pipe", "pipe"] });
   let stderr = "";
   worker.stderr.on("data", (chunk) => { stderr += chunk; });
@@ -245,13 +294,13 @@ test("a killed process's session resumes from the queue with no caller", async (
   const deliveries = [];
   const world = createWorld({ dataDir: data, recoverActiveRuns: true });
   const build = defineAgent(gateway.port, () => { sends += 1; return "sent"; });
-  const durable = workflow({ world, wakeAfterSeconds: 1, createAgent: (options) => { agents += 1; return build(options); } });
+  const handler = route(world, build, () => { agents += 1; });
   gateway.requests.length = 0;
   const resumed = new Promise((resolveResumed, rejectResumed) => {
-    world.registerHandler(workflowQueuePrefix, async (request) => {
+    world.registerHandler(queuePrefix, async (request) => {
       try {
         const before = agents;
-        const response = await durable.handler(request);
+        const response = await handler(request);
         deliveries.push({ status: response.status, resumed: agents > before });
         if (agents > before) resolveResumed();
         return response;
@@ -276,8 +325,7 @@ test("a killed process's session resumes from the queue with no caller", async (
 
   // The session's journal now ends with the resumed turn committed.
   const reader = createWorld({ dataDir: data, recoverActiveRuns: false });
-  const { events } = await workflow({ world: reader, sessionId: created.sessionId }).journal.load();
-  const last = events.at(-1);
+  const last = (await storedEvents(reader, sessionId)).at(-1);
   assert.equal(last.type, "turn_committed");
   assert.equal(last.data.kind, "assistant");
   assert.equal(last.data.user.text, "send it");
@@ -296,12 +344,12 @@ test("a wake while the owner is still running does not take the session over", a
     await new Promise((resolveSend) => setTimeout(resolveSend, 2500));
     return "sent";
   });
-  const route = workflow({ world, wakeAfterSeconds: 1, createAgent: (options) => { agents += 1; return build(options); } });
-  world.registerHandler(workflowQueuePrefix, async (request) => {
+  const handler = route(world, build, () => { agents += 1; });
+  world.registerHandler(queuePrefix, async (request) => {
     deliveries += 1;
-    return route.handler(request);
+    return handler(request);
   });
-  const owner = await build(workflow({ world, wakeAfterSeconds: 1 }));
+  const owner = await build({ world, wakeAfterSeconds: 1 });
   assert.equal((await run(owner, "send it")).stopReason, "end_turn");
   await owner.close();
   // Let the last queued check arrive and find the turn closed.
@@ -324,12 +372,12 @@ test("a handed-off turn goes quiet when its agent closes, and the queue resumes 
     started();
     return new Promise(() => {});
   });
-  const route = workflow({ world, wakeAfterSeconds: 1, createAgent: (options) => { agents += 1; return build(options); } });
+  const handler = route(world, build, () => { agents += 1; });
   let resumedStatus;
   const resumed = new Promise((resolveResumed) => { resumedStatus = resolveResumed; });
-  world.registerHandler(workflowQueuePrefix, async (request) => {
+  world.registerHandler(queuePrefix, async (request) => {
     const before = agents;
-    const response = await route.handler(request);
+    const response = await handler(request);
     if (agents > before) resumedStatus(response.status);
     return response;
   });
@@ -350,12 +398,12 @@ test("the queue route acknowledges a turn it cannot resume under another config"
   const build = defineAgent(gateway.port, () => { started(); return new Promise(() => {}); });
   // The next deployment describes send_email differently.
   const changed = defineAgent(gateway.port, () => "sent", "Sends an email with a signature.");
-  const route = workflow({ world, wakeAfterSeconds: 1, createAgent: changed });
+  const handler = route(world, changed);
   const deliveries = [];
   let acknowledged;
   const answered = new Promise((resolveAnswered) => { acknowledged = resolveAnswered; });
-  world.registerHandler(workflowQueuePrefix, async (request) => {
-    const response = await route.handler(request);
+  world.registerHandler(queuePrefix, async (request) => {
+    const response = await handler(request);
     deliveries.push({ status: response.status, text: await response.clone().text() });
     if (response.status === 200) acknowledged();
     return response;
@@ -374,14 +422,11 @@ test("the queue route acknowledges a turn it cannot resume under another config"
 test("the queue route acknowledges a session no libfx can open", async () => {
   const world = createWorld({ dataDir: mkdtempSync(join(tmpdir(), "libfx-world-")), recoverActiveRuns: false });
   await world.start?.();
-  const session = workflow({ world });
-  await session.journal.load();
   // An open turn whose progress does not fold.
-  await session.journal.append([{ v: 1, seq: 1, turn: 1, type: "turn_progress", data: { not: "a checkpoint" } }]);
-  session.journal.close();
-  const route = workflow({ world, wakeAfterSeconds: 1, createAgent: defineAgent(gateway.port, () => "sent") });
+  const sessionId = await seedRun(world, [{ v: 1, seq: 1, turn: 1, type: "turn_progress", data: { not: "a checkpoint" } }]);
+  const handler = route(world, defineAgent(gateway.port, () => "sent"));
   await new Promise((resolveWait) => setTimeout(resolveWait, 1200));
-  const response = await route.handler(new Request("http://localhost/queue", { method: "POST", body: JSON.stringify({ runId: session.sessionId }) }));
+  const response = await handler(new Request("http://localhost/queue", { method: "POST", body: JSON.stringify({ runId: sessionId }) }));
   await closeWorld(world);
   assert.equal(response.status, 200);
   assert.match(await response.text(), /was not resumed: Invalid libfx journal/);
@@ -390,20 +435,17 @@ test("the queue route acknowledges a session no libfx can open", async () => {
 test("the queue route recognizes a config mismatch from another copy of libfx", async () => {
   const world = createWorld({ dataDir: mkdtempSync(join(tmpdir(), "libfx-world-")), recoverActiveRuns: false });
   await world.start?.();
-  const session = workflow({ world });
-  await session.journal.load();
-  await session.journal.append([{ v: 1, seq: 1, turn: 1, type: "turn_progress", data: {} }]);
-  session.journal.close();
+  const sessionId = await seedRun(world, [{ v: 1, seq: 1, turn: 1, type: "turn_progress", data: {} }]);
   // The CommonJS bundle carries its own copy of the error class.
   const foreign = () => Object.assign(new Error("the open turn started under other instructions, tools or model"), { code: "FX_CONFIG_MISMATCH" });
   let closed = 0;
-  const route = workflow({
+  const handler = worldHandler({
     world,
     wakeAfterSeconds: 1,
     createAgent: async () => ({ resume() { throw foreign(); }, async close() { closed += 1; } }),
   });
   await new Promise((resolveWait) => setTimeout(resolveWait, 1200));
-  const response = await route.handler(new Request("http://localhost/queue", { method: "POST", body: JSON.stringify({ runId: session.sessionId }) }));
+  const response = await handler(new Request("http://localhost/queue", { method: "POST", body: JSON.stringify({ runId: sessionId }) }));
   await closeWorld(world);
   assert.equal(response.status, 200);
   assert.match(await response.text(), /was not resumed: the open turn started under other/);
@@ -418,10 +460,22 @@ test("a World event id without a slot stops the write", async () => {
     },
     queue: async () => {},
   };
-  const durable = workflow({ world, sessionId: "wrun_test" });
-  await durable.journal.load();
-  const batch = [{ v: 1, seq: 1, turn: 1, type: "turn_committed", data: {} }];
-  await assert.rejects(durable.journal.append(batch), /cannot read a slot from/);
+  const agent = await defineAgent(gateway.port, () => "sent")({ world, sessionId: "wrun_test" });
+  await assert.rejects(
+    run(agent, "hello"),
+    (error) => error.code === "FX_JOURNAL_APPEND_FAILED" && /cannot read a slot from/.test(error.cause?.message),
+  );
+  await agent.close();
+});
+
+test("world takes no journal or checkpoint, and wakeAfterSeconds needs world", async () => {
+  const world = { events: { create: async () => ({}), list: async () => ({ data: [], hasMore: false }) }, queue: async () => {} };
+  const build = defineAgent(gateway.port, () => "sent");
+  await assert.rejects(build({ world, journal: { append() {}, async load() { return { events: [] }; } } }), /world cannot be combined with journal/);
+  await assert.rejects(build({ world, checkpoint: new Uint8Array(8) }), /world cannot be combined with checkpoint/);
+  await assert.rejects(build({ wakeAfterSeconds: 1 }), /wakeAfterSeconds needs world/);
+  await assert.rejects(build({ world: { events: {} } }), /world must be a Workflow World/);
+  assert.throws(() => worldHandler({ world }), /createAgent must be a function/);
 });
 
 try {
@@ -429,7 +483,7 @@ try {
     await body();
     console.log(`ok - ${name}`);
   }
-  console.log(`workflow integration passed: ${backend}`);
+  console.log(`World integration passed: ${backend}`);
 } finally {
   gateway.server.closeAllConnections();
   await new Promise((resolveClose) => gateway.server.close(resolveClose));

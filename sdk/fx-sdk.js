@@ -151,6 +151,15 @@ export function normalizeAgentOptions(value) {
       throw new TypeError("journal cannot be combined with checkpoint");
     }
   }
+  if (options.world !== undefined) {
+    validateWorld(options.world);
+    if (options.journal !== undefined) throw new TypeError("world cannot be combined with journal");
+    if (options.checkpoint !== undefined) throw new TypeError("world cannot be combined with checkpoint");
+  }
+  if (options.wakeAfterSeconds !== undefined) {
+    if (options.world === undefined) throw new TypeError("wakeAfterSeconds needs world");
+    validateWakeAfterSeconds(options.wakeAfterSeconds);
+  }
   return options;
 }
 
@@ -209,28 +218,18 @@ export class FxConfigMismatchError extends Error {
   }
 }
 
-// The last event a snapshot covers, from its header.
-function snapshotSeq(bytes) {
-  if (!(bytes instanceof Uint8Array) || bytes.byteLength < 21) return 0;
-  return Number(new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getBigUint64(5, true));
-}
-
 /**
  * A journal that keeps events in memory, for tests and for hosts that copy
  * them elsewhere. `events` is the stored list, oldest first. An append that
  * does not continue the stored events is rejected, so a second agent cannot
- * write the same journal. `snapshots: true` adds `snapshot()`, which drops
- * the events a snapshot covers; `snapshot` starts from a stored snapshot.
+ * write the same journal.
  */
-export function createMemoryJournal(events = [], { snapshots = false, snapshot = null } = {}) {
+export function createMemoryJournal(events = []) {
   if (!Array.isArray(events)) throw new TypeError("events must be an array");
-  if (snapshot !== null && !(snapshot instanceof Uint8Array)) throw new TypeError("snapshot must be a Uint8Array");
   const stored = [...events];
-  let latest = snapshot ? { bytes: snapshot.slice(), atSeq: snapshotSeq(snapshot) } : null;
-  const lastSeq = () => stored.at(-1)?.seq ?? latest?.atSeq ?? 0;
-  const journal = {
+  const lastSeq = () => stored.at(-1)?.seq ?? 0;
+  return {
     events: stored,
-    get latestSnapshot() { return latest; },
     async append(batch) {
       const expected = lastSeq() + 1;
       if (batch[0]?.seq !== expected) {
@@ -239,24 +238,294 @@ export function createMemoryJournal(events = [], { snapshots = false, snapshot =
       stored.push(...batch);
     },
     async load() {
-      return latest ? { snapshot: latest.bytes.slice(), events: stored.slice() } : { events: stored.slice() };
+      return { events: stored.slice() };
     },
   };
-  if (snapshots) {
-    journal.snapshot = async (bytes, atSeq) => {
-      if (!(bytes instanceof Uint8Array) || !Number.isSafeInteger(atSeq) || atSeq < 1) {
-        throw new TypeError("snapshot() takes bytes and the seq they cover");
-      }
-      if (atSeq > lastSeq()) throw new RangeError("a snapshot cannot cover events the journal has not stored");
-      // Snapshots only move forward: a late one, even from an agent another
-      // has since replaced, summarizes events a newer one already covers.
-      if (latest && atSeq <= latest.atSeq) return;
-      const after = stored.findIndex((event) => event.seq > atSeq);
-      stored.splice(0, after < 0 ? stored.length : after);
-      latest = { bytes: bytes.slice(), atSeq };
-    };
+}
+
+// World storage. A session `createFxAgent({ world })` keeps is a World run,
+// and each journal append is one `step_created` event in it, so the run's
+// event log holds the session. The World is the app's, such as
+// `createWorld()` from `@workflow/world-vercel`; libfx imports no Workflow
+// package.
+const worldJournalStep = "libfx.journal";
+const worldJournalFormat = "libfx-journal-v1";
+// A run names its workflow and deployment; nothing executes these runs.
+const worldWorkflowName = "libfx";
+// The queue topic of that workflow's runs (`getQueueTopicPrefix`).
+const worldQueueName = `__wkf_workflow_${worldWorkflowName}`;
+const defaultWakeAfterSeconds = 300;
+// Event ids are `evnt_` followed by the slot, zero-padded to 26 digits.
+const worldEventId = /^[a-z]+_(\d{26})$/;
+// Failures a later delivery of the same wake would repeat, by code, so an
+// error from another copy of libfx counts too.
+const permanentWorldOpenFailures = new Set(["FX_CONFIG_MISMATCH", "FX_JOURNAL_TOO_LARGE", "FX_JOURNAL_INVALID"]);
+
+function validateWorld(world) {
+  if (!world?.events || typeof world.events.create !== "function" || typeof world.events.list !== "function" || typeof world.queue !== "function") {
+    throw new TypeError("world must be a Workflow World with events.create(), events.list() and queue()");
   }
-  return journal;
+}
+
+function validateWakeAfterSeconds(value) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    throw new TypeError("wakeAfterSeconds must be a positive number");
+  }
+}
+
+// Fencing reads the slot from the id, so an id in another form stops the
+// write rather than letting it pass unchecked.
+function worldSlot(event) {
+  const match = worldEventId.exec(String(event?.eventId ?? ""));
+  if (!match) throw new Error(`the World returned event id ${JSON.stringify(event?.eventId ?? null)}, which libfx cannot read a slot from`);
+  return Number(match[1]);
+}
+
+function worldBatch(event) {
+  if (event?.eventType !== "step_created" || event.eventData?.stepName !== worldJournalStep) return null;
+  const input = event.eventData.input;
+  if (input?.format !== worldJournalFormat || !Array.isArray(input.events) || input.events.length === 0) return null;
+  return input.events;
+}
+
+// Whether a turn is open after `events`: progress or a tool intent opens one;
+// a commit or a cleared turn closes it; compaction leaves it as it was.
+function worldTurnOpenAfter(open, events) {
+  for (const event of events) {
+    if (event.type === "turn_progress" || event.type === "tool_intent") open = true;
+    else if (event.type === "turn_committed" || event.type === "turn_progress_cleared") open = false;
+  }
+  return open;
+}
+
+// Whether the journal holds follow-ups no turn has run: accepted, and never
+// placed by a progress or withdrawn.
+function worldHoldsFollowUps(events) {
+  const waiting = new Set();
+  for (const event of events) {
+    if (event.type === "input_accepted" && event.data?.kind === "follow_up") waiting.add(event.data.id);
+    else if (event.type === "input_withdrawn") waiting.delete(event.data?.id);
+    else if (event.type === "turn_progress") for (const id of event.inputs ?? []) waiting.delete(id);
+  }
+  return waiting.size > 0;
+}
+
+// The journal events a run holds. A batch counts only if it continues the
+// events before it; a fenced writer's late batch repeats a seq and is skipped.
+function worldJournalEvents(events) {
+  const journalEvents = [];
+  for (const event of events) {
+    const batch = worldBatch(event);
+    if (batch && batch[0].seq === journalEvents.length + 1) journalEvents.push(...batch);
+  }
+  return journalEvents;
+}
+
+async function readWorldRun(world, runId) {
+  const events = [];
+  let cursor;
+  for (;;) {
+    const page = await world.events.list({
+      runId,
+      pagination: { sortOrder: "asc", limit: 1000, ...(cursor ? { cursor } : {}) },
+      resolveData: "all",
+    });
+    events.push(...page.data);
+    if (!page.hasMore) break;
+    cursor = page.cursor;
+  }
+  return events;
+}
+
+// The journal of a World session. `sessionId` opens that run; without it,
+// `load()` creates one, and its id becomes the agent's `sessionId`.
+// `wakeAfterSeconds` bounds how long an open turn may go without a write:
+// the agent writes a heartbeat while a turn is open, so the queue route
+// takes the turn over only once its process has stopped.
+function worldJournal(world, sessionId, wakeAfterSeconds = defaultWakeAfterSeconds) {
+  const wakeAfterMs = wakeAfterSeconds * 1000;
+  // At least 100 ms, so a short test timeout does not turn into a write loop.
+  const heartbeatMs = Math.max(100, wakeAfterMs / 3);
+
+  let runId = sessionId ?? null;
+  // Slots this process has seen. Slots are dense, so this is the last one.
+  let eventCount = 0;
+  let previous = Promise.resolve();
+  let fenced = null;
+  // The seq the next journal batch starts at.
+  let nextSeq = 1;
+  let turnOpen = false;
+  // Whether this process queued a wake for the open turn.
+  let wakeQueued = false;
+  let lastWriteAt = 0;
+  let heartbeat = null;
+  let closed = false;
+
+  const queueWake = (delaySeconds) => world.queue(worldQueueName, { runId }, { delaySeconds });
+
+  function fence(message) {
+    fenced = new FxFencedError(message);
+    stopHeartbeat();
+    return fenced;
+  }
+
+  // Writes one event at the slot after the last one this process has seen.
+  // A World never refuses a write for a taken slot: it commits at the next
+  // free one and reports what it skipped. When a skipped event is another
+  // writer's batch starting at `seq`, that batch continues the journal and
+  // this process's view is stale, so it stops writing; load skips whatever
+  // it wrote after the other batch.
+  async function commit(request, seq) {
+    if (fenced) throw fenced;
+    const result = await world.events.create(runId, request, { eventCount });
+    lastWriteAt = Date.now();
+    const slot = worldSlot(result.event);
+    const expected = eventCount + 1;
+    eventCount = slot;
+    if (slot === expected) return;
+    const skipped = Array.isArray(result.events) ? result.events : (await readWorldRun(world, runId)).slice(expected - 1, eventCount - 1);
+    if (skipped.some((event) => worldBatch(event)?.[0].seq === seq)) {
+      throw fence(`another process wrote to session ${runId}; this one has stopped`);
+    }
+  }
+
+  function serialize(task) {
+    const done = previous.then(task);
+    previous = done.catch(() => {});
+    return done;
+  }
+
+  function startHeartbeat() {
+    if (heartbeat) return;
+    heartbeat = setInterval(() => {
+      if (Date.now() - lastWriteAt < heartbeatMs) return;
+      // A failed heartbeat is not retried here; the next one or the next
+      // append writes again, and a fence stops both.
+      serialize(() => (turnOpen && !fenced ? commit({ eventType: "noop", eventData: { libfx: "heartbeat" } }, nextSeq) : undefined)).catch(() => {});
+    }, heartbeatMs);
+    heartbeat.unref?.();
+  }
+
+  function stopHeartbeat() {
+    if (!heartbeat) return;
+    clearInterval(heartbeat);
+    heartbeat = null;
+  }
+
+  async function write(batch) {
+    const open = worldTurnOpenAfter(turnOpen, batch);
+    const wake = open && !wakeQueued;
+    // A unique step id per write: a write that died partway can leave its id
+    // taken in some Worlds, and must not block the write that replaces it.
+    const step = commit({
+      eventType: "step_created",
+      correlationId: `fxj_${batch[0].seq}_${crypto.randomUUID()}`,
+      eventData: { stepName: worldJournalStep, input: { format: worldJournalFormat, events: batch } },
+    }, batch[0].seq);
+    // The wake rides alongside the turn's first write, so it costs no extra
+    // round trip; without it no one resumes the turn if this process stops.
+    await Promise.all([step, wake ? queueWake(wakeAfterSeconds) : undefined]);
+    nextSeq = batch.at(-1).seq + 1;
+    turnOpen = open;
+    if (open) {
+      wakeQueued = true;
+      startHeartbeat();
+    } else {
+      wakeQueued = false;
+      stopHeartbeat();
+    }
+  }
+
+  return {
+    async load() {
+      if (runId === null) {
+        const created = await world.events.create(null, {
+          eventType: "run_created",
+          ...(world.specVersion === undefined ? {} : { specVersion: world.specVersion }),
+          eventData: { deploymentId: worldWorkflowName, workflowName: worldWorkflowName, input: { format: worldJournalFormat } },
+        });
+        runId = created.run?.runId ?? created.event?.runId;
+        if (typeof runId !== "string") throw new Error("the World did not return the new run's id");
+      }
+      const events = await readWorldRun(world, runId);
+      eventCount = events.length;
+      const journalEvents = worldJournalEvents(events);
+      nextSeq = journalEvents.length + 1;
+      turnOpen = worldTurnOpenAfter(false, journalEvents);
+      return { events: journalEvents, sessionId: runId };
+    },
+    append(batch) {
+      if (closed) return Promise.reject(new Error("the session's journal is closed"));
+      // Each write states the slot it expects, so writes go out in call order.
+      return serialize(() => write(batch));
+    },
+    // The agent closed: no more heartbeats, so a turn it left open, such as
+    // one handed off, goes silent and the queue route resumes it.
+    close() {
+      closed = true;
+      stopHeartbeat();
+    },
+  };
+}
+
+/**
+ * The queue route for sessions `createFxAgent({ world })` keeps, for example
+ * `export const POST = worldHandler({ world, createAgent })` in
+ * `app/.well-known/workflow/v1/flow/route.js`. Resumes the session a queue
+ * message names when its open turn, or a follow-up it holds, has gone
+ * `wakeAfterSeconds` without a write; checks again later while the owner is
+ * still writing; does nothing once no work is left.
+ *
+ * `createAgent({ sessionId })` builds the agent the app builds, with the same
+ * tools, instructions and model, for that session.
+ */
+export function worldHandler({ world, createAgent, wakeAfterSeconds = defaultWakeAfterSeconds } = {}) {
+  validateWorld(world);
+  if (typeof createAgent !== "function") throw new TypeError("createAgent must be a function");
+  validateWakeAfterSeconds(wakeAfterSeconds);
+  const wakeAfterMs = wakeAfterSeconds * 1000;
+  return async (request) => {
+    let message;
+    try {
+      message = await request.json();
+    } catch {
+      return new Response("invalid queue message", { status: 400 });
+    }
+    const target = message?.runId;
+    if (typeof target !== "string") return new Response("queue message has no runId", { status: 400 });
+
+    const events = await readWorldRun(world, target);
+    const journalEvents = worldJournalEvents(events);
+    if (!worldTurnOpenAfter(false, journalEvents) && !worldHoldsFollowUps(journalEvents)) return new Response(null, { status: 204 });
+    const lastAt = Math.max(0, ...events.map((event) => new Date(event.createdAt).getTime()).filter(Number.isFinite));
+    const silentMs = Date.now() - lastAt;
+    if (silentMs < wakeAfterMs) {
+      // The owner wrote recently and may still be running the turn.
+      await world.queue(worldQueueName, { runId: target }, { delaySeconds: Math.max(1, Math.ceil((wakeAfterMs - silentMs) / 1000)) });
+      return new Response(null, { status: 204 });
+    }
+
+    let agent = null;
+    try {
+      agent = await createAgent({ sessionId: target });
+      // The open turn first, then each follow-up the journal held.
+      for (let turn = agent.resume(); turn; turn = agent.resume()) {
+        for await (const _ of turn) {}
+        await turn.result;
+      }
+    } catch (error) {
+      // Asking again will not change these: a deployment with other tools,
+      // instructions or model cannot resume the turn, and this libfx cannot
+      // open a journal that is too large or does not fold. A config
+      // mismatch waits for the session's next prompt, which ends the turn
+      // as interrupted.
+      if (!permanentWorldOpenFailures.has(error?.code)) throw error;
+      return new Response(`session ${target} was not resumed: ${error.message}`, { status: 200 });
+    } finally {
+      await agent?.close();
+    }
+    return new Response(null, { status: 204 });
+  };
 }
 
 // Marks the turn `agent.resume()` starts; never a caller-visible option.
@@ -269,15 +538,6 @@ function journalAppendError(cause) {
   error.code = "FX_JOURNAL_APPEND_FAILED";
   return error;
 }
-
-// Matches the core's snapshot limit (journal.max_snapshot_bytes).
-const maxSnapshotBytes = 4 * 1024 * 1024;
-// libfx asks the core for a snapshot as a turn's result arrives, once this
-// many events landed since the last one.
-const snapshotEvery = 100;
-// Or once this many bytes of events landed, so a few large turns cannot
-// outgrow a load.
-const snapshotEveryBytes = 1024 * 1024;
 
 // What shapes a turn: instructions, model, and each tool's name,
 // description, schema, replay policy and whether it writes. A turn the
@@ -324,14 +584,11 @@ function journalLoaded(loaded) {
   if (!loaded || typeof loaded !== "object" || !Array.isArray(loaded.events)) {
     throw new TypeError("journal.load() must resolve to { events: [] }");
   }
-  const snapshot = loaded.snapshot ?? null;
-  if (snapshot !== null && !(snapshot instanceof Uint8Array)) throw new TypeError("journal.load() snapshot must be a Uint8Array");
-  if (snapshot !== null && snapshot.byteLength > maxSnapshotBytes) throw journalLoadError("libfx journal snapshot is too large", "FX_JOURNAL_TOO_LARGE");
   const sessionId = loaded.sessionId ?? null;
   if (sessionId !== null && !validSessionId(sessionId)) {
     throw new TypeError(`journal.load() sessionId must be ${sessionIdRule}`);
   }
-  return { events: loaded.events, sessionId, snapshot };
+  return { events: loaded.events, sessionId };
 }
 
 function agentEnvironment(options) {
@@ -1993,7 +2250,7 @@ function base64ToBytes(value) {
 
 export async function createFxAgent(options = {}) {
   options = normalizeAgentOptions(options);
-  const hostTools = normalizeHostTools(options.tools, { journaled: options.journal !== undefined });
+  const hostTools = normalizeHostTools(options.tools, { journaled: options.journal !== undefined || options.world !== undefined });
   const instructions = normalizeInstructions(options.instructions);
   const initialCheckpoint = checkpointBytes(options.checkpoint);
   // Checked before the core starts, and with the core's message, so both
@@ -2012,7 +2269,9 @@ export async function createFxAgent(options = {}) {
   // arrive together share one append, and an append starts without waiting
   // for earlier ones, so a remote journal adds one round trip to a turn
   // rather than one per append. The host stores calls in call order.
-  const journal = options.journal ?? null;
+  const journal = options.world !== undefined
+    ? worldJournal(options.world, options.sessionId ?? null, options.wakeAfterSeconds)
+    : options.journal ?? null;
   let resumable = false;
   let openTurnConfigMismatch = false;
   // Follow-ups waiting for the turn ahead of them, oldest first.
@@ -2055,55 +2314,6 @@ export async function createFxAgent(options = {}) {
       inputWaiters.set(key, waiters);
     });
   };
-  // The last event the journal has stored, the last one the core sent, the
-  // newest snapshot's seq, and the snapshot in progress.
-  let durableSeq = 0;
-  let receivedSeq = 0;
-  let snapshotAtSeq = 0;
-  let bytesSinceSnapshot = 0;
-  let snapshotSkipped = null;
-  let snapshotting = null;
-  // Called as a turn's prompt response arrives, before the host can start
-  // another, so the core is between turns and the request reaches it first.
-  // The snapshot reaches the journal only once every event it covers is
-  // stored.
-  const maybeSnapshot = () => {
-    if (typeof journal?.snapshot !== "function" || snapshotting || closing || journalFailure || handedOff) return;
-    if (receivedSeq - snapshotAtSeq < snapshotEvery && bytesSinceSnapshot < snapshotEveryBytes) return;
-    // The snapshot covers every event received so far; the count comes back
-    // if none is stored.
-    const coveredBytes = bytesSinceSnapshot;
-    bytesSinceSnapshot = 0;
-    let stored = false;
-    snapshotting = (async () => {
-      const response = await request("libfx/snapshot", { sessionId });
-      // The session is past a snapshot's bounds and gets none until it is
-      // back within them.
-      if (typeof response?.skipped === "string") {
-        if (response.skipped !== snapshotSkipped) emit("journal.snapshot_skipped", { reason: response.skipped });
-        snapshotSkipped = response.skipped;
-        return;
-      }
-      const id = response?.snapshotAttachment;
-      const atSeq = response?.atSeq;
-      if (!Number.isSafeInteger(id) || id <= 0 || !Number.isSafeInteger(atSeq)) return;
-      const bytes = runtime.takeAttachment?.(id);
-      if (!(bytes instanceof Uint8Array)) return;
-      await journalSettled();
-      if (durableSeq < atSeq) return;
-      await journal.snapshot(new Uint8Array(bytes), atSeq);
-      stored = true;
-      snapshotSkipped = null;
-      snapshotAtSeq = Math.max(snapshotAtSeq, atSeq);
-      emit("journal.snapshot", { atSeq, bytes: bytes.byteLength });
-    })().catch((error) => {
-      // A journal without its latest snapshot is still complete.
-      emit("journal.snapshot_error", { error: error instanceof Error ? error.name : "Error" });
-    }).finally(() => {
-      if (!stored) bytesSinceSnapshot += coveredBytes;
-      snapshotting = null;
-    });
-  };
   const settleInputs = (batch) => {
     for (const event of batch) {
       if (event.type !== "input_accepted" && event.type !== "input_withdrawn") continue;
@@ -2136,7 +2346,6 @@ export async function createFxAgent(options = {}) {
       return;
     }
     journalQueue.push(...events);
-    receivedSeq = Math.max(receivedSeq, events.at(-1)?.seq ?? 0);
     if (journalFlushScheduled) return;
     journalFlushScheduled = true;
     queueMicrotask(flushJournal);
@@ -2154,7 +2363,6 @@ export async function createFxAgent(options = {}) {
       appended = Promise.reject(error);
     }
     const settled = appended.then(() => {
-      durableSeq = Math.max(durableSeq, batch.at(-1).seq);
       settleInputs(batch);
     }, (error) => {
       // Later events would leave a gap after the failed batch.
@@ -2397,7 +2605,6 @@ export async function createFxAgent(options = {}) {
     emit("acp.receive", { message });
     if (message.method === "libfx/journal_append") {
       if (journal && message.params?.sessionId === sessionId) {
-        bytesSinceSnapshot += size;
         queueJournalEvents(message.params.events);
       }
       return;
@@ -2480,21 +2687,10 @@ export async function createFxAgent(options = {}) {
     if (journal) {
       const { events } = loaded;
       const params = { sessionId, configHash: await configHashOf(instructions, options.model, hostTools.descriptors) };
-      durableSeq = events.at(-1)?.seq ?? snapshotSeq(loaded.snapshot);
-      receivedSeq = durableSeq;
-      snapshotAtSeq = loaded.snapshot ? snapshotSeq(loaded.snapshot) : 0;
-      // One attachBytes call: each call discards the attachments before it.
-      const payloads = [];
-      if (loaded.snapshot) payloads.push(["snapshotAttachment", loaded.snapshot]);
       if (events.length > 0) {
         const bytes = encoder.encode(JSON.stringify(withoutSupersededProgress(events)));
         if (bytes.byteLength > maxJournalBytes) throw journalLoadError("libfx journal is too large", "FX_JOURNAL_TOO_LARGE");
-        payloads.push(["journalAttachment", bytes]);
-        bytesSinceSnapshot = bytes.byteLength;
-      }
-      if (payloads.length > 0) {
-        const ids = attachBytes(payloads.map(([, bytes]) => bytes));
-        payloads.forEach(([key], index) => { params[key] = ids[index]; });
+        [params.journalAttachment] = attachBytes([bytes]);
       }
       const opened = await request("libfx/journal_open", params).catch((error) => {
         const message = error?.message ?? "";
@@ -2509,7 +2705,7 @@ export async function createFxAgent(options = {}) {
       for (const held of Array.isArray(opened?.followUps) ? opened.followUps : []) {
         followUps.push({ id: held.id, text: held.text, accepted: true, held: true });
       }
-      emit("journal.open", { events: events.length, turns: opened?.turns, resumable, snapshot: loaded.snapshot !== null });
+      emit("journal.open", { events: events.length, turns: opened?.turns, resumable });
     }
   } catch (error) {
     closing = true;
@@ -2520,6 +2716,10 @@ export async function createFxAgent(options = {}) {
   }
 
   const agent = {
+    // The session's id: for a World session, its run id.
+    get sessionId() {
+      return sessionId;
+    },
     prompt(input, promptOptions = {}) {
       if (closing) throw new Error("fx agent is closed");
       if (journalFailure) throw reportJournalFailure();
@@ -2625,7 +2825,6 @@ export async function createFxAgent(options = {}) {
       const turn = activeTurn;
       turn?.cancel();
       if (turn) await turn.result.catch(() => {});
-      if (snapshotting) await snapshotting;
       closing = true;
       // A journal keeps these; the next `resume()` runs them.
       for (const entry of followUps.splice(0)) entry.rejectTurn?.(new Error("fx agent closed before the follow-up ran"));
@@ -2953,7 +3152,6 @@ export async function createFxAgent(options = {}) {
     turn.result = response
       .then((value) => {
         if (journalFailure) throw reportJournalFailure();
-        maybeSnapshot();
         return { stopReason: cancelled ? "cancelled" : value.stopReason, usage: value.usage };
       })
       .catch(async (error) => {
