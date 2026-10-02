@@ -13,6 +13,7 @@ const app_session_runtime = @import("app_session_runtime.zig");
 const app_render_runtime = @import("app_render_runtime.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const permission_request = @import("../permissions/permission_request.zig");
+const child_agents_runtime = @import("../child_agents/runtime.zig");
 const session = @import("../session/session.zig");
 const interaction_state = @import("../../ui/footer/interaction_state.zig");
 const approval_prompt = @import("../permissions/approval_prompt.zig");
@@ -241,6 +242,25 @@ pub fn ApprovalRuntime(comptime App: type) type {
             );
             var response_submitted = false;
             errdefer if (!response_submitted) response.deinit();
+            if (child_agents_runtime.ofApp(app)) |children| {
+                if (children.ownsPrompt(request_id)) {
+                    response_submitted = true;
+                    defer response.deinit();
+                    const child_decision: @import("../child_agents/labels.zig").Decision = switch (response.decision) {
+                        .once => .once,
+                        .always => .always,
+                        else => .deny,
+                    };
+                    children.answerPermission(request_id, child_decision, response.feedback) catch |err| {
+                        debug_trace.logf("child_agents", "approval answer failed request_id={d} err={s}", .{ request_id, @errorName(err) });
+                        return;
+                    };
+                    clearApprovalPromptAfterSubmission(app);
+                    app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
+                    requestActiveSurfaceFrame(app);
+                    return;
+                }
+            }
             const result = app.worker.submitPermissionResponse(request_id, response);
             response_submitted = true;
             switch (result) {
@@ -398,6 +418,20 @@ pub fn ApprovalRuntime(comptime App: type) type {
         }
 
         pub fn cancelApprovalOperation(app: *App) !void {
+            // Dismissing a sub-engine child's prompt denies it; the child
+            // goes on.
+            if (app.approval_prompt.request) |request| {
+                if (child_agents_runtime.ofApp(app)) |children| {
+                    if (children.ownsPrompt(request.id)) {
+                        children.answerPermission(request.id, .deny, null) catch |err| {
+                            debug_trace.logf("child_agents", "approval dismissal failed request_id={d} err={s}", .{ request.id, @errorName(err) });
+                        };
+                        clearApprovalPrompt(app, "child_approval_dismissed");
+                        requestActiveSurfaceFrame(app);
+                        return;
+                    }
+                }
+            }
             if (app_session_runtime.Runtime(App).subagentHost(app)) |host| {
                 if (try host.pendingApprovalRequest(app.alloc)) |loaded| {
                     var pending = loaded;

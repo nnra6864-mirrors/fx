@@ -251,6 +251,10 @@ pub fn Runtime(comptime App: type) type {
                     app_session_runtime.Runtime(App).subagentHost(app)
                 else
                     null,
+                .child_agents = if (comptime @hasField(App, "child_agents"))
+                    (if (app.child_agents) |*children| children else null)
+                else
+                    null,
                 .subagent_caller_id = if (comptime @hasField(App, "session_persistence"))
                     app_session_runtime.Runtime(App).activeSessionId(app)
                 else

@@ -70,6 +70,8 @@ const host_runtime_profile = @import("core/hosts/runtime_profile.zig");
 const js_host_url_opener = @import("core/hosts/js_host_url_opener.zig");
 const js_host_workspace = @import("core/hosts/js_host_workspace.zig");
 const host_target = @import("core/hosts/target.zig");
+const child_agents_runtime = @import("core/child_agents/runtime.zig");
+const self_exe = @import("core/shared/self_exe.zig");
 const native_host = @import("core/hosts/native.zig");
 const debug_trace = @import("core/shared/debug_trace.zig");
 const display_width = @import("core/shared/display_width.zig");
@@ -543,6 +545,9 @@ const App = struct {
     notifications: builtin_hooks.notifications.State = .{},
     herdr: builtin_hooks.Client = .{},
     parent_report: builtin_hooks.parent_report.Client = .{},
+    /// The children of the subagent tool with sub-engine children, when
+    /// `--subagents-v2` is on.
+    child_agents: ?child_agents_runtime.Runtime = null,
 
     session: SessionRuntime = SessionRuntime.initWithProviders(
         max_history_turns,
@@ -698,6 +703,13 @@ const App = struct {
             },
         );
         errdefer app.deinit();
+        if (comptime !host_target.is_wasm) {
+            if (child_agents_runtime.enabled(launch.modifiers.subagents_v2)) {
+                const program = try self_exe.pathForPeerReexec(alloc);
+                defer alloc.free(program);
+                app.child_agents = try child_agents_runtime.Runtime.init(alloc, io_mod.getIo(), .{ .program = program });
+            }
+        }
         try WorkspaceAppRuntime.applyLaunch(
             &app,
             launch.modifiers.additional_directories,
@@ -859,6 +871,13 @@ const App = struct {
         return self.upgrader.takeRelaunchRequest();
     }
 
+    /// Closes every child of the subagent tool. Their sessions stay saved.
+    fn stopChildAgents(self: *App) void {
+        if (comptime host_target.is_wasm) return;
+        if (self.child_agents) |*children| children.deinit();
+        self.child_agents = null;
+    }
+
     /// Native interactive exit. Runs only the work whose effects outlive the
     /// process: restoring the terminal, persisting the session, finishing
     /// durable credential saves, and terminating child processes. Memory and
@@ -878,6 +897,7 @@ const App = struct {
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
         self.parent_report.deinit();
+        self.stopChildAgents();
         self.stopStream();
         self.worker.requestShutdown();
         SessionAppRuntime.requestPersistenceShutdown(self);
@@ -943,6 +963,7 @@ const App = struct {
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
         self.parent_report.deinit();
+        self.stopChildAgents();
         self.stopStream();
         shutdown_trace.mark("stop_stream");
 
@@ -1853,6 +1874,7 @@ const App = struct {
 
     fn effectiveToolSet(self: *const App) tool_set_contract.ToolSet {
         if (comptime host_profile.tools) {
+            if (self.child_agents != null) return builtin_tools.subagents_v2_set;
             return builtin_tools.advertisement_set;
         }
         return browser_workspace_tools.selectToolSet(
@@ -2023,7 +2045,8 @@ const App = struct {
         return tool_projection.buildModelToolProjectionForSet(alloc, self.toolAdvertisementSet(), .{
             .permission_mode = permission_mode,
             .permission_rules = permission_rules,
-            .subagent_available = self.session_persistence.subagent_host != null,
+            .subagent_available = self.child_agents != null or
+                (self.session_persistence.subagent_host != null and !child_agents_runtime.isChild()),
         });
     }
 
@@ -3964,6 +3987,7 @@ fn fullEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
         .context_registry = default_context_registry,
         .mode_registry = builtin_modes.registry,
         .tool_set = builtin_tools.advertisement_set,
+        .subagents_v2_tool_set = if (host_target.is_wasm) null else builtin_tools.subagents_v2_set,
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
@@ -4003,6 +4027,7 @@ fn localEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
         .context_registry = default_context_registry,
         .mode_registry = builtin_modes.registry,
         .tool_set = builtin_tools.advertisement_set,
+        .subagents_v2_tool_set = if (host_target.is_wasm) null else builtin_tools.subagents_v2_set,
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
@@ -4042,6 +4067,7 @@ fn emptyEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
         .context_registry = default_context_registry,
         .mode_registry = builtin_modes.registry,
         .tool_set = builtin_tools.advertisement_set,
+        .subagents_v2_tool_set = if (host_target.is_wasm) null else builtin_tools.subagents_v2_set,
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
