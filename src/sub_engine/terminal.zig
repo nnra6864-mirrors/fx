@@ -679,8 +679,8 @@ test "an inherited report entry is replaced by the terminal's own" {
 }
 
 test "a query reply written back reaches the child" {
-    // The child asks for the cursor position as a program would; the test
-    // answers as an emulator would.
+    // The child sends a position query (CSI 6n) as a program would; the
+    // test answers as an emulator would.
     var terminal = try openShell(
         "stty raw -echo; printf '\\033[6n'; r=$(dd bs=1 count=8 2>/dev/null); stty sane; echo; echo \"reply=$r\"",
     );
