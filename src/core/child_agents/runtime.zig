@@ -43,7 +43,11 @@ pub fn enabled(flag: bool) bool {
 }
 
 /// The runtime `app` holds in its `child_agents` field, if it has one.
-pub fn ofApp(app: anytype) ?*Runtime {
+pub inline fn ofApp(app: anytype) ?*Runtime {
+    // The wasm builds have no child terminals. A null known at compile
+    // time keeps every caller's child-runtime branch, and with it socket
+    // calls the wasm hosts do not provide, out of those builds.
+    if (comptime host_target.is_wasm) return null;
     const App = @typeInfo(@TypeOf(app)).pointer.child;
     if (comptime !@hasField(App, "child_agents")) return null;
     return if (app.child_agents) |*children| children else null;
