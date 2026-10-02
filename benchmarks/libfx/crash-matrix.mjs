@@ -1,15 +1,16 @@
 #!/usr/bin/env node
-// Crash matrix (docs/workflows phase 0 and goal.md "Crash matrix").
+// Crash matrix: kill a libfx process at every step of a turn and check what
+// the next process does.
 //
 // For each backend and workload, a worker child runs a committed setup turn,
 // saves a checkpoint, then runs the crash turn one step at a time: it prints
 // each step (prompt sent, each turn event, before and after each tool's side
 // effect) and waits for an ack on stdin. The parent kills it with SIGKILL at
 // step k instead of acking, then starts a restorer child. In "today" mode
-// the restorer does what a host can do with today's libfx: restore the last
+// the restorer does what a host can do without a journal: restore the last
 // checkpoint and send the stored prompt again. Side effects are counted from
-// a file, and each cell is checked by durable.mjs checkCrashCell. Today's
-// failures are recorded, not fatal, unless --require-clean is set.
+// a file, and each cell is checked by durable.mjs checkCrashCell. Failures
+// in "today" mode are recorded, not fatal, unless --require-clean is set.
 //
 // In "journal" mode the worker keeps a libfx journal in a JSONL file, with a
 // step before and after each append lands, and saves no checkpoint. The

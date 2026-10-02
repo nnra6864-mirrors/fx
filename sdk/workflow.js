@@ -9,7 +9,7 @@
 //   const agent = await createAgent(durable);   // createFxAgent({ ...durable, ... })
 //   export const POST = durable.handler;        // the queue calls this after a crash
 
-import { FxFencedError } from "./fx-sdk.js";
+import { FxConfigMismatchError, FxFencedError } from "./fx-sdk.js";
 
 const journalStep = "libfx.journal";
 const payloadFormat = "libfx-journal-v1";
@@ -22,9 +22,12 @@ const eventIdPattern = /^[a-z]+_(\d{26})$/;
 
 export { FxFencedError };
 
+// Fencing reads the slot from the id, so an id in another form stops the
+// write rather than letting it pass unchecked.
 function slotOf(event) {
   const match = eventIdPattern.exec(String(event?.eventId ?? ""));
-  return match ? Number(match[1]) : null;
+  if (!match) throw new Error(`the World returned event id ${JSON.stringify(event?.eventId ?? null)}, which libfx cannot read a slot from`);
+  return Number(match[1]);
 }
 
 function journalBatch(event) {
@@ -136,6 +139,7 @@ export function workflow({
   let wakeQueued = false;
   let lastWriteAt = 0;
   let heartbeat = null;
+  let closed = false;
 
   const queueWake = (delaySeconds) => world.queue(queueName, { runId }, { delaySeconds });
 
@@ -157,7 +161,7 @@ export function workflow({
     lastWriteAt = Date.now();
     const slot = slotOf(result.event);
     const expected = eventCount + 1;
-    eventCount = slot ?? expected;
+    eventCount = slot;
     if (slot === expected) return;
     const skipped = Array.isArray(result.events) ? result.events : (await readRun(world, runId)).slice(expected - 1, eventCount - 1);
     if (skipped.some((event) => journalBatch(event)?.[0].seq === seq)) {
@@ -232,8 +236,15 @@ export function workflow({
       return { events: journalEvents, sessionId: runId };
     },
     append(batch) {
+      if (closed) return Promise.reject(new Error("the session's journal is closed"));
       // Each write states the slot it expects, so writes go out in call order.
       return serialize(() => write(batch));
+    },
+    // The agent closed: no more heartbeats, so a turn it left open, such as
+    // one handed off, goes silent and the queue route resumes it.
+    close() {
+      closed = true;
+      stopHeartbeat();
     },
   };
 
@@ -275,6 +286,12 @@ export function workflow({
           for await (const _ of turn) {}
           await turn.result;
         }
+      } catch (error) {
+        // A deployment with other tools, instructions or model cannot resume
+        // the turn, and asking again will not change that. The session waits
+        // for its next prompt, which ends the turn as interrupted.
+        if (!(error instanceof FxConfigMismatchError)) throw error;
+        return new Response(`session ${target} was not resumed: ${error.message}`, { status: 200 });
       } finally {
         await agent.close();
       }

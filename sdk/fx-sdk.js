@@ -34,7 +34,7 @@ const maxOutboundAttachments = 4;
 // Matches the core's kernel checkpoint limit (max_checkpoint_bytes).
 const maxCheckpointBytes = 4 * 1024 * 1024;
 // Matches the core's journal load limit (journal.max_load_bytes).
-const maxJournalBytes = 8 * 1024 * 1024;
+const maxJournalBytes = 4 * 1024 * 1024;
 // The core's ACP reader drops frames over 8 MiB without a request id to answer
 // (jsonrpc frame_resource_byte_limit), so the SDK must never emit one. The
 // envelope allowance covers the method key and request id.
@@ -155,12 +155,6 @@ export function normalizeAgentOptions(value) {
 }
 
 /**
- * A journal that keeps events in memory, for tests and for hosts that copy
- * them elsewhere. `events` is the stored list, oldest first. An append that
- * does not continue the stored events is rejected, so a second agent cannot
- * write the same journal.
- */
-/**
  * Another writer took over the session after this agent loaded it. A journal
  * rejects the append with this error; the agent stops its turn at once and
  * makes no further effect or write. Check `code === "FX_FENCED"` when the
@@ -203,8 +197,11 @@ function snapshotSeq(bytes) {
 }
 
 /**
- * A journal in memory. `snapshots: true` adds `snapshot()`, which drops the
- * events a snapshot covers; `snapshot` starts from a stored snapshot.
+ * A journal that keeps events in memory, for tests and for hosts that copy
+ * them elsewhere. `events` is the stored list, oldest first. An append that
+ * does not continue the stored events is rejected, so a second agent cannot
+ * write the same journal. `snapshots: true` adds `snapshot()`, which drops
+ * the events a snapshot covers; `snapshot` starts from a stored snapshot.
  */
 export function createMemoryJournal(events = [], { snapshots = false, snapshot = null } = {}) {
   if (!Array.isArray(events)) throw new TypeError("events must be an array");
@@ -254,23 +251,47 @@ function journalAppendError(cause) {
   return error;
 }
 
-// A checkpoint of at most 4 MiB and the snapshot header.
-const maxSnapshotBytes = 4 * 1024 * 1024 + 64;
-// libfx asks the core for a snapshot once this many events landed since the
-// last one, at the next commit with no turn running.
+// Matches the core's snapshot limit (journal.max_snapshot_bytes).
+const maxSnapshotBytes = 4 * 1024 * 1024;
+// libfx asks the core for a snapshot as a turn's result arrives, once this
+// many events landed since the last one.
 const snapshotEvery = 100;
+// Or once this many bytes of events landed, so a few large turns cannot
+// outgrow a load.
+const snapshotEveryBytes = 1024 * 1024;
 
-// What shapes the requests a turn sends: instructions, model, and each
-// tool's name, description and schema. A turn the journal left open
-// continues only under the same hash.
+// What shapes a turn: instructions, model, and each tool's name,
+// description, schema, replay policy and whether it writes. A turn the
+// journal left open continues only under the same hash.
 async function configHashOf(instructions, model, tools) {
   const text = JSON.stringify({
     instructions: instructions ?? null,
     model: model ?? null,
-    tools: tools.map((tool) => [tool.name, tool.description ?? null, tool.inputSchema ?? null]),
+    tools: tools.map((tool) => [
+      tool.name,
+      tool.description ?? null,
+      tool.inputSchema ?? null,
+      tool.replay ?? null,
+      tool.writes ?? null,
+    ]),
   });
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", encoder.encode(text)));
   return [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+// Restoring an open turn needs only its newest progress, so an older one's
+// state is left out of a load (data: null). A load then grows with the
+// session's committed turns, not with every step of every turn.
+function withoutSupersededProgress(events) {
+  const kept = new Array(events.length);
+  let superseded = false;
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    const type = event?.type;
+    kept[index] = superseded && type === "turn_progress" && event.data != null ? { ...event, data: null } : event;
+    if (type === "turn_progress" || type === "turn_committed" || type === "turn_progress_cleared") superseded = true;
+  }
+  return kept;
 }
 
 // A session id reaches gateway headers; the core applies the same rule.
@@ -2018,6 +2039,7 @@ export async function createFxAgent(options = {}) {
   let durableSeq = 0;
   let receivedSeq = 0;
   let snapshotAtSeq = 0;
+  let bytesSinceSnapshot = 0;
   let snapshotting = null;
   // Called as a turn's prompt response arrives, before the host can start
   // another, so the core is between turns and the request reaches it first.
@@ -2025,7 +2047,12 @@ export async function createFxAgent(options = {}) {
   // stored.
   const maybeSnapshot = () => {
     if (typeof journal?.snapshot !== "function" || snapshotting || closing || journalFailure || handedOff) return;
-    if (receivedSeq - snapshotAtSeq < snapshotEvery) return;
+    if (receivedSeq - snapshotAtSeq < snapshotEvery && bytesSinceSnapshot < snapshotEveryBytes) return;
+    // The snapshot covers every event received so far; the count comes back
+    // if none is stored.
+    const coveredBytes = bytesSinceSnapshot;
+    bytesSinceSnapshot = 0;
+    let stored = false;
     snapshotting = (async () => {
       const response = await request("libfx/snapshot", { sessionId });
       const id = response?.snapshotAttachment;
@@ -2036,12 +2063,16 @@ export async function createFxAgent(options = {}) {
       await journalSettled();
       if (durableSeq < atSeq) return;
       await journal.snapshot(new Uint8Array(bytes), atSeq);
+      stored = true;
       snapshotAtSeq = Math.max(snapshotAtSeq, atSeq);
       emit("journal.snapshot", { atSeq, bytes: bytes.byteLength });
     })().catch((error) => {
       // A journal without its latest snapshot is still complete.
       emit("journal.snapshot_error", { error: error instanceof Error ? error.name : "Error" });
-    }).finally(() => { snapshotting = null; });
+    }).finally(() => {
+      if (!stored) bytesSinceSnapshot += coveredBytes;
+      snapshotting = null;
+    });
   };
   const settleInputs = (batch) => {
     for (const event of batch) {
@@ -2088,7 +2119,7 @@ export async function createFxAgent(options = {}) {
     emit("journal.append", { events: batch.length });
     let appended;
     try {
-      appended = Promise.resolve(journal.append(batch, { barrier: false }));
+      appended = Promise.resolve(journal.append(batch));
     } catch (error) {
       appended = Promise.reject(error);
     }
@@ -2324,7 +2355,10 @@ export async function createFxAgent(options = {}) {
   runtime.setLineHandler((message, size) => {
     emit("acp.receive", { message });
     if (message.method === "libfx/journal_append") {
-      if (journal && message.params?.sessionId === sessionId) queueJournalEvents(message.params.events);
+      if (journal && message.params?.sessionId === sessionId) {
+        bytesSinceSnapshot += size;
+        queueJournalEvents(message.params.events);
+      }
       return;
     }
     if (message.method === "session/update") {
@@ -2412,9 +2446,10 @@ export async function createFxAgent(options = {}) {
       const payloads = [];
       if (loaded.snapshot) payloads.push(["snapshotAttachment", loaded.snapshot]);
       if (events.length > 0) {
-        const bytes = encoder.encode(JSON.stringify(events));
+        const bytes = encoder.encode(JSON.stringify(withoutSupersededProgress(events)));
         if (bytes.byteLength > maxJournalBytes) throw new Error("libfx journal is too large");
         payloads.push(["journalAttachment", bytes]);
+        bytesSinceSnapshot = bytes.byteLength;
       }
       if (payloads.length > 0) {
         const ids = attachBytes(payloads.map(([, bytes]) => bytes));
@@ -2550,11 +2585,14 @@ export async function createFxAgent(options = {}) {
       await runtime.exited;
       // Every append the session started has landed, or close reports why.
       if (journal) {
+        let failure = null;
         try {
           await journalSettled();
-        } catch (error) {
-          if (!journalFailureReported) throw reportJournalFailure();
+        } catch {
+          if (!journalFailureReported) failure = reportJournalFailure();
         }
+        if (typeof journal.close === "function") await journal.close();
+        if (failure) throw failure;
       }
     },
   };

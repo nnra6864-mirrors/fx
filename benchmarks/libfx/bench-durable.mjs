@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Durable libfx benchmark (docs/workflows phase 0, gates G2-G6 and G9).
+// Durable libfx benchmark: what a journal costs per turn, per tool call and
+// per restore, against the same workloads with no durability.
 //
 // "control" runs each scripted workload with no durability. "today-rN"
 // emulates a host that makes libfx durable from outside, on a remote log with an N ms

@@ -1,12 +1,11 @@
 #!/usr/bin/env node
-// Parallel tool stress and fault injection (docs/workflows phase 0, G9 and
-// tla/ParallelBatch.tla). Each turn asks for one batch of tool calls drawn
-// from a seeded PRNG: random writer flags, latencies and thrown errors, and
-// sometimes a cancel while the batch runs. Every batch is checked against
-// the ParallelBatch invariants from the real start and end order of the
-// tools and the order the next model request carried their results. Today
-// libfx runs host tools one at a time, which satisfies every invariant; the
-// report's concurrency and speedup show how much parallelism there is.
+// Parallel tool stress and fault injection. Each turn asks for one batch of
+// tool calls drawn from a seeded PRNG: random writer flags, latencies and
+// thrown errors, and sometimes a cancel while the batch runs. Every batch is
+// checked from the real start and end order of the tools and the order the
+// next model request carried their results. The WebAssembly core runs host
+// tools one at a time, which satisfies every check; the report's concurrency
+// and speedup show how much parallelism each backend has.
 import { createFxAgent, supportsJspi } from "../../sdk/node.js";
 import {
   batchSteps,

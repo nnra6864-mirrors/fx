@@ -60,8 +60,6 @@ export async function agentOptions({ backend, fetch, tools = [], checkpoint, jou
 }
 
 // libfx tool descriptors for the durable tool set, all routed to `run`.
-// `writes` and `replay` describe the planned contract; today's libfx
-// ignores unknown descriptor fields.
 export function hostTools(run) {
   return Object.entries(durableTools).map(([name, policy]) => ({
     name,

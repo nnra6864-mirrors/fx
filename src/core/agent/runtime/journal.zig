@@ -37,9 +37,14 @@ const compactor = @import("../../compactor/compactor.zig");
 const Allocator = std.mem.Allocator;
 
 pub const version: u8 = 1;
-/// The most event bytes one load accepts: the hosts' inbound attachment
-/// limit. Longer sessions need snapshots.
-pub const max_load_bytes: usize = 8 * 1024 * 1024;
+/// The most event bytes one load accepts, and the most bytes one snapshot
+/// holds: each travels as one host attachment, and an attachment holds at
+/// most one kernel checkpoint. Longer sessions need snapshots.
+pub const max_load_bytes: usize = checkpoint_codec.max_checkpoint_bytes;
+pub const max_snapshot_bytes: usize = checkpoint_codec.max_checkpoint_bytes;
+/// The largest `seq` or turn a host can carry: hosts in JavaScript hold them
+/// as numbers.
+const max_safe_position: u64 = (1 << 53) - 1;
 pub const max_history_turns = checkpoint_codec.max_history_turns;
 
 pub const EventType = enum {
@@ -208,7 +213,7 @@ pub fn parseSnapshot(bytes: []const u8) LoadError!Snapshot {
     if (found_version != snapshot_version) return error.InvalidJournal;
     const seq = std.mem.readInt(u64, bytes[snapshot_magic.len + 1 ..][0..8], .little);
     const turn = std.mem.readInt(u64, bytes[snapshot_magic.len + 9 ..][0..8], .little);
-    if (seq == 0 or turn == 0 or seq == std.math.maxInt(u64)) return error.InvalidJournal;
+    if (seq == 0 or turn == 0 or seq > max_safe_position or turn > max_safe_position) return error.InvalidJournal;
     const hash_len = bytes[snapshot_header_bytes - 1];
     if (hash_len > max_config_hash_bytes or bytes.len - snapshot_header_bytes < hash_len) return error.InvalidJournal;
     return .{
@@ -366,8 +371,10 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
                 endTurnInputs(&inputs);
             },
             .turn_progress => {
+                // A host may leave out a superseded progress's state as
+                // `null`: a later progress in the turn, or its end, replaces it.
                 const data = event.data orelse return error.InvalidJournal;
-                if (data != .object) return error.InvalidJournal;
+                if (data != .object and data != .null) return error.InvalidJournal;
                 // A turn's first progress fixes the config it runs under.
                 if (open == null) open_config = config;
                 open = data;
@@ -441,7 +448,7 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
     }
 
     var open_turn: ?session_codec.RecoveryCheckpoint = null;
-    if (open) |data| open_turn = session_codec.parseRecoveryCheckpoint(alloc, data) catch |err| switch (err) {
+    if (open) |data| open_turn = if (data == .null) return error.InvalidJournal else session_codec.parseRecoveryCheckpoint(alloc, data) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidJournal,
     };
@@ -1047,6 +1054,28 @@ test "a snapshot and the events after it fold into the same session as every eve
     }));
 }
 
+test "a superseded progress may leave out its state, the open turn's last may not" {
+    const alloc = std.testing.allocator;
+    var first = try testProgress(alloc, "first state");
+    defer first.deinit(alloc);
+    var last = try testProgress(alloc, "last state");
+    defer last.deinit(alloc);
+    const events = [_]Event{ .{ .turn_progress = .{ .checkpoint = first } }, .{ .turn_progress = .{ .checkpoint = last } } };
+    const full = try testJournal(alloc, &events);
+    defer alloc.free(full);
+    const marker = "\"data\":{";
+    const first_data = std.mem.find(u8, full, marker).?;
+    const second_event = std.mem.find(u8, full[first_data..], "},{\"v\"").? + first_data;
+    const stripped = try std.mem.concat(alloc, u8, &.{ full[0..first_data], "\"data\":null}", full[second_event + 1 ..] });
+    defer alloc.free(stripped);
+    var folded = try fold(alloc, stripped);
+    defer folded.deinit(alloc);
+    try std.testing.expectEqualStrings("last state", folded.open_turn.?.user.text);
+
+    const only_null = "[{\"v\":1,\"seq\":1,\"turn\":1,\"type\":\"turn_progress\",\"data\":null}]";
+    try std.testing.expectError(error.InvalidJournal, fold(alloc, only_null));
+}
+
 test "a progress event names the model its request goes to" {
     const alloc = std.testing.allocator;
     var progress = try testProgress(alloc, "look at this");
@@ -1088,6 +1117,19 @@ test "a snapshot carries the recorded config to the turns after it" {
     defer alloc.free(cut);
     cut[snapshot_header_bytes - 1] = 3;
     try std.testing.expectError(error.InvalidJournal, parseSnapshot(cut));
+}
+
+test "a snapshot past the positions a JavaScript host can hold is refused" {
+    const alloc = std.testing.allocator;
+    const far = try encodeSnapshot(alloc, max_safe_position + 1, 2, null, "");
+    defer alloc.free(far);
+    try std.testing.expectError(error.InvalidJournal, parseSnapshot(far));
+    const late = try encodeSnapshot(alloc, 3, max_safe_position + 1, null, "");
+    defer alloc.free(late);
+    try std.testing.expectError(error.InvalidJournal, parseSnapshot(late));
+    const edge = try encodeSnapshot(alloc, max_safe_position, max_safe_position, null, "");
+    defer alloc.free(edge);
+    _ = try parseSnapshot(edge);
 }
 
 test "a snapshot that is not one, or comes from a newer fx, is refused" {

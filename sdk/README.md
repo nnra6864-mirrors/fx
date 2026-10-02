@@ -358,8 +358,7 @@ about one round trip to a turn instead of one per call. Calls arrive in event
 order, and your journal must store each call's events after those of the call
 before it, even while that call is still pending. Rejecting a batch whose
 first `seq` does not follow the last stored event keeps a failed or competing
-writer from leaving a gap. Each call receives `{ barrier: false }` as its
-second argument.
+writer from leaving a gap.
 
 libfx waits for your journal only where a crash could otherwise lose work or
 repeat it: the first event of each turn, which holds the prompt, is stored
@@ -375,8 +374,11 @@ started while the failed append was in flight can still complete; a
 `replay: "never"` call never starts before its stored intent.
 
 `createFxAgent()` calls `load()` once. It must resolve to `{ events }` with
-every stored event, oldest first, up to 8 MiB of JSON, or to
-`{ snapshot, events }` as described below. libfx refuses a journal whose
+every stored event, oldest first, or to `{ snapshot, events }` as described
+below. Each `turn_progress` event repeats its turn so far, so a turn with many
+large tool results stores more than its final entry, and libfx reads only the
+newest progress of the open turn. The events it reads must fit in 4 MiB of
+JSON. libfx refuses a journal whose
 events repeat, skip a `seq`, or do not parse, and `createFxAgent()` rejects
 with the reason. For a journal or snapshot written by a newer libfx, it
 rejects with an `FxJournalVersionError`, whose `code` is `FX_JOURNAL_VERSION`.
@@ -386,9 +388,12 @@ the ones that write it.
 
 A journal without snapshots grows with every turn, and `load()` returns all of
 it. Give the journal a `snapshot(bytes, atSeq)` method and libfx calls it about
-every 100 events, between turns, with opaque bytes that stand for every event
-up to and including `atSeq`. libfx calls it only after those events are
-stored. Keep the latest snapshot and return it from `load()` as
+every 100 events or 1 MiB of events, between turns, with opaque bytes that
+stand for every event up to and including `atSeq`. libfx calls it only after
+those events are stored. A snapshot holds the session's whole history, within
+a checkpoint's bounds of 4 MiB and 1,024 turns. libfx skips a snapshot that
+would not fit, and a session that outgrows those bounds cannot be restored
+from its journal. Keep the latest snapshot and return it from `load()` as
 `{ snapshot, events }` with only the events after `atSeq`; the events it covers
 can be deleted. Snapshots only move forward: store one only if its `atSeq` is
 greater than the stored snapshot's. A snapshot can arrive late, even from an
@@ -401,6 +406,9 @@ keeps the latest snapshot as `journal.latestSnapshot`, `{ bytes, atSeq }`, and
 drops the events it covers; `createMemoryJournal(events, { snapshot })` starts
 from a stored one.
 
+Give the journal a `close()` method to release what it holds, such as a timer
+or a connection. `agent.close()` calls it once, after the last append settles.
+
 AI Gateway keys session affinity and prompt caching to the session's id. libfx
 picks a new id for each agent unless you pass `sessionId` or `load()` resolves
 to `{ events, sessionId }`, so give a restored session the id it had before.
@@ -411,9 +419,10 @@ If the last process stopped during a turn, `agent.resume()` continues that
 turn with no new input and returns it, like `prompt()`. The model is told
 "Resuming from unexpected session interruption.", and tool calls that were
 running come back answered as possibly run, so a `replay: "never"` call does
-not run again unless the model decides to call it. `resume()` returns `null`
-when the journal holds no open turn, so a host can call it every time it
-opens a session:
+not run again unless the model decides to call it. A turn that fails or is
+cancelled ends in the journal as it does in the agent, so only a stopped
+process leaves one to resume. `resume()` returns `null` when the journal holds
+no open turn, so a host can call it every time it opens a session:
 
 ```js
 const agent = await createFxAgent({ apiKey, model, journal, tools });
@@ -483,7 +492,11 @@ session: a closed turn needs nothing, a turn written to within
 is opened with `createAgent` and resumed with `agent.resume()`, which the
 route calls until it returns `null` so that follow-ups the session held run
 too. Define `createAgent` at module scope so the route builds the same agent
-as the app.
+as the app. When `resume()` throws an `FxConfigMismatchError` because the
+deployment changed, the route answers the wake with status 200 and the reason,
+so the queue does not deliver it again; the session's next `prompt()` ends the
+turn. The heartbeat stops when the agent closes, so a turn handed off with
+`turn.cancel({ reason: "handoff" })` goes silent and the route resumes it.
 
 A session's run id is also its session id for AI Gateway, so affinity and
 prompt caching survive the move to another process. Only one process writes to

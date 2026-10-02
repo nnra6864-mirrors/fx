@@ -1811,7 +1811,7 @@ fn handleKernelJournalOpen(
         const attachment = host_attachments.idFromJson(reference) orelse
             return state.writer.writeError(alloc, msg.id, invalid);
         const store = state.cfg.host_attachments orelse return state.writer.writeError(alloc, msg.id, invalid);
-        snapshot = store.take(alloc, attachment, max_snapshot_bytes) catch |err| switch (err) {
+        snapshot = store.take(alloc, attachment, journal_events.max_snapshot_bytes) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.AttachmentUnavailable => return state.writer.writeError(alloc, msg.id, invalid),
             error.AttachmentTooLarge => return state.writer.writeError(alloc, msg.id, too_large),
@@ -1878,9 +1878,6 @@ fn handleKernelJournalOpen(
     try state.writer.writeResponse(alloc, msg.id, response.written());
 }
 
-/// A snapshot holds a checkpoint and a small header.
-const max_snapshot_bytes = agent_checkpoint.max_checkpoint_bytes + 64;
-
 /// A snapshot of the session for its journal to store, when it is quiet: no
 /// turn open and no follow-up waiting. `null` otherwise; the host asks again
 /// after a later turn. The snapshot covers every event through `atSeq`.
@@ -1919,12 +1916,17 @@ fn handleKernelSnapshot(
     const at_seq = journal.cursor.next_seq - 1;
     const bytes = try journal_events.encodeSnapshot(alloc, at_seq, journal.cursor.turn, journal.recorded_config, checkpoint);
     defer alloc.free(bytes);
+    // A snapshot travels back as one host attachment.
+    if (bytes.len > journal_events.max_snapshot_bytes) {
+        debug_trace.logf("session", "event=libfx_snapshot_skipped reason=too_large bytes={d}", .{bytes.len});
+        return state.writer.writeResponse(alloc, msg.id, none);
+    }
     const attachment = store.put(bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.AttachmentStoreFull => return state.writer.writeResponse(alloc, msg.id, none),
     };
-    var response: [96]u8 = undefined;
-    const written = std.fmt.bufPrint(&response, "{{\"snapshotAttachment\":{d},\"atSeq\":{d}}}", .{ attachment, at_seq }) catch unreachable;
+    const written = try std.fmt.allocPrint(alloc, "{{\"snapshotAttachment\":{d},\"atSeq\":{d}}}", .{ attachment, at_seq });
+    defer alloc.free(written);
     try state.writer.writeResponse(alloc, msg.id, written);
 }
 

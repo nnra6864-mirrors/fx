@@ -24,9 +24,37 @@ const toolResults = (prompt) => prompt
   .filter((part) => part.type === "tool-result");
 
 // "use the tool" asks for one host tool call, then answers with its result.
+// "gather everything" calls bulky bulkySteps times, one call per response.
 // Any other prompt is answered with its own text.
+const bulkySteps = 24;
 function framesFor(prompt) {
   const text = lastUserText(prompt);
+  if (text === "explain and use the tool") {
+    if (toolResults(prompt).length === 0) {
+      return [
+        { type: "text-delta", id: "note", delta: "Looking it up." },
+        { type: "tool-call", toolCallId: "call-1", toolName: "lookup", input: { key: "alpha" } },
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" }, usage },
+      ];
+    }
+    return [
+      { type: "text-delta", id: "answer", delta: "found it" },
+      { type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage },
+    ];
+  }
+  if (text === "gather everything") {
+    const done = toolResults(prompt).length;
+    if (done < bulkySteps) {
+      return [
+        { type: "tool-call", toolCallId: `call-bulky-${done}`, toolName: "bulky", input: { part: done } },
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" }, usage },
+      ];
+    }
+    return [
+      { type: "text-delta", id: "answer", delta: "gathered" },
+      { type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage },
+    ];
+  }
   if (text === "use the tool" && toolResults(prompt).length === 0) {
     return [
       { type: "tool-call", toolCallId: "call-1", toolName: "lookup", input: { key: "alpha" } },
@@ -55,6 +83,11 @@ const server = createServer((request, response) => {
     const prompt = JSON.parse(body).prompt;
     requests.push(prompt);
     sessionHeaders.push([request.headers["x-session-id"], request.headers["x-session-affinity"]]);
+    if (lastUserText(prompt) === "fail please") {
+      response.writeHead(400, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: { message: "refused for the test", type: "invalid_request_error" } }));
+      return;
+    }
     response.writeHead(200, { "content-type": "text/event-stream" });
     response.end(framesFor(prompt).map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join("") + "data: [DONE]\n\n");
   });
@@ -76,6 +109,14 @@ const lookup = {
   inputSchema: { type: "object", properties: { key: { type: "string" } }, required: ["key"] },
   replay: "safe",
   execute: async ({ key }) => `value of ${key} is beta`,
+};
+// Each result is large, so the open turn's progress grows with every step.
+const bulky = {
+  name: "bulky",
+  description: "Returns a large part",
+  inputSchema: { type: "object", properties: { part: { type: "number" } } },
+  replay: "safe",
+  execute: async ({ part }) => `${part}:${"x".repeat(60_000)}`,
 };
 const options = (backend, journal, extra = {}) => ({
   backend,
@@ -256,6 +297,24 @@ test("a resumed turn answers a call a crash left running and never reruns it", a
   assertContiguous(crashed.events);
 });
 
+test("a resumed turn keeps what the model wrote before the calls a crash left running", async () => {
+  const journal = createMemoryJournal();
+  const agent = await createFxAgent(options(sourceBackend, journal));
+  await run(agent, "explain and use the tool");
+  await agent.close();
+  const intent = journal.events.findIndex((event) => event.type === "tool_intent");
+  assert.ok(intent > 0);
+  const resumed = await createFxAgent(options(targetBackend, createMemoryJournal(journal.events.slice(0, intent + 1))));
+  requests.length = 0;
+  const turn = resumed.resume();
+  for await (const _ of turn) {}
+  assert.equal((await turn.result).stopReason, "end_turn");
+  await resumed.close();
+  const assistant = requests[0].filter((message) => message.role === "assistant").flatMap((message) => message.content);
+  assert.deepEqual(assistant.map((part) => part.type), ["text", "tool-call"]);
+  assert.equal(assistant[0].text, "Looking it up.");
+});
+
 test("a new prompt instead of resume ends the crashed turn as interrupted", async () => {
   const journal = createMemoryJournal();
   const agent = await createFxAgent(options(sourceBackend, journal));
@@ -295,8 +354,8 @@ test("a slow journal receives overlapping appends in order", async () => {
   let inFlight = 0;
   let maxInFlight = 0;
   const journal = {
-    append(batch, options) {
-      assert.deepEqual(options, { barrier: false });
+    append(batch, ...rest) {
+      assert.equal(rest.length, 0, "append receives only the batch");
       inFlight += 1;
       maxInFlight = Math.max(maxInFlight, inFlight);
       const delay = new Promise((resolveDelay) => setTimeout(resolveDelay, 15));
@@ -890,6 +949,43 @@ test("a handoff needs a journal and takes no other reason", async () => {
   for await (const _ of turn) {}
   await turn.result;
   await plain.close();
+});
+
+test("a crash late in a long tool turn restores though its progress outgrew a load", async () => {
+  const journal = createMemoryJournal();
+  const tools = [lookup, bulky];
+  const source = await createFxAgent(options(sourceBackend, journal, { tools }));
+  const { text } = await run(source, "gather everything");
+  assert.equal(text, "gathered");
+  await source.close();
+  // The process died just before the commit, with every step stored.
+  const crashed = journal.events.slice(0, journal.events.findLastIndex((event) => event.type === "turn_progress") + 1);
+  const rawBytes = new TextEncoder().encode(JSON.stringify(crashed)).byteLength;
+  assert.ok(rawBytes > 4 * 1024 * 1024, `the turn's progress events hold ${rawBytes} bytes`);
+
+  const target = await createFxAgent(options(targetBackend, createMemoryJournal(crashed), { tools }));
+  const turn = target.resume();
+  assert.ok(turn, "the crashed turn is open");
+  for await (const _ of turn) {}
+  assert.equal((await turn.result).stopReason, "end_turn");
+  assert.equal(toolResults(requests.at(-1)).length, bulkySteps, "the resumed request carries every step");
+  await target.close();
+});
+
+test("a turn that fails ends in the journal and is not resumed", async () => {
+  for (const backend of [sourceBackend, targetBackend]) {
+    const journal = createMemoryJournal();
+    const agent = await createFxAgent(options(backend, journal));
+    const failed = await run(agent, "fail please");
+    assert.notEqual(failed.result.stopReason, "end_turn");
+    await agent.close();
+    assert.equal(journal.events.at(-1).type, "turn_progress_cleared", journal.events.map((event) => event.type).join(","));
+
+    const next = await createFxAgent(options(backend, createMemoryJournal(journal.events)));
+    assert.equal(next.resume(), null, "a failed turn is not a crashed one");
+    assert.equal((await run(next, "hello")).text, "answer to hello");
+    await next.close();
+  }
 });
 
 test("a host session id reaches the gateway and stays the same across a restore", async () => {

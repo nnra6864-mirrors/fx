@@ -80,9 +80,9 @@ async function startGateway() {
 }
 
 // The app's agent definition, the same in every process.
-function defineAgent(port, onSend) {
+function defineAgent(port, onSend, description = "Sends an email.") {
   const send = {
-    description: "Sends an email.",
+    description,
     inputSchema: { type: "object" },
     replay: "never",
     writes: true,
@@ -119,6 +119,26 @@ async function run(agent, input) {
   for await (const _ of turn) {}
   return turn.result;
 }
+
+// Starts "send it", hands the turn off once send_email has started, and
+// closes the agent, leaving the turn open for the queue route.
+async function handOff(world, build, sending) {
+  const session = workflow({ world, wakeAfterSeconds: 1 });
+  const owner = await build(session);
+  const turn = owner.prompt("send it");
+  const drained = (async () => { for await (const _ of turn) {} })().catch(() => {});
+  await sending;
+  turn.cancel({ reason: "handoff" });
+  await turn.result.catch(() => {});
+  await drained;
+  await owner.close();
+  return session.sessionId;
+}
+
+const within = (promise, ms, message) => Promise.race([
+  promise,
+  new Promise((_, rejectLate) => setTimeout(() => rejectLate(new Error(message)), ms)),
+]);
 
 // Child: run "send it" and stop inside send_email after its effect, the way
 // a process dies mid-turn. The parent kills it there.
@@ -290,6 +310,79 @@ test("a wake while the owner is still running does not take the session over", a
   assert.ok(deliveries >= 2, `the queue delivered ${deliveries} wakes during the turn`);
   assert.equal(agents, 0, "no wake took the session over");
   assert.equal(sends, 1);
+});
+
+test("a handed-off turn goes quiet when its agent closes, and the queue resumes it", async () => {
+  const world = createWorld({ dataDir: mkdtempSync(join(tmpdir(), "libfx-world-")), recoverActiveRuns: false });
+  await world.start?.();
+  let sends = 0;
+  let agents = 0;
+  let started;
+  const sending = new Promise((resolveSending) => { started = resolveSending; });
+  const build = defineAgent(gateway.port, () => {
+    sends += 1;
+    started();
+    return new Promise(() => {});
+  });
+  const route = workflow({ world, wakeAfterSeconds: 1, createAgent: (options) => { agents += 1; return build(options); } });
+  let resumedStatus;
+  const resumed = new Promise((resolveResumed) => { resumedStatus = resolveResumed; });
+  world.registerHandler(workflowQueuePrefix, async (request) => {
+    const before = agents;
+    const response = await route.handler(request);
+    if (agents > before) resumedStatus(response.status);
+    return response;
+  });
+  await handOff(world, build, sending);
+  // Without the close, the owner's heartbeat would keep the turn fresh.
+  const status = await within(resumed, 10_000, "the queue never resumed the handed-off turn");
+  await closeWorld(world);
+  assert.equal(status, 204);
+  assert.equal(agents, 1);
+  assert.equal(sends, 1, "send_email did not run again");
+});
+
+test("the queue route acknowledges a turn it cannot resume under another config", async () => {
+  const world = createWorld({ dataDir: mkdtempSync(join(tmpdir(), "libfx-world-")), recoverActiveRuns: false });
+  await world.start?.();
+  let started;
+  const sending = new Promise((resolveSending) => { started = resolveSending; });
+  const build = defineAgent(gateway.port, () => { started(); return new Promise(() => {}); });
+  // The next deployment describes send_email differently.
+  const changed = defineAgent(gateway.port, () => "sent", "Sends an email with a signature.");
+  const route = workflow({ world, wakeAfterSeconds: 1, createAgent: changed });
+  const deliveries = [];
+  let acknowledged;
+  const answered = new Promise((resolveAnswered) => { acknowledged = resolveAnswered; });
+  world.registerHandler(workflowQueuePrefix, async (request) => {
+    const response = await route.handler(request);
+    deliveries.push({ status: response.status, text: await response.clone().text() });
+    if (response.status === 200) acknowledged();
+    return response;
+  });
+  await handOff(world, build, sending);
+  await within(answered, 10_000, "the queue route never answered the wake");
+  // An answered wake is not delivered again.
+  await new Promise((resolveWait) => setTimeout(resolveWait, 1500));
+  await closeWorld(world);
+  const answers = deliveries.filter((delivery) => delivery.status === 200);
+  assert.equal(answers.length, 1, JSON.stringify(deliveries));
+  assert.match(answers[0].text, /was not resumed: the open turn started under other/);
+  assert.equal(deliveries.at(-1).status, 200, "no wake followed the answer");
+});
+
+test("a World event id without a slot stops the write", async () => {
+  const world = {
+    events: {
+      create: async () => ({ event: { eventId: "event-without-a-slot" } }),
+      list: async () => ({ data: [], hasMore: false }),
+    },
+    queue: async () => {},
+  };
+  const durable = workflow({ world, sessionId: "wrun_test" });
+  await durable.journal.load();
+  const batch = [{ v: 1, seq: 1, turn: 1, type: "turn_committed", data: {} }];
+  await assert.rejects(durable.journal.append(batch), /cannot read a slot from/);
 });
 
 try {

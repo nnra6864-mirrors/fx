@@ -59,9 +59,14 @@ fn isConcurrentHostCall(registry: tool_dispatch.Registry, call: ToolCall) bool {
     return tool.executor_kind == .host and tool.host_concurrent;
 }
 
+/// Each running host call holds one of the host's pending requests, which
+/// journal barriers and permission prompts share, so a group stays well
+/// below that limit. Later calls form the next group.
+const max_parallel_host_calls = 16;
+
 fn parallelHostPrefixLen(registry: tool_dispatch.Registry, calls: []const ToolCall) usize {
     var len: usize = 0;
-    while (len < calls.len and isConcurrentHostCall(registry, calls[len])) : (len += 1) {}
+    while (len < calls.len and len < max_parallel_host_calls and isConcurrentHostCall(registry, calls[len])) : (len += 1) {}
     return len;
 }
 
@@ -678,6 +683,24 @@ test "host calls run together until a writer, which runs alone" {
     try std.testing.expectEqual(LeadingGroup{}, leadingParallelGroup(registry, calls[2..]));
     const expected_last: LeadingGroup = if (builtin.single_threaded) .{} else .{ .kind = .host, .len = 1 };
     try std.testing.expectEqual(expected_last, leadingParallelGroup(registry, calls[3..]));
+}
+
+test "a host group holds at most max_parallel_host_calls calls" {
+    const host_tool_runtime = @import("../../tooling/host_tool_runtime.zig");
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\[{"name":"read","description":"Read","inputSchema":{}}]
+    , .{});
+    defer parsed.deinit();
+    var host = try host_tool_runtime.Runtime.init(std.testing.allocator, parsed.value);
+    defer host.deinit();
+    const registry = host.toolSet().registry;
+    var calls: [max_parallel_host_calls + 4]ToolCall = undefined;
+    for (&calls) |*call| call.* = toolCall("call", "read", "{}");
+
+    const expected: LeadingGroup = if (builtin.single_threaded) .{} else .{ .kind = .host, .len = max_parallel_host_calls };
+    try std.testing.expectEqual(expected, leadingParallelGroup(registry, &calls));
+    const rest: LeadingGroup = if (builtin.single_threaded) .{} else .{ .kind = .host, .len = 4 };
+    try std.testing.expectEqual(rest, leadingParallelGroup(registry, calls[max_parallel_host_calls..]));
 }
 
 test "parallel classifier keeps one leading registered subagent group" {

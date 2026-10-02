@@ -46,6 +46,9 @@ pub const Journal = struct {
     pending_follow_ups: []journal.PendingInput = &.{},
     /// Accepted follow-ups no turn has placed yet. A snapshot waits for none.
     follow_ups_waiting: usize = 0,
+    /// Whether `placed_next` holds the follow-up the running turn runs; it
+    /// stops waiting only when a progress places it.
+    placing_follow_up: bool = false,
     /// The host's config hash, and the last one the journal recorded. Owned
     /// by the session's allocator.
     host_config: ?[]u8 = null,
@@ -113,6 +116,17 @@ pub const Journal = struct {
     fn clearPlaced(self: *Journal, alloc: Allocator) void {
         for (self.placed_next.items) |id| alloc.free(id);
         self.placed_next.clearRetainingCapacity();
+        self.placing_follow_up = false;
+    }
+
+    /// Drops inputs taken for a model request that never went out because
+    /// their turn ended first. The model never saw them, the journal already
+    /// dropped the steers with their turn, and a follow-up among them stays
+    /// waiting for a later turn.
+    pub fn dropUnplaced(self: *Journal, alloc: Allocator) void {
+        if (self.placed_next.items.len == 0) return;
+        debug_trace.logf("session", "event=libfx_journal_inputs_dropped count={d} reason=turn_ended_before_request", .{self.placed_next.items.len});
+        self.clearPlaced(alloc);
     }
 
     /// Sends the open turn so far and the model its next request goes to,
@@ -131,6 +145,7 @@ pub const Journal = struct {
             .placed = self.placed_next.items,
             .model = model,
         } });
+        if (self.placing_follow_up) self.follow_ups_waiting -|= 1;
         self.clearPlaced(session_alloc);
     }
 
@@ -161,7 +176,7 @@ pub const Journal = struct {
     /// The follow-up a starting turn runs: its first progress places it.
     pub fn placeFollowUp(self: *Journal, alloc: Allocator, id: []const u8) Allocator.Error!void {
         try self.notePlaced(alloc, &.{id});
-        self.follow_ups_waiting -|= 1;
+        self.placing_follow_up = true;
     }
 
     /// Whether the session is at a point a snapshot can stand for: no turn
@@ -299,8 +314,9 @@ pub fn resumeCheckpoint(
 /// Gives each call the crash left running a result saying it may have
 /// partly run, as one more step of the open turn, so the model sees every
 /// call it made answered and never has a `replay: "never"` call run again
-/// on its own. The response that made the calls is now that step, so the
-/// turn continues after its tools. Borrows `calls`; allocates in `scratch`.
+/// on its own. The response that made the calls, with any text the model
+/// wrote before them, is now that step, so the turn continues after its
+/// tools. Borrows `calls` and the turn's text; allocates in `scratch`.
 fn answerRunning(scratch: Allocator, turn: *session_codec.RecoveryCheckpoint, calls: []types.ToolCall) Allocator.Error!void {
     if (calls.len == 0) return;
     const output = session_adapter.unfinished_tool_output;
@@ -316,8 +332,75 @@ fn answerRunning(scratch: Allocator, turn: *session_codec.RecoveryCheckpoint, ca
     const old = turn.execution.tool_steps;
     const steps = try scratch.alloc(types.ToolExecutionStep, old.len + 1);
     @memcpy(steps[0..old.len], old);
-    steps[old.len] = .{ .tool_calls = calls, .tool_results = results };
+    steps[old.len] = .{
+        .assistant = if (turn.assistant_source.len > 0) turn.assistant_source else null,
+        .tool_calls = calls,
+        .tool_results = results,
+    };
     turn.execution.tool_steps = steps;
     turn.assistant_source = @constCast("");
     turn.tool_state = .confirmed;
+}
+
+const TestCapture = struct {
+    frames: std.ArrayList(u8) = .empty,
+
+    fn write(raw: ?*anyopaque, frame: []const u8) !void {
+        const self: *TestCapture = @ptrCast(@alignCast(raw.?));
+        try self.frames.appendSlice(std.testing.allocator, frame);
+    }
+};
+
+fn testProgress(alloc: Allocator) !session_codec.RecoveryCheckpoint {
+    return .{
+        .turn_id = 1,
+        .user = .{ .text = try alloc.dupe(u8, "prompt") },
+        .assistant_source = try alloc.dupe(u8, ""),
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = try alloc.dupe(u8, "fake/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 3,
+        .consumed_provider_attempts = 0,
+    };
+}
+
+test "inputs taken for a request that never went out are not placed by the next turn" {
+    const alloc = std.testing.allocator;
+    var capture: TestCapture = .{};
+    defer capture.frames.deinit(alloc);
+    var writer = jsonrpc.Writer.initCallback(&capture, TestCapture.write);
+    var session: Journal = .{ .writer = &writer };
+    defer session.deinit(alloc);
+    var progress = try testProgress(alloc);
+    defer progress.deinit(alloc);
+
+    try session.notePlaced(alloc, &.{"steer-1"});
+    // Its turn ended before the next progress; the next turn starts.
+    session.dropUnplaced(alloc);
+    try session.appendProgress(alloc, alloc, "session", progress, "fake/model");
+    try std.testing.expect(std.mem.find(u8, capture.frames.items, "steer-1") == null);
+}
+
+test "a follow-up waits until a progress places it, even through a turn that ended first" {
+    const alloc = std.testing.allocator;
+    var capture: TestCapture = .{};
+    defer capture.frames.deinit(alloc);
+    var writer = jsonrpc.Writer.initCallback(&capture, TestCapture.write);
+    var session: Journal = .{ .writer = &writer, .follow_ups_waiting = 1 };
+    defer session.deinit(alloc);
+    var progress = try testProgress(alloc);
+    defer progress.deinit(alloc);
+
+    try session.placeFollowUp(alloc, "follow-1");
+    try std.testing.expectEqual(@as(usize, 1), session.follow_ups_waiting);
+    session.dropUnplaced(alloc);
+    try std.testing.expectEqual(@as(usize, 1), session.follow_ups_waiting);
+    try std.testing.expect(!session.quiet());
+
+    try session.placeFollowUp(alloc, "follow-1");
+    try session.appendProgress(alloc, alloc, "session", progress, "fake/model");
+    try std.testing.expectEqual(@as(usize, 0), session.follow_ups_waiting);
+    try std.testing.expect(std.mem.find(u8, capture.frames.items, "follow-1") != null);
 }

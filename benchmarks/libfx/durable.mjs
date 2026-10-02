@@ -9,8 +9,8 @@ export const durableCatalog = {
   data: [{ id: durableModel, type: "language", tags: ["tool-use"], context_window: 1_000_000, max_tokens: 4096 }],
 };
 
-// Tool behavior as data. `writes` and `replay` are the planned durable
-// contract (docs/workflows/goal.md R9, R12); today's libfx ignores both.
+// Tool behavior as data: whether each tool writes, and whether a resumed
+// turn may run it again.
 export const durableTools = {
   read_item: { writes: false, replay: "safe" },
   list_files: { writes: false, replay: "safe" },
@@ -188,7 +188,8 @@ function intervals(trace, size) {
   return spans;
 }
 
-// The ParallelBatch.tla invariants, checked on a real run. `resultOrder`
+// A parallel batch's rules, checked on a real run: a writer runs alone,
+// and results reach the model in call order. `resultOrder`
 // is the tool call ids in the order the next model request carried them.
 export function checkBatch({ writes, trace, resultOrder, expectedOrder }) {
   const violations = [];
@@ -226,7 +227,7 @@ export function maxConcurrency(trace) {
   return peak;
 }
 
-// The crash-matrix invariants (goal.md "Crash matrix") for one cell.
+// What must hold after a crash and restore, for one crash-matrix cell.
 export function checkCrashCell({ workload, neverEffects, completed, rememberedSetup, resultCounts }) {
   const violations = [];
   const steps = durableWorkloads[workload];

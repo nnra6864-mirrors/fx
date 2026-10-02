@@ -780,6 +780,14 @@ pub fn handlePrompt(
             prior_image_catalog = merged;
         }
     }
+    // A journaled session's open turn carries the images it was given.
+    if (session.journal) |journal| {
+        if (journal.pending_resume) |pending| {
+            const merged = try session_runtime.merge_image_catalog_history_turn(alloc, prior_image_catalog, pending.interruptedTurn());
+            types.freeImageAttachmentSlice(alloc, prior_image_catalog);
+            prior_image_catalog = merged;
+        }
+    }
     const next_image_id = (try image_attachments.calculate_next_image_id(prior_image_catalog)).next_id;
     var prompt_input = parsePromptInputWithFirstImageId(
         alloc,
@@ -855,6 +863,11 @@ pub fn handlePrompt(
 
     var recovery_checkpoint: ?session_codec.RecoveryCheckpoint = null;
     defer if (recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
+    if (session.journal) |*journal| {
+        session.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer session.session_write_mutex.unlock(io_mod.getIo());
+        journal.dropUnplaced(state.alloc);
+    }
     if (prompt_input.continue_recovery and session.journal != null) {
         // A journaled libfx session resumes the turn its journal left open.
         const journal = &session.journal.?;
@@ -1048,10 +1061,18 @@ pub fn handlePrompt(
     }, agent_config, job) catch |err| {
         if (err == error.NonInteractivePermissionRequired) {
             ctx.stop_reason = .refused;
+        } else if (err == error.Cancelled and session.cancel_flag.load(.seq_cst)) {
+            // A cancel that arrived while a journal barrier was pending.
+            ctx.stop_reason = .cancelled;
         } else {
+            // The turn's own failure is the one to report.
+            closeOpenJournalTurn(alloc, session) catch |close_err| {
+                debug_trace.logf("session", "event=libfx_journal_turn_close_failed err={s} turn_err={s}", .{ @errorName(close_err), @errorName(err) });
+            };
             return promptExecutionFailure(err);
         }
     };
+    try closeOpenJournalTurn(alloc, session);
     prompt_input.retainImageSnapshots();
     completeAcpTitleTask(state, session, alloc);
     try sessions.sendActiveSessionInfoUpdate(state, alloc);
@@ -1837,14 +1858,10 @@ fn noteJournalPlacement(ctx: *AcpContext, input_ids: []const ?[]u8) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
     const journal = if (session.journal) |*value| value else return;
-    var ids: [libfx_steering.max_messages][]const u8 = undefined;
-    var count: usize = 0;
     for (input_ids) |maybe_id| {
         const id = maybe_id orelse continue;
-        ids[count] = id;
-        count += 1;
+        try journal.notePlaced(ctx.state.alloc, &.{id});
     }
-    try journal.notePlaced(ctx.state.alloc, ids[0..count]);
 }
 
 /// The web core takes steering from the host at a boundary, so a journaled
@@ -1855,15 +1872,11 @@ fn acceptHostSteering(ctx: *AcpContext, taken: []const js_host_steering.Taken) !
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
     const journal = if (session.journal) |*value| value else return;
-    var ids: [libfx_steering.max_messages][]const u8 = undefined;
-    var count: usize = 0;
     for (taken) |entry| {
         const id = entry.id orelse continue;
         try journal.append(ctx.alloc, session.session_id, .{ .input_accepted = .{ .id = id, .text = entry.text } });
-        ids[count] = id;
-        count += 1;
+        try journal.notePlaced(ctx.state.alloc, &.{id});
     }
-    try journal.notePlaced(ctx.state.alloc, ids[0..count]);
 }
 
 fn publishSteeringReplay(ctx: *AcpContext, text: []const u8, request_id: ?jsonrpc.RequestId) !void {
@@ -2582,7 +2595,20 @@ fn flushJournal(state: *server.ServerState, alloc: Allocator, session_id: []cons
     var response = server.awaitOutboundResponse(state, outbound_id, .journal) orelse return error.JournalFlushFailed;
     awaiting = false;
     defer response.deinit(state.alloc);
-    if (response.cancelled or response.error_json != null or response.result_json == null) return error.JournalFlushFailed;
+    if (response.cancelled) return error.Cancelled;
+    if (response.error_json != null or response.result_json == null) return error.JournalFlushFailed;
+}
+
+/// A journaled turn that ended without a history entry, because it failed or
+/// a barrier was cancelled, is closed in the journal as it is in the session:
+/// resuming is for turns a stopped process left open.
+fn closeOpenJournalTurn(alloc: Allocator, session: *server.ActiveSessionState) !void {
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const journal = if (session.journal) |*value| value else return;
+    if (!journal.progress_open) return;
+    debug_trace.logf("session", "event=libfx_journal_turn_closed reason=ended_without_commit", .{});
+    try journal.clearProgress(alloc, session.session_id);
 }
 
 fn sessionChildCapability(session: *server.ActiveSessionState) ?*session_child_store.SessionChildCapability {
