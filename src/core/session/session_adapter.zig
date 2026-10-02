@@ -1312,14 +1312,15 @@ pub const Session = struct {
     /// first call starts the turn, later calls append only the pieces
     /// completed since. A tool result gets the side file the commit would
     /// write for it (`withResultFiles`); a tool image without its handle
-    /// waits for the commit, which is authoritative. `running_calls` are
+    /// waits for the commit, which is authoritative. `running`'s calls are
     /// saved once each as `tool_running` items, outside the streamed pieces,
-    /// so a finished step still streams and commits as it always did (D28).
+    /// so a finished step still streams and commits as it always did (D28),
+    /// and its message's text with them (D51).
     pub fn appendProgress(
         self: *Session,
         user: types.UserTurn,
         execution: types.ExecutionMemory,
-        running_calls: []const types.ToolCall,
+        running: Running,
     ) !void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -1343,21 +1344,35 @@ pub const Session = struct {
             try self.streamed.ensureUnusedCapacity(self.alloc, encoded.len - start);
             for (encoded[start..]) |bytes| self.streamed.appendAssumeCapacity(try self.alloc.dupe(u8, bytes));
         }
-        try self.saveRunning(a, running_calls);
+        try self.saveRunning(a, running);
     }
 
+    /// The step whose calls are running: its calls in their saved form, and
+    /// the text of the message that issued them.
+    pub const Running = struct {
+        calls: []const types.ToolCall = &.{},
+        assistant: ?[]const u8 = null,
+    };
+
     /// Saves the calls not yet saved as running in the open turn, which the
-    /// pieces above have just opened if it was not.
-    fn saveRunning(self: *Session, a: Allocator, calls: []const types.ToolCall) !void {
+    /// pieces above have just opened if it was not. A step's first save also
+    /// keeps its message's text as an `assistant_running` item (D51). Not
+    /// its provider replay, which binds to all of that message's calls.
+    fn saveRunning(self: *Session, a: Allocator, running: Running) !void {
         var batch: std.ArrayList(sm.Event) = .empty;
         var ids: std.ArrayList([]const u8) = .empty;
-        for (calls) |call| {
+        for (running.calls) |call| {
             if (self.isRunning(call.id)) continue;
             const bytes = try encodePiece(a, .{ .tool_call = conversationToolCall(call) });
             try batch.append(a, .{ .item = try self.itemAs(a, running_type, bytes) });
             try ids.append(a, call.id);
         }
         if (batch.items.len == 0) return;
+        const text = running.assistant orelse "";
+        if (text.len > 0) {
+            const bytes = try encodePiece(a, .{ .assistant = .{ .text = text } });
+            try batch.insert(a, 0, .{ .item = try self.itemAs(a, running_assistant_type, bytes) });
+        }
         _ = try self.write(batch.items);
         try self.running.ensureUnusedCapacity(self.alloc, ids.items.len);
         for (ids.items) |call_id| self.running.appendAssumeCapacity(try self.alloc.dupe(u8, call_id));
@@ -2393,6 +2408,9 @@ noinline fn replay(
     defer turn_arena.deinit();
     var running: std.ArrayList(session_event.ConversationToolCall) = .empty;
     var represented: std.ArrayList([]const u8) = .empty;
+    // The text of the message whose calls are running, until a finished
+    // step's own assistant piece supersedes it (D51).
+    var running_text: ?[]const u8 = null;
     var from = start;
     while (true) {
         var page = try src.read(sa, from, replay_page_lines);
@@ -2410,6 +2428,7 @@ noinline fn replay(
                     _ = turn_arena.reset(.retain_capacity);
                     running = .empty;
                     represented = .empty;
+                    running_text = null;
                 },
                 .item => |piece| {
                     if (std.mem.eql(u8, piece.type, superseded_type)) {
@@ -2423,6 +2442,11 @@ noinline fn replay(
                         try running.append(ta, call.tool_call);
                         continue;
                     }
+                    if (std.mem.eql(u8, piece.type, running_assistant_type)) {
+                        const value = try decodePiece(ta, .assistant, try src.pieceData(ta, piece), .alloc_always);
+                        running_text = value.assistant.text;
+                        continue;
+                    }
                     const kind = pieceKind(piece.type) orelse {
                         debug_trace.logf("session", "event=sessions_v2_unknown_item session={s} type={s} dropped=item", .{ src.id, piece.type });
                         continue;
@@ -2432,7 +2456,10 @@ noinline fn replay(
                     // reader, so strings may point into the page.
                     switch (try decodePiece(pa, kind, data, .alloc_if_needed)) {
                         .user => |value| try builder.begin(try src.withMovedImages(pa, value)),
-                        .assistant => |value| try builder.appendAssistant(value),
+                        .assistant => |value| {
+                            running_text = null;
+                            try builder.appendAssistant(value);
+                        },
                         .tool_call => |value| {
                             try builder.appendToolCall(value);
                             try represented.append(ta, try ta.dupe(u8, value.call_id));
@@ -2463,7 +2490,7 @@ noinline fn replay(
                         .cancel, .closed => .cancelled,
                         .failed, .crash => .failed,
                     } });
-                    const answered = answerRunning(alloc, &turn.interrupted, running.items, represented.items) catch |err| {
+                    const answered = answerRunning(alloc, &turn.interrupted, running.items, represented.items, running_text) catch |err| {
                         types.freeHistoryTurn(alloc, turn);
                         return err;
                     };
@@ -2501,12 +2528,14 @@ fn withoutCreatedAt(a: Allocator, bytes: []const u8) ![]u8 {
 
 /// Gives each call that was saved as running but that `represented` does not
 /// name a failed result saying it may have partly run (D28), as one more
-/// step of `turn`, so every call keeps its result. Returns how many.
+/// step of `turn`, so every call keeps its result. That step keeps `text`,
+/// the text of the message that issued them (D51). Returns how many.
 fn answerRunning(
     alloc: Allocator,
     turn: *types.InterruptedHistoryTurn,
     running: []const session_event.ConversationToolCall,
     represented: []const []const u8,
+    text: ?[]const u8,
 ) !usize {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -2530,10 +2559,12 @@ fn answerRunning(
     errdefer types.freeToolCallSlice(alloc, owned_calls);
     const owned_results = try types.dupePersistedToolResults(alloc, results.items);
     errdefer types.freePersistedToolResults(alloc, owned_results);
+    const owned_text = if (text) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (owned_text) |value| alloc.free(value);
     const old = turn.execution.tool_steps;
     const steps = try alloc.alloc(types.ToolExecutionStep, old.len + 1);
     @memcpy(steps[0..old.len], old);
-    steps[old.len] = .{ .tool_calls = owned_calls, .tool_results = owned_results };
+    steps[old.len] = .{ .assistant = owned_text, .tool_calls = owned_calls, .tool_results = owned_results };
     if (old.len > 0) alloc.free(old);
     turn.execution.tool_steps = steps;
     return calls.items.len;
@@ -2767,6 +2798,8 @@ fn resumeError(err: sm.OpenError, target: Target) ResumeError {
 const superseded_type = "superseded";
 /// A tool call saved before it runs (D28); its data is a `tool_call` piece.
 const running_type = "tool_running";
+/// The text of the message whose calls are running (D51).
+const running_assistant_type = "assistant_running";
 /// What the model reads for a call that was running when its turn ended.
 const unfinished_tool_output = "fx stopped while this tool was running, so it may have partly run. Check its effects before running it again.";
 const blob_ref_key = "$blob";
@@ -3352,10 +3385,10 @@ test "streamed pieces are written once, and the commit adds only the rest" {
     var model = "m".*;
     const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
     const user: types.UserTurn = .{ .text = @constCast("streamed question") };
-    try s.appendProgress(user, .{}, &.{});
+    try s.appendProgress(user, .{}, .{});
     // The first piece published the session.
     try testing.expect(s.saved());
-    try s.appendProgress(user, .{}, &.{});
+    try s.appendProgress(user, .{}, .{});
     try s.commitTurn(.{ .assistant = .{ .user = user, .assistant = @constCast("streamed answer") } }, types.ConversationLanguage.default());
     const id = try testing.allocator.dupe(u8, s.id());
     defer testing.allocator.free(id);
@@ -3388,9 +3421,9 @@ test "a running tool call is saved once, and resume answers it as possibly run" 
     const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
     const user: types.UserTurn = .{ .text = @constCast("run it") };
     const call: types.ToolCall = .{ .id = "call_1", .name = "bash", .arguments_json = "{\"command\":\"sleep 9\"}" };
-    try s.appendProgress(user, .{}, &.{call});
+    try s.appendProgress(user, .{}, .{ .calls = &.{call} });
     try testing.expect(s.saved());
-    try s.appendProgress(user, .{}, &.{call});
+    try s.appendProgress(user, .{}, .{ .calls = &.{call} });
     const id = try testing.allocator.dupe(u8, s.id());
     defer testing.allocator.free(id);
     try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, running_type));
@@ -3417,6 +3450,79 @@ test "a running tool call is saved once, and resume answers it as possibly run" 
     try testing.expectEqualStrings("bash", step.tool_results[0].tool_name);
     try testing.expectEqual(types.PersistedToolStatus.failure, step.tool_results[0].status);
     try testing.expectEqualStrings(unfinished_tool_output, step.tool_results[0].output);
+}
+
+test "a crash while a tool runs keeps the text of the message that issued it (D51)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("build it") };
+    const call: types.ToolCall = .{ .id = "call_1", .name = "bash", .arguments_json = "{\"command\":\"bash build.sh\"}" };
+    const plan = "It makes .build and prints forty steps. Running it now.";
+    try s.appendProgress(user, .{}, .{ .calls = &.{call}, .assistant = plan });
+    // Saved once with its calls; the same step reported again adds nothing.
+    try s.appendProgress(user, .{}, .{ .calls = &.{call}, .assistant = plan });
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, running_assistant_type));
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, running_type));
+    s.close();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), restored.history.len);
+    const turn = restored.history[0].interrupted;
+    try testing.expectEqual(@as(usize, 1), turn.execution.tool_steps.len);
+    const step = turn.execution.tool_steps[0];
+    try testing.expectEqualStrings(plan, step.assistant.?);
+    try testing.expectEqualStrings("call_1", step.tool_calls[0].id);
+    try testing.expectEqualStrings(unfinished_tool_output, step.tool_results[0].output);
+}
+
+test "text an earlier step finished with never lands on a later running step without text (D51)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("two steps") };
+    const first: types.ToolCall = .{ .id = "call-1", .name = "shell", .arguments_json = "{}" };
+    const second: types.ToolCall = .{ .id = "call-2", .name = "bash", .arguments_json = "{\"command\":\"sleep 9\"}" };
+    try s.appendProgress(user, .{}, .{ .calls = &.{first}, .assistant = "plan A" });
+    // The first step finishes with its text; the second runs with none.
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call-1"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast("listed"),
+        .output_bytes = 6,
+        .stored_output_bytes = 6,
+    }};
+    var steps: [1]types.ToolExecutionStep = undefined;
+    const turn = toolTurn("two steps", &results, &steps);
+    steps[0].assistant = @constCast("plan A");
+    try s.appendProgress(user, turn.assistant.execution, .{ .calls = &.{second} });
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, running_assistant_type));
+    s.close();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    const interrupted = restored.history[0].interrupted;
+    try testing.expectEqual(@as(usize, 2), interrupted.execution.tool_steps.len);
+    try testing.expectEqualStrings("plan A", interrupted.execution.tool_steps[0].assistant.?);
+    try testing.expectEqual(types.PersistedToolStatus.success, interrupted.execution.tool_steps[0].tool_results[0].status);
+    const repaired = interrupted.execution.tool_steps[1];
+    try testing.expectEqual(@as(?[]u8, null), repaired.assistant);
+    try testing.expectEqualStrings("call-2", repaired.tool_calls[0].id);
+    try testing.expectEqualStrings(unfinished_tool_output, repaired.tool_results[0].output);
 }
 
 test "a crash answers only the running calls its turn does not already hold" {
@@ -3465,7 +3571,7 @@ test "a finished turn keeps no trace of its running calls" {
     const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
     const user: types.UserTurn = .{ .text = @constCast("asked") };
     const call: types.ToolCall = .{ .id = "call_9", .name = "bash", .arguments_json = "{}" };
-    try s.appendProgress(user, .{}, &.{call});
+    try s.appendProgress(user, .{}, .{ .calls = &.{call} });
     try s.commitTurn(.{ .assistant = .{ .user = user, .assistant = @constCast("answered") } }, types.ConversationLanguage.default());
     // The next turn starts with nothing saved as running.
     try testing.expectEqual(@as(usize, 0), s.running.items.len);
@@ -3571,8 +3677,8 @@ test "a tool result backed only by its command replay streams as it commits" {
     }};
     var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
     const execution: types.ExecutionMemory = .{ .tool_steps = &steps };
-    try s.appendProgress(user, execution, &.{});
-    try s.appendProgress(user, execution, &.{});
+    try s.appendProgress(user, execution, .{});
+    try s.appendProgress(user, execution, .{});
     const streamed = s.stored_results.get("call-1").?;
     const written = try (try s.childCapability()).readBlob(testing.allocator, .tool_results, streamed, 1024);
     defer testing.allocator.free(written);
@@ -3610,7 +3716,7 @@ test "a streamed turn that differs from its commit is superseded, never mixed" {
     defer t.deinit();
     var model = "m".*;
     const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
-    try s.appendProgress(.{ .text = @constCast("draft") }, .{}, &.{});
+    try s.appendProgress(.{ .text = @constCast("draft") }, .{}, .{});
     try s.commitTurn(assistantTurn("final", "answer"), types.ConversationLanguage.default());
     const id = try testing.allocator.dupe(u8, s.id());
     defer testing.allocator.free(id);
@@ -4017,7 +4123,7 @@ test "a v2 session keeps its bodies as blobs its items list, and never makes a s
     var steps: [1]types.ToolExecutionStep = undefined;
     var turn = toolTurn("run it", &results, &steps);
     // Streaming the result stores its body before any piece opened the turn.
-    try s.appendProgress(user, turn.assistant.execution, &.{});
+    try s.appendProgress(user, turn.assistant.execution, .{});
     try s.prepareTurn(&turn);
     defer testing.allocator.free(results[0].output_handle.?);
     defer testing.allocator.free(results[0].preview.?);

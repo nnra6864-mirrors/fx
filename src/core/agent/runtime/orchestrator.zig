@@ -3911,7 +3911,8 @@ noinline fn pausedRequiredAction(
 
 /// Hands the model's tool calls to `append_turn_piece` before any of them
 /// runs (D28). Execution memory holds only finished exchanges, so the calls
-/// travel apart, in the form a finished step saves them.
+/// travel apart, in the form a finished step saves them, with the text of
+/// the message that issued them, the newest one (D51).
 fn appendRunningToolCalls(
     deps: *const AgentRuntimeDeps,
     finalization: *const TurnFinalizationGuard,
@@ -3927,10 +3928,13 @@ fn appendRunningToolCalls(
     const execution = try runtime_execution_memory.buildExecutionMemory(arena, current_turn_messages);
     const running = try arena.alloc(types.ToolCall, calls.len);
     for (calls, running) |call, *saved| saved.* = try execution_memory_helpers.dupePersistedToolCall(arena, call);
+    const issuing = current_turn_messages[current_turn_messages.len - 1];
+    std.debug.assert(issuing.role == .assistant and issuing.tool_calls.len == calls.len);
     try append(deps.ctx, .{
         .user = .{ .text = @constCast(job.prompt), .images = job.images },
         .execution = try finalization.compacted_execution.project(arena, execution),
         .running_calls = running,
+        .running_assistant = issuing.content,
     });
 }
 
@@ -4124,11 +4128,14 @@ test "running tool calls reach append_turn_piece before they run" {
         appends: usize = 0,
         finished_steps: usize = 0,
         running: std.ArrayList([]u8) = .empty,
+        running_text: ?[]u8 = null,
 
         fn append(raw: *anyopaque, progress: runtime_deps.TurnProgress) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.appends += 1;
             self.finished_steps = progress.execution.tool_steps.len;
+            if (self.running_text) |text| std.testing.allocator.free(text);
+            self.running_text = if (progress.running_assistant) |text| try std.testing.allocator.dupe(u8, text) else null;
             for (progress.running_calls) |call| {
                 try self.running.append(std.testing.allocator, try std.testing.allocator.dupe(u8, call.id));
             }
@@ -4138,6 +4145,7 @@ test "running tool calls reach append_turn_piece before they run" {
     defer {
         for (sink.running.items) |id| std.testing.allocator.free(id);
         sink.running.deinit(std.testing.allocator);
+        if (sink.running_text) |text| std.testing.allocator.free(text);
     }
     var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
     defer fake.deinit();
@@ -4155,9 +4163,9 @@ test "running tool calls reach append_turn_piece before they run" {
         .{ .id = "run_2", .name = "read_file", .arguments_json = "{\"path\":\"a\"}" },
     };
     const messages = [_]ChatMessage{
-        .{ .role = .assistant, .tool_calls = &finished },
+        .{ .role = .assistant, .content = "Reading b first.", .tool_calls = &finished },
         .{ .role = .tool, .tool_call_id = "read_0", .tool_name = "read_file", .tool_result_status = .success, .content = "done" },
-        .{ .role = .assistant, .tool_calls = &running },
+        .{ .role = .assistant, .content = "Running both now.", .tool_calls = &running },
     };
 
     // Without the hook, as on v1, nothing is built or sent.
@@ -4173,6 +4181,8 @@ test "running tool calls reach append_turn_piece before they run" {
     try std.testing.expectEqual(@as(usize, 2), sink.running.items.len);
     try std.testing.expectEqualStrings("run_1", sink.running.items[0]);
     try std.testing.expectEqualStrings("run_2", sink.running.items[1]);
+    // With the text of the message that issued them, not an earlier one (D51).
+    try std.testing.expectEqualStrings("Running both now.", sink.running_text.?);
 
     // A step with no calls sends nothing.
     try appendRunningToolCalls(&deps, &finalization, fixture.job(), &messages, &.{});

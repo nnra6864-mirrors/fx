@@ -40,6 +40,9 @@ pub const TurnProgress = struct {
     /// Tool calls the model issued that have no result yet, in their saved
     /// form, so a crash while they run leaves them in the session (D28).
     running_calls: []const types.ToolCall = &.{},
+    /// The text of the message that issued `running_calls`, so a crash also
+    /// leaves what fx already showed (D51).
+    running_assistant: ?[]const u8 = null,
 };
 
 /// Borrows checkpoint slices only for the call. A sink must synchronously copy

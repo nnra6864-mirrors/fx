@@ -22,6 +22,7 @@ import {
   FAKE_GATEWAY_MODEL,
   type FakeGatewayOptions,
   fakeGatewayFinalText,
+  fakeGatewaySerializedToolCall,
   fakeGatewayToolCall,
   fakeShellRun,
   heldFakeGatewayFinalText,
@@ -135,6 +136,21 @@ function promptToolParts(body: string) {
     calls: parts.filter((part) => part.type === "tool-call"),
     results: parts.filter((part) => part.type === "tool-result"),
   };
+}
+
+/// The text of the assistant message that issued `callId`, in a request.
+function assistantTextBeside(body: string, callId: string) {
+  const prompt: any[] = JSON.parse(body).prompt ?? [];
+  const message = prompt.find(
+    (entry) =>
+      entry.role === "assistant" &&
+      Array.isArray(entry.content) &&
+      entry.content.some((part: any) => part.type === "tool-call" && part.toolCallId === callId),
+  );
+  return (message?.content ?? [])
+    .filter((part: any) => part.type === "text")
+    .map((part: any) => part.text)
+    .join("");
 }
 
 function expectPairedToolCalls(body: string) {
@@ -691,6 +707,60 @@ test("a kill while a tool runs keeps the finished tool and answers the running o
     expect(lines.filter((line) => line.kind === "turn_interrupted").map((line) => line.reason)).toEqual(["crash"]);
     expectWholeLog(fixture, id);
     expectNoV1Sessions(fixture);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("a kill while a tool runs keeps the text of the message that issued it", async () => {
+  const fixture = createFixture("fx-v2-kill-text-");
+  let slowServed: () => void = () => {};
+  const slowStarted = new Promise<void>((resolve) => (slowServed = resolve));
+  const shell = (command: string) => JSON.stringify({ request: { yield_time_ms: 30_000, action: "run", command } });
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (body.includes("After the text kill.")) return fakeGatewayFinalText("AFTER_TEXT_KILL");
+    if (body.includes("Run the build.") && body.includes("FIRST_STEP_OUTPUT_4410")) {
+      slowServed();
+      return fakeGatewaySerializedToolCall("v2-slow-2", "shell", shell("sleep 5"), "RUNNING_PLAN_7731 builds it now.");
+    }
+    if (body.includes("Run the build.")) {
+      return fakeGatewaySerializedToolCall("v2-fast-1", "shell", shell("echo FIRST_STEP_OUTPUT_4410"), "EARLIER_PLAN_2209 reads first.");
+    }
+    return fakeGatewayFinalText("BEFORE_TEXT_KILL");
+  });
+  try {
+    const created = await ask(fixture, gateway, ["Before the text kill."]);
+    expect(created.code).toBe(0);
+    const id = JSON.parse(created.stdout).session_id;
+
+    const run = spawnAsk(fixture, gateway, ["--resume-id", id, "Run the build."]);
+    await slowStarted;
+    await waitForLog(fixture, id, "v2-slow-2");
+    run.child.kill("SIGKILL");
+    await run.exited;
+    // The text is saved with the running call, before the tool finishes (D51).
+    const running = logLines(fixture, id).filter((line) => line.kind === "item" && line.type === "assistant_running");
+    expect(running.length).toBe(2);
+    expect(JSON.stringify(running.at(-1))).toContain("RUNNING_PLAN_7731");
+
+    const resumed = await ask(fixture, gateway, ["--resume-id", id, "After the text kill."]);
+    expect(resumed.code).toBe(0);
+    expect(resumed.stderr).toBe("");
+    expect(JSON.parse(resumed.stdout).output).toBe("AFTER_TEXT_KILL");
+    const body = gateway.requests.at(-1)!.body;
+    expectPairedToolCalls(body);
+    // Each step keeps its own text, beside its own call, once.
+    expect(assistantTextBeside(body, "v2-fast-1")).toBe("EARLIER_PLAN_2209 reads first.");
+    expect(assistantTextBeside(body, "v2-slow-2")).toBe("RUNNING_PLAN_7731 builds it now.");
+    expect(body.split("RUNNING_PLAN_7731").length - 1).toBe(1);
+    expect(body.split("EARLIER_PLAN_2209").length - 1).toBe(1);
+    const { results } = promptToolParts(body);
+    expect(results.find((part) => part.toolCallId === "v2-slow-2")?.output?.value).toContain("may have partly run");
+    expect(logLines(fixture, id).filter((line) => line.kind === "turn_interrupted").map((line) => line.reason)).toEqual([
+      "crash",
+    ]);
+    expectWholeLog(fixture, id);
   } finally {
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });
@@ -3349,7 +3419,8 @@ function twoToolGateway(prefix: string, prompt: string, after: [string, string])
     if (body.includes(after[0])) return fakeGatewayFinalText(after[1]);
     if (body.includes(prompt) && body.includes(`${prefix}_FIRST_TOOL_OUTPUT`)) {
       served();
-      return fakeShellRun(`${prefix}-slow-2`, "sleep 30");
+      const input = JSON.stringify({ request: { yield_time_ms: 30_000, action: "run", command: "sleep 30" } });
+      return fakeGatewaySerializedToolCall(`${prefix}-slow-2`, "shell", input, `${prefix}_RUNNING_PLAN starts the slow one.`);
     }
     if (body.includes(prompt)) return fakeShellRun(`${prefix}-fast-1`, `echo ${prefix}_FIRST_TOOL_OUTPUT`);
     return fakeGatewayFinalText(`${prefix}_UNEXPECTED`);
@@ -3358,10 +3429,12 @@ function twoToolGateway(prefix: string, prompt: string, after: [string, string])
 }
 
 /// After a kill mid-tool: the finished call keeps its result, the running one
-/// comes back answered as possibly run, and the crash interrupted the turn.
+/// comes back answered as possibly run with its message's text, and the crash
+/// interrupted the turn.
 function expectToolKillRepaired(fixture: Fixture, id: string, body: string, prefix: string) {
   expect(body).toContain(`${prefix}_FIRST_TOOL_OUTPUT`);
   expectPairedToolCalls(body);
+  expect(assistantTextBeside(body, `${prefix}-slow-2`)).toBe(`${prefix}_RUNNING_PLAN starts the slow one.`);
   const { calls, results } = promptToolParts(body);
   expect(calls.map((part) => part.toolCallId)).toEqual([`${prefix}-fast-1`, `${prefix}-slow-2`]);
   expect(results.find((part) => part.toolCallId === `${prefix}-slow-2`)?.output?.value).toContain("may have partly run");
@@ -3389,6 +3462,8 @@ test.skipIf(!tmuxAvailable())("an app killed while a tool runs answers that call
     await app.session.kill();
 
     const resumed = await startApp(fixture, gateway, ["--resume", id], true, appEnv);
+    // The resumed transcript shows the text fx showed before the kill.
+    expect(await scrollbackContains(resumed.session, "APP_RUNNING_PLAN")).toContain("APP_RUNNING_PLAN");
     await resumed.session.sendText("After the app tool kill.");
     await resumed.session.waitForText("AFTER_APP_TOOL_KILL", TIMEOUT);
     await quitApp(resumed);
@@ -3414,6 +3489,8 @@ test("ACP killed while a tool runs answers that call on load and goes on", async
 
     client = await AcpRpc.start(fixture, gateway, acpEnv);
     await client.ok("session/load", { sessionId: id, cwd: fixture.workspace, mcpServers: [] });
+    // Load replays the text fx sent before the kill.
+    expect(client.texts("agent_message_chunk").join("")).toContain("ACP_RUNNING_PLAN");
     await client.ok("session/prompt", { sessionId: id, ...acpPrompt("After the ACP tool kill.") });
     expect(await client.close()).toBe(0);
     client = undefined;
