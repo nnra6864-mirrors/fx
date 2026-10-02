@@ -508,6 +508,8 @@ export function worldHandler({ world, createAgent, wakeAfterSeconds = defaultWak
     let agent = null;
     try {
       agent = await createAgent({ sessionId: target });
+      // An agent on another run would answer the wake and strand this one.
+      if (agent.sessionId !== target) throw new TypeError("createAgent({ sessionId }) must open that session");
       // The open turn first, then each follow-up the journal held.
       for (let turn = agent.resume(); turn; turn = agent.resume()) {
         for await (const _ of turn) {}

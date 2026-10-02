@@ -236,9 +236,9 @@ fn dupePendingInputs(alloc: Allocator, inputs: []const journal.PendingInput) All
 }
 
 /// Rebuilds a fresh session from the host's events and starts its journal
-/// after them. A turn a crash
-/// left open becomes the pending resume, with every call it left running
-/// answered as possibly run; `session_alloc` owns it.
+/// after them. A turn a crash left open becomes the pending resume, with
+/// every call it left running answered as possibly run; `session_alloc` owns
+/// it.
 pub fn open(
     alloc: Allocator,
     session_alloc: Allocator,
@@ -377,7 +377,7 @@ test "inputs taken for a request that never went out are not placed by the next 
     try std.testing.expect(std.mem.find(u8, capture.frames.items, "steer-1") == null);
 }
 
-test "a follow-up stops waiting when a progress places it" {
+test "a progress places the follow-up its turn runs" {
     const alloc = std.testing.allocator;
     var capture: TestCapture = .{};
     defer capture.frames.deinit(alloc);

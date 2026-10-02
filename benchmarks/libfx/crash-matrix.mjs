@@ -183,8 +183,9 @@ async function worldEvents(world, runId) {
   for (let cursor; ;) {
     const page = await world.events.list({ runId, pagination: { sortOrder: "asc", limit: 1000, ...(cursor ? { cursor } : {}) }, resolveData: "all" });
     for (const event of page.data) {
-      const batch = event.eventData?.stepName === "libfx.journal" ? event.eventData.input?.events : null;
-      if (Array.isArray(batch) && batch[0]?.seq === events.length + 1) events.push(...batch);
+      const input = event.eventType === "step_created" && event.eventData?.stepName === "libfx.journal" ? event.eventData.input : null;
+      const batch = input?.format === "libfx-journal-v1" && Array.isArray(input.events) && input.events.length > 0 ? input.events : null;
+      if (batch && batch[0].seq === events.length + 1) events.push(...batch);
     }
     if (!page.hasMore) break;
     cursor = page.cursor;

@@ -295,21 +295,20 @@ takes it at the next boundary, so there `steer()` resolves then, and a steer
 still queued when the turn ends rejects.
 
 `agent.followUp(input)` queues text to run as its own turn once the current
-turn ends, or at once when none is running, instead of failing with `a prompt
-is already in progress`. It returns a promise for that turn; the promise
-carries the follow-up's `id` and `accepted`, which resolves `{ id }` once a
-journal holds it. With a journal, a follow-up survives a crash. After a
+turn ends, or at once when none is running, instead of failing with
+`a prompt is already in progress`. It returns a promise for that turn; the
+promise carries the follow-up's `id` and `accepted`, which resolves `{ id }`
+once a journal holds it. With a journal, a follow-up survives a crash. After a
 restore, the follow-ups the journal held have no caller, so each waits for
 `agent.resume()`: every call continues the open turn first, then starts the
 next held follow-up, and returns `null` once none is left. Follow-ups this
-agent queues run on their own and do not wait behind held ones. Call
-`resume()` until it returns `null` whenever a session opens, before this
-agent queues follow-ups of its own: one queued during a resumed turn starts
-when that turn ends, and
-`resume()` throws while it runs. A follow-up whose turn ends before libfx
-records its first `turn_progress` is withdrawn, and one that ends after it is
-recorded like any other turn, so a follow-up never runs twice. `close()` rejects
-follow-ups that have not started; a journal still holds them.
+agent queues run on their own and do not wait behind held ones. Call `resume()`
+until it returns `null` whenever a session opens, before this agent queues
+follow-ups of its own: one queued during a resumed turn starts when that turn
+ends, and `resume()` throws while it runs. A follow-up whose turn ends before
+libfx records its first `turn_progress` is withdrawn, and one that ends after
+it is recorded like any other turn, so a follow-up never runs twice. `close()`
+rejects follow-ups that have not started; a journal still holds them.
 
 Cancelling a steered turn drops any guidance that has not reached a safe
 boundary and releases its queue. Applied guidance is part of the same history
@@ -384,17 +383,15 @@ started while the failed append was in flight can still complete; a
 `createFxAgent()` calls `load()` once. It must resolve to `{ events }` with
 every stored event, oldest first. Each `turn_progress` event repeats its turn
 so far, so a turn with many large tool results stores more than its final
-entry, and libfx reads only the
-newest progress of the open turn. The events it reads must fit in 4 MiB of
-JSON, and the history at most 1,024 turns; otherwise `createFxAgent()`
-rejects with an error whose `code` is `FX_JOURNAL_TOO_LARGE`. libfx refuses a
-journal whose events repeat, skip a `seq`, or do not parse, and
+entry, and libfx reads only the newest progress of the open turn. The events it
+reads must fit in 4 MiB of JSON, and the history at most 1,024 turns; otherwise
+`createFxAgent()` rejects with an error whose `code` is `FX_JOURNAL_TOO_LARGE`.
+libfx refuses a journal whose events repeat, skip a `seq`, or do not parse, and
 `createFxAgent()` rejects with the reason and the `code` `FX_JOURNAL_INVALID`.
 For a journal written by a newer libfx, it rejects with an
-`FxJournalVersionError`, whose `code` is `FX_JOURNAL_VERSION`.
-Each libfx release resumes the journals and checkpoints that the release
-before it saved, so upgrade the processes that read a session before
-the ones that write it.
+`FxJournalVersionError`, whose `code` is `FX_JOURNAL_VERSION`. Each libfx
+release resumes the journals and checkpoints that the release before it saved,
+so upgrade the processes that read a session before the ones that write it.
 
 A journal grows with every turn, and `load()` returns all of it, so a session
 opens only while its events fit in one load.
@@ -407,7 +404,7 @@ AI Gateway keys session affinity and prompt caching to the session's id. libfx
 picks a new id for each agent unless you pass `sessionId` or `load()` resolves
 to `{ events, sessionId }`, so give a restored session the id it had before.
 An id is 1 to 255 letters, digits, `.`, `_`, or `-`; when both are given they
-must match.
+must match. `agent.sessionId` is the id the agent uses.
 
 If the last process stopped during a turn, `agent.resume()` continues that
 turn with no new input and returns it, like `prompt()`. The model is told

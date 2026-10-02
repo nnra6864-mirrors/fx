@@ -79,7 +79,6 @@ const turnBytes = (events, turn) => events
   .filter((event) => event.turn === turn)
   .reduce((sum, event) => sum + JSON.stringify(event).length, 0);
 
-// Counts another journal's appends the way remoteJournal does.
 // A World that counts libfx's journal writes as a journal counts appends.
 function countingWorld(inner) {
   const counter = { appends: 0, bytes: 0 };

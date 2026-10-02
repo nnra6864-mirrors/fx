@@ -127,8 +127,9 @@ async function storedEvents(world, runId) {
   for (let cursor; ;) {
     const page = await world.events.list({ runId, pagination: { sortOrder: "asc", limit: 1000, ...(cursor ? { cursor } : {}) }, resolveData: "all" });
     for (const event of page.data) {
-      const batch = event.eventData?.stepName === "libfx.journal" ? event.eventData.input?.events : null;
-      if (Array.isArray(batch) && batch[0]?.seq === events.length + 1) events.push(...batch);
+      const input = event.eventType === "step_created" && event.eventData?.stepName === "libfx.journal" ? event.eventData.input : null;
+      const batch = input?.format === "libfx-journal-v1" && Array.isArray(input.events) && input.events.length > 0 ? input.events : null;
+      if (batch && batch[0].seq === events.length + 1) events.push(...batch);
     }
     if (!page.hasMore) break;
     cursor = page.cursor;
@@ -442,7 +443,7 @@ test("the queue route recognizes a config mismatch from another copy of libfx", 
   const handler = worldHandler({
     world,
     wakeAfterSeconds: 1,
-    createAgent: async () => ({ resume() { throw foreign(); }, async close() { closed += 1; } }),
+    createAgent: async ({ sessionId: opened }) => ({ sessionId: opened, resume() { throw foreign(); }, async close() { closed += 1; } }),
   });
   await new Promise((resolveWait) => setTimeout(resolveWait, 1200));
   const response = await handler(new Request("http://localhost/queue", { method: "POST", body: JSON.stringify({ runId: sessionId }) }));
@@ -450,6 +451,21 @@ test("the queue route recognizes a config mismatch from another copy of libfx", 
   assert.equal(response.status, 200);
   assert.match(await response.text(), /was not resumed: the open turn started under other/);
   assert.equal(closed, 1);
+});
+
+test("the queue route refuses an agent on another session", async () => {
+  const world = createWorld({ dataDir: mkdtempSync(join(tmpdir(), "libfx-world-")), recoverActiveRuns: false });
+  await world.start?.();
+  const sessionId = await seedRun(world, [{ v: 1, seq: 1, turn: 1, type: "turn_progress", data: {} }]);
+  // This createAgent drops the sessionId, so it would open a new run.
+  const build = defineAgent(gateway.port, () => "sent");
+  const handler = worldHandler({ world, wakeAfterSeconds: 1, createAgent: () => build({ world }) });
+  await new Promise((resolveWait) => setTimeout(resolveWait, 1200));
+  await assert.rejects(
+    handler(new Request("http://localhost/queue", { method: "POST", body: JSON.stringify({ runId: sessionId }) })),
+    /createAgent\(\{ sessionId \}\) must open that session/,
+  );
+  await closeWorld(world);
 });
 
 test("a World event id without a slot stops the write", async () => {
