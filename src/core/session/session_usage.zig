@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const secret = @import("../auth/secret.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const generation_fact_codec = @import("generation_fact_codec.zig");
 const generation_usage = @import("generation_usage_provider.zig");
 const io_mod = @import("../shared/io.zig");
@@ -3777,9 +3778,7 @@ fn parseCredentialIdentityOptional(value: ?std.json.Value) !?credential_authorit
         .null => null,
         .string => |hex| identity: {
             var bytes: [Sha256.digest_length]u8 = undefined;
-            _ = std.fmt.hexToBytes(&bytes, hex) catch return error.InvalidUsageSnapshot;
-            const canonical = std.fmt.bytesToHex(bytes, .lower);
-            if (!std.mem.eql(u8, &canonical, hex)) return error.InvalidUsageSnapshot;
+            text_utils.decode_lower_hex(&bytes, hex) catch return error.InvalidUsageSnapshot;
             break :identity credential_authority.Identity{ .bytes = bytes };
         },
         else => error.InvalidUsageSnapshot,

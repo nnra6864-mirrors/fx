@@ -1,6 +1,7 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const types = @import("../shared/types.zig");
 const session = @import("session.zig");
@@ -1226,9 +1227,7 @@ fn parseOptionalBackgroundRecordId(
     if (value == .null) return null;
     if (value != .string or value.string.len != 32) return error.InvalidSessionFormat;
     var id: [16]u8 = undefined;
-    _ = std.fmt.hexToBytes(&id, value.string) catch return error.InvalidSessionFormat;
-    const canonical = std.fmt.bytesToHex(id, .lower);
-    if (!std.mem.eql(u8, &canonical, value.string)) return error.InvalidSessionFormat;
+    text_utils.decode_lower_hex(&id, value.string) catch return error.InvalidSessionFormat;
     return id;
 }
 

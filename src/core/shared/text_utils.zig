@@ -2,6 +2,62 @@ const std = @import("std");
 const debug_trace = @import("debug_trace.zig");
 const display_width = @import("display_width.zig");
 
+/// Decodes exact-length lowercase hex. On failure, decoded may be partially written.
+pub fn decode_lower_hex(decoded: []u8, encoded: []const u8) error{InvalidHex}!void {
+    if (encoded.len % 2 != 0 or encoded.len / 2 != decoded.len) return error.InvalidHex;
+    for (decoded, 0..) |*byte, index| {
+        const high = try lower_hex_digit(encoded[2 * index]);
+        const low = try lower_hex_digit(encoded[2 * index + 1]);
+        byte.* = high << 4 | low;
+    }
+}
+
+fn lower_hex_digit(byte: u8) error{InvalidHex}!u8 {
+    const digit = byte -% '0';
+    if (digit < 10) return digit;
+    const letter = byte -% 'a';
+    if (letter < 6) return letter + 10;
+    return error.InvalidHex;
+}
+
+test "lowercase hex decoding matches canonical round trips for every byte pair" {
+    var encoded: [2]u8 = undefined;
+    for (0..256) |high| {
+        encoded[0] = @intCast(high);
+        for (0..256) |low| {
+            encoded[1] = @intCast(low);
+            var expected: [1]u8 = undefined;
+            var actual: [1]u8 = undefined;
+            if (std.fmt.hexToBytes(&expected, &encoded)) |_| {
+                const canonical = std.fmt.bytesToHex(expected, .lower);
+                if (std.mem.eql(u8, &canonical, &encoded)) {
+                    try decode_lower_hex(&actual, &encoded);
+                    try std.testing.expectEqual(expected, actual);
+                    continue;
+                }
+            } else |_| {}
+            try std.testing.expectError(error.InvalidHex, decode_lower_hex(&actual, &encoded));
+        }
+    }
+}
+
+test "lowercase hex decoding bounds identifiers and digests without allocating" {
+    var digest: [32]u8 = undefined;
+    for (&digest, 0..) |*byte, index| byte.* = @intCast(index * 8 + 7);
+    const encoded = std.fmt.bytesToHex(digest, .lower);
+    var decoded: [32]u8 = undefined;
+    try decode_lower_hex(&decoded, &encoded);
+    try std.testing.expectEqual(digest, decoded);
+    var id: [16]u8 = undefined;
+    try decode_lower_hex(&id, encoded[0..32]);
+    try std.testing.expectEqualSlices(u8, digest[0..16], &id);
+    try std.testing.expectError(error.InvalidHex, decode_lower_hex(&id, &encoded));
+    try std.testing.expectError(error.InvalidHex, decode_lower_hex(&decoded, encoded[0..63]));
+    try std.testing.expectError(error.InvalidHex, decode_lower_hex(&decoded, encoded[0..62]));
+    try std.testing.expectError(error.InvalidHex, decode_lower_hex(&decoded, ""));
+    try decode_lower_hex(&.{}, "");
+}
+
 pub fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return true;
     if (needle.len > haystack.len) return false;

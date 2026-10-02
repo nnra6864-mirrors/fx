@@ -1,5 +1,6 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const session_event = @import("session_event.zig");
 const session_log = @import("session_log.zig");
 const session_projection = @import("session_projection.zig");
@@ -330,9 +331,7 @@ pub fn jsonU64(object: std.json.ObjectMap, key: []const u8) error{InvalidSession
 pub fn parseIdentifier(raw: []const u8) error{InvalidSessionFormat}!session_event.Identifier {
     if (raw.len != 32) return error.InvalidSessionFormat;
     var result: session_event.Identifier = undefined;
-    _ = std.fmt.hexToBytes(&result, raw) catch return error.InvalidSessionFormat;
-    const canonical = std.fmt.bytesToHex(result, .lower);
-    if (!std.mem.eql(u8, &canonical, raw)) return error.InvalidSessionFormat;
+    text_utils.decode_lower_hex(&result, raw) catch return error.InvalidSessionFormat;
     return result;
 }
 

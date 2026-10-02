@@ -3,6 +3,7 @@ const session = @import("session.zig");
 const session_codec = @import("session_codec.zig");
 const session_event = @import("session_event.zig");
 const types = @import("../shared/types.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -528,9 +529,7 @@ fn parseDigest(hex: []const u8) !Digest {
 fn parseHex(comptime T: type, hex: []const u8) !T {
     if (hex.len != @sizeOf(T) * 2) return error.InvalidManifest;
     var value: T = undefined;
-    _ = std.fmt.hexToBytes(&value, hex) catch return error.InvalidManifest;
-    const canonical = std.fmt.bytesToHex(value, .lower);
-    if (!std.mem.eql(u8, &canonical, hex)) return error.InvalidManifest;
+    text_utils.decode_lower_hex(&value, hex) catch return error.InvalidManifest;
     return value;
 }
 

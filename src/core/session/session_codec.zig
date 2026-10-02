@@ -5,6 +5,7 @@ const session = @import("session.zig");
 const session_usage = @import("session_usage.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const captured_command = @import("../tooling/captured_command.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -1540,9 +1541,7 @@ fn parseTurnAuthority(alloc: Allocator, value: std.json.Value) !TurnAuthority {
         .null => null,
         .string => |hex| identity: {
             var bytes: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-            _ = std.fmt.hexToBytes(&bytes, hex) catch return error.InvalidDurableField;
-            const canonical = std.fmt.bytesToHex(bytes, .lower);
-            if (!std.mem.eql(u8, &canonical, hex)) return error.InvalidDurableField;
+            text_utils.decode_lower_hex(&bytes, hex) catch return error.InvalidDurableField;
             break :identity credential_authority.Identity{ .bytes = bytes };
         },
         else => return error.InvalidDurableField,
@@ -3054,9 +3053,7 @@ fn parseOptionalIdentifier(value: std.json.Value) !?[16]u8 {
 fn parseHexIdentifier(hex: []const u8) ![16]u8 {
     if (hex.len != 32) return error.InvalidSessionFormat;
     var result: [16]u8 = undefined;
-    _ = std.fmt.hexToBytes(&result, hex) catch return error.InvalidSessionFormat;
-    const canonical = std.fmt.bytesToHex(result, .lower);
-    if (!std.mem.eql(u8, &canonical, hex)) return error.InvalidSessionFormat;
+    text_utils.decode_lower_hex(&result, hex) catch return error.InvalidSessionFormat;
     return result;
 }
 

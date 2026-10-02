@@ -7,6 +7,7 @@ const types = @import("../shared/types.zig");
 const model_provider = @import("../config/model_provider.zig");
 const context_limits = @import("../config/context_limits.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -2072,9 +2073,7 @@ fn parseDigest(hex: []const u8) !Digest {
 fn parseHex(comptime T: type, hex: []const u8) !T {
     if (hex.len != @sizeOf(T) * 2) return error.InvalidEventFrame;
     var value: T = undefined;
-    _ = std.fmt.hexToBytes(&value, hex) catch return error.InvalidEventFrame;
-    const canonical = std.fmt.bytesToHex(value, .lower);
-    if (!std.mem.eql(u8, &canonical, hex)) return error.InvalidEventFrame;
+    text_utils.decode_lower_hex(&value, hex) catch return error.InvalidEventFrame;
     return value;
 }
 
