@@ -387,6 +387,29 @@ test("the queue route acknowledges a session no libfx can open", async () => {
   assert.match(await response.text(), /was not resumed: Invalid libfx journal/);
 });
 
+test("the queue route recognizes a config mismatch from another copy of libfx", async () => {
+  const world = createWorld({ dataDir: mkdtempSync(join(tmpdir(), "libfx-world-")), recoverActiveRuns: false });
+  await world.start?.();
+  const session = workflow({ world });
+  await session.journal.load();
+  await session.journal.append([{ v: 1, seq: 1, turn: 1, type: "turn_progress", data: {} }]);
+  session.journal.close();
+  // The CommonJS bundle carries its own copy of the error class.
+  const foreign = () => Object.assign(new Error("the open turn started under other instructions, tools or model"), { code: "FX_CONFIG_MISMATCH" });
+  let closed = 0;
+  const route = workflow({
+    world,
+    wakeAfterSeconds: 1,
+    createAgent: async () => ({ resume() { throw foreign(); }, async close() { closed += 1; } }),
+  });
+  await new Promise((resolveWait) => setTimeout(resolveWait, 1200));
+  const response = await route.handler(new Request("http://localhost/queue", { method: "POST", body: JSON.stringify({ runId: session.sessionId }) }));
+  await closeWorld(world);
+  assert.equal(response.status, 200);
+  assert.match(await response.text(), /was not resumed: the open turn started under other/);
+  assert.equal(closed, 1);
+});
+
 test("a World event id without a slot stops the write", async () => {
   const world = {
     events: {

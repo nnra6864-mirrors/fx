@@ -9,7 +9,7 @@
 //   const agent = await createAgent(durable);   // createFxAgent({ ...durable, ... })
 //   export const POST = durable.handler;        // the queue calls this after a crash
 
-import { FxConfigMismatchError, FxFencedError } from "./fx-sdk.js";
+import { FxFencedError } from "./fx-sdk.js";
 
 const journalStep = "libfx.journal";
 const payloadFormat = "libfx-journal-v1";
@@ -22,8 +22,9 @@ const eventIdPattern = /^[a-z]+_(\d{26})$/;
 
 export { FxFencedError };
 
-// Load failures a later delivery of the same wake would repeat.
-const permanentOpenFailures = new Set(["FX_JOURNAL_TOO_LARGE", "FX_JOURNAL_INVALID"]);
+// Failures a later delivery of the same wake would repeat, by code, so an
+// error from another copy of libfx counts too.
+const permanentOpenFailures = new Set(["FX_CONFIG_MISMATCH", "FX_JOURNAL_TOO_LARGE", "FX_JOURNAL_INVALID"]);
 
 // Fencing reads the slot from the id, so an id in another form stops the
 // write rather than letting it pass unchecked.
@@ -296,7 +297,7 @@ export function workflow({
         // open a journal that is too large or does not fold. A config
         // mismatch waits for the session's next prompt, which ends the turn
         // as interrupted.
-        if (!(error instanceof FxConfigMismatchError) && !permanentOpenFailures.has(error?.code)) throw error;
+        if (!permanentOpenFailures.has(error?.code)) throw error;
         return new Response(`session ${target} was not resumed: ${error.message}`, { status: 200 });
       } finally {
         await agent?.close();

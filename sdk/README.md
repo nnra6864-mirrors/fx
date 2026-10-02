@@ -306,8 +306,9 @@ agent queues run on their own and do not wait behind held ones. libfx takes no
 snapshot while a held follow-up waits, so call `resume()` until it returns
 `null` whenever a session opens, before this agent queues follow-ups of its
 own: one queued during a resumed turn starts when that turn ends, and
-`resume()` throws while it runs. A follow-up whose turn ends before its first
-model request is withdrawn, so it never runs again. `close()` rejects
+`resume()` throws while it runs. A follow-up whose turn ends before libfx
+records its first `turn_progress` is withdrawn, and one that ends after it is
+recorded like any other turn, so a follow-up never runs twice. `close()` rejects
 follow-ups that have not started; a journal still holds them.
 
 Cancelling a steered turn drops any guidance that has not reached a safe

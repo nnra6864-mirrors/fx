@@ -1065,7 +1065,10 @@ pub fn handlePrompt(
             // A cancel that arrived while a journal barrier was pending ends
             // the turn as interrupted, as a cancel anywhere else does.
             ctx.stop_reason = .cancelled;
-            try commitCancelledJournalTurn(alloc, state.alloc, session, &prompt_input);
+            // If the commit fails, the turn still ends below.
+            commitCancelledJournalTurn(alloc, state.alloc, session, &prompt_input) catch |commit_err| {
+                debug_trace.logf("session", "event=libfx_journal_interrupted_commit_failed err={s}", .{@errorName(commit_err)});
+            };
         } else {
             // The turn's own failure is the one to report.
             endJournalTurn(alloc, state.alloc, session) catch |end_err| {

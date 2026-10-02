@@ -186,7 +186,9 @@ function journalLoadError(message, code, cause) {
 }
 
 // The core's libfx/journal_open errors, by their exact message. The journal
-// tests open a journal for each, so rewording one fails them.
+// tests open a journal for each, so rewording one fails them, except the size
+// limit: libfx refuses a journal over it before the core sees one, so that
+// entry is a backstop.
 const journalOpenErrorCodes = new Map([
   ["Invalid libfx journal", "FX_JOURNAL_INVALID"],
   ["libfx journal events are out of order", "FX_JOURNAL_INVALID"],

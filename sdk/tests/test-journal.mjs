@@ -401,6 +401,11 @@ test("a journal that does not fold is refused", async () => {
   await assert.rejects(createFxAgent(options(targetBackend, newer)), /libfx journal was written by a newer fx/);
   const garbled = createMemoryJournal([{ v: 1, seq: 1, turn: 1, type: "turn_committed", data: { kind: "nope" } }]);
   await assert.rejects(createFxAgent(options(targetBackend, garbled)), invalid(/Invalid libfx journal/));
+  const oversized = createMemoryJournal(journal.events, { snapshot: new Uint8Array(4 * 1024 * 1024 + 1) });
+  await assert.rejects(
+    createFxAgent(options(targetBackend, oversized)),
+    (error) => /libfx journal snapshot is too large/.test(error.message) && error.code === "FX_JOURNAL_TOO_LARGE",
+  );
   const huge = createMemoryJournal([{ ...journal.events.at(-1), seq: 1, turn: 1, padding: "x".repeat(4 * 1024 * 1024) }]);
   await assert.rejects(
     createFxAgent(options(targetBackend, huge)),
@@ -461,16 +466,17 @@ test("a session taken over mid-turn fences the first agent, which stops at once"
   const laptopRequests = () => sessionHeaders.filter(([id]) => id === laptopSession).length;
 
   // The laptop learns of the takeover from its next append. Progress appends
-  // do not hold up model requests (B3), so a request it started while that
-  // append was in flight may still arrive; nothing starts once it knows.
+  // do not hold up model requests, so the request the tool's result
+  // starts while that append is in flight may still arrive, even after the
+  // turn has failed; nothing starts once the laptop knows.
+  const requestsBeforeRelease = laptopRequests();
   releaseTool();
   const fenced = (error) => error.code === "FX_JOURNAL_APPEND_FAILED" && error.cause instanceof FxFencedError && error.cause.code === "FX_FENCED";
   await assert.rejects(drained, fenced);
   await assert.rejects(turn.result, fenced);
-  const requestsWhenFenced = laptopRequests();
   await laptop.close();
   await new Promise((resolveWait) => setTimeout(resolveWait, 50));
-  assert.equal(laptopRequests(), requestsWhenFenced, "the laptop started no request once fenced");
+  assert.ok(laptopRequests() <= requestsBeforeRelease + 1, `the laptop started no request once fenced (${laptopRequests()} after ${requestsBeforeRelease})`);
   assert.equal(journal.events.length, eventsAfterTakeover, "the laptop wrote nothing after the fence");
   assert.equal(laptopRuns, 1);
   assertContiguous(journal.events);
