@@ -69,9 +69,9 @@ Set `FX_OTTY=0` to disable reporting for a run. This custom-agent integration pr
 
 ## cmux integration
 
-When you run `fx` inside [cmux](https://cmux.com), fx reports its state as an `fx` status pill in the workspace sidebar. The pill shows **Running** while fx works on a prompt, including after you answer a permission prompt or question, **Needs input** while a permission prompt or question waits for you, **Error** when a turn fails, and **Idle** when a turn finishes. A waiting prompt also posts a cmux notification. Reports include only the state and the kind of prompt, never your prompts or tool output, and fx removes the pill when it exits.
+Run `fx` inside [cmux](https://cmux.com) to show running, waiting for input, idle, and error states in the workspace sidebar automatically, with a notification when fx needs your input. Reports include only lifecycle state and the kind of prompt that is waiting, never prompts or tool output. Reporting is best-effort and does not block your conversation if cmux is unavailable.
 
-fx detects cmux from the `CMUX_SOCKET_PATH` and `CMUX_WORKSPACE_ID` variables that cmux sets in its terminals. Reporting is best-effort, so the session continues normally if cmux is unavailable. Set `FX_CMUX=0` to turn reporting off for a run.
+Set `FX_CMUX=0` to disable reporting for a run. This integration provides a sidebar status and notifications, not cmux session restore. cmux's notification settings still apply.
 
 ## Documentation
 
