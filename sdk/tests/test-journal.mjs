@@ -29,6 +29,21 @@ const toolResults = (prompt) => prompt
 const bulkySteps = 24;
 function framesFor(prompt) {
   const text = lastUserText(prompt);
+  // "keep using the tool" asks for a lookup until three results are in, so an
+  // agent that ignored a fence would keep calling it.
+  if (text === "keep using the tool") {
+    const done = toolResults(prompt).length;
+    if (done < 3) {
+      return [
+        { type: "tool-call", toolCallId: `call-keep-${done}`, toolName: "lookup", input: { key: "alpha" } },
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" }, usage },
+      ];
+    }
+    return [
+      { type: "text-delta", id: "answer", delta: "kept at it" },
+      { type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage },
+    ];
+  }
   if (text === "explain and use the tool") {
     if (toolResults(prompt).length === 0) {
       return [
@@ -451,7 +466,7 @@ test("a session taken over mid-turn fences the first agent, which stops at once"
   const slowLookup = { ...lookup, execute: async () => { laptopRuns += 1; toolStarted(); await released; return "value of alpha is beta"; } };
   sessionHeaders.length = 0;
   const laptop = await createFxAgent(options(sourceBackend, journal, { tools: [slowLookup] }));
-  const turn = laptop.prompt("use the tool");
+  const turn = laptop.prompt("keep using the tool");
   const drained = (async () => { for await (const _ of turn) {} })();
   await started;
   const [laptopSession] = sessionHeaders[0];

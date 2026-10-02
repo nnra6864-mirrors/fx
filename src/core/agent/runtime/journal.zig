@@ -20,7 +20,7 @@
 //! - `input_accepted`: a steer or follow-up the host handed in, before the
 //!   model sees it
 //! - `input_withdrawn`: a steer the host took back before it was placed, or
-//!   a follow-up whose turn ended before its first model request
+//!   a follow-up whose turn ended before its first progress
 //! - `session_config`: a hash of the host's instructions, tools and model,
 //!   when a turn starts under a hash the journal has not recorded
 //!
