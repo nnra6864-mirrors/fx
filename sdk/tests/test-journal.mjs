@@ -394,12 +394,18 @@ test("a journal that does not fold is refused", async () => {
   const agent = await createFxAgent(options(sourceBackend, journal));
   await run(agent, "one");
   await agent.close();
+  const invalid = (pattern) => (error) => pattern.test(error.message) && error.code === "FX_JOURNAL_INVALID";
   const duplicated = createMemoryJournal([...journal.events, journal.events.at(-1)]);
-  await assert.rejects(createFxAgent(options(targetBackend, duplicated)), /libfx journal events are out of order/);
+  await assert.rejects(createFxAgent(options(targetBackend, duplicated)), invalid(/libfx journal events are out of order/));
   const newer = createMemoryJournal([{ ...journal.events[0], v: 2 }]);
   await assert.rejects(createFxAgent(options(targetBackend, newer)), /libfx journal was written by a newer fx/);
   const garbled = createMemoryJournal([{ v: 1, seq: 1, turn: 1, type: "turn_committed", data: { kind: "nope" } }]);
-  await assert.rejects(createFxAgent(options(targetBackend, garbled)), /Invalid libfx journal/);
+  await assert.rejects(createFxAgent(options(targetBackend, garbled)), invalid(/Invalid libfx journal/));
+  const huge = createMemoryJournal([{ ...journal.events.at(-1), seq: 1, turn: 1, padding: "x".repeat(4 * 1024 * 1024) }]);
+  await assert.rejects(
+    createFxAgent(options(targetBackend, huge)),
+    (error) => /libfx journal is too large/.test(error.message) && error.code === "FX_JOURNAL_TOO_LARGE",
+  );
 });
 
 test("a failed append fails the turn and stops the agent", async () => {
@@ -678,6 +684,36 @@ test("a follow-up the journal holds runs when the session resumes", async () => 
   const again = await createFxAgent(options(sourceBackend, createMemoryJournal(crashed.events)));
   assert.equal(again.resume(), null, "nothing is left after the follow-up ran");
   await again.close();
+});
+
+test("a held follow-up waits for resume() without holding up the agent's own", async () => {
+  if (sourceBackend !== "native") return; // the web core stores a follow-up when its turn starts
+  const journal = createMemoryJournal();
+  const { agent, turn, drained, releaseTool } = await steeredTurn(journal);
+  const next = agent.followUp("then summarize");
+  await next.accepted;
+  releaseTool();
+  await drained;
+  await turn.result;
+  const firstCommit = journal.events.findIndex((event) => event.type === "turn_committed");
+  const survived = journal.events.slice(0, firstCommit + 1);
+  await agent.close();
+  await next.catch(() => {});
+
+  const reopened = await createFxAgent(options(targetBackend, createMemoryJournal(survived)));
+  requests.length = 0;
+  const late = sleepMs(10_000).then(() => { throw new Error("the agent's own follow-up never started"); });
+  const own = await Promise.race([reopened.followUp("my own follow-up"), late]);
+  for await (const _ of own) {}
+  assert.equal((await own.result).stopReason, "end_turn");
+  assert.equal(lastUserText(requests.at(-1)), "my own follow-up");
+  const held = reopened.resume();
+  assert.ok(held, "the held follow-up still waits for resume()");
+  for await (const _ of held) {}
+  await held.result;
+  assert.equal(lastUserText(requests.at(-1)), "then summarize");
+  assert.equal(reopened.resume(), null);
+  await reopened.close();
 });
 
 test("a follow-up on an idle agent runs at once", async () => {
@@ -985,6 +1021,71 @@ test("a turn that fails ends in the journal and is not resumed", async () => {
     assert.equal(next.resume(), null, "a failed turn is not a crashed one");
     assert.equal((await run(next, "hello")).text, "answer to hello");
     await next.close();
+  }
+});
+
+test("a follow-up cancelled as its turn starts never runs again, and snapshots go on", async () => {
+  for (const backend of [sourceBackend, targetBackend]) {
+    const journal = createMemoryJournal([], { snapshots: true });
+    const tools = [lookup, bulky];
+    const agent = await createFxAgent(options(backend, journal, { tools }));
+    await run(agent, "one");
+    // On an idle agent the follow-up starts at once; the cancel lands before
+    // its first model request.
+    const queued = agent.followUp("cancel me");
+    const cancelled = await queued;
+    cancelled.cancel();
+    for await (const _ of cancelled) {}
+    await cancelled.result;
+    // More than 1 MiB in fewer than 100 events earns a snapshot by its bytes.
+    assert.equal((await run(agent, "gather everything")).text, "gathered");
+    for (let waited = 0; !journal.latestSnapshot && waited < 3000; waited += 20) await sleepMs(20);
+    await agent.close();
+    assert.ok(journal.latestSnapshot, `a snapshot follows the cancelled follow-up on ${backend}`);
+    assert.ok(journal.latestSnapshot.atSeq < 100, `snapshot at ${journal.latestSnapshot.atSeq}`);
+
+    const reopened = await createFxAgent(options(backend, createMemoryJournal(journal.events, { snapshot: journal.latestSnapshot.bytes }), { tools }));
+    assert.equal(reopened.resume(), null, "the cancelled follow-up is not run again");
+    await reopened.close();
+  }
+});
+
+test("a cancel during a slow journal's barrier ends the turn as the agent does", async () => {
+  for (const backend of [sourceBackend, targetBackend]) {
+    const stored = createMemoryJournal();
+    let previous = Promise.resolve();
+    // Each append lands 300 ms after the one before it.
+    const journal = {
+      load: () => stored.load(),
+      append(batch) {
+        previous = previous.then(() => sleepMs(300)).then(() => stored.append(batch));
+        return previous;
+      },
+    };
+    const agent = await createFxAgent(options(backend, journal));
+    const turn = agent.prompt("slow start");
+    const drained = (async () => { for await (const _ of turn) {} })();
+    await sleepMs(100);
+    turn.cancel();
+    await drained;
+    assert.equal((await turn.result).stopReason, "cancelled");
+    requests.length = 0;
+    await run(agent, "next");
+    const live = userTexts(requests.at(-1)).includes("slow start");
+    await agent.close();
+    const committed = stored.events.some((event) => event.type === "turn_committed" && event.data.user?.text === "slow start");
+    const types = `${backend}: ${stored.events.map((event) => event.type).join(",")}`;
+    assert.equal(committed, live, `the journal keeps the cancelled turn exactly when the agent does; ${types}`);
+    // The native core waits for that barrier, so the cancel lands there; the
+    // turn ends as interrupted, as a cancel anywhere else in a step does.
+    if (backend === "native") assert.ok(committed, types);
+
+    const reopened = await createFxAgent(options(backend, createMemoryJournal(stored.events)));
+    assert.equal(reopened.resume(), null, "a cancelled turn is not resumed");
+    requests.length = 0;
+    await run(reopened, "again");
+    await reopened.close();
+    assert.equal(userTexts(requests.at(-1)).includes("slow start"), live, "the restored history matches the live one");
   }
 });
 

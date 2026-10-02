@@ -177,6 +177,14 @@ export class FxJournalVersionError extends Error {
   }
 }
 
+// A journal this libfx cannot open: more than one load holds
+// (FX_JOURNAL_TOO_LARGE), or events that do not fold (FX_JOURNAL_INVALID).
+function journalLoadError(message, cause) {
+  const error = new Error(message, cause === undefined ? undefined : { cause });
+  error.code = /too large|more than \d+ turns/.test(message) ? "FX_JOURNAL_TOO_LARGE" : "FX_JOURNAL_INVALID";
+  return error;
+}
+
 /**
  * The turn the journal left open started under other instructions, tools or
  * model than this agent has, so `resume()` will not continue it. `prompt()`
@@ -307,7 +315,7 @@ function journalLoaded(loaded) {
   }
   const snapshot = loaded.snapshot ?? null;
   if (snapshot !== null && !(snapshot instanceof Uint8Array)) throw new TypeError("journal.load() snapshot must be a Uint8Array");
-  if (snapshot !== null && snapshot.byteLength > maxSnapshotBytes) throw new Error("libfx journal snapshot is too large");
+  if (snapshot !== null && snapshot.byteLength > maxSnapshotBytes) throw journalLoadError("libfx journal snapshot is too large");
   const sessionId = loaded.sessionId ?? null;
   if (sessionId !== null && !validSessionId(sessionId)) {
     throw new TypeError(`journal.load() sessionId must be ${sessionIdRule}`);
@@ -1998,12 +2006,14 @@ export async function createFxAgent(options = {}) {
   let openTurnConfigMismatch = false;
   // Follow-ups waiting for the turn ahead of them, oldest first.
   const followUps = [];
-  // A follow-up a caller queued starts when the turn ahead of it ends. One the
-  // journal held has no caller, so it waits for `resume()` to start it.
+  // A follow-up this agent queued starts when the turn ahead of it ends, ahead
+  // of any the journal held: those have no caller, so each waits for
+  // `resume()` to start it, oldest first.
   const runNextFollowUp = (resuming = false) => {
-    if (activeTurn || closing || journalFailure || followUps.length === 0) return;
-    if (!resuming && !followUps[0].resolveTurn) return;
-    const next = followUps.shift();
+    if (activeTurn || closing || journalFailure) return;
+    const index = followUps.findIndex((entry) => (entry.held === true) === resuming);
+    if (index < 0) return;
+    const [next] = followUps.splice(index, 1);
     let turn;
     try {
       turn = normalizeTurn(startTurn(next.text, { [followUpInput]: { id: next.id, accepted: next.accepted } }));
@@ -2040,6 +2050,7 @@ export async function createFxAgent(options = {}) {
   let receivedSeq = 0;
   let snapshotAtSeq = 0;
   let bytesSinceSnapshot = 0;
+  let snapshotSkipped = null;
   let snapshotting = null;
   // Called as a turn's prompt response arrives, before the host can start
   // another, so the core is between turns and the request reaches it first.
@@ -2055,6 +2066,12 @@ export async function createFxAgent(options = {}) {
     let stored = false;
     snapshotting = (async () => {
       const response = await request("libfx/snapshot", { sessionId });
+      // The session is past a snapshot's bounds and gets none from now on.
+      if (typeof response?.skipped === "string") {
+        if (response.skipped !== snapshotSkipped) emit("journal.snapshot_skipped", { reason: response.skipped });
+        snapshotSkipped = response.skipped;
+        return;
+      }
       const id = response?.snapshotAttachment;
       const atSeq = response?.atSeq;
       if (!Number.isSafeInteger(id) || id <= 0 || !Number.isSafeInteger(atSeq)) return;
@@ -2138,6 +2155,15 @@ export async function createFxAgent(options = {}) {
       activeTurn?.cancel();
     }).finally(() => journalPending.delete(settled));
     journalPending.add(settled);
+  }
+  // The journal's own work, such as a heartbeat, ends with the agent: once,
+  // after the last append settles.
+  let journalClosed = null;
+  function closeJournal() {
+    journalClosed ??= journalSettled().catch(() => {}).then(() => {
+      if (typeof journal.close === "function") return journal.close();
+    });
+    return journalClosed;
   }
   async function journalSettled() {
     for (;;) {
@@ -2345,6 +2371,8 @@ export async function createFxAgent(options = {}) {
   };
   runtime.exited.then((code) => {
     closing = true;
+    // An agent whose core exited writes nothing more.
+    if (journal) void closeJournal().catch(() => {});
     const error = runtime.error ?? new Error(`fx-core exited with code ${code} before completing the ACP request`);
     coreExitError = error;
     activeTurn?.failImagePrep(error);
@@ -2447,7 +2475,7 @@ export async function createFxAgent(options = {}) {
       if (loaded.snapshot) payloads.push(["snapshotAttachment", loaded.snapshot]);
       if (events.length > 0) {
         const bytes = encoder.encode(JSON.stringify(withoutSupersededProgress(events)));
-        if (bytes.byteLength > maxJournalBytes) throw new Error("libfx journal is too large");
+        if (bytes.byteLength > maxJournalBytes) throw journalLoadError("libfx journal is too large");
         payloads.push(["journalAttachment", bytes]);
         bytesSinceSnapshot = bytes.byteLength;
       }
@@ -2456,14 +2484,18 @@ export async function createFxAgent(options = {}) {
         payloads.forEach(([key], index) => { params[key] = ids[index]; });
       }
       const opened = await request("libfx/journal_open", params).catch((error) => {
-        if (/newer fx/.test(error?.message ?? "")) throw new FxJournalVersionError(error.message);
+        const message = error?.message ?? "";
+        if (/newer fx/.test(message)) throw new FxJournalVersionError(message);
+        if (/^(Invalid libfx journal$|libfx journal (is too large|holds more than|events are out of order))/.test(message)) {
+          throw journalLoadError(message, error);
+        }
         throw error;
       });
       resumable = opened?.resumable === true;
       openTurnConfigMismatch = resumable && opened?.configMatches === false;
-      // Follow-ups the journal holds run after any resume, as accepted.
+      // Follow-ups the journal holds, as accepted; each waits for `resume()`.
       for (const held of Array.isArray(opened?.followUps) ? opened.followUps : []) {
-        followUps.push({ id: held.id, text: held.text, accepted: true });
+        followUps.push({ id: held.id, text: held.text, accepted: true, held: true });
       }
       emit("journal.open", { events: events.length, turns: opened?.turns, resumable, snapshot: loaded.snapshot !== null });
     }
@@ -2504,7 +2536,7 @@ export async function createFxAgent(options = {}) {
         return normalizeTurn(startTurn(null, { ...promptOptions, [resumeTurn]: true }));
       }
       // With no open turn, the follow-ups the journal held are the work left.
-      const next = followUps[0];
+      const next = followUps.find((entry) => entry.held);
       if (!next) return null;
       let started = null;
       const resolveTurn = next.resolveTurn;
@@ -2573,7 +2605,11 @@ export async function createFxAgent(options = {}) {
       return run;
     },
     async close() {
-      if (closing) { await runtime.exited; return; }
+      if (closing) {
+        await runtime.exited;
+        if (journal) await closeJournal();
+        return;
+      }
       const turn = activeTurn;
       turn?.cancel();
       if (turn) await turn.result.catch(() => {});
@@ -2591,7 +2627,7 @@ export async function createFxAgent(options = {}) {
         } catch {
           if (!journalFailureReported) failure = reportJournalFailure();
         }
-        if (typeof journal.close === "function") await journal.close();
+        await closeJournal();
         if (failure) throw failure;
       }
     },

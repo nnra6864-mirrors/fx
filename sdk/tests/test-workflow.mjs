@@ -371,6 +371,22 @@ test("the queue route acknowledges a turn it cannot resume under another config"
   assert.equal(deliveries.at(-1).status, 200, "no wake followed the answer");
 });
 
+test("the queue route acknowledges a session no libfx can open", async () => {
+  const world = createWorld({ dataDir: mkdtempSync(join(tmpdir(), "libfx-world-")), recoverActiveRuns: false });
+  await world.start?.();
+  const session = workflow({ world });
+  await session.journal.load();
+  // An open turn whose progress does not fold.
+  await session.journal.append([{ v: 1, seq: 1, turn: 1, type: "turn_progress", data: { not: "a checkpoint" } }]);
+  session.journal.close();
+  const route = workflow({ world, wakeAfterSeconds: 1, createAgent: defineAgent(gateway.port, () => "sent") });
+  await new Promise((resolveWait) => setTimeout(resolveWait, 1200));
+  const response = await route.handler(new Request("http://localhost/queue", { method: "POST", body: JSON.stringify({ runId: session.sessionId }) }));
+  await closeWorld(world);
+  assert.equal(response.status, 200);
+  assert.match(await response.text(), /was not resumed: Invalid libfx journal/);
+});
+
 test("a World event id without a slot stops the write", async () => {
   const world = {
     events: {

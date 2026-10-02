@@ -255,7 +255,7 @@ for (const history of histories) {
       const row = await runTurn(handle, "no-tool", index, null);
       lastTurnJournalBytes = row.journal_bytes;
     }
-    // G6: one tool turn after `history` turns; turns count from 1.
+    // One tool turn after `history` turns; turns count from 1.
     await runTurn(handle, "one-safe", history, null);
     for (let index = 0; index < restoreSamples; index += 1) {
       const startedAt = performance.now();
@@ -269,7 +269,7 @@ for (const history of histories) {
   const journalRestoreMs = [];
   const snapshotRestoreMs = [];
   const createMs = [];
-  // G5: the newest snapshot that leaves at least 100 events after it.
+  // The newest snapshot that leaves at least 100 events after it.
   const chosen = snapshots.findLast((snapshot) => journal.stored.length - snapshot.atSeq >= 100) ?? null;
   const tail = chosen ? journal.stored.filter((event) => event.seq > chosen.atSeq) : [];
   for (let index = 0; index < restoreSamples; index += 1) {

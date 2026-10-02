@@ -46,9 +46,12 @@ pub const Journal = struct {
     pending_follow_ups: []journal.PendingInput = &.{},
     /// Accepted follow-ups no turn has placed yet. A snapshot waits for none.
     follow_ups_waiting: usize = 0,
-    /// Whether `placed_next` holds the follow-up the running turn runs; it
-    /// stops waiting only when a progress places it.
-    placing_follow_up: bool = false,
+    /// The follow-up the running turn runs, until a progress places it.
+    /// Owned by the session's allocator.
+    placing_follow_up: ?[]u8 = null,
+    /// The progress whose barrier a cancel interrupted: the turn commits
+    /// from it as interrupted. Owned by the session's allocator.
+    cancelled_progress: ?session_codec.RecoveryCheckpoint = null,
     /// The host's config hash, and the last one the journal recorded. Owned
     /// by the session's allocator.
     host_config: ?[]u8 = null,
@@ -58,6 +61,9 @@ pub const Journal = struct {
         self.dropPendingResume(alloc);
         self.clearPlaced(alloc);
         self.placed_next.deinit(alloc);
+        if (self.placing_follow_up) |id| alloc.free(id);
+        if (self.cancelled_progress) |*checkpoint| checkpoint.deinit(alloc);
+        self.cancelled_progress = null;
         journal.freePendingInputs(alloc, self.takeFollowUps());
         if (self.host_config) |hash| alloc.free(hash);
         if (self.recorded_config) |hash| alloc.free(hash);
@@ -116,17 +122,32 @@ pub const Journal = struct {
     fn clearPlaced(self: *Journal, alloc: Allocator) void {
         for (self.placed_next.items) |id| alloc.free(id);
         self.placed_next.clearRetainingCapacity();
-        self.placing_follow_up = false;
     }
 
-    /// Drops inputs taken for a model request that never went out because
-    /// their turn ended first. The model never saw them, the journal already
-    /// dropped the steers with their turn, and a follow-up among them stays
-    /// waiting for a later turn.
-    pub fn dropUnplaced(self: *Journal, alloc: Allocator) void {
+    /// Settles inputs taken for a model request that never went out because
+    /// their turn ended first. The model never saw them: the journal dropped
+    /// the steers with their turn, and the follow-up the turn ran is
+    /// withdrawn, since that turn ran and ended. `session_alloc` owns the
+    /// placed ids.
+    pub fn endUnplaced(self: *Journal, alloc: Allocator, session_alloc: Allocator, session_id: []const u8) !void {
+        if (self.placing_follow_up) |id| {
+            try self.append(alloc, session_id, .{ .input_withdrawn = id });
+            debug_trace.logf("session", "event=libfx_journal_follow_up_withdrawn reason=turn_ended_before_request", .{});
+            self.follow_ups_waiting -|= 1;
+            session_alloc.free(id);
+            self.placing_follow_up = null;
+        }
         if (self.placed_next.items.len == 0) return;
         debug_trace.logf("session", "event=libfx_journal_inputs_dropped count={d} reason=turn_ended_before_request", .{self.placed_next.items.len});
-        self.clearPlaced(alloc);
+        self.clearPlaced(session_alloc);
+    }
+
+    /// Hands the progress a cancelled barrier interrupted to the caller, who
+    /// owns it.
+    pub fn takeCancelledProgress(self: *Journal) ?session_codec.RecoveryCheckpoint {
+        const checkpoint = self.cancelled_progress;
+        self.cancelled_progress = null;
+        return checkpoint;
     }
 
     /// Sends the open turn so far and the model its next request goes to,
@@ -145,7 +166,11 @@ pub const Journal = struct {
             .placed = self.placed_next.items,
             .model = model,
         } });
-        if (self.placing_follow_up) self.follow_ups_waiting -|= 1;
+        if (self.placing_follow_up) |id| {
+            self.follow_ups_waiting -|= 1;
+            session_alloc.free(id);
+            self.placing_follow_up = null;
+        }
         self.clearPlaced(session_alloc);
     }
 
@@ -175,8 +200,11 @@ pub const Journal = struct {
 
     /// The follow-up a starting turn runs: its first progress places it.
     pub fn placeFollowUp(self: *Journal, alloc: Allocator, id: []const u8) Allocator.Error!void {
+        const owned = try alloc.dupe(u8, id);
+        errdefer alloc.free(owned);
         try self.notePlaced(alloc, &.{id});
-        self.placing_follow_up = true;
+        if (self.placing_follow_up) |old| alloc.free(old);
+        self.placing_follow_up = owned;
     }
 
     /// Whether the session is at a point a snapshot can stand for: no turn
@@ -378,29 +406,43 @@ test "inputs taken for a request that never went out are not placed by the next 
 
     try session.notePlaced(alloc, &.{"steer-1"});
     // Its turn ended before the next progress; the next turn starts.
-    session.dropUnplaced(alloc);
+    try session.endUnplaced(alloc, alloc, "session");
     try session.appendProgress(alloc, alloc, "session", progress, "fake/model");
     try std.testing.expect(std.mem.find(u8, capture.frames.items, "steer-1") == null);
 }
 
-test "a follow-up waits until a progress places it, even through a turn that ended first" {
+test "a follow-up stops waiting when a progress places it" {
     const alloc = std.testing.allocator;
     var capture: TestCapture = .{};
     defer capture.frames.deinit(alloc);
     var writer = jsonrpc.Writer.initCallback(&capture, TestCapture.write);
-    var session: Journal = .{ .writer = &writer, .follow_ups_waiting = 1 };
+    var session: Journal = .{ .writer = &writer, .follow_ups_waiting = 1, .cursor = .{ .next_seq = 3, .turn = 2 } };
     defer session.deinit(alloc);
     var progress = try testProgress(alloc);
     defer progress.deinit(alloc);
 
     try session.placeFollowUp(alloc, "follow-1");
     try std.testing.expectEqual(@as(usize, 1), session.follow_ups_waiting);
-    session.dropUnplaced(alloc);
-    try std.testing.expectEqual(@as(usize, 1), session.follow_ups_waiting);
-    try std.testing.expect(!session.quiet());
-
-    try session.placeFollowUp(alloc, "follow-1");
     try session.appendProgress(alloc, alloc, "session", progress, "fake/model");
     try std.testing.expectEqual(@as(usize, 0), session.follow_ups_waiting);
-    try std.testing.expect(std.mem.find(u8, capture.frames.items, "follow-1") != null);
+    try std.testing.expect(std.mem.find(u8, capture.frames.items, "\"inputs\":[\"follow-1\"]") != null);
+    // Nothing is left to settle when the turn ends.
+    try session.endUnplaced(alloc, alloc, "session");
+    try std.testing.expect(std.mem.find(u8, capture.frames.items, "input_withdrawn") == null);
+}
+
+test "a follow-up whose turn ended before its request is withdrawn, so it never runs again" {
+    const alloc = std.testing.allocator;
+    var capture: TestCapture = .{};
+    defer capture.frames.deinit(alloc);
+    var writer = jsonrpc.Writer.initCallback(&capture, TestCapture.write);
+    var session: Journal = .{ .writer = &writer, .follow_ups_waiting = 1, .cursor = .{ .next_seq = 3, .turn = 2 } };
+    defer session.deinit(alloc);
+
+    try session.placeFollowUp(alloc, "follow-1");
+    try std.testing.expect(!session.quiet());
+    try session.endUnplaced(alloc, alloc, "session");
+    try std.testing.expectEqual(@as(usize, 0), session.follow_ups_waiting);
+    try std.testing.expect(session.quiet());
+    try std.testing.expect(std.mem.find(u8, capture.frames.items, "\"type\":\"input_withdrawn\",\"data\":{\"id\":\"follow-1\"}") != null);
 }

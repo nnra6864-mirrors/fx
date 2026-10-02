@@ -298,9 +298,14 @@ still queued when the turn ends rejects.
 turn ends, or at once when none is running, instead of failing with `a prompt
 is already in progress`. It returns a promise for that turn; the promise
 carries the follow-up's `id` and `accepted`, which resolves `{ id }` once a
-journal holds it. With a journal, a follow-up survives a crash: after a
-restore, `agent.resume()` continues an open turn and the held follow-ups run
-after it, or, with no open turn, starts the first one. `close()` rejects
+journal holds it. With a journal, a follow-up survives a crash. After a
+restore, the follow-ups the journal held have no caller, so each waits for
+`agent.resume()`: every call continues the open turn first, then starts the
+next held follow-up, and returns `null` once none is left. Follow-ups this
+agent queues run on their own and do not wait behind held ones. libfx takes no
+snapshot while a held follow-up waits, so call `resume()` until it returns
+`null` whenever a session opens. A follow-up whose turn ends before its first
+model request is withdrawn, so it never runs again. `close()` rejects
 follow-ups that have not started; a journal still holds them.
 
 Cancelling a steered turn drops any guidance that has not reached a safe
@@ -378,9 +383,11 @@ every stored event, oldest first, or to `{ snapshot, events }` as described
 below. Each `turn_progress` event repeats its turn so far, so a turn with many
 large tool results stores more than its final entry, and libfx reads only the
 newest progress of the open turn. The events it reads must fit in 4 MiB of
-JSON. libfx refuses a journal whose
-events repeat, skip a `seq`, or do not parse, and `createFxAgent()` rejects
-with the reason. For a journal or snapshot written by a newer libfx, it
+JSON, and the history at most 1,024 turns; otherwise `createFxAgent()`
+rejects with an error whose `code` is `FX_JOURNAL_TOO_LARGE`. libfx refuses a
+journal whose events repeat, skip a `seq`, or do not parse, and
+`createFxAgent()` rejects with the reason and the `code` `FX_JOURNAL_INVALID`.
+For a journal or snapshot written by a newer libfx, it
 rejects with an `FxJournalVersionError`, whose `code` is `FX_JOURNAL_VERSION`.
 Each libfx release resumes the journals, snapshots, and checkpoints that the
 release before it saved, so upgrade the processes that read a session before
@@ -391,9 +398,10 @@ it. Give the journal a `snapshot(bytes, atSeq)` method and libfx calls it about
 every 100 events or 1 MiB of events, between turns, with opaque bytes that
 stand for every event up to and including `atSeq`. libfx calls it only after
 those events are stored. A snapshot holds the session's whole history, within
-a checkpoint's bounds of 4 MiB and 1,024 turns. libfx skips a snapshot that
-would not fit, and a session that outgrows those bounds cannot be restored
-from its journal. Keep the latest snapshot and return it from `load()` as
+a checkpoint's bounds of 4 MiB and 1,024 turns. A session that outgrows them
+gets no more snapshots and cannot be restored from its journal; libfx emits a
+`journal.snapshot_skipped` event with the `reason` (`too_large`,
+`too_many_turns`, or `invalid`) when that happens. Keep the latest snapshot and return it from `load()` as
 `{ snapshot, events }` with only the events after `atSeq`; the events it covers
 can be deleted. Snapshots only move forward: store one only if its `atSeq` is
 greater than the stored snapshot's. A snapshot can arrive late, even from an
@@ -407,7 +415,8 @@ drops the events it covers; `createMemoryJournal(events, { snapshot })` starts
 from a stored one.
 
 Give the journal a `close()` method to release what it holds, such as a timer
-or a connection. `agent.close()` calls it once, after the last append settles.
+or a connection. libfx calls it once, after the last append settles, when
+`agent.close()` is called or the agent's core exits.
 
 AI Gateway keys session affinity and prompt caching to the session's id. libfx
 picks a new id for each agent unless you pass `sessionId` or `load()` resolves
@@ -422,12 +431,15 @@ running come back answered as possibly run, so a `replay: "never"` call does
 not run again unless the model decides to call it. A turn that fails or is
 cancelled ends in the journal as it does in the agent, so only a stopped
 process leaves one to resume. `resume()` returns `null` when the journal holds
-no open turn, so a host can call it every time it opens a session:
+no open turn and no held follow-up, so a host can call it until it does every
+time it opens a session:
 
 ```js
 const agent = await createFxAgent({ apiKey, model, journal, tools });
-const resumed = agent.resume();
-if (resumed) await resumed.result;
+for (let turn = agent.resume(); turn; turn = agent.resume()) {
+  for await (const event of turn) console.log(event);
+  await turn.result;
+}
 ```
 
 Calling `prompt()` instead ends the open turn as interrupted and starts a new
@@ -492,11 +504,15 @@ session: a closed turn needs nothing, a turn written to within
 is opened with `createAgent` and resumed with `agent.resume()`, which the
 route calls until it returns `null` so that follow-ups the session held run
 too. Define `createAgent` at module scope so the route builds the same agent
-as the app. When `resume()` throws an `FxConfigMismatchError` because the
-deployment changed, the route answers the wake with status 200 and the reason,
-so the queue does not deliver it again; the session's next `prompt()` ends the
-turn. The heartbeat stops when the agent closes, so a turn handed off with
-`turn.cancel({ reason: "handoff" })` goes silent and the route resumes it.
+as the app. When the session cannot open or resume however often it is asked,
+because `resume()` throws an `FxConfigMismatchError` after a deploy or the
+journal fails with `FX_JOURNAL_TOO_LARGE` or `FX_JOURNAL_INVALID`, the route
+answers the wake with status 200 and the reason, so the queue does not deliver
+it again; after a config change, the session's next `prompt()` ends the turn.
+The World journal keeps no snapshots, so a session opens only while its
+events fit in one load. The heartbeat stops when the agent closes, so a turn
+handed off with `turn.cancel({ reason: "handoff" })` goes silent and the route
+resumes it.
 
 A session's run id is also its session id for AI Gateway, so affinity and
 prompt caching survive the move to another process. Only one process writes to

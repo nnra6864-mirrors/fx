@@ -1853,6 +1853,10 @@ fn handleKernelJournalOpen(
             .message = "libfx journal events are out of order",
         }),
         error.JournalTooLarge => return state.writer.writeError(alloc, msg.id, too_large),
+        error.JournalTooManyTurns => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = std.fmt.comptimePrint("libfx journal holds more than {d} turns", .{journal_events.max_history_turns}),
+        }),
         error.InvalidJournal => return state.writer.writeError(alloc, msg.id, invalid),
     };
     active.journal = journal;
@@ -1905,22 +1909,19 @@ fn handleKernelSnapshot(
     defer active.session_write_mutex.unlock(io_mod.getIo());
     const journal = if (active.journal) |*value| value else return state.writer.writeResponse(alloc, msg.id, none);
     if (!journal.quiet()) return state.writer.writeResponse(alloc, msg.id, none);
+    // A session past a snapshot's bounds gets none now or later; the host
+    // learns why.
     const checkpoint = active.session_rt.agent.checkpoint(alloc) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            debug_trace.logf("session", "event=libfx_snapshot_skipped reason={s}", .{@errorName(err)});
-            return state.writer.writeResponse(alloc, msg.id, none);
-        },
+        error.CheckpointTooLarge => return writeSnapshotSkipped(state, alloc, msg.id, if (active.session_rt.agent.history.items.len > journal_events.max_history_turns) .too_many_turns else .too_large),
+        else => return writeSnapshotSkipped(state, alloc, msg.id, .invalid),
     };
     defer alloc.free(checkpoint);
     const at_seq = journal.cursor.next_seq - 1;
     const bytes = try journal_events.encodeSnapshot(alloc, at_seq, journal.cursor.turn, journal.recorded_config, checkpoint);
     defer alloc.free(bytes);
     // A snapshot travels back as one host attachment.
-    if (bytes.len > journal_events.max_snapshot_bytes) {
-        debug_trace.logf("session", "event=libfx_snapshot_skipped reason=too_large bytes={d}", .{bytes.len});
-        return state.writer.writeResponse(alloc, msg.id, none);
-    }
+    if (bytes.len > journal_events.max_snapshot_bytes) return writeSnapshotSkipped(state, alloc, msg.id, .too_large);
     const attachment = store.put(bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.AttachmentStoreFull => return state.writer.writeResponse(alloc, msg.id, none),
@@ -1928,6 +1929,16 @@ fn handleKernelSnapshot(
     const written = try std.fmt.allocPrint(alloc, "{{\"snapshotAttachment\":{d},\"atSeq\":{d}}}", .{ attachment, at_seq });
     defer alloc.free(written);
     try state.writer.writeResponse(alloc, msg.id, written);
+}
+
+/// Why a session gets no snapshot now or later.
+const SnapshotSkip = enum { too_large, too_many_turns, invalid };
+
+fn writeSnapshotSkipped(state: *ServerState, alloc: Allocator, id: ?jsonrpc.RequestId, reason: SnapshotSkip) !void {
+    debug_trace.logf("session", "event=libfx_snapshot_skipped reason={s}", .{@tagName(reason)});
+    const body = try std.fmt.allocPrint(alloc, "{{\"snapshotAttachment\":null,\"skipped\":\"{s}\"}}", .{@tagName(reason)});
+    defer alloc.free(body);
+    try state.writer.writeResponse(alloc, id, body);
 }
 
 /// Records a follow-up the host queued behind the running turn, so a journal

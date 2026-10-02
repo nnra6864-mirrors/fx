@@ -866,7 +866,7 @@ pub fn handlePrompt(
     if (session.journal) |*journal| {
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
         defer session.session_write_mutex.unlock(io_mod.getIo());
-        journal.dropUnplaced(state.alloc);
+        try journal.endUnplaced(alloc, state.alloc, session.session_id);
     }
     if (prompt_input.continue_recovery and session.journal != null) {
         // A journaled libfx session resumes the turn its journal left open.
@@ -1062,17 +1062,19 @@ pub fn handlePrompt(
         if (err == error.NonInteractivePermissionRequired) {
             ctx.stop_reason = .refused;
         } else if (err == error.Cancelled and session.cancel_flag.load(.seq_cst)) {
-            // A cancel that arrived while a journal barrier was pending.
+            // A cancel that arrived while a journal barrier was pending ends
+            // the turn as interrupted, as a cancel anywhere else does.
             ctx.stop_reason = .cancelled;
+            try commitCancelledJournalTurn(alloc, state.alloc, session, &prompt_input);
         } else {
             // The turn's own failure is the one to report.
-            closeOpenJournalTurn(alloc, session) catch |close_err| {
-                debug_trace.logf("session", "event=libfx_journal_turn_close_failed err={s} turn_err={s}", .{ @errorName(close_err), @errorName(err) });
+            endJournalTurn(alloc, state.alloc, session) catch |end_err| {
+                debug_trace.logf("session", "event=libfx_journal_turn_end_failed err={s} turn_err={s}", .{ @errorName(end_err), @errorName(err) });
             };
             return promptExecutionFailure(err);
         }
     };
-    try closeOpenJournalTurn(alloc, session);
+    try endJournalTurn(alloc, state.alloc, session);
     prompt_input.retainImageSnapshots();
     completeAcpTitleTask(state, session, alloc);
     try sessions.sendActiveSessionInfoUpdate(state, alloc);
@@ -2599,16 +2601,36 @@ fn flushJournal(state: *server.ServerState, alloc: Allocator, session_id: []cons
     if (response.error_json != null or response.result_json == null) return error.JournalFlushFailed;
 }
 
-/// A journaled turn that ended without a history entry, because it failed or
-/// a barrier was cancelled, is closed in the journal as it is in the session:
-/// resuming is for turns a stopped process left open.
-fn closeOpenJournalTurn(alloc: Allocator, session: *server.ActiveSessionState) !void {
+/// Ends a journaled turn in the journal as it ended in the session. One that
+/// failed left no history entry, so its progress is cleared: resuming is for
+/// turns a stopped process left open. Inputs it took and never placed are
+/// settled. `session_alloc` owns the journal's state.
+fn endJournalTurn(alloc: Allocator, session_alloc: Allocator, session: *server.ActiveSessionState) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
     const journal = if (session.journal) |*value| value else return;
-    if (!journal.progress_open) return;
-    debug_trace.logf("session", "event=libfx_journal_turn_closed reason=ended_without_commit", .{});
-    try journal.clearProgress(alloc, session.session_id);
+    if (journal.progress_open) {
+        debug_trace.logf("session", "event=libfx_journal_turn_closed reason=ended_without_commit", .{});
+        try journal.clearProgress(alloc, session.session_id);
+    }
+    try journal.endUnplaced(alloc, session_alloc, session.session_id);
+    if (journal.takeCancelledProgress()) |checkpoint| {
+        var unused = checkpoint;
+        unused.deinit(session_alloc);
+    }
+}
+
+/// Commits the turn whose barrier a cancel interrupted as interrupted, from
+/// the progress that barrier held, to the session and its journal.
+fn commitCancelledJournalTurn(alloc: Allocator, session_alloc: Allocator, session: *server.ActiveSessionState, prompt_input: *ParsedPromptInput) !void {
+    var cancelled = cancelled: {
+        session.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer session.session_write_mutex.unlock(io_mod.getIo());
+        const journal = if (session.journal) |*value| value else return;
+        break :cancelled journal.takeCancelledProgress() orelse return;
+    };
+    defer cancelled.deinit(session_alloc);
+    try persistAcpHistoryTurn(alloc, session, cancelled.interruptedTurn(), prompt_input);
 }
 
 fn sessionChildCapability(session: *server.ActiveSessionState) ?*session_child_store.SessionChildCapability {
@@ -2804,7 +2826,21 @@ fn setJournalProgress(raw_ctx: *anyopaque, checkpoint: session_codec.RecoveryChe
         journal.barrier_next_progress = false;
         break :barrier barrier;
     };
-    if (barrier) try flushJournal(ctx.state, ctx.alloc, session.session_id);
+    if (barrier) flushJournal(ctx.state, ctx.alloc, session.session_id) catch |err| {
+        // The turn commits from this progress as interrupted.
+        if (err == error.Cancelled) try keepCancelledProgress(ctx.state.alloc, session, checkpoint);
+        return err;
+    };
+}
+
+fn keepCancelledProgress(session_alloc: Allocator, session: *server.ActiveSessionState, checkpoint: session_codec.RecoveryCheckpoint) !void {
+    var owned = try checkpoint.dupe(session_alloc);
+    errdefer owned.deinit(session_alloc);
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const journal = if (session.journal) |*value| value else return error.SessionPersistenceUnavailable;
+    if (journal.cancelled_progress) |*old| old.deinit(session_alloc);
+    journal.cancelled_progress = owned;
 }
 
 fn clearJournalProgress(raw_ctx: *anyopaque) !void {

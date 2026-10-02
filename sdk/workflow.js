@@ -22,6 +22,9 @@ const eventIdPattern = /^[a-z]+_(\d{26})$/;
 
 export { FxFencedError };
 
+// Load failures a later delivery of the same wake would repeat.
+const permanentOpenFailures = new Set(["FX_JOURNAL_TOO_LARGE", "FX_JOURNAL_INVALID"]);
+
 // Fencing reads the slot from the id, so an id in another form stops the
 // write rather than letting it pass unchecked.
 function slotOf(event) {
@@ -279,21 +282,24 @@ export function workflow({
         return new Response(null, { status: 204 });
       }
 
-      const agent = await createAgent(workflow({ ...options, sessionId: target }));
+      let agent = null;
       try {
+        agent = await createAgent(workflow({ ...options, sessionId: target }));
         // The open turn first, then each follow-up the journal held.
         for (let turn = agent.resume(); turn; turn = agent.resume()) {
           for await (const _ of turn) {}
           await turn.result;
         }
       } catch (error) {
-        // A deployment with other tools, instructions or model cannot resume
-        // the turn, and asking again will not change that. The session waits
-        // for its next prompt, which ends the turn as interrupted.
-        if (!(error instanceof FxConfigMismatchError)) throw error;
+        // Asking again will not change these: a deployment with other tools,
+        // instructions or model cannot resume the turn, and this libfx cannot
+        // open a journal that is too large or does not fold. A config
+        // mismatch waits for the session's next prompt, which ends the turn
+        // as interrupted.
+        if (!(error instanceof FxConfigMismatchError) && !permanentOpenFailures.has(error?.code)) throw error;
         return new Response(`session ${target} was not resumed: ${error.message}`, { status: 200 });
       } finally {
-        await agent.close();
+        await agent?.close();
       }
       return new Response(null, { status: 204 });
     },

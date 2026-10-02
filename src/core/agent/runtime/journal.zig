@@ -19,7 +19,8 @@
 //! - `history_replaced`: the whole history, after compaction
 //! - `input_accepted`: a steer or follow-up the host handed in, before the
 //!   model sees it
-//! - `input_withdrawn`: a steer the host took back before it was placed
+//! - `input_withdrawn`: a steer the host took back before it was placed, or
+//!   a follow-up whose turn ended before its first model request
 //! - `session_config`: a hash of the host's instructions, tools and model,
 //!   when a turn starts under a hash the journal has not recorded
 //!
@@ -231,7 +232,10 @@ pub const LoadError = Allocator.Error || error{
     UnsupportedJournalVersion,
     /// A `seq` or `turn` is missing, repeated, or out of order.
     OutOfOrderJournalEvent,
+    /// The events are more than one load holds.
     JournalTooLarge,
+    /// The history is longer than a session restores.
+    JournalTooManyTurns,
 };
 
 /// A session rebuilt from its events. Owns every slice.
@@ -326,7 +330,7 @@ pub fn fold(alloc: Allocator, events_json: []const u8) LoadError!Folded {
 /// Rebuilds a session from `base` and the events after it.
 pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError!Folded {
     if (events_json.len > max_load_bytes) return error.JournalTooLarge;
-    if (base.history.len > max_history_turns) return error.JournalTooLarge;
+    if (base.history.len > max_history_turns) return error.JournalTooManyTurns;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), events_json, .{}) catch |err| switch (err) {
@@ -427,7 +431,7 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
             .history_replaced => {
                 const data = event.data orelse return error.InvalidJournal;
                 if (data != .array) return error.InvalidJournal;
-                if (data.array.items.len > max_history_turns) return error.JournalTooLarge;
+                if (data.array.items.len > max_history_turns) return error.JournalTooManyTurns;
                 var replacement: std.ArrayList(types.HistoryTurn) = .empty;
                 errdefer {
                     for (replacement.items) |turn| types.freeHistoryTurn(alloc, turn);
@@ -440,7 +444,7 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
                 history = replacement;
             },
         }
-        if (history.items.len > max_history_turns) return error.JournalTooLarge;
+        if (history.items.len > max_history_turns) return error.JournalTooManyTurns;
         cursor = .{
             .next_seq = cursor.next_seq + 1,
             .turn = if (event.kind == .turn_committed) cursor.turn + 1 else cursor.turn,
