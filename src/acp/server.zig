@@ -1909,8 +1909,8 @@ fn handleKernelSnapshot(
     defer active.session_write_mutex.unlock(io_mod.getIo());
     const journal = if (active.journal) |*value| value else return state.writer.writeResponse(alloc, msg.id, none);
     if (!journal.quiet()) return state.writer.writeResponse(alloc, msg.id, none);
-    // A session past a snapshot's bounds gets none now or later; the host
-    // learns why.
+    // A session past a snapshot's bounds gets none until compaction brings it
+    // back within them; the host learns why.
     const checkpoint = active.session_rt.agent.checkpoint(alloc) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.CheckpointTooLarge => return writeSnapshotSkipped(state, alloc, msg.id, if (active.session_rt.agent.history.items.len > journal_events.max_history_turns) .too_many_turns else .too_large),
@@ -1931,7 +1931,7 @@ fn handleKernelSnapshot(
     try state.writer.writeResponse(alloc, msg.id, written);
 }
 
-/// Why a session gets no snapshot now or later.
+/// Why a session past a snapshot's bounds gets none.
 const SnapshotSkip = enum { too_large, too_many_turns, invalid };
 
 fn writeSnapshotSkipped(state: *ServerState, alloc: Allocator, id: ?jsonrpc.RequestId, reason: SnapshotSkip) !void {

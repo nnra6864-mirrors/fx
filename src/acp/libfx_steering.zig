@@ -10,7 +10,7 @@ pub const max_message_bytes: usize = 64 * 1024;
 pub const max_messages: usize = 64;
 pub const max_queued_bytes: usize = 1024 * 1024;
 
-pub const max_input_id_bytes: usize = 128;
+const max_input_id_bytes: usize = 128;
 
 pub const EnqueueError = Allocator.Error || error{
     EmptySteeringMessage,
@@ -20,7 +20,7 @@ pub const EnqueueError = Allocator.Error || error{
 };
 
 /// A libfx input id that is malformed or already queued.
-pub const InputError = EnqueueError || error{InvalidInputId};
+const InputError = EnqueueError || error{InvalidInputId};
 
 const Entry = struct {
     text: []u8,

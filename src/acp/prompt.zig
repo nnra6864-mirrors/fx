@@ -2621,13 +2621,19 @@ fn endJournalTurn(alloc: Allocator, session_alloc: Allocator, session: *server.A
 }
 
 /// Commits the turn whose barrier a cancel interrupted as interrupted, from
-/// the progress that barrier held, to the session and its journal.
+/// the progress that barrier held, to the session and its journal. A turn
+/// with finished steps was already committed on its way out.
 fn commitCancelledJournalTurn(alloc: Allocator, session_alloc: Allocator, session: *server.ActiveSessionState, prompt_input: *ParsedPromptInput) !void {
     var cancelled = cancelled: {
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
         defer session.session_write_mutex.unlock(io_mod.getIo());
         const journal = if (session.journal) |*value| value else return;
-        break :cancelled journal.takeCancelledProgress() orelse return;
+        var checkpoint = journal.takeCancelledProgress() orelse return;
+        if (!journal.progress_open) {
+            checkpoint.deinit(session_alloc);
+            return;
+        }
+        break :cancelled checkpoint;
     };
     defer cancelled.deinit(session_alloc);
     try persistAcpHistoryTurn(alloc, session, cancelled.interruptedTurn(), prompt_input);

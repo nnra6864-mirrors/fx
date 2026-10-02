@@ -702,8 +702,10 @@ test("a held follow-up waits for resume() without holding up the agent's own", a
 
   const reopened = await createFxAgent(options(targetBackend, createMemoryJournal(survived)));
   requests.length = 0;
-  const late = sleepMs(10_000).then(() => { throw new Error("the agent's own follow-up never started"); });
+  let timer;
+  const late = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("the agent's own follow-up never started")), 10_000); });
   const own = await Promise.race([reopened.followUp("my own follow-up"), late]);
+  clearTimeout(timer);
   for await (const _ of own) {}
   assert.equal((await own.result).stopReason, "end_turn");
   assert.equal(lastUserText(requests.at(-1)), "my own follow-up");
@@ -1086,6 +1088,108 @@ test("a cancel during a slow journal's barrier ends the turn as the agent does",
     await run(reopened, "again");
     await reopened.close();
     assert.equal(userTexts(requests.at(-1)).includes("slow start"), live, "the restored history matches the live one");
+  }
+});
+
+test("a resumed turn cancelled during a slow journal's barrier is committed once", async () => {
+  for (const backend of [sourceBackend, targetBackend]) {
+    const journal = createMemoryJournal();
+    const agent = await createFxAgent(options(backend, journal));
+    await run(agent, "use the tool");
+    await agent.close();
+    // The crash: after the progress that holds the tool's result.
+    const crashed = journal.events.slice(0, journal.events.findLastIndex((event) => event.type === "turn_progress") + 1);
+    const stored = createMemoryJournal(crashed);
+    let previous = Promise.resolve();
+    const slow = {
+      load: () => stored.load(),
+      append(batch) {
+        previous = previous.then(() => sleepMs(300)).then(() => stored.append(batch));
+        return previous;
+      },
+    };
+    const reopened = await createFxAgent(options(backend, slow));
+    const turn = reopened.resume();
+    assert.ok(turn);
+    const drained = (async () => { for await (const _ of turn) {} })();
+    await sleepMs(100);
+    turn.cancel();
+    await drained;
+    await turn.result;
+    requests.length = 0;
+    await run(reopened, "next");
+    await reopened.close();
+    const commits = stored.events.filter((event) => event.type === "turn_committed" && event.data.user?.text === "use the tool");
+    assert.equal(commits.length, 1, `${backend}: ${stored.events.map((event) => event.type).join(",")}`);
+    assert.equal(userTexts(requests.at(-1)).filter((text) => text === "use the tool").length, 1);
+  }
+});
+
+const pngData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=";
+
+test("an image prompt after a crashed image turn gets the next image id", async () => {
+  const vision = { modelCatalog: [{ id: "journal/model", type: "language", tags: ["tool-use", "vision", "file-input"] }] };
+  const image = { type: "image", data: pngData, mimeType: "image/png" };
+  const journal = createMemoryJournal();
+  const agent = await createFxAgent(options(sourceBackend, journal, vision));
+  await run(agent, [{ type: "text", text: "look at this" }, image]);
+  await agent.close();
+  // The crash: the turn's first progress is stored, its commit is not.
+  const firstProgress = journal.events.findIndex((event) => event.type === "turn_progress");
+  const reopened = await createFxAgent(options(targetBackend, createMemoryJournal(journal.events.slice(0, firstProgress + 1)), vision));
+  requests.length = 0;
+  const { result } = await run(reopened, [{ type: "text", text: "and this" }, image]);
+  await reopened.close();
+  assert.equal(result.stopReason, "end_turn");
+  assert.match(lastUserText(requests.at(-1)), /\[Image #2\]$/);
+});
+
+test("a journal past the turn limit is refused by name", async () => {
+  const journal = createMemoryJournal();
+  const agent = await createFxAgent(options(sourceBackend, journal));
+  await run(agent, "one");
+  await agent.close();
+  const commit = journal.events.find((event) => event.type === "turn_committed");
+  const turns = Array.from({ length: 1025 }, (_, index) => ({ ...commit, seq: index + 1, turn: index + 1 }));
+  await assert.rejects(
+    createFxAgent(options(targetBackend, createMemoryJournal(turns))),
+    (error) => error.message === "libfx journal holds more than 1024 turns" && error.code === "FX_JOURNAL_TOO_LARGE",
+  );
+});
+
+test("a session too large for a snapshot reports why", async () => {
+  for (const backend of [sourceBackend, targetBackend]) {
+    const journal = createMemoryJournal([], { snapshots: true });
+    const skipped = [];
+    const agent = await createFxAgent(options(backend, journal, {
+      onEvent: (event) => { if (event.type === "journal.snapshot_skipped") skipped.push(event.reason); },
+    }));
+    // A history no checkpoint holds.
+    await run(agent, "x".repeat(2_200_000));
+    for (let waited = 0; skipped.length === 0 && waited < 3000; waited += 20) await sleepMs(20);
+    await run(agent, "and more");
+    await agent.close();
+    assert.deepEqual(skipped, ["too_large"], `${backend}: reported once`);
+    assert.equal(journal.latestSnapshot, null);
+  }
+});
+
+test("a journal's close() runs once, whether the agent closes or never opens", async () => {
+  for (const backend of [sourceBackend, targetBackend]) {
+    let closes = 0;
+    const stored = createMemoryJournal();
+    const counted = { load: () => stored.load(), append: (batch) => stored.append(batch), close() { closes += 1; } };
+    const agent = await createFxAgent(options(backend, counted));
+    await run(agent, "one");
+    await agent.close();
+    await agent.close();
+    assert.equal(closes, 1, `${backend}: a second close() does not close the journal again`);
+
+    closes = 0;
+    const garbled = { ...counted, load: async () => ({ events: [{ v: 1, seq: 1, turn: 1, type: "turn_committed", data: { kind: "nope" } }] }) };
+    await assert.rejects(createFxAgent(options(backend, garbled)), (error) => error.code === "FX_JOURNAL_INVALID");
+    for (let waited = 0; closes === 0 && waited < 2000; waited += 20) await sleepMs(20);
+    assert.equal(closes, 1, `${backend}: the core exited, so the journal was closed`);
   }
 });
 

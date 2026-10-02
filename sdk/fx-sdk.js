@@ -179,11 +179,20 @@ export class FxJournalVersionError extends Error {
 
 // A journal this libfx cannot open: more than one load holds
 // (FX_JOURNAL_TOO_LARGE), or events that do not fold (FX_JOURNAL_INVALID).
-function journalLoadError(message, cause) {
+function journalLoadError(message, code, cause) {
   const error = new Error(message, cause === undefined ? undefined : { cause });
-  error.code = /too large|more than \d+ turns/.test(message) ? "FX_JOURNAL_TOO_LARGE" : "FX_JOURNAL_INVALID";
+  error.code = code;
   return error;
 }
+
+// The core's libfx/journal_open errors, by their exact message. The journal
+// tests open a journal for each, so rewording one fails them.
+const journalOpenErrorCodes = new Map([
+  ["Invalid libfx journal", "FX_JOURNAL_INVALID"],
+  ["libfx journal events are out of order", "FX_JOURNAL_INVALID"],
+  ["libfx journal is too large", "FX_JOURNAL_TOO_LARGE"],
+  ["libfx journal holds more than 1024 turns", "FX_JOURNAL_TOO_LARGE"],
+]);
 
 /**
  * The turn the journal left open started under other instructions, tools or
@@ -315,7 +324,7 @@ function journalLoaded(loaded) {
   }
   const snapshot = loaded.snapshot ?? null;
   if (snapshot !== null && !(snapshot instanceof Uint8Array)) throw new TypeError("journal.load() snapshot must be a Uint8Array");
-  if (snapshot !== null && snapshot.byteLength > maxSnapshotBytes) throw journalLoadError("libfx journal snapshot is too large");
+  if (snapshot !== null && snapshot.byteLength > maxSnapshotBytes) throw journalLoadError("libfx journal snapshot is too large", "FX_JOURNAL_TOO_LARGE");
   const sessionId = loaded.sessionId ?? null;
   if (sessionId !== null && !validSessionId(sessionId)) {
     throw new TypeError(`journal.load() sessionId must be ${sessionIdRule}`);
@@ -2066,7 +2075,8 @@ export async function createFxAgent(options = {}) {
     let stored = false;
     snapshotting = (async () => {
       const response = await request("libfx/snapshot", { sessionId });
-      // The session is past a snapshot's bounds and gets none from now on.
+      // The session is past a snapshot's bounds and gets none until it is
+      // back within them.
       if (typeof response?.skipped === "string") {
         if (response.skipped !== snapshotSkipped) emit("journal.snapshot_skipped", { reason: response.skipped });
         snapshotSkipped = response.skipped;
@@ -2081,6 +2091,7 @@ export async function createFxAgent(options = {}) {
       if (durableSeq < atSeq) return;
       await journal.snapshot(new Uint8Array(bytes), atSeq);
       stored = true;
+      snapshotSkipped = null;
       snapshotAtSeq = Math.max(snapshotAtSeq, atSeq);
       emit("journal.snapshot", { atSeq, bytes: bytes.byteLength });
     })().catch((error) => {
@@ -2475,7 +2486,7 @@ export async function createFxAgent(options = {}) {
       if (loaded.snapshot) payloads.push(["snapshotAttachment", loaded.snapshot]);
       if (events.length > 0) {
         const bytes = encoder.encode(JSON.stringify(withoutSupersededProgress(events)));
-        if (bytes.byteLength > maxJournalBytes) throw journalLoadError("libfx journal is too large");
+        if (bytes.byteLength > maxJournalBytes) throw journalLoadError("libfx journal is too large", "FX_JOURNAL_TOO_LARGE");
         payloads.push(["journalAttachment", bytes]);
         bytesSinceSnapshot = bytes.byteLength;
       }
@@ -2486,9 +2497,8 @@ export async function createFxAgent(options = {}) {
       const opened = await request("libfx/journal_open", params).catch((error) => {
         const message = error?.message ?? "";
         if (/newer fx/.test(message)) throw new FxJournalVersionError(message);
-        if (/^(Invalid libfx journal$|libfx journal (is too large|holds more than|events are out of order))/.test(message)) {
-          throw journalLoadError(message, error);
-        }
+        const code = journalOpenErrorCodes.get(message);
+        if (code) throw journalLoadError(message, code, error);
         throw error;
       });
       resumable = opened?.resumable === true;

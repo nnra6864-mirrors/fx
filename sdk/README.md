@@ -304,7 +304,9 @@ restore, the follow-ups the journal held have no caller, so each waits for
 next held follow-up, and returns `null` once none is left. Follow-ups this
 agent queues run on their own and do not wait behind held ones. libfx takes no
 snapshot while a held follow-up waits, so call `resume()` until it returns
-`null` whenever a session opens. A follow-up whose turn ends before its first
+`null` whenever a session opens, before this agent queues follow-ups of its
+own: one queued during a resumed turn starts when that turn ends, and
+`resume()` throws while it runs. A follow-up whose turn ends before its first
 model request is withdrawn, so it never runs again. `close()` rejects
 follow-ups that have not started; a journal still holds them.
 
@@ -398,10 +400,11 @@ it. Give the journal a `snapshot(bytes, atSeq)` method and libfx calls it about
 every 100 events or 1 MiB of events, between turns, with opaque bytes that
 stand for every event up to and including `atSeq`. libfx calls it only after
 those events are stored. A snapshot holds the session's whole history, within
-a checkpoint's bounds of 4 MiB and 1,024 turns. A session that outgrows them
-gets no more snapshots and cannot be restored from its journal; libfx emits a
-`journal.snapshot_skipped` event with the `reason` (`too_large`,
-`too_many_turns`, or `invalid`) when that happens. Keep the latest snapshot and return it from `load()` as
+a checkpoint's bounds of 4 MiB and 1,024 turns. A session past them gets no
+snapshot, and libfx emits a `journal.snapshot_skipped` event with the `reason`
+(`too_large`, `too_many_turns`, or `invalid`). Snapshots resume once compaction
+brings the session back within the bounds; until one is stored, a journal whose
+events no longer fit in one load cannot be restored. Keep the latest snapshot and return it from `load()` as
 `{ snapshot, events }` with only the events after `atSeq`; the events it covers
 can be deleted. Snapshots only move forward: store one only if its `atSeq` is
 greater than the stored snapshot's. A snapshot can arrive late, even from an

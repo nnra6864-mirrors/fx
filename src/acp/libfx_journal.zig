@@ -17,7 +17,7 @@ const Allocator = std.mem.Allocator;
 pub const Event = journal.Event;
 pub const max_load_bytes = journal.max_load_bytes;
 /// What the model is told when libfx continues a turn a crash left open.
-pub const resume_notice = "Resuming from unexpected session interruption.";
+const resume_notice = "Resuming from unexpected session interruption.";
 
 /// One session's journal. Its owner serializes every call with the
 /// session's write mutex, so events reach the host in `seq` order.

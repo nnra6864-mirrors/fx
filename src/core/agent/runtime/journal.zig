@@ -48,7 +48,7 @@ pub const max_snapshot_bytes: usize = checkpoint_codec.max_checkpoint_bytes;
 const max_safe_position: u64 = (1 << 53) - 1;
 pub const max_history_turns = checkpoint_codec.max_history_turns;
 
-pub const EventType = enum {
+const EventType = enum {
     turn_committed,
     turn_progress,
     tool_intent,
@@ -59,7 +59,7 @@ pub const EventType = enum {
     session_config,
 };
 
-pub const InputKind = enum { steer, follow_up };
+const InputKind = enum { steer, follow_up };
 
 /// A steer or follow-up the host handed in.
 pub const Input = struct {
@@ -169,7 +169,7 @@ pub const max_config_hash_bytes = 128;
 /// covers and the turn after it (each a little-endian u64), the recorded
 /// config hash (a length byte, zero for none, then its bytes), then a
 /// checkpoint of the history. Hosts store it as opaque bytes.
-pub const snapshot_magic = "FXSN";
+const snapshot_magic = "FXSN";
 const snapshot_version: u8 = 1;
 const snapshot_header_bytes = snapshot_magic.len + 1 + 8 + 8 + 1;
 
