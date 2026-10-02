@@ -249,6 +249,8 @@ export function createMemoryJournal(events = []) {
 // `createWorld()` from `@workflow/world-vercel`; libfx imports no Workflow
 // package.
 const worldJournalStep = "libfx.journal";
+// A heartbeat is a step of its own: Worlds accept only their event types.
+const worldHeartbeatStep = "libfx.heartbeat";
 const worldJournalFormat = "libfx-journal-v1";
 // A run names its workflow and deployment; nothing executes these runs.
 const worldWorkflowName = "libfx";
@@ -260,6 +262,16 @@ const worldEventId = /^[a-z]+_(\d{26})$/;
 // Failures a later delivery of the same wake would repeat, by code, so an
 // error from another copy of libfx counts too.
 const permanentWorldOpenFailures = new Set(["FX_CONFIG_MISMATCH", "FX_JOURNAL_TOO_LARGE", "FX_JOURNAL_INVALID"]);
+
+// A ULID: 48 bits of time, then 80 random bits, in Crockford base32.
+function worldUlid(now = Date.now()) {
+  const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+  let time = "";
+  for (let rest = now, index = 0; index < 10; index += 1, rest = Math.floor(rest / 32)) time = alphabet[rest % 32] + time;
+  let random = "";
+  for (const byte of crypto.getRandomValues(new Uint8Array(16))) random += alphabet[byte % 32];
+  return time + random;
+}
 
 function validateWorld(world) {
   if (!world?.events || typeof world.events.create !== "function" || typeof world.events.list !== "function" || typeof world.queue !== "function") {
@@ -281,9 +293,24 @@ function worldSlot(event) {
   return Number(match[1]);
 }
 
+// An event's payload travels as bytes, the form every World stores: here,
+// UTF-8 JSON, which no World's own format prefix starts like.
+function worldPayload(value) {
+  return encoder.encode(JSON.stringify(value));
+}
+
+function worldPayloadOf(bytes) {
+  if (!(bytes instanceof Uint8Array)) return null;
+  try {
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    return null;
+  }
+}
+
 function worldBatch(event) {
   if (event?.eventType !== "step_created" || event.eventData?.stepName !== worldJournalStep) return null;
-  const input = event.eventData.input;
+  const input = worldPayloadOf(event.eventData.input);
   if (input?.format !== worldJournalFormat || !Array.isArray(input.events) || input.events.length === 0) return null;
   return input.events;
 }
@@ -342,7 +369,10 @@ async function readWorldRun(world, runId) {
 // `wakeAfterSeconds` bounds how long an open turn may go without a write:
 // the agent writes a heartbeat while a turn is open, so the queue route
 // takes the turn over only once its process has stopped.
-function worldJournal(world, sessionId, wakeAfterSeconds = defaultWakeAfterSeconds) {
+// `onWakeFailed(error)` hears once when the World cannot queue a wake, as
+// outside a deployment; the session is kept, and only an automatic resume
+// after a crash is lost.
+function worldJournal(world, sessionId, wakeAfterSeconds = defaultWakeAfterSeconds, onWakeFailed = () => {}) {
   const wakeAfterMs = wakeAfterSeconds * 1000;
   // At least 100 ms, so a short test timeout does not turn into a write loop.
   const heartbeatMs = Math.max(100, wakeAfterMs / 3);
@@ -355,13 +385,22 @@ function worldJournal(world, sessionId, wakeAfterSeconds = defaultWakeAfterSecon
   // The seq the next journal batch starts at.
   let nextSeq = 1;
   let turnOpen = false;
-  // Whether this process queued a wake for the open turn.
+  // Whether this process queued a wake for the open turn, and whether the
+  // World refused one.
   let wakeQueued = false;
+  let wakeUnavailable = false;
   let lastWriteAt = 0;
   let heartbeat = null;
   let closed = false;
 
-  const queueWake = (delaySeconds) => world.queue(worldQueueName, { runId }, { delaySeconds });
+  const queueWake = (delaySeconds) => Promise.resolve()
+    .then(() => world.queue(worldQueueName, { runId }, { delaySeconds }))
+    .catch((error) => {
+      wakeUnavailable = true;
+      onWakeFailed(error);
+    });
+  // Step ids are `step_` and a ULID, the form Worlds accept.
+  const stepId = () => `step_${worldUlid()}`;
 
   function fence(message) {
     fenced = new FxFencedError(message);
@@ -371,10 +410,10 @@ function worldJournal(world, sessionId, wakeAfterSeconds = defaultWakeAfterSecon
 
   // Writes one event at the slot after the last one this process has seen.
   // A World never refuses a write for a taken slot: it commits at the next
-  // free one and reports what it skipped. When a skipped event is another
-  // writer's batch starting at `seq`, that batch continues the journal and
-  // this process's view is stale, so it stops writing; load skips whatever
-  // it wrote after the other batch.
+  // free one and reports what it skipped, some Worlds with the new event
+  // too. When a skipped event is another writer's batch starting at `seq`,
+  // that batch continues the journal and this process's view is stale, so it
+  // stops writing; load skips whatever it wrote after the other batch.
   async function commit(request, seq) {
     if (fenced) throw fenced;
     const result = await world.events.create(runId, request, { eventCount });
@@ -383,7 +422,11 @@ function worldJournal(world, sessionId, wakeAfterSeconds = defaultWakeAfterSecon
     const expected = eventCount + 1;
     eventCount = slot;
     if (slot === expected) return;
-    const skipped = Array.isArray(result.events) ? result.events : (await readWorldRun(world, runId)).slice(expected - 1, eventCount - 1);
+    const reported = Array.isArray(result.events) ? result.events : await readWorldRun(world, runId);
+    const skipped = reported.filter((event) => {
+      const other = worldSlot(event);
+      return other >= expected && other < slot;
+    });
     if (skipped.some((event) => worldBatch(event)?.[0].seq === seq)) {
       throw fence(`another process wrote to session ${runId}; this one has stopped`);
     }
@@ -401,7 +444,9 @@ function worldJournal(world, sessionId, wakeAfterSeconds = defaultWakeAfterSecon
       if (Date.now() - lastWriteAt < heartbeatMs) return;
       // A failed heartbeat is not retried here; the next one or the next
       // append writes again, and a fence stops both.
-      serialize(() => (turnOpen && !fenced ? commit({ eventType: "noop", eventData: { libfx: "heartbeat" } }, nextSeq) : undefined)).catch(() => {});
+      serialize(() => (turnOpen && !fenced
+        ? commit({ eventType: "step_created", correlationId: stepId(), eventData: { stepName: worldHeartbeatStep, input: worldPayload({}) } }, nextSeq)
+        : undefined)).catch(() => {});
     }, heartbeatMs);
     heartbeat.unref?.();
   }
@@ -414,16 +459,17 @@ function worldJournal(world, sessionId, wakeAfterSeconds = defaultWakeAfterSecon
 
   async function write(batch) {
     const open = worldTurnOpenAfter(turnOpen, batch);
-    const wake = open && !wakeQueued;
+    const wake = open && !wakeQueued && !wakeUnavailable;
     // A unique step id per write: a write that died partway can leave its id
     // taken in some Worlds, and must not block the write that replaces it.
     const step = commit({
       eventType: "step_created",
-      correlationId: `fxj_${batch[0].seq}_${crypto.randomUUID()}`,
-      eventData: { stepName: worldJournalStep, input: { format: worldJournalFormat, events: batch } },
+      correlationId: stepId(),
+      eventData: { stepName: worldJournalStep, input: worldPayload({ format: worldJournalFormat, events: batch }) },
     }, batch[0].seq);
     // The wake rides alongside the turn's first write, so it costs no extra
     // round trip; without it no one resumes the turn if this process stops.
+    // A wake the World refuses does not fail the write.
     await Promise.all([step, wake ? queueWake(wakeAfterSeconds) : undefined]);
     nextSeq = batch.at(-1).seq + 1;
     turnOpen = open;
@@ -439,15 +485,26 @@ function worldJournal(world, sessionId, wakeAfterSeconds = defaultWakeAfterSecon
   return {
     async load() {
       if (runId === null) {
-        const created = await world.events.create(null, {
+        // The client names a new run, as Workflow's `start()` does; a World
+        // that embeds its own metadata in the id mints it.
+        const created = `wrun_${typeof world.createRunId === "function" ? world.createRunId({}) : worldUlid()}`;
+        await world.events.create(created, {
           eventType: "run_created",
           ...(world.specVersion === undefined ? {} : { specVersion: world.specVersion }),
-          eventData: { deploymentId: worldWorkflowName, workflowName: worldWorkflowName, input: { format: worldJournalFormat } },
+          eventData: { deploymentId: worldWorkflowName, workflowName: worldWorkflowName, input: worldPayload({ format: worldJournalFormat }) },
         });
-        runId = created.run?.runId ?? created.event?.runId;
-        if (typeof runId !== "string") throw new Error("the World did not return the new run's id");
+        runId = created;
       }
-      const events = await readWorldRun(world, runId);
+      let events = await readWorldRun(world, runId);
+      // A run takes steps once it has started; one whose creator stopped
+      // before starting it is started here.
+      if (!events.some((event) => event.eventType === "run_started")) {
+        await world.events.create(runId, {
+          eventType: "run_started",
+          ...(world.specVersion === undefined ? {} : { specVersion: world.specVersion }),
+        }, { eventCount: events.length });
+        events = await readWorldRun(world, runId);
+      }
       eventCount = events.length;
       const journalEvents = worldJournalEvents(events);
       nextSeq = journalEvents.length + 1;
@@ -2272,7 +2329,9 @@ export async function createFxAgent(options = {}) {
   // for earlier ones, so a remote journal adds one round trip to a turn
   // rather than one per append. The host stores calls in call order.
   const journal = options.world !== undefined
-    ? worldJournal(options.world, options.sessionId ?? null, options.wakeAfterSeconds)
+    ? worldJournal(options.world, options.sessionId ?? null, options.wakeAfterSeconds, (error) => {
+      emit("journal.wake_failed", { error: error instanceof Error ? error.name : "Error", message: error?.message ?? "" });
+    })
     : options.journal ?? null;
   let resumable = false;
   let openTurnConfigMismatch = false;

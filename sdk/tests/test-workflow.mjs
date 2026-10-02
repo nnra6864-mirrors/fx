@@ -120,6 +120,15 @@ function route(world, build, onAgent = () => {}) {
   });
 }
 
+const payloadOf = (bytes) => {
+  if (!(bytes instanceof Uint8Array)) return null;
+  try {
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    return null;
+  }
+};
+
 // The journal events a run holds, by the rule libfx loads with: a batch
 // counts only if it continues the events before it.
 async function storedEvents(world, runId) {
@@ -127,7 +136,7 @@ async function storedEvents(world, runId) {
   for (let cursor; ;) {
     const page = await world.events.list({ runId, pagination: { sortOrder: "asc", limit: 1000, ...(cursor ? { cursor } : {}) }, resolveData: "all" });
     for (const event of page.data) {
-      const input = event.eventType === "step_created" && event.eventData?.stepName === "libfx.journal" ? event.eventData.input : null;
+      const input = event.eventType === "step_created" && event.eventData?.stepName === "libfx.journal" ? payloadOf(event.eventData.input) : null;
       const batch = input?.format === "libfx-journal-v1" && Array.isArray(input.events) && input.events.length > 0 ? input.events : null;
       if (batch && batch[0].seq === events.length + 1) events.push(...batch);
     }
@@ -142,14 +151,14 @@ async function seedRun(world, events) {
   const created = await world.events.create(null, {
     eventType: "run_created",
     ...(world.specVersion === undefined ? {} : { specVersion: world.specVersion }),
-    eventData: { deploymentId: "libfx", workflowName: "libfx", input: { format: "libfx-journal-v1" } },
+    eventData: { deploymentId: "libfx", workflowName: "libfx", input: new TextEncoder().encode(JSON.stringify({ format: "libfx-journal-v1" })) },
   });
   const runId = created.run?.runId ?? created.event?.runId;
   if (events.length > 0) {
     await world.events.create(runId, {
       eventType: "step_created",
       correlationId: `fxj_1_${crypto.randomUUID()}`,
-      eventData: { stepName: "libfx.journal", input: { format: "libfx-journal-v1", events } },
+      eventData: { stepName: "libfx.journal", input: new TextEncoder().encode(JSON.stringify({ format: "libfx-journal-v1", events })) },
     }, { eventCount: 1 });
   }
   return runId;
@@ -466,6 +475,54 @@ test("the queue route refuses an agent on another session", async () => {
     /createAgent\(\{ sessionId \}\) must open that session/,
   );
   await closeWorld(world);
+});
+
+test("a World that cannot queue a wake keeps the session", async () => {
+  const inner = createWorld({ dataDir: mkdtempSync(join(tmpdir(), "libfx-world-")), recoverActiveRuns: false });
+  await inner.start?.();
+  // Outside a deployment, world-vercel refuses to queue.
+  const world = { ...inner, queue: async () => { throw new Error("no deployment"); }, events: inner.events };
+  const failures = [];
+  const createAgent = defineAgent(gateway.port, () => "sent");
+  const agent = await createAgent({ world, onEvent: (event) => { if (event.type === "journal.wake_failed") failures.push(event); } });
+  const sessionId = agent.sessionId;
+  assert.equal((await run(agent, "remember plums")).stopReason, "end_turn");
+  assert.equal((await run(agent, "and pears")).stopReason, "end_turn");
+  await agent.close();
+  assert.deepEqual(failures.map((event) => event.message), ["no deployment"]);
+  const again = await createAgent({ world, sessionId });
+  gateway.requests.length = 0;
+  await run(again, "what did I say");
+  await again.close();
+  assert.ok(gateway.requests[0].some((message) => message.role === "user" && textOf(message) === "and pears"));
+  await closeWorld(inner);
+});
+
+test("a write that skips only another writer's heartbeat is not fenced", async () => {
+  // Reports what a write skipped as world-vercel does: every event after the
+  // writer's count, through the new one.
+  const events = [];
+  let foreignHeartbeat = true;
+  const slotted = (request) => ({ ...request, eventId: `evnt_${String(events.length + 1).padStart(26, "0")}`, createdAt: new Date() });
+  const world = {
+    events: {
+      async create(_runId, request, params = {}) {
+        if (foreignHeartbeat && request.eventData?.stepName === "libfx.journal") {
+          foreignHeartbeat = false;
+          events.push(slotted({ eventType: "step_created", eventData: { stepName: "libfx.heartbeat", input: new Uint8Array() } }));
+        }
+        const event = slotted(request);
+        events.push(event);
+        return { event, events: events.slice(params.eventCount ?? 0) };
+      },
+      list: async () => ({ data: [...events], hasMore: false }),
+    },
+    queue: async () => {},
+  };
+  const agent = await defineAgent(gateway.port, () => "sent")({ world, sessionId: "wrun_test" });
+  assert.equal((await run(agent, "one")).stopReason, "end_turn");
+  assert.equal((await run(agent, "two")).stopReason, "end_turn");
+  await agent.close();
 });
 
 test("a World event id without a slot stops the write", async () => {

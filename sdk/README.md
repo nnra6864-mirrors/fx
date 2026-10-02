@@ -479,7 +479,10 @@ export const POST = worldHandler({ world, createAgent });
 ```
 
 Each session is a World run, and libfx writes its journal there, one event in
-the run per append. `world` takes the place of `journal` and cannot be combined
+the run per append: a `step_created` event whose input is the batch as UTF-8
+JSON. libfx names a new run the way Workflow's `start()` does, through the
+World's `createRunId()` when it has one, and starts it before its first step.
+`world` takes the place of `journal` and cannot be combined
 with it or with `checkpoint`. When a turn starts, libfx queues a delayed wake
 for the session, and while the turn is open it writes a heartbeat if
 `wakeAfterSeconds` (default 300) would otherwise pass without a write. When a
@@ -497,6 +500,10 @@ status 200 and the reason, so the queue does not deliver it again; after a
 config change, the session's next `prompt()` ends the turn. The heartbeat stops
 when the agent closes, so a turn handed off with
 `turn.cancel({ reason: "handoff" })` goes silent and the route resumes it.
+When the World cannot queue a wake, as `@workflow/world-vercel` cannot outside
+a Vercel deployment, the turn goes on and libfx emits one `journal.wake_failed`
+event: the session is still stored and restores when the app opens it, but
+nothing resumes it after a crash on its own.
 
 A session's run id is also its session id for AI Gateway, so affinity and
 prompt caching survive the move to another process. Only one process writes to

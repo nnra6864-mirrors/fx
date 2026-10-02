@@ -83,10 +83,9 @@ const turnBytes = (events, turn) => events
 function countingWorld(inner) {
   const counter = { appends: 0, bytes: 0 };
   const create = (runId, request, params) => {
-    const events = request?.eventData?.stepName === "libfx.journal" ? request.eventData.input?.events : null;
-    if (Array.isArray(events)) {
+    if (request?.eventData?.stepName === "libfx.journal") {
       counter.appends += 1;
-      counter.bytes += JSON.stringify(events).length;
+      counter.bytes += request.eventData.input.byteLength;
     }
     return inner.events.create(runId, request, params);
   };

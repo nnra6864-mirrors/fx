@@ -158,11 +158,21 @@ async function closeWorld(world) {
   }
 }
 
+// A journal payload, which libfx writes as UTF-8 JSON bytes.
+function payloadOf(bytes) {
+  if (!(bytes instanceof Uint8Array)) return null;
+  try {
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    return null;
+  }
+}
+
 // The World, with the same steps as fileJournal around each journal write.
 // libfx writes a session's events one at a time, in order.
 function steppedWorld(world, step) {
   const create = async (runId, request, params) => {
-    const events = request?.eventData?.stepName === "libfx.journal" ? request.eventData.input?.events : null;
+    const events = request?.eventData?.stepName === "libfx.journal" ? payloadOf(request.eventData.input)?.events : null;
     if (!Array.isArray(events)) return world.events.create(runId, request, params);
     await step(`journal_before:${events.map((event) => event.type).join("+")}`);
     const result = await world.events.create(runId, request, params);
@@ -183,7 +193,7 @@ async function worldEvents(world, runId) {
   for (let cursor; ;) {
     const page = await world.events.list({ runId, pagination: { sortOrder: "asc", limit: 1000, ...(cursor ? { cursor } : {}) }, resolveData: "all" });
     for (const event of page.data) {
-      const input = event.eventType === "step_created" && event.eventData?.stepName === "libfx.journal" ? event.eventData.input : null;
+      const input = event.eventType === "step_created" && event.eventData?.stepName === "libfx.journal" ? payloadOf(event.eventData.input) : null;
       const batch = input?.format === "libfx-journal-v1" && Array.isArray(input.events) && input.events.length > 0 ? input.events : null;
       if (batch && batch[0].seq === events.length + 1) events.push(...batch);
     }
