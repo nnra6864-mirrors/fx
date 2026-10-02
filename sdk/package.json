@@ -31,10 +31,12 @@
     "./browser": "./browser.js",
     "./wasm": "./fx-sdk.js",
     "./mcp": "./mcp.js",
+    "./workflow": "./workflow.js",
     "./skills": "./skills.js",
     "./skills/node": "./skills-node.js"
   },
   "files": [
+    "workflow.js",
     "browser.js",
     "node.js",
     "node.cjs",

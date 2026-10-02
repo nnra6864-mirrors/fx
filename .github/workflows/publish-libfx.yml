@@ -283,7 +283,7 @@ jobs:
             const names = new Set(report.files.map(({ path }) => path));
             const required = [
               "package.json", "README.md", "LICENSE", "browser.js", "node.js", "node.cjs", "fx-sdk.js", "wasm-module.js",
-              "core-output.js", "mcp.js", "skills.js", "skills-node.js",
+              "core-output.js", "mcp.js", "skills.js", "skills-node.js", "workflow.js",
               "fx-core.wasm", "fx-term.wasm",
               "libfx.linux-x64.node", "libfx.linux-arm64.node",
               "libfx.darwin-x64.node", "libfx.darwin-arm64.node",
