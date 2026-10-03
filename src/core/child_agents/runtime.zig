@@ -172,6 +172,8 @@ pub const Stopped = struct {
 pub const PendingQuestions = struct {
     id: u64,
     arena: std.heap.ArenaAllocator,
+    /// The asking child's name, for main's question screen.
+    child_name: []const u8,
     entries: []const types.QuestionBatchEntry,
 
     pub fn deinit(self: *PendingQuestions) void {
@@ -713,15 +715,17 @@ pub const Runtime = struct {
         self.lockTable();
         defer self.unlockTable();
         const slot = self.oldestPromptLocked() orelse return null;
-        const entries = switch (self.table.get(slot).labels.prompt.?.body) {
+        const child = self.table.get(slot);
+        const entries = switch (child.labels.prompt.?.body) {
             .questions => |entries| entries,
             .permission => return null,
         };
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const copy = try copyQuestions(arena.allocator(), entries);
+        const child_name = try arena.allocator().dupe(u8, child.name());
         self.presented_questions = self.prompts[slot].id;
-        return .{ .id = self.prompts[slot].id, .arena = arena, .entries = copy };
+        return .{ .id = self.prompts[slot].id, .arena = arena, .child_name = child_name, .entries = copy };
     }
 
     /// The id of the child question batch main shows, if any. It may have
@@ -1231,6 +1235,7 @@ test "a child's questions are shown on main, answered or cancelled" {
     try pollUntil(&runtime, Present.ready);
     var first = (try runtime.presentQuestions(testing.allocator)).?;
     defer first.deinit();
+    try testing.expectEqualStrings("a1", first.child_name);
     try testing.expectEqualStrings("Which?", first.entries[0].question);
     try testing.expectEqualStrings("b", first.entries[0].options[1].label);
     try testing.expectEqual(@as(?u64, first.id), runtime.presentedQuestions());
