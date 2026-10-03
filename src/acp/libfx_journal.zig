@@ -10,8 +10,7 @@ const session_codec = @import("../core/session/session_codec.zig");
 const types = @import("../core/shared/types.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const session_adapter = @import("../core/session/session_adapter.zig");
-const execution_memory = @import("../core/agent/execution_memory.zig");
-const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
+const checkpoint_codec = @import("../core/agent/runtime/checkpoint.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -19,6 +18,25 @@ pub const Event = journal.Event;
 pub const max_load_bytes = journal.max_load_bytes;
 /// What the model is told when libfx continues a turn a crash left open.
 const resume_notice = "Resuming from unexpected session interruption.";
+
+/// A host's id for a turn, kept in place so copying a journal copies it.
+pub const TurnId = struct {
+    bytes: [journal.max_turn_id_bytes]u8 = undefined,
+    len: u8 = 0,
+
+    /// `id` is at most `journal.max_turn_id_bytes` long.
+    pub fn of(id: ?[]const u8) TurnId {
+        const value = id orelse return .{};
+        std.debug.assert(value.len <= journal.max_turn_id_bytes);
+        var turn_id: TurnId = .{ .len = @intCast(value.len) };
+        @memcpy(turn_id.bytes[0..value.len], value);
+        return turn_id;
+    }
+
+    pub fn slice(self: *const TurnId) ?[]const u8 {
+        return if (self.len == 0) null else self.bytes[0..self.len];
+    }
+};
 
 /// One session's journal. Its owner serializes every call with the
 /// session's write mutex, so events reach the host in `seq` order.
@@ -32,9 +50,6 @@ pub const Journal = struct {
     /// host resumes it or starts another turn. Owned by the session's
     /// allocator.
     pending_resume: ?session_codec.RecoveryCheckpoint = null,
-    /// Which step of the pending resume answers the calls the crash left
-    /// running, when it left any. The resume runs its safe calls again.
-    pending_resume_answered: ?usize = null,
     /// Set when a turn starts: its first progress carries the prompt, or the
     /// resolution of a resumed turn, and must be stored before the model
     /// sees it. Also set when the next progress places inputs.
@@ -48,16 +63,19 @@ pub const Journal = struct {
     /// Follow-ups the journal holds that no turn ran, until the host takes
     /// them. Owned by the session's allocator.
     pending_follow_ups: []journal.PendingInput = &.{},
+    /// Accepted follow-ups no turn has placed yet. A snapshot waits for none.
+    follow_ups_waiting: usize = 0,
     /// The follow-up the running turn runs, until a progress places it.
     /// Owned by the session's allocator.
     placing_follow_up: ?[]u8 = null,
     /// The progress whose barrier a cancel interrupted: the turn commits
     /// from it as interrupted. Owned by the session's allocator.
     cancelled_progress: ?session_codec.RecoveryCheckpoint = null,
-    /// The host's config hash, and the last one the journal recorded. Owned
-    /// by the session's allocator.
-    host_config: ?[]u8 = null,
-    recorded_config: ?[]u8 = null,
+    /// The host's id for the starting turn, until its first progress names
+    /// it; then the open turn's, until it ends; then the last turn's.
+    next_turn_id: TurnId = .{},
+    open_turn_id: TurnId = .{},
+    last_turn_id: TurnId = .{},
 
     pub fn deinit(self: *Journal, alloc: Allocator) void {
         self.dropPendingResume(alloc);
@@ -67,20 +85,11 @@ pub const Journal = struct {
         if (self.cancelled_progress) |*checkpoint| checkpoint.deinit(alloc);
         self.cancelled_progress = null;
         journal.freePendingInputs(alloc, self.takeFollowUps());
-        if (self.host_config) |hash| alloc.free(hash);
-        if (self.recorded_config) |hash| alloc.free(hash);
     }
 
-    /// Records the host's config hash when a turn starts under one the
-    /// journal has not recorded, so a later resume can tell.
-    pub fn noteConfig(self: *Journal, alloc: Allocator, session_alloc: Allocator, session_id: []const u8) !void {
-        const hash = self.host_config orelse return;
-        if (self.recorded_config) |recorded| if (std.mem.eql(u8, recorded, hash)) return;
-        const recorded = try session_alloc.dupe(u8, hash);
-        errdefer session_alloc.free(recorded);
-        try self.append(alloc, session_id, .{ .session_config = hash });
-        if (self.recorded_config) |old| session_alloc.free(old);
-        self.recorded_config = recorded;
+    /// Names the turn that is starting; its first progress records the name.
+    pub fn nameNextTurn(self: *Journal, id: ?[]const u8) void {
+        self.next_turn_id = TurnId.of(id);
     }
 
     /// Hands the follow-ups the journal held to the caller, who owns them.
@@ -93,7 +102,6 @@ pub const Journal = struct {
     pub fn dropPendingResume(self: *Journal, alloc: Allocator) void {
         if (self.pending_resume) |*checkpoint| checkpoint.deinit(alloc);
         self.pending_resume = null;
-        self.pending_resume_answered = null;
         if (self.pending_inputs.len > 0) {
             debug_trace.logf("session", "event=libfx_journal_inputs_dropped count={d} reason=resume_replaced", .{self.pending_inputs.len});
         }
@@ -136,6 +144,7 @@ pub const Journal = struct {
         if (self.placing_follow_up) |id| {
             try self.append(alloc, session_id, .{ .input_withdrawn = id });
             debug_trace.logf("session", "event=libfx_journal_follow_up_withdrawn reason=turn_ended_before_request", .{});
+            self.follow_ups_waiting -|= 1;
             session_alloc.free(id);
             self.placing_follow_up = null;
         }
@@ -167,8 +176,14 @@ pub const Journal = struct {
             .checkpoint = checkpoint,
             .placed = self.placed_next.items,
             .model = model,
+            .turn_id = self.next_turn_id.slice(),
         } });
+        if (self.next_turn_id.len > 0) {
+            self.open_turn_id = self.next_turn_id;
+            self.next_turn_id = .{};
+        }
         if (self.placing_follow_up) |id| {
+            self.follow_ups_waiting -|= 1;
             session_alloc.free(id);
             self.placing_follow_up = null;
         }
@@ -191,8 +206,15 @@ pub const Journal = struct {
         // standing.
         switch (event) {
             .turn_progress => self.progress_open = true,
-            .turn_committed, .turn_progress_cleared => self.progress_open = false,
-            .tool_intent, .history_replaced, .input_accepted, .input_withdrawn, .session_config => {},
+            .turn_committed, .turn_progress_cleared => {
+                self.progress_open = false;
+                self.last_turn_id = self.open_turn_id;
+                self.open_turn_id = .{};
+            },
+            .input_accepted => |input| if (input.kind == .follow_up) {
+                self.follow_ups_waiting += 1;
+            },
+            .tool_intent, .history_replaced, .input_withdrawn => {},
         }
     }
 
@@ -203,6 +225,13 @@ pub const Journal = struct {
         try self.notePlaced(alloc, &.{id});
         if (self.placing_follow_up) |old| alloc.free(old);
         self.placing_follow_up = owned;
+    }
+
+    /// Whether the session is at a point a snapshot can stand for: no turn
+    /// open or waiting to resume, and no follow-up waiting for its turn.
+    pub fn quiet(self: *const Journal) bool {
+        return !self.progress_open and self.pending_resume == null and
+            self.follow_ups_waiting == 0 and self.cursor.next_seq > 1;
     }
 
     /// Records that the open turn ended without a history entry. A turn
@@ -217,9 +246,9 @@ pub const Opened = struct {
     turns: usize,
     /// A crash left a turn open; `resume` continues it.
     resumable: bool,
-    /// False when the open turn started under another config hash, so the
-    /// host's instructions, tools or model differ from the ones it ran with.
-    config_matches: bool = true,
+    /// The host's ids for the open turn and the last turn that ended.
+    open_turn_id: TurnId = .{},
+    last_turn_id: TurnId = .{},
 };
 
 fn dupePendingInputs(alloc: Allocator, inputs: []const journal.PendingInput) Allocator.Error![]journal.PendingInput {
@@ -241,50 +270,66 @@ fn dupePendingInputs(alloc: Allocator, inputs: []const journal.PendingInput) All
     return owned;
 }
 
-/// Rebuilds a fresh session from the host's events and starts its journal
-/// after them. A turn a crash left open becomes the pending resume, with
-/// every call it left running answered as possibly run until the resume
-/// runs the safe ones again (`rerunSafeCalls`); `session_alloc` owns it.
+/// Rebuilds a fresh session from the host's events, after `snapshot` when
+/// the host stored one, and starts its journal after them. A turn a crash
+/// left open becomes the pending resume, with every call it left running
+/// answered as possibly run, for the model to decide about; `session_alloc`
+/// owns it.
 pub fn open(
     alloc: Allocator,
     session_alloc: Allocator,
     writer: *jsonrpc.Writer,
     runtime: *session_runtime.SessionRuntime,
     events_json: []const u8,
-    config_hash: ?[]const u8,
+    snapshot: ?[]const u8,
 ) !struct { Journal, Opened } {
     if (!runtime.agent.fresh or runtime.agent.history.items.len != 0) return error.AgentNotFresh;
-    var folded = try journal.fold(alloc, events_json);
+    var base: journal.Base = .{};
+    var decoded: ?checkpoint_codec.Decoded = null;
+    defer if (decoded) |*value| value.deinit(alloc);
+    if (snapshot) |bytes| {
+        const parsed = try journal.parseSnapshot(bytes);
+        decoded = checkpoint_codec.decode(alloc, parsed.checkpoint) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnsupportedCheckpointVersion => return error.UnsupportedJournalVersion,
+            else => return error.InvalidJournal,
+        };
+        base = .{
+            .history = decoded.?.history,
+            .cursor = .{ .next_seq = parsed.seq + 1, .turn = parsed.turn },
+            .last_turn_id = parsed.last_turn_id,
+        };
+    }
+    var folded = try journal.foldFrom(alloc, events_json, base);
     defer folded.deinit(alloc);
     if (folded.history.len > 0) try runtime.agent.restoreHistory(alloc, folded.history);
+    if (decoded) |value| runtime.agent.turn_usage = value.usage;
     var state: Journal = .{
         .writer = writer,
         .cursor = folded.cursor,
         .progress_open = folded.open_turn != null,
         .pending_follow_ups = try dupePendingInputs(session_alloc, folded.pending_follow_ups),
+        .follow_ups_waiting = folded.pending_follow_ups.len,
+        .open_turn_id = TurnId.of(folded.open_turn_id),
+        .last_turn_id = TurnId.of(folded.last_turn_id),
     };
     errdefer state.deinit(session_alloc);
-    if (config_hash) |hash| state.host_config = try session_alloc.dupe(u8, hash);
-    if (folded.config_hash) |hash| state.recorded_config = try session_alloc.dupe(u8, hash);
     const checkpoint = folded.open_turn orelse
-        return .{ state, .{ .turns = folded.history.len, .resumable = false } };
-    // Committed turns continue under any config; only an open turn
-    // recorded under another one is refused.
-    const config_matches = if (folded.open_turn_config) |recorded|
-        if (config_hash) |hash| std.mem.eql(u8, recorded, hash) else true
-    else
-        true;
+        return .{ state, .{ .turns = folded.history.len, .resumable = false, .last_turn_id = state.last_turn_id } };
 
     debug_trace.logf("session", "event=libfx_journal_open_turn turn={d} running_calls={d} resolved=pending_resume", .{ folded.cursor.turn, folded.running_calls.len });
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     var answered = checkpoint;
-    const answered_step = answered.execution.tool_steps.len;
     try answerRunning(scratch.allocator(), &answered, folded.running_calls);
     state.pending_resume = try answered.dupe(session_alloc);
-    if (folded.running_calls.len > 0) state.pending_resume_answered = answered_step;
     state.pending_inputs = try dupePendingInputs(session_alloc, folded.pending_inputs);
-    return .{ state, .{ .turns = folded.history.len, .resumable = true, .config_matches = config_matches } };
+    return .{ state, .{
+        .turns = folded.history.len,
+        .resumable = true,
+        .open_turn_id = state.open_turn_id,
+        .last_turn_id = state.last_turn_id,
+    } };
 }
 
 /// An owned copy of `pending` ready to continue: the model is told the
@@ -315,12 +360,10 @@ pub fn resumeCheckpoint(
 
 /// Gives each call the crash left running a result saying it may have
 /// partly run, as one more step of the open turn, so the model sees every
-/// call it made answered and never has a `replay: "never"` call run again
-/// on its own. A resume replaces the answers of safe calls with what they
-/// return when they run again. The response that made the calls, with any
-/// text the model wrote before them, is now that step, so the turn
-/// continues after its tools. Borrows `calls` and the turn's text;
-/// allocates in `scratch`.
+/// call it made answered and decides whether to run it again. The response
+/// that made the calls, with any text the model wrote before them, is now
+/// that step, so the turn continues after its tools. Borrows `calls` and the
+/// turn's text; allocates in `scratch`.
 fn answerRunning(scratch: Allocator, turn: *session_codec.RecoveryCheckpoint, calls: []types.ToolCall) Allocator.Error!void {
     if (calls.len == 0) return;
     const output = session_adapter.unfinished_tool_output;
@@ -344,56 +387,6 @@ fn answerRunning(scratch: Allocator, turn: *session_codec.RecoveryCheckpoint, ca
     turn.execution.tool_steps = steps;
     turn.assistant_source = @constCast("");
     turn.tool_state = .confirmed;
-}
-
-/// Runs again each call of `checkpoint`'s step `step_index`, the step that
-/// answers the calls a crash left running, whose tool `runner.safe` says is
-/// `replay: "safe"` for this agent, under the id the model gave it, and puts
-/// what `runner.run` returns in place of the answer that it may have partly
-/// run. A `replay: "never"` call, or one whose tool the agent no longer has,
-/// keeps that answer. Stops at the first call `runner.run` returns null for
-/// (the turn is being cancelled or handed off), so that call and every later
-/// one keep it too. `alloc` owns `checkpoint` and the results put in it.
-/// Returns how many calls ran again.
-pub fn rerunSafeCalls(
-    alloc: Allocator,
-    checkpoint: *session_codec.RecoveryCheckpoint,
-    step_index: usize,
-    runner: anytype,
-) !usize {
-    const steps = checkpoint.execution.tool_steps;
-    if (step_index >= steps.len) return 0;
-    const step = &steps[step_index];
-    var reran: usize = 0;
-    for (step.tool_calls, step.tool_results) |call, *result| {
-        if (!runner.safe(call)) continue;
-        const outcome = (try runner.run(alloc, call)) orelse {
-            debug_trace.logf("session", "event=libfx_resume_rerun_stopped call={s} reran={d} kept=may_have_partly_run", .{ call.id, reran });
-            break;
-        };
-        defer outcome.deinit(alloc);
-        const replacement = try persistedResult(alloc, call, outcome);
-        types.freePersistedToolResult(alloc, result.*);
-        result.* = replacement;
-        reran += 1;
-        debug_trace.logf("session", "event=libfx_resume_rerun call={s} tool={s} status={s}", .{ call.id, call.name, @tagName(replacement.status) });
-    }
-    return reran;
-}
-
-fn persistedResult(alloc: Allocator, call: types.ToolCall, outcome: tool_dispatch.ToolResult) !types.PersistedToolResult {
-    return switch (outcome) {
-        .success => |text| execution_memory.makePersistedToolResult(alloc, call.id, call.name, .success, text, null),
-        .failure => |text| execution_memory.makePersistedToolResult(alloc, call.id, call.name, .failure, text, null),
-        .rich => |content| execution_memory.makePersistedToolResult(
-            alloc,
-            call.id,
-            call.name,
-            if (content.is_error) .failure else .success,
-            content.text,
-            .{ .tool_images = content.images, .output_bytes = content.text.len, .stored_output_bytes = content.text.len },
-        ),
-    };
 }
 
 const TestCapture = struct {
@@ -442,13 +435,15 @@ test "a progress places the follow-up its turn runs" {
     var capture: TestCapture = .{};
     defer capture.frames.deinit(alloc);
     var writer = jsonrpc.Writer.initCallback(&capture, TestCapture.write);
-    var session: Journal = .{ .writer = &writer, .cursor = .{ .next_seq = 3, .turn = 2 } };
+    var session: Journal = .{ .writer = &writer, .follow_ups_waiting = 1, .cursor = .{ .next_seq = 3, .turn = 2 } };
     defer session.deinit(alloc);
     var progress = try testProgress(alloc);
     defer progress.deinit(alloc);
 
     try session.placeFollowUp(alloc, "follow-1");
+    try std.testing.expectEqual(@as(usize, 1), session.follow_ups_waiting);
     try session.appendProgress(alloc, alloc, "session", progress, "fake/model");
+    try std.testing.expectEqual(@as(usize, 0), session.follow_ups_waiting);
     try std.testing.expect(std.mem.find(u8, capture.frames.items, "\"inputs\":[\"follow-1\"]") != null);
     // Nothing is left to settle when the turn ends.
     try session.endUnplaced(alloc, alloc, "session");
@@ -460,83 +455,40 @@ test "a follow-up whose turn ended before its request is withdrawn, so it never 
     var capture: TestCapture = .{};
     defer capture.frames.deinit(alloc);
     var writer = jsonrpc.Writer.initCallback(&capture, TestCapture.write);
-    var session: Journal = .{ .writer = &writer, .cursor = .{ .next_seq = 3, .turn = 2 } };
+    var session: Journal = .{ .writer = &writer, .follow_ups_waiting = 1, .cursor = .{ .next_seq = 3, .turn = 2 } };
     defer session.deinit(alloc);
 
     try session.placeFollowUp(alloc, "follow-1");
+    try std.testing.expect(!session.quiet());
     try session.endUnplaced(alloc, alloc, "session");
+    try std.testing.expectEqual(@as(usize, 0), session.follow_ups_waiting);
+    try std.testing.expect(session.quiet());
     try std.testing.expect(std.mem.find(u8, capture.frames.items, "\"type\":\"input_withdrawn\",\"data\":{\"id\":\"follow-1\"}") != null);
 }
 
-/// Runs `read` calls again, except `stop_at`, which it reports as cancelled.
-const TestRerunner = struct {
-    stop_at: ?[]const u8 = null,
-    ran: *std.ArrayList([]const u8),
-
-    pub fn safe(_: TestRerunner, call: types.ToolCall) bool {
-        return std.mem.eql(u8, call.name, "read");
-    }
-
-    pub fn run(self: TestRerunner, alloc: Allocator, call: types.ToolCall) !?tool_dispatch.ToolResult {
-        if (self.stop_at) |id| if (std.mem.eql(u8, call.id, id)) return null;
-        try self.ran.append(std.testing.allocator, call.id);
-        return .{ .success = try std.fmt.allocPrint(alloc, "read again by {s}", .{call.id}) };
-    }
-};
-
-fn testAnswered(alloc: Allocator, calls: []types.ToolCall) !session_codec.RecoveryCheckpoint {
+test "a turn's id reaches its first progress only, and is the last turn's once the turn ends" {
+    const alloc = std.testing.allocator;
+    var capture: TestCapture = .{};
+    defer capture.frames.deinit(alloc);
+    var writer = jsonrpc.Writer.initCallback(&capture, TestCapture.write);
+    var session: Journal = .{ .writer = &writer };
+    defer session.deinit(alloc);
     var progress = try testProgress(alloc);
     defer progress.deinit(alloc);
-    var scratch = std.heap.ArenaAllocator.init(alloc);
-    defer scratch.deinit();
-    var answered = progress;
-    try answerRunning(scratch.allocator(), &answered, calls);
-    return answered.dupe(alloc);
-}
 
-test "a resumed turn runs its safe calls again and keeps a never call answered" {
-    const alloc = std.testing.allocator;
-    var calls = [_]types.ToolCall{
-        .{ .id = "call-1", .name = "read", .arguments_json = "{}" },
-        .{ .id = "call-2", .name = "send", .arguments_json = "{}" },
-        .{ .id = "call-3", .name = "read", .arguments_json = "{}" },
-    };
-    var answered = try testAnswered(alloc, &calls);
-    defer answered.deinit(alloc);
-    var ran: std.ArrayList([]const u8) = .empty;
-    defer ran.deinit(alloc);
+    session.nameNextTurn("turn-1");
+    try session.appendProgress(alloc, alloc, "session", progress, "fake/model");
+    try session.appendProgress(alloc, alloc, "session", progress, "fake/model");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, capture.frames.items, "\"turnId\":\"turn-1\""));
+    try std.testing.expectEqualStrings("turn-1", session.open_turn_id.slice().?);
 
-    const reran = try rerunSafeCalls(alloc, &answered, 0, TestRerunner{ .ran = &ran });
-    try std.testing.expectEqual(@as(usize, 2), reran);
-    try std.testing.expectEqual(@as(usize, 2), ran.items.len);
-    const results = answered.execution.tool_steps[0].tool_results;
-    // Every call keeps its place, so results reach the model in its order.
-    try std.testing.expectEqualStrings("call-1", results[0].tool_call_id);
-    try std.testing.expectEqualStrings("read again by call-1", results[0].output);
-    try std.testing.expectEqual(types.PersistedToolStatus.success, results[0].status);
-    try std.testing.expectEqualStrings(session_adapter.unfinished_tool_output, results[1].output);
-    try std.testing.expectEqual(types.PersistedToolStatus.failure, results[1].status);
-    try std.testing.expectEqualStrings("read again by call-3", results[2].output);
-}
+    try session.clearProgress(alloc, "session");
+    try std.testing.expect(session.open_turn_id.slice() == null);
+    try std.testing.expectEqualStrings("turn-1", session.last_turn_id.slice().?);
 
-test "a resume cancelled during a rerun keeps that call and the later ones answered" {
-    const alloc = std.testing.allocator;
-    var calls = [_]types.ToolCall{
-        .{ .id = "call-1", .name = "read", .arguments_json = "{}" },
-        .{ .id = "call-2", .name = "read", .arguments_json = "{}" },
-        .{ .id = "call-3", .name = "read", .arguments_json = "{}" },
-    };
-    var answered = try testAnswered(alloc, &calls);
-    defer answered.deinit(alloc);
-    var ran: std.ArrayList([]const u8) = .empty;
-    defer ran.deinit(alloc);
-
-    const reran = try rerunSafeCalls(alloc, &answered, 0, TestRerunner{ .stop_at = "call-2", .ran = &ran });
-    try std.testing.expectEqual(@as(usize, 1), reran);
-    const results = answered.execution.tool_steps[0].tool_results;
-    try std.testing.expectEqualStrings("read again by call-1", results[0].output);
-    try std.testing.expectEqualStrings(session_adapter.unfinished_tool_output, results[1].output);
-    try std.testing.expectEqualStrings(session_adapter.unfinished_tool_output, results[2].output);
-    // A step index past the turn's steps runs nothing.
-    try std.testing.expectEqual(@as(usize, 0), try rerunSafeCalls(alloc, &answered, 5, TestRerunner{ .ran = &ran }));
+    // A turn the host did not name ends with no last id.
+    session.nameNextTurn(null);
+    try session.appendProgress(alloc, alloc, "session", progress, "fake/model");
+    try session.clearProgress(alloc, "session");
+    try std.testing.expect(session.last_turn_id.slice() == null);
 }

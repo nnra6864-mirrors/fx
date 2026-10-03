@@ -1,12 +1,13 @@
 #!/usr/bin/env node
-// The libfx journal: a session written as events and rebuilt from them,
-// across backends, through a crash, and through host-side failures.
+// libfx persistence: a session written as journal records and rebuilt from
+// them and its latest checkpoint, across backends, through a crash, and
+// through host-side failures.
 import { strict as assert } from "node:assert";
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent, createMemoryJournal, FxConfigMismatchError, FxFencedError, FxJournalVersionError } from "../node.js";
+import { createFxAgent, createMemoryPersistence, FxFencedError, FxJournalVersionError } from "../node.js";
 
 const sourceBackend = process.argv[2] || "native";
 const targetBackend = process.argv[3] || "wasm";
@@ -22,6 +23,42 @@ const lastUserText = (prompt) => textOf(prompt.filter((message) => message.role 
 const toolResults = (prompt) => prompt
   .flatMap((message) => Array.isArray(message.content) ? message.content : [])
   .filter((part) => part.type === "tool-result");
+
+// A record's bytes are libfx's own; these tests read them to check the events.
+const encodeRecord = (events) => new TextEncoder().encode(JSON.stringify({ format: "libfx-journal-v1", events }));
+const decodeRecord = (data) => JSON.parse(new TextDecoder().decode(data)).events;
+const storedEvents = (store) => store.records.flatMap((record) => decodeRecord(record.data));
+
+// The tests shape sessions as event lists, such as a crash that lost the last
+// events. `persisted` keeps such a list behind the persistence interface: each
+// record's events join the list, and a cursor is the last seq it holds, so an
+// append that does not continue the list is fenced.
+function eventJournal(initial = []) {
+  const events = initial.map((event) => structuredClone(event));
+  return {
+    events,
+    async append(batch) { events.push(...batch); },
+    async load() { return { events: events.slice() }; },
+  };
+}
+
+function persisted(journal) {
+  const headOf = (events) => (events.length ? String(events.at(-1).seq) : null);
+  return {
+    async load() {
+      const { events } = await journal.load();
+      return { journal: events.length ? [{ cursor: headOf(events), data: encodeRecord(events) }] : [] };
+    },
+    async append({ expected, data }) {
+      const batch = decodeRecord(data);
+      if (journal.events && expected !== headOf(journal.events)) {
+        throw new FxFencedError(`expected ${expected}, head ${headOf(journal.events)}`);
+      }
+      await journal.append(batch);
+      return { cursor: String(batch.at(-1).seq) };
+    },
+  };
+}
 
 // "use the tool" asks for one host tool call, then answers with its result.
 // "gather everything" calls bulky bulkySteps times, one call per response.
@@ -96,6 +133,8 @@ const server = createServer((request, response) => {
       return;
     }
     const prompt = JSON.parse(body).prompt;
+    // Which agent sent it: a fenced agent's last request can arrive late.
+    Object.defineProperty(prompt, "sessionId", { value: request.headers["x-session-id"] });
     requests.push(prompt);
     sessionHeaders.push([request.headers["x-session-id"], request.headers["x-session-affinity"]]);
     if (lastUserText(prompt) === "fail please") {
@@ -122,7 +161,6 @@ const lookup = {
   name: "lookup",
   description: "Looks up a key",
   inputSchema: { type: "object", properties: { key: { type: "string" } }, required: ["key"] },
-  replay: "safe",
   execute: async ({ key }) => `value of ${key} is beta`,
 };
 // Each result is large, so the open turn's progress grows with every step.
@@ -130,7 +168,6 @@ const bulky = {
   name: "bulky",
   description: "Returns a large part",
   inputSchema: { type: "object", properties: { part: { type: "number" } } },
-  replay: "safe",
   execute: async ({ part }) => `${part}:${"x".repeat(60_000)}`,
 };
 const options = (backend, journal, extra = {}) => ({
@@ -142,7 +179,7 @@ const options = (backend, journal, extra = {}) => ({
   gatewayChatUrl: `http://127.0.0.1:${port}/chat`,
   model: "journal/model",
   tools: [lookup],
-  journal,
+  ...(journal === undefined ? {} : { persistence: persisted(journal) }),
   ...extra,
 });
 
@@ -158,9 +195,7 @@ async function run(agent, input) {
 // One turn: progress before each model request and after each response,
 // intents before tool calls run, then one commit. The first progress lands
 // before any response exists.
-function assertTurn(all) {
-  // A turn that starts under a config the journal has not recorded records it first.
-  const events = all.filter((event) => event.type !== "session_config");
+function assertTurn(events) {
   assert.ok(events.length >= 2, "a turn records progress and a commit");
   assert.ok(events.slice(0, -1).every((event) => event.type === "turn_progress" || event.type === "tool_intent"));
   assert.equal(events[0].type, "turn_progress");
@@ -183,7 +218,7 @@ const cases = [];
 const test = (name, body) => cases.push({ name, body });
 
 test("a journaled session restores on another backend", async () => {
-  const journal = createMemoryJournal();
+  const journal = eventJournal();
   const source = await createFxAgent(options(sourceBackend, journal));
   assert.equal((await run(source, "remember plums")).text, "answer to remember plums");
   await source.close();
@@ -200,16 +235,14 @@ test("a journaled session restores on another backend", async () => {
   assert.equal(said("user", "remember plums"), 1, "restored turn appears once");
   assert.equal(said("assistant", "answer to remember plums"), 1, "restored answer appears once");
   assertContiguous(journal.events);
-  // The restored session appended only its own turn, and recorded the same
-  // config once.
+  // The restored session appended only its own turn.
   const ownTurn = journal.events.slice(firstTurnEvents);
-  assert.ok(!ownTurn.some((event) => event.type === "session_config"));
-  assert.equal(ownTurn.length, firstTurnEvents - 1);
+  assert.equal(ownTurn.length, firstTurnEvents);
   assertTurn(ownTurn);
 });
 
 test("a tool turn records progress before each model request", async () => {
-  const journal = createMemoryJournal();
+  const journal = eventJournal();
   const agent = await createFxAgent(options(sourceBackend, journal));
   assert.equal((await run(agent, "use the tool")).text, "tool said beta");
   await agent.close();
@@ -226,7 +259,7 @@ test("a tool turn records progress before each model request", async () => {
   assert.equal(toolResults(requests[0]).length, 1, "restored history keeps the tool result");
 });
 
-test("a replay never call starts only after its intent is stored", async () => {
+test("a tool call starts only after its intent is stored", async () => {
   // A remote store: each call lands 30 ms after it, behind earlier calls.
   const stored = [];
   let previous = Promise.resolve();
@@ -241,9 +274,8 @@ test("a replay never call starts only after its intent is stored", async () => {
   const seen = [];
   const send = {
     ...lookup,
-    replay: "never",
-    execute: async (input, { toolCallId }) => {
-      seen.push(stored.some((event) => event.type === "tool_intent" && event.data.some((call) => call.id === toolCallId)));
+    execute: async (input, { callId }) => {
+      seen.push(stored.some((event) => event.type === "tool_intent" && event.data.some((call) => call.id === callId)));
       return lookup.execute(input);
     },
   };
@@ -255,13 +287,13 @@ test("a replay never call starts only after its intent is stored", async () => {
 });
 
 test("resume continues a crashed turn and tells the model", async () => {
-  const journal = createMemoryJournal();
+  const journal = eventJournal();
   const agent = await createFxAgent(options(sourceBackend, journal));
   await run(agent, "first");
   await run(agent, "remember plums");
   await agent.close();
   // The process died after the response, before the turn's commit.
-  const crashed = createMemoryJournal(journal.events.slice(0, -1));
+  const crashed = eventJournal(journal.events.slice(0, -1));
   assert.equal(crashed.events.at(-1).type, "turn_progress");
 
   const events = [];
@@ -287,10 +319,10 @@ test("resume continues a crashed turn and tells the model", async () => {
   assertContiguous(crashed.events);
 });
 
-test("a resumed turn answers a call a crash left running and never reruns it", async () => {
-  const journal = createMemoryJournal();
+test("a resumed turn answers a call a crash left running instead of running it again", async () => {
+  const journal = eventJournal();
   let sends = 0;
-  const send = { ...lookup, replay: "never", execute: async (input) => { sends += 1; return lookup.execute(input); } };
+  const send = { ...lookup, execute: async (input) => { sends += 1; return lookup.execute(input); } };
   const agent = await createFxAgent(options(sourceBackend, journal, { tools: [send] }));
   await run(agent, "use the tool");
   await agent.close();
@@ -298,54 +330,28 @@ test("a resumed turn answers a call a crash left running and never reruns it", a
   // The process died while the call ran: after its intent, before any result.
   const intent = journal.events.findIndex((event) => event.type === "tool_intent");
   assert.ok(intent > 0);
-  const crashed = createMemoryJournal(journal.events.slice(0, intent + 1));
+  const crashed = eventJournal(journal.events.slice(0, intent + 1));
   const resumed = await createFxAgent(options(targetBackend, crashed, { tools: [send] }));
   requests.length = 0;
   const turn = resumed.resume();
   for await (const _ of turn) {}
   assert.equal((await turn.result).stopReason, "end_turn");
   await resumed.close();
-  assert.equal(sends, 1, "the never call did not run again");
+  assert.equal(sends, 1, "the call did not run again");
   const results = toolResults(requests[0]);
   assert.equal(results.length, 1, "the running call is answered");
   assert.match(JSON.stringify(results[0]), /may have partly run/);
   assertContiguous(crashed.events);
 });
 
-test("a resumed turn runs a safe call a crash left running again, under the same call id", async () => {
-  const journal = createMemoryJournal();
-  const seen = [];
-  const read = { ...lookup, replay: "safe", execute: async (input, { toolCallId }) => { seen.push(toolCallId); return lookup.execute(input); } };
-  const agent = await createFxAgent(options(sourceBackend, journal, { tools: [read] }));
-  await run(agent, "use the tool");
-  await agent.close();
-  assert.equal(seen.length, 1);
-  // The process died while the call ran: after its intent, before any result.
-  const intent = journal.events.findIndex((event) => event.type === "tool_intent");
-  assert.ok(intent > 0);
-  const crashed = createMemoryJournal(journal.events.slice(0, intent + 1));
-  const resumed = await createFxAgent(options(targetBackend, crashed, { tools: [read] }));
-  requests.length = 0;
-  const turn = resumed.resume();
-  for await (const _ of turn) {}
-  assert.equal((await turn.result).stopReason, "end_turn");
-  await resumed.close();
-  assert.deepEqual(seen, [seen[0], seen[0]], "the safe call ran again with the call id the model gave it");
-  const results = toolResults(requests[0]);
-  assert.equal(results.length, 1, "the call has one result");
-  assert.doesNotMatch(JSON.stringify(results[0]), /may have partly run/);
-  assert.match(JSON.stringify(results[0]), /is beta/);
-  assertContiguous(crashed.events);
-});
-
 test("a resumed turn keeps what the model wrote before the calls a crash left running", async () => {
-  const journal = createMemoryJournal();
+  const journal = eventJournal();
   const agent = await createFxAgent(options(sourceBackend, journal));
   await run(agent, "explain and use the tool");
   await agent.close();
   const intent = journal.events.findIndex((event) => event.type === "tool_intent");
   assert.ok(intent > 0);
-  const resumed = await createFxAgent(options(targetBackend, createMemoryJournal(journal.events.slice(0, intent + 1))));
+  const resumed = await createFxAgent(options(targetBackend, eventJournal(journal.events.slice(0, intent + 1))));
   requests.length = 0;
   const turn = resumed.resume();
   for await (const _ of turn) {}
@@ -357,11 +363,11 @@ test("a resumed turn keeps what the model wrote before the calls a crash left ru
 });
 
 test("a new prompt instead of resume ends the crashed turn as interrupted", async () => {
-  const journal = createMemoryJournal();
+  const journal = eventJournal();
   const agent = await createFxAgent(options(sourceBackend, journal));
   await run(agent, "use the tool");
   await agent.close();
-  const crashed = createMemoryJournal(journal.events.slice(0, -1));
+  const crashed = eventJournal(journal.events.slice(0, -1));
   const resumed = await createFxAgent(options(targetBackend, crashed));
   requests.length = 0;
   await run(resumed, "after the crash");
@@ -374,7 +380,7 @@ test("a new prompt instead of resume ends the crashed turn as interrupted", asyn
 });
 
 test("each turn appends its own events, not the whole history", async () => {
-  const journal = createMemoryJournal();
+  const journal = eventJournal();
   const agent = await createFxAgent(options(sourceBackend, journal));
   const sizes = [];
   for (let index = 0; index < 6; index++) {
@@ -388,61 +394,70 @@ test("each turn appends its own events, not the whole history", async () => {
   assert.ok(sizes.at(-1) < sizes[0] * 1.5, `turn bytes grew: ${sizes.join(", ")}`);
 });
 
-test("a slow journal receives overlapping appends in order", async () => {
-  // A remote store that lands each call 15 ms after it, behind earlier calls.
-  const stored = [];
-  let previous = Promise.resolve();
+test("a slow store receives one opaque record at a time, each naming the cursor before it", async () => {
+  const store = createMemoryPersistence();
+  const calls = [];
   let inFlight = 0;
   let maxInFlight = 0;
-  const journal = {
-    append(batch, ...rest) {
-      assert.equal(rest.length, 0, "append receives only the batch");
+  const slow = {
+    load: () => store.load(),
+    async append(input, ...rest) {
+      assert.equal(rest.length, 0, "append receives one argument");
+      assert.deepEqual(Object.keys(input).sort(), ["data", "expected", "idempotencyKey"]);
+      assert.ok(input.data instanceof Uint8Array);
       inFlight += 1;
       maxInFlight = Math.max(maxInFlight, inFlight);
-      const delay = new Promise((resolveDelay) => setTimeout(resolveDelay, 15));
-      previous = Promise.all([previous, delay]).then(() => { stored.push(...batch); inFlight -= 1; });
-      return previous;
+      try {
+        await sleepMs(15);
+        const result = await store.append(input);
+        calls.push({ expected: input.expected, key: input.idempotencyKey, cursor: result.cursor });
+        return result;
+      } finally {
+        inFlight -= 1;
+      }
     },
-    async load() { return { events: stored.slice() }; },
   };
-  const agent = await createFxAgent(options(sourceBackend, journal));
+  const agent = await createFxAgent(options(sourceBackend, undefined, { persistence: slow }));
   await run(agent, "use the tool");
   await run(agent, "second");
   // The result does not wait for lazy appends; close does.
   await agent.close();
-  assert.equal(stored.at(-1).type, "turn_committed");
-  assertContiguous(stored);
-  assert.ok(maxInFlight > 1, "appends overlap instead of waiting for each other");
+  assert.equal(maxInFlight, 1, "each append waits for the cursor before it");
+  calls.forEach((call, index) => assert.equal(call.expected, index === 0 ? null : calls[index - 1].cursor));
+  assert.equal(new Set(calls.map((call) => call.key)).size, calls.length, "each write has its own key");
+  const events = storedEvents(store);
+  assert.equal(events.at(-1).type, "turn_committed");
+  assertContiguous(events);
 });
 
-test("a second agent on the same memory journal stops the first", async () => {
-  const journal = createMemoryJournal();
-  const first = await createFxAgent(options(sourceBackend, journal));
+test("a second agent on the same store fences the first", async () => {
+  const store = createMemoryPersistence();
+  const first = await createFxAgent(options(sourceBackend, undefined, { persistence: store }));
   await run(first, "from the first");
-  const second = await createFxAgent(options(targetBackend, journal));
+  const second = await createFxAgent(options(targetBackend, undefined, { persistence: store }));
   await run(second, "from the second");
   await second.close();
   const turn = first.prompt("too late");
-  const fenced = (error) => error.code === "FX_JOURNAL_APPEND_FAILED" && /expected seq/.test(error.cause.message);
+  const fenced = (error) => error.code === "FX_JOURNAL_APPEND_FAILED" && error.cause instanceof FxFencedError;
   await assert.rejects((async () => { for await (const _ of turn) {} })(), fenced);
   await assert.rejects(turn.result, fenced);
   await first.close();
-  assertContiguous(journal.events);
+  assertContiguous(storedEvents(store));
 });
 
 test("a journal that does not fold is refused", async () => {
-  const journal = createMemoryJournal();
+  const journal = eventJournal();
   const agent = await createFxAgent(options(sourceBackend, journal));
   await run(agent, "one");
   await agent.close();
   const invalid = (pattern) => (error) => pattern.test(error.message) && error.code === "FX_JOURNAL_INVALID";
-  const duplicated = createMemoryJournal([...journal.events, journal.events.at(-1)]);
+  const duplicated = eventJournal([...journal.events, journal.events.at(-1)]);
   await assert.rejects(createFxAgent(options(targetBackend, duplicated)), invalid(/libfx journal events are out of order/));
-  const newer = createMemoryJournal([{ ...journal.events[0], v: 2 }]);
+  const newer = eventJournal([{ ...journal.events[0], v: 2 }]);
   await assert.rejects(createFxAgent(options(targetBackend, newer)), /libfx journal was written by a newer fx/);
-  const garbled = createMemoryJournal([{ v: 1, seq: 1, turn: 1, type: "turn_committed", data: { kind: "nope" } }]);
+  const garbled = eventJournal([{ v: 1, seq: 1, turn: 1, type: "turn_committed", data: { kind: "nope" } }]);
   await assert.rejects(createFxAgent(options(targetBackend, garbled)), invalid(/Invalid libfx journal/));
-  const huge = createMemoryJournal([{ ...journal.events.at(-1), seq: 1, turn: 1, padding: "x".repeat(4 * 1024 * 1024) }]);
+  const huge = eventJournal([{ ...journal.events.at(-1), seq: 1, turn: 1, padding: "x".repeat(4 * 1024 * 1024) }]);
   await assert.rejects(
     createFxAgent(options(targetBackend, huge)),
     (error) => /libfx journal is too large/.test(error.message) && error.code === "FX_JOURNAL_TOO_LARGE",
@@ -464,19 +479,34 @@ test("a failed append fails the turn and stops the agent", async () => {
   await agent.close();
 });
 
-test("journal options are checked before the core starts", async () => {
-  await assert.rejects(createFxAgent(options(sourceBackend, { load() {} })), /journal must be an object with append\(\) and load\(\)/);
+test("persistence options are checked before the core starts", async () => {
   await assert.rejects(
-    createFxAgent(options(sourceBackend, createMemoryJournal(), { checkpoint: new Uint8Array(64) })),
-    /journal cannot be combined with checkpoint/,
+    createFxAgent(options(sourceBackend, undefined, { persistence: { load() {} } })),
+    /persistence must be an object with load\(\), append\(\) and, optionally, saveCheckpoint\(\)/,
   );
+  await assert.rejects(
+    createFxAgent(options(sourceBackend, undefined, { persistence: { load() {}, append() {}, saveCheckpoint: 1 } })),
+    /persistence must be an object/,
+  );
+  await assert.rejects(
+    createFxAgent(options(sourceBackend, eventJournal(), { checkpoint: new Uint8Array(64) })),
+    /persistence cannot be combined with checkpoint/,
+  );
+  await assert.rejects(createFxAgent(options(sourceBackend, undefined, { checkpointAfterBytes: 10 })), /checkpointAfterBytes needs persistence/);
+  await assert.rejects(
+    createFxAgent(options(sourceBackend, eventJournal(), { checkpointAfterBytes: -1 })),
+    /checkpointAfterBytes must be a non-negative integer/,
+  );
+  const agent = await createFxAgent(options(sourceBackend, eventJournal()));
+  assert.throws(() => agent.prompt("hello", { turnId: "a b" }), /turnId must be 1 to 128/);
+  await agent.close();
 });
 
 // A laptop runs a turn; while its tool runs, a function opens the same
 // journal and resumes the turn. The laptop's next append is fenced, and it
 // stops at once: no further request, tool call, or write.
 test("a session taken over mid-turn fences the first agent, which stops at once", async () => {
-  const journal = createMemoryJournal();
+  const journal = eventJournal();
   let toolStarted;
   const started = new Promise((resolveStarted) => { toolStarted = resolveStarted; });
   let releaseTool;
@@ -516,34 +546,33 @@ test("a session taken over mid-turn fences the first agent, which stops at once"
   assertContiguous(journal.events);
   assert.equal(journal.events.at(-1).type, "turn_committed");
 
-  const reopened = await createFxAgent(options(sourceBackend, createMemoryJournal(journal.events)));
+  const reopened = await createFxAgent(options(sourceBackend, eventJournal(journal.events)));
   assert.equal(reopened.resume(), null);
   assert.equal((await run(reopened, "what did I say")).text, "answer to what did I say");
   await reopened.close();
 });
 
-// The fencing invariants for a replay never call caught by a takeover.
-test("a takeover never reruns a never call and records one outcome for it", async () => {
-  const journal = createMemoryJournal();
+// The fencing invariants for a call a takeover catches running.
+test("a takeover does not run a running call again and records one outcome for it", async () => {
+  const journal = eventJournal();
   let toolStarted;
   const started = new Promise((resolveStarted) => { toolStarted = resolveStarted; });
   let releaseTool;
   const released = new Promise((resolveReleased) => { releaseTool = resolveReleased; });
   const runs = [];
-  const never = (who, wait) => ({
+  const sender = (who, wait) => ({
     ...lookup,
-    replay: "never",
     execute: async () => {
       runs.push(who);
       if (wait) { toolStarted(); await released; }
       return `${who} looked up alpha`;
     },
   });
-  const laptop = await createFxAgent(options(sourceBackend, journal, { tools: [never("laptop", true)] }));
+  const laptop = await createFxAgent(options(sourceBackend, journal, { tools: [sender("laptop", true)] }));
   const turn = laptop.prompt("use the tool");
   const drained = (async () => { for await (const _ of turn) {} })();
   await started;
-  const takeover = await createFxAgent(options(targetBackend, journal, { tools: [never("takeover", false)] }));
+  const takeover = await createFxAgent(options(targetBackend, journal, { tools: [sender("takeover", false)] }));
   const resumed = takeover.resume();
   for await (const _ of resumed) {}
   assert.equal((await resumed.result).stopReason, "end_turn");
@@ -561,11 +590,13 @@ test("a takeover never reruns a never call and records one outcome for it", asyn
   assert.ok(intents[0].seq < journal.events.findLast((event) => event.type === "turn_committed").seq);
   // OneOutcome and ResultByRunner: the session holds one result for the call, and it is
   // the takeover's account of a call it did not run, not the fenced laptop's output.
-  const reopened = await createFxAgent(options(sourceBackend, createMemoryJournal(journal.events), { tools: [never("reopened", false)] }));
-  requests.length = 0;
+  const reopened = await createFxAgent(options(sourceBackend, eventJournal(journal.events), { tools: [sender("reopened", false)] }));
   await run(reopened, "what did I say");
   await reopened.close();
-  const results = toolResults(requests[0]).filter((part) => part.toolCallId === "call-1");
+  // The fenced laptop's last request, carrying its own result, may arrive
+  // late; only the reopened agent's request shows the session.
+  const ownRequest = requests.find((prompt) => prompt.sessionId === reopened.sessionId);
+  const results = toolResults(ownRequest).filter((part) => part.toolCallId === "call-1");
   assert.equal(results.length, 1);
   assert.match(JSON.stringify(results[0]), /may have partly run/);
   assert.doesNotMatch(JSON.stringify(results[0]), /laptop looked up alpha/);
@@ -590,7 +621,7 @@ async function steeredTurn(journal) {
 const placedBy = (events, id) => events.filter((event) => event.type === "turn_progress" && (event.inputs ?? []).includes(id));
 
 test("a steer is stored before the model request that carries it", async () => {
-  const journal = createMemoryJournal();
+  const journal = eventJournal();
   const { agent, turn, drained, releaseTool } = await steeredTurn(journal);
   const steered = turn.steer("answer in one word");
   assert.match(steered.id, /^in_[0-9a-f-]+$/);
@@ -612,7 +643,7 @@ test("a steer is stored before the model request that carries it", async () => {
 });
 
 test("a steer withdrawn before its boundary never reaches the model", async () => {
-  const journal = createMemoryJournal();
+  const journal = eventJournal();
   const { agent, turn, drained, releaseTool } = await steeredTurn(journal);
   const kept = turn.steer("keep this one");
   const dropped = turn.steer("forget this one");
@@ -634,14 +665,14 @@ test("a steer withdrawn before its boundary never reaches the model", async () =
     // The native core accepted it before the withdraw, so both are stored.
     assert.ok(journal.events.some((event) => event.type === "input_withdrawn" && event.data.id === dropped.id));
   }
-  const reopened = await createFxAgent(options(targetBackend, createMemoryJournal(journal.events)));
+  const reopened = await createFxAgent(options(targetBackend, eventJournal(journal.events)));
   assert.equal(reopened.resume(), null);
   await reopened.close();
 });
 
 test("a steer accepted before a crash reaches the model when the turn resumes", async () => {
   if (sourceBackend !== "native") return; // the web core accepts a steer only when it places it
-  const journal = createMemoryJournal();
+  const journal = eventJournal();
   const { agent, turn, drained, releaseTool } = await steeredTurn(journal);
   const steered = await turn.steer("mention plums");
   // The crash: everything after the acceptance is lost.
@@ -652,7 +683,7 @@ test("a steer accepted before a crash reaches the model when the turn resumes", 
   await turn.result;
   await agent.close();
 
-  const crashed = createMemoryJournal(survived);
+  const crashed = eventJournal(survived);
   const resumedAgent = await createFxAgent(options(targetBackend, crashed));
   requests.length = 0;
   const resumed = resumedAgent.resume();
@@ -670,7 +701,7 @@ test("a steer accepted before a crash reaches the model when the turn resumes", 
 const followUpAccepted = (events, id) => events.filter((event) => event.type === "input_accepted" && event.data.id === id && event.data.kind === "follow_up");
 
 test("a follow-up queued during a turn runs after it as its own turn", async () => {
-  const journal = createMemoryJournal();
+  const journal = eventJournal();
   const { agent, turn, drained, releaseTool } = await steeredTurn(journal);
   const next = agent.followUp("then summarize");
   assert.match(next.id, /^in_[0-9a-f-]+$/);
@@ -697,7 +728,7 @@ test("a follow-up queued during a turn runs after it as its own turn", async () 
 
 test("a follow-up the journal holds runs when the session resumes", async () => {
   if (sourceBackend !== "native") return; // the web core stores a follow-up when its turn starts
-  const journal = createMemoryJournal();
+  const journal = eventJournal();
   const { agent, turn, drained, releaseTool } = await steeredTurn(journal);
   const next = agent.followUp("then summarize");
   await next.accepted;
@@ -710,7 +741,7 @@ test("a follow-up the journal holds runs when the session resumes", async () => 
   await agent.close();
   await next.catch(() => {});
 
-  const crashed = createMemoryJournal(survived);
+  const crashed = eventJournal(survived);
   const reopened = await createFxAgent(options(targetBackend, crashed));
   requests.length = 0;
   const resumed = reopened.resume();
@@ -721,14 +752,14 @@ test("a follow-up the journal holds runs when the session resumes", async () => 
   await reopened.close();
   assert.equal(lastUserText(requests[0]), "then summarize");
   assert.equal(placedBy(crashed.events, next.id).length, 1);
-  const again = await createFxAgent(options(sourceBackend, createMemoryJournal(crashed.events)));
+  const again = await createFxAgent(options(sourceBackend, eventJournal(crashed.events)));
   assert.equal(again.resume(), null, "nothing is left after the follow-up ran");
   await again.close();
 });
 
 test("a held follow-up waits for resume() without holding up the agent's own", async () => {
   if (sourceBackend !== "native") return; // the web core stores a follow-up when its turn starts
-  const journal = createMemoryJournal();
+  const journal = eventJournal();
   const { agent, turn, drained, releaseTool } = await steeredTurn(journal);
   const next = agent.followUp("then summarize");
   await next.accepted;
@@ -740,7 +771,7 @@ test("a held follow-up waits for resume() without holding up the agent's own", a
   await agent.close();
   await next.catch(() => {});
 
-  const reopened = await createFxAgent(options(targetBackend, createMemoryJournal(survived)));
+  const reopened = await createFxAgent(options(targetBackend, eventJournal(survived)));
   requests.length = 0;
   let timer;
   const late = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("the agent's own follow-up never started")), 10_000); });
@@ -759,7 +790,7 @@ test("a held follow-up waits for resume() without holding up the agent's own", a
 });
 
 test("a follow-up on an idle agent runs at once", async () => {
-  const journal = createMemoryJournal();
+  const journal = eventJournal();
   const agent = await createFxAgent(options(sourceBackend, journal));
   const queued = agent.followUp("right away");
   const now = await queued;
@@ -777,43 +808,39 @@ test("a follow-up on an idle agent runs at once", async () => {
 const sleepMs = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 const userTexts = (prompt) => prompt.filter((message) => message.role === "user").map(textOf);
 
-test("a turn left open under other tools is not resumed under these", async () => {
-  const journal = createMemoryJournal();
+test("a turn left open resumes under the tools the new agent has", async () => {
+  const journal = eventJournal();
   const { agent, turn, drained, releaseTool } = await steeredTurn(journal);
   const survived = journal.events.slice();
   releaseTool();
   await drained;
   await turn.result;
   await agent.close();
-  assert.ok(survived.some((event) => event.type === "session_config"), "the turn recorded its config");
 
   const changed = { ...lookup, description: "Looks up a key in another store" };
-  const other = await createFxAgent(options(targetBackend, createMemoryJournal(survived), { tools: [changed] }));
-  assert.throws(() => other.resume(), (error) => error instanceof FxConfigMismatchError && error.code === "FX_CONFIG_MISMATCH");
-  // prompt() ends the open turn as interrupted and runs under the new tools.
-  assert.equal((await run(other, "carry on")).result.stopReason, "end_turn");
-  await other.close();
-
-  const same = await createFxAgent(options(targetBackend, createMemoryJournal(survived)));
-  const resumed = same.resume();
-  assert.ok(resumed, "the same config resumes");
+  const other = await createFxAgent(options(targetBackend, eventJournal(survived), { tools: [changed] }));
+  requests.length = 0;
+  const resumed = other.resume();
+  assert.ok(resumed, "the open turn resumes");
   for await (const _ of resumed) {}
   assert.equal((await resumed.result).stopReason, "end_turn");
-  await same.close();
+  await other.close();
+  assert.ok(JSON.stringify(requests[0]).includes("Resuming from unexpected session interruption."));
 });
 
-test("a journal from a newer libfx and the deprecated checkpoint are reported", async () => {
-  const future = createMemoryJournal([{ v: 2, seq: 1, turn: 1, type: "turn_progress", data: {} }]);
-  await assert.rejects(createFxAgent(options(sourceBackend, future)), (error) => error instanceof FxJournalVersionError && error.code === "FX_JOURNAL_VERSION");
-
-  const deprecations = [];
-  const onEvent = (event) => { if (event.type === "deprecated") deprecations.push(event.api); };
-  const agent = await createFxAgent(options(sourceBackend, undefined, { onEvent }));
-  await run(agent, "hello");
-  await agent.checkpoint();
-  await agent.checkpoint();
-  await agent.close();
-  assert.deepEqual(deprecations, ["checkpoint"]);
+test("a journal from a newer libfx is refused", async () => {
+  const future = eventJournal([{ v: 2, seq: 1, turn: 1, type: "turn_progress", data: {} }]);
+  const newer = (error) => error instanceof FxJournalVersionError && error.code === "FX_JOURNAL_VERSION";
+  await assert.rejects(createFxAgent(options(sourceBackend, future)), newer);
+  const record = (format) => ({
+    async load() { return { journal: [{ cursor: "1", data: new TextEncoder().encode(JSON.stringify({ format, events: [] })) }] }; },
+    async append() { throw new Error("not reached"); },
+  });
+  await assert.rejects(createFxAgent(options(sourceBackend, undefined, { persistence: record("libfx-journal-v2") })), newer);
+  await assert.rejects(
+    createFxAgent(options(sourceBackend, undefined, { persistence: record("something-else") })),
+    (error) => error.code === "FX_JOURNAL_INVALID",
+  );
 });
 
 // Written by the first libfx with journals (format v1): a journal whose last
@@ -823,7 +850,7 @@ const fixture = JSON.parse(await readFile(resolve(scriptDir, "fixtures/libfx-jou
 
 test("a v1 journal from the first journaled libfx still resumes", async () => {
   assert.equal(fixture.format, "libfx-journal-v1");
-  const plain = await createFxAgent(options(targetBackend, createMemoryJournal(fixture.plain.events)));
+  const plain = await createFxAgent(options(targetBackend, eventJournal(fixture.plain.events)));
   requests.length = 0;
   const resumed = plain.resume();
   assert.ok(resumed, "the open turn resumes");
@@ -847,21 +874,18 @@ const previousCheckpoint = JSON.parse(await readFile(resolve(scriptDir, "fixture
 
 test("a checkpoint saved by the previous published libfx restores in this one", async () => {
   assert.equal(previousCheckpoint.libfx, "0.0.11");
-  const deprecations = [];
-  const onEvent = (event) => { if (event.type === "deprecated") deprecations.push(event.api); };
   const checkpoint = new Uint8Array(Buffer.from(previousCheckpoint.checkpoint, "base64"));
-  const agent = await createFxAgent(options(targetBackend, undefined, { checkpoint, onEvent }));
+  const agent = await createFxAgent(options(targetBackend, undefined, { checkpoint }));
   requests.length = 0;
   await run(agent, "what did I say");
   await agent.close();
-  assert.deepEqual(deprecations, ["checkpoint"]);
   const users = userTexts(requests[0]);
   for (const text of ["remember plums", "use the tool", "what did I say"]) assert.ok(users.includes(text), `${text} is in the history`);
   assert.ok(JSON.stringify(toolResults(requests[0])).includes("value of alpha is beta"), "the tool result survived");
 });
 
 test("each progress event names the model its request goes to", async () => {
-  const journal = createMemoryJournal();
+  const journal = eventJournal();
   const agent = await createFxAgent(options(sourceBackend, journal));
   await run(agent, "use the tool");
   await agent.close();
@@ -871,7 +895,7 @@ test("each progress event names the model its request goes to", async () => {
 });
 
 test("a turn handed off mid-tool stays open for the next agent", async () => {
-  const journal = createMemoryJournal();
+  const journal = eventJournal();
   const { agent, turn, drained, releaseTool } = await steeredTurn(journal);
   turn.cancel({ reason: "handoff" });
   releaseTool();
@@ -884,7 +908,7 @@ test("a turn handed off mid-tool stays open for the next agent", async () => {
   const ends = journal.events.filter((event) => event.type === "turn_committed" || event.type === "turn_progress_cleared");
   assert.deepEqual(ends, [], "nothing ended the handed-off turn");
 
-  const next = await createFxAgent(options(targetBackend, createMemoryJournal(journal.events)));
+  const next = await createFxAgent(options(targetBackend, eventJournal(journal.events)));
   requests.length = 0;
   const resumed = next.resume();
   assert.ok(resumed, "the next agent resumes the turn");
@@ -894,10 +918,10 @@ test("a turn handed off mid-tool stays open for the next agent", async () => {
   assert.ok(JSON.stringify(requests[0]).includes("Resuming from unexpected session interruption"));
 });
 
-test("a handoff needs a journal and takes no other reason", async () => {
+test("a handoff needs persistence and takes no other reason", async () => {
   const plain = await createFxAgent(options(sourceBackend));
   const turn = plain.prompt("hello");
-  assert.throws(() => turn.cancel({ reason: "handoff" }), /needs a journal/);
+  assert.throws(() => turn.cancel({ reason: "handoff" }), /needs persistence/);
   assert.throws(() => turn.cancel({ reason: "later" }), /reason must be "handoff"/);
   for await (const _ of turn) {}
   await turn.result;
@@ -905,7 +929,7 @@ test("a handoff needs a journal and takes no other reason", async () => {
 });
 
 test("a crash late in a long tool turn restores though its progress outgrew a load", async () => {
-  const journal = createMemoryJournal();
+  const journal = eventJournal();
   const tools = [lookup, bulky];
   const source = await createFxAgent(options(sourceBackend, journal, { tools }));
   const { text } = await run(source, "gather everything");
@@ -916,7 +940,7 @@ test("a crash late in a long tool turn restores though its progress outgrew a lo
   const rawBytes = new TextEncoder().encode(JSON.stringify(crashed)).byteLength;
   assert.ok(rawBytes > 4 * 1024 * 1024, `the turn's progress events hold ${rawBytes} bytes`);
 
-  const target = await createFxAgent(options(targetBackend, createMemoryJournal(crashed), { tools }));
+  const target = await createFxAgent(options(targetBackend, eventJournal(crashed), { tools }));
   const turn = target.resume();
   assert.ok(turn, "the crashed turn is open");
   for await (const _ of turn) {}
@@ -927,14 +951,14 @@ test("a crash late in a long tool turn restores though its progress outgrew a lo
 
 test("a turn that fails ends in the journal and is not resumed", async () => {
   for (const backend of [sourceBackend, targetBackend]) {
-    const journal = createMemoryJournal();
+    const journal = eventJournal();
     const agent = await createFxAgent(options(backend, journal));
     const failed = await run(agent, "fail please");
     assert.notEqual(failed.result.stopReason, "end_turn");
     await agent.close();
     assert.equal(journal.events.at(-1).type, "turn_progress_cleared", journal.events.map((event) => event.type).join(","));
 
-    const next = await createFxAgent(options(backend, createMemoryJournal(journal.events)));
+    const next = await createFxAgent(options(backend, eventJournal(journal.events)));
     assert.equal(next.resume(), null, "a failed turn is not a crashed one");
     assert.equal((await run(next, "hello")).text, "answer to hello");
     await next.close();
@@ -943,7 +967,7 @@ test("a turn that fails ends in the journal and is not resumed", async () => {
 
 test("a follow-up cancelled as its turn starts never runs again", async () => {
   for (const backend of [sourceBackend, targetBackend]) {
-    const journal = createMemoryJournal();
+    const journal = eventJournal();
     const agent = await createFxAgent(options(backend, journal));
     await run(agent, "one");
     // On an idle agent the follow-up starts at once; the cancel lands before
@@ -955,7 +979,7 @@ test("a follow-up cancelled as its turn starts never runs again", async () => {
     await cancelled.result;
     await agent.close();
 
-    const reopened = await createFxAgent(options(backend, createMemoryJournal(journal.events)));
+    const reopened = await createFxAgent(options(backend, eventJournal(journal.events)));
     assert.equal(reopened.resume(), null, "the cancelled follow-up is not run again");
     await reopened.close();
   }
@@ -963,7 +987,7 @@ test("a follow-up cancelled as its turn starts never runs again", async () => {
 
 test("a cancel during a slow journal's barrier ends the turn as the agent does", async () => {
   for (const backend of [sourceBackend, targetBackend]) {
-    const stored = createMemoryJournal();
+    const stored = eventJournal();
     let previous = Promise.resolve();
     // Each append lands 300 ms after the one before it.
     const journal = {
@@ -991,7 +1015,7 @@ test("a cancel during a slow journal's barrier ends the turn as the agent does",
     // turn ends as interrupted, as a cancel anywhere else in a step does.
     if (backend === "native") assert.ok(committed, types);
 
-    const reopened = await createFxAgent(options(backend, createMemoryJournal(stored.events)));
+    const reopened = await createFxAgent(options(backend, eventJournal(stored.events)));
     assert.equal(reopened.resume(), null, "a cancelled turn is not resumed");
     requests.length = 0;
     await run(reopened, "again");
@@ -1002,13 +1026,13 @@ test("a cancel during a slow journal's barrier ends the turn as the agent does",
 
 test("a resumed turn cancelled during a slow journal's barrier is committed once", async () => {
   for (const backend of [sourceBackend, targetBackend]) {
-    const journal = createMemoryJournal();
+    const journal = eventJournal();
     const agent = await createFxAgent(options(backend, journal));
     await run(agent, "use the tool");
     await agent.close();
     // The crash: after the progress that holds the tool's result.
     const crashed = journal.events.slice(0, journal.events.findLastIndex((event) => event.type === "turn_progress") + 1);
-    const stored = createMemoryJournal(crashed);
+    const stored = eventJournal(crashed);
     let previous = Promise.resolve();
     const slow = {
       load: () => stored.load(),
@@ -1039,13 +1063,13 @@ const pngData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8
 test("an image prompt after a crashed image turn gets the next image id", async () => {
   const vision = { modelCatalog: [{ id: "journal/model", type: "language", tags: ["tool-use", "vision", "file-input"] }] };
   const image = { type: "image", data: pngData, mimeType: "image/png" };
-  const journal = createMemoryJournal();
+  const journal = eventJournal();
   const agent = await createFxAgent(options(sourceBackend, journal, vision));
   await run(agent, [{ type: "text", text: "look at this" }, image]);
   await agent.close();
   // The crash: the turn's first progress is stored, its commit is not.
   const firstProgress = journal.events.findIndex((event) => event.type === "turn_progress");
-  const reopened = await createFxAgent(options(targetBackend, createMemoryJournal(journal.events.slice(0, firstProgress + 1)), vision));
+  const reopened = await createFxAgent(options(targetBackend, eventJournal(journal.events.slice(0, firstProgress + 1)), vision));
   requests.length = 0;
   const { result } = await run(reopened, [{ type: "text", text: "and this" }, image]);
   await reopened.close();
@@ -1054,67 +1078,151 @@ test("an image prompt after a crashed image turn gets the next image id", async 
 });
 
 test("a journal past the turn limit is refused by name", async () => {
-  const journal = createMemoryJournal();
+  const journal = eventJournal();
   const agent = await createFxAgent(options(sourceBackend, journal));
   await run(agent, "one");
   await agent.close();
   const commit = journal.events.find((event) => event.type === "turn_committed");
   const turns = Array.from({ length: 1025 }, (_, index) => ({ ...commit, seq: index + 1, turn: index + 1 }));
   await assert.rejects(
-    createFxAgent(options(targetBackend, createMemoryJournal(turns))),
+    createFxAgent(options(targetBackend, eventJournal(turns))),
     (error) => error.message === "libfx journal holds more than 1024 turns" && error.code === "FX_JOURNAL_TOO_LARGE",
   );
 });
 
-test("a journal's close() runs once, whether the agent closes or never opens", async () => {
-  for (const backend of [sourceBackend, targetBackend]) {
-    let closes = 0;
-    const stored = createMemoryJournal();
-    const counted = { load: () => stored.load(), append: (batch) => stored.append(batch), close() { closes += 1; } };
-    const agent = await createFxAgent(options(backend, counted));
-    await run(agent, "one");
-    await agent.close();
-    await agent.close();
-    assert.equal(closes, 1, `${backend}: a second close() does not close the journal again`);
-
-    closes = 0;
-    const garbled = { ...counted, load: async () => ({ events: [{ v: 1, seq: 1, turn: 1, type: "turn_committed", data: { kind: "nope" } }] }) };
-    await assert.rejects(createFxAgent(options(backend, garbled)), (error) => error.code === "FX_JOURNAL_INVALID");
-    for (let waited = 0; closes === 0 && waited < 2000; waited += 20) await sleepMs(20);
-    assert.equal(closes, 1, `${backend}: the core exited, so the journal was closed`);
-  }
-});
-
 test("a host session id reaches the gateway and stays the same across a restore", async () => {
-  const journal = createMemoryJournal();
+  const journal = eventJournal();
   sessionHeaders.length = 0;
   const source = await createFxAgent(options(sourceBackend, journal, { sessionId: "app-session-1" }));
   await run(source, "remember plums");
   await source.close();
-  const target = await createFxAgent(options(targetBackend, createMemoryJournal(journal.events), { sessionId: "app-session-1" }));
+  const target = await createFxAgent(options(targetBackend, eventJournal(journal.events), { sessionId: "app-session-1" }));
   await run(target, "what did I say");
   await target.close();
   assert.ok(sessionHeaders.length >= 2);
   assert.ok(sessionHeaders.every(([id, affinity]) => id === "app-session-1" && affinity === "app-session-1"), JSON.stringify(sessionHeaders));
 });
 
-test("a journal that names its session supplies the session id", async () => {
-  const named = (inner) => ({ append: (batch) => inner.append(batch), load: async () => ({ ...(await inner.load()), sessionId: "journal-session" }) });
-  const journal = createMemoryJournal();
-  sessionHeaders.length = 0;
-  const agent = await createFxAgent(options(sourceBackend, named(journal)));
-  await run(agent, "remember plums");
-  await agent.close();
-  assert.ok(sessionHeaders.every(([id]) => id === "journal-session"), JSON.stringify(sessionHeaders));
-
-  await assert.rejects(
-    createFxAgent(options(sourceBackend, named(createMemoryJournal(journal.events)), { sessionId: "other-session" })),
-    /sessionId does not match the journal's session/,
-  );
-  await assert.rejects(createFxAgent(options(sourceBackend, createMemoryJournal(), { sessionId: "a b" })), /sessionId must be 1 to 255/);
-  await assert.rejects(createFxAgent(options(sourceBackend, createMemoryJournal(), { sessionId: "a\r\nx-injected: 1" })), /sessionId must be 1 to 255/);
+test("a session id must be safe to send as a header", async () => {
+  await assert.rejects(createFxAgent(options(sourceBackend, eventJournal(), { sessionId: "a b" })), /sessionId must be 1 to 255/);
+  await assert.rejects(createFxAgent(options(sourceBackend, eventJournal(), { sessionId: "a\r\nx-injected: 1" })), /sessionId must be 1 to 255/);
 });
 
+test("a checkpoint is saved after a turn, and a restore reads it and only the records after it", async () => {
+  const store = createMemoryPersistence();
+  const saves = [];
+  const onEvent = (event) => { if (event.type.startsWith("checkpoint.")) saves.push(event); };
+  const source = await createFxAgent(options(sourceBackend, undefined, { persistence: store, checkpointAfterBytes: 0, onEvent }));
+  await run(source, "remember plums");
+  const last = source.prompt("use the tool", { turnId: "turn-last" });
+  for await (const _ of last) {}
+  await last.result;
+  await source.close();
+  assert.ok(saves.length >= 1 && saves.every((event) => event.type === "checkpoint.save"), JSON.stringify(saves));
+  assert.ok(store.checkpoint, "the store holds a checkpoint");
+  assert.equal(store.checkpoint.through, store.records.at(-1).cursor, "it covers every record the session wrote");
+
+  // The checkpoint alone knows the last turn ended, so its retry does not run.
+  const target = await createFxAgent(options(targetBackend, undefined, { persistence: store }));
+  requests.length = 0;
+  const retried = target.prompt("use the tool", { turnId: "turn-last" });
+  assert.equal((await retried.result).stopReason, "end_turn");
+  assert.equal(requests.length, 0, "the ended turn did not run again");
+  await run(target, "what did I say");
+  await target.close();
+  const users = userTexts(requests[0]);
+  for (const text of ["remember plums", "use the tool", "what did I say"]) assert.ok(users.includes(text), `${text} is in the history`);
+  assert.equal(toolResults(requests[0]).length, 1);
+  const loaded = await store.load();
+  assert.ok(loaded.checkpoint);
+  assert.ok(loaded.journal.length > 0 && loaded.journal.length < store.records.length, "a load returns only the records after the checkpoint");
+  assertContiguous(storedEvents(store));
+});
+
+test("a failed checkpoint save is reported and the records still restore the session", async () => {
+  const store = createMemoryPersistence();
+  const failing = { load: () => store.load(), append: (input) => store.append(input), async saveCheckpoint() { throw new Error("bucket full"); } };
+  const errors = [];
+  const onEvent = (event) => { if (event.type === "checkpoint.error") errors.push(event.message); };
+  const agent = await createFxAgent(options(sourceBackend, undefined, { persistence: failing, checkpointAfterBytes: 0, onEvent }));
+  await run(agent, "remember plums");
+  await agent.close();
+  assert.deepEqual(errors, ["bucket full"]);
+  const target = await createFxAgent(options(targetBackend, undefined, { persistence: store }));
+  requests.length = 0;
+  await run(target, "what did I say");
+  await target.close();
+  assert.ok(userTexts(requests[0]).includes("remember plums"));
+});
+
+test("a retried prompt with the same turn id continues its open turn instead of adding the prompt again", async () => {
+  const journal = eventJournal();
+  const agent = await createFxAgent(options(sourceBackend, journal));
+  await run(agent, "first");
+  const turn = agent.prompt("remember plums", { turnId: "turn-7" });
+  assert.equal(turn.id, "turn-7");
+  for await (const _ of turn) {}
+  await turn.result;
+  await agent.close();
+  assert.ok(journal.events.some((event) => event.type === "turn_progress" && event.turnId === "turn-7"), "the turn's first progress records its id");
+  // The crash: the turn's commit was lost.
+  const crashed = eventJournal(journal.events.slice(0, -1));
+  const retried = await createFxAgent(options(targetBackend, crashed));
+  requests.length = 0;
+  const again = retried.prompt("remember plums", { turnId: "turn-7" });
+  assert.equal(again.id, "turn-7");
+  for await (const _ of again) {}
+  assert.equal((await again.result).stopReason, "end_turn");
+  await retried.close();
+  assert.ok(JSON.stringify(requests[0]).includes("Resuming from unexpected session interruption."));
+  assert.equal(userTexts(requests[0]).filter((text) => text === "remember plums").length, 1, "the prompt is in the history once");
+  assert.deepEqual(crashed.events.filter((event) => event.type === "turn_committed").map((event) => event.data.kind), ["assistant", "assistant"]);
+  assertContiguous(crashed.events);
+});
+
+test("a retried prompt with the id of a turn that ended does not run it again", async () => {
+  const journal = eventJournal();
+  const agent = await createFxAgent(options(sourceBackend, journal));
+  const turn = agent.prompt("remember plums", { turnId: "turn-8" });
+  for await (const _ of turn) {}
+  await turn.result;
+  requests.length = 0;
+  const same = agent.prompt("remember plums", { turnId: "turn-8" });
+  assert.equal((await same.result).stopReason, "end_turn");
+  await agent.close();
+
+  const restored = await createFxAgent(options(targetBackend, journal));
+  const retried = restored.prompt("remember plums", { turnId: "turn-8" });
+  assert.equal(retried.id, "turn-8");
+  for await (const _ of retried) {}
+  assert.equal((await retried.result).stopReason, "end_turn");
+  assert.equal(requests.length, 0, "no model request ran for the ended turn");
+  // Another id is another turn.
+  const next = restored.prompt("and now", { turnId: "turn-9" });
+  for await (const _ of next) {}
+  assert.equal((await next.result).stopReason, "end_turn");
+  await restored.close();
+  assert.equal(requests.length, 1);
+  assert.equal(journal.events.filter((event) => event.type === "turn_committed").length, 2);
+  assertContiguous(journal.events);
+});
+
+test("a tool receives the turn id and the model's call id", async () => {
+  const seen = [];
+  const recording = {
+    ...lookup,
+    execute: async (input, context) => {
+      seen.push({ turnId: context.turnId, callId: context.callId, signal: context.signal instanceof AbortSignal });
+      return lookup.execute(input);
+    },
+  };
+  const agent = await createFxAgent(options(sourceBackend, eventJournal(), { tools: [recording] }));
+  const turn = agent.prompt("use the tool", { turnId: "turn-tools" });
+  for await (const _ of turn) {}
+  await turn.result;
+  await agent.close();
+  assert.deepEqual(seen, [{ turnId: "turn-tools", callId: "call-1", signal: true }]);
+});
 try {
   for (const { name, body } of cases) {
     await body();

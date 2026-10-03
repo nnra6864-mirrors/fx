@@ -529,28 +529,6 @@ fn activeToolSet(state: *const server.ServerState) tool_set_contract.ToolSet {
     return tool_call_presentation.activeToolSet(state);
 }
 
-/// Runs a resumed turn's safe calls again through the host, as the turn's
-/// tools run.
-const ResumeRerun = struct {
-    ctx: *AcpContext,
-    cancel_flag: *std.atomic.Value(bool),
-    max_result_bytes: usize,
-
-    pub fn safe(self: ResumeRerun, call: types.ToolCall) bool {
-        const tool = self.ctx.toolRegistry().lookup(call.name) orelse return false;
-        return tool.executor_kind == .host and !tool.provider_executed and !tool.host_replay_never;
-    }
-
-    /// Null when the turn is cancelled or handed off, or no host can run it.
-    pub fn run(self: ResumeRerun, alloc: Allocator, call: types.ToolCall) !?tool_dispatch.ToolResult {
-        const provider = hostToolProvider(self.ctx.state) orelse return null;
-        return provider.call(alloc, call.name, call.id, call.arguments_json, self.max_result_bytes, self.cancel_flag) catch |err| switch (err) {
-            error.Cancelled => null,
-            else => |other| other,
-        };
-    }
-};
-
 fn hostToolProvider(state: *server.ServerState) ?tool_dispatch.HostToolProvider {
     if (state.host_tools.tools.len == 0) return null;
     if (comptime host_target.is_wasm) return js_host_tools.provider();
@@ -904,7 +882,6 @@ pub fn handlePrompt(
         const inputs = journal.takePendingInputs();
         defer journal_events.freePendingInputs(state.alloc, inputs);
         recovery_checkpoint = try libfx_journal.resumeCheckpoint(alloc, pending, inputs);
-        const answered_step = journal.pending_resume_answered;
         {
             session.session_write_mutex.lockUncancelable(io_mod.getIo());
             defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -914,16 +891,6 @@ pub fn handlePrompt(
             try journal.notePlaced(state.alloc, ids);
         }
         journal.dropPendingResume(state.alloc);
-        // Calls the crash left running whose tool is `replay: "safe"` run
-        // again before the turn continues, and their results replace the
-        // answer that they may have partly run.
-        if (answered_step) |step| {
-            _ = try libfx_journal.rerunSafeCalls(alloc, &recovery_checkpoint.?, step, ResumeRerun{
-                .ctx = &ctx,
-                .cancel_flag = &session.cancel_flag,
-                .max_result_bytes = session.max_tool_result_bytes,
-            });
-        }
     } else if (prompt_input.continue_recovery) {
         const writable = if (session.writable) |*value| value else return .{
             .rpc_error = .{
@@ -956,7 +923,9 @@ pub fn handlePrompt(
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
         defer session.session_write_mutex.unlock(io_mod.getIo());
         journal.barrier_next_progress = true;
-        try journal.noteConfig(alloc, state.alloc, session.session_id);
+        // A new turn's first progress records the host's id for it; a
+        // resumed turn keeps the id it started with.
+        journal.nameNextTurn(prompt_input.turn_id);
         // A follow-up's turn places it in its first progress, a barrier. The
         // web core records its acceptance only now.
         if (prompt_input.input_id) |input_id| {
@@ -1423,6 +1392,8 @@ const ParsedPromptInput = struct {
     continue_recovery: bool = false,
     /// The follow-up this prompt runs, which its first progress places.
     input_id: ?[]u8 = null,
+    /// The host's id for the turn this prompt starts.
+    turn_id: ?[]u8 = null,
     /// Whether the host already recorded the follow-up as accepted.
     input_accepted: bool = false,
     targets: []context_contract.ApplicableTarget = &.{},
@@ -1500,6 +1471,7 @@ const ParsedPromptInput = struct {
     fn deinit(self: *ParsedPromptInput, alloc: Allocator) void {
         alloc.free(self.text);
         if (self.input_id) |id| alloc.free(id);
+        if (self.turn_id) |id| alloc.free(id);
         for (self.targets) |target| alloc.free(@constCast(target.path));
         if (self.targets.len > 0) alloc.free(self.targets);
         for (self.omissions) |omission| alloc.free(@constCast(omission.source));
@@ -1584,6 +1556,10 @@ fn parsePromptInputWithFirstImageId(
     else
         null;
     const input_accepted = acp_types.fxMetaBool(parsed.value.object, "inputAccepted") orelse false;
+    const turn_id: ?[]const u8 = if (acp_types.fxMetaField(parsed.value.object, "turnId")) |value|
+        if (value == .string and libfx_steering.validInputId(value.string)) value.string else null
+    else
+        null;
 
     const prompt_arr = parsed.value.object.get("prompt") orelse
         return .{ .text = try alloc.dupe(u8, ""), .continue_recovery = continue_recovery };
@@ -1714,6 +1690,7 @@ fn parsePromptInputWithFirstImageId(
     };
     errdefer result.deinit(alloc);
     if (input_id) |id| result.input_id = try alloc.dupe(u8, id);
+    if (turn_id) |id| result.turn_id = try alloc.dupe(u8, id);
     result.targets = try targets.toOwnedSlice(alloc);
     result.omissions = try omissions.toOwnedSlice(alloc);
     result.pending_images = try pending_images.toOwnedSlice(alloc);
@@ -2590,9 +2567,9 @@ fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !v
 
 /// `AgentRuntimeDeps.append_turn_piece` for a journaled libfx session. The
 /// orchestrator calls it before any call in a batch runs: the calls reach the
-/// journal first, and a batch with a `replay: "never"` call waits until the
-/// host holds them, so such a call never starts without a durable intent.
-/// Finished pieces travel in `turn_progress` instead.
+/// journal first, and a batch with a call fx runs itself waits until the host
+/// holds them, so no such call starts without a durable intent. Finished
+/// pieces travel in `turn_progress` instead.
 fn appendJournalToolIntent(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !void {
     if (progress.running_calls.len == 0) return;
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
@@ -2606,7 +2583,9 @@ fn appendJournalToolIntent(raw_ctx: *anyopaque, progress: agent_runtime.TurnProg
     const registry = ctx.toolRegistry();
     for (progress.running_calls) |call| {
         const tool = registry.lookup(call.name) orelse continue;
-        if (tool.host_replay_never) return flushJournal(ctx.state, ctx.alloc, session.session_id);
+        // Every call fx runs itself waits for its intent to be stored; a
+        // call the provider runs has no effect here to guard.
+        if (!tool.provider_executed) return flushJournal(ctx.state, ctx.alloc, session.session_id);
     }
 }
 

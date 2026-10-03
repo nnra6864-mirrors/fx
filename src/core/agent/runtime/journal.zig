@@ -21,12 +21,11 @@
 //!   model sees it
 //! - `input_withdrawn`: a steer the host took back before it was placed, or
 //!   a follow-up whose turn ended before its first progress
-//! - `session_config`: a hash of the host's instructions, tools and model,
-//!   when a turn starts under a hash the journal has not recorded
 //!
 //! A `turn_progress` event lists the inputs its model request carries for
 //! the first time in `inputs`, so placement is stored with the text it
-//! places, and names the model the request goes to in `model`. A steer
+//! places, and names the model the request goes to in `model`. A turn's
+//! first progress carries the host's id for the turn in `turnId`. A steer
 //! belongs to the turn it arrives in; a follow-up waits for the turn that
 //! runs it.
 const std = @import("std");
@@ -38,9 +37,14 @@ const compactor = @import("../../compactor/compactor.zig");
 const Allocator = std.mem.Allocator;
 
 pub const version: u8 = 1;
-/// The most event bytes one load accepts: they travel as one host
-/// attachment, and an attachment holds at most one kernel checkpoint.
+/// The most event bytes one load accepts, and the most bytes one snapshot
+/// holds: each travels as one host attachment, and an attachment holds at
+/// most one kernel checkpoint. Longer sessions need snapshots.
 pub const max_load_bytes: usize = checkpoint_codec.max_checkpoint_bytes;
+pub const max_snapshot_bytes: usize = checkpoint_codec.max_checkpoint_bytes;
+/// The largest `seq` or turn a host can carry: hosts in JavaScript hold them
+/// as numbers.
+const max_safe_position: u64 = (1 << 53) - 1;
 pub const max_history_turns = checkpoint_codec.max_history_turns;
 
 const EventType = enum {
@@ -51,7 +55,6 @@ const EventType = enum {
     history_replaced,
     input_accepted,
     input_withdrawn,
-    session_config,
 };
 
 const InputKind = enum { steer, follow_up };
@@ -69,7 +72,12 @@ pub const Progress = struct {
     checkpoint: session_codec.RecoveryCheckpoint,
     placed: []const []const u8 = &.{},
     model: ?[]const u8 = null,
+    /// The host's id for the turn, on the turn's first progress only.
+    turn_id: ?[]const u8 = null,
 };
+
+/// The longest turn id a host may give.
+pub const max_turn_id_bytes = 128;
 
 /// Borrows its payload only for `Cursor.write`.
 pub const Event = union(EventType) {
@@ -81,8 +89,6 @@ pub const Event = union(EventType) {
     input_accepted: Input,
     /// The withdrawn input's id.
     input_withdrawn: []const u8,
-    /// The host's config hash.
-    session_config: []const u8,
 };
 
 /// An input the open turn accepted and has not placed or withdrawn.
@@ -121,6 +127,10 @@ pub const Cursor = struct {
                     try writer.writeAll(",\"model\":");
                     try std.json.Stringify.value(model, .{}, writer);
                 }
+                if (progress.turn_id) |id| {
+                    try writer.writeAll(",\"turnId\":");
+                    try std.json.Stringify.value(id, .{}, writer);
+                }
             },
             .tool_intent => |calls| {
                 try writer.writeAll(",\"data\":");
@@ -144,10 +154,6 @@ pub const Cursor = struct {
                 try writer.writeAll(",\"data\":");
                 try std.json.Stringify.value(.{ .id = id }, .{}, writer);
             },
-            .session_config => |hash| {
-                try writer.writeAll(",\"data\":");
-                try std.json.Stringify.value(.{ .hash = hash }, .{}, writer);
-            },
         }
         try writer.writeByte('}');
         return .{
@@ -157,8 +163,65 @@ pub const Cursor = struct {
     }
 };
 
-/// The longest config hash a host may record.
-pub const max_config_hash_bytes = 128;
+/// A snapshot of a quiet prefix: `FXSN`, a version byte, the last `seq` it
+/// covers and the turn after it (each a little-endian u64), the id of the
+/// last turn (a length byte, zero for none, then its bytes), then a
+/// checkpoint of the history. Hosts store it as opaque bytes.
+const snapshot_magic = "FXSN";
+const snapshot_version: u8 = 1;
+const snapshot_header_bytes = snapshot_magic.len + 1 + 8 + 8 + 1;
+
+pub const Snapshot = struct {
+    /// The last event the snapshot covers; the tail starts after it.
+    seq: u64,
+    turn: u64,
+    /// The last turn's id. Borrowed from the snapshot bytes.
+    last_turn_id: ?[]const u8,
+    /// Borrowed from the snapshot bytes.
+    checkpoint: []const u8,
+};
+
+/// Returns caller-owned snapshot bytes for a checkpoint taken after `seq`.
+/// `last_turn_id` is at most `max_turn_id_bytes` long.
+pub fn encodeSnapshot(
+    alloc: Allocator,
+    seq: u64,
+    turn: u64,
+    last_turn_id: ?[]const u8,
+    checkpoint: []const u8,
+) Allocator.Error![]u8 {
+    const id = last_turn_id orelse "";
+    std.debug.assert(id.len <= max_turn_id_bytes);
+    const bytes = try alloc.alloc(u8, snapshot_header_bytes + id.len + checkpoint.len);
+    @memcpy(bytes[0..snapshot_magic.len], snapshot_magic);
+    bytes[snapshot_magic.len] = snapshot_version;
+    std.mem.writeInt(u64, bytes[snapshot_magic.len + 1 ..][0..8], seq, .little);
+    std.mem.writeInt(u64, bytes[snapshot_magic.len + 9 ..][0..8], turn, .little);
+    bytes[snapshot_header_bytes - 1] = @intCast(id.len);
+    @memcpy(bytes[snapshot_header_bytes..][0..id.len], id);
+    @memcpy(bytes[snapshot_header_bytes + id.len ..], checkpoint);
+    return bytes;
+}
+
+pub fn parseSnapshot(bytes: []const u8) LoadError!Snapshot {
+    if (bytes.len < snapshot_header_bytes or !std.mem.eql(u8, bytes[0..snapshot_magic.len], snapshot_magic)) {
+        return error.InvalidJournal;
+    }
+    const found_version = bytes[snapshot_magic.len];
+    if (found_version > snapshot_version) return error.UnsupportedJournalVersion;
+    if (found_version != snapshot_version) return error.InvalidJournal;
+    const seq = std.mem.readInt(u64, bytes[snapshot_magic.len + 1 ..][0..8], .little);
+    const turn = std.mem.readInt(u64, bytes[snapshot_magic.len + 9 ..][0..8], .little);
+    if (seq == 0 or turn == 0 or seq > max_safe_position or turn > max_safe_position) return error.InvalidJournal;
+    const id_len = bytes[snapshot_header_bytes - 1];
+    if (id_len > max_turn_id_bytes or bytes.len - snapshot_header_bytes < id_len) return error.InvalidJournal;
+    return .{
+        .seq = seq,
+        .turn = turn,
+        .last_turn_id = if (id_len == 0) null else bytes[snapshot_header_bytes..][0..id_len],
+        .checkpoint = bytes[snapshot_header_bytes + id_len ..],
+    };
+}
 
 pub const LoadError = Allocator.Error || error{
     /// An event is not the shape this version writes.
@@ -186,10 +249,10 @@ pub const Folded = struct {
     pending_inputs: []PendingInput = &.{},
     /// Follow-ups no turn has run yet, in the order they arrived.
     pending_follow_ups: []PendingInput = &.{},
-    /// The last config hash the journal recorded.
-    config_hash: ?[]u8 = null,
-    /// The config hash in force when the open turn started, if recorded.
-    open_turn_config: ?[]u8 = null,
+    /// The host's id for the open turn, when it gave one.
+    open_turn_id: ?[]u8 = null,
+    /// The host's id for the last turn that ended, when it gave one.
+    last_turn_id: ?[]u8 = null,
     cursor: Cursor,
 
     pub fn deinit(self: *Folded, alloc: Allocator) void {
@@ -198,8 +261,8 @@ pub const Folded = struct {
         types.freeToolCallSlice(alloc, self.running_calls);
         freePendingInputs(alloc, self.pending_inputs);
         freePendingInputs(alloc, self.pending_follow_ups);
-        if (self.config_hash) |hash| alloc.free(hash);
-        if (self.open_turn_config) |hash| alloc.free(hash);
+        if (self.open_turn_id) |id| alloc.free(id);
+        if (self.last_turn_id) |id| alloc.free(id);
         self.* = undefined;
     }
 };
@@ -248,9 +311,24 @@ fn stringField(value: std.json.Value, name: []const u8) LoadError![]const u8 {
     return field.string;
 }
 
+/// Where a fold starts: an empty session, or a snapshot of a quiet prefix
+/// (no open turn, no follow-up waiting) and the cursor after it.
+pub const Base = struct {
+    history: []const types.HistoryTurn = &.{},
+    cursor: Cursor = .{},
+    /// The id of the prefix's last turn.
+    last_turn_id: ?[]const u8 = null,
+};
+
 /// Rebuilds a session from `events_json`, a JSON array of events in order.
 pub fn fold(alloc: Allocator, events_json: []const u8) LoadError!Folded {
+    return foldFrom(alloc, events_json, .{});
+}
+
+/// Rebuilds a session from `base` and the events after it.
+pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError!Folded {
     if (events_json.len > max_load_bytes) return error.JournalTooLarge;
+    if (base.history.len > max_history_turns) return error.JournalTooManyTurns;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), events_json, .{}) catch |err| switch (err) {
@@ -264,6 +342,8 @@ pub fn fold(alloc: Allocator, events_json: []const u8) LoadError!Folded {
         for (history.items) |turn| types.freeHistoryTurn(alloc, turn);
         history.deinit(alloc);
     }
+    try history.ensureTotalCapacity(alloc, base.history.len);
+    for (base.history) |turn| history.appendAssumeCapacity(try types.dupeHistoryTurn(alloc, turn));
     var open: ?std.json.Value = null;
     // The open turn's announced calls; the ones its progress answers are
     // dropped at the end.
@@ -271,9 +351,9 @@ pub fn fold(alloc: Allocator, events_json: []const u8) LoadError!Folded {
     defer running.deinit(alloc);
     var inputs: std.ArrayList(InputState) = .empty;
     defer inputs.deinit(alloc);
-    var config: ?[]const u8 = null;
-    var open_config: ?[]const u8 = null;
-    var cursor: Cursor = .{};
+    var open_id: ?[]const u8 = null;
+    var last_id: ?[]const u8 = base.last_turn_id;
+    var cursor = base.cursor;
     for (parsed.array.items) |value| {
         const event = try envelope(value, cursor);
         switch (event.kind) {
@@ -289,6 +369,8 @@ pub fn fold(alloc: Allocator, events_json: []const u8) LoadError!Folded {
                     return err;
                 };
                 open = null;
+                last_id = open_id;
+                open_id = null;
                 running.clearRetainingCapacity();
                 endTurnInputs(&inputs);
             },
@@ -297,8 +379,8 @@ pub fn fold(alloc: Allocator, events_json: []const u8) LoadError!Folded {
                 // `null`: a later progress in the turn, or its end, replaces it.
                 const data = event.data orelse return error.InvalidJournal;
                 if (data != .object and data != .null) return error.InvalidJournal;
-                // A turn's first progress fixes the config it runs under.
-                if (open == null) open_config = config;
+                // A turn's first progress names it.
+                if (open == null) open_id = try turnIdOf(event.turn_id);
                 open = data;
                 // Each placed input was accepted in this turn and is placed once.
                 if (event.inputs) |placed| {
@@ -321,6 +403,8 @@ pub fn fold(alloc: Allocator, events_json: []const u8) LoadError!Folded {
             .turn_progress_cleared => {
                 if (event.data != null) return error.InvalidJournal;
                 open = null;
+                last_id = open_id;
+                open_id = null;
                 running.clearRetainingCapacity();
                 endTurnInputs(&inputs);
             },
@@ -334,11 +418,6 @@ pub fn fold(alloc: Allocator, events_json: []const u8) LoadError!Folded {
                 } else .steer;
                 if (findInput(inputs.items, id) != null) return error.InvalidJournal;
                 try inputs.append(alloc, .{ .id = id, .text = text, .kind = kind });
-            },
-            .session_config => {
-                const hash = try stringField(event.data orelse return error.InvalidJournal, "hash");
-                if (hash.len == 0 or hash.len > max_config_hash_bytes) return error.InvalidJournal;
-                config = hash;
             },
             .input_withdrawn => {
                 const data = event.data orelse return error.InvalidJournal;
@@ -393,10 +472,10 @@ pub fn fold(alloc: Allocator, events_json: []const u8) LoadError!Folded {
     errdefer freePendingInputs(alloc, pending);
     const follow_ups = try pendingInputsOf(alloc, inputs.items, .follow_up);
     errdefer freePendingInputs(alloc, follow_ups);
-    const config_hash = if (config) |hash| try alloc.dupe(u8, hash) else null;
-    errdefer if (config_hash) |hash| alloc.free(hash);
-    const turn_config = if (open_turn != null and open_config != null) try alloc.dupe(u8, open_config.?) else null;
-    errdefer if (turn_config) |hash| alloc.free(hash);
+    const open_turn_id = if (open_id) |id| try alloc.dupe(u8, id) else null;
+    errdefer if (open_turn_id) |id| alloc.free(id);
+    const last_turn_id = if (last_id) |id| try alloc.dupe(u8, id) else null;
+    errdefer if (last_turn_id) |id| alloc.free(id);
     const owned = try history.toOwnedSlice(alloc);
     return .{
         .history = owned,
@@ -404,8 +483,8 @@ pub fn fold(alloc: Allocator, events_json: []const u8) LoadError!Folded {
         .running_calls = unanswered,
         .pending_inputs = pending,
         .pending_follow_ups = follow_ups,
-        .config_hash = config_hash,
-        .open_turn_config = turn_config,
+        .open_turn_id = open_turn_id,
+        .last_turn_id = last_turn_id,
         .cursor = cursor,
     };
 }
@@ -478,6 +557,8 @@ const Envelope = struct {
     data: ?std.json.Value,
     /// The inputs a `turn_progress` places.
     inputs: ?std.json.Value,
+    /// The host's id for the turn a first `turn_progress` starts.
+    turn_id: ?std.json.Value,
 };
 
 /// Checks one event's envelope against the cursor it must continue.
@@ -492,7 +573,14 @@ fn envelope(value: std.json.Value, cursor: Cursor) LoadError!Envelope {
     const kind_value = object.get("type") orelse return error.InvalidJournal;
     if (kind_value != .string) return error.InvalidJournal;
     const kind = std.meta.stringToEnum(EventType, kind_value.string) orelse return error.InvalidJournal;
-    return .{ .kind = kind, .data = object.get("data"), .inputs = object.get("inputs") };
+    return .{ .kind = kind, .data = object.get("data"), .inputs = object.get("inputs"), .turn_id = object.get("turnId") };
+}
+
+/// A progress's `turnId`, if it has one. Borrows from the parse.
+fn turnIdOf(value: ?std.json.Value) LoadError!?[]const u8 {
+    const id = value orelse return null;
+    if (id != .string or id.string.len == 0 or id.string.len > max_turn_id_bytes) return error.InvalidJournal;
+    return id.string;
 }
 
 fn integerField(object: std.json.ObjectMap, name: []const u8) LoadError!u64 {
@@ -921,6 +1009,61 @@ test "a follow-up waits across turns until the turn that runs it places it" {
     try std.testing.expectEqual(@as(usize, 0), running.pending_follow_ups.len);
 }
 
+test "a snapshot and the events after it fold into the same session as every event" {
+    const alloc = std.testing.allocator;
+    const first = try testTurn(alloc, "list files", "two files");
+    defer types.freeHistoryTurn(alloc, first);
+    const second = try testTurn(alloc, "read one", "it says hi");
+    defer types.freeHistoryTurn(alloc, second);
+    var progress = try testProgress(alloc, "read the other");
+    defer progress.deinit(alloc);
+    const events = [_]Event{
+        .{ .turn_committed = first },
+        .{ .turn_committed = second },
+        .{ .turn_progress = .{ .checkpoint = progress } },
+    };
+
+    const full = try testJournal(alloc, &events);
+    defer alloc.free(full);
+    var replayed = try fold(alloc, full);
+    defer replayed.deinit(alloc);
+
+    // A snapshot after the first commit, then the tail from seq 2.
+    const snapshot = try encodeSnapshot(alloc, 1, 2, null, "checkpoint-bytes");
+    defer alloc.free(snapshot);
+    const parsed = try parseSnapshot(snapshot);
+    try std.testing.expectEqual(@as(u64, 1), parsed.seq);
+    try std.testing.expectEqual(@as(u64, 2), parsed.turn);
+    try std.testing.expect(parsed.last_turn_id == null);
+    try std.testing.expectEqualStrings("checkpoint-bytes", parsed.checkpoint);
+    var tail_out: std.Io.Writer.Allocating = .init(alloc);
+    defer tail_out.deinit();
+    var cursor: Cursor = .{ .next_seq = parsed.seq + 1, .turn = parsed.turn };
+    try tail_out.writer.writeByte('[');
+    for (events[1..], 0..) |event, index| {
+        if (index > 0) try tail_out.writer.writeByte(',');
+        cursor = try cursor.write(&tail_out.writer, event);
+    }
+    try tail_out.writer.writeByte(']');
+    var resumed = try foldFrom(alloc, tail_out.written(), .{
+        .history = &.{first},
+        .cursor = .{ .next_seq = parsed.seq + 1, .turn = parsed.turn },
+    });
+    defer resumed.deinit(alloc);
+
+    try std.testing.expectEqual(replayed.history.len, resumed.history.len);
+    try std.testing.expectEqualStrings(replayed.history[1].assistant.assistant, resumed.history[1].assistant.assistant);
+    try std.testing.expectEqual(replayed.cursor, resumed.cursor);
+    try std.testing.expect(resumed.open_turn != null);
+    try std.testing.expectEqualStrings("read the other", resumed.open_turn.?.user.text);
+
+    // The tail must continue the snapshot.
+    try std.testing.expectError(error.OutOfOrderJournalEvent, foldFrom(alloc, full, .{
+        .history = &.{first},
+        .cursor = .{ .next_seq = parsed.seq + 1, .turn = parsed.turn },
+    }));
+}
+
 test "a superseded progress may leave out its state, the open turn's last may not" {
     const alloc = std.testing.allocator;
     var first = try testProgress(alloc, "first state");
@@ -956,29 +1099,96 @@ test "a progress event names the model its request goes to" {
     try std.testing.expectEqualStrings("look at this", folded.open_turn.?.user.text);
 }
 
-test "the open turn keeps the config hash it started under" {
+test "a snapshot carries the last turn's id to the turns after it" {
+    const alloc = std.testing.allocator;
+    const snapshot = try encodeSnapshot(alloc, 4, 3, "turn-a", "checkpoint-bytes");
+    defer alloc.free(snapshot);
+    const parsed = try parseSnapshot(snapshot);
+    try std.testing.expectEqualStrings("turn-a", parsed.last_turn_id.?);
+    try std.testing.expectEqualStrings("checkpoint-bytes", parsed.checkpoint);
+
+    // A turn opened after the snapshot leaves the snapshot's last turn as the last.
+    var progress = try testProgress(alloc, "keep going");
+    defer progress.deinit(alloc);
+    var tail_out: std.Io.Writer.Allocating = .init(alloc);
+    defer tail_out.deinit();
+    const cursor: Cursor = .{ .next_seq = parsed.seq + 1, .turn = parsed.turn };
+    try tail_out.writer.writeByte('[');
+    _ = try cursor.write(&tail_out.writer, .{ .turn_progress = .{ .checkpoint = progress, .turn_id = "turn-b" } });
+    try tail_out.writer.writeByte(']');
+    var folded = try foldFrom(alloc, tail_out.written(), .{ .cursor = cursor, .last_turn_id = parsed.last_turn_id });
+    defer folded.deinit(alloc);
+    try std.testing.expectEqualStrings("turn-a", folded.last_turn_id.?);
+    try std.testing.expectEqualStrings("turn-b", folded.open_turn_id.?);
+
+    // An id length that runs past the bytes is refused.
+    const cut = try alloc.dupe(u8, snapshot[0 .. snapshot_header_bytes + 2]);
+    defer alloc.free(cut);
+    cut[snapshot_header_bytes - 1] = 3;
+    try std.testing.expectError(error.InvalidJournal, parseSnapshot(cut));
+}
+
+test "a snapshot past the positions a JavaScript host can hold is refused" {
+    const alloc = std.testing.allocator;
+    const far = try encodeSnapshot(alloc, max_safe_position + 1, 2, null, "");
+    defer alloc.free(far);
+    try std.testing.expectError(error.InvalidJournal, parseSnapshot(far));
+    const late = try encodeSnapshot(alloc, 3, max_safe_position + 1, null, "");
+    defer alloc.free(late);
+    try std.testing.expectError(error.InvalidJournal, parseSnapshot(late));
+    const edge = try encodeSnapshot(alloc, max_safe_position, max_safe_position, null, "");
+    defer alloc.free(edge);
+    _ = try parseSnapshot(edge);
+}
+
+test "a snapshot that is not one, or comes from a newer fx, is refused" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidJournal, parseSnapshot("FXCP"));
+    try std.testing.expectError(error.InvalidJournal, parseSnapshot("FXSN"));
+    const zero = try encodeSnapshot(alloc, 0, 1, null, "");
+    defer alloc.free(zero);
+    try std.testing.expectError(error.InvalidJournal, parseSnapshot(zero));
+    const newer = try encodeSnapshot(alloc, 3, 2, null, "");
+    defer alloc.free(newer);
+    newer[snapshot_magic.len] = snapshot_version + 1;
+    try std.testing.expectError(error.UnsupportedJournalVersion, parseSnapshot(newer));
+}
+
+test "a turn's first progress names it, and the turn keeps that name until it ends" {
     const alloc = std.testing.allocator;
     var progress = try testProgress(alloc, "write it");
     defer progress.deinit(alloc);
     const turn = try testTurn(alloc, "list", "done");
     defer types.freeHistoryTurn(alloc, turn);
     const bytes = try testJournal(alloc, &.{
-        .{ .session_config = "old" },
+        .{ .turn_progress = .{ .checkpoint = progress, .turn_id = "t1" } },
         .{ .turn_committed = turn },
-        .{ .session_config = "new" },
-        .{ .turn_progress = .{ .checkpoint = progress } },
-        .{ .turn_progress = .{ .checkpoint = progress } },
+        .{ .turn_progress = .{ .checkpoint = progress, .turn_id = "t2" } },
+        // A later progress of the same turn does not rename it.
+        .{ .turn_progress = .{ .checkpoint = progress, .turn_id = "other" } },
     });
     defer alloc.free(bytes);
     var folded = try fold(alloc, bytes);
     defer folded.deinit(alloc);
-    try std.testing.expectEqualStrings("new", folded.config_hash.?);
-    try std.testing.expectEqualStrings("new", folded.open_turn_config.?);
+    try std.testing.expectEqualStrings("t1", folded.last_turn_id.?);
+    try std.testing.expectEqualStrings("t2", folded.open_turn_id.?);
 
-    // A journal from before config hashes leaves the open turn's unknown.
-    const unhashed = try testJournal(alloc, &.{.{ .turn_progress = .{ .checkpoint = progress } }});
-    defer alloc.free(unhashed);
-    var older = try fold(alloc, unhashed);
-    defer older.deinit(alloc);
-    try std.testing.expect(older.open_turn_config == null);
+    // A turn the host gave no id leaves none, and a cleared turn ends like a commit.
+    const unnamed = try testJournal(alloc, &.{
+        .{ .turn_progress = .{ .checkpoint = progress, .turn_id = "t1" } },
+        .turn_progress_cleared,
+        .{ .turn_progress = .{ .checkpoint = progress } },
+    });
+    defer alloc.free(unnamed);
+    var later = try fold(alloc, unnamed);
+    defer later.deinit(alloc);
+    try std.testing.expectEqualStrings("t1", later.last_turn_id.?);
+    try std.testing.expect(later.open_turn_id == null);
+
+    const named = try testJournal(alloc, &.{.{ .turn_progress = .{ .checkpoint = progress, .turn_id = "x" } }});
+    defer alloc.free(named);
+    const at = std.mem.find(u8, named, "\"turnId\":\"x\"").?;
+    const wrong = try std.mem.concat(alloc, u8, &.{ named[0..at], "\"turnId\":7", named[at + "\"turnId\":\"x\"".len ..] });
+    defer alloc.free(wrong);
+    try std.testing.expectError(error.InvalidJournal, fold(alloc, wrong));
 }

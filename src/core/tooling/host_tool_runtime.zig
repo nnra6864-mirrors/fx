@@ -93,12 +93,6 @@ pub const Runtime = struct {
                 .bool => |declared| declared,
                 else => return error.InvalidHostTool,
             } else false;
-            const replay_never = if (entry.object.get("replay")) |value_| replay: {
-                if (value_ != .string) return error.InvalidHostTool;
-                if (std.mem.eql(u8, value_.string, "never")) break :replay true;
-                if (std.mem.eql(u8, value_.string, "safe")) break :replay false;
-                return error.InvalidHostTool;
-            } else false;
             if (description_value != .string or schema_value != .object) return error.InvalidHostTool;
             if (description_value.string.len > max_description_bytes) {
                 return error.HostToolDescriptionTooLarge;
@@ -134,7 +128,6 @@ pub const Runtime = struct {
                 .model_schema = .{ .name = name, .description = "" },
                 .model_visible = false,
                 .host_concurrent = !writes,
-                .host_replay_never = replay_never,
                 .executor_kind = .host,
                 .activity_kind = .command,
                 .action_label = "Running",

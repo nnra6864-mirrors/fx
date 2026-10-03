@@ -6,15 +6,6 @@
     "v": 1,
     "seq": 1,
     "turn": 1,
-    "type": "session_config",
-    "data": {
-     "hash": "81cc783ead0b86c4bd4a83851752d2029046f3f96b6617da1e75c4faa7ef705f"
-    }
-   },
-   {
-    "v": 1,
-    "seq": 2,
-    "turn": 1,
     "type": "turn_progress",
     "data": {
      "version": 2,
@@ -50,7 +41,7 @@
    },
    {
     "v": 1,
-    "seq": 3,
+    "seq": 2,
     "turn": 1,
     "type": "turn_progress",
     "data": {
@@ -87,7 +78,7 @@
    },
    {
     "v": 1,
-    "seq": 4,
+    "seq": 3,
     "turn": 1,
     "type": "turn_committed",
     "data": {
@@ -120,7 +111,7 @@
    },
    {
     "v": 1,
-    "seq": 5,
+    "seq": 4,
     "turn": 2,
     "type": "turn_progress",
     "data": {
@@ -157,7 +148,7 @@
    },
    {
     "v": 1,
-    "seq": 6,
+    "seq": 5,
     "turn": 2,
     "type": "turn_progress",
     "data": {
@@ -194,7 +185,7 @@
    },
    {
     "v": 1,
-    "seq": 7,
+    "seq": 6,
     "turn": 2,
     "type": "tool_intent",
     "data": [
@@ -208,7 +199,7 @@
    },
    {
     "v": 1,
-    "seq": 8,
+    "seq": 7,
     "turn": 2,
     "type": "input_accepted",
     "data": {
@@ -219,7 +210,7 @@
    },
    {
     "v": 1,
-    "seq": 9,
+    "seq": 8,
     "turn": 2,
     "type": "input_accepted",
     "data": {

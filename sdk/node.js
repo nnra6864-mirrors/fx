@@ -10,8 +10,7 @@ import { loadModule, withModuleFailure } from "./wasm-module.js";
 import {
   createFxAgent as createWasmAgent,
   createFxTerminal as createWasmTerminal,
-  createMemoryJournal,
-  FxConfigMismatchError,
+  createMemoryPersistence,
   FxFencedError,
   FxJournalVersionError,
   encodeXtermKeyEvent,
@@ -19,11 +18,10 @@ import {
   listModels,
   normalizeAgentOptions,
   supportsJspi,
-  worldHandler,
   xtermAdapter,
 } from "./fx-sdk.js";
 
-export { createMemoryJournal, encodeXtermKeyEvent, FxConfigMismatchError, FxFencedError, FxJournalVersionError, fxSdkApiVersion, listModels, supportsJspi, worldHandler, xtermAdapter };
+export { createMemoryPersistence, encodeXtermKeyEvent, FxFencedError, FxJournalVersionError, fxSdkApiVersion, listModels, supportsJspi, xtermAdapter };
 export const libfxApiVersion = 2;
 const nativeCoreApiVersion = 4;
 

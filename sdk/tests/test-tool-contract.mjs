@@ -1,13 +1,13 @@
 #!/usr/bin/env node
-// The host tool contract: tools as an object, replay and writes
-// declarations, non-empty error results, and calls that run together until a
-// writer, with results in the model's order.
+// The host tool contract: tools as an object, the writes declaration, the
+// turn and call ids a tool receives, non-empty error results, and calls that
+// run together until a writer, with results in the model's order.
 import { strict as assert } from "node:assert";
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent, createMemoryJournal } from "../node.js";
+import { createFxAgent, createMemoryPersistence } from "../node.js";
 
 const backend = process.argv[2] || "native";
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
@@ -131,20 +131,28 @@ test("calls run together until a writer, and results keep the model's order", as
   assert.deepEqual(results, ["first", "second", "save", "after"]);
 });
 
-test("execute receives the model's call id", async () => {
+test("execute receives the turn id and the model's call id", async () => {
   const seen = [];
   const probe = {
     description: "Records its context.",
     inputSchema: { type: "object" },
     execute: async (_input, context) => {
-      seen.push({ toolCallId: context.toolCallId, aborted: context.signal.aborted });
+      seen.push({ turnId: context.turnId, callId: context.callId, aborted: context.signal.aborted });
       return "probed";
     },
   };
   const agent = await createFxAgent(options({ probe }));
-  await run(agent, "call probe probe");
+  const turn = agent.prompt("call probe probe", { turnId: "turn-probe" });
+  for await (const _ of turn) {}
+  await turn.result;
   await agent.close();
-  assert.deepEqual(seen.map((entry) => entry.toolCallId).sort(), ["call-0", "call-1"]);
+  // Without a turn id, libfx names the turn.
+  const unnamed = await createFxAgent(options({ probe }));
+  await run(unnamed, "call probe");
+  await unnamed.close();
+  assert.deepEqual(seen.slice(0, 2).map((entry) => entry.callId).sort(), ["call-0", "call-1"]);
+  assert.ok(seen.slice(0, 2).every((entry) => entry.turnId === "turn-probe"));
+  assert.match(seen[2].turnId, /^turn_[0-9a-f-]+$/);
   assert.ok(seen.every((entry) => entry.aborted === false));
 });
 
@@ -160,15 +168,13 @@ test("an error without a message still reaches the model as text", async () => {
   assert.match(text, /Tool broken failed without a message/);
 });
 
-test("replay and writes are checked, and a journal requires replay", async () => {
-  await assert.rejects(createFxAgent(options({ read: timed("read", { replay: "sometimes" }) })), /tool read replay must be "safe" or "never"/);
+test("writes is checked, and a persisted session needs no other tool declaration", async () => {
   await assert.rejects(createFxAgent(options({ read: timed("read", { writes: "yes" }) })), /tool read writes must be a boolean/);
-  await assert.rejects(
-    createFxAgent(options({ read: timed("read") }, { journal: createMemoryJournal() })),
-    /tool read needs replay: "safe" or "never" when a journal is set/,
-  );
-  const agent = await createFxAgent(options({ read: timed("read", { replay: "safe" }) }, { journal: createMemoryJournal() }));
+  const agent = await createFxAgent(options({ read: timed("read") }, { persistence: createMemoryPersistence() }));
+  spans.length = 0;
+  assert.equal((await run(agent, "call read")).stopReason, "end_turn");
   await agent.close();
+  assert.deepEqual(spans.map((span) => span.name), ["read"]);
 });
 
 try {

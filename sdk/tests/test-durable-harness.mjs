@@ -94,9 +94,9 @@ const results = (...ids) => ({ role: "tool", content: ids.map((toolCallId) => ({
 }
 
 {
-  const clean = { workload: "one-never", neverEffects: 1, completed: true, rememberedSetup: true, resultCounts: { a: 1 } };
+  const clean = { workload: "one-send", sendEffects: 1, completed: true, rememberedSetup: true, resultCounts: { a: 1 } };
   assert.deepEqual(checkCrashCell(clean), []);
-  assert.match(checkCrashCell({ ...clean, neverEffects: 2 })[0], /^NeverRunsTwice/);
+  assert.match(checkCrashCell({ ...clean, sendEffects: 2 })[0], /^SendRunsOnce/);
   assert.match(checkCrashCell({ ...clean, completed: false })[0], /^TurnCompletes/);
   assert.match(checkCrashCell({ ...clean, rememberedSetup: false })[0], /^KeepsCommittedHistory/);
   assert.match(checkCrashCell({ ...clean, resultCounts: { a: 2 } })[0], /^OneOutcome/);
@@ -137,17 +137,17 @@ for (const backend of ["native", "wasm"]) {
   assert.equal(parallel.failing_batches, 0, JSON.stringify(parallel.failures));
   assert.deepEqual(parallel.fixed.map((batch) => batch.violations), [[], []], "list-then-read and write-then-read keep their order");
 
-  const crash = run("crash-matrix.mjs", ["--backends", backend, "--workloads", "one-never"], backend);
+  const crash = run("crash-matrix.mjs", ["--backends", backend, "--workloads", "one-send"], backend);
   assert.ok(crash.cells >= 5, "one cell per crash step");
   for (const cell of crash.groups[0].cells) {
     assert.ok(cell.killed, `step ${cell.k} was a real SIGKILL`);
     assert.ok(cell.completed && cell.rememberedSetup, `step ${cell.k}: restore finished the turn and kept history`);
   }
-  // With a journal, no crash step may run send_email twice or lose the
+  // With persistence, no crash step may run send_email twice or lose the
   // setup turn.
-  const journaled = run("crash-matrix.mjs", ["--backends", backend, "--workloads", "one-never", "--mode", "journal", "--require-clean"], backend);
+  const journaled = run("crash-matrix.mjs", ["--backends", backend, "--workloads", "one-send", "--mode", "journal", "--require-clean"], backend);
   assert.ok(journaled.cells >= 5, "one cell per crash step");
   assert.equal(journaled.failing_cells, 0, `journal crash matrix on ${backend}`);
-  console.log(`${backend}: durable harnesses passed; today's crash matrix: ${crash.failing_cells}/${crash.cells} one-never cells ran send_email twice; journaled: none`);
+  console.log(`${backend}: durable harnesses passed; today's crash matrix: ${crash.failing_cells}/${crash.cells} one-send cells ran send_email twice; journaled: none`);
 }
 console.log("durable harness checks passed");

@@ -286,8 +286,8 @@ for await (const event of turn) {
 
 `steer()` resolves to `{ id }`, and the returned promise carries the same `id`
 at once. Until the model sees a steer, `turn.withdraw(id)` takes it back and
-resolves to `withdrawn`; after that it resolves to `already_placed`. With a
-journal, a steer resolves only once its acceptance is stored, a model request
+resolves to `withdrawn`; after that it resolves to `already_placed`. With
+[persistence](#persistence), a steer resolves only once its acceptance is stored, a model request
 carries it only after that, and a withdrawal resolves once it is stored, so a
 crash never loses a steer the call reported as accepted: `agent.resume()`
 delivers one the model had not seen yet. The web core accepts a steer when it
@@ -298,8 +298,8 @@ still queued when the turn ends rejects.
 turn ends, or at once when none is running, instead of failing with
 `a prompt is already in progress`. It returns a promise for that turn; the
 promise carries the follow-up's `id` and `accepted`, which resolves `{ id }`
-once a journal holds it. With a journal, a follow-up survives a crash. After a
-restore, the follow-ups the journal held have no caller, so each waits for
+once it is stored. With persistence, a follow-up survives a crash. After a
+restore, the follow-ups the session held have no caller, so each waits for
 `agent.resume()`: every call continues the open turn first, then starts the
 next held follow-up, and returns `null` once none is left. Follow-ups this
 agent queues run on their own and do not wait behind held ones. Call `resume()`
@@ -308,15 +308,12 @@ follow-ups of its own: one queued during a resumed turn starts when that turn
 ends, and `resume()` throws while it runs. A follow-up whose turn ends before
 libfx records its first `turn_progress` is withdrawn, and one that ends after
 it is recorded like any other turn, so a follow-up never runs twice. `close()`
-rejects follow-ups that have not started; a journal still holds them.
+rejects follow-ups that have not started; the session's records still hold them.
 
 Cancelling a steered turn drops any guidance that has not reached a safe
 boundary and releases its queue. Applied guidance is part of the same history
 turn, so an idle `checkpoint()` includes the full steered conversation.
 
-`checkpoint()` and the `checkpoint` option are deprecated in favor of a
-[journal](#journal), which records the session as it runs. Both keep working,
-and each emits one `deprecated` event naming the API and its replacement.
 `checkpoint()` returns opaque, bounded, versioned bytes. Concurrent calls run
 one at a time, and a call still waiting for an earlier one fails the same way a
 direct call would if a prompt starts or the agent closes first. A newer libfx
@@ -337,88 +334,103 @@ agent-creation options and are not stored in a checkpoint: recreate the agent
 with new `model.effort`, `model.fast`, or `model.ultrafast` values to change
 them, the same path as switching models.
 
-### Journal
+### Persistence
 
-A journal records the session as it runs instead of in checkpoints you request.
-Pass an object with `append(events)` and `load()`, and libfx sends it
-each state change as an event:
+Pass a store as `persistence`, and libfx records the session as it runs, so a
+new agent can continue it after the process running it stops. libfx writes
+opaque records and checkpoints to the store and reads them back. The store
+never parses them, and libfx never sees how they are stored.
 
 ```js
-import { createFxAgent, createMemoryJournal } from "libfx";
+import { createFxAgent, createMemoryPersistence } from "libfx";
 
-const journal = createMemoryJournal();
-const agent = await createFxAgent({ apiKey, model, journal });
+const persistence = createMemoryPersistence();
+const agent = await createFxAgent({ apiKey, model, persistence, sessionId: "support-42" });
 ```
 
-Before each model request and after each response, libfx appends the open
-turn so far, and before tool calls run, it appends the calls about to run.
-When a turn ends, it appends the finished turn, and after compaction it
-appends the replaced history. Each event is a JSON object with
-`v`, `seq`, `turn`, `type`, and `data` fields, and an event written before a
-model request also names that request's model in `model`. Store the events in the order
-they arrive and return them unchanged: `seq` counts from 1 without gaps, and
-the shape of `data` belongs to libfx.
+A store is an object with these methods:
 
-Events that arrive together share one `append` call, and libfx starts each
-call without waiting for earlier calls to resolve, so a remote store adds
-about one round trip to a turn instead of one per call. Calls arrive in event
-order, and your journal must store each call's events after those of the call
-before it, even while that call is still pending. Rejecting a batch whose
-first `seq` does not follow the last stored event keeps a failed or competing
-writer from leaving a gap.
+```ts
+interface Persistence {
+  load(): Promise<{
+    checkpoint?: { data: Uint8Array; through: string };
+    journal?: Iterable<JournalRecord> | AsyncIterable<JournalRecord>;
+  }>;
+  append(input: { expected: string | null; idempotencyKey: string; data: Uint8Array }): Promise<{ cursor: string }>;
+  saveCheckpoint?(input: { through: string; data: Uint8Array }): Promise<void>;
+}
 
-libfx waits for your journal only where a crash could otherwise lose work or
-repeat it: the first event of each turn, which holds the prompt, is stored
-before the model sees it, and a response's tool calls are stored before a
-`replay: "never"` call starts. Other appends are not waited for, so a turn's
-`result` can settle before its last events land; `agent.close()` waits for
-every append. If `append` rejects, libfx stops the current turn at once: it
-starts no further model request or tool call and writes nothing more. The turn
-fails with an error whose `code` is `FX_JOURNAL_APPEND_FAILED` and whose
-`cause` is your error, and the agent refuses later prompts. When no turn was
-left to report the failure, `close()` rejects with it. A model request the turn
-started while the failed append was in flight can still complete; a
-`replay: "never"` call never starts before its stored intent.
+interface JournalRecord {
+  cursor: string;
+  data: Uint8Array;
+}
+```
 
-`createFxAgent()` calls `load()` once. It must resolve to `{ events }` with
-every stored event, oldest first. Each `turn_progress` event repeats its turn
-so far, so a turn with many large tool results stores more than its final
-entry, and libfx reads only the newest progress of the open turn. The events it
-reads must fit in 4 MiB of JSON, and the history at most 1,024 turns; otherwise
-`createFxAgent()` rejects with an error whose `code` is `FX_JOURNAL_TOO_LARGE`.
-libfx refuses a journal whose events repeat, skip a `seq`, or do not parse, and
-`createFxAgent()` rejects with the reason and the `code` `FX_JOURNAL_INVALID`.
-For a journal written by a newer libfx, it rejects with an
+`append()` stores one record and resolves to its cursor, a string the store
+chooses that places the record after the ones before it. The session's records
+are its journal. libfx sends records one at a time, in order, and `expected`
+is the cursor of the last record the agent knows of, or `null` for a new
+session. Reject the append with an `FxFencedError` when `expected` is not the
+cursor of the last stored record, so that a second agent writing the same
+session stops the first instead of interleaving with it. `idempotencyKey` is
+unique to each write, so a store that retries a write can return the stored
+record's cursor instead of storing it twice.
+
+`createFxAgent()` calls `load()` once. Resolve to the latest checkpoint, if any,
+and the records stored after it, oldest first, each with its cursor. Resolve to
+`{}` for a session with nothing stored. libfx skips any record the checkpoint
+already covers.
+
+libfx waits for the store only where a crash could otherwise lose work or
+repeat it: the first record of each turn, which holds the prompt, is stored
+before the model sees it, and a response's tool calls are stored before any of
+them starts. Other appends are not waited for, so a turn's `result` can settle
+before its last records land, and `agent.close()` waits for every append. If
+`append` rejects, libfx stops the current turn at once: it starts no further
+model request or tool call and writes nothing more. The turn fails with an
+error whose `code` is `FX_JOURNAL_APPEND_FAILED` and whose `cause` is your
+error, and the agent refuses later prompts. When no turn was left to report
+the failure, `close()` rejects with it. A model request the turn started while
+the failed append was in flight can still complete.
+
+When the store has `saveCheckpoint()`, libfx saves a checkpoint after a turn
+ends once the records stored since the last checkpoint reach
+`checkpointAfterBytes` (default 1 MiB). `through` is the cursor of the last
+record the checkpoint covers, so `load()` can return that checkpoint and only
+the records after it, and the cost of opening a session stays bounded as its
+history grows. libfx takes a checkpoint only while no turn is running. A saved
+checkpoint emits a `checkpoint.save` event. A failed save emits
+`checkpoint.error` and changes nothing: the records still restore the session,
+and the next turn's end tries again. Deleting the records a checkpoint covers
+is up to the store.
+
+The records a load reads, after libfx drops the older progress of an open
+turn, must fit in 4 MiB of JSON, a checkpoint in 4 MiB, and the history in
+1,024 turns. Otherwise `createFxAgent()` rejects with an error whose `code` is
+`FX_JOURNAL_TOO_LARGE`. libfx refuses records that repeat, skip, or do not
+parse, and `createFxAgent()` rejects with the reason and the `code`
+`FX_JOURNAL_INVALID`. For records written by a newer libfx, it rejects with an
 `FxJournalVersionError`, whose `code` is `FX_JOURNAL_VERSION`. Each libfx
-release resumes the journals and checkpoints that the release before it saved,
+release resumes the sessions and checkpoints that the release before it saved,
 so upgrade the processes that read a session before the ones that write it.
 
-A journal grows with every turn, and `load()` returns all of it, so a session
-opens only while its events fit in one load.
-
-Give the journal a `close()` method to release what it holds, such as a timer
-or a connection. libfx calls it once, after the last append settles, when
-`agent.close()` is called or the agent's core exits.
-
 AI Gateway keys session affinity and prompt caching to the session's id. libfx
-picks a new id for each agent unless you pass `sessionId` or `load()` resolves
-to `{ events, sessionId }`, so give a restored session the id it had before.
-An id is 1 to 255 letters, digits, `.`, `_`, or `-`; when both are given they
-must match. `agent.sessionId` is the id the agent uses.
+picks a new id for each agent unless you pass `sessionId`, so give a restored
+session the id it had before. An id is 1 to 255 letters, digits, `.`, `_`, or
+`-`. `agent.sessionId` is the id the agent uses.
 
 If the last process stopped during a turn, `agent.resume()` continues that
 turn with no new input and returns it, like `prompt()`. The model is told
 "Resuming from unexpected session interruption.". A tool call that was
-running runs again when its tool is `replay: "safe"`, under the same call id,
-and comes back answered as possibly run otherwise, so a `replay: "never"` call
-does not run again unless the model decides to call it. A turn that fails or
-is cancelled ends in the journal as it does in the agent, so only a stopped
-process leaves one to resume. `resume()` returns `null` when the journal holds
-no open turn and no held follow-up, so a host can call it until it does every
-time it opens a session:
+running does not run again: it comes back answered with an error saying it may
+have partly run, and the model decides whether to check its effects, call it
+again, or ask the user. A turn that fails or is cancelled ends in the journal
+as it does in the agent, so only a stopped process leaves one to resume.
+`resume()` returns `null` when the session holds no open turn and no held
+follow-up, so a host can call it until it does every time it opens a session:
 
 ```js
-const agent = await createFxAgent({ apiKey, model, journal, tools });
+const agent = await createFxAgent({ apiKey, model, persistence, sessionId, tools });
 for (let turn = agent.resume(); turn; turn = agent.resume()) {
   for await (const event of turn) console.log(event);
   await turn.result;
@@ -428,89 +440,49 @@ for (let turn = agent.resume(); turn; turn = agent.resume()) {
 Calling `prompt()` instead ends the open turn as interrupted and starts a new
 one.
 
+Give a prompt a `turnId` when the same request can reach libfx more than once,
+such as from a queue that delivers it again after a crash. When the open turn
+has that id, `prompt(input, { turnId })` continues it as `resume()` does. When
+the session's last turn ended with that id, it returns a turn that has already
+ended, with the stop reason `end_turn`, without calling the model. Any other id
+starts a new turn. A turn id is 1 to 128 letters, digits, `.`, `_`, or `-`.
+Without one, libfx names the turn. `turn.id` is the turn's id, and each tool
+call receives it.
+
 To move a running session to another process, call
 `turn.cancel({ reason: "handoff" })`. The turn stops at once, like any
 cancellation, but libfx stores nothing more, so the journal keeps the turn
 open and the agent that opens the session next continues it with `resume()`.
 The handed-off agent then refuses `prompt()`, `resume()`, and `followUp()`;
-close it. A handoff needs a journal.
+close it. A handoff needs persistence.
 
-libfx records a hash of the instructions, model, and tools in the journal. If
-the open turn was recorded under a different configuration, for example after
-a deploy changed a tool, `resume()` throws an `FxConfigMismatchError`, whose
-`code` is `FX_CONFIG_MISMATCH`, instead of continuing the turn under tools it
-did not start with. `prompt()` still ends that turn as interrupted and runs
-under the new configuration. Finished turns are not checked.
+Pass `persistence` instead of a `checkpoint` option; the two cannot be
+combined. Like a checkpoint, persistence holds conversation history only:
+resupply models, credentials, instructions, tools, MCP clients, and skill
+records when you create the agent. A resumed turn continues under the tools the
+new agent has. `createMemoryPersistence()` keeps the records and the latest
+checkpoint in memory as `persistence.records` and `persistence.checkpoint`,
+which suits tests and hosts that copy them to their own storage. It fences an
+append whose `expected` cursor is not its last record's, and returns the stored
+cursor for a repeated `idempotencyKey`. `FxFencedError` is exported by `libfx`;
+its `code` is `FX_FENCED`, which a store of your own can use for the same case.
+`FxJournalVersionError` is exported by `libfx` too.
 
-Pass a journal instead of a `checkpoint` option; the two cannot be combined.
-Like a checkpoint, a journal holds conversation history only: resupply models,
-credentials, instructions, tools, MCP clients, and skill records when you
-create the agent. `createMemoryJournal(events)` keeps events in memory and
-exposes the stored list as `journal.events`, which suits tests and hosts that
-copy events to their own storage. It rejects a batch that does not continue
-the stored events with an `FxFencedError`, so when a second agent opens the
-same journal and appends, the first agent's next append fails and its turn
-stops instead of interleaving. `FxFencedError` is exported by `libfx`; its
-`code` is `FX_FENCED`, which a journal of your own can use for the same case.
-`FxJournalVersionError` and `FxConfigMismatchError` are exported by `libfx`
-too.
+### Workflow Worlds and other stores
 
-### Worlds
+libfx depends on no storage package. A store maps its methods onto the storage
+your app already uses, such as a database table, a Durable Object, or a
+Workflow World. `sdk/tests/world-persistence.mjs` in the fx repository is a
+store over a World: each record and checkpoint is a `step_created` event in
+one World run, and a record's cursor is its event slot. A World commits a write
+at the next free slot rather than refusing it, so that store also keeps the
+cursor each record continued, reads only the unbroken chain of records, and
+fences a write that lands after another writer's record for the same cursor.
 
-Pass a Workflow World as `world`, and libfx stores the session in it and
-resumes the session after the process running it stops, without a caller. Use
-the World your app already uses, such as `createWorld()` from
-`@workflow/world-vercel` or `@workflow/world-local`; libfx itself depends on no
-Workflow package. Without `world`, nothing changes.
-
-```js
-import { createFxAgent, worldHandler } from "libfx";
-import { createWorld } from "@workflow/world-vercel";
-
-const world = createWorld();
-const createAgent = ({ sessionId } = {}) => createFxAgent({ apiKey, model, tools, world, sessionId });
-
-// Start a session, or pass sessionId to open an existing one.
-const agent = await createAgent();
-const turn = agent.prompt("Summarize the open issues");
-// agent.sessionId is the session's run id.
-
-// The queue route, for example app/.well-known/workflow/v1/flow/route.js.
-export const POST = worldHandler({ world, createAgent });
-```
-
-Each session is a World run, and libfx writes its journal there, one event in
-the run per append: a `step_created` event whose input is the batch as UTF-8
-JSON. libfx names a new run the way Workflow's `start()` does, through the
-World's `createRunId()` when it has one, and starts it before its first step.
-`world` takes the place of `journal` and cannot be combined
-with it or with `checkpoint`. When a turn starts, libfx queues a delayed wake
-for the session, and while the turn is open it writes a heartbeat if
-`wakeAfterSeconds` (default 300) would otherwise pass without a write. When a
-wake arrives, `worldHandler` reads the session: a closed turn needs nothing, a
-turn written to within `wakeAfterSeconds` is checked again later, and only a
-turn silent for longer is opened with `createAgent({ sessionId })` and resumed
-with `agent.resume()`, which the route calls until it returns `null` so that
-follow-ups the session held run too. Define `createAgent` at module scope so
-the route builds the same agent as the app, and give `createFxAgent()` and
-`worldHandler()` the same `wakeAfterSeconds`. When the session cannot open or
-resume however often it is asked, because `resume()` throws an
-`FxConfigMismatchError` after a deploy or the journal fails with
-`FX_JOURNAL_TOO_LARGE` or `FX_JOURNAL_INVALID`, the route answers the wake with
-status 200 and the reason, so the queue does not deliver it again; after a
-config change, the session's next `prompt()` ends the turn. The heartbeat stops
-when the agent closes, so a turn handed off with
-`turn.cancel({ reason: "handoff" })` goes silent and the route resumes it.
-When the World cannot queue a wake, as `@workflow/world-vercel` cannot outside
-a Vercel deployment, the turn goes on and libfx emits one `journal.wake_failed`
-event: the session is still stored and restores when the app opens it, but
-nothing resumes it after a crash on its own.
-
-A session's run id is also its session id for AI Gateway, so affinity and
-prompt caching survive the move to another process. Only one process writes to
-a session. When another process has written to it since this one loaded it, the
-append fails with `FX_JOURNAL_APPEND_FAILED` and its `cause` is an
-`FxFencedError`, and the turn stops.
+libfx does not schedule turns. To run each turn in a fresh function
+invocation, enqueue it with your app's queue, such as `World.queue()`, and in
+the handler create the agent with the same `persistence` and `sessionId`, then
+call `prompt(input, { turnId })` or `resume()`.
 
 ## Models
 
@@ -595,22 +567,16 @@ starts after every earlier call in the response finishes, and later calls
 wait for it. WebAssembly runs calls one at a time. Every call still goes
 through its own permission check before any of them starts.
 
-`execute` receives `{ signal, toolCallId }`. `toolCallId` is the model's id
-for the call, which a journal records, so it stays the same for that call
-after a restore and can serve as an idempotency key.
+`execute` receives `{ signal, turnId, callId }`. `turnId` is the turn's id and
+`callId` is the model's id for the call. Both stay the same after a restore, so
+a tool with an external effect can use them as an idempotency key.
 
-`replay: "safe"` or `replay: "never"` declares whether a call that may have
-started can run again, and a journal requires it on every tool that libfx
-runs. With a journal, libfx appends the calls of a response before any of
-them starts. When a response includes a `replay: "never"` call, no call in it
-starts until your journal has stored that append, so such a call never runs
-without a record that it was about to. If the process stops while calls are
-running, `resume()` runs each `replay: "safe"` call again before the turn
-continues, and answers each `replay: "never"` call, or a call to a tool the
-agent no longer has, with an error saying it may have partly run, so the
-model checks before calling it again. When a tool
-rejects with an empty message, the model receives a non-empty error so the
-provider does not refuse the conversation.
+With persistence, libfx stores the calls of a response before any of them
+starts, so no call runs without a record that it was about to. If the process
+stops while calls are running, `resume()` answers each of them with an error
+saying it may have partly run, so the model checks before calling it again.
+When a tool rejects with an empty message, the model receives a non-empty error
+so the provider does not refuse the conversation.
 
 For ordinary tools, the JavaScript host is the authority for effects. The same
 descriptors, schemas, cancellation, results, and events are used by N-API and

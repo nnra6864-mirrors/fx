@@ -9,16 +9,26 @@ export const durableCatalog = {
   data: [{ id: durableModel, type: "language", tags: ["tool-use"], context_window: 1_000_000, max_tokens: 4096 }],
 };
 
-// Tool behavior as data: whether each tool writes, and whether a resumed
-// turn may run it again.
+// Tool behavior as data: whether each tool writes. send_email is the effect a
+// crash must not repeat.
 export const durableTools = {
-  read_item: { writes: false, replay: "safe" },
-  list_files: { writes: false, replay: "safe" },
-  read_file: { writes: false, replay: "safe" },
-  write_file: { writes: true, replay: "safe" },
-  write_item: { writes: true, replay: "safe" },
-  send_email: { writes: true, replay: "never" },
+  read_item: { writes: false },
+  list_files: { writes: false },
+  read_file: { writes: false },
+  write_file: { writes: true },
+  write_item: { writes: true },
+  send_email: { writes: true },
 };
+
+// A libfx journal record: one append's events as UTF-8 JSON. Only libfx and
+// its harnesses read one; a store keeps the bytes as they are.
+export function journalRecord(events) {
+  return new TextEncoder().encode(JSON.stringify({ format: "libfx-journal-v1", events }));
+}
+
+export function recordEvents(data) {
+  return JSON.parse(new TextDecoder().decode(data)).events;
+}
 
 const integers = Array.from({ length: 200 }, (_, index) => String(index + 1));
 
@@ -27,7 +37,7 @@ const integers = Array.from({ length: 200 }, (_, index) => String(index + 1));
 export const durableWorkloads = {
   "no-tool": [{ text: ["done"] }],
   "one-safe": [{ calls: [{ name: "read_item", input: { key: "alpha" } }] }, { text: ["done"] }],
-  "one-never": [{ calls: [{ name: "send_email", input: { to: "team" } }] }, { text: ["sent"] }],
+  "one-send": [{ calls: [{ name: "send_email", input: { to: "team" } }] }, { text: ["sent"] }],
   "list-then-read": [
     { calls: [{ name: "list_files", input: { dir: "." } }, { name: "read_file", input: { path: "a.txt" } }] },
     { text: ["done"] },
@@ -228,11 +238,11 @@ export function maxConcurrency(trace) {
 }
 
 // What must hold after a crash and restore, for one crash-matrix cell.
-export function checkCrashCell({ workload, neverEffects, completed, rememberedSetup, resultCounts }) {
+export function checkCrashCell({ workload, sendEffects, completed, rememberedSetup, resultCounts }) {
   const violations = [];
   const steps = durableWorkloads[workload];
   if (!steps) throw new Error(`unknown workload: ${workload}`);
-  if (neverEffects > 1) violations.push(`NeverRunsTwice: a replay "never" tool ran ${neverEffects} times`);
+  if (sendEffects > 1) violations.push(`SendRunsOnce: send_email ran ${sendEffects} times`);
   if (!completed) violations.push("TurnCompletes: the restored session did not finish the turn");
   if (!rememberedSetup) violations.push("KeepsCommittedHistory: the restored session lost the committed setup turn");
   for (const [id, count] of Object.entries(resultCounts)) {

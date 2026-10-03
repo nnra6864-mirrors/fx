@@ -462,9 +462,6 @@ pub const Tool = struct {
     /// tools. A host tool that declares `writes` leaves it unset and runs
     /// alone. Concurrency never changes a call's permission review.
     host_concurrent: bool = false,
-    /// A host tool declared `replay: "never"`. With a journal, its calls
-    /// start only after the journal holds their intent.
-    host_replay_never: bool = false,
     executor_kind: ExecutorKind = .read_file,
     activity_kind: core_types.ToolActivityKind = .read,
     requires_approval: bool = false,

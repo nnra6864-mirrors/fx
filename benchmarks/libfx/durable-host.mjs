@@ -43,15 +43,15 @@ export function sleep(ms, signal) {
 
 let wasmBytes = null;
 
-export async function agentOptions({ backend, fetch, tools = [], checkpoint, journal, world }) {
+export async function agentOptions({ backend, fetch, tools = [], checkpoint, persistence, sessionId }) {
   if (backend === "wasm") wasmBytes ??= await readFile(resolve(repoRoot, "zig-out/bin/fx-core.wasm"));
   return {
     backend,
     nativeAddon: resolve(repoRoot, "zig-out/lib/libfx.node"),
     ...(backend === "wasm" ? { wasm: wasmBytes } : {}),
     ...(checkpoint ? { checkpoint } : {}),
-    ...(journal ? { journal } : {}),
-    ...(world ? { world } : {}),
+    ...(persistence ? { persistence } : {}),
+    ...(sessionId ? { sessionId } : {}),
     fetch,
     apiKey: "durable-harness-key",
     gatewayChatUrl: "http://127.0.0.1:9/chat",

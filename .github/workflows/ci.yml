@@ -172,10 +172,10 @@ jobs:
         run: |
           world_root="$(mktemp -d "$RUNNER_TEMP/libfx-world.XXXXXX")"
           npm install --prefix "$world_root" --no-audit --no-fund @workflow/world@5.0.0-beta.39 @workflow/world-local@5.0.0-beta.48
-          node sdk/tests/test-workflow.mjs "$world_root" native
-          node --experimental-wasm-jspi sdk/tests/test-workflow.mjs "$world_root" wasm
-          bun sdk/tests/test-workflow.mjs "$world_root" native
-          bun sdk/tests/test-workflow.mjs "$world_root" wasm
+          node sdk/tests/test-world-persistence.mjs "$world_root" native
+          node --experimental-wasm-jspi sdk/tests/test-world-persistence.mjs "$world_root" wasm
+          bun sdk/tests/test-world-persistence.mjs "$world_root" native
+          bun sdk/tests/test-world-persistence.mjs "$world_root" wasm
 
       - name: Test Bun cross-backend integrations
         run: |
