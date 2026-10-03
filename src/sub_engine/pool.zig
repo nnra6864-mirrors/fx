@@ -47,7 +47,7 @@ pub const Sink = struct {
     /// One complete line that terminal `id`'s child wrote to its report
     /// channel, newline excluded. `line` is valid only during the call. Lines
     /// arrive in the order written; a line longer than `max_report_line`
-    /// and a partial last line are dropped.
+    /// and a partial last line are dropped, and `close` reports how many.
     report: *const fn (ctx: *anyopaque, id: Id, line: []const u8) void,
     /// Terminal `id`'s child exited. Called once per id, after every report
     /// line the child finished. Output may still follow, from processes the
@@ -90,22 +90,15 @@ pub const Pool = struct {
     report_buf: [16 * 1024]u8 = undefined,
     /// What the reader drained from a report channel before an exit.
     drain: std.ArrayList(u8) = .empty,
-    trace: Trace = .{},
+    /// What the drain read but could not keep, short of memory: its
+    /// newlines, and whether bytes followed the last one.
+    drain_lost: struct { newlines: usize = 0, trailing: bool = false } = .{},
 
     /// Starts the reader thread. Call `destroy` when done.
     pub fn create(
         gpa: Allocator,
         io: std.Io,
         sink: Sink,
-    ) error{ OutOfMemory, PipeUnavailable, SystemResources }!*Pool {
-        return createWith(gpa, io, sink, .{});
-    }
-
-    fn createWith(
-        gpa: Allocator,
-        io: std.Io,
-        sink: Sink,
-        trace: Trace,
     ) error{ OutOfMemory, PipeUnavailable, SystemResources }!*Pool {
         const self = try gpa.create(Pool);
         errdefer gpa.destroy(self);
@@ -114,7 +107,7 @@ pub const Pool = struct {
             fd_ops.close(wake.read);
             fd_ops.close(wake.write);
         }
-        self.* = .{ .gpa = gpa, .io = io, .sink = sink, .wake = wake, .trace = trace };
+        self.* = .{ .gpa = gpa, .io = io, .sink = sink, .wake = wake };
         self.thread = std.Thread.spawn(.{}, run, .{self}) catch return error.SystemResources;
         return self;
     }
@@ -149,15 +142,17 @@ pub const Pool = struct {
         // the reader must keep streaming the other terminals meanwhile.
         var terminal = try Terminal.open(self.gpa, options);
         self.lockTable();
-        defer self.unlockTable();
         const id = self.table.open() catch {
+            self.unlockTable();
+            // Another open took the last slot meanwhile. Closing waits for
+            // the child, so it happens outside the lock.
             _ = terminal.close() catch {};
             return error.LimitReached;
         };
         self.terminals[id.slot] = terminal;
         self.report_done[id.slot] = false;
         self.wakeReader();
-        self.trace.owner(self, "Open");
+        self.unlockTable();
         return id;
     }
 
@@ -172,10 +167,7 @@ pub const Pool = struct {
         const terminal = &self.terminals[id.slot].?;
         const was_pending = terminal.pendingBytes() > 0;
         const result = terminal.write(bytes);
-        if (!was_pending and terminal.pendingBytes() > 0) {
-            self.wakeReader();
-            self.trace.owner(self, "Write");
-        }
+        if (!was_pending and terminal.pendingBytes() > 0) self.wakeReader();
         result catch |err| return switch (err) {
             error.Closed => error.NotFound,
             else => |e| e,
@@ -185,14 +177,19 @@ pub const Pool = struct {
     pub const ReplyError = error{NotFound} || Terminal.ReplyError;
 
     /// Sends `line` to terminal `id`'s child on its report channel (see
-    /// `Terminal.reply`). `Ended` once the child's end is closed.
+    /// `Terminal.reply`); the reader sends what the channel cannot take yet.
+    /// `Ended` once the child's end is closed.
     pub fn reply(self: *Pool, id: Id, line: []const u8) ReplyError!void {
         self.lockTable();
         defer self.unlockTable();
         if (!self.table.isCurrent(id)) {
             return if (self.table.isLive(id)) error.Ended else error.NotFound;
         }
-        self.terminals[id.slot].?.reply(line) catch |err| return switch (err) {
+        const terminal = &self.terminals[id.slot].?;
+        const was_pending = terminal.pendingReplyBytes() > 0;
+        const result = terminal.reply(line);
+        if (!was_pending and terminal.pendingReplyBytes() > 0) self.wakeReader();
+        result catch |err| return switch (err) {
             error.Closed => error.Ended,
             else => |e| e,
         };
@@ -226,28 +223,28 @@ pub const Pool = struct {
         // A poll that still watches the fd keeps the PTY open on Linux,
         // which would delay the child's hangup.
         self.wakeReader();
-        self.trace.owner(self, "CloseRemove");
         self.unlockTable();
 
         // A delivery that began before the removal finishes before close
         // goes on.
         self.delivery_lock.lockUncancelable(self.io);
-        self.trace.ownerUnlocked(self, "CloseWait");
         self.delivery_lock.unlock(self.io);
         // The slot stays reserved until `release`, so no reader or open
         // uses its framing meanwhile.
+        const dropped_lines = self.reports[id.slot].dropped;
         self.reports[id.slot].deinit(self.gpa);
 
-        const report = terminal.close();
+        const closed = terminal.close();
         self.lockTable();
         self.table.release(id);
-        self.trace.owner(self, "CloseFinish");
         self.unlockTable();
-        return report catch |err| switch (err) {
+        var report = closed catch |err| return switch (err) {
             // Only this call closes the terminal it removed from the table.
             error.Closed => unreachable,
             error.WaitFailed => error.WaitFailed,
         };
+        report.dropped_report_lines = dropped_lines;
+        return report;
     }
 
     fn lockTable(self: *Pool) void {
@@ -265,13 +262,11 @@ pub const Pool = struct {
         _ = std.c.write(self.wake.write, "w", 1);
     }
 
-    /// Empties the wake pipe. Called with the table lock held. Returns
-    /// whether a wake was pending.
-    fn drainWake(self: *Pool) bool {
+    /// Empties the wake pipe. Called with the table lock held.
+    fn drainWake(self: *Pool) void {
         var byte: [8]u8 = undefined;
         while (std.c.read(self.wake.read, &byte, byte.len) > 0) {}
-        defer self.wake_pending = false;
-        return self.wake_pending;
+        self.wake_pending = false;
     }
 
     const Entry = struct {
@@ -280,6 +275,8 @@ pub const Pool = struct {
         want_out: bool,
         /// The report channel, while it is still read.
         report_fd: ?std.posix.fd_t,
+        /// Replies wait to be sent on the report channel.
+        want_reply: bool,
     };
 
     const Pick = struct {
@@ -305,13 +302,13 @@ pub const Pool = struct {
 
             if (self.findExit()) |found| {
                 self.delivery_lock.lockUncancelable(self.io);
-                self.trace.reader(self, "ExitCheck", .{ .rpc = .deliver, .delivering = true });
                 self.unlockTable();
                 const lines = &self.reports[found.id.slot];
                 self.feedReport(found.id, self.drain.items);
+                lines.lose(self.drain_lost.newlines, self.drain_lost.trailing);
                 lines.end();
                 self.sink.exited(self.sink.ctx, found.id, found.exit);
-                self.finishDelivery(&.{});
+                self.delivery_lock.unlock(self.io);
                 continue;
             }
 
@@ -327,10 +324,10 @@ pub const Pool = struct {
                     .fd = terminal.fd(),
                     .want_out = terminal.pendingBytes() > 0,
                     .report_fd = if (self.report_done[index]) null else terminal.reportFd(),
+                    .want_reply = !self.report_done[index] and terminal.pendingReplyBytes() > 0,
                 };
                 count += 1;
             }
-            self.trace.reader(self, "Snapshot", .{ .rpc = .poll, .snap = entries[0..count], .timed = timed });
             self.unlockTable();
 
             fds[0] = .{ .fd = self.wake.read, .events = POLL.IN, .revents = 0 };
@@ -341,7 +338,8 @@ pub const Pool = struct {
                 watched += 1;
                 at.* = null;
                 if (entry.report_fd) |report_fd| {
-                    fds[watched] = .{ .fd = report_fd, .events = POLL.IN, .revents = 0 };
+                    const reply_out: i16 = if (entry.want_reply) POLL.OUT else 0;
+                    fds[watched] = .{ .fd = report_fd, .events = POLL.IN | reply_out, .revents = 0 };
                     at.* = watched;
                     watched += 1;
                 }
@@ -351,7 +349,8 @@ pub const Pool = struct {
             {}
 
             self.lockTable();
-            const woke = self.drainWake();
+            // A wake only restarts the poll with a fresh snapshot.
+            self.drainWake();
             var pick_count: usize = 0;
             var at_pty: usize = 1;
             for (entries[0..count], report_at[0..count]) |entry, at_report| {
@@ -362,20 +361,11 @@ pub const Pool = struct {
                 picks[pick_count] = .{ .entry = entry, .revents = revents, .report_revents = report_revents };
                 pick_count += 1;
             }
-            if (pick_count == 0 and !woke) {
-                self.trace.reader(self, "PollTimeout", .{ .rpc = .snapshot });
-                self.unlockTable();
-                continue;
-            }
-            self.trace.reader(self, "Poll", .{
-                .rpc = if (pick_count == 0) .snapshot else .read,
-                .picks = picks[0..pick_count],
-            });
             self.unlockTable();
 
-            for (picks[0..pick_count], 1..) |pick, handled| {
+            for (picks[0..pick_count]) |pick| {
                 self.lockTable();
-                self.handle(pick, picks[handled..pick_count]);
+                self.handle(pick);
             }
         }
     }
@@ -400,15 +390,23 @@ pub const Pool = struct {
     /// finished. Called with the table lock held.
     fn drainReport(self: *Pool, index: usize, terminal: *Terminal) void {
         self.drain.clearRetainingCapacity();
+        self.drain_lost = .{};
         defer self.report_done[index] = true;
         if (self.report_done[index]) return;
+        var keeping = true;
         while (true) {
             const result = terminal.readReport(&self.report_buf) catch return;
-            switch (result) {
-                // Short of memory, the lines read so far still arrive.
-                .data => |bytes| self.drain.appendSlice(self.gpa, bytes) catch return,
+            const bytes = switch (result) {
+                .data => |data| data,
                 .empty, .ended => return,
+            };
+            if (keeping) {
+                if (self.drain.appendSlice(self.gpa, bytes)) |_| continue else |_| keeping = false;
             }
+            // Short of memory, the lines read so far still arrive, and the
+            // lines in the rest are counted as dropped.
+            self.drain_lost.newlines += std.mem.count(u8, bytes, "\n");
+            self.drain_lost.trailing = bytes[bytes.len - 1] != '\n';
         }
     }
 
@@ -431,11 +429,9 @@ pub const Pool = struct {
 
     /// Handles one ready fd. Called with the table lock held; returns with
     /// it released.
-    fn handle(self: *Pool, pick: Pick, rest: []const Pick) void {
+    fn handle(self: *Pool, pick: Pick) void {
         const id = pick.entry.id;
-        const after: Trace.Rpc = if (rest.len == 0) .snapshot else .read;
         if (!self.table.isCurrent(id)) {
-            self.trace.reader(self, "Read", .{ .rpc = after, .picks = rest });
             self.unlockTable();
             return;
         }
@@ -443,6 +439,8 @@ pub const Pool = struct {
         // A failed write leaves the bytes queued; the child side closing
         // ends the terminal, and close drops what is left.
         if (pick.entry.want_out and pick.revents & POLL.OUT != 0) terminal.flush() catch {};
+        // Replies the child can no longer read are dropped by the flush.
+        if (pick.entry.want_reply and pick.report_revents & POLL.OUT != 0) terminal.flushReplies() catch {};
         const ready = POLL.IN | POLL.HUP | POLL.ERR;
         // Any other read error ends the terminal the way a hangup does, so a
         // broken fd cannot keep poll spinning; its exit is still reported.
@@ -459,174 +457,15 @@ pub const Pool = struct {
         if (output_bytes.len > 0 or report_bytes.len > 0 or report_ended) {
             // A PTY that also ended is noticed on its next read.
             self.delivery_lock.lockUncancelable(self.io);
-            self.trace.reader(self, "Read", .{ .rpc = .deliver, .picks = rest, .delivering = true });
             self.unlockTable();
             if (output_bytes.len > 0) self.sink.output(self.sink.ctx, id, output_bytes);
             self.feedReport(id, report_bytes);
             if (report_ended) self.reports[id.slot].end();
-            self.finishDelivery(rest);
+            self.delivery_lock.unlock(self.io);
             return;
         }
         if (output == .ended) self.table.markEnded(id);
-        self.trace.reader(self, "Read", .{ .rpc = after, .picks = rest });
         self.unlockTable();
-    }
-
-    /// The sink returned: release the delivery lock.
-    fn finishDelivery(self: *Pool, rest: []const Pick) void {
-        self.trace.deliver(self, if (rest.len == 0) .snapshot else .read, rest);
-        self.delivery_lock.unlock(self.io);
-    }
-};
-
-// Test builds can record every step of the pool, owner and reader threads
-// alike, as JSON lines for checking against a model outside this
-// repository. Other builds compile the calls away.
-
-const Trace = if (builtin.is_test) Recorder else struct {
-    const Rpc = Recorder.Rpc;
-    fn owner(_: *Trace, _: *Pool, _: []const u8) void {}
-    fn ownerUnlocked(_: *Trace, _: *Pool, _: []const u8) void {}
-    fn reader(_: *Trace, _: *Pool, _: []const u8, _: Recorder.View) void {}
-    fn deliver(_: *Trace, _: *Pool, _: Rpc, _: []const Pool.Pick) void {}
-};
-
-const Recorder = struct {
-    file: ?std.Io.File = null,
-    offset: u64 = 0,
-    failed: bool = false,
-    /// Orders every recorded step. Taken after the table and delivery
-    /// locks, never before them.
-    lock: std.Io.Mutex = .init,
-    /// The state as of the last recorded step.
-    last: Saved = .{},
-
-    const Rpc = enum { snapshot, poll, read, deliver };
-
-    const View = struct {
-        rpc: Rpc,
-        snap: ?[]const Pool.Entry = null,
-        picks: []const Pool.Pick = &.{},
-        delivering: bool = false,
-        timed: ?bool = null,
-    };
-
-    const Saved = struct {
-        states: [max_terminals]core.SlotState = [_]core.SlotState{.free} ** max_terminals,
-        gens: [max_terminals]u32 = [_]u32{0} ** max_terminals,
-        exit_sent: [max_terminals]bool = [_]bool{false} ** max_terminals,
-        wake: bool = false,
-        rpc: Rpc = .snapshot,
-        snap: [max_terminals]Id = undefined,
-        snap_len: usize = 0,
-        picks: [max_terminals]Id = undefined,
-        picks_len: usize = 0,
-        delivering: bool = false,
-        timed: bool = false,
-    };
-
-    /// An owner step that changes the table. Called with the table lock held.
-    fn owner(self: *Recorder, pool: *Pool, event: []const u8) void {
-        self.step(pool, event, null);
-    }
-
-    /// An owner step that changes nothing the trace records (close waiting
-    /// out deliveries). Called with the delivery lock held.
-    fn ownerUnlocked(self: *Recorder, _: *Pool, event: []const u8) void {
-        self.step(null, event, null);
-    }
-
-    /// A reader step. Called with the table lock held.
-    fn reader(self: *Recorder, pool: *Pool, event: []const u8, view: View) void {
-        self.step(pool, event, view);
-    }
-
-    /// The sink returned. Called with the delivery lock held.
-    fn deliver(self: *Recorder, _: *Pool, after: Rpc, rest: []const Pool.Pick) void {
-        self.step(null, "Deliver", .{ .rpc = after, .picks = rest });
-    }
-
-    /// Stops recording; later steps are not written. Fails if any line
-    /// could not be written.
-    fn finish(self: *Recorder) error{TraceWriteFailed}!void {
-        self.lock.lockUncancelable(std.testing.io);
-        defer self.lock.unlock(std.testing.io);
-        if (self.file) |file| file.close(std.testing.io);
-        self.file = null;
-        if (self.failed) return error.TraceWriteFailed;
-    }
-
-    /// Records one step. `pool` is given when the caller holds the table
-    /// lock, so the table can be read; steps without it change no table
-    /// state.
-    fn step(self: *Recorder, pool: ?*Pool, event: []const u8, view: ?View) void {
-        self.lock.lockUncancelable(std.testing.io);
-        defer self.lock.unlock(std.testing.io);
-        if (self.file == null) return;
-        const last = &self.last;
-        if (pool) |p| {
-            for (p.table.slots, 0..) |slot, index| {
-                last.states[index] = slot.state;
-                last.gens[index] = slot.gen;
-                last.exit_sent[index] = slot.exit_sent;
-            }
-            last.wake = p.wake_pending;
-        }
-        if (view) |v| {
-            last.rpc = v.rpc;
-            last.delivering = v.delivering;
-            if (v.timed) |timed| last.timed = timed;
-            if (v.snap) |snap| {
-                for (snap, 0..) |entry, index| last.snap[index] = entry.id;
-                last.snap_len = snap.len;
-            }
-            for (v.picks, 0..) |pick, index| last.picks[index] = pick.entry.id;
-            last.picks_len = v.picks.len;
-        }
-        self.emit(event);
-    }
-
-    const Ref = struct { s: usize, g: u32 };
-
-    fn refs(ids: []const Id, out: []Ref) []Ref {
-        for (ids, out[0..ids.len]) |id, *ref| ref.* = .{ .s = @as(usize, id.slot) + 1, .g = id.gen };
-        return out[0..ids.len];
-    }
-
-    /// Writes `last` as one line. The model numbers slots from 1.
-    fn emit(self: *Recorder, event: []const u8) void {
-        const file = self.file.?;
-        const last = &self.last;
-        var states: [max_terminals][]const u8 = undefined;
-        for (last.states, &states) |state, *name| name.* = @tagName(state);
-        var snap_refs: [max_terminals]Ref = undefined;
-        var pick_refs: [max_terminals]Ref = undefined;
-        const line = std.json.Stringify.valueAlloc(std.testing.allocator, .{
-            .event = event,
-            .state = states,
-            .gen = last.gens,
-            .exit_sent = last.exit_sent,
-            .wake = last.wake,
-            .rpc = @tagName(last.rpc),
-            .snap = .{ .@"$set" = refs(last.snap[0..last.snap_len], &snap_refs) },
-            .picks = .{ .@"$set" = refs(last.picks[0..last.picks_len], &pick_refs) },
-            .delivering = last.delivering,
-            .timed = last.timed,
-        }, .{}) catch {
-            self.failed = true;
-            return;
-        };
-        defer std.testing.allocator.free(line);
-        file.writePositionalAll(std.testing.io, line, self.offset) catch {
-            self.failed = true;
-            return;
-        };
-        self.offset += line.len;
-        file.writePositionalAll(std.testing.io, "\n", self.offset) catch {
-            self.failed = true;
-            return;
-        };
-        self.offset += 1;
     }
 };
 
@@ -950,7 +789,8 @@ test "report lines arrive whole, in order and before the exit" {
     const id = try openShell(pool, report_path ++
         "{ printf 'one\ntw'; sleep 0.05; printf 'o\n\nlast'; } >&$r; exit 3");
     try testing.expectEqual(terminal_mod.Exit{ .code = 3 }, try collector.waitExit(id, 5000));
-    _ = try pool.close(id);
+    // The partial last line is dropped and counted.
+    try testing.expectEqual(@as(usize, 1), (try pool.close(id)).dropped_report_lines);
     try collector.expectReports(id, &.{ "one", "two", "" });
     try testing.expectEqual(@as(usize, 3), collector.record(id).reports_at_exit);
 }
@@ -987,8 +827,37 @@ test "a report line over the limit is dropped" {
     defer testing.allocator.free(script);
     const id = try openShell(pool, script);
     _ = try collector.waitExit(id, 10000);
-    _ = try pool.close(id);
+    try testing.expectEqual(@as(usize, 1), (try pool.close(id)).dropped_report_lines);
     try collector.expectReports(id, &.{"ok"});
+}
+
+test "a reply larger than the socket buffer reaches the child whole" {
+    var collector: Collector = .{};
+    defer collector.deinit();
+    const pool = try Pool.create(testing.allocator, testing.io, collector.sink());
+    defer pool.destroy();
+
+    // The child reads its replies only after the test says go.
+    const id = try openShell(pool, report_path ++
+        "read -r go; read -r a <&$r; read -r b <&$r; echo \"a=${#a} b=$b\"; sleep 5");
+    pool.lockTable();
+    const report_fd = pool.terminals[id.slot].?.reportFd();
+    pool.unlockTable();
+    const size: c_int = 4096;
+    try testing.expectEqual(@as(c_int, 0), std.c.setsockopt(report_fd, std.c.SOL.SOCKET, std.c.SO.SNDBUF, &size, @sizeOf(c_int)));
+
+    const long = [_]u8{'x'} ** terminal_mod.max_reply_line;
+    try pool.reply(id, &long);
+    try pool.reply(id, "after");
+    pool.lockTable();
+    const queued = pool.terminals[id.slot].?.pendingReplyBytes();
+    pool.unlockTable();
+    // The rest is left for the reader to send once the child reads.
+    try testing.expect(queued > 0);
+    try pool.write(id, "go\n");
+    var expected: [32]u8 = undefined;
+    try collector.waitOutput(id, try std.fmt.bufPrint(&expected, "a={d} b=after", .{long.len}), 5000);
+    _ = try pool.close(id);
 }
 
 test "each terminal's report lines keep their order" {
@@ -1032,8 +901,7 @@ test "destroy closes the terminals still open" {
 
 // Random runs open, write to and close up to three terminals while their
 // children print, exit, and leave the PTY to background processes, and
-// while other fds are opened and closed so fd numbers get reused. With
-// SUB_ENGINE_TRACE_DIR set, each run's steps are written to that folder.
+// while other fds are opened and closed so fd numbers get reused.
 
 const scripts = [_][]const u8{
     "echo hi",
@@ -1052,15 +920,7 @@ fn runRandom(seed: u64) !void {
     var collector: Collector = .{};
     defer collector.deinit();
 
-    var trace: Trace = .{};
-    if (std.c.getenv("SUB_ENGINE_TRACE_DIR")) |dir_path| {
-        var dir = try std.Io.Dir.cwd().openDir(testing.io, std.mem.span(dir_path), .{});
-        defer dir.close(testing.io);
-        var name: [64]u8 = undefined;
-        const file_name = try std.fmt.bufPrint(&name, "Pool--seed-{d}.ndjson", .{seed});
-        trace.file = try dir.createFile(testing.io, file_name, .{ .truncate = true });
-    }
-    const pool = try Pool.createWith(testing.allocator, testing.io, collector.sink(), trace);
+    const pool = try Pool.create(testing.allocator, testing.io, collector.sink());
     defer pool.destroy();
 
     var open_ids: std.ArrayList(Id) = .empty;
@@ -1102,7 +962,6 @@ fn runRandom(seed: u64) !void {
         collector.markClosed(id);
     }
     for (foreign.items) |fd| _ = std.c.close(fd);
-    try pool.trace.finish();
 
     try testing.expectEqual(@as(usize, 0), collector.late);
     try testing.expectEqual(@as(usize, 0), collector.late_reports);
