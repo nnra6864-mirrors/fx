@@ -1872,6 +1872,23 @@ fn handleKernelJournalOpen(
         try response.writer.writeAll(",\"lastTurnId\":");
         try writeJsonStr(id, &response.writer);
     }
+    // The calls the open turn left running, which the host may have the
+    // resume run again instead of leaving them to the model.
+    const running = active.journal.?.ambiguousCalls();
+    if (running.len > 0) {
+        try response.writer.writeAll(",\"runningCalls\":[");
+        for (running, 0..) |call, index| {
+            if (index > 0) try response.writer.writeByte(',');
+            try response.writer.writeAll("{\"id\":");
+            try writeJsonStr(call.id, &response.writer);
+            try response.writer.writeAll(",\"name\":");
+            try writeJsonStr(call.name, &response.writer);
+            try response.writer.writeAll(",\"arguments\":");
+            try writeJsonStr(call.arguments_json, &response.writer);
+            try response.writer.writeByte('}');
+        }
+        try response.writer.writeByte(']');
+    }
     try response.writer.writeAll(",\"followUps\":[");
     for (follow_ups, 0..) |follow_up, index| {
         if (index > 0) try response.writer.writeByte(',');

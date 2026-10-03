@@ -344,6 +344,33 @@ test("a resumed turn answers a call a crash left running instead of running it a
   assertContiguous(crashed.events);
 });
 
+test("a host that knows a running call never ran has the resumed turn run it again", async () => {
+  const journal = eventJournal();
+  const seen = [];
+  const send = { ...lookup, execute: async (input, { callId }) => { seen.push(callId); return lookup.execute(input); } };
+  const agent = await createFxAgent(options(sourceBackend, journal, { tools: [send] }));
+  await run(agent, "use the tool");
+  await agent.close();
+  const intent = journal.events.findIndex((event) => event.type === "tool_intent");
+  const crashed = eventJournal(journal.events.slice(0, intent + 1));
+
+  const resumed = await createFxAgent(options(targetBackend, crashed, { tools: [send] }));
+  assert.throws(() => resumed.resume({ onAmbiguous: "rerun" }), /onAmbiguous must be a function/);
+  const asked = [];
+  requests.length = 0;
+  const turn = resumed.resume({ onAmbiguous: (call) => { asked.push(call); return "rerun"; } });
+  for await (const _ of turn) {}
+  assert.equal((await turn.result).stopReason, "end_turn");
+  await resumed.close();
+  assert.deepEqual(asked, [{ callId: "call-1", name: "lookup", input: { key: "alpha" } }]);
+  assert.deepEqual(seen, ["call-1", "call-1"], "the call ran again under the id the model gave it");
+  const results = toolResults(requests[0]);
+  assert.equal(results.length, 1, "the call has one result");
+  assert.doesNotMatch(JSON.stringify(results[0]), /may have partly run/);
+  assert.match(JSON.stringify(results[0]), /is beta/);
+  assertContiguous(crashed.events);
+});
+
 test("a resumed turn keeps what the model wrote before the calls a crash left running", async () => {
   const journal = eventJournal();
   const agent = await createFxAgent(options(sourceBackend, journal));

@@ -248,6 +248,8 @@ export function createMemoryPersistence() {
 const resumeTurn = Symbol("libfx.resume");
 // Carries the follow-up a turn runs: `{ id, accepted }`.
 const followUpInput = Symbol("libfx.followUp");
+// Carries the ids of the calls a resumed turn runs again.
+const rerunCallIds = Symbol("libfx.rerun");
 
 function journalAppendError(cause) {
   const error = new Error("libfx journal append failed", { cause });
@@ -287,6 +289,15 @@ const turnIdRule = "1 to 128 letters, digits, '.', '_' or '-'";
 
 function validTurnId(id) {
   return typeof id === "string" && /^[A-Za-z0-9._-]{1,128}$/.test(id);
+}
+
+function checkOnAmbiguous(onAmbiguous) {
+  if (onAmbiguous !== undefined && typeof onAmbiguous !== "function") throw new TypeError("onAmbiguous must be a function");
+}
+
+// A call's input as the model wrote it: JSON when it parses, else the text.
+function parsedToolInput(text) {
+  try { return JSON.parse(text); } catch { return text; }
 }
 
 function validCursor(cursor) {
@@ -2066,6 +2077,18 @@ export async function createFxAgent(options = {}) {
   // ended, so a retried prompt continues or skips its turn.
   let openTurnId = null;
   let lastTurnId = null;
+  // The calls the open turn left running: `{ id, name, arguments }`.
+  let ambiguousCalls = [];
+  // Asks `onAmbiguous` about each of them, once, and returns the ids of the
+  // calls to run again; the resume answers the rest as possibly run.
+  const rerunIds = (onAmbiguous) => {
+    const calls = ambiguousCalls;
+    ambiguousCalls = [];
+    if (onAmbiguous === undefined) return [];
+    return calls
+      .filter((call) => onAmbiguous({ callId: call.id, name: call.name, input: parsedToolInput(call.arguments) }) === "rerun")
+      .map((call) => call.id);
+  };
   // Follow-ups waiting for the turn ahead of them, oldest first.
   const followUps = [];
   // A follow-up this agent queued starts when the turn ahead of it ends, ahead
@@ -2384,8 +2407,10 @@ export async function createFxAgent(options = {}) {
     if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) throw new Error("fx returned an invalid checkpoint");
     return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   }
-  const sendPrompt = (blocks, resuming = false, followUp = null, turnId = null) => {
-    if (resuming) return request("session/prompt", { sessionId, prompt: [], _meta: { fx: { continueRecovery: true } } });
+  const sendPrompt = (blocks, resuming = false, followUp = null, turnId = null, rerun = []) => {
+    if (resuming) {
+      return request("session/prompt", { sessionId, prompt: [], _meta: { fx: { continueRecovery: true, ...(rerun.length ? { rerun } : {}) } } });
+    }
     const images = blocks.filter((block) => block.type === "image" && block.bytes !== undefined);
     const ids = images.length ? attachBytes(images.map((block) => block.bytes)) : [];
     let next = 0;
@@ -2515,6 +2540,9 @@ export async function createFxAgent(options = {}) {
       resumable = opened?.resumable === true;
       openTurnId = resumable && validTurnId(opened?.openTurnId) ? opened.openTurnId : null;
       lastTurnId = validTurnId(opened?.lastTurnId) ? opened.lastTurnId : null;
+      ambiguousCalls = resumable && Array.isArray(opened?.runningCalls)
+        ? opened.runningCalls.filter((call) => typeof call?.id === "string" && typeof call.name === "string")
+        : [];
       journalHead = loaded.head;
       appendedSeq = loaded.lastSeq;
       bytesSinceCheckpoint = loaded.tailBytes;
@@ -2550,31 +2578,35 @@ export async function createFxAgent(options = {}) {
       if (activeTurn) throw new Error("a prompt is already in progress for this session");
       const turnId = promptOptions.turnId;
       if (turnId !== undefined && !validTurnId(turnId)) throw new TypeError(`turnId must be ${turnIdRule}`);
+      checkOnAmbiguous(promptOptions.onAmbiguous);
       if (turnId !== undefined && journal) {
         if (resumable && turnId === openTurnId) {
           resumable = false;
-          return normalizeTurn(startTurn(null, { ...promptOptions, [resumeTurn]: true }));
+          return normalizeTurn(startTurn(null, { ...promptOptions, [resumeTurn]: true, [rerunCallIds]: rerunIds(promptOptions.onAmbiguous) }));
         }
         if (turnId === lastTurnId) return endedTurn(turnId);
       }
       // A new prompt ends a turn the last process left open as interrupted.
       resumable = false;
+      ambiguousCalls = [];
       return normalizeTurn(startTurn(input, { ...promptOptions, turnId: turnId ?? `turn_${crypto.randomUUID()}` }));
     },
     /**
      * Continues the turn the last process left open, with no new input, and
      * returns it; returns null when the journal holds no open turn. The
      * model is told the session was interrupted; calls that were running
-     * come back answered as possibly run, for the model to decide about.
+     * come back answered as possibly run, for the model to decide about,
+     * unless `onAmbiguous(call)` returns "rerun" for them.
      */
     resume(promptOptions = {}) {
       if (closing) throw new Error("fx agent is closed");
       if (journalFailure) throw reportJournalFailure();
       if (handedOff) throw handedOffError();
       if (activeTurn) throw new Error("a prompt is already in progress for this session");
+      checkOnAmbiguous(promptOptions.onAmbiguous);
       if (resumable) {
         resumable = false;
-        return normalizeTurn(startTurn(null, { ...promptOptions, [resumeTurn]: true }));
+        return normalizeTurn(startTurn(null, { ...promptOptions, [resumeTurn]: true, [rerunCallIds]: rerunIds(promptOptions.onAmbiguous) }));
       }
       // With no open turn, the follow-ups the journal held are the work left.
       const next = followUps.find((entry) => entry.held);
@@ -2994,7 +3026,7 @@ export async function createFxAgent(options = {}) {
         return sendPrompt(prepared, false, followUp, turn.id);
       });
     } else {
-      try { response = sendPrompt(prompt, resuming, followUp, turn.id); } catch (error) { response = Promise.reject(error); }
+      try { response = sendPrompt(prompt, resuming, followUp, turn.id, promptOptions[rerunCallIds] ?? []); } catch (error) { response = Promise.reject(error); }
     }
     // Appends after a turn's first progress are lazy, so the result does not
     // wait for them; `close()` does. A failure already seen fails the turn.

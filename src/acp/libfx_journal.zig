@@ -11,6 +11,8 @@ const types = @import("../core/shared/types.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const session_adapter = @import("../core/session/session_adapter.zig");
 const checkpoint_codec = @import("../core/agent/runtime/checkpoint.zig");
+const execution_memory = @import("../core/agent/execution_memory.zig");
+const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -50,6 +52,9 @@ pub const Journal = struct {
     /// host resumes it or starts another turn. Owned by the session's
     /// allocator.
     pending_resume: ?session_codec.RecoveryCheckpoint = null,
+    /// Which step of the pending resume answers the calls the crash left
+    /// running, when it left any. The host may have the resume run them again.
+    pending_resume_answered: ?usize = null,
     /// Set when a turn starts: its first progress carries the prompt, or the
     /// resolution of a resumed turn, and must be stored before the model
     /// sees it. Also set when the next progress places inputs.
@@ -102,10 +107,21 @@ pub const Journal = struct {
     pub fn dropPendingResume(self: *Journal, alloc: Allocator) void {
         if (self.pending_resume) |*checkpoint| checkpoint.deinit(alloc);
         self.pending_resume = null;
+        self.pending_resume_answered = null;
         if (self.pending_inputs.len > 0) {
             debug_trace.logf("session", "event=libfx_journal_inputs_dropped count={d} reason=resume_replaced", .{self.pending_inputs.len});
         }
         self.dropPendingInputs(alloc);
+    }
+
+    /// The calls the crash left running in the pending resume, answered as
+    /// possibly run unless the host has the resume run them again. Borrowed
+    /// from the pending resume.
+    pub fn ambiguousCalls(self: *const Journal) []const types.ToolCall {
+        const pending = self.pending_resume orelse return &.{};
+        const step = self.pending_resume_answered orelse return &.{};
+        if (step >= pending.execution.tool_steps.len) return &.{};
+        return pending.execution.tool_steps[step].tool_calls;
     }
 
     /// Hands the pending resume's inputs to the caller, who owns them.
@@ -273,8 +289,8 @@ fn dupePendingInputs(alloc: Allocator, inputs: []const journal.PendingInput) All
 /// Rebuilds a fresh session from the host's events, after `snapshot` when
 /// the host stored one, and starts its journal after them. A turn a crash
 /// left open becomes the pending resume, with every call it left running
-/// answered as possibly run, for the model to decide about; `session_alloc`
-/// owns it.
+/// answered as possibly run, for the model to decide about unless the host
+/// has the resume run it again (`rerunCalls`); `session_alloc` owns it.
 pub fn open(
     alloc: Allocator,
     session_alloc: Allocator,
@@ -321,8 +337,10 @@ pub fn open(
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     var answered = checkpoint;
+    const answered_step = answered.execution.tool_steps.len;
     try answerRunning(scratch.allocator(), &answered, folded.running_calls);
     state.pending_resume = try answered.dupe(session_alloc);
+    if (folded.running_calls.len > 0) state.pending_resume_answered = answered_step;
     state.pending_inputs = try dupePendingInputs(session_alloc, folded.pending_inputs);
     return .{ state, .{
         .turns = folded.history.len,
@@ -387,6 +405,56 @@ fn answerRunning(scratch: Allocator, turn: *session_codec.RecoveryCheckpoint, ca
     turn.execution.tool_steps = steps;
     turn.assistant_source = @constCast("");
     turn.tool_state = .confirmed;
+}
+
+/// Runs again each call of `checkpoint`'s step `step_index`, the step that
+/// answers the calls a crash left running, that `runner.rerun` says the host
+/// asked to run again, under the id the model gave it, and puts what
+/// `runner.run` returns in place of the answer that it may have partly run.
+/// Every other call keeps that answer, for the model to decide about. Stops
+/// at the first call `runner.run` returns null for (the turn is being
+/// cancelled or handed off), so that call and every later one keep it too.
+/// `alloc` owns `checkpoint` and the results put in it. Returns how many
+/// calls ran again.
+pub fn rerunCalls(
+    alloc: Allocator,
+    checkpoint: *session_codec.RecoveryCheckpoint,
+    step_index: usize,
+    runner: anytype,
+) !usize {
+    const steps = checkpoint.execution.tool_steps;
+    if (step_index >= steps.len) return 0;
+    const step = &steps[step_index];
+    var reran: usize = 0;
+    for (step.tool_calls, step.tool_results) |call, *result| {
+        if (!runner.rerun(call)) continue;
+        const outcome = (try runner.run(alloc, call)) orelse {
+            debug_trace.logf("session", "event=libfx_resume_rerun_stopped call={s} reran={d} kept=may_have_partly_run", .{ call.id, reran });
+            break;
+        };
+        defer outcome.deinit(alloc);
+        const replacement = try persistedResult(alloc, call, outcome);
+        types.freePersistedToolResult(alloc, result.*);
+        result.* = replacement;
+        reran += 1;
+        debug_trace.logf("session", "event=libfx_resume_rerun call={s} tool={s} status={s}", .{ call.id, call.name, @tagName(replacement.status) });
+    }
+    return reran;
+}
+
+fn persistedResult(alloc: Allocator, call: types.ToolCall, outcome: tool_dispatch.ToolResult) !types.PersistedToolResult {
+    return switch (outcome) {
+        .success => |text| execution_memory.makePersistedToolResult(alloc, call.id, call.name, .success, text, null),
+        .failure => |text| execution_memory.makePersistedToolResult(alloc, call.id, call.name, .failure, text, null),
+        .rich => |content| execution_memory.makePersistedToolResult(
+            alloc,
+            call.id,
+            call.name,
+            if (content.is_error) .failure else .success,
+            content.text,
+            .{ .tool_images = content.images, .output_bytes = content.text.len, .stored_output_bytes = content.text.len },
+        ),
+    };
 }
 
 const TestCapture = struct {
@@ -491,4 +559,81 @@ test "a turn's id reaches its first progress only, and is the last turn's once t
     try session.appendProgress(alloc, alloc, "session", progress, "fake/model");
     try session.clearProgress(alloc, "session");
     try std.testing.expect(session.last_turn_id.slice() == null);
+}
+
+/// Runs again the calls in `ids`, except `stop_at`, which it reports as cancelled.
+const TestRerunner = struct {
+    ids: []const []const u8,
+    stop_at: ?[]const u8 = null,
+    ran: *std.ArrayList([]const u8),
+
+    pub fn rerun(self: TestRerunner, call: types.ToolCall) bool {
+        for (self.ids) |id| if (std.mem.eql(u8, id, call.id)) return true;
+        return false;
+    }
+
+    pub fn run(self: TestRerunner, alloc: Allocator, call: types.ToolCall) !?tool_dispatch.ToolResult {
+        if (self.stop_at) |id| if (std.mem.eql(u8, call.id, id)) return null;
+        try self.ran.append(std.testing.allocator, call.id);
+        return .{ .success = try std.fmt.allocPrint(alloc, "ran again as {s}", .{call.id}) };
+    }
+};
+
+fn testAnswered(alloc: Allocator, calls: []types.ToolCall) !session_codec.RecoveryCheckpoint {
+    var progress = try testProgress(alloc);
+    defer progress.deinit(alloc);
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    var answered = progress;
+    try answerRunning(scratch.allocator(), &answered, calls);
+    return answered.dupe(alloc);
+}
+
+test "a resumed turn runs again the calls the host asks for and leaves the rest to the model" {
+    const alloc = std.testing.allocator;
+    var calls = [_]types.ToolCall{
+        .{ .id = "call-1", .name = "read", .arguments_json = "{}" },
+        .{ .id = "call-2", .name = "send", .arguments_json = "{}" },
+        .{ .id = "call-3", .name = "read", .arguments_json = "{}" },
+    };
+    var answered = try testAnswered(alloc, &calls);
+    defer answered.deinit(alloc);
+    var ran: std.ArrayList([]const u8) = .empty;
+    defer ran.deinit(alloc);
+
+    const ids = [_][]const u8{ "call-1", "call-3" };
+    const reran = try rerunCalls(alloc, &answered, 0, TestRerunner{ .ids = &ids, .ran = &ran });
+    try std.testing.expectEqual(@as(usize, 2), reran);
+    try std.testing.expectEqual(@as(usize, 2), ran.items.len);
+    const results = answered.execution.tool_steps[0].tool_results;
+    // Every call keeps its place, so results reach the model in its order.
+    try std.testing.expectEqualStrings("call-1", results[0].tool_call_id);
+    try std.testing.expectEqualStrings("ran again as call-1", results[0].output);
+    try std.testing.expectEqual(types.PersistedToolStatus.success, results[0].status);
+    try std.testing.expectEqualStrings(session_adapter.unfinished_tool_output, results[1].output);
+    try std.testing.expectEqual(types.PersistedToolStatus.failure, results[1].status);
+    try std.testing.expectEqualStrings("ran again as call-3", results[2].output);
+}
+
+test "a resume cancelled during a rerun keeps that call and the later ones answered" {
+    const alloc = std.testing.allocator;
+    var calls = [_]types.ToolCall{
+        .{ .id = "call-1", .name = "read", .arguments_json = "{}" },
+        .{ .id = "call-2", .name = "read", .arguments_json = "{}" },
+        .{ .id = "call-3", .name = "read", .arguments_json = "{}" },
+    };
+    var answered = try testAnswered(alloc, &calls);
+    defer answered.deinit(alloc);
+    var ran: std.ArrayList([]const u8) = .empty;
+    defer ran.deinit(alloc);
+
+    const ids = [_][]const u8{ "call-1", "call-2", "call-3" };
+    const reran = try rerunCalls(alloc, &answered, 0, TestRerunner{ .ids = &ids, .stop_at = "call-2", .ran = &ran });
+    try std.testing.expectEqual(@as(usize, 1), reran);
+    const results = answered.execution.tool_steps[0].tool_results;
+    try std.testing.expectEqualStrings("ran again as call-1", results[0].output);
+    try std.testing.expectEqualStrings(session_adapter.unfinished_tool_output, results[1].output);
+    try std.testing.expectEqualStrings(session_adapter.unfinished_tool_output, results[2].output);
+    // A step index past the turn's steps runs nothing.
+    try std.testing.expectEqual(@as(usize, 0), try rerunCalls(alloc, &answered, 5, TestRerunner{ .ids = &ids, .ran = &ran }));
 }

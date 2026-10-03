@@ -437,12 +437,20 @@ for (let turn = agent.resume(); turn; turn = agent.resume()) {
 }
 ```
 
+When your host knows a call never ran, such as one it handed to another
+process before the call did anything, pass `resume({ onAmbiguous })`. libfx
+calls `onAmbiguous({ callId, name, input })` once for each call the turn left
+running, and each call it returns `"rerun"` for runs again under the same call
+id before the turn continues. Every other call keeps the answer that it may
+have partly run.
+
 Calling `prompt()` instead ends the open turn as interrupted and starts a new
 one.
 
 Give a prompt a `turnId` when the same request can reach libfx more than once,
 such as from a queue that delivers it again after a crash. When the open turn
-has that id, `prompt(input, { turnId })` continues it as `resume()` does. When
+has that id, `prompt(input, { turnId })` continues it as `resume()` does, and
+takes `onAmbiguous` the same way. When
 the session's last turn ended with that id, it returns a turn that has already
 ended, with the stop reason `end_turn`, without calling the model. Any other id
 starts a new turn. A turn id is 1 to 128 letters, digits, `.`, `_`, or `-`.
@@ -574,7 +582,8 @@ a tool with an external effect can use them as an idempotency key.
 With persistence, libfx stores the calls of a response before any of them
 starts, so no call runs without a record that it was about to. If the process
 stops while calls are running, `resume()` answers each of them with an error
-saying it may have partly run, so the model checks before calling it again.
+saying it may have partly run, so the model checks before calling it again,
+unless `onAmbiguous` has the call run again.
 When a tool rejects with an empty message, the model receives a non-empty error
 so the provider does not refuse the conversation.
 

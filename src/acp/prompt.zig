@@ -529,6 +529,33 @@ fn activeToolSet(state: *const server.ServerState) tool_set_contract.ToolSet {
     return tool_call_presentation.activeToolSet(state);
 }
 
+/// Runs again, through the host, the calls of a resumed turn the host asked
+/// to run again, as the turn's tools run.
+const ResumeRerun = struct {
+    ctx: *AcpContext,
+    cancel_flag: *std.atomic.Value(bool),
+    max_result_bytes: usize,
+    call_ids: []const []const u8,
+
+    pub fn rerun(self: ResumeRerun, call: types.ToolCall) bool {
+        for (self.call_ids) |id| {
+            if (!std.mem.eql(u8, id, call.id)) continue;
+            const tool = self.ctx.toolRegistry().lookup(call.name) orelse return false;
+            return tool.executor_kind == .host and !tool.provider_executed;
+        }
+        return false;
+    }
+
+    /// Null when the turn is cancelled or handed off, or no host can run it.
+    pub fn run(self: ResumeRerun, alloc: Allocator, call: types.ToolCall) !?tool_dispatch.ToolResult {
+        const provider = hostToolProvider(self.ctx.state) orelse return null;
+        return provider.call(alloc, call.name, call.id, call.arguments_json, self.max_result_bytes, self.cancel_flag) catch |err| switch (err) {
+            error.Cancelled => null,
+            else => |other| other,
+        };
+    }
+};
+
 fn hostToolProvider(state: *server.ServerState) ?tool_dispatch.HostToolProvider {
     if (state.host_tools.tools.len == 0) return null;
     if (comptime host_target.is_wasm) return js_host_tools.provider();
@@ -882,6 +909,7 @@ pub fn handlePrompt(
         const inputs = journal.takePendingInputs();
         defer journal_events.freePendingInputs(state.alloc, inputs);
         recovery_checkpoint = try libfx_journal.resumeCheckpoint(alloc, pending, inputs);
+        const answered_step = journal.pending_resume_answered;
         {
             session.session_write_mutex.lockUncancelable(io_mod.getIo());
             defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -891,6 +919,17 @@ pub fn handlePrompt(
             try journal.notePlaced(state.alloc, ids);
         }
         journal.dropPendingResume(state.alloc);
+        // Calls the crash left running that the host asked to run again do
+        // so before the turn continues, and their results replace the answer
+        // that they may have partly run.
+        if (answered_step) |step| if (prompt_input.rerun_call_ids.len > 0) {
+            _ = try libfx_journal.rerunCalls(alloc, &recovery_checkpoint.?, step, ResumeRerun{
+                .ctx = &ctx,
+                .cancel_flag = &session.cancel_flag,
+                .max_result_bytes = session.max_tool_result_bytes,
+                .call_ids = prompt_input.rerun_call_ids,
+            });
+        };
     } else if (prompt_input.continue_recovery) {
         const writable = if (session.writable) |*value| value else return .{
             .rpc_error = .{
@@ -1394,6 +1433,9 @@ const ParsedPromptInput = struct {
     input_id: ?[]u8 = null,
     /// The host's id for the turn this prompt starts.
     turn_id: ?[]u8 = null,
+    /// Calls a resumed turn's crash left running that the host asked to run
+    /// again instead of leaving them to the model.
+    rerun_call_ids: [][]u8 = &.{},
     /// Whether the host already recorded the follow-up as accepted.
     input_accepted: bool = false,
     targets: []context_contract.ApplicableTarget = &.{},
@@ -1472,6 +1514,8 @@ const ParsedPromptInput = struct {
         alloc.free(self.text);
         if (self.input_id) |id| alloc.free(id);
         if (self.turn_id) |id| alloc.free(id);
+        for (self.rerun_call_ids) |id| alloc.free(id);
+        if (self.rerun_call_ids.len > 0) alloc.free(self.rerun_call_ids);
         for (self.targets) |target| alloc.free(@constCast(target.path));
         if (self.targets.len > 0) alloc.free(self.targets);
         for (self.omissions) |omission| alloc.free(@constCast(omission.source));
@@ -1537,6 +1581,29 @@ fn takePromptImageAttachment(
     return bytes;
 }
 
+/// At most this many calls of a resumed turn run again; a turn's response
+/// makes no more calls than its batch limit.
+const max_rerun_calls = 128;
+const max_call_id_bytes = 256;
+
+/// The call ids in `value`, a JSON array of strings, owned by the caller.
+/// Anything else, and ids that are empty or too long, are left out.
+fn ownedCallIds(alloc: Allocator, value: std.json.Value) Allocator.Error![][]u8 {
+    if (value != .array) return &.{};
+    var ids: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (ids.items) |id| alloc.free(id);
+        ids.deinit(alloc);
+    }
+    for (value.array.items) |item| {
+        if (ids.items.len == max_rerun_calls) break;
+        if (item != .string or item.string.len == 0 or item.string.len > max_call_id_bytes) continue;
+        try ids.append(alloc, try alloc.dupe(u8, item.string));
+    }
+    if (ids.items.len == 0) return &.{};
+    return ids.toOwnedSlice(alloc);
+}
+
 fn parsePromptInputWithFirstImageId(
     alloc: Allocator,
     params_json: []const u8,
@@ -1560,6 +1627,7 @@ fn parsePromptInputWithFirstImageId(
         if (value == .string and libfx_steering.validInputId(value.string)) value.string else null
     else
         null;
+    const rerun_value = acp_types.fxMetaField(parsed.value.object, "rerun");
 
     const prompt_arr = parsed.value.object.get("prompt") orelse
         return .{ .text = try alloc.dupe(u8, ""), .continue_recovery = continue_recovery };
@@ -1691,6 +1759,7 @@ fn parsePromptInputWithFirstImageId(
     errdefer result.deinit(alloc);
     if (input_id) |id| result.input_id = try alloc.dupe(u8, id);
     if (turn_id) |id| result.turn_id = try alloc.dupe(u8, id);
+    if (rerun_value) |value| result.rerun_call_ids = try ownedCallIds(alloc, value);
     result.targets = try targets.toOwnedSlice(alloc);
     result.omissions = try omissions.toOwnedSlice(alloc);
     result.pending_images = try pending_images.toOwnedSlice(alloc);
@@ -3863,6 +3932,19 @@ test "parsePromptInput accepts explicit recovery continuation metadata" {
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), result.text.len);
     try std.testing.expect(result.continue_recovery);
+    try std.testing.expectEqual(@as(usize, 0), result.rerun_call_ids.len);
+}
+
+test "parsePromptInput keeps the call ids a resume runs again and drops the rest" {
+    const alloc = std.testing.allocator;
+    const params =
+        "{\"sessionId\":\"s1\",\"prompt\":[],\"_meta\":{\"fx\":{\"continueRecovery\":true,\"rerun\":[\"call-1\",7,\"\",\"call-2\"]}}}";
+    var result = try parsePromptInput(alloc, params);
+    defer result.deinit(alloc);
+    try std.testing.expect(result.continue_recovery);
+    try std.testing.expectEqual(@as(usize, 2), result.rerun_call_ids.len);
+    try std.testing.expectEqualStrings("call-1", result.rerun_call_ids[0]);
+    try std.testing.expectEqualStrings("call-2", result.rerun_call_ids[1]);
 }
 
 test "parsePromptInput accepts image blocks as owned pending images" {
