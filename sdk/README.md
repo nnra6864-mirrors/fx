@@ -408,10 +408,11 @@ must match. `agent.sessionId` is the id the agent uses.
 
 If the last process stopped during a turn, `agent.resume()` continues that
 turn with no new input and returns it, like `prompt()`. The model is told
-"Resuming from unexpected session interruption.", and tool calls that were
-running come back answered as possibly run, so a `replay: "never"` call does
-not run again unless the model decides to call it. A turn that fails or is
-cancelled ends in the journal as it does in the agent, so only a stopped
+"Resuming from unexpected session interruption.". A tool call that was
+running runs again when its tool is `replay: "safe"`, under the same call id,
+and comes back answered as possibly run otherwise, so a `replay: "never"` call
+does not run again unless the model decides to call it. A turn that fails or
+is cancelled ends in the journal as it does in the agent, so only a stopped
 process leaves one to resume. `resume()` returns `null` when the journal holds
 no open turn and no held follow-up, so a host can call it until it does every
 time it opens a session:
@@ -604,8 +605,10 @@ runs. With a journal, libfx appends the calls of a response before any of
 them starts. When a response includes a `replay: "never"` call, no call in it
 starts until your journal has stored that append, so such a call never runs
 without a record that it was about to. If the process stops while calls are
-running, the restored session answers each one with an error saying it may
-have partly run, so the model checks before calling it again. When a tool
+running, `resume()` runs each `replay: "safe"` call again before the turn
+continues, and answers each `replay: "never"` call, or a call to a tool the
+agent no longer has, with an error saying it may have partly run, so the
+model checks before calling it again. When a tool
 rejects with an empty message, the model receives a non-empty error so the
 provider does not refuse the conversation.
 

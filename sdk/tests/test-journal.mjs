@@ -312,6 +312,32 @@ test("a resumed turn answers a call a crash left running and never reruns it", a
   assertContiguous(crashed.events);
 });
 
+test("a resumed turn runs a safe call a crash left running again, under the same call id", async () => {
+  const journal = createMemoryJournal();
+  const seen = [];
+  const read = { ...lookup, replay: "safe", execute: async (input, { toolCallId }) => { seen.push(toolCallId); return lookup.execute(input); } };
+  const agent = await createFxAgent(options(sourceBackend, journal, { tools: [read] }));
+  await run(agent, "use the tool");
+  await agent.close();
+  assert.equal(seen.length, 1);
+  // The process died while the call ran: after its intent, before any result.
+  const intent = journal.events.findIndex((event) => event.type === "tool_intent");
+  assert.ok(intent > 0);
+  const crashed = createMemoryJournal(journal.events.slice(0, intent + 1));
+  const resumed = await createFxAgent(options(targetBackend, crashed, { tools: [read] }));
+  requests.length = 0;
+  const turn = resumed.resume();
+  for await (const _ of turn) {}
+  assert.equal((await turn.result).stopReason, "end_turn");
+  await resumed.close();
+  assert.deepEqual(seen, [seen[0], seen[0]], "the safe call ran again with the call id the model gave it");
+  const results = toolResults(requests[0]);
+  assert.equal(results.length, 1, "the call has one result");
+  assert.doesNotMatch(JSON.stringify(results[0]), /may have partly run/);
+  assert.match(JSON.stringify(results[0]), /is beta/);
+  assertContiguous(crashed.events);
+});
+
 test("a resumed turn keeps what the model wrote before the calls a crash left running", async () => {
   const journal = createMemoryJournal();
   const agent = await createFxAgent(options(sourceBackend, journal));

@@ -529,6 +529,28 @@ fn activeToolSet(state: *const server.ServerState) tool_set_contract.ToolSet {
     return tool_call_presentation.activeToolSet(state);
 }
 
+/// Runs a resumed turn's safe calls again through the host, as the turn's
+/// tools run.
+const ResumeRerun = struct {
+    ctx: *AcpContext,
+    cancel_flag: *std.atomic.Value(bool),
+    max_result_bytes: usize,
+
+    pub fn safe(self: ResumeRerun, call: types.ToolCall) bool {
+        const tool = self.ctx.toolRegistry().lookup(call.name) orelse return false;
+        return tool.executor_kind == .host and !tool.provider_executed and !tool.host_replay_never;
+    }
+
+    /// Null when the turn is cancelled or handed off, or no host can run it.
+    pub fn run(self: ResumeRerun, alloc: Allocator, call: types.ToolCall) !?tool_dispatch.ToolResult {
+        const provider = hostToolProvider(self.ctx.state) orelse return null;
+        return provider.call(alloc, call.name, call.id, call.arguments_json, self.max_result_bytes, self.cancel_flag) catch |err| switch (err) {
+            error.Cancelled => null,
+            else => |other| other,
+        };
+    }
+};
+
 fn hostToolProvider(state: *server.ServerState) ?tool_dispatch.HostToolProvider {
     if (state.host_tools.tools.len == 0) return null;
     if (comptime host_target.is_wasm) return js_host_tools.provider();
@@ -882,6 +904,7 @@ pub fn handlePrompt(
         const inputs = journal.takePendingInputs();
         defer journal_events.freePendingInputs(state.alloc, inputs);
         recovery_checkpoint = try libfx_journal.resumeCheckpoint(alloc, pending, inputs);
+        const answered_step = journal.pending_resume_answered;
         {
             session.session_write_mutex.lockUncancelable(io_mod.getIo());
             defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -891,6 +914,16 @@ pub fn handlePrompt(
             try journal.notePlaced(state.alloc, ids);
         }
         journal.dropPendingResume(state.alloc);
+        // Calls the crash left running whose tool is `replay: "safe"` run
+        // again before the turn continues, and their results replace the
+        // answer that they may have partly run.
+        if (answered_step) |step| {
+            _ = try libfx_journal.rerunSafeCalls(alloc, &recovery_checkpoint.?, step, ResumeRerun{
+                .ctx = &ctx,
+                .cancel_flag = &session.cancel_flag,
+                .max_result_bytes = session.max_tool_result_bytes,
+            });
+        }
     } else if (prompt_input.continue_recovery) {
         const writable = if (session.writable) |*value| value else return .{
             .rpc_error = .{
