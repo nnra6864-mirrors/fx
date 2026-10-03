@@ -640,6 +640,9 @@ const App = struct {
             else
                 shell_process_provider.provider,
         };
+        // Claims an inherited report channel before anything starts other
+        // programs, which must not inherit it.
+        app.parent_report.initFromEnv();
         auth_runtime.Runtime.initIntoWithMode(
             &app.auth,
             app_api_key_validator,

@@ -484,8 +484,11 @@ pub const Runtime = struct {
         };
         const report = self.pool.?.close(id) catch |err| blk: {
             debug_trace.logf("child_agents", "stop name={s} close failed err={s}", .{ name, @errorName(err) });
-            break :blk sub_engine.CloseReport{ .exit = .{ .signal = 9 }, .dropped_bytes = 0 };
+            break :blk sub_engine.CloseReport{ .exit = .{ .signal = 9 }, .dropped_bytes = 0, .dropped_report_lines = 0 };
         };
+        if (report.dropped_report_lines > 0) {
+            debug_trace.logf("child_agents", "stop name={s} dropped_report_lines={d}", .{ name, report.dropped_report_lines });
+        }
         self.lockTable();
         defer self.unlockTable();
         const child = self.table.get(slot);
