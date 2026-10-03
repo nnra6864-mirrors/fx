@@ -23,6 +23,14 @@ const status_rows = 1;
 const picker_repaint_ms = 250;
 const main_notice = "main needs you";
 
+/// What the status line of a child's view tells the user is waiting.
+const Notice = struct {
+    /// Main shows a prompt of its own.
+    main: bool = false,
+    /// Other children wait on a prompt.
+    others: usize = 0,
+};
+
 /// The view's state; one per TUI.
 pub const State = struct {
     view: view_core.View(child_agents.Handle) = .{},
@@ -31,12 +39,16 @@ pub const State = struct {
     painted_version: ?u64 = null,
     name_buf: [64]u8 = undefined,
     name_len: usize = 0,
-    /// The status line names main's waiting prompt.
-    noticed: bool = false,
+    /// What the painted status line says needs the user.
+    noticed: Notice = .{},
     picker_rows: usize = 0,
     picker_painted_ms: i64 = 0,
     /// The last picker frame, so an unchanged one is not written again.
     picker_hash: ?u64 = null,
+    /// Main's terminal size when the picker opened, to tell on leaving
+    /// whether main's screen needs repairing.
+    open_cols: u16 = 0,
+    open_rows: u16 = 0,
 
     pub fn deinit(self: *State) void {
         self.forgetPainted();
@@ -58,14 +70,18 @@ pub fn active(app: anytype) bool {
 
 pub fn Runtime(comptime App: type) type {
     return struct {
-        /// Ctrl+T on main. Does nothing without children support, or while
-        /// main asks the user something.
+        /// Ctrl+T on main. Does nothing without children support, while main
+        /// asks the user something, or while another screen, such as the
+        /// full transcript, holds the alternate screen.
         pub fn open(app: *App) !void {
             // The wasm builds have no terminals for children.
             if (comptime host_target.is_wasm or !@hasField(App, "child_view")) return;
             if (child_agents.ofApp(app) == null) return;
+            if (app.terminal.alternate_screen_owner != .none) return;
             if (!app.child_view.view.open(mainAsks(app))) return;
             app.child_view.picker_hash = null;
+            app.child_view.open_cols = app.shell.layout.cols;
+            app.child_view.open_rows = app.shell.layout.rows;
             try app_lifecycle.enterChildViewScreen(&app.terminal, &app.shell, &app.metrics);
             try paintPicker(app, true);
         }
@@ -105,9 +121,10 @@ pub fn Runtime(comptime App: type) type {
         fn apply(app: *App, result: view_core.Matcher.Result) !void {
             const state = &app.child_view;
             if (result.pass.len > 0 and state.view.mode == .view) {
-                // A child that is gone takes nothing; the tick then leaves.
-                child_agents.ofApp(app).?.keys(state.view.viewed.?, result.pass) catch {
-                    debug_trace.logf("child_view", "keys dropped bytes={d}: the viewed child is gone", .{result.pass.len});
+                // Keys the child cannot take are dropped. A child that is gone
+                // is left on the next tick.
+                child_agents.ofApp(app).?.keys(state.view.viewed.?, result.pass) catch |err| {
+                    debug_trace.logf("child_view", "keys dropped bytes={d} err={s}", .{ result.pass.len, @errorName(err) });
                 };
             }
             const key = result.key orelse return;
@@ -135,7 +152,7 @@ pub fn Runtime(comptime App: type) type {
             // An exited child stays listed until stopped, but has no screen.
             if (status.exit != null) return;
             state.view.choose(status.handle orelse return);
-            state.noticed = false;
+            state.noticed = .{};
             state.name_len = @min(status.name.len, state.name_buf.len);
             @memcpy(state.name_buf[0..state.name_len], status.name[0..state.name_len]);
             state.forgetPainted();
@@ -148,15 +165,25 @@ pub fn Runtime(comptime App: type) type {
             state.view.leave();
             state.forgetPainted();
             try app_lifecycle.leaveChildViewScreen(&app.terminal, &app.shell, &app.metrics);
-            try shell_runtime.requestRedraw(&app.shell, &app.metrics, .replay_viewport);
+            // After a resize a viewport replay can drop rows the terminal
+            // reflowed, so main is repaired the way the full transcript's
+            // close repairs it.
+            const shell = &app.shell;
+            const resized = shell.layout.cols != state.open_cols or shell.layout.rows != state.open_rows or
+                shell.terminal_reset_pending or shell.resize_history_row_delta != null;
+            if (resized) {
+                shell.repaintRestoredPrimaryTranscriptAfterResize();
+            } else {
+                try shell_runtime.requestRedraw(shell, &app.metrics, .replay_viewport);
+            }
         }
 
         fn paintChild(app: *App, children: *child_agents.Runtime) !void {
             const state = &app.child_view;
-            // A change in main's notice repaints the status line: a fresh copy
-            // matches what is painted, so only that line is written.
-            const notice = mainAsks(app);
-            const after = if (notice == state.noticed) state.painted_version else null;
+            // A change in what needs the user repaints the status line: a
+            // fresh copy matches what is painted, so only that line is written.
+            const notice: Notice = .{ .main = mainAsks(app), .others = children.blockedOthers(state.view.viewed.?) };
+            const after = if (std.meta.eql(notice, state.noticed)) state.painted_version else null;
             var gone = false;
             const screen = children.screen(app.alloc, state.view.viewed.?, after) catch |err| switch (err) {
                 error.Gone => blk: {
@@ -170,10 +197,18 @@ pub fn Runtime(comptime App: type) type {
             errdefer next.grid.deinit();
             state.noticed = notice;
 
-            var status_buf: [128]u8 = undefined;
-            const status = std.fmt.bufPrint(&status_buf, " {s} \u{00b7} {s}Ctrl+T returns to main", .{
+            // At most about 150 bytes: the name is capped at 64.
+            var status_buf: [256]u8 = undefined;
+            var others_buf: [48]u8 = undefined;
+            const others = switch (notice.others) {
+                0 => "",
+                1 => "1 other child needs you \u{00b7} ",
+                else => std.fmt.bufPrint(&others_buf, "{d} other children need you \u{00b7} ", .{notice.others}) catch unreachable,
+            };
+            const status = std.fmt.bufPrint(&status_buf, " {s} \u{00b7} {s}{s}Ctrl+T returns to main", .{
                 state.name_buf[0..state.name_len],
-                if (notice) main_notice ++ " \u{00b7} " else "",
+                if (notice.main) main_notice ++ " \u{00b7} " else "",
+                others,
             }) catch unreachable;
             var out: std.Io.Writer.Allocating = .init(app.alloc);
             defer out.deinit();

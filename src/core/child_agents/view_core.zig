@@ -9,10 +9,15 @@ pub const Key = enum { ctrl_t, up, down, enter, escape };
 pub const KeySet = std.EnumSet(Key);
 
 /// The bytes main's terminal may send for each key: legacy bytes, the kitty
-/// keyboard protocol and xterm's modifyOtherKeys, which fx turns on.
+/// keyboard protocol and xterm's modifyOtherKeys, which fx turns on. A kitty
+/// report may add Caps Lock (64) and Num Lock (128) to its modifier value;
+/// main ignores those lock states, and so do these forms.
 const forms = [_]struct { bytes: []const u8, key: Key }{
     .{ .bytes = "\x14", .key = .ctrl_t },
     .{ .bytes = "\x1b[116;5u", .key = .ctrl_t },
+    .{ .bytes = "\x1b[116;69u", .key = .ctrl_t },
+    .{ .bytes = "\x1b[116;133u", .key = .ctrl_t },
+    .{ .bytes = "\x1b[116;197u", .key = .ctrl_t },
     .{ .bytes = "\x1b[27;5;116~", .key = .ctrl_t },
     .{ .bytes = "\x1b[A", .key = .up },
     .{ .bytes = "\x1bOA", .key = .up },
@@ -20,7 +25,13 @@ const forms = [_]struct { bytes: []const u8, key: Key }{
     .{ .bytes = "\x1bOB", .key = .down },
     .{ .bytes = "\r", .key = .enter },
     .{ .bytes = "\x1b[13u", .key = .enter },
+    .{ .bytes = "\x1b[13;65u", .key = .enter },
+    .{ .bytes = "\x1b[13;129u", .key = .enter },
+    .{ .bytes = "\x1b[13;193u", .key = .enter },
     .{ .bytes = "\x1b[27u", .key = .escape },
+    .{ .bytes = "\x1b[27;65u", .key = .escape },
+    .{ .bytes = "\x1b[27;129u", .key = .escape },
+    .{ .bytes = "\x1b[27;193u", .key = .escape },
     // A lone escape is known only once no more bytes follow it.
     .{ .bytes = "\x1b", .key = .escape },
 };
@@ -197,7 +208,7 @@ fn feedAll(matcher: *Matcher, keys: KeySet, bytes: []const u8, passed: *std.Arra
 
 test "every Ctrl+T form leaves a view and other bytes pass unchanged" {
     const view_keys = KeySet.initOne(.ctrl_t);
-    for ([_][]const u8{ "\x14", "\x1b[116;5u", "\x1b[27;5;116~" }) |form| {
+    for ([_][]const u8{ "\x14", "\x1b[116;5u", "\x1b[116;69u", "\x1b[116;133u", "\x1b[116;197u", "\x1b[27;5;116~" }) |form| {
         var matcher: Matcher = .{};
         var passed: std.ArrayList(u8) = .empty;
         defer passed.deinit(testing.allocator);
@@ -242,8 +253,8 @@ test "the picker reads arrows, enter and escape in each form" {
     defer passed.deinit(testing.allocator);
     var found: std.ArrayList(Key) = .empty;
     defer found.deinit(testing.allocator);
-    try feedAll(&matcher, .initFull(), "\x1b[B\x1bOA\r\x1b[13u\x1b[27ux", &passed, &found);
-    try testing.expectEqualSlices(Key, &.{ .down, .up, .enter, .enter, .escape }, found.items);
+    try feedAll(&matcher, .initFull(), "\x1b[B\x1bOA\r\x1b[13u\x1b[13;65u\x1b[27u\x1b[27;129ux", &passed, &found);
+    try testing.expectEqualSlices(Key, &.{ .down, .up, .enter, .enter, .enter, .escape, .escape }, found.items);
     try testing.expectEqualStrings("x", passed.items);
 }
 
@@ -269,9 +280,6 @@ test "the view opens only from main while main asks nothing" {
 // bytes, while the test plays the app around them:
 // the screen owner, main's own prompts and main's paints. After every step
 // it checks that a viewed child received exactly the bytes typed into it.
-//
-// With SUB_ENGINE_TRACE_DIR set, each run is also written to that folder as
-// JSON lines for checking against a model outside this repository.
 
 const Sim = struct {
     const Owner = enum { none, view, prompt };
@@ -285,14 +293,12 @@ const Sim = struct {
     key_to: ?[]const u8 = null,
     main_screen: MainScreen = .current,
     redraw: bool = false,
-    left_because: []const u8 = "",
     now_ms: i64 = 0,
 
-    fn leave(self: *Sim, why: []const u8) void {
+    fn leave(self: *Sim) void {
         self.view.leave();
         self.owner = .none;
         self.redraw = true;
-        self.left_because = why;
     }
 
     /// Feeds `bytes` and acts on the keys found, as the app does. Returns
@@ -319,10 +325,10 @@ const Sim = struct {
             .picker => switch (key) {
                 .up, .down => self.view.move(key, children),
                 .enter => if (self.alive[self.view.selected]) self.view.choose(@intCast(self.view.selected + 1)),
-                .escape, .ctrl_t => self.leave("user"),
+                .escape, .ctrl_t => self.leave(),
             },
             .view => switch (key) {
-                .ctrl_t => self.leave("user"),
+                .ctrl_t => self.leave(),
                 else => unreachable,
             },
         }
@@ -345,55 +351,10 @@ const Choices = struct {
 const ctrl_t_forms = [_][]const u8{ "\x14", "\x1b[116;5u", "\x1b[27;5;116~" };
 const child_keys = [_][]const u8{ "a", "\r", "\x1b[A", "\x1b", "\x1b[1;5C", "\x1b[200~hi\x1b[201~" };
 
-/// One JSON object per line in `<SUB_ENGINE_TRACE_DIR>/View--seed-N.ndjson`,
-/// or nothing when the variable is unset.
-const SimTrace = struct {
-    file: ?std.Io.File,
-    offset: u64 = 0,
-
-    fn create(seed: u64) !SimTrace {
-        const dir_path = std.c.getenv("SUB_ENGINE_TRACE_DIR") orelse return .{ .file = null };
-        const io = testing.io;
-        var dir = try std.Io.Dir.cwd().openDir(io, std.mem.span(dir_path), .{});
-        defer dir.close(io);
-        var buf: [64]u8 = undefined;
-        const name = try std.fmt.bufPrint(&buf, "View--seed-{d}.ndjson", .{seed});
-        return .{ .file = try dir.createFile(io, name, .{ .truncate = true }) };
-    }
-
-    fn finish(self: *SimTrace) void {
-        if (self.file) |file| file.close(testing.io);
-    }
-
-    fn step(self: *SimTrace, gpa: std.mem.Allocator, event: []const u8, sim: *const Sim) !void {
-        const file = self.file orelse return;
-        const key_to: []const []const u8 = if (sim.key_to) |place| &.{place} else &.{};
-        const line = try std.json.Stringify.valueAlloc(gpa, .{
-            .event = event,
-            .mode = @tagName(sim.view.mode),
-            .viewed = sim.view.viewed orelse 0,
-            .alive = sim.alive,
-            .owner = @tagName(sim.owner),
-            .prompt = sim.prompt,
-            .key_to = key_to,
-            .main_screen = @tagName(sim.main_screen),
-            .redraw = sim.redraw,
-            .left_because = sim.left_because,
-        }, .{});
-        defer gpa.free(line);
-        try file.writePositionalAll(testing.io, line, self.offset);
-        self.offset += line.len;
-        try file.writePositionalAll(testing.io, "\n", self.offset);
-        self.offset += 1;
-    }
-};
-
 fn runView(gpa: std.mem.Allocator, seed: u64) !void {
     var prng = std.Random.DefaultPrng.init(seed);
     const random = prng.random();
     var sim: Sim = .{};
-    var trace = try SimTrace.create(seed);
-    defer trace.finish();
 
     var steps: usize = 0;
     while (steps < 80) : (steps += 1) {
@@ -412,17 +373,14 @@ fn runView(gpa: std.mem.Allocator, seed: u64) !void {
         choices.add(mode == .main and sim.owner == .none, .MainPaints);
 
         const action = choices.items[random.uintLessThan(usize, choices.len)];
-        var event: []const u8 = @tagName(action);
         switch (action) {
             .CtrlTOnMain => {
                 // Main decodes Ctrl+T itself; a prompt on screen takes it.
                 if (sim.owner == .none and sim.view.open(sim.prompt)) {
                     sim.owner = .view;
                     sim.main_screen = .stale;
-                    event = "OpenPicker";
                 } else {
                     sim.key_to = "main";
-                    event = "Key";
                 }
             },
             .PickerKey => {
@@ -430,11 +388,8 @@ fn runView(gpa: std.mem.Allocator, seed: u64) !void {
                 var passed = try sim.type_(gpa, keys_[random.uintLessThan(usize, keys_.len)]);
                 defer passed.deinit(gpa);
                 try testing.expectEqual(@as(usize, 0), passed.items.len);
-                if (sim.view.mode == .view) {
-                    event = "Choose";
-                } else {
+                if (sim.view.mode == .view) {} else {
                     sim.key_to = "picker";
-                    event = "Key";
                 }
             },
             .GoBack => {
@@ -473,13 +428,12 @@ fn runView(gpa: std.mem.Allocator, seed: u64) !void {
                     sim.redraw = true;
                 }
             },
-            .Tick => sim.leave("exit"),
+            .Tick => sim.leave(),
             .MainPaints => {
                 if (sim.redraw) sim.main_screen = .current;
                 sim.redraw = false;
             },
         }
-        try trace.step(gpa, event, &sim);
     }
 }
 

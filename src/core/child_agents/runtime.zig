@@ -535,15 +535,33 @@ pub const Runtime = struct {
     }
 
     /// Types the user's raw keys into the child, as a terminal would. The
-    /// main agent's messages may arrive in between.
-    pub fn keys(self: *Runtime, handle: Handle, bytes: []const u8) error{Gone}!void {
+    /// main agent's messages may arrive in between. `QueueFull` means the
+    /// child stopped reading its input; the keys are dropped.
+    pub fn keys(self: *Runtime, handle: Handle, bytes: []const u8) error{ Gone, QueueFull, OutOfMemory }!void {
         {
             self.lockTable();
             defer self.unlockTable();
             const child = self.childAt(handle.slot, handle.id) orelse return error.Gone;
             if (child.exit != null) return error.Gone;
         }
-        self.pool.?.write(handle.id, bytes) catch return error.Gone;
+        self.pool.?.write(handle.id, bytes) catch |err| return switch (err) {
+            error.NotFound, error.Ended, error.WriteFailed => error.Gone,
+            error.QueueFull, error.OutOfMemory => |e| e,
+        };
+    }
+
+    /// How many children other than the one `except` names wait on a
+    /// permission or question prompt.
+    pub fn blockedOthers(self: *Runtime, except: Handle) usize {
+        self.lockTable();
+        defer self.unlockTable();
+        var count: usize = 0;
+        for (&self.table.slots, 0..) |*slot, index| {
+            const child = &(slot.* orelse continue);
+            if (index == except.slot and std.meta.eql(child.id, except.id)) continue;
+            if (child.exit == null and child.labels.state == .blocked) count += 1;
+        }
+        return count;
     }
 
     /// Resizes every child's terminal and screen. Children launched later
@@ -1167,6 +1185,35 @@ test "a launch cancelled during its delivery leaves no child" {
     const statuses = try runtime.list(testing.allocator);
     defer freeStatuses(testing.allocator, statuses);
     try testing.expectEqual(@as(usize, 0), statuses.len);
+}
+
+test "blockedOthers counts the other children waiting on a prompt" {
+    const prompt = try labels_mod.encode(testing.allocator, .{ .prompt = .{ .number = 1, .reason = .permission, .body = .{
+        .permission = .{ .id = 1, .label = "shell" },
+    } } });
+    defer testing.allocator.free(prompt);
+    const body = try std.mem.concat(testing.allocator, u8, &.{
+        "say '{\"event\":\"state\",\"state\":\"idle\"}'\nturn 4 'done'\nsay '",
+        std.mem.trimEnd(u8, prompt, "\n"),
+        "'\nsleep 30",
+    });
+    defer testing.allocator.free(body);
+    var fake = try FakeChild.create(body);
+    defer fake.deinit();
+    var runtime = try fake.runtime();
+    defer runtime.deinit();
+
+    const launched = try runtime.launch(testing.allocator, "a1", "task", .{}, null);
+    defer launched.status.deinit(testing.allocator);
+    const statuses = try runtime.list(testing.allocator);
+    defer freeStatuses(testing.allocator, statuses);
+    const handle = statuses[0].handle.?;
+    var waited: u32 = 0;
+    while (runtime.blockedOthers(.{ .slot = handle.slot + 1, .id = handle.id }) == 0) : (waited += 20) {
+        if (waited >= 3000) return error.TestExpectedBlockedChild;
+        sleepMs(20);
+    }
+    try testing.expectEqual(@as(usize, 0), runtime.blockedOthers(handle));
 }
 
 test "a child takes its task and later messages, and wait returns once each turn ends" {

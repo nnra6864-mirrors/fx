@@ -7,6 +7,7 @@ import { FX_BIN } from "../evals/eval-helpers";
 import {
   fakeGatewayFinalText,
   fakeGatewayToolCall,
+  fakeShellRun,
   startDynamicFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -24,6 +25,7 @@ const CHILD_TASK = "CHILD_TASK_REPLY_READY";
 const TYPED = "TYPED_INTO_CHILD_VIEW";
 const LAUNCH_CALL = "launch_c1";
 const STATUS_LINE = "c1 \u00b7 Ctrl+T returns to main";
+const PICKER_HINT = "Enter view";
 
 const roots: string[] = [];
 const gateways: Array<ReturnType<typeof startDynamicFakeGateway>> = [];
@@ -68,20 +70,58 @@ async function waitUntilGone(pids: number[], timeoutMs: number): Promise<number[
   return pids.filter(alive);
 }
 
+type Gateway = ReturnType<typeof startDynamicFakeGateway>;
+
+// Starts main fx in tmux on a fresh home and workspace, answered by
+// `gateway`. The session is also kept for cleanup.
+async function startMain(
+  gateway: Gateway,
+  env: Record<string, string | undefined> = {},
+): Promise<{ s: TmuxSession; stderrPath: string }> {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-child-view-e2e-")));
+  roots.push(root);
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(workspace);
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ sandbox: "none" }));
+  const stderrPath = join(root, "stderr.log");
+  writeFileSync(stderrPath, "");
+  const s = await TmuxSession.create({
+    cmd: FX_BIN,
+    cwd: workspace,
+    env: {
+      HOME: home,
+      AI_GATEWAY_API_KEY: "fake-child-view-key",
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_MODEL: MODEL,
+      FX_AUTO_UPGRADE: "0",
+      FX_SUBAGENTS_V2: "1",
+      NO_COLOR: "1",
+      ...env,
+    },
+    stderrPath,
+    width: 120,
+    height: 40,
+  });
+  session = s;
+  await s.waitForComposer(TIMEOUT);
+  return { s, stderrPath };
+}
+
+async function quitCleanly(s: TmuxSession, stderrPath: string): Promise<void> {
+  await s.sendText("/quit");
+  expect(await s.waitForSessionEnd(10_000)).toBe(true);
+  session = null;
+  expect(readFileSync(stderrPath, "utf8")).toBe("");
+}
+
 describe("subagent live view", () => {
   test.skipIf(!tmuxAvailable())(
     "Ctrl+T shows a child's own fx, types into it, and returns to main",
     async () => {
-      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-child-view-e2e-")));
-      roots.push(root);
-      const home = join(root, "home");
-      const workspace = join(root, "workspace");
-      mkdirSync(join(home, ".fx"), { recursive: true });
-      mkdirSync(workspace);
-      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ sandbox: "none" }));
-      const stderrPath = join(root, "stderr.log");
-      writeFileSync(stderrPath, "");
-
       let childSawSubagentTool = false;
       const gateway = startDynamicFakeGateway((body) => {
         const user = lastUserText(body);
@@ -97,55 +137,122 @@ describe("subagent live view", () => {
       });
       gateways.push(gateway);
 
-      session = await TmuxSession.create({
-        cmd: FX_BIN,
-        cwd: workspace,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: "fake-child-view-key",
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_MODEL: MODEL,
-          FX_AUTO_UPGRADE: "0",
-          FX_SUBAGENTS_V2: "1",
-          NO_COLOR: "1",
-        },
-        stderrPath,
-        width: 120,
-        height: 40,
-      });
-      await session.waitForComposer(TIMEOUT);
-      await session.sendText(LAUNCH_PROMPT);
-      await session.waitForText("PARENT_LAUNCHED", TIMEOUT);
+      const { s, stderrPath } = await startMain(gateway);
+      await s.sendText(LAUNCH_PROMPT);
+      await s.waitForText("PARENT_LAUNCHED", TIMEOUT);
 
       // The picker lists the child, then Enter shows its own fx.
-      await session.sendKeys("C-t");
-      await session.waitForText(/\u203a c1 +(idle|working|starting)/, TIMEOUT);
-      await session.sendKeys("Enter");
-      const view = await session.waitForText(STATUS_LINE, TIMEOUT);
+      await s.sendKeys("C-t");
+      await s.waitForText(/\u203a c1 +(idle|working|starting)/, TIMEOUT);
+      await s.sendKeys("Enter");
+      const view = await s.waitForText(STATUS_LINE, TIMEOUT);
       expect(view).not.toContain("PARENT_LAUNCHED");
-      await session.waitForText("CHILD_READY", TIMEOUT);
+      await s.waitForText("CHILD_READY", TIMEOUT);
 
       // Keys go to the child: its own composer takes the text and submits it.
-      await session.sendText(TYPED);
-      await session.waitForText("CHILD_HEARD_YOU", TIMEOUT);
+      await s.sendText(TYPED);
+      await s.waitForText("CHILD_HEARD_YOU", TIMEOUT);
 
       // Ctrl+T returns to main, whose screen comes back whole.
-      await session.sendKeys("C-t");
-      const main = await session.waitForText("PARENT_LAUNCHED", TIMEOUT);
+      await s.sendKeys("C-t");
+      const main = await s.waitForText("PARENT_LAUNCHED", TIMEOUT);
       expect(main).not.toContain(STATUS_LINE);
       expect(main).not.toContain("CHILD_HEARD_YOU");
       expect(childSawSubagentTool).toBe(false);
 
       // Quitting main stops its child.
-      const children = directChildren(session.processPid());
+      const children = directChildren(s.processPid());
       expect(children.length).toBe(1);
-      await session.sendText("/quit");
-      expect(await session.waitForSessionEnd(10_000)).toBe(true);
+      await s.sendText("/quit");
+      expect(await s.waitForSessionEnd(10_000)).toBe(true);
       session = null;
       expect(await waitUntilGone(children, 5_000)).toEqual([]);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    90_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "Ctrl+T over the full transcript leaves it alone",
+    async () => {
+      const gateway = startDynamicFakeGateway((body) => {
+        throw new Error(`unexpected request: ${body.slice(0, 400)}`);
+      });
+      gateways.push(gateway);
+      const { s, stderrPath } = await startMain(gateway);
+      await s.sendKeys("C-o");
+      await Bun.sleep(500);
+      await s.sendKeys("C-t");
+      await Bun.sleep(500);
+      expect(await s.capturePane()).not.toContain(PICKER_HINT);
+      await s.sendKeys("C-o");
+      await s.waitForComposer(TIMEOUT);
+      await quitCleanly(s, stderrPath);
+    },
+    60_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "Ctrl+T does nothing without the flag",
+    async () => {
+      const gateway = startDynamicFakeGateway((body) => {
+        throw new Error(`unexpected request: ${body.slice(0, 400)}`);
+      });
+      gateways.push(gateway);
+      const { s, stderrPath } = await startMain(gateway, { FX_SUBAGENTS_V2: undefined });
+      await s.sendKeys("C-t");
+      await Bun.sleep(500);
+      expect(await s.capturePane()).not.toContain(PICKER_HINT);
+      await s.waitForComposer(TIMEOUT);
+      await quitCleanly(s, stderrPath);
+    },
+    60_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "main's own prompt waits on a view, which survives a resize, and main comes back whole",
+    async () => {
+      let mainAsked = false;
+      const gateway = startDynamicFakeGateway(async (body) => {
+        const user = lastUserText(body);
+        if (user.includes(CHILD_TASK)) return fakeGatewayFinalText("CHILD_READY");
+        if (body.includes('"toolCallId":"main_ask"')) return fakeGatewayFinalText("PARENT_DONE");
+        if (body.includes(`"toolCallId":"${LAUNCH_CALL}"`)) {
+          // Late enough that the test is in the child's view first.
+          await Bun.sleep(3000);
+          mainAsked = true;
+          return fakeShellRun("main_ask", "printf MAIN_ASKED");
+        }
+        if (user.includes(LAUNCH_PROMPT)) {
+          return fakeGatewayToolCall(LAUNCH_CALL, "subagent", { action: "launch", name: "c1", task: CHILD_TASK });
+        }
+        throw new Error(`unexpected request: ${body.slice(0, 400)}`);
+      });
+      gateways.push(gateway);
+      const { s, stderrPath } = await startMain(gateway, { FX_PERMISSION_MODE: "ask" });
+      await s.sendText(LAUNCH_PROMPT);
+
+      await s.sendKeys("C-t");
+      await s.waitForText(/\u203a c1 +(idle|working|starting)/, TIMEOUT);
+      await s.sendKeys("Enter");
+      await s.waitForText(STATUS_LINE, TIMEOUT);
+      expect(mainAsked).toBe(false);
+
+      // Main's approval waits while the view is open, and the status line
+      // says so, also after a resize.
+      await s.waitForText("c1 \u00b7 main needs you \u00b7 Ctrl+T returns to main", TIMEOUT);
+      await s.resizeWindow(100, 32);
+      await s.waitForText("c1 \u00b7 main needs you \u00b7 Ctrl+T returns to main", TIMEOUT);
+
+      // Back on main the approval shows, and the transcript before it is
+      // whole.
+      await s.sendKeys("C-t");
+      const main = await s.waitForText("printf MAIN_ASKED", TIMEOUT);
+      expect(main).toContain(LAUNCH_PROMPT);
+      expect(main).not.toContain(STATUS_LINE);
+      await s.sendKeys("1");
+      await s.waitForText("PARENT_DONE", TIMEOUT);
+      await quitCleanly(s, stderrPath);
     },
     90_000,
   );
