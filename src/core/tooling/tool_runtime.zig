@@ -892,6 +892,7 @@ fn executeRegisteredTool(
                 .effort = ctx.effort.label(),
                 .permission_mode = @tagName(ctx.permission_mode),
                 .cwd = ctx.workspace_root,
+                .root_context = ctx.root_user_intent_context,
             } };
         },
     }

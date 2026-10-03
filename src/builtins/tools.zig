@@ -216,9 +216,9 @@ const subagent_model_request_properties = [_]model_tool_schema.Property{.{
     .shape = &.{ .object = &subagent_model_action_union },
 }};
 const child_agents_description =
-    "Run up to 10 named fx children, each a full fx in its own hidden terminal in this workspace. launch starts one child and types its task; send types a message into a ready child. Children work in parallel and keep their own sessions. wait blocks until any named child (or any child, when names is omitted) is settled: idle with every message handled, blocked on its own permission or question prompt, or exited. Only the user answers a blocked child's permission and question prompts, on this fx's screen when it has one: wait for the child, or stop it. read returns a child's final reply, its messages, or its screen as text. list shows every child; stop closes one and returns its session ID. When to use: split independent work across children, or keep a long task running while you continue. When NOT to use: a single quick lookup you can do yourself. Do not poll with read or list; use wait.";
+    "Run up to 10 named fx children, each a full fx in its own hidden terminal in this workspace. launch starts one child and types its task; send types a message into a ready child. Children work in parallel and keep their own sessions. wait blocks until any named child (or any child, when names is omitted) is settled: idle with every message handled, or exited. Only the user answers a child's permission and question prompts. Where this fx shows them on its screen, wait keeps waiting while the user answers; elsewhere wait returns the blocked child. Do not call wait again for a child that stays blocked: stop it, or tell the user. read returns a child's final reply, its messages, or its screen as text. list shows every child; stop closes one and returns its session ID. When to use: split independent work across children, or keep a long task running while you continue. When NOT to use: a single quick lookup you can do yourself. Do not poll with read or list; use wait.";
 
-const child_agents_name_property = model_tool_schema.Property{ .name = "name", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = 32 }, .description = "The child's name: lowercase letters, digits and hyphens, starting with a letter. Unique among running children." };
+const child_agents_name_property = model_tool_schema.Property{ .name = "name", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = child_agents_impl.max_name_bytes }, .description = "The child's name: lowercase letters, digits and hyphens, starting with a letter. Unique among running children." };
 
 const child_agents_action_schemas = [_]model_tool_schema.ObjectSchema{
     .{ .properties = &.{
@@ -236,7 +236,7 @@ const child_agents_action_schemas = [_]model_tool_schema.ObjectSchema{
     .{ .properties = &.{
         .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"wait"} } },
         .{ .name = "names", .json_type = .array, .bounds = &.{ .max_items = 10 }, .shape = &.{ .array_values = .{ .json_type = .string } }, .description = "Children to wait on. Omit to wait on every child." },
-        .{ .name = "timeout_ms", .json_type = .integer, .bounds = &.{ .minimum = 0, .maximum = child_agents_impl.max_wait_ms }, .description = "How long to wait. Defaults to 60000. On timeout the result reports each child's current state." },
+        .{ .name = "timeout_ms", .json_type = .integer, .bounds = &.{ .minimum = 0, .maximum = child_agents_impl.max_wait_ms }, .description = std.fmt.comptimePrint("How long to wait. Defaults to {d}. On timeout the result reports each child's current state.", .{child_agents_impl.default_wait_ms}) },
     }, .required = &.{"action"}, .additional_properties = false },
     .{ .properties = &.{
         .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"read"} } },
