@@ -120,8 +120,17 @@ pub const Pool = struct {
         self.wakeReader();
         self.unlockTable();
         self.thread.join();
+        // Every child is hung up before any is waited on, so they exit side
+        // by side within one grace period instead of one each.
         for (&self.terminals) |*slot| {
-            if (slot.*) |*terminal| _ = terminal.close() catch {};
+            if (slot.*) |*terminal| terminal.hangUp() catch {};
+        }
+        const deadline = std.Io.Clock.Timestamp.fromNow(self.io, .{
+            .clock = .awake,
+            .raw = .fromMilliseconds(terminal_mod.close_grace_ms),
+        });
+        for (&self.terminals) |*slot| {
+            if (slot.*) |*terminal| _ = terminal.closeWithin(remainingMs(self.io, deadline)) catch {};
             slot.* = null;
         }
         for (&self.reports) |*lines| lines.deinit(self.gpa);
@@ -468,6 +477,14 @@ pub const Pool = struct {
         self.unlockTable();
     }
 };
+
+/// Milliseconds until `deadline`, or zero once it passed.
+fn remainingMs(io: std.Io, deadline: std.Io.Clock.Timestamp) u32 {
+    const now = std.Io.Clock.Timestamp.now(io, .awake);
+    const ns = now.raw.durationTo(deadline.raw).toNanoseconds();
+    if (ns <= 0) return 0;
+    return @intCast(@min(@divTrunc(ns, std.time.ns_per_ms), std.math.maxInt(u32)));
+}
 
 // Tests run real children on real PTYs with /bin/sh.
 
@@ -889,6 +906,21 @@ test "each terminal's report lines keep their order" {
         for (expected, &views) |line, *view| view.* = line;
         try collector.expectReports(id, &views);
     }
+}
+
+test "destroy waits for every child at once" {
+    var collector: Collector = .{};
+    defer collector.deinit();
+    const pool = try Pool.create(testing.allocator, testing.io, collector.sink());
+    // Each child takes about 0.6 s to exit after its hangup, so closing
+    // them one after another would take over 2 s.
+    var ids: [4]Id = undefined;
+    for (&ids) |*id| id.* = try openShell(pool, "trap 'sleep 0.6; exit 0' HUP; echo up; while :; do sleep 0.05; done");
+    for (ids) |id| try collector.waitOutput(id, "up", 5000);
+    const started = std.Io.Clock.Timestamp.now(testing.io, .awake);
+    pool.destroy();
+    const elapsed = started.raw.durationTo(std.Io.Clock.Timestamp.now(testing.io, .awake).raw).toNanoseconds();
+    try testing.expect(elapsed < 2 * std.time.ns_per_s);
 }
 
 test "destroy closes the terminals still open" {
