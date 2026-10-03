@@ -24,7 +24,8 @@ const debug_trace = @import("../../core/shared/debug_trace.zig");
 const host_target = @import("../../core/hosts/target.zig");
 const labels = @import("../../core/child_agents/labels.zig");
 const diff = @import("../../core/output/diff.zig");
-const permission_request = @import("../../core/permissions/permission_request.zig");
+const input_approval_runtime = @import("../../core/app/input_approval_runtime.zig");
+const input_question_runtime = @import("../../core/app/input_question_runtime.zig");
 const types = @import("../../core/shared/types.zig");
 
 /// How long one report waits for room in the channel before reporting stops.
@@ -292,9 +293,9 @@ fn writeAll(fd: std.posix.fd_t, bytes: []const u8) error{ Timeout, WriteFailed }
 /// `worker` fields.
 pub fn Runtime(comptime App: type) type {
     return struct {
-        /// Must run before the lifecycle runtime is frozen.
+        /// Must run before the lifecycle runtime is frozen. Does nothing
+        /// unless `Client.initFromEnv` claimed a report channel.
         pub fn configure(app: *App, active_session_id: ?[]const u8) !void {
-            app.parent_report.initFromEnv();
             if (!app.parent_report.enabled()) return;
             if (active_session_id) |session_id| app.parent_report.reportSession(session_id);
             app.parent_report.reportState(.idle);
@@ -319,7 +320,7 @@ pub fn Runtime(comptime App: type) type {
 
         /// Every loop tick, after the worker's: reports the prompt this fx
         /// shows when it changes, and applies the parent's answers to it.
-        /// Needs `approval_prompt`, `question_prompt`, `shell` and `alloc`.
+        /// Needs what the approval and question input runtimes need.
         pub fn tick(app: *App) void {
             if (!app.parent_report.enabled()) return;
             var arena_state = std.heap.ArenaAllocator.init(app.alloc);
@@ -345,6 +346,9 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
+        /// Applies a parent's answer through the same paths as an answer
+        /// given on this fx's own screen, so the transcript and the turn
+        /// end up the same either way.
         fn applyAnswer(raw: *anyopaque, key: labels.PromptTracker.Key, answer: labels.Answer) void {
             const app: *App = @ptrCast(@alignCast(raw));
             switch (key) {
@@ -353,35 +357,39 @@ pub fn Runtime(comptime App: type) type {
                         .permission => |permission| permission,
                         .questions => return debug_trace.logf("parent_report", "answer dropped prompt={d} reason=wrong_kind", .{answer.prompt}),
                     };
-                    const feedback = if (permission.feedback) |text| app.alloc.dupe(u8, text) catch null else null;
                     const decision: types.ToolPermissionDecision = switch (permission.decision) {
                         .once => .once,
                         .always => .always,
                         .deny => .deny,
                     };
-                    const result = app.worker.submitPermissionResponse(
+                    const applied = input_approval_runtime.ApprovalRuntime(App).submitParentPermission(
+                        app,
                         request_id,
-                        permission_request.OwnedPermissionResponse.init(app.alloc, decision, feedback),
-                    );
-                    debug_trace.logf("parent_report", "permission answered prompt={d} decision={s} result={s}", .{ answer.prompt, @tagName(decision), @tagName(result) });
+                        decision,
+                        permission.feedback,
+                    ) catch |err| {
+                        return debug_trace.logf("parent_report", "permission answer failed prompt={d} err={s}", .{ answer.prompt, @errorName(err) });
+                    };
+                    debug_trace.logf("parent_report", "permission answered prompt={d} decision={s} applied={}", .{ answer.prompt, @tagName(decision), applied });
                 },
                 .questions => |hash| {
                     const answers = switch (answer.reply) {
                         .questions => |answers| answers,
                         .permission => return debug_trace.logf("parent_report", "answer dropped prompt={d} reason=wrong_kind", .{answer.prompt}),
                     };
-                    if (answers) |list| {
-                        const batch = (app.worker.snapshotPendingQuestionBatch(app.alloc) catch null) orelse return;
-                        defer batch.deinit(app.alloc);
-                        if (hashQuestions(batch.entries) != hash or batch.entries.len != list.len) {
-                            return debug_trace.logf("parent_report", "answer dropped prompt={d} reason=batch_mismatch", .{answer.prompt});
-                        }
-                    }
-                    app.worker.submitQuestionBatchAnswer(app.alloc, answers) catch |err| {
+                    const batch = (app.worker.snapshotPendingQuestionBatch(app.alloc) catch null) orelse {
+                        return debug_trace.logf("parent_report", "answer dropped prompt={d} reason=no_batch", .{answer.prompt});
+                    };
+                    defer batch.deinit(app.alloc);
+                    const entries = app.question_prompt.entries.items.len;
+                    const matches = hashQuestions(batch.entries) == hash and app.question_prompt.isActive() and
+                        (if (answers) |list| list.len == entries else true);
+                    if (!matches) return debug_trace.logf("parent_report", "answer dropped prompt={d} reason=batch_mismatch", .{answer.prompt});
+                    const question_runtime = input_question_runtime.QuestionRuntime(App);
+                    const result = if (answers) |list| question_runtime.submitQuestionAnswers(app, list) else question_runtime.cancelQuestionPrompt(app);
+                    result catch |err| {
                         return debug_trace.logf("parent_report", "question answer failed prompt={d} err={s}", .{ answer.prompt, @errorName(err) });
                     };
-                    app.question_prompt.discard(app.alloc, "answered_by_parent");
-                    app.shell.render_requests.request(.modal);
                     debug_trace.logf("parent_report", "questions answered prompt={d} cancelled={}", .{ answer.prompt, answers == null });
                 },
             }

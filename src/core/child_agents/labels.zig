@@ -608,11 +608,7 @@ test "a line that is not a known event changes nothing" {
 // exactly when a prompt is open; that the final reply belongs to the latest
 // ended turn; and that messages arrive in order.
 //
-// With SUB_ENGINE_TRACE_DIR set, each run is also written to that folder as
-// JSON lines for checking against a model outside this repository.
-
-/// Messages and prompts per run. The model the traces are checked against
-/// uses the same bounds.
+/// Messages and prompts per run, small so that runs cover many orderings.
 const run_messages = 3;
 const run_blocks = 2;
 
@@ -669,68 +665,11 @@ const Sim = struct {
     }
 };
 
-/// One JSON object per line in `<SUB_ENGINE_TRACE_DIR>/<name>--seed-N.ndjson`,
-/// or nothing when the variable is unset.
-const SimTrace = struct {
-    gpa: Allocator,
-    file: ?std.Io.File,
-    offset: u64 = 0,
-
-    fn create(gpa: Allocator, name: []const u8, seed: u64) !SimTrace {
-        const dir_path = std.c.getenv("SUB_ENGINE_TRACE_DIR") orelse
-            return .{ .gpa = gpa, .file = null };
-        const io = testing.io;
-        var dir = try std.Io.Dir.cwd().openDir(io, std.mem.span(dir_path), .{});
-        defer dir.close(io);
-        var buf: [64]u8 = undefined;
-        const file_name = try std.fmt.bufPrint(&buf, "{s}--seed-{d}.ndjson", .{ name, seed });
-        return .{ .gpa = gpa, .file = try dir.createFile(io, file_name, .{ .truncate = true }) };
-    }
-
-    fn write(self: *SimTrace, value: anytype) !void {
-        const file = self.file orelse return;
-        const line = try std.json.Stringify.valueAlloc(self.gpa, value, .{});
-        defer self.gpa.free(line);
-        try file.writePositionalAll(testing.io, line, self.offset);
-        self.offset += line.len;
-        try file.writePositionalAll(testing.io, "\n", self.offset);
-        self.offset += 1;
-    }
-
-    fn step(self: *SimTrace, event: []const u8, sim: *const Sim) !void {
-        try self.write(.{
-            .event = event,
-            .queue = sim.queue.items,
-            .sent = sim.sent,
-            .ui = @tagName(sim.ui),
-            .running = sim.running,
-            .turns = sim.turns,
-            .worker = @tagName(sim.worker),
-            .next = @tagName(sim.next),
-            .lock = @tagName(sim.lock),
-            .blocks = sim.blocks,
-            .prompt = @tagName(sim.prompt),
-            .reported = @tagName(sim.reported),
-            .pipe_len = sim.pipe.items.len,
-            .store_state = @tagName(sim.labels.state),
-            .store_final = try sim.finalTurn(),
-            .store_ended = sim.labels.turns_ended,
-            .store_messages = sim.labels.messages.items.len,
-        });
-    }
-
-    fn finish(self: *SimTrace) void {
-        if (self.file) |file| file.close(testing.io);
-    }
-};
-
 fn runRandom(gpa: Allocator, seed: u64) !void {
     var prng = std.Random.DefaultPrng.init(seed);
     const random = prng.random();
     var sim: Sim = .{ .gpa = gpa };
     defer sim.deinit();
-    var trace = try SimTrace.create(gpa, "Labels", seed);
-    defer trace.finish();
     // The child reports idle once it is ready for input.
     try sim.write(.{ .state = .idle });
 
@@ -809,12 +748,11 @@ fn runRandom(gpa: Allocator, seed: u64) !void {
                 try sim.labels.apply(gpa, line[0 .. line.len - 1]);
             },
         }
-        try trace.step(@tagName(action), &sim);
         try sim.check();
     }
 }
 
-/// The Labels model's actions, named as the model names them.
+/// The steps a random run chooses from.
 const Action = enum {
     SubmitLock,
     SubmitQueue,
@@ -848,10 +786,9 @@ test "random runs keep the labels' rules" {
     while (seed < 64) : (seed += 1) try runRandom(testing.allocator, seed);
 }
 
-// Random runs drive one child's prompts the way the Prompts model does: the
-// child opens prompts and may close one itself or have it answered on its
-// own screen, the parent applies the reports in order, and the user answers
-// what main shows. The child's side is the real `PromptTracker`, reports are
+// Random runs drive one child's prompts: the child opens prompts and may
+// close one itself or have it answered on its own screen, the parent applies
+// the reports in order, and the user answers what main shows. The child's side is the real `PromptTracker`, reports are
 // real `encode` lines applied by `Labels.apply`, and answers are real
 // `encodeAnswer` lines read back with `parseAnswer`. After every step the
 // test checks that no prompt closed twice, that an answer from main closed
@@ -861,14 +798,11 @@ test "random runs keep the labels' rules" {
 const run_prompts = 3;
 
 const PromptSim = struct {
-    const Closer = enum { none, main, child, self };
-
     gpa: Allocator,
     tracker: PromptTracker = .{},
     /// The prompt the child's UI shows, by the number the tracker gave it.
     showing: ?u64 = null,
     opened: u64 = 0,
-    closer: [run_prompts]Closer = @splat(.none),
     closes: [run_prompts]u64 = @splat(0),
     to_parent: std.ArrayList([]u8) = .empty,
     to_child: std.ArrayList([]u8) = .empty,
@@ -909,10 +843,9 @@ const PromptSim = struct {
         try self.to_parent.append(self.gpa, try encode(self.gpa, event));
     }
 
-    /// The open prompt closes, by `who`, and the child reports it.
-    fn close(self: *PromptSim, who: Closer) !void {
+    /// The open prompt closes, and the child reports it.
+    fn close(self: *PromptSim) !void {
         const number = self.showing.?;
-        self.closer[number - 1] = who;
         self.closes[number - 1] += 1;
         self.showing = null;
         try self.observe();
@@ -940,8 +873,6 @@ fn runPrompts(gpa: Allocator, seed: u64) !void {
     const random = prng.random();
     var sim: PromptSim = .{ .gpa = gpa };
     defer sim.deinit();
-    var trace = try SimTrace.create(gpa, "Prompts", seed);
-    defer trace.finish();
 
     while (true) {
         var choices: Choices(PromptAction) = .{};
@@ -962,8 +893,8 @@ fn runPrompts(gpa: Allocator, seed: u64) !void {
                 sim.showing = sim.opened;
                 try sim.observe();
             },
-            .ChildCancels => try sim.close(.self),
-            .UserAnswersOnChild => try sim.close(.child),
+            .ChildCancels => try sim.close(),
+            .UserAnswersOnChild => try sim.close(),
             .ChildReadsAnswer => {
                 const line = sim.to_child.orderedRemove(0);
                 defer gpa.free(line);
@@ -972,7 +903,7 @@ fn runPrompts(gpa: Allocator, seed: u64) !void {
                 const answer = try parseAnswer(arena.allocator(), line);
                 if (sim.tracker.take(answer.prompt)) |key| {
                     sim.misapplied = sim.misapplied or key.permission != answer.prompt or sim.showing != answer.prompt;
-                    try sim.close(.main);
+                    try sim.close();
                 }
             },
             // Typed text lands in the prompt's draft at most.
@@ -990,20 +921,6 @@ fn runPrompts(gpa: Allocator, seed: u64) !void {
                 }, 16 * 1024));
             },
         }
-        var closer: [run_prompts][]const u8 = undefined;
-        for (&closer, sim.closer) |*name, who| name.* = @tagName(who);
-        try trace.write(.{
-            .event = @tagName(action),
-            .open = sim.showing orelse 0,
-            .opened = sim.opened,
-            .closer = closer,
-            .closes = sim.closes,
-            .to_parent = sim.to_parent.items.len,
-            .shown = sim.shown(),
-            .to_child = sim.to_child.items.len,
-            .answered = sim.answered.items,
-            .misapplied = sim.misapplied,
-        });
         try sim.check();
     }
 }
