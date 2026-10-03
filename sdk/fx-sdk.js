@@ -493,7 +493,16 @@ function worldJournal(world, sessionId, wakeAfterSeconds = defaultWakeAfterSecon
           ...(world.specVersion === undefined ? {} : { specVersion: world.specVersion }),
           eventData: { deploymentId: worldWorkflowName, workflowName: worldWorkflowName, input: worldPayload({ format: worldJournalFormat }) },
         });
+        // Nobody else knows the new run, so there is nothing to read back.
+        // Should the World have added events of its own, the first write
+        // finds them and continues after them.
+        const started = await world.events.create(created, {
+          eventType: "run_started",
+          ...(world.specVersion === undefined ? {} : { specVersion: world.specVersion }),
+        }, { eventCount: 1 });
         runId = created;
+        eventCount = worldSlot(started.event);
+        return { events: [], sessionId: runId };
       }
       let events = await readWorldRun(world, runId);
       // A run takes steps once it has started; one whose creator stopped
@@ -2407,6 +2416,9 @@ export async function createFxAgent(options = {}) {
       return;
     }
     journalQueue.push(...events);
+    // A turn notes a new config right before its first progress, a barrier:
+    // the two go out in one write instead of two in a row.
+    if (events.every((event) => event?.type === "session_config")) return;
     if (journalFlushScheduled) return;
     journalFlushScheduled = true;
     queueMicrotask(flushJournal);
@@ -2449,7 +2461,7 @@ export async function createFxAgent(options = {}) {
   }
   async function journalSettled() {
     for (;;) {
-      if (journalFlushScheduled) flushJournal();
+      if (journalFlushScheduled || journalQueue.length > 0) flushJournal();
       if (journalPending.size === 0) break;
       await Promise.all([...journalPending]);
     }

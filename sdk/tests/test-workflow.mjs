@@ -248,6 +248,44 @@ test("a session stored in a World restores in a new agent", async () => {
   await closeWorld(world);
 });
 
+test("a new session reaches its first model request after three World writes and no reads", async () => {
+  const world = createWorld({ dataDir: mkdtempSync(join(tmpdir(), "libfx-world-")), recoverActiveRuns: false });
+  await world.start?.();
+  const calls = [];
+  const events = new Proxy(world.events, {
+    get(target, prop) {
+      const value = Reflect.get(target, prop);
+      if (prop === "create") {
+        return (runId, request, params) => {
+          calls.push(request.eventType === "step_created" ? request.eventData?.stepName : request.eventType);
+          return value.call(target, runId, request, params);
+        };
+      }
+      if (prop === "list") return (...list) => { calls.push("list"); return value.apply(target, list); };
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const recorded = new Proxy(world, { get: (target, prop) => prop === "events" ? events : Reflect.get(target, prop) });
+  const agent = await defineAgent(gateway.port, () => "sent")({
+    world: recorded,
+    fetch: (input, init) => {
+      const url = new URL(String(input?.url ?? input));
+      if ((init?.method ?? "GET") === "POST") calls.push("model");
+      return fetch(url.hostname === "ai-gateway.vercel.sh" ? `http://127.0.0.1:${gateway.port}${url.pathname}` : input, init);
+    },
+  });
+  assert.equal((await run(agent, "first words")).stopReason, "end_turn");
+  await agent.close();
+  assert.deepEqual(calls.slice(0, calls.indexOf("model")), ["run_created", "run_started", "libfx.journal"]);
+
+  const again = await defineAgent(gateway.port, () => "sent")({ world, sessionId: agent.sessionId });
+  gateway.requests.length = 0;
+  await run(again, "what came first");
+  await again.close();
+  assert.ok(gateway.requests[0].some((message) => message.role === "user" && textOf(message) === "first words"), "the new run restores");
+  await closeWorld(world);
+});
+
 test("a second process on the session fences the first", async () => {
   const world = createWorld({ dataDir: mkdtempSync(join(tmpdir(), "libfx-world-")), recoverActiveRuns: false });
   await world.start?.();
