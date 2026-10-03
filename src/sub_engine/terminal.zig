@@ -690,8 +690,9 @@ fn shrinkSendBuffer(report: fd_t) !void {
 }
 
 test "a reply larger than the socket buffer reaches the child whole" {
-    // The child reads its replies only after the test says go.
-    var terminal = try openShell("read -r go; r=${SUB_ENGINE_REPORT%%:*}; read -r a <&$r; read -r b <&$r; echo \"a=${#a} b=$b\"");
+    // The child reads its replies only after the test says go, then stays
+    // alive so the channel is still open for the last reply.
+    var terminal = try openShell("read -r go; r=${SUB_ENGINE_REPORT%%:*}; read -r a <&$r; read -r b <&$r; echo \"a=${#a} b=$b\"; sleep 5");
     defer _ = terminal.close() catch {};
     try shrinkSendBuffer(terminal.reportFd());
     const long = [_]u8{'x'} ** max_reply_line;
