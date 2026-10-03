@@ -62,6 +62,7 @@ const vercel_model_policy = @import("gateway/vercel_model_policy.zig");
 const model_catalog = @import("core/gateway/model_catalog.zig");
 const agent_stream_provider = @import("core/agent/stream_provider.zig");
 const builtin_hooks = @import("builtins/hooks.zig");
+const builtin_terminal_status = @import("builtins/terminal_status/terminal_status.zig");
 const builtin_mcp = @import("builtins/mcp.zig");
 const builtin_modes = @import("builtins/modes.zig");
 const builtin_skills = @import("builtins/skills.zig");
@@ -406,7 +407,7 @@ const App = struct {
         Self,
         builtin_hooks.notifications.provider(Self),
     );
-    const TerminalStatusAppRuntime = builtin_hooks.Runtime(Self);
+    const TerminalStatusHooks = builtin_terminal_status.Hooks(Self, SessionAppRuntime.activeSessionId);
     const RenderAppRuntime = app_render_runtime.Runtime(Self);
     const SessionAppRuntime = app_session_runtime.Runtime(Self);
     const UpgradeAppRuntime = app_upgrade_runtime.Runtime(Self);
@@ -536,9 +537,7 @@ const App = struct {
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     notifications: builtin_hooks.notifications.State = .{},
-    herdr: builtin_hooks.HerdrClient = .{},
-    cmux: builtin_hooks.CmuxClient = .{},
-    otty: builtin_hooks.otty.Client = .{},
+    terminal_status: builtin_terminal_status.TerminalStatus = .{},
 
     session: SessionRuntime = SessionRuntime.initWithProviders(
         max_history_turns,
@@ -746,13 +745,16 @@ const App = struct {
     }
 
     pub fn configureNotifications(self: *App) !void {
-        // Register terminal status hooks (Otty, herdr, cmux) before
-        // NotificationAppRuntime.configure freezes the lifecycle runtime (its
-        // call to freeze() is the sole freeze site). Otty initializes first so
-        // the shared foreground observer can include it.
-        try builtin_hooks.otty.Hooks(App).configure(self);
-        try TerminalStatusAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
+        // Register terminal status hooks before NotificationAppRuntime.configure
+        // freezes the lifecycle runtime (its call to freeze() is the sole
+        // freeze site).
+        try TerminalStatusHooks.configure(self);
         try NotificationAppRuntime.configure(self);
+    }
+
+    /// Reports the latest approval-prompt observation to terminal hosts.
+    pub fn syncTerminalStatus(self: *App, child_approval_waiting: bool, parent_approval_waiting: bool) void {
+        TerminalStatusHooks.sync(self, child_approval_waiting, parent_approval_waiting);
     }
 
     pub fn rebindAfterInit(self: *App) void {
@@ -872,10 +874,6 @@ const App = struct {
         shutdown_trace.mark("terminal_released");
 
         self.auth.stopProviderPreparation();
-        // Client.deinit releases the herdr pane (clear agent + label) when enabled.
-        self.herdr.deinit();
-        // Client.deinit clears the cmux sidebar status when enabled.
-        self.cmux.deinit();
         self.stopStream();
         self.worker.requestShutdown();
         SessionAppRuntime.requestPersistenceShutdown(self);
@@ -892,7 +890,9 @@ const App = struct {
         WorkerAppRuntime.settleFinishedPromptsForShutdown(self) catch |err| {
             SessionAppRuntime.recordShutdownFailure(self, err);
         };
-        self.otty.deinit();
+        // Report the final status and clear fx from terminal hosts after every
+        // status producer, including the foreground worker, has stopped.
+        self.terminal_status.deinit();
         // The dashboard loader reads the profile usage ledger that
         // persistence flushes; stop it first.
         self.usage_dashboard.deinit();
@@ -939,10 +939,6 @@ const App = struct {
         // not write to the profile directory.
         const was_interactive = self.terminal.raw_enabled or self.terminal.signal_handler_installed;
         self.auth.stopProviderPreparation();
-        // Client.deinit releases the herdr pane (clear agent + label) when enabled.
-        self.herdr.deinit();
-        // Client.deinit clears the cmux sidebar status when enabled.
-        self.cmux.deinit();
         self.stopStream();
         shutdown_trace.mark("stop_stream");
 
@@ -960,7 +956,9 @@ const App = struct {
         WorkerAppRuntime.settleFinishedPromptsForShutdown(self) catch |err| {
             SessionAppRuntime.recordShutdownFailure(self, err);
         };
-        self.otty.deinit();
+        // Report the final status and clear fx from terminal hosts after every
+        // status producer, including the foreground worker, has stopped.
+        self.terminal_status.deinit();
         self.terminal_client.deinit();
         self.managed_executions.deinit();
         self.model_cache.deinit();
@@ -1421,7 +1419,6 @@ const App = struct {
         );
         errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
         try self.worker.admitInteractivePrompt(std.heap.c_allocator, queued);
-        TerminalStatusAppRuntime.reportWorking(self);
         return true;
     }
 
@@ -1464,7 +1461,6 @@ const App = struct {
         );
         errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
         try self.worker.enqueuePrompt(std.heap.c_allocator, queued);
-        TerminalStatusAppRuntime.reportWorking(self);
         return true;
     }
 
@@ -1624,7 +1620,6 @@ const App = struct {
             .history = history,
             .unversioned_history_count = self.session.unversionedHistoryEnd(),
         });
-        TerminalStatusAppRuntime.reportWorking(self);
         return true;
     }
 
@@ -4959,7 +4954,7 @@ test {
     _ = @import("core/tooling/tool_runtime.zig");
     _ = @import("core/tooling/tool_specs.zig");
     _ = @import("builtins/commands.zig");
-    _ = @import("builtins/hooks/otty.zig");
+    _ = @import("builtins/terminal_status/terminal_status.zig");
     _ = @import("builtins/mcp.zig");
     _ = @import("builtins/modes.zig");
     _ = @import("builtins/tools.zig");

@@ -69,6 +69,8 @@ Key rules:
 
 * `src/core/compactor/` owns context compaction. Outside code imports only its front door, `compactor.zig`, and the compactor imports only shared basics and model configuration; its caller hands in the model caller, the record store, and the session's projection of saved turns into chat messages. `scripts/check-compactor-boundary.sh` enforces this in CI.
 
+* `src/builtins/terminal_status/` mirrors fx's foreground status into terminal hosts such as herdr, cmux, and Otty. Outside code imports only its front door, `terminal_status.zig`, and reports lifecycle signals through `publish`; status policy lives in `status.zig`, and each host in `hosts/` renders `Status` values using only the status model, the socket transport, and shared basics. `scripts/check-terminal-status-boundary.sh` enforces this in CI.
+
 * `src/tools/` owns built-in tool implementations. Generic tool contracts and dispatch live in `src/core/tooling/`. Default tool specs are centralized in `src/core/tooling/tool_specs.zig` or `src/builtins/tools.zig`, not in individual tool files.
 
 * `src/ui/` owns terminal rendering, event loop, input, transcript. It must not own product state.

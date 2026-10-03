@@ -41,6 +41,9 @@ jobs:
       - name: Check compactor boundary
         run: ./scripts/check-compactor-boundary.sh
 
+      - name: Check terminal status boundary
+        run: ./scripts/check-terminal-status-boundary.sh
+
       - name: Build
         run: zig build -Doptimize=${{ matrix.optimize }}
 
@@ -478,6 +481,7 @@ jobs:
             benchmarks/startup.sh
             scripts/check-compactor-boundary.sh
             scripts/check-public-surface.sh
+            scripts/check-terminal-status-boundary.sh
           )
           bash -n "${scripts[@]}"
           shellcheck "${scripts[@]}"

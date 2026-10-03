@@ -144,13 +144,26 @@ pub fn Runtime(comptime App: type) type {
                 defer worker_runtime.freeWorkItem(std.heap.c_allocator, work);
                 defer app.worker.finishProcessing();
                 if (comptime @hasDecl(@TypeOf(app.worker), "notify_foreground_work")) {
-                    if (work == .prompt) app.worker.notify_foreground_work();
+                    app.worker.notify_foreground_work();
                 }
                 var failure_provenance: ?compaction_activity.ErrorProvenance = null;
-                app.processQueuedWork(work, &failure_provenance) catch |err| {
+                if (app.processQueuedWork(work, &failure_provenance)) |_| {
+                    // The agent's turn-end hook settles prompts; other work
+                    // settles here.
+                    if (comptime @hasDecl(@TypeOf(app.worker), "notify_foreground_outcome")) {
+                        switch (work) {
+                            .prompt => {},
+                            .compact_context => app.worker.notify_foreground_outcome(.completed),
+                        }
+                    }
+                } else |err| {
                     // Preparation can fail before the agent's turn-end hook.
                     if (comptime @hasDecl(@TypeOf(app.worker), "notify_foreground_outcome")) {
-                        if (work == .prompt and err != error.RouteRecoveryStopped) {
+                        const settles = switch (work) {
+                            .prompt => err != error.RouteRecoveryStopped,
+                            .compact_context => true,
+                        };
+                        if (settles) {
                             app.worker.notify_foreground_outcome(if (err == error.Cancelled or app.worker.isCancelRequested()) .interrupted else .failed);
                         }
                     }
@@ -166,7 +179,7 @@ pub fn Runtime(comptime App: type) type {
                             .body = body,
                         } });
                     }
-                };
+                }
             }
         }
     };
