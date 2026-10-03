@@ -16,6 +16,9 @@ pub const max_text_bytes: u32 = 64 * 1024;
 pub const max_model_bytes: u32 = 256;
 pub const default_wait_ms: u32 = 60_000;
 pub const max_wait_ms: u32 = 600_000;
+pub const max_name_bytes: u32 = children.max_name_bytes;
+
+const name_rule = std.fmt.comptimePrint("Names are 1 to {d} lowercase letters, digits and hyphens, starting with a letter.", .{max_name_bytes});
 
 pub const Request = union(enum) {
     launch: struct { name: []const u8, task: []const u8, model: ?[]const u8, effort: ?[]const u8 },
@@ -98,7 +101,7 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
             return success(gpa, .{ .ok = true, .delivery = launched.delivery, .child = statusJson(launched.status) });
         },
         .send => |send| {
-            const delivery = runtime.send(send.name, send.message, cancel) catch |err| return runtimeFailure(gpa, err);
+            const delivery = runtime.send(send.name, send.message, host.settings.root_context, cancel) catch |err| return runtimeFailure(gpa, err);
             return success(gpa, .{ .ok = true, .name = send.name, .delivery = delivery });
         },
         .wait => |wait| {
@@ -265,9 +268,9 @@ fn decodeCode(err: DecodeError) []const u8 {
 
 fn decodeMessage(err: DecodeError) []const u8 {
     return switch (err) {
-        error.InvalidName => "Names are 1 to 32 lowercase letters, digits and hyphens, starting with a letter.",
-        error.InvalidText => "Tasks and messages are 1 to 65536 bytes.",
-        error.InvalidTimeout => "timeout_ms is 0 to 600000.",
+        error.InvalidName => name_rule,
+        error.InvalidText => std.fmt.comptimePrint("Tasks and messages are 1 to {d} bytes.", .{max_text_bytes}),
+        error.InvalidTimeout => std.fmt.comptimePrint("timeout_ms is 0 to {d}.", .{max_wait_ms}),
         error.TooManyNames => "Wait on at most 10 names.",
         else => "The request does not match the tool's schema.",
     };
@@ -279,15 +282,15 @@ const RuntimeError = children.LaunchError || children.SendError;
 fn runtimeFailure(gpa: Allocator, err: RuntimeError) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const code: []const u8, const message: []const u8 = switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.InvalidName => .{ "invalid_name", "Names are 1 to 32 lowercase letters, digits and hyphens, starting with a letter." },
+        error.InvalidName => .{ "invalid_name", name_rule },
         error.NameTaken => .{ "name_taken", "A child with that name exists. Use send, or stop it first." },
         error.LimitReached => .{ "limit_reached", "Ten children are running. Stop one first." },
         error.NotFound => .{ "not_found", "No child has that name." },
         error.Exited => .{ "exited", "The child exited. Stop it to free its name." },
         error.Blocked => .{ "blocked", "The child is waiting on a permission or question prompt, which only the user answers. Wait for it, or stop it." },
-        error.UnsupportedText => .{ "unsupported_text", "The text has control characters other than tab and newline." },
+        error.UnsupportedText => .{ "unsupported_text", "The text has control characters other than tab, newline and carriage return." },
         error.StartFailed => .{ "start_failed", "The child could not start." },
-        error.StartTimedOut => .{ "start_timed_out", "The child did not start within 30 seconds and was stopped." },
+        error.StartTimedOut => .{ "start_timed_out", "The child did not start in time and was stopped." },
         error.Cancelled => .{ "cancelled", "The call was cancelled." },
     };
     return failureResult(gpa, code, message);

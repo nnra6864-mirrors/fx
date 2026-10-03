@@ -2,11 +2,12 @@
 //! channel is.
 //!
 //! The child inherits its end of a socket pair the owner holds the other end
-//! of, and its environment names it as
-//! `SUB_ENGINE_REPORT=<fd>:<device>:<inode>`. Processes the child starts
-//! inherit the entry but usually not the fd, and that fd number may then
-//! belong to some other file, so a program checks that the fd is still the
-//! named channel before it writes.
+//! of, without close-on-exec, and its environment names it as
+//! `SUB_ENGINE_REPORT=<fd>:<device>:<inode>`. The child program must set
+//! FD_CLOEXEC on that fd itself before it starts other programs, or they
+//! inherit the channel too and can write to the owner. They still inherit
+//! the entry, and that fd number may then belong to some other file, so a
+//! program checks that the fd is still the named channel before it writes.
 
 const std = @import("std");
 const builtin = @import("builtin");

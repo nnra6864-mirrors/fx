@@ -49,24 +49,26 @@ pub const Child = struct {
     }
 
     /// Every message typed into the child has been reported.
-    pub fn delivered(self: *const Child) bool {
+    fn delivered(self: *const Child) bool {
         return self.labels.messages_total >= self.typed;
     }
 
     /// The child exited, or it reported everything typed into it and is
-    /// idle or blocked.
-    pub fn settled(self: *const Child) bool {
+    /// idle, or blocked when `blocked_settles`. A blocked child waits for a
+    /// user's answer, which can only come where its prompts reach a user.
+    pub fn settled(self: *const Child, blocked_settles: bool) bool {
         if (self.exit != null) return true;
-        return self.delivered() and (self.labels.state == .idle or self.labels.state == .blocked);
+        if (!self.delivered()) return false;
+        return self.labels.state == .idle or (blocked_settles and self.labels.state == .blocked);
     }
 };
 
-/// Lowercase letters, digits, '-' and '_', starting with a letter or digit.
+/// Lowercase letters, digits and '-', starting with a letter.
 pub fn validName(name: []const u8) bool {
     if (name.len == 0 or name.len > max_name_bytes) return false;
-    if (!std.ascii.isLower(name[0]) and !std.ascii.isDigit(name[0])) return false;
+    if (!std.ascii.isLower(name[0])) return false;
     for (name) |byte| {
-        if (!std.ascii.isLower(byte) and !std.ascii.isDigit(byte) and byte != '-' and byte != '_') return false;
+        if (!std.ascii.isLower(byte) and !std.ascii.isDigit(byte) and byte != '-') return false;
     }
     return true;
 }
@@ -175,7 +177,7 @@ pub const Table = struct {
         self.slots[slot].?.exit = exit;
     }
 
-    pub fn count(self: *const Table) usize {
+    fn count(self: *const Table) usize {
         var live: usize = 0;
         for (self.slots) |slot| live += @intFromBool(slot != null);
         return live;
@@ -197,7 +199,7 @@ fn applyEvent(table: *Table, id: sub_engine.Id, event: labels_mod.Event) !void {
 test "names are checked, unique and limited" {
     var table: Table = .{};
     defer table.deinit(testing.allocator);
-    for ([_][]const u8{ "", "Upper", "-lead", "has space", "a" ** (max_name_bytes + 1) }) |bad| {
+    for ([_][]const u8{ "", "Upper", "-lead", "1lead", "under_score", "has space", "a" ** (max_name_bytes + 1) }) |bad| {
         try testing.expectError(error.InvalidName, table.reserve(bad));
     }
     var name: [8]u8 = undefined;
@@ -218,25 +220,34 @@ test "a child settles once it reported everything typed into it" {
 
     try applyEvent(&table, testId(0), .{ .state = .idle });
     try testing.expect(child.started());
-    try testing.expect(child.settled());
+    try testing.expect(child.settled(true));
 
     // The task is typed: until the child reports it, its old idle does not
     // count.
     table.markReady(slot);
     table.typedOne(slot);
-    try testing.expect(!child.settled());
+    try testing.expect(!child.settled(true));
     try applyEvent(&table, testId(0), .{ .message = "task" });
-    try testing.expect(!child.settled());
+    try testing.expect(!child.settled(true));
     try applyEvent(&table, testId(0), .{ .turn_end = .{ .final = "done", .next = .idle } });
-    try testing.expect(child.settled());
+    try testing.expect(child.settled(true));
+
+    // Blocked settles only where no user can answer the prompt.
+    try applyEvent(&table, testId(0), .{ .prompt = .{ .number = 1, .reason = .permission, .body = .{
+        .permission = .{ .id = 1, .label = "shell" },
+    } } });
+    try testing.expect(child.settled(true));
+    try testing.expect(!child.settled(false));
+    try applyEvent(&table, testId(0), .{ .prompt_closed = .{ .number = 1, .next = .idle } });
+    try testing.expect(child.settled(false));
 
     // Reports from a terminal no name holds change nothing.
     try applyEvent(&table, testId(5), .{ .state = .working });
-    try testing.expect(child.settled());
+    try testing.expect(child.settled(true));
 
     table.exited(testId(0), .{ .code = 0 });
     table.typedOne(slot);
-    try testing.expect(child.settled());
+    try testing.expect(child.settled(true));
 }
 
 test "only a ready child can be stopped" {
@@ -257,12 +268,9 @@ test "only a ready child can be stopped" {
 // is typed only once a child can read it, that a wait never says idle
 // before the child finished what it was sent, that nothing is typed after a
 // stop, that the limit holds, and that every running child has a name.
-//
-// With SUB_ENGINE_TRACE_DIR set, each run is also written to that folder as
-// JSON lines for checking against a model outside this repository.
 
-/// Children, messages and tool calls per run. The model the traces are
-/// checked against uses the same bounds.
+/// Children, messages and tool calls per run, small so that runs cover many
+/// orderings.
 const run_names = [_][]const u8{ "a", "b" };
 const run_threads = 2;
 const run_ids = 6;
@@ -296,7 +304,7 @@ const Sim = struct {
         return .{ .slot = @intCast(i), .gen = 1 };
     }
 
-    fn modelId(child: *const Child) usize {
+    fn procIndex(child: *const Child) usize {
         return if (child.id) |id| id.slot else 0;
     }
 
@@ -317,7 +325,7 @@ const Sim = struct {
 
     /// One message typed into the child holding `name`.
     fn typeInto(self: *Sim, slot: usize) void {
-        const i = modelId(self.table.get(slot));
+        const i = procIndex(self.table.get(slot));
         self.procs[i].inbox += 1;
         self.table.typedOne(slot);
         self.late = self.late or self.procs[i].closed;
@@ -333,96 +341,6 @@ const Sim = struct {
     }
 };
 
-const ControlTrace = struct {
-    gpa: Allocator,
-    file: ?std.Io.File,
-    offset: u64 = 0,
-
-    fn create(gpa: Allocator, seed: u64) !ControlTrace {
-        const dir_path = std.c.getenv("SUB_ENGINE_TRACE_DIR") orelse
-            return .{ .gpa = gpa, .file = null };
-        const io = testing.io;
-        var dir = try std.Io.Dir.cwd().openDir(io, std.mem.span(dir_path), .{});
-        defer dir.close(io);
-        var name: [64]u8 = undefined;
-        const file_name = try std.fmt.bufPrint(&name, "Control--seed-{d}.ndjson", .{seed});
-        return .{ .gpa = gpa, .file = try dir.createFile(io, file_name, .{ .truncate = true }) };
-    }
-
-    const Rec = struct { phase: []const u8, id: usize };
-    const Held = struct { id: usize, state: []const u8, msgs: u64, typed: u64 };
-    const PcView = struct { op: []const u8, step: u8, n: []const u8, id: usize, mark: u64 };
-
-    fn step(self: *ControlTrace, event: []const u8, sim: *Sim) !void {
-        const file = self.file orelse return;
-        var recs: [run_names.len]Rec = undefined;
-        var held: std.ArrayList(Held) = .empty;
-        defer held.deinit(self.gpa);
-        for (run_names, &recs, 0..) |_, *rec, n| {
-            rec.* = .{ .phase = "none", .id = 0 };
-            const child = sim.childOf(n) orelse continue;
-            rec.* = .{ .phase = @tagName(child.phase), .id = Sim.modelId(child) };
-            if (child.id != null) try held.append(self.gpa, .{
-                .id = rec.id,
-                .state = @tagName(child.labels.state),
-                .msgs = child.labels.messages_total,
-                .typed = child.typed,
-            });
-        }
-        var alive: [run_ids]bool = undefined;
-        var closed: [run_ids]bool = undefined;
-        var ready: [run_ids]bool = undefined;
-        var inbox: [run_ids]u64 = undefined;
-        var queue: [run_ids]u64 = undefined;
-        var done: [run_ids]u64 = undefined;
-        var blocked: [run_ids]bool = undefined;
-        for (sim.procs[1..], 0..) |proc, k| {
-            alive[k] = proc.alive;
-            closed[k] = proc.closed;
-            ready[k] = proc.ready;
-            inbox[k] = proc.inbox;
-            queue[k] = proc.queue;
-            done[k] = proc.done;
-            blocked[k] = proc.blocked;
-        }
-        var pcs: [run_threads]PcView = undefined;
-        for (sim.calls, &pcs) |call, *pc| pc.* = .{
-            .op = @tagName(call.op),
-            .step = call.step,
-            .n = run_names[call.name],
-            .id = call.id,
-            .mark = call.mark,
-        };
-        const line = try std.json.Stringify.valueAlloc(self.gpa, .{
-            .event = event,
-            .rec = .{ .a = recs[0], .b = recs[1] },
-            .held = .{ .@"$set" = held.items },
-            .nextId = sim.next_id,
-            .alive = alive,
-            .closed = closed,
-            .ready = ready,
-            .inbox = inbox,
-            .queue = queue,
-            .done = done,
-            .blocked = blocked,
-            .pc = pcs,
-            .ops = sim.ops,
-            .lost = sim.lost,
-            .early = sim.early,
-            .late = sim.late,
-        }, .{});
-        defer self.gpa.free(line);
-        try file.writePositionalAll(testing.io, line, self.offset);
-        self.offset += line.len;
-        try file.writePositionalAll(testing.io, "\n", self.offset);
-        self.offset += 1;
-    }
-
-    fn finish(self: *ControlTrace) void {
-        if (self.file) |file| file.close(testing.io);
-    }
-};
-
 /// One enabled step: a tool call's next step, or a child's own step.
 const SimStep = union(enum) {
     call: usize,
@@ -434,8 +352,6 @@ fn runRandom(gpa: Allocator, seed: u64) !void {
     const random = prng.random();
     var sim: Sim = .{ .gpa = gpa };
     defer sim.table.deinit(gpa);
-    var trace = try ControlTrace.create(gpa, seed);
-    defer trace.finish();
 
     var steps: std.ArrayList(SimStep) = .empty;
     defer steps.deinit(gpa);
@@ -487,18 +403,16 @@ fn runRandom(gpa: Allocator, seed: u64) !void {
                         sim.table.exited(Sim.idOf(c.id), .{ .code = 0 });
                     },
                 }
-                try trace.step(@tagName(c.kind), &sim);
             },
-            .call => |t| try stepCall(&sim, &trace, random, t),
+            .call => |t| try stepCall(&sim, random, t),
         }
         try sim.check();
     }
 }
 
-fn stepCall(sim: *Sim, trace: *ControlTrace, random: std.Random, t: usize) !void {
+fn stepCall(sim: *Sim, random: std.Random, t: usize) !void {
     const call = &sim.calls[t];
     const name = run_names[call.name];
-    var event: []const u8 = undefined;
     switch (call.op) {
         .none => {
             call.* = .{
@@ -508,17 +422,14 @@ fn stepCall(sim: *Sim, trace: *ControlTrace, random: std.Random, t: usize) !void
             };
             if (call.op == .none) call.op = .wait;
             sim.ops += 1;
-            event = "StartCall";
         },
         .launch => switch (call.step) {
             1 => {
-                event = "LaunchReserve";
                 if (sim.table.reserve(name)) |_| call.step = 2 else |_| call.* = .{};
             },
             2 => {
-                // Out of terminal ids, the model's launch waits forever.
+                // Out of terminal ids, a launch waits forever.
                 if (sim.next_id > run_ids) return;
-                event = "LaunchOpen";
                 const i = sim.next_id;
                 sim.next_id += 1;
                 sim.procs[i].alive = true;
@@ -528,15 +439,13 @@ fn stepCall(sim: *Sim, trace: *ControlTrace, random: std.Random, t: usize) !void
             3 => {
                 const slot = sim.table.find(name).?;
                 const child = sim.table.get(slot);
-                const i = Sim.modelId(child);
+                const i = Sim.procIndex(child);
                 if (!child.started() and random.uintLessThan(u8, 4) == 0) {
-                    event = "LaunchTimeout";
                     sim.procs[i].closed = true;
                     sim.procs[i].alive = false;
                     sim.table.free(sim.gpa, slot);
                     call.* = .{};
                 } else if (child.started()) {
-                    event = "LaunchTask";
                     sim.table.markReady(slot);
                     if (sim.procs[i].alive) {
                         sim.typeInto(slot);
@@ -545,16 +454,14 @@ fn stepCall(sim: *Sim, trace: *ControlTrace, random: std.Random, t: usize) !void
                 } else return;
             },
             else => {
-                event = "Delivered";
                 call.* = .{};
             },
         },
         .send => switch (call.step) {
             1 => {
-                event = "SendType";
                 const slot = sim.table.find(name);
                 const child = if (slot) |s| sim.table.get(s) else null;
-                if (child != null and child.?.phase == .ready and sim.procs[Sim.modelId(child.?)].alive and
+                if (child != null and child.?.phase == .ready and sim.procs[Sim.procIndex(child.?)].alive and
                     child.?.typed < run_messages)
                 {
                     sim.typeInto(slot.?);
@@ -562,25 +469,22 @@ fn stepCall(sim: *Sim, trace: *ControlTrace, random: std.Random, t: usize) !void
                 } else call.* = .{};
             },
             else => {
-                event = "Delivered";
                 call.* = .{};
             },
         },
         .wait => switch (call.step) {
             1 => {
-                event = "WaitStart";
                 const child = sim.childOf(call.name);
                 if (child != null and child.?.phase == .ready) {
                     call.step = 2;
-                    call.id = Sim.modelId(child.?);
+                    call.id = Sim.procIndex(child.?);
                     call.mark = child.?.typed;
                 } else call.* = .{};
             },
             else => {
                 const child = sim.childOf(call.name);
-                const same = child != null and child.?.phase == .ready and Sim.modelId(child.?) == call.id;
-                if (same and !child.?.settled()) return;
-                event = "WaitReturn";
+                const same = child != null and child.?.phase == .ready and Sim.procIndex(child.?) == call.id;
+                if (same and !child.?.settled(true)) return;
                 const proc = sim.procs[call.id];
                 if (same and proc.alive and child.?.labels.state == .idle and proc.done < call.mark) sim.early = true;
                 call.* = .{};
@@ -588,26 +492,22 @@ fn stepCall(sim: *Sim, trace: *ControlTrace, random: std.Random, t: usize) !void
         },
         .stop => switch (call.step) {
             1 => {
-                event = "StopMark";
                 if (sim.table.markStopping(name)) |_| call.step = 2 else |_| call.* = .{};
             },
             2 => {
-                event = "StopClose";
                 const child = sim.childOf(call.name).?;
-                const i = Sim.modelId(child);
+                const i = Sim.procIndex(child);
                 sim.procs[i].closed = true;
                 sim.procs[i].alive = false;
                 sim.table.exited(Sim.idOf(i), .{ .signal = 1 });
                 call.step = 3;
             },
             else => {
-                event = "StopFree";
                 sim.table.free(sim.gpa, sim.table.find(name).?);
                 call.* = .{};
             },
         },
     }
-    try trace.step(event, sim);
 }
 
 test "random runs keep the runtime's rules" {

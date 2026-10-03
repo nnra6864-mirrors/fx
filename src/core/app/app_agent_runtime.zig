@@ -1064,7 +1064,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasDecl(App, "providerSet")) deps.agent_stream_provider = app.providerSet().select(job.provider).agent_stream_or_unavailable();
             deps.compaction_failure = failure_provenance;
             const semantic_presentation = app_callbacks.Bindings(App).semanticPresentationSink(app);
-            const config = buildQueuedPromptConfig(
+            var config = buildQueuedPromptConfig(
                 app,
                 job,
                 .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
@@ -1074,6 +1074,19 @@ pub fn Runtime(comptime App: type) type {
                 &tool_projection,
                 session_child_capability,
             );
+            // A child that a parent fx launched gets its prompts from the
+            // parent's model, so its turns run as a subagent's and are
+            // reviewed against the parent's user requests.
+            const parent_context = if (comptime @hasField(App, "parent_report"))
+                try app.parent_report.rootContext(std.heap.c_allocator)
+            else
+                null;
+            defer if (parent_context) |context| std.heap.c_allocator.free(context);
+            if (parent_context) |context| {
+                config.origin = .subagent;
+                config.root_user_intent_context = context;
+                config.current_prompt_is_root_authority = false;
+            }
             const process_result = agent_runtime.processAgentPrompt(&app.session.agent, &deps, semantic_presentation, lifecycleContext(app), config, job);
             try process_result;
         }

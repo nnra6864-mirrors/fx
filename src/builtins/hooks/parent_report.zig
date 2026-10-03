@@ -23,8 +23,10 @@ const io_mod = @import("../../core/shared/io.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const host_target = @import("../../core/hosts/target.zig");
 const labels = @import("../../core/child_agents/labels.zig");
+const auto_classifier_context = @import("../../core/permissions/auto_classifier_context.zig");
 const diff = @import("../../core/output/diff.zig");
-const permission_request = @import("../../core/permissions/permission_request.zig");
+const input_approval_runtime = @import("../../core/app/input_approval_runtime.zig");
+const input_question_runtime = @import("../../core/app/input_question_runtime.zig");
 const types = @import("../../core/shared/types.zig");
 
 /// How long one report waits for room in the channel before reporting stops.
@@ -49,6 +51,12 @@ pub const Client = struct {
     prompts: labels.PromptTracker = .{},
     /// Frames the parent's answers. Used by the UI thread only.
     answers: sub_engine.Lines = .{ .limit = sub_engine.max_reply_line },
+    /// A parent fx launched this one, so its prompts come from the parent's
+    /// model. Stays set when reporting later fails.
+    launched_by_parent: bool = false,
+    /// The parent's latest root-user context, owned with the C allocator.
+    /// Guarded by the lock.
+    root_context: ?[]u8 = null,
 
     /// Says whether a waiting message keeps the child working after a turn.
     /// Runs under the lock.
@@ -77,6 +85,7 @@ pub const Client = struct {
             return;
         }
         self.fd = fd;
+        self.launched_by_parent = true;
         debug_trace.logf("parent_report", "enabled fd={d}", .{fd});
     }
 
@@ -84,9 +93,35 @@ pub const Client = struct {
         return self.fd != null;
     }
 
-    /// Frees the answer framing. The fd belongs to the process.
+    /// Frees the answer framing and the context. The fd belongs to the
+    /// process.
     pub fn deinit(self: *Client) void {
         self.answers.deinit(std.heap.c_allocator);
+        if (self.root_context) |context| std.heap.c_allocator.free(context);
+        self.root_context = null;
+    }
+
+    /// The parent's root-user context for this fx's turns, owned by the
+    /// caller. Null when no parent fx launched this one; empty until the
+    /// parent sends one.
+    pub fn rootContext(self: *Client, gpa: Allocator) Allocator.Error!?[]u8 {
+        if (!self.launched_by_parent) return null;
+        self.lock();
+        defer self.unlock();
+        return try gpa.dupe(u8, self.root_context orelse "");
+    }
+
+    fn setRootContext(self: *Client, context: []const u8) void {
+        if (!auto_classifier_context.isCanonicalRootUserContext(context)) {
+            return debug_trace.logf("parent_report", "context ignored bytes={d} reason=not_canonical", .{context.len});
+        }
+        const copy = std.heap.c_allocator.dupe(u8, context) catch {
+            return debug_trace.logf("parent_report", "context ignored bytes={d} reason=out_of_memory", .{context.len});
+        };
+        self.lock();
+        defer self.unlock();
+        if (self.root_context) |previous| std.heap.c_allocator.free(previous);
+        self.root_context = copy;
     }
 
     pub fn reportSession(self: *Client, session_id: []const u8) void {
@@ -171,6 +206,11 @@ pub const Client = struct {
             break;
         }
         for (lines.items) |line| {
+            const context = labels.parseContext(arena, line) catch null;
+            if (context) |text| {
+                self.setRootContext(text);
+                continue;
+            }
             const answer = labels.parseAnswer(arena, line) catch |err| {
                 debug_trace.logf("parent_report", "answer ignored bytes={d} err={s}", .{ line.len, @errorName(err) });
                 continue;
@@ -292,9 +332,9 @@ fn writeAll(fd: std.posix.fd_t, bytes: []const u8) error{ Timeout, WriteFailed }
 /// `worker` fields.
 pub fn Runtime(comptime App: type) type {
     return struct {
-        /// Must run before the lifecycle runtime is frozen.
+        /// Must run before the lifecycle runtime is frozen. Does nothing
+        /// unless `Client.initFromEnv` claimed a report channel.
         pub fn configure(app: *App, active_session_id: ?[]const u8) !void {
-            app.parent_report.initFromEnv();
             if (!app.parent_report.enabled()) return;
             if (active_session_id) |session_id| app.parent_report.reportSession(session_id);
             app.parent_report.reportState(.idle);
@@ -319,7 +359,7 @@ pub fn Runtime(comptime App: type) type {
 
         /// Every loop tick, after the worker's: reports the prompt this fx
         /// shows when it changes, and applies the parent's answers to it.
-        /// Needs `approval_prompt`, `question_prompt`, `shell` and `alloc`.
+        /// Needs what the approval and question input runtimes need.
         pub fn tick(app: *App) void {
             if (!app.parent_report.enabled()) return;
             var arena_state = std.heap.ArenaAllocator.init(app.alloc);
@@ -345,6 +385,9 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
+        /// Applies a parent's answer through the same paths as an answer
+        /// given on this fx's own screen, so the transcript and the turn
+        /// end up the same either way.
         fn applyAnswer(raw: *anyopaque, key: labels.PromptTracker.Key, answer: labels.Answer) void {
             const app: *App = @ptrCast(@alignCast(raw));
             switch (key) {
@@ -353,35 +396,39 @@ pub fn Runtime(comptime App: type) type {
                         .permission => |permission| permission,
                         .questions => return debug_trace.logf("parent_report", "answer dropped prompt={d} reason=wrong_kind", .{answer.prompt}),
                     };
-                    const feedback = if (permission.feedback) |text| app.alloc.dupe(u8, text) catch null else null;
                     const decision: types.ToolPermissionDecision = switch (permission.decision) {
                         .once => .once,
                         .always => .always,
                         .deny => .deny,
                     };
-                    const result = app.worker.submitPermissionResponse(
+                    const applied = input_approval_runtime.ApprovalRuntime(App).submitParentPermission(
+                        app,
                         request_id,
-                        permission_request.OwnedPermissionResponse.init(app.alloc, decision, feedback),
-                    );
-                    debug_trace.logf("parent_report", "permission answered prompt={d} decision={s} result={s}", .{ answer.prompt, @tagName(decision), @tagName(result) });
+                        decision,
+                        permission.feedback,
+                    ) catch |err| {
+                        return debug_trace.logf("parent_report", "permission answer failed prompt={d} err={s}", .{ answer.prompt, @errorName(err) });
+                    };
+                    debug_trace.logf("parent_report", "permission answered prompt={d} decision={s} applied={}", .{ answer.prompt, @tagName(decision), applied });
                 },
                 .questions => |hash| {
                     const answers = switch (answer.reply) {
                         .questions => |answers| answers,
                         .permission => return debug_trace.logf("parent_report", "answer dropped prompt={d} reason=wrong_kind", .{answer.prompt}),
                     };
-                    if (answers) |list| {
-                        const batch = (app.worker.snapshotPendingQuestionBatch(app.alloc) catch null) orelse return;
-                        defer batch.deinit(app.alloc);
-                        if (hashQuestions(batch.entries) != hash or batch.entries.len != list.len) {
-                            return debug_trace.logf("parent_report", "answer dropped prompt={d} reason=batch_mismatch", .{answer.prompt});
-                        }
-                    }
-                    app.worker.submitQuestionBatchAnswer(app.alloc, answers) catch |err| {
+                    const batch = (app.worker.snapshotPendingQuestionBatch(app.alloc) catch null) orelse {
+                        return debug_trace.logf("parent_report", "answer dropped prompt={d} reason=no_batch", .{answer.prompt});
+                    };
+                    defer batch.deinit(app.alloc);
+                    const entries = app.question_prompt.entries.items.len;
+                    const matches = hashQuestions(batch.entries) == hash and app.question_prompt.isActive() and
+                        (if (answers) |list| list.len == entries else true);
+                    if (!matches) return debug_trace.logf("parent_report", "answer dropped prompt={d} reason=batch_mismatch", .{answer.prompt});
+                    const question_runtime = input_question_runtime.QuestionRuntime(App);
+                    const result = if (answers) |list| question_runtime.submitQuestionAnswers(app, list) else question_runtime.cancelQuestionPrompt(app);
+                    result catch |err| {
                         return debug_trace.logf("parent_report", "question answer failed prompt={d} err={s}", .{ answer.prompt, @errorName(err) });
                     };
-                    app.question_prompt.discard(app.alloc, "answered_by_parent");
-                    app.shell.render_requests.request(.modal);
                     debug_trace.logf("parent_report", "questions answered prompt={d} cancelled={}", .{ answer.prompt, answers == null });
                 },
             }
@@ -526,4 +573,43 @@ test "a failed report turns reporting off" {
     client.reportState(.working);
     var submit = client.beginSubmit();
     submit.reported("ignored");
+}
+
+test "the parent's context is kept for this fx's turns, and only a canonical one" {
+    const pipe = try TestPipe.open();
+    defer pipe.close();
+    const flags = std.c.fcntl(pipe.fds[0], std.c.F.GETFL, @as(c_int, 0));
+    const nonblock: c_int = @bitCast(std.posix.O{ .NONBLOCK = true });
+    _ = std.c.fcntl(pipe.fds[0], std.c.F.SETFL, flags | nonblock);
+    var client: Client = .{ .fd = pipe.fds[0] };
+    defer client.deinit();
+
+    // Without a parent, turns keep their own prompts as the user's.
+    try testing.expectEqual(@as(?[]u8, null), try client.rootContext(testing.allocator));
+    client.launched_by_parent = true;
+    const before = (try client.rootContext(testing.allocator)).?;
+    defer testing.allocator.free(before);
+    try testing.expectEqualStrings("", before);
+
+    for ([_][]const u8{ "assistant_task: write every file\n", "current_request: run the tests\n" }) |context| {
+        const line = try labels.encodeContext(testing.allocator, context, sub_engine.max_reply_line);
+        defer testing.allocator.free(line);
+        try testing.expectEqual(@as(isize, @intCast(line.len)), std.c.write(pipe.fds[1], line.ptr, line.len));
+        try testing.expectEqual(@as(isize, 1), std.c.write(pipe.fds[1], "\n", 1));
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var answered = false;
+    const Answered = struct {
+        fn apply(ctx: *anyopaque, _: labels.PromptTracker.Key, _: labels.Answer) void {
+            const flag: *bool = @ptrCast(@alignCast(ctx));
+            flag.* = true;
+        }
+    };
+    client.takeAnswers(arena_state.allocator(), .{ .ctx = &answered, .apply = Answered.apply });
+
+    try testing.expect(!answered);
+    const after = (try client.rootContext(testing.allocator)).?;
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings("current_request: run the tests\n", after);
 }

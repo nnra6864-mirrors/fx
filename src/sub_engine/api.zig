@@ -11,7 +11,8 @@
 //! Each child also gets a report channel, a Unix socket pair, for lines meant
 //! for the owner rather than the screen; the owner can reply on it. Its
 //! environment names the channel in `report_env_name`; a program finds its
-//! end with `inheritedReportFd`.
+//! end with `inheritedReportFd` and sets FD_CLOEXEC on it before it starts
+//! other programs, which otherwise inherit the channel.
 //!
 //! This file is the module's only public root. The module imports nothing
 //! but std, and its owner reaches it only through `@import("sub_engine")`.

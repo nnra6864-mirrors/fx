@@ -25,12 +25,16 @@ const fd_t = std.posix.fd_t;
 pub const Exit = core_mod.Exit;
 
 /// The longest line `Terminal.reply` sends, without its newline.
-pub const max_reply_line: usize = 16 * 1024;
+pub const max_reply_line = core_mod.max_reply_line;
 
 /// How long `close` waits for the child to exit after the hangup before it
 /// kills the child's process group.
-const close_grace_ms: u32 = 1000;
+pub const close_grace_ms: u32 = 1000;
 const close_poll_ms: u32 = 10;
+/// How long `open` waits for the child to report its exec. Exec closes the
+/// launch pipe within milliseconds; the bound matters when another process
+/// inherited the pipe's write end and keeps the pipe open.
+const launch_timeout_ms: u32 = 5000;
 
 pub const Options = struct {
     /// The program and its arguments. A program without a '/' is looked up
@@ -57,6 +61,9 @@ pub const OpenError = error{
     /// The PTY, or a pipe the child needs, could not be created.
     PtyUnavailable,
     ForkFailed,
+    /// The child did not report its exec within `launch_timeout_ms`, so
+    /// open killed it.
+    LaunchTimedOut,
     OutOfMemory,
 };
 
@@ -71,8 +78,12 @@ pub const ReadResult = union(enum) {
 
 pub const CloseReport = struct {
     exit: Exit,
-    /// Unsent bytes that close dropped.
+    /// Unsent bytes, PTY input and replies, that close dropped.
     dropped_bytes: usize,
+    /// Report lines the pool dropped over the terminal's life (see
+    /// `Sink.report`). Always zero from `Terminal.close`, whose owner frames
+    /// report lines itself.
+    dropped_report_lines: usize,
 };
 
 pub const Terminal = struct {
@@ -82,8 +93,8 @@ pub const Terminal = struct {
     /// The owner's end of the child's report channel.
     report: fd_t,
     pid: std.c.pid_t,
-    /// A reply was cut short, so no more are sent.
-    reply_broken: bool = false,
+    /// Unsent bytes that `hangUp` dropped, for the close report.
+    dropped: usize = 0,
 
     /// Starts `options.argv` on a new PTY. On success the child is running
     /// and the caller must eventually call `close`.
@@ -121,10 +132,16 @@ pub const Terminal = struct {
         if (pid == 0) execChild(pty, report.child, launch.write, program, argv, envp, cwd);
         fd_ops.close(launch.write);
 
-        if (readLaunchFailure(launch.read)) |failure| {
+        awaitLaunch(launch.read, launch_timeout_ms) catch |err| {
+            if (err == error.LaunchTimedOut) {
+                // The child may be anywhere from before its setsid to
+                // running the program, so both it and its group are killed.
+                _ = std.c.kill(-pid, std.c.SIG.KILL);
+                _ = std.c.kill(pid, std.c.SIG.KILL);
+            }
             waitBlocking(pid);
-            return failure;
-        }
+            return err;
+        };
         return .{ .gpa = gpa, .core = .{}, .master = pty.master, .report = report.parent, .pid = pid };
     }
 
@@ -152,7 +169,8 @@ pub const Terminal = struct {
     }
 
     /// The owner's end of the child's report channel, for the owner's
-    /// poll(2).
+    /// poll(2). Readable when `readReport` has lines; writable when
+    /// `flushReplies` can make progress.
     pub fn reportFd(self: Terminal) fd_t {
         return self.report;
     }
@@ -177,37 +195,55 @@ pub const Terminal = struct {
         }
     }
 
-    pub const ReplyError = error{ Closed, InvalidLine, Busy, Ended, Broken };
+    pub const ReplyError = error{ Closed, InvalidLine, Busy, Ended, OutOfMemory };
 
-    /// Sends `line` and a newline to the child on its report channel without
-    /// blocking. `line` holds no newline and at most `max_reply_line` bytes.
-    /// `Busy` means nothing was sent because the child has not read earlier
-    /// replies. A reply cut short leaves the channel `Broken`, and no more
-    /// replies are sent, so the child never sees two lines run together.
+    /// Queues `line` and a newline after any unsent replies, then sends as
+    /// much as the report channel takes now; `flushReplies` sends the rest
+    /// once `reportFd` is writable. So the child reads every accepted reply
+    /// whole and in order. `line` holds no newline and at most
+    /// `max_reply_line` bytes. `Busy` means nothing was queued because the
+    /// child has not read enough of the earlier replies. `Ended` means the
+    /// child's end is closed; the unsent replies, this one included, are
+    /// dropped.
     pub fn reply(self: *Terminal, line: []const u8) ReplyError!void {
         try self.core.checkOpen();
-        if (self.reply_broken) return error.Broken;
         if (line.len > max_reply_line or std.mem.findScalar(u8, line, '\n') != null) return error.InvalidLine;
-        var buf: [max_reply_line + 1]u8 = undefined;
-        @memcpy(buf[0..line.len], line);
-        buf[line.len] = '\n';
-        const framed = buf[0 .. line.len + 1];
-        var sent: usize = 0;
-        while (sent < framed.len) {
-            const rc = fd_ops.send(self.report, framed[sent..]);
-            if (rc >= 0) {
-                sent += @intCast(rc);
+        self.core.queueReply(self.gpa, line) catch |err| return switch (err) {
+            error.QueueFull => error.Busy,
+            else => |e| e,
+        };
+        try self.flushReplies();
+    }
+
+    /// Sends unsent replies until the report channel would block. `Ended`
+    /// means the child's end is closed, and the unsent replies are dropped.
+    pub fn flushReplies(self: *Terminal) error{ Closed, Ended }!void {
+        try self.core.checkOpen();
+        while (true) {
+            const bytes = self.core.pendingReply();
+            if (bytes.len == 0) return;
+            const rc = fd_ops.send(self.report, bytes);
+            if (rc > 0) {
+                self.core.flushedReply(@intCast(rc));
                 continue;
             }
+            if (rc == 0) return;
             switch (std.c.errno(rc)) {
                 .INTR => continue,
-                .AGAIN => if (sent == 0) return error.Busy,
-                .PIPE, .CONNRESET => return error.Ended,
-                else => {},
+                .PIPE, .CONNRESET => {
+                    self.core.dropReplies(self.gpa);
+                    return error.Ended;
+                },
+                // The child has not read enough yet, or the kernel is short
+                // of buffers. The rest waits for the next call.
+                else => return,
             }
-            self.reply_broken = true;
-            return error.Broken;
         }
+    }
+
+    /// Reply bytes queued but not yet sent.
+    pub fn pendingReplyBytes(self: Terminal) usize {
+        return self.core.pendingReply().len;
     }
 
     /// Queues `bytes` after any unsent bytes, then writes as much as the
@@ -268,12 +304,25 @@ pub const Terminal = struct {
     /// later calls return `error.Closed`. `error.WaitFailed` means something
     /// else in the process reaped the child; the fd and queue are freed.
     pub fn close(self: *Terminal) error{ Closed, WaitFailed }!CloseReport {
-        const dropped = try self.core.closeStart(self.gpa);
+        return self.closeWithin(close_grace_ms);
+    }
+
+    /// Hangs up the child without waiting for it: drops the unsent bytes and
+    /// closes the PTY and the report channel. `close` or `closeWithin`
+    /// finishes. Lets an owner hang up many children before waiting on any.
+    pub fn hangUp(self: *Terminal) error{Closed}!void {
+        self.dropped = try self.core.closeStart(self.gpa);
         fd_ops.close(self.master);
         fd_ops.close(self.report);
+    }
+
+    /// `close` with `grace_ms` for the child to exit, which may follow
+    /// `hangUp`.
+    pub fn closeWithin(self: *Terminal, grace_ms: u32) error{ Closed, WaitFailed }!CloseReport {
+        if (self.core.phase != .closing) try self.hangUp();
 
         var waited: u32 = 0;
-        while (self.core.exit == null and waited < close_grace_ms) : (waited += close_poll_ms) {
+        while (self.core.exit == null and waited < grace_ms) : (waited += close_poll_ms) {
             if (try self.wait(std.c.W.NOHANG) != null) break;
             sleepMs(close_poll_ms);
         }
@@ -288,7 +337,7 @@ pub const Terminal = struct {
         const exit = self.core.exit.?;
         self.core.deinit(self.gpa);
         self.core = .{ .phase = .closed, .exit = exit };
-        return .{ .exit = exit, .dropped_bytes = dropped };
+        return .{ .exit = exit, .dropped_bytes = self.dropped, .dropped_report_lines = 0 };
     }
 
     /// One waitpid with `flags`. Returns null when the child is still
@@ -364,7 +413,7 @@ const Pty = struct { master: fd_t, slave: fd_t };
 extern "c" fn posix_openpt(flags: c_int) c_int;
 extern "c" fn grantpt(fd: c_int) c_int;
 extern "c" fn unlockpt(fd: c_int) c_int;
-extern "c" fn ptsname(fd: c_int) ?[*:0]u8;
+extern "c" fn ptsname_r(fd: c_int, buf: [*]u8, len: usize) c_int;
 
 // std has no macOS values for these two requests; they come from macOS's
 // <sys/ttycom.h>. The window-size request does not fit in a signed 32-bit
@@ -386,7 +435,12 @@ fn openPty(cols: u16, rows: u16) error{PtyUnavailable}!Pty {
     if (master < 0) return error.PtyUnavailable;
     errdefer fd_ops.close(master);
     if (grantpt(master) != 0 or unlockpt(master) != 0) return error.PtyUnavailable;
-    const slave_name = ptsname(master) orelse return error.PtyUnavailable;
+    // ptsname(3) returns one buffer shared by the whole process, and
+    // terminals open on any thread.
+    var name_buf: [128]u8 = undefined;
+    if (ptsname_r(master, &name_buf, name_buf.len) != 0) return error.PtyUnavailable;
+    // On success the name ends with a NUL inside the buffer.
+    const slave_name: [*:0]const u8 = @ptrCast(&name_buf);
     const slave = std.posix.openatZ(std.posix.AT.FDCWD, slave_name, .{
         .ACCMODE = .RDWR,
         .NOCTTY = true,
@@ -460,12 +514,21 @@ fn failLaunch(launch: fd_t, stage: LaunchStage) noreturn {
     std.c._exit(127);
 }
 
-/// Reads the child's launch failure. Null means exec succeeded.
-fn readLaunchFailure(launch: fd_t) ?OpenError {
+/// Waits for the child's verdict on the launch pipe: returns when exec
+/// succeeded, the child's failure otherwise. Each wait for the pipe lasts at
+/// most `timeout_ms`.
+fn awaitLaunch(launch: fd_t, timeout_ms: u32) OpenError!void {
     var message: [2]i32 = undefined;
     const bytes = std.mem.asBytes(&message);
     var got: usize = 0;
     while (got < bytes.len) {
+        var fds = [_]std.c.pollfd{.{ .fd = launch, .events = std.c.POLL.IN, .revents = 0 }};
+        const ready = std.c.poll(&fds, 1, @intCast(timeout_ms));
+        if (ready == 0) return error.LaunchTimedOut;
+        if (ready < 0) {
+            if (std.c.errno(ready) == .INTR) continue;
+            break;
+        }
         const rc = std.c.read(launch, bytes[got..].ptr, bytes.len - got);
         if (rc > 0) {
             got += @intCast(rc);
@@ -474,7 +537,7 @@ fn readLaunchFailure(launch: fd_t) ?OpenError {
         if (rc < 0 and std.c.errno(rc) == .INTR) continue;
         break;
     }
-    if (got == 0) return null;
+    if (got == 0) return;
     if (got < bytes.len) return error.ExecFailed;
     const errno_value: std.c.E = @enumFromInt(message[1]);
     return switch (std.enums.fromInt(LaunchStage, message[0]) orelse return error.ExecFailed) {
@@ -488,7 +551,7 @@ fn readLaunchFailure(launch: fd_t) ?OpenError {
     };
 }
 
-/// Reaps a child that failed before exec.
+/// Reaps a child whose launch failed.
 fn waitBlocking(pid: std.c.pid_t) void {
     var status: c_int = 0;
     while (std.c.waitpid(pid, &status, 0) < 0 and std.c.errno(@as(c_int, -1)) == .INTR) {}
@@ -619,6 +682,38 @@ test "the owner's replies reach the child on its report channel" {
     try testing.expectError(error.InvalidLine, terminal.reply(&long));
 }
 
+/// Shrinks the send buffer of the owner's end of a report channel, so a
+/// long reply cannot leave in one send.
+fn shrinkSendBuffer(report: fd_t) !void {
+    const size: c_int = 4096;
+    try testing.expectEqual(@as(c_int, 0), std.c.setsockopt(report, std.c.SOL.SOCKET, std.c.SO.SNDBUF, &size, @sizeOf(c_int)));
+}
+
+test "a reply larger than the socket buffer reaches the child whole" {
+    // The child reads its replies only after the test says go.
+    var terminal = try openShell("read -r go; r=${SUB_ENGINE_REPORT%%:*}; read -r a <&$r; read -r b <&$r; echo \"a=${#a} b=$b\"");
+    defer _ = terminal.close() catch {};
+    try shrinkSendBuffer(terminal.reportFd());
+    const long = [_]u8{'x'} ** max_reply_line;
+    try terminal.reply(&long);
+    try testing.expect(terminal.pendingReplyBytes() > 0);
+    // Queued behind the unsent rest of the long reply.
+    try terminal.reply("after");
+    try terminal.write("go\n");
+
+    var waited: u32 = 0;
+    while (terminal.pendingReplyBytes() > 0) : (waited += 20) {
+        if (waited >= 5000) return error.Timeout;
+        var fds = [_]std.c.pollfd{.{ .fd = terminal.reportFd(), .events = std.c.POLL.OUT, .revents = 0 }};
+        _ = std.c.poll(&fds, 1, 20);
+        try terminal.flushReplies();
+    }
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try readUntil(&terminal, &out, std.fmt.comptimePrint("a={d} b=after", .{max_reply_line}), 5000);
+    try terminal.reply("still open");
+}
+
 test "a reply after the child closed its end fails without SIGPIPE" {
     var terminal = try openShell("eval \"exec ${SUB_ENGINE_REPORT%%:*}>&-\"; echo closed; sleep 5");
     defer _ = terminal.close() catch {};
@@ -719,6 +814,24 @@ test "open reports a missing program or directory" {
         .cols = 80,
         .rows = 24,
     }));
+}
+
+test "the launch verdict is read, and waited for only so long" {
+    const held = try fd_ops.pipe(.{});
+    defer fd_ops.close(held.read);
+    defer fd_ops.close(held.write);
+    // A write end another process inherited keeps the pipe open.
+    try testing.expectError(error.LaunchTimedOut, awaitLaunch(held.read, 50));
+    const message = [2]i32{ @intFromEnum(LaunchStage.exec), @intFromEnum(std.c.E.NOENT) };
+    const bytes = std.mem.asBytes(&message);
+    try testing.expectEqual(@as(isize, bytes.len), std.c.write(held.write, bytes.ptr, bytes.len));
+    try testing.expectError(error.ProgramNotFound, awaitLaunch(held.read, 50));
+
+    // Exec closed the last write end.
+    const done = try fd_ops.pipe(.{});
+    defer fd_ops.close(done.read);
+    fd_ops.close(done.write);
+    try awaitLaunch(done.read, 50);
 }
 
 test "close hangs up the child" {

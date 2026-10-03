@@ -643,6 +643,9 @@ const App = struct {
             else
                 shell_process_provider.provider,
         };
+        // Claims an inherited report channel before anything starts other
+        // programs, which must not inherit it.
+        app.parent_report.initFromEnv();
         auth_runtime.Runtime.initIntoWithMode(
             &app.auth,
             app_api_key_validator,
@@ -710,7 +713,7 @@ const App = struct {
             if (child_agents_runtime.enabled(launch.modifiers.subagents_v2)) {
                 const program = try self_exe.pathForPeerReexec(alloc);
                 defer alloc.free(program);
-                app.child_agents = try child_agents_runtime.Runtime.init(alloc, io_mod.getIo(), .{ .program = program });
+                app.child_agents = try child_agents_runtime.Runtime.init(alloc, io_mod.getIo(), .{ .program = program, .prompts_reach_user = true });
             }
         }
         try WorkspaceAppRuntime.applyLaunch(
@@ -902,7 +905,6 @@ const App = struct {
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
         self.parent_report.deinit();
-        self.stopChildAgents();
         self.stopStream();
         self.worker.requestShutdown();
         SessionAppRuntime.requestPersistenceShutdown(self);
@@ -916,6 +918,9 @@ const App = struct {
         // The worker mutates session state, so it stops before persistence.
         if (self.worker_thread) |thread| thread.join();
         shutdown_trace.mark("worker_thread_joined");
+        // A subagent call may still use the children until the worker stops;
+        // the cancel above ends such a call promptly.
+        self.stopChildAgents();
         WorkerAppRuntime.settleFinishedPromptsForShutdown(self) catch |err| {
             SessionAppRuntime.recordShutdownFailure(self, err);
         };
@@ -968,7 +973,6 @@ const App = struct {
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
         self.parent_report.deinit();
-        self.stopChildAgents();
         self.stopStream();
         shutdown_trace.mark("stop_stream");
 
@@ -983,6 +987,9 @@ const App = struct {
         self.releaseTerminal();
         if (self.worker_thread) |thread| thread.join();
         shutdown_trace.mark("worker_thread_joined");
+        // A subagent call may still use the children until the worker stops;
+        // the cancel above ends such a call promptly.
+        self.stopChildAgents();
         WorkerAppRuntime.settleFinishedPromptsForShutdown(self) catch |err| {
             SessionAppRuntime.recordShutdownFailure(self, err);
         };

@@ -17,6 +17,8 @@
 const std = @import("std");
 const sub_engine = @import("sub_engine");
 const core = @import("control_core.zig");
+
+pub const max_name_bytes = core.max_name_bytes;
 const labels_mod = @import("labels.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const types = @import("../shared/types.zig");
@@ -73,6 +75,10 @@ pub const Config = struct {
     /// How long a child may take to take a paste, and then to report the
     /// message.
     delivery_timeout_ms: u32 = 10_000,
+    /// A user answers the children's prompts in this fx, so `wait` keeps
+    /// waiting through a blocked child. Without one, a blocked child counts
+    /// as settled, since nothing would unblock it.
+    prompts_reach_user: bool = false,
 };
 
 /// What a child runs with. Empty values leave the child's own default.
@@ -86,6 +92,10 @@ pub const Settings = struct {
     permission_mode: []const u8 = "",
     /// The folder the child runs in. Null keeps this process's.
     cwd: ?[]const u8 = null,
+    /// This fx's root-user context. The child gets it before each message
+    /// and reviews its own actions against it, since its prompts come from
+    /// this fx's model.
+    root_context: []const u8 = "",
 };
 
 /// What one subagent tool call gets from its host.
@@ -129,8 +139,8 @@ pub const Status = struct {
     exit: ?sub_engine.Exit,
     session_id: ?[]u8,
     turns_ended: u64,
-    messages_total: u64,
-    /// Exited, or reported everything typed into it and idle or blocked.
+    /// Exited, or reported everything typed into it and idle, or blocked
+    /// where no user answers its prompts.
     settled: bool,
     /// Stopped while the call ran.
     stopped: bool = false,
@@ -330,23 +340,31 @@ pub const Runtime = struct {
             sleepMs(poll_ms);
         }
 
+        self.sendContext(id, settings.root_context);
         const delivery = self.deliver(slot, id, task, cancel) catch |err| switch (err) {
             error.NotFound => Delivery.exited,
-            error.Cancelled => return error.Cancelled,
+            error.Cancelled => {
+                // A cancelled launch leaves no child behind. A parallel stop
+                // may have closed it already.
+                if (self.stop(gpa, name)) |stopped| stopped.deinit(gpa) else |_| {}
+                return error.Cancelled;
+            },
             error.OutOfMemory => return error.OutOfMemory,
         };
         self.lockTable();
         defer self.unlockTable();
         // A parallel stop may have closed the child meanwhile.
-        const status = if (self.childAt(slot, id)) |child| try statusOf(gpa, child) else try stoppedStatus(gpa, name);
+        const status = if (self.childAt(slot, id)) |child| try statusOf(self, gpa, child) else try stoppedStatus(gpa, name);
         return .{ .delivery = delivery, .status = status };
     }
 
-    /// Types `message` into the ready child named `name`.
+    /// Types `message` into the ready child named `name`, after
+    /// `root_context` (see `Settings.root_context`).
     pub fn send(
         self: *Runtime,
         name: []const u8,
         message: []const u8,
+        root_context: []const u8,
         cancel: ?*std.atomic.Value(bool),
     ) SendError!Delivery {
         if (!supportedText(message)) return error.UnsupportedText;
@@ -360,6 +378,7 @@ pub const Runtime = struct {
             if (child.labels.state == .blocked) return error.Blocked;
             break :blk .{ slot, child.id.? };
         };
+        self.sendContext(id, root_context);
         return self.deliver(slot, id, message, cancel) catch |err| switch (err) {
             error.NotFound => error.NotFound,
             error.Cancelled => error.Cancelled,
@@ -421,7 +440,7 @@ pub const Runtime = struct {
                         any = true;
                         continue;
                     };
-                    any = any or (child.phase == .ready and child.settled());
+                    any = any or (child.phase == .ready and child.settled(!self.config.prompts_reach_user));
                 }
                 const timed_out = waited >= timeout_ms;
                 if (any or timed_out) {
@@ -432,7 +451,7 @@ pub const Runtime = struct {
                     }
                     for (targets.items) |*target| {
                         const status = if (self.childAt(target.slot, target.id)) |child|
-                            try statusOf(gpa, child)
+                            try statusOf(self, gpa, child)
                         else
                             try stoppedStatus(gpa, target.name());
                         try statuses.append(gpa, status);
@@ -485,7 +504,7 @@ pub const Runtime = struct {
         }
         for (&self.table.slots, 0..) |*slot, index| {
             const child = &(slot.* orelse continue);
-            var status = try statusOf(gpa, child);
+            var status = try statusOf(self, gpa, child);
             if (child.id) |id| status.handle = .{ .slot = index, .id = id };
             statuses.append(gpa, status) catch |err| {
                 status.deinit(gpa);
@@ -560,8 +579,11 @@ pub const Runtime = struct {
         };
         const report = self.pool.?.close(id) catch |err| blk: {
             debug_trace.logf("child_agents", "stop name={s} close failed err={s}", .{ name, @errorName(err) });
-            break :blk sub_engine.CloseReport{ .exit = .{ .signal = 9 }, .dropped_bytes = 0 };
+            break :blk sub_engine.CloseReport{ .exit = .{ .signal = 9 }, .dropped_bytes = 0, .dropped_report_lines = 0 };
         };
+        if (report.dropped_report_lines > 0) {
+            debug_trace.logf("child_agents", "stop name={s} dropped_report_lines={d}", .{ name, report.dropped_report_lines });
+        }
         self.lockTable();
         defer self.unlockTable();
         const child = self.table.get(slot);
@@ -607,10 +629,17 @@ pub const Runtime = struct {
         const paste = try std.mem.concat(self.gpa, u8, &.{ "\x1b[200~", text, "\x1b[201~" });
         defer self.gpa.free(paste);
         self.pool.?.write(id, paste) catch return .exited;
-        switch (try self.waitCount(slot, id, .pastes, pastes, cancel)) {
+        const pasted = self.waitCount(slot, id, .pastes, pastes, cancel) catch |err| {
+            self.clearDraft(id);
+            return err;
+        };
+        switch (pasted) {
             .reached => {},
             .exited => return .exited,
-            .timed_out => return .not_delivered,
+            .timed_out => {
+                self.clearDraft(id);
+                return .not_delivered;
+            },
         }
 
         {
@@ -625,6 +654,13 @@ pub const Runtime = struct {
             .exited => .exited,
             .timed_out => .pending,
         };
+    }
+
+    /// Clears the child's draft with Ctrl+U, after a paste whose delivery
+    /// failed. The child reads input in order, so this also clears a paste
+    /// that lands late, and the next message does not run into it.
+    fn clearDraft(self: *Runtime, id: sub_engine.Id) void {
+        self.pool.?.write(id, "\x15") catch {};
     }
 
     const Counter = enum { pastes, messages };
@@ -844,6 +880,20 @@ pub const Runtime = struct {
     }
 
     /// Sends the user's answer to child prompt `id` and stops showing it.
+    /// Sends `context` to the child with terminal `id` ahead of a message,
+    /// so the message is reviewed against it. A child without it treats its
+    /// prompts as instructions from this fx's model with no user context.
+    fn sendContext(self: *Runtime, id: sub_engine.Id, context: []const u8) void {
+        if (context.len == 0) return;
+        const line = labels_mod.encodeContext(self.gpa, context, sub_engine.max_reply_line) catch |err| {
+            return debug_trace.logf("child_agents", "context not sent err={s}", .{@errorName(err)});
+        };
+        defer self.gpa.free(line);
+        self.pool.?.reply(id, line) catch |err| {
+            debug_trace.logf("child_agents", "context not sent err={s}", .{@errorName(err)});
+        };
+    }
+
     fn answer(self: *Runtime, id: u64, reply: @FieldType(labels_mod.Answer, "reply")) AnswerError!void {
         self.lockTable();
         defer self.unlockTable();
@@ -923,7 +973,7 @@ fn supportedText(text: []const u8) bool {
     return true;
 }
 
-fn statusOf(gpa: Allocator, child: *const core.Child) Allocator.Error!Status {
+fn statusOf(self: *const Runtime, gpa: Allocator, child: *const core.Child) Allocator.Error!Status {
     const name = try gpa.dupe(u8, child.name());
     errdefer gpa.free(name);
     return .{
@@ -933,8 +983,7 @@ fn statusOf(gpa: Allocator, child: *const core.Child) Allocator.Error!Status {
         .exit = child.exit,
         .session_id = if (child.labels.session_id) |id| try gpa.dupe(u8, id) else null,
         .turns_ended = child.labels.turns_ended,
-        .messages_total = child.labels.messages_total,
-        .settled = child.settled(),
+        .settled = child.settled(!self.config.prompts_reach_user),
     };
 }
 
@@ -946,7 +995,6 @@ fn stoppedStatus(gpa: Allocator, name: []const u8) Allocator.Error!Status {
         .exit = null,
         .session_id = null,
         .turns_ended = 0,
-        .messages_total = 0,
         .settled = true,
         .stopped = true,
     };
@@ -1038,6 +1086,89 @@ fn expectStatus(status: Status, state: labels_mod.State, turns: u64) !void {
     try testing.expectEqual(turns, status.turns_ended);
 }
 
+test "a child gets the root-user context before its task and each message" {
+    // The child reads one report-channel line before each turn and says in
+    // its final reply whether it was the context.
+    var fake = try FakeChild.create(
+        \\say '{"event":"state","state":"idle"}'
+        \\for turn_name in task message; do
+        \\  read -r line <&"$r"
+        \\  if [[ $line == *'"kind":"context"'*'run the tests'* ]]; then got="$turn_name with context"; else got=missing; fi
+        \\  turn 4 "$got"
+        \\done
+        \\sleep 30
+    );
+    defer fake.deinit();
+    var runtime = try fake.runtime();
+    defer runtime.deinit();
+    const context = "current_request: run the tests\n";
+
+    const launched = try runtime.launch(testing.allocator, "a1", "task", .{ .root_context = context }, null);
+    defer launched.status.deinit(testing.allocator);
+    const first = try runtime.wait(testing.allocator, &.{"a1"}, 5000, null);
+    defer freeStatuses(testing.allocator, first.children);
+    const final = try runtime.read(testing.allocator, "a1", .final);
+    defer final.deinit(testing.allocator);
+    try testing.expectEqualStrings("task with context", final.final.text.?);
+
+    try testing.expectEqual(Delivery.delivered, try runtime.send("a1", "more", context, null));
+    const second = try runtime.wait(testing.allocator, &.{"a1"}, 5000, null);
+    defer freeStatuses(testing.allocator, second.children);
+    const final2 = try runtime.read(testing.allocator, "a1", .final);
+    defer final2.deinit(testing.allocator);
+    try testing.expectEqualStrings("message with context", final2.final.text.?);
+}
+
+test "a delivery that times out clears the child's draft" {
+    // The child never reports the paste, and says when Ctrl+U arrives.
+    var fake = try FakeChild.create(
+        \\say '{"event":"state","state":"idle"}'
+        \\while IFS= read -r -n1 -d '' c; do
+        \\  if [[ $c == $'\x15' ]]; then printf 'cleared\r\n'; break; fi
+        \\done
+        \\sleep 30
+    );
+    defer fake.deinit();
+    var runtime = try fake.runtime();
+    defer runtime.deinit();
+
+    const launched = try runtime.launch(testing.allocator, "a1", "task", .{}, null);
+    defer launched.status.deinit(testing.allocator);
+    try testing.expectEqual(Delivery.not_delivered, launched.delivery);
+    var waited: u32 = 0;
+    while (true) : (waited += 20) {
+        const shown = try runtime.read(testing.allocator, "a1", .screen);
+        defer shown.deinit(testing.allocator);
+        if (std.mem.find(u8, shown.screen, "cleared") != null) break;
+        if (waited >= 3000) return error.TestExpectedClearedDraft;
+        sleepMs(20);
+    }
+}
+
+test "a launch cancelled during its delivery leaves no child" {
+    var fake = try FakeChild.create(
+        \\say '{"event":"state","state":"idle"}'
+        \\sleep 30
+    );
+    defer fake.deinit();
+    var runtime = try fake.runtime();
+    defer runtime.deinit();
+
+    var cancel = std.atomic.Value(bool).init(false);
+    const Canceller = struct {
+        fn run(flag: *std.atomic.Value(bool)) void {
+            sleepMs(300);
+            flag.store(true, .release);
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Canceller.run, .{&cancel});
+    defer thread.join();
+    try testing.expectError(error.Cancelled, runtime.launch(testing.allocator, "a1", "task", .{}, &cancel));
+    const statuses = try runtime.list(testing.allocator);
+    defer freeStatuses(testing.allocator, statuses);
+    try testing.expectEqual(@as(usize, 0), statuses.len);
+}
+
 test "a child takes its task and later messages, and wait returns once each turn ends" {
     var fake = try FakeChild.create(
         \\say '{"event":"session","id":"sess-1"}'
@@ -1063,7 +1194,7 @@ test "a child takes its task and later messages, and wait returns once each turn
     defer final.deinit(testing.allocator);
     try testing.expectEqualStrings("first done", final.final.text.?);
 
-    try testing.expectEqual(Delivery.delivered, try runtime.send("a1", "more", null));
+    try testing.expectEqual(Delivery.delivered, try runtime.send("a1", "more", "", null));
     const second = try runtime.wait(testing.allocator, &.{}, 5000, null);
     defer freeStatuses(testing.allocator, second.children);
     try expectStatus(second.children[0], .idle, 2);
@@ -1083,7 +1214,7 @@ test "a child takes its task and later messages, and wait returns once each turn
     const statuses = try runtime.list(testing.allocator);
     defer freeStatuses(testing.allocator, statuses);
     try testing.expectEqual(@as(usize, 0), statuses.len);
-    try testing.expectError(error.NotFound, runtime.send("a1", "gone", null));
+    try testing.expectError(error.NotFound, runtime.send("a1", "gone", "", null));
 }
 
 test "a paste the child never takes submits nothing" {
@@ -1130,7 +1261,7 @@ test "a child that exits is settled and refuses messages" {
         if (exit == null) sleepMs(20);
     }
     try testing.expectEqual(sub_engine.Exit{ .code = 3 }, exit.?);
-    try testing.expectError(error.Exited, runtime.send("a1", "hello", null));
+    try testing.expectError(error.Exited, runtime.send("a1", "hello", "", null));
     const stopped = try runtime.stop(testing.allocator, "a1");
     stopped.deinit(testing.allocator);
 }
@@ -1349,7 +1480,7 @@ test "a message to a child waiting on a prompt is refused, not typed" {
     const waited = try runtime.wait(testing.allocator, &.{"a1"}, 5000, null);
     defer freeStatuses(testing.allocator, waited.children);
     try testing.expectEqual(labels_mod.State.blocked, waited.children[0].state);
-    try testing.expectError(error.Blocked, runtime.send("a1", "answer it for me", null));
+    try testing.expectError(error.Blocked, runtime.send("a1", "answer it for me", "", null));
 }
 
 fn echoedKey(runtime: *Runtime) !bool {
