@@ -197,22 +197,19 @@ pub fn Runtime(comptime App: type) type {
             errdefer next.grid.deinit();
             state.noticed = notice;
 
-            // At most about 150 bytes: the name is capped at 64.
-            var status_buf: [256]u8 = undefined;
-            var others_buf: [48]u8 = undefined;
-            const others = switch (notice.others) {
-                0 => "",
-                1 => "1 other child needs you \u{00b7} ",
-                else => std.fmt.bufPrint(&others_buf, "{d} other children need you \u{00b7} ", .{notice.others}) catch unreachable,
-            };
-            const status = std.fmt.bufPrint(&status_buf, " {s} \u{00b7} {s}{s}Ctrl+T returns to main", .{
-                state.name_buf[0..state.name_len],
-                if (notice.main) main_notice ++ " \u{00b7} " else "",
-                others,
-            }) catch unreachable;
+            var status: std.Io.Writer.Allocating = .init(app.alloc);
+            defer status.deinit();
+            try status.writer.print(" {s} \u{00b7} ", .{state.name_buf[0..state.name_len]});
+            if (notice.main) try status.writer.writeAll(main_notice ++ " \u{00b7} ");
+            switch (notice.others) {
+                0 => {},
+                1 => try status.writer.writeAll("1 other child needs you \u{00b7} "),
+                else => try status.writer.print("{d} other children need you \u{00b7} ", .{notice.others}),
+            }
+            try status.writer.writeAll("Ctrl+T returns to main");
             var out: std.Io.Writer.Allocating = .init(app.alloc);
             defer out.deinit();
-            try child_view_screen.paintChild(app.alloc, &out.writer, if (state.painted) |*grid| grid else null, &next.grid, status);
+            try child_view_screen.paintChild(app.alloc, &out.writer, if (state.painted) |*grid| grid else null, &next.grid, status.written());
             try app_lifecycle.writeLifecycleTerminalBytes(&app.shell, &app.metrics, out.written());
             state.forgetPainted();
             state.painted = next.grid;

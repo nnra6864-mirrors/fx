@@ -256,4 +256,47 @@ describe("subagent live view", () => {
     },
     90_000,
   );
+
+  test.skipIf(!tmuxAvailable())(
+    "another child's prompt is counted on the view's status line and shows back on main",
+    async () => {
+      const gateway = startDynamicFakeGateway(async (body) => {
+        const user = lastUserText(body);
+        if (user.includes(CHILD_TASK)) return fakeGatewayFinalText("CHILD_READY");
+        if (user.includes("CHILD_TWO_ASKS")) {
+          if (body.includes('"toolCallId":"c2_ask"')) return fakeGatewayFinalText("C2_DONE");
+          return fakeShellRun("c2_ask", "printf C2_ASKED");
+        }
+        if (body.includes('"toolCallId":"launch_c2"')) return fakeGatewayFinalText("PARENT_DONE");
+        if (body.includes(`"toolCallId":"${LAUNCH_CALL}"`)) {
+          // Late enough that the test is in c1's view first.
+          await Bun.sleep(3000);
+          return fakeGatewayToolCall("launch_c2", "subagent", { action: "launch", name: "c2", task: "CHILD_TWO_ASKS" });
+        }
+        if (user.includes(LAUNCH_PROMPT)) {
+          return fakeGatewayToolCall(LAUNCH_CALL, "subagent", { action: "launch", name: "c1", task: CHILD_TASK });
+        }
+        throw new Error(`unexpected request: ${body.slice(0, 400)}`);
+      });
+      gateways.push(gateway);
+      const { s, stderrPath } = await startMain(gateway, { FX_PERMISSION_MODE: "ask" });
+      await s.sendText(LAUNCH_PROMPT);
+
+      await s.sendKeys("C-t");
+      await s.waitForText(/\u203a c1 +(idle|working|starting)/, TIMEOUT);
+      await s.sendKeys("Enter");
+      await s.waitForText(STATUS_LINE, TIMEOUT);
+
+      // c2's approval cannot show over c1's screen, so the status line
+      // counts it instead.
+      await s.waitForText("c1 \u00b7 1 other child needs you \u00b7 Ctrl+T returns to main", TIMEOUT);
+
+      await s.sendKeys("C-t");
+      await s.waitForText("printf C2_ASKED", TIMEOUT);
+      await s.sendKeys("1");
+      await s.waitForText("PARENT_DONE", TIMEOUT);
+      await quitCleanly(s, stderrPath);
+    },
+    90_000,
+  );
 });
