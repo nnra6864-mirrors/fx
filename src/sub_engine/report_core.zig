@@ -4,7 +4,8 @@
 //! A line ends at a newline, which is not part of it. A line longer than
 //! `limit` is dropped whole, up to and including its newline, and so is a
 //! line that cannot be buffered. When the writer is gone, `end` drops a
-//! partial last line. So the owner only ever sees lines the child finished.
+//! partial last line. So the owner only ever sees lines the child finished,
+//! and `dropped` counts every line it does not see.
 
 const std = @import("std");
 
@@ -26,6 +27,8 @@ pub const Lines = struct {
     buf: std.ArrayList(u8) = .empty,
     /// The line being framed is too long; drop it up to its newline.
     skipping: bool = false,
+    /// Lines dropped so far. Each line counts once.
+    dropped: usize = 0,
 
     pub fn deinit(self: *Lines, gpa: Allocator) void {
         self.buf.deinit(gpa);
@@ -60,8 +63,23 @@ pub const Lines = struct {
         }
     }
 
+    /// Accounts for bytes that followed what was fed but were lost unread.
+    /// They held `newlines` newlines and, when `trailing`, bytes after the
+    /// last one. Every line they touch is dropped.
+    pub fn lose(self: *Lines, newlines: usize, trailing: bool) void {
+        if (newlines > 0) {
+            // The first lost newline ends the line being framed.
+            if (!self.skipping) self.dropped += 1;
+            self.dropped += newlines - 1;
+            self.buf.clearRetainingCapacity();
+            self.skipping = false;
+        }
+        if (trailing and !self.skipping) self.drop();
+    }
+
     /// The writer is gone: drops a partial last line.
     pub fn end(self: *Lines) void {
+        if (self.buf.items.len > 0) self.dropped += 1;
         self.buf.clearRetainingCapacity();
         self.skipping = false;
     }
@@ -69,6 +87,7 @@ pub const Lines = struct {
     fn drop(self: *Lines) void {
         self.buf.clearRetainingCapacity();
         self.skipping = true;
+        self.dropped += 1;
     }
 };
 
@@ -108,6 +127,7 @@ test "lines split across reads arrive whole and in order" {
         lines.feed(testing.allocator, chunk, got.emit());
     }
     try got.expect(&.{ "first", "second", "", "third" });
+    try testing.expectEqual(@as(usize, 0), lines.dropped);
 }
 
 test "a line over the limit is dropped up to its newline" {
@@ -119,6 +139,19 @@ test "a line over the limit is dropped up to its newline" {
         lines.feed(testing.allocator, chunk, got.emit());
     }
     try got.expect(&.{ "four", "ok", "x" });
+    try testing.expectEqual(@as(usize, 2), lines.dropped);
+}
+
+test "a line that cannot be buffered is dropped and counted" {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const gpa = failing.allocator();
+    var lines: Lines = .{};
+    defer lines.deinit(gpa);
+    var got: Collected = .{ .gpa = testing.allocator };
+    defer got.deinit();
+    for ([_][]const u8{ "par", "tial\nok\n" }) |chunk| lines.feed(gpa, chunk, got.emit());
+    try got.expect(&.{"ok"});
+    try testing.expectEqual(@as(usize, 1), lines.dropped);
 }
 
 test "a partial line is dropped when the writer is gone" {
@@ -130,22 +163,42 @@ test "a partial line is dropped when the writer is gone" {
     lines.end();
     try got.expect(&.{"whole"});
     try testing.expectEqual(@as(usize, 0), lines.buf.items.len);
+    try testing.expectEqual(@as(usize, 1), lines.dropped);
+}
+
+test "lost bytes drop each line they touch once" {
+    var lines: Lines = .{ .limit = 4 };
+    defer lines.deinit(testing.allocator);
+    var got: Collected = .{ .gpa = testing.allocator };
+    defer got.deinit();
+    // Lost "x\nc\n\nd": they finish "ab", hold "c" and "", and start "d".
+    lines.feed(testing.allocator, "ok\nab", got.emit());
+    lines.lose(3, true);
+    lines.end();
+    try got.expect(&.{"ok"});
+    try testing.expectEqual(@as(usize, 4), lines.dropped);
+
+    // A line already dropped for its length is not counted again.
+    lines.feed(testing.allocator, "toolong", got.emit());
+    lines.lose(1, false);
+    lines.feed(testing.allocator, "next\n", got.emit());
+    try got.expect(&.{ "ok", "next" });
+    try testing.expectEqual(@as(usize, 5), lines.dropped);
 }
 
 // Random runs drive the core the way a terminal's report channel does: a
 // simulated child writes a script of lines one byte at a time and may exit
 // mid-line, the reader frames reads of 1 to `read_max` bytes, drains the
-// channel and ends the lines when it sees the exit, and the owner may close
-// first. After every step the test checks that every delivered line is a
-// whole, short line the child finished, in order, and that when the exit is
-// reported every such line has been delivered.
-//
-// With SUB_ENGINE_TRACE_DIR set, each run is also written to that folder as
-// JSON lines for checking against a model outside this repository.
+// channel and ends the lines when it sees the exit, possibly losing the end
+// of the drain, and the owner may close first. After every step the test
+// checks that every delivered line is a whole, short line the child
+// finished, in order, that when the exit is reported every such line that
+// was not lost has been delivered, and that every line the reader saw is
+// either delivered or counted as dropped.
 
-/// The longest delivered line and the largest read in a run. The model the
-/// traces are checked against uses the same bounds.
-const trace_limit = 2;
+/// The longest delivered line and the largest read in a run, small so that
+/// long lines and split reads are common.
+const run_limit = 2;
 const read_max = 3;
 
 const Phase = enum { open, exited, closed };
@@ -156,17 +209,20 @@ const Run = struct {
     stream: []const u8,
     sent: usize = 0,
     read: usize = 0,
+    /// Bytes past this were lost unread when the exit was reported.
+    kept: ?usize = null,
     alive: bool = true,
     phase: Phase = .open,
-    lines: Lines = .{ .limit = trace_limit },
+    lines: Lines = .{ .limit = run_limit },
     got: Collected,
 
-    /// The lines the child has finished that are short enough, in order.
+    /// The lines the child has finished that are short enough and were
+    /// not lost, in order.
     fn deliverable(self: Run, out: *std.ArrayList(usize)) !void {
         var end: usize = 0;
         for (self.script) |len| {
             end += len + 1;
-            if (end <= self.sent and len <= trace_limit) try out.append(self.gpa, len);
+            if (end <= (self.kept orelse self.sent) and len <= run_limit) try out.append(self.gpa, len);
         }
     }
 
@@ -182,56 +238,17 @@ const Run = struct {
             try testing.expectEqual(len, line.len);
             if (line.len > 0) for (line) |byte| try testing.expectEqual(line[0], byte);
         }
+        const seen = startedLines(self.stream[0..self.read]);
+        try testing.expect(got.len + self.lines.dropped <= seen);
+        if (self.phase != .open) try testing.expectEqual(seen, got.len + self.lines.dropped);
     }
 };
 
-const Trace = struct {
-    gpa: Allocator,
-    file: ?std.Io.File,
-    offset: u64 = 0,
-
-    fn create(gpa: Allocator, seed: u64) !Trace {
-        const dir_path = std.c.getenv("SUB_ENGINE_TRACE_DIR") orelse
-            return .{ .gpa = gpa, .file = null };
-        const io = testing.io;
-        var dir = try std.Io.Dir.cwd().openDir(io, std.mem.span(dir_path), .{});
-        defer dir.close(io);
-        var name: [64]u8 = undefined;
-        const file_name = try std.fmt.bufPrint(&name, "Lines--seed-{d}.ndjson", .{seed});
-        return .{ .gpa = gpa, .file = try dir.createFile(io, file_name, .{ .truncate = true }) };
-    }
-
-    fn line(self: *Trace, value: anytype) !void {
-        const file = self.file orelse return;
-        const text = try std.json.Stringify.valueAlloc(self.gpa, value, .{});
-        defer self.gpa.free(text);
-        try file.writePositionalAll(testing.io, text, self.offset);
-        self.offset += text.len;
-        try file.writePositionalAll(testing.io, "\n", self.offset);
-        self.offset += 1;
-    }
-
-    fn step(self: *Trace, event: []const u8, run: *const Run) !void {
-        if (self.file == null) return;
-        var lens: std.ArrayList(usize) = .empty;
-        defer lens.deinit(self.gpa);
-        for (run.got.lines.items) |item| try lens.append(self.gpa, item.len);
-        try self.line(.{
-            .event = event,
-            .sent = run.sent,
-            .alive = run.alive,
-            .pipe_len = run.sent - run.read,
-            .buf_len = run.lines.buf.items.len,
-            .skipping = run.lines.skipping,
-            .delivered = lens.items,
-            .phase = @tagName(run.phase),
-        });
-    }
-
-    fn finish(self: *Trace) void {
-        if (self.file) |file| file.close(testing.io);
-    }
-};
+/// Lines that `bytes` finish or start.
+fn startedLines(bytes: []const u8) usize {
+    const partial: usize = @intFromBool(bytes.len > 0 and bytes[bytes.len - 1] != '\n');
+    return std.mem.count(u8, bytes, "\n") + partial;
+}
 
 fn runRandom(gpa: Allocator, seed: u64) !void {
     var prng = std.Random.DefaultPrng.init(seed);
@@ -242,7 +259,7 @@ fn runRandom(gpa: Allocator, seed: u64) !void {
     var stream: std.ArrayList(u8) = .empty;
     defer stream.deinit(gpa);
     for (script[0..line_count], 0..) |*len, index| {
-        len.* = random.uintAtMost(usize, trace_limit + 1);
+        len.* = random.uintAtMost(usize, run_limit + 1);
         try stream.appendNTimes(gpa, @intCast('a' + index), len.*);
         try stream.append(gpa, '\n');
     }
@@ -255,41 +272,38 @@ fn runRandom(gpa: Allocator, seed: u64) !void {
     };
     defer run.lines.deinit(gpa);
     defer run.got.deinit();
-    var trace = try Trace.create(gpa, seed);
-    defer trace.finish();
-    try trace.line(.{ .event = "Start", .script = run.script });
 
     while (run.phase == .open) {
         switch (random.uintLessThan(u8, 6)) {
             0, 1 => if (run.alive and run.sent < run.stream.len) {
                 run.sent += 1;
-                try trace.step("ChildWrite", &run);
             },
             2 => if (run.alive and random.uintLessThan(u8, 4) == 0) {
                 run.alive = false;
-                try trace.step("ChildExits", &run);
             },
             3, 4 => if (run.read < run.sent) {
                 const n = random.intRangeAtMost(usize, 1, @min(read_max, run.sent - run.read));
                 run.lines.feed(gpa, run.stream[run.read..][0..n], run.got.emit());
                 run.read += n;
-                try trace.step("Feed", &run);
             },
             else => if (!run.alive) {
-                run.lines.feed(gpa, run.stream[run.read..run.sent], run.got.emit());
+                // A drain short of memory loses everything after some byte.
+                const kept = if (random.uintLessThan(u8, 4) == 0) random.intRangeAtMost(usize, run.read, run.sent) else run.sent;
+                run.lines.feed(gpa, run.stream[run.read..kept], run.got.emit());
+                const lost = run.stream[kept..run.sent];
+                run.lines.lose(std.mem.count(u8, lost, "\n"), lost.len > 0 and lost[lost.len - 1] != '\n');
                 run.read = run.sent;
+                run.kept = kept;
                 run.lines.end();
                 run.phase = .exited;
-                try trace.step("ReportExit", &run);
             } else if (random.uintLessThan(u8, 8) == 0) {
+                run.lines.end();
                 run.phase = .closed;
-                try trace.step("Close", &run);
             },
         }
         // A child that wrote everything exits.
         if (run.alive and run.sent == run.stream.len and random.boolean()) {
             run.alive = false;
-            try trace.step("ChildExits", &run);
         }
         try run.check();
     }
