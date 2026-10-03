@@ -754,8 +754,14 @@ fn decideConnectionSetup(snapshot: ConnectionSetupSnapshot) ConnectionSetupDecis
     };
 }
 
+/// `error.Unexpected` is included because std.Io.Threaded retries a connect()
+/// interrupted by a signal, and on macOS that retry can find the connection
+/// already established. Setup retries require definitely unsent delivery, so
+/// retrying this catch-all cannot repeat a request.
 fn isRetryableConnectionSetupError(err: anyerror) bool {
-    return err == error.TlsInitializationFailed or isRetryableGatewayError(err);
+    return err == error.TlsInitializationFailed or
+        err == error.Unexpected or
+        isRetryableGatewayError(err);
 }
 
 /// std.http.Client does not mark a connection closing when the body write or
@@ -1207,6 +1213,28 @@ test "connection setup policy bounds retry by deadline attempts and delivery" {
         .outcome = .{ .request_failed = error.TlsInitializationFailed },
     });
     try expectConnectionSetupActionTag(.fail, possibly_sent.action);
+
+    const interrupted_connect = decideConnectionSetup(.{
+        .attempt = 1,
+        .attempt_limit = 3,
+        .now = testAwakeTimestamp(10),
+        .deadline = testAwakeTimestamp(30_000),
+        .cancelled = false,
+        .delivery = .definitely_unsent,
+        .outcome = .{ .request_failed = error.Unexpected },
+    });
+    try expectConnectionSetupActionTag(.retry, interrupted_connect.action);
+
+    const unexpected_after_send = decideConnectionSetup(.{
+        .attempt = 1,
+        .attempt_limit = 3,
+        .now = testAwakeTimestamp(10),
+        .deadline = testAwakeTimestamp(30_000),
+        .cancelled = false,
+        .delivery = .possibly_sent,
+        .outcome = .{ .request_failed = error.Unexpected },
+    });
+    try expectConnectionSetupActionTag(.fail, unexpected_after_send.action);
 
     const timed_out = decideConnectionSetup(.{
         .attempt = 1,
@@ -7180,6 +7208,7 @@ pub const TestModelCatalogFixture = struct {
 const RequestOpenProbe = struct {
     attempts: usize = 0,
     tls_failure_attempt: ?usize = null,
+    unexpected_failure_attempt: ?usize = null,
     delays_ms: [3]i64 = .{ 0, 0, 0 },
     keep_alive_seen: ?bool = null,
 
@@ -7206,6 +7235,9 @@ const RequestOpenProbe = struct {
         }
         if (self.tls_failure_attempt == attempt_index) {
             return error.TlsInitializationFailed;
+        }
+        if (self.unexpected_failure_attempt == attempt_index) {
+            return error.Unexpected;
         }
         return client.request(method, uri, options);
     }
@@ -7369,6 +7401,42 @@ test "transport-owned TLS setup retries before send" {
     try harness.start();
 
     var probe = RequestOpenProbe{ .tls_failure_attempt = 0 };
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var callback_ctx: u8 = 0;
+    var result = try streamGatewayCompletionCoreWithOptions(
+        std.testing.allocator,
+        .{
+            .api_key = "test-key",
+            .model = "test/model",
+            .retry_count = 2,
+            .chat_url = harness.url,
+            .payload = "{}",
+        },
+        @ptrCast(&callback_ctx),
+        discardConnectionSetupTestChunk,
+        null,
+        &cancel_flag,
+        null,
+        false,
+        .{
+            .setup_timing = .{ .timeout_ms = 1000 },
+            .request_open_override = probe.requestOpenOverride(),
+        },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), probe.attempts);
+    try std.testing.expectEqualStrings("ok", result.completion.content.?);
+    harness.fixture.deinit();
+    if (harness.fixture.failure) |err| return err;
+}
+
+test "connection setup retries an unexpected connect failure before send" {
+    var harness = try ConnectionSetupHarness.init(.success, false);
+    defer harness.deinit();
+    try harness.start();
+
+    var probe = RequestOpenProbe{ .unexpected_failure_attempt = 0 };
     var cancel_flag = std.atomic.Value(bool).init(false);
     var callback_ctx: u8 = 0;
     var result = try streamGatewayCompletionCoreWithOptions(
