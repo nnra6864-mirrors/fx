@@ -29,7 +29,7 @@ pub const max_reply_line = core_mod.max_reply_line;
 
 /// How long `close` waits for the child to exit after the hangup before it
 /// kills the child's process group.
-const close_grace_ms: u32 = 1000;
+pub const close_grace_ms: u32 = 1000;
 const close_poll_ms: u32 = 10;
 /// How long `open` waits for the child to report its exec. Exec closes the
 /// launch pipe within milliseconds; the bound matters when another process
@@ -93,6 +93,8 @@ pub const Terminal = struct {
     /// The owner's end of the child's report channel.
     report: fd_t,
     pid: std.c.pid_t,
+    /// Unsent bytes that `hangUp` dropped, for the close report.
+    dropped: usize = 0,
 
     /// Starts `options.argv` on a new PTY. On success the child is running
     /// and the caller must eventually call `close`.
@@ -302,12 +304,25 @@ pub const Terminal = struct {
     /// later calls return `error.Closed`. `error.WaitFailed` means something
     /// else in the process reaped the child; the fd and queue are freed.
     pub fn close(self: *Terminal) error{ Closed, WaitFailed }!CloseReport {
-        const dropped = try self.core.closeStart(self.gpa);
+        return self.closeWithin(close_grace_ms);
+    }
+
+    /// Hangs up the child without waiting for it: drops the unsent bytes and
+    /// closes the PTY and the report channel. `close` or `closeWithin`
+    /// finishes. Lets an owner hang up many children before waiting on any.
+    pub fn hangUp(self: *Terminal) error{Closed}!void {
+        self.dropped = try self.core.closeStart(self.gpa);
         fd_ops.close(self.master);
         fd_ops.close(self.report);
+    }
+
+    /// `close` with `grace_ms` for the child to exit, which may follow
+    /// `hangUp`.
+    pub fn closeWithin(self: *Terminal, grace_ms: u32) error{ Closed, WaitFailed }!CloseReport {
+        if (self.core.phase != .closing) try self.hangUp();
 
         var waited: u32 = 0;
-        while (self.core.exit == null and waited < close_grace_ms) : (waited += close_poll_ms) {
+        while (self.core.exit == null and waited < grace_ms) : (waited += close_poll_ms) {
             if (try self.wait(std.c.W.NOHANG) != null) break;
             sleepMs(close_poll_ms);
         }
@@ -322,7 +337,7 @@ pub const Terminal = struct {
         const exit = self.core.exit.?;
         self.core.deinit(self.gpa);
         self.core = .{ .phase = .closed, .exit = exit };
-        return .{ .exit = exit, .dropped_bytes = dropped, .dropped_report_lines = 0 };
+        return .{ .exit = exit, .dropped_bytes = self.dropped, .dropped_report_lines = 0 };
     }
 
     /// One waitpid with `flags`. Returns null when the child is still
