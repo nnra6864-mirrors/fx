@@ -715,7 +715,7 @@ pub fn Runtime(comptime App: type) type {
             }
             var pending = (children.presentQuestions(app.alloc) catch return) orelse return;
             defer pending.deinit();
-            app.question_prompt.syncFrom(app.alloc, pending.entries) catch |err| {
+            app.question_prompt.syncFromChild(app.alloc, pending.entries, pending.child_name) catch |err| {
                 children.dropPresentedQuestions();
                 debug_trace.logf("child_agents", "child questions not shown err={s}", .{@errorName(err)});
                 return;
