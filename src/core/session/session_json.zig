@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const image_data = @import("../images/image_data.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
@@ -1310,7 +1311,7 @@ fn parseOptionalStringArray(alloc: Allocator, maybe_value: ?std.json.Value) ![][
 }
 
 test "validateImagesArray frees path when media_type allocation fails" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"images\":[{\"path\":\"/tmp/a.png\",\"media_type\":\"image/png\"}]}", .{});
     defer parsed.deinit();
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 2 });
@@ -1479,7 +1480,7 @@ fn checkV3SteeringAllocationFailures(alloc: Allocator) !void {
 
 test "session JSON steering cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkV3SteeringAllocationFailures,
         .{},
     );
@@ -1540,7 +1541,7 @@ test "legacy execution memory frees parsed tool steps when files are malformed" 
 
 test "legacy execution memory cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkLegacyExecutionMemoryAllocationFailures,
         .{},
     );
@@ -1653,7 +1654,7 @@ test "non-object legacy interrupted repair cleans every allocation failure" {
         \\{"id":"pending","name":"read_file","arguments_json":"[]","provider_result":null}
     , .{});
     defer parsed.deinit();
-    try std.testing.checkAllAllocationFailures(alloc, checkNonObjectLegacyInterruptedAllocationFailures, .{parsed.value});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkNonObjectLegacyInterruptedAllocationFailures, .{parsed.value});
 }
 
 test "legacy cancellation provenance reads old sessions and roundtrips optional origin" {
@@ -1682,9 +1683,9 @@ test "legacy cancellation provenance reads old sessions and roundtrips optional 
             try std.testing.expectEqualStrings("partial", reloaded.history[0].interrupted.assistant.?);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{ "", types.CancellationOrigin.turn });
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{ ",\"cancellation_origin\":\"turn\"", types.CancellationOrigin.turn });
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{ ",\"cancellation_origin\":\"compaction\"", types.CancellationOrigin.compaction });
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Case.run, .{ "", types.CancellationOrigin.turn });
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Case.run, .{ ",\"cancellation_origin\":\"turn\"", types.CancellationOrigin.turn });
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Case.run, .{ ",\"cancellation_origin\":\"compaction\"", types.CancellationOrigin.compaction });
 }
 
 test "legacy cancellation provenance rejects invalid values after owned fields" {
@@ -1845,7 +1846,7 @@ test "legacy session JSON rejects ambiguous malformed tool result pairings" {
 
 test "legacy duplicate-key repair preserves allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkLegacyToolArgumentRepairAllocationFailures,
         .{},
     );
@@ -2047,7 +2048,7 @@ test "session JSON image source refs round trip and reject malformed metadata" {
     } }};
     const bytes = try renderSessionJson(alloc, "refs", 1, 2, .literal("en"), "/workspace", &history, .{});
     defer alloc.free(bytes);
-    try std.testing.checkAllAllocationFailures(alloc, struct {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
         fn check(a: Allocator, encoded: []const u8) !void {
             var loaded = try parseLegacyExact(TestStoredSession, a, encoded);
             defer loaded.deinit(a);
@@ -2117,7 +2118,7 @@ test "legacy exact and summary readers preserve resource exhaustion" {
         "\"workspace_root\":\"/tmp/workspace\",\"conversation_language\":\"en\",\"history_len\":0,\"history\":[]}";
 
     var exact_failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     try std.testing.expectError(
@@ -2127,7 +2128,7 @@ test "legacy exact and summary readers preserve resource exhaustion" {
 
     var source = std.Io.Reader.fixed(json);
     var summary_failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     try std.testing.expectError(

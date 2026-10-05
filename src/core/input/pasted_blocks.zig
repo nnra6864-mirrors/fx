@@ -1,5 +1,6 @@
 const std = @import("std");
 const entity_spans = @import("../shared/entity_spans.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const Allocator = std.mem.Allocator;
 
 /// Pasted text stays visible inline until it exceeds the threshold; oversized
@@ -272,10 +273,10 @@ test "formatPlaceholder singular and plural" {
 
 test "shouldUsePlaceholder matches large paste threshold" {
     try std.testing.expect(!shouldUsePlaceholder("hello"));
-    try std.testing.expect(!shouldUsePlaceholder("x" ** large_paste_char_threshold));
-    try std.testing.expect(shouldUsePlaceholder("x" ** (large_paste_char_threshold + 1)));
-    try std.testing.expect(!shouldUsePlaceholder("\xc3\xa9" ** large_paste_char_threshold));
-    try std.testing.expect(shouldUsePlaceholder("\xc3\xa9" ** (large_paste_char_threshold + 1)));
+    try std.testing.expect(!shouldUsePlaceholder(text_utils.repeat("x", large_paste_char_threshold)));
+    try std.testing.expect(shouldUsePlaceholder(text_utils.repeat("x", large_paste_char_threshold + 1)));
+    try std.testing.expect(!shouldUsePlaceholder(text_utils.repeat("\xc3\xa9", large_paste_char_threshold)));
+    try std.testing.expect(shouldUsePlaceholder(text_utils.repeat("\xc3\xa9", large_paste_char_threshold + 1)));
 }
 
 test "expand substitutes placeholder for real text" {

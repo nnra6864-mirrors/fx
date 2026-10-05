@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const managed_execution = @import("../core/execution/managed_execution.zig");
 const acp_runner = @import("../core/cli/acp_runner.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
@@ -3545,7 +3546,7 @@ test "ACP legacy URL publication owns partial allocations" {
             try std.testing.expect(reserved);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Case.run, .{});
 }
 
 test "ACP legacy URL state requires consent and completion" {
@@ -3734,7 +3735,7 @@ fn acpModelTestState(
 }
 
 test "ACP ultrafast writes preserve v2 baselines across other preference changes" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
@@ -3943,7 +3944,7 @@ test "ACP rejects refreshed Codex tokens for another account" {
 }
 
 test "ACP usage flush preserves snapshot ownership on allocation failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var runtime: session_runtime.SessionRuntime = .{ .max_history_turns = 8 };
     var runtime_owned = true;
     defer if (runtime_owned) runtime.deinit(alloc);

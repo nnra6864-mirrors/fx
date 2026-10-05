@@ -3,6 +3,7 @@ const stream_provider = @import("../agent/stream_provider.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
 const tool_set = @import("tool_set.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -312,7 +313,7 @@ test "host tool runtime rejects unknown provider tools" {
 
 test "host tool runtime preserves long MCP descriptions" {
     const alloc = std.testing.allocator;
-    const description = "Tool parameter guidance. " ** 100;
+    const description = text_utils.repeat("Tool parameter guidance. ", 100);
     const parsed = try std.json.parseFromSlice(
         std.json.Value,
         alloc,

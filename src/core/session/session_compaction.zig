@@ -41,6 +41,7 @@ const result_store = @import("result_store.zig");
 const session_event = @import("session_event.zig");
 const session_replay = @import("session_replay.zig");
 const types = @import("../shared/types.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -850,7 +851,7 @@ fn lineAt(text: []const u8, target: usize) ?[]const u8 {
 fn fixtureFatContent() []const u8 {
     // ~136 KB per copy: two copies push the fixture log past the 256 KB
     // log-size gate so tests exercise the real (unforced) entry condition.
-    return "FIXTURE_DIFF_LINE_0123456789abcdef\n" ** 4000;
+    return text_utils.repeat("FIXTURE_DIFF_LINE_0123456789abcdef\n", 4000);
 }
 
 test "compaction spills inline snapshots and preserves every frame" {
@@ -934,7 +935,7 @@ test "compaction migrates small logs that can hold spillable payloads" {
     var dir = try openTestDir(&tmp);
     defer dir.close();
 
-    const small_spill = "SMALL_LEGACY_INLINE_PAYLOAD_0123456789abcdef\n" ** 128;
+    const small_spill = text_utils.repeat("SMALL_LEGACY_INLINE_PAYLOAD_0123456789abcdef\n", 128);
     try writeFatSessionLog(alloc, &dir, small_spill);
     const before = try readLogText(alloc, &dir);
     defer alloc.free(before);

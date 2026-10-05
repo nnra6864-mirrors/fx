@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const contracts = @import("contracts.zig");
 const terminal_engine = @import("engine.zig");
@@ -319,7 +320,7 @@ pub fn runControlMarker(raw_args: []const [*:0]const u8) !void {
 
     var bytes: [marker_frame_len]u8 = @splat(0);
     @memcpy(bytes[0..control_nonce_len], nonce);
-    bytes[control_nonce_len] = @intFromEnum(kind);
+    bytes[control_nonce_len] = @backingInt(kind);
     const address = try std.Io.net.UnixAddress.init(control_path);
     var stream = try address.connect(io_mod.getIo());
     defer stream.close(io_mod.getIo());
@@ -445,7 +446,7 @@ pub fn runLauncher(alloc: Allocator) !void {
         try writeControlFd(
             std.posix.STDERR_FILENO,
             .startup_failed,
-            @intFromEnum(StartupFailure.shell_unavailable),
+            @backingInt(StartupFailure.shell_unavailable),
         );
         return;
     };
@@ -500,7 +501,7 @@ pub fn runLauncher(alloc: Allocator) !void {
         try writeControlFd(
             std.posix.STDERR_FILENO,
             .startup_failed,
-            @intFromEnum(StartupFailure.control_failed),
+            @backingInt(StartupFailure.control_failed),
         );
         return;
     }
@@ -510,7 +511,7 @@ pub fn runLauncher(alloc: Allocator) !void {
         try writeControlFd(
             std.posix.STDERR_FILENO,
             .startup_failed,
-            @intFromEnum(StartupFailure.profile_failed),
+            @backingInt(StartupFailure.profile_failed),
         );
         return;
     }
@@ -523,7 +524,7 @@ pub fn runLauncher(alloc: Allocator) !void {
         .signal => |signal| try writeControlFd(
             std.posix.STDERR_FILENO,
             .command_signal,
-            @intFromEnum(signal),
+            @backingInt(signal),
         ),
         .stopped, .unknown => try writeControlFd(
             std.posix.STDERR_FILENO,
@@ -559,15 +560,15 @@ test "launcher wait status classifies terminal results before stops" {
     );
     try std.testing.expectEqual(
         std.process.Child.Term{ .signal = .TERM },
-        launcherStatusToTerm(@intFromEnum(std.c.SIG.TERM)),
+        launcherStatusToTerm(@backingInt(std.c.SIG.TERM)),
     );
     try std.testing.expectEqual(
         std.process.Child.Term{ .signal = .SEGV },
-        launcherStatusToTerm(@intFromEnum(std.c.SIG.SEGV) | 0x80),
+        launcherStatusToTerm(@backingInt(std.c.SIG.SEGV) | 0x80),
     );
     try std.testing.expectEqual(
         std.process.Child.Term{ .stopped = .TTIN },
-        launcherStatusToTerm((@as(u32, @intFromEnum(std.c.SIG.TTIN)) << 8) | 0x7f),
+        launcherStatusToTerm((@as(u32, @backingInt(std.c.SIG.TTIN)) << 8) | 0x7f),
     );
 }
 
@@ -2536,7 +2537,7 @@ const Session = struct {
         }
         const persisted: terminal_store.PersistedTermination = switch (term) {
             .exited => |code| .{ .exited = code },
-            .signal => |signal| .{ .signal = @intFromEnum(signal) },
+            .signal => |signal| .{ .signal = @backingInt(signal) },
             .stopped, .unknown => {
                 self.persistLostLocked(io_mod.milliTimestamp());
                 self.mutex.unlock(zio);
@@ -3326,7 +3327,7 @@ fn terminalSignalCompleted(
 fn processGroupMissing(pid: std.posix.pid_t) bool {
     while (true) switch (std.c.errno(std.c.kill(
         -pid,
-        @enumFromInt(0),
+        @fromBackingInt(@intCast(0)),
     ))) {
         .SUCCESS, .PERM => return false,
         .INTR => continue,
@@ -3589,7 +3590,7 @@ const ControlFrame = struct {
 
 fn writeControlFd(fd: std.posix.fd_t, kind: ControlKind, value: u32) !void {
     var bytes: [control_frame_len]u8 = undefined;
-    bytes[0] = @intFromEnum(kind);
+    bytes[0] = @backingInt(kind);
     std.mem.writeInt(u32, bytes[1..5], value, .little);
     try writeAllFd(fd, &bytes, false);
 }
@@ -3814,7 +3815,7 @@ fn signalTestBarrier(name: []const u8) void {
 fn outcomeFromTerm(term: std.process.Child.Term) ?contracts.ReturnOutcome {
     return switch (term) {
         .exited => |code| .{ .exited = code },
-        .signal => |signal| .{ .signal = @intFromEnum(signal) },
+        .signal => |signal| .{ .signal = @backingInt(signal) },
         .stopped, .unknown => null,
     };
 }
@@ -3859,7 +3860,7 @@ fn signalValue(signal: contracts.Signal) std.c.SIG {
 
 fn signalFromInt(value: u32) ?std.posix.SIG {
     if (value == 0 or value > 255) return null;
-    return @enumFromInt(value);
+    return @fromBackingInt(@intCast(value));
 }
 
 fn projectedFacts(
@@ -3970,14 +3971,14 @@ test "terminal outcomes preserve exact exit and signal status" {
         outcomeFromTerm(.{ .exited = 23 }).?,
     );
     try std.testing.expectEqual(
-        contracts.ReturnOutcome{ .signal = @intFromEnum(std.posix.SIG.TERM) },
+        contracts.ReturnOutcome{ .signal = @backingInt(std.posix.SIG.TERM) },
         outcomeFromTerm(.{ .signal = .TERM }).?,
     );
     try std.testing.expect(outcomeFromTerm(.{ .unknown = 1 }) == null);
     try std.testing.expect(outcomeFromTerm(.{ .stopped = .STOP }) == null);
     try std.testing.expectEqual(
         std.posix.SIG.SEGV,
-        signalFromInt(@intFromEnum(std.posix.SIG.SEGV)).?,
+        signalFromInt(@backingInt(std.posix.SIG.SEGV)).?,
     );
     try std.testing.expect(signalFromInt(0) == null);
     try std.testing.expect(signalFromInt(256) == null);
@@ -4102,7 +4103,7 @@ fn checkSessionInitAllocationFailures(alloc: Allocator) !void {
 
 test "session initialization owns durable resources" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkSessionInitAllocationFailures,
         .{},
     );
@@ -4594,7 +4595,7 @@ test "recovery classifiers preserve allocation and transient failures" {
 }
 
 test "checkpoint load allocation failure preserves durable recovery facts" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var fixture = try TestDurableFixture.init(alloc);
     defer fixture.deinit();
     const id = try alloc.dupe(u8, "terminal-checkpoint-load-oom");
@@ -4648,7 +4649,7 @@ test "checkpoint load allocation failure preserves durable recovery facts" {
 }
 
 test "journal engine feed allocation failure preserves durable recovery facts" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var fixture = try TestDurableFixture.init(alloc);
     defer fixture.deinit();
     const id = try alloc.dupe(u8, "terminal-replay-feed-oom");

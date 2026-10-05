@@ -943,7 +943,17 @@ pub fn Runtime(comptime App: type) type {
                     render_requests.animation_next_deadline_ms,
                 },
             );
-            errdefer |err| {
+            defer attempt.deinit();
+
+            const resize_commit = if (comptime has_resize_lifecycle)
+                shell_runtime.pendingResizeFrameCommit(
+                    &app.shell,
+                    snapshot.reasons.contains(.resize),
+                )
+            else
+                shell_runtime.ResizeFrameCommit.none;
+            const attempted = attemptRequestedFrame(app, snapshot) catch |err| {
+                attempt.restore();
                 if (comptime @hasField(App, "terminal")) {
                     _ = app_lifecycle.closeFullTranscriptIfActive(
                         app.alloc,
@@ -965,17 +975,9 @@ pub fn Runtime(comptime App: type) type {
                         render_requests.animation_next_deadline_ms,
                     },
                 );
-            }
-            defer attempt.deinit();
-
-            const resize_commit = if (comptime has_resize_lifecycle)
-                shell_runtime.pendingResizeFrameCommit(
-                    &app.shell,
-                    snapshot.reasons.contains(.resize),
-                )
-            else
-                shell_runtime.ResizeFrameCommit.none;
-            const result = (try attemptRequestedFrame(app, snapshot)) orelse {
+                return err;
+            };
+            const result = attempted orelse {
                 attempt.restore();
                 render_requests.noteInputPendingAbort();
                 debug_trace.logf(
@@ -2615,7 +2617,7 @@ test "pending prompt at an occupied band bottom preserves the summary through ad
     var history: std.ArrayList(u8) = .empty;
     defer history.deinit(alloc);
     var offset: u64 = 0;
-    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, "previous answer\n" ** 235, .unknown_raw);
+    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, text_utils.repeat("previous answer\n", 235), .unknown_raw);
     const summary = "  10m 31s (↑177 ↓21k)";
     _ = try app.shell.appendRawTranscriptEntryClassified(alloc, summary, .turn_summary);
     app.shell.render_requests.request(.first_frame);
@@ -2633,7 +2635,7 @@ test "pending prompt at an occupied band bottom preserves the summary through ad
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, initial, summary));
 
     const last_line = "- evidence gaps that could still change the design.";
-    const prompt = ("PASTE_BODY\n" ** 383) ++ last_line;
+    const prompt = text_utils.repeat("PASTE_BODY\n", 383) ++ last_line;
     app.submission.pending = .{ .draft = .{
         .turn_id = 1,
         .prompt = try alloc.dupe(u8, prompt),
@@ -2668,7 +2670,7 @@ test "pending prompt at an occupied band bottom preserves the summary through ad
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, adopted, "┃ - evidence gaps"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, adopted, last_line));
     try std.testing.expectEqual(@as(usize, 0), publicationLineCount(adopted, "┃ - evidence gaps tha"));
-    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, "FOLLOWUP\n" ** 80, .unknown_raw);
+    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, text_utils.repeat("FOLLOWUP\n", 80), .unknown_raw);
     _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, history.items, summary));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, history.items, last_line));
@@ -2693,7 +2695,7 @@ test "pending prompt preview preserves blank bottom rows and canonical leading s
         .alloc = alloc,
         .submission = .{ .pending = .{ .draft = .{
             .turn_id = 1,
-            .prompt = try alloc.dupe(u8, "line\n" ** 30),
+            .prompt = try alloc.dupe(u8, text_utils.repeat("line\n", 30)),
             .images = &.{},
             .skill_display_spans = &.{},
         } } },
@@ -3049,11 +3051,11 @@ const CoordinatorFaultTestApp = struct {
     file_picker_receipt: ?input_completion_runtime.FilePickerReceipt = null,
     last_snapshot: ?render_request.AttemptSnapshot = null,
 
-    fn flushNotifications(self: *CoordinatorFaultTestApp) void {
+    pub fn flushNotifications(self: *CoordinatorFaultTestApp) void {
         self.notification_flushes += 1;
     }
 
-    fn renderFrameAttemptForTest(
+    pub fn renderFrameAttemptForTest(
         self: *CoordinatorFaultTestApp,
         snapshot: render_request.AttemptSnapshot,
     ) !FrameAttemptResult {
@@ -4538,9 +4540,9 @@ fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: Publication
     try app.selected_model.appendSlice(alloc, "test-model");
     try app.shell.initBacking(alloc);
     try app.shell.enableShadowVt(alloc);
-    const prefix_id = try app.shell.appendRawTranscriptEntryClassified(alloc, ("\x1b[0m" ** 256) ++ ("prefix padding\n" ** 2), .subagent_status);
+    const prefix_id = try app.shell.appendRawTranscriptEntryClassified(alloc, text_utils.repeat("\x1b[0m", 256) ++ text_utils.repeat("prefix padding\n", 2), .subagent_status);
     const text = "1. earlier context\n2. earlier context\n3. earlier context\n4. earlier context\n5. RW_OLD_00\n6. RW_OLD_01\n7. RW_OLD_02\n8. RW_OLD_03\n9. RW_OLD_04\n10. RW_OLD_05\n\n";
-    const assistant_id = try app.shell.streamAssistantChunk(alloc, &app.metrics, if (retry.utf8) text ++ ("界é" ** 48) ++ "\n\nRW_ARTIFACTS\n" else text ++ "RW_ARTIFACTS\n");
+    const assistant_id = try app.shell.streamAssistantChunk(alloc, &app.metrics, if (retry.utf8) text ++ text_utils.repeat("界é", 48) ++ "\n\nRW_ARTIFACTS\n" else text ++ "RW_ARTIFACTS\n");
     const status_id = if (retry.cancel) blk: {
         const id: types.ToolLifecycleId = .{ .turn_id = 41, .call_id = "publication-cancel" };
         _ = try app.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{ .id = id, .reconciles_provisional_call_id = null, .tool_name = "run_command", .activity_kind = .command } });
@@ -6143,7 +6145,7 @@ test "core.app_render_runtime lifecycle rewrite recovers normal buffer after fil
     try app.shell.writeTranscript(
         alloc,
         &app.metrics,
-        "retained assistant history\n" ** 64,
+        text_utils.repeat("retained assistant history\n", 64),
         true,
     );
     app.shell.render_requests.request(.first_frame);
@@ -6247,7 +6249,7 @@ test "core.app_render_runtime full transcript defers repaint until its page is r
     try app.shell.writeTranscript(
         alloc,
         &app.metrics,
-        ("historical transcript row\n" ** 512) ++ "FULL_ASYNC_SENTINEL\n",
+        text_utils.repeat("historical transcript row\n", 512) ++ "FULL_ASYNC_SENTINEL\n",
         true,
     );
     app.shell.render_requests.request(.first_frame);
@@ -6311,7 +6313,7 @@ test "core.app_render_runtime full transcript resize defers history reset until 
     try app.shell.writeTranscript(
         alloc,
         &app.metrics,
-        "old primary history\n" ** 256,
+        text_utils.repeat("old primary history\n", 256),
         true,
     );
     app.shell.render_requests.request(.first_frame);

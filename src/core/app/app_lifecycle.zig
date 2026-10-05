@@ -2440,10 +2440,10 @@ test "shutdown cleanup erases from footer frame top after frame commit" {
 }
 
 test "startup credential modes select a refresh policy, never a narrower source set" {
-    const modes = std.meta.fields(CredentialLoadMode);
+    const modes = @typeInfo(CredentialLoadMode).@"enum".field_names;
     try std.testing.expectEqual(@as(usize, 2), modes.len);
-    try std.testing.expectEqualStrings("stored", modes[0].name);
-    try std.testing.expectEqualStrings("refresh_if_needed", modes[1].name);
+    try std.testing.expectEqualStrings("stored", modes[0]);
+    try std.testing.expectEqualStrings("refresh_if_needed", modes[1]);
 }
 
 test "loadStartupState applies core env overrides" {

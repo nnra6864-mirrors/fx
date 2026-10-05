@@ -1330,7 +1330,7 @@ fn writeSignalPhrase(writer: *std.Io.Writer, verb: []const u8, signal: anytype) 
     if (@TypeOf(signal) == void) {
         try writer.print("{s} a signal", .{verb});
     } else {
-        try writer.print("{s} signal {d}", .{ verb, @intFromEnum(signal) });
+        try writer.print("{s} signal {d}", .{ verb, @backingInt(signal) });
     }
 }
 
@@ -1576,7 +1576,7 @@ test "server stderr display keeps the first line and the end, bounded and masked
     try std.testing.expect(std.mem.find(u8, cut_display, "ijklmnop") == null);
 
     // An escape sequence cut at the gap cannot swallow the start of a token.
-    const token = "ghp_" ++ "a1b2c3d4e5" ** 4;
+    const token = "ghp_" ++ text_utils.repeat("a1b2c3d4e5", 4);
     var cut_escape = testOmittedCapture("log line \x1b[ ", "xx " ++ token ++ " rejected\n");
     const escape_display = try displayStderr(arena, &cut_escape);
     try std.testing.expect(std.mem.find(u8, escape_display, token[1..]) == null);

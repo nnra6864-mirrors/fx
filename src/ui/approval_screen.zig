@@ -1652,7 +1652,7 @@ test "command approval screen preserves raw command newlines as rows" {
 test "command approval screen includes compact permission header" {
     const alloc = std.testing.allocator;
     var screen_state = interaction_state.ApprovalScreenState{};
-    const label = "shell.run printf '%s' '" ++ ("x" ** 256) ++ "'";
+    const label = "shell.run printf '%s' '" ++ text_utils.repeat("x", 256) ++ "'";
 
     var approval = approval_prompt.ApprovalPrompt{};
     defer approval.deinit(alloc);
@@ -1716,7 +1716,7 @@ test "command approval screen wraps commands at word boundaries" {
 }
 
 test "bounded command approval previews route by complete command fit" {
-    const command = "printf '" ++ ("x" ** 160) ++ "'";
+    const command = "printf '" ++ text_utils.repeat("x", 160) ++ "'";
     const request: permission_request.PermissionRequest = .{
         .label = "shell.run printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...",
         .command = command,

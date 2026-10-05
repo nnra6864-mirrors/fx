@@ -630,7 +630,7 @@ test "render geometry wrappers match visual layout projections" {
 
 test "render row window stays cursor-containing for direct and restored input" {
     var buf: [128]u8 = undefined;
-    inline for (.{ "x" ** 4096, "y" ** 5000 }) |input| {
+    inline for (.{ text_utils.repeat("x", 4096), text_utils.repeat("y", 5000) }) |input| {
         const summary = visual_layout.summarize(.{ .input = input, .cursor = input.len, .terminal_cols = 80 }, null);
         const window = visual_layout.visibleWindow(summary.cursor.row_index, summary.total_rows, 4);
         try std.testing.expect(window.first_row <= summary.cursor.row_index);
@@ -762,7 +762,7 @@ test "terminal title sanitizes and bounds untrusted labels" {
     var sink = try tmp.dir.createFile(std.testing.io, "terminal-title-hostile.log", .{});
     defer sink.close(io_mod.getIo());
 
-    terminalTitleFor(&sink).set("safe\x07\x1b]2;owned\xc2\x9b" ++ ("é" ** 80));
+    terminalTitleFor(&sink).set("safe\x07\x1b]2;owned\xc2\x9b" ++ text_utils.repeat("é", 80));
 
     var written_file = try tmp.dir.openFile(io_mod.getIo(), "terminal-title-hostile.log", .{});
     defer written_file.close(io_mod.getIo());

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
@@ -684,7 +685,7 @@ fn renderCandidateLessThan(_: void, lhs: *RuleCandidate, rhs: *RuleCandidate) bo
 
 fn omissionLessThan(_: void, lhs: context_contract.ContextOmissionInput, rhs: context_contract.ContextOmissionInput) bool {
     if (!std.mem.eql(u8, lhs.source, rhs.source)) return std.mem.lessThan(u8, lhs.source, rhs.source);
-    return @intFromEnum(lhs.reason) < @intFromEnum(rhs.reason);
+    return @backingInt(lhs.reason) < @backingInt(rhs.reason);
 }
 
 fn stringLessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
@@ -774,7 +775,7 @@ fn appendOmissionSummaryNotice(scratch: *SelectionScratch) !void {
         .{ scratch.omission_summary.omitted_count, digest },
     );
 
-    const hidden_count = scratch.omission_summary.reason_counts[@intFromEnum(context_contract.OmissionReason.home_outside_workspace)];
+    const hidden_count = scratch.omission_summary.reason_counts[@backingInt(context_contract.OmissionReason.home_outside_workspace)];
     const actionable_count = scratch.omission_summary.omitted_count - hidden_count;
     if (actionable_count == 0) return;
 
@@ -791,12 +792,12 @@ fn appendOmissionSummaryNotice(scratch: *SelectionScratch) !void {
 
 fn writeOmissionReasonCounts(
     writer: *std.Io.Writer,
-    counts: [std.meta.fields(context_contract.OmissionReason).len]usize,
+    counts: [@typeInfo(context_contract.OmissionReason).@"enum".field_names.len]usize,
     actionable_only: bool,
 ) !void {
     var wrote_any = false;
     for (counts, 0..) |count, index| {
-        const reason: context_contract.OmissionReason = @enumFromInt(index);
+        const reason: context_contract.OmissionReason = @fromBackingInt(@intCast(index));
         if (count == 0 or (actionable_only and reason == .home_outside_workspace)) continue;
         if (wrote_any) try writer.writeAll(", ");
         try writer.print("{s}:{d}", .{ reason.label(), count });
@@ -1251,9 +1252,9 @@ test "combined project instruction cap keeps global and closest whole sections i
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var scratch = SelectionScratch{ .arena = arena };
-    const full = "GUIDE\n\nGLOBAL_BODY\n" ++ ("g" ** 160) ++
-        "\n\nMIDDLE_BODY\n" ++ ("m" ** 400) ++
-        "\n\nCLOSE_BODY\n" ++ ("c" ** 160) ++
+    const full = "GUIDE\n\nGLOBAL_BODY\n" ++ text_utils.repeat("g", 160) ++
+        "\n\nMIDDLE_BODY\n" ++ text_utils.repeat("m", 400) ++
+        "\n\nCLOSE_BODY\n" ++ text_utils.repeat("c", 160) ++
         "\n\n<project-rules-omitted from=\"/unsafe/AGENTS.md\" reason=\"unsafe target\" />";
     const global_start = std.mem.find(u8, full, "\n\nGLOBAL_BODY").?;
     const middle_start = std.mem.find(u8, full, "\n\nMIDDLE_BODY").?;
@@ -2038,7 +2039,7 @@ fn checkLaterSelectionAllocationFailures(alloc: Allocator, workspace: []const u8
 }
 
 test "later applicable selection cleans partial allocation failures" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 

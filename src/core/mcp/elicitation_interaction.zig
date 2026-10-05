@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const elicitation = @import("elicitation.zig");
 const mrtr = @import("mrtr.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
@@ -1529,7 +1530,7 @@ fn checkAcceptedFormAllocationFailures(alloc: Allocator) !void {
 
 test "form interaction owns every accepted response allocation" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkAcceptedFormAllocationFailures,
         .{},
     );

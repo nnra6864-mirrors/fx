@@ -213,9 +213,9 @@ pub const HelpMenu = struct {
 
     pub fn cycleCategory(self: *HelpMenu, delta: i32) bool {
         if (!self.active or delta == 0) return false;
-        const count: i32 = @intCast(std.meta.fields(SlashPresentationCategory).len + 1);
+        const count: i32 = @intCast(@typeInfo(SlashPresentationCategory).@"enum".field_names.len + 1);
         var next: i32 = if (self.category) |category|
-            @as(i32, @intCast(@intFromEnum(category))) + 1
+            @as(i32, @intCast(@backingInt(category))) + 1
         else
             0;
         next += delta;
@@ -224,7 +224,7 @@ pub const HelpMenu = struct {
         self.category = if (next == 0)
             null
         else
-            @enumFromInt(next - 1);
+            @fromBackingInt(@intCast(next - 1));
         self.resetForQuery();
         return true;
     }
@@ -1812,30 +1812,30 @@ test "rendered slash summaries include aliases and welcome entries" {
 
 test "top-level specs cover every TopLevelKind" {
     const registry = testTopLevelRegistry();
-    var seen = [_]bool{false} ** std.meta.fields(TopLevelKind).len;
+    var seen: [@typeInfo(TopLevelKind).@"enum".field_names.len]bool = @splat(false);
     for (registry.specs) |spec| {
-        const index = @intFromEnum(spec.kind);
+        const index = @backingInt(spec.kind);
         try std.testing.expect(!seen[index]);
         seen[index] = true;
     }
-    inline for (std.meta.fields(TopLevelKind)) |field| {
-        const kind: TopLevelKind = @enumFromInt(field.value);
-        try std.testing.expect(seen[@intFromEnum(kind)]);
+    inline for (@typeInfo(TopLevelKind).@"enum".field_values) |field_value| {
+        const kind: TopLevelKind = @fromBackingInt(@intCast(field_value));
+        try std.testing.expect(seen[@backingInt(kind)]);
         try std.testing.expect(topLevelUsage(registry, kind).len > 0);
     }
 }
 
 test "slash specs cover every SlashKind" {
-    var seen = [_]bool{false} ** std.meta.fields(SlashKind).len;
+    var seen: [@typeInfo(SlashKind).@"enum".field_names.len]bool = @splat(false);
     const registry = testSlashRegistry();
     for (registry.commands) |spec| {
-        const index = @intFromEnum(spec.kind);
+        const index = @backingInt(spec.kind);
         try std.testing.expect(!seen[index]);
         seen[index] = true;
     }
-    inline for (std.meta.fields(SlashKind)) |field| {
-        const kind: SlashKind = @enumFromInt(field.value);
-        try std.testing.expect(seen[@intFromEnum(kind)]);
+    inline for (@typeInfo(SlashKind).@"enum".field_values) |field_value| {
+        const kind: SlashKind = @fromBackingInt(@intCast(field_value));
+        try std.testing.expect(seen[@backingInt(kind)]);
         _ = slashSpec(registry, kind);
     }
 }

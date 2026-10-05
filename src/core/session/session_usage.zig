@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const secret = @import("../auth/secret.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -427,16 +428,17 @@ pub const Usage = struct {
         self: *Usage,
         providers: generation_usage.Set,
     ) void {
-        inline for (std.meta.fields(Usage)) |field| {
-            if (comptime std.mem.eql(u8, field.name, "active_sequences") or
-                std.mem.eql(u8, field.name, "incidents") or
-                std.mem.eql(u8, field.name, "billing") or
-                std.mem.eql(u8, field.name, "api_duration_complete") or
-                std.mem.eql(u8, field.name, "wall_duration_complete") or
-                std.mem.eql(u8, field.name, "code_complete") or
-                std.mem.eql(u8, field.name, "reasoning_tokens") or
-                std.mem.eql(u8, field.name, "request_count")) continue;
-            @field(self.*, field.name) = field.defaultValue().?;
+        const usage_info = @typeInfo(Usage).@"struct";
+        inline for (usage_info.field_names, usage_info.field_types, usage_info.field_attrs) |field_name, field_type, field_attrs| {
+            if (comptime std.mem.eql(u8, field_name, "active_sequences") or
+                std.mem.eql(u8, field_name, "incidents") or
+                std.mem.eql(u8, field_name, "billing") or
+                std.mem.eql(u8, field_name, "api_duration_complete") or
+                std.mem.eql(u8, field_name, "wall_duration_complete") or
+                std.mem.eql(u8, field_name, "code_complete") or
+                std.mem.eql(u8, field_name, "reasoning_tokens") or
+                std.mem.eql(u8, field_name, "request_count")) continue;
+            @field(self.*, field_name) = field_attrs.defaultValue(field_type).?;
         }
         self.billing = .complete;
         self.api_duration_complete = true;
@@ -4344,7 +4346,7 @@ test "incident overflow retains the newest incomplete boundary" {
 }
 
 test "usage snapshot parsing releases every partial allocation" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var usage = Usage.initFresh();
     defer usage.deinit(alloc);
 
@@ -4613,9 +4615,9 @@ test "legacy usage compatibility releases rejected and unavailable allocations" 
             try std.testing.expectEqual(Availability.legacy, snapshot.billing);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ parsed.value, false });
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Check.run, .{ parsed.value, false });
     parsed.value.object.getPtr("input_tokens").?.* = .{ .integer = 9 };
-    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ parsed.value, true });
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Check.run, .{ parsed.value, true });
 }
 
 test "usage deduplicates terminal and generation callbacks" {
@@ -4869,7 +4871,7 @@ test "active invocation capacity fails before provider admission" {
 }
 
 test "generation allocation failure marks billing incomplete before snapshot" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var usage = Usage.initFresh();
     defer usage.deinit(alloc);
     const sequence = try usage.reserveInvocation();

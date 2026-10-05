@@ -13,6 +13,7 @@
 //   compactAfterCollapsedResize, footerTopRowForExtra
 
 const std = @import("std");
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const shared_theme = @import("../../core/shared/theme.zig");
 const types = @import("../../core/shared/types.zig");
@@ -22,6 +23,7 @@ const source_preparation = @import("source_preparation.zig");
 const transcript_release = @import("../../core/output/transcript_release.zig");
 const transcript_writer = @import("writer.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const Metrics = types.Metrics;
@@ -3814,7 +3816,7 @@ test "empty hard line start maps to its exact visual row" {
 
 test "inexact measured endpoint resumes from its containing target row" {
     const alloc = std.testing.allocator;
-    const record = "a" ** 249;
+    const record = text_utils.repeat("a", 249);
     const flow =
         record ++ "\n" ++
         record ++ "\n" ++
@@ -3869,9 +3871,9 @@ test "inexact measured endpoint resumes from its containing target row" {
     );
     defer rendered.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 9), rendered.rows.items[0].bytes.len);
-    try std.testing.expectEqualStrings("a" ** 9, rendered.rows.items[0].bytes);
+    try std.testing.expectEqualStrings(text_utils.repeat("a", 9), rendered.rows.items[0].bytes);
     try std.testing.expectEqual(@as(u16, 1), rendered.rows.items[0].rows_painted);
-    try std.testing.expectEqualStrings("a" ** 9, rendered.last_visible_line);
+    try std.testing.expectEqualStrings(text_utils.repeat("a", 9), rendered.last_visible_line);
     const cursor = calculateViewportCursor(
         layout,
         20,
@@ -3892,7 +3894,7 @@ test "inexact measured endpoint resumes from its containing target row" {
 }
 
 test "committed measured endpoint advances by source hard-row groups" {
-    const flow = ("a" ** 21) ++ "\n" ++ ("b" ** 21) ++ "\n";
+    const flow = text_utils.repeat("a", 21) ++ "\n" ++ text_utils.repeat("b", 21) ++ "\n";
     const advanced = advanceMeasuredHistoryOriginForCommittedRows(
         flow,
         .{
@@ -4034,7 +4036,7 @@ test "transcript surface painter renders soft wrap across three rows" {
 
 test "transcript surface painter materializes an ANSI-only logical row" {
     const alloc = std.testing.allocator;
-    const styled_notice = "\x1b[2m" ++ ("x" ** 391) ++ "\x1b[0m";
+    const styled_notice = "\x1b[2m" ++ text_utils.repeat("x", 391) ++ "\x1b[0m";
     try std.testing.expectEqual(@as(usize, 399), styled_notice.len);
 
     var batch = try transcriptTestBatch(alloc, styled_notice ++ "\n\x1b[0m", 123);
@@ -4177,7 +4179,7 @@ fn expectAppendBoundaryAllocation(alloc: Allocator) !void {
 }
 
 test "append pending wrap preparation allocation failures release owned boundaries" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, expectAppendBoundaryAllocation, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, expectAppendBoundaryAllocation, .{});
 }
 
 test "resume document append matches full prefix replay" {

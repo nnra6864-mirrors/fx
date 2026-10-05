@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../shared/testing_allocator.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const types = @import("../../shared/types.zig");
@@ -1425,10 +1426,28 @@ test "streamed presentation preserves ANSI OSC 8 code fence and table spans" {
     defer environ.deinit();
     try environ.put(ansi_span_fixture_env, "1");
 
+    // The fixture reaches the shell tool, which imports the `test_paths`
+    // module that `zig build test` generates, so the nested compile needs the
+    // same module.
+    const test_paths = @import("test_paths");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_paths_source = try std.fmt.allocPrint(
+        alloc,
+        "pub const product_exe: []const u8 = \"{f}\";\npub const source_root: []const u8 = \"{f}\";\n",
+        .{ std.zig.fmtString(test_paths.product_exe), std.zig.fmtString(test_paths.source_root) },
+    );
+    defer alloc.free(test_paths_source);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "test_paths.zig", .data = test_paths_source });
+    const test_paths_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "test_paths.zig");
+    defer alloc.free(test_paths_path);
+    const test_paths_module = try std.fmt.allocPrint(alloc, "-Mtest_paths={s}", .{test_paths_path});
+    defer alloc.free(test_paths_module);
+
     const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
     defer alloc.free(cwd);
     const result = try std.process.run(alloc, std.testing.io, .{
-        .argv = &.{ "zig", "test", "-lc", "-Mroot=src/main.zig", "--test-filter", ansi_span_test_name },
+        .argv = &.{ "zig", "test", "-lc", "--dep", "test_paths", "-Mroot=src/main.zig", test_paths_module, "--test-filter", ansi_span_test_name },
         .cwd = .{ .path = cwd },
         .environ_map = &environ,
         .stdout_limit = .limited(64 * 1024),
@@ -1989,7 +2008,7 @@ test "stream callbacks publish absolute raw output token progress" {
 }
 
 test "streamed presentation suppresses callback-time failures" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
 
     {
         var capture = StreamCapture{};
@@ -2171,7 +2190,7 @@ fn checkSemanticCodeBlockCaptureAllocationFailures(alloc: Allocator) !void {
 
 test "streamed presentation cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkStreamPresentationAllocationFailures,
         .{},
     );
@@ -2179,7 +2198,7 @@ test "streamed presentation cleans up every allocation failure" {
 
 test "semantic table capture cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkSemanticTableCaptureAllocationFailures,
         .{},
     );
@@ -2187,7 +2206,7 @@ test "semantic table capture cleans up every allocation failure" {
 
 test "semantic code block capture cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkSemanticCodeBlockCaptureAllocationFailures,
         .{},
     );

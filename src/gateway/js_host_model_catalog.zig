@@ -75,7 +75,7 @@ fn fetch(
     if (response_len < 0) return .{ .failure = .{ .category = .transport, .retryable = true } };
     if (response_len > response.len) return .{ .failure = .{ .category = .resource_exhausted } };
     if (status != 200) {
-        return .{ .failure = model_catalog.failureForHttpStatus(@enumFromInt(status)) };
+        return .{ .failure = model_catalog.failureForHttpStatus(@fromBackingInt(@intCast(status))) };
     }
 
     const catalog = builtin_gateway.parseModelCatalogForView(

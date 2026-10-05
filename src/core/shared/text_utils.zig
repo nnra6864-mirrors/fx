@@ -14,6 +14,17 @@ pub fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+/// Returns `text` repeated `count` times as a comptime string literal.
+pub inline fn repeat(comptime text: []const u8, comptime count: usize) *const [text.len * count:0]u8 {
+    return comptime blk: {
+        const units: [count][text.len]u8 = @splat(text[0..text.len].*);
+        var bytes: [text.len * count:0]u8 = @splat(0);
+        @memcpy(bytes[0 .. text.len * count], @as(*const [text.len * count]u8, @ptrCast(&units)));
+        const final = bytes;
+        break :blk &final;
+    };
+}
+
 pub fn isModelSafeText(text: []const u8) bool {
     if (std.mem.findScalar(u8, text, 0) != null) return false;
     return std.unicode.utf8ValidateSlice(text);

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../../shared/testing_allocator.zig");
 const types = @import("../../../shared/types.zig");
 const debug_trace = @import("../../../shared/debug_trace.zig");
 const io_mod = @import("../../../shared/io.zig");
@@ -1996,7 +1997,7 @@ test "common Stop finish event failure wins and is not retried" {
 }
 
 test "common Stop terminal payload construction failure leaves guard open for one fallback" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     const calls = [_]ToolCall{
         toolCall("call_read", "read_file", "{\"path\":\"README.md\"}"),
     };

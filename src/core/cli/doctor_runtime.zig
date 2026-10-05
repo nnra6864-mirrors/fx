@@ -704,7 +704,7 @@ fn pathExists(path: []const u8) bool {
 
 fn accessPath(path: []const u8) !bool {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return false;
+    const path_z = std.fmt.bufPrintSentinel(&path_buf, "{s}", .{path}, 0) catch return false;
     const rc = std.c.access(path_z.ptr, std.c.F_OK);
     if (rc == 0) return true;
     return switch (std.posix.errno(rc)) {

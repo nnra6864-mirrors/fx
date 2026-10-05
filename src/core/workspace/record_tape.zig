@@ -310,7 +310,7 @@ fn writeFrameLocked(zio: std.Io, kind: Kind, payload: []const u8) void {
 
     var header: [9]u8 = undefined;
     std.mem.writeInt(i32, header[0..4], delta, .little);
-    header[4] = @intFromEnum(kind);
+    header[4] = @backingInt(kind);
     const len: u32 = @intCast(@min(payload.len, std.math.maxInt(u32)));
     std.mem.writeInt(u32, header[5..9], len, .little);
 
@@ -453,7 +453,7 @@ pub const Parser = struct {
         self.pos = end;
         return .{
             .delta_ms = delta_ms,
-            .kind = @enumFromInt(kind_raw),
+            .kind = @fromBackingInt(@intCast(kind_raw)),
             .payload = self.bytes[start..end],
         };
     }
@@ -582,7 +582,7 @@ test "writer helper frames parse back through Parser" {
 }
 
 test "parser rejects bad magic" {
-    const garbage = "NOTA\x01" ++ [_]u8{0} ** 32;
+    const garbage = "NOTA\x01" ++ @as([32]u8, @splat(0));
     try testing.expectError(error.BadTapeMagic, Parser.init(garbage));
 }
 
@@ -662,7 +662,7 @@ test "Parser.next returns TruncatedFramePayload for non-overflowing truncated pa
     try appendHeader(&bytes, testing.allocator, 80, 24, 123, "");
     var frame_header: [9]u8 = undefined;
     std.mem.writeInt(i32, frame_header[0..4], 0, .little);
-    frame_header[4] = @intFromEnum(Kind.stdout);
+    frame_header[4] = @backingInt(Kind.stdout);
     std.mem.writeInt(u32, frame_header[5..9], 5, .little);
     try bytes.appendSlice(testing.allocator, &frame_header);
     try bytes.appendSlice(testing.allocator, "ab");
@@ -680,7 +680,7 @@ test "Parser.next accepts unknown kind bytes" {
 
     var parser = try Parser.init(bytes.items);
     const frame = (try parser.next()).?;
-    try testing.expectEqual(@as(u8, 200), @intFromEnum(frame.kind));
+    try testing.expectEqual(@as(u8, 200), @backingInt(frame.kind));
     try testing.expectEqual(@as(i32, 7), frame.delta_ms);
     try testing.expectEqualStrings("x", frame.payload);
 }
@@ -690,7 +690,7 @@ test "Parser.next accepts malformed kind-specific payload lengths" {
     defer bytes.deinit(testing.allocator);
 
     try appendHeader(&bytes, testing.allocator, 80, 24, 123, "");
-    try appendFrame(&bytes, testing.allocator, 0, @intFromEnum(Kind.resize), "x");
+    try appendFrame(&bytes, testing.allocator, 0, @backingInt(Kind.resize), "x");
 
     var parser = try Parser.init(bytes.items);
     const frame = (try parser.next()).?;

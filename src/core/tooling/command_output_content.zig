@@ -400,7 +400,7 @@ const CollectorSink = struct {
         try self.output.records.items[index].text.appendSlice(self.alloc, bytes);
     }
 
-    fn recordTransform(
+    pub fn recordTransform(
         self: *CollectorSink,
         kind: TransformKind,
         byte: u8,
@@ -441,7 +441,7 @@ const CollectorSink = struct {
 };
 
 fn streamIndex(stream: Stream) usize {
-    return @intFromEnum(stream);
+    return @backingInt(stream);
 }
 
 pub fn eql(lhs: CanonicalOutput, rhs: CanonicalOutput) bool {

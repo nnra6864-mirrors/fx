@@ -54,7 +54,7 @@ pub fn isDevelopmentBuildPath(path: []const u8) bool {
 }
 
 pub const AutoUpgrade = struct {
-    state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(State.idle)),
+    state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@backingInt(State.idle)),
     should_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     stopped: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     render_dirty: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -127,7 +127,7 @@ pub const AutoUpgrade = struct {
     }
 
     pub fn getState(self: *const AutoUpgrade) State {
-        return @enumFromInt(self.state.load(.acquire));
+        return @fromBackingInt(@intCast(self.state.load(.acquire)));
     }
 
     fn transferControl(self: *AutoUpgrade) helpers.TransferControl {
@@ -193,7 +193,7 @@ pub const AutoUpgrade = struct {
     }
 
     fn setState(self: *AutoUpgrade, state: State) void {
-        const next = @intFromEnum(state);
+        const next = @backingInt(state);
         const previous = self.state.swap(next, .acq_rel);
         if (previous != next) self.markRenderDirty();
     }
@@ -518,7 +518,7 @@ test "setLatestVersion stores normalized version" {
 test "relaunch request owns its path and previous revision and is consumed once" {
     var au = AutoUpgrade{};
     var path = [_]u8{ '/', 't', 'm', 'p', '/', 'f', 'x' };
-    var revision = [_]u8{'1'} ** 40;
+    var revision: [40]u8 = @splat('1');
     au.configure_channel(.dev);
     au.setPreviousRevision(&revision);
     try au.requestRelaunch(&path);

@@ -295,7 +295,6 @@ fn runCancellable(
         .expand_arg0 = options.expand_arg0,
         .progress_node = options.progress_node,
         .create_no_window = options.create_no_window,
-        .disable_aslr = options.disable_aslr,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,

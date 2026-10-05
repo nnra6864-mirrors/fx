@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const lexical_relevance = @import("../../core/shared/lexical_relevance.zig");
 const result_store = @import("../../core/session/result_store.zig");
 const capability_retrieval = @import("../../core/tooling/capability_retrieval.zig");
@@ -423,7 +424,7 @@ test "capability search combined projection releases every allocation failure" {
             alloc.free(output);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Case.run, .{});
 }
 
 test "capability search marks an empty search as terminal" {

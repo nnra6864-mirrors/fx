@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const assistant_presentation = @import("../../core/agent/assistant_presentation.zig");
 const diff = @import("../../core/output/diff.zig");
 const types = @import("../../core/shared/types.zig");
@@ -801,7 +802,7 @@ fn checkResumeProjectionAllocationFailures(alloc: Allocator) !void {
 
 test "resume projection releases every failed detached build" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkResumeProjectionAllocationFailures,
         .{},
     );
@@ -824,7 +825,7 @@ fn checkLiveResumeProjectionAllocationFailures(alloc: Allocator) !void {
 
 test "live resume projection releases every failed detached build" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkLiveResumeProjectionAllocationFailures,
         .{},
     );

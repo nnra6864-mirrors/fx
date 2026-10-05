@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation_contract = @import("file_mutation_contract.zig");
@@ -2439,11 +2440,11 @@ test "apply rejects binding mismatches before allocation or filesystem access" {
     const prepared = try prepareForApply(owner_alloc, root, call);
 
     var failing_call = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     var failing_result = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     const call_alloc = failing_call.allocator();
@@ -2533,7 +2534,7 @@ test "apply allocation failure before rename leaves target unchanged" {
     };
     const prepared = try prepareForApply(call_alloc, root, call);
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 3 },
     );
     var test_state = StageTestState{};

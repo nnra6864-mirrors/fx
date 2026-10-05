@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const mcp_auth = @import("mcp_auth.zig");
 const native_keychain = @import("../hosts/native_keychain.zig");
@@ -1038,7 +1039,7 @@ fn checkCredentialStoreIsolationAllocationFailures(alloc: Allocator) !void {
 
 test "credential store isolation cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkCredentialStoreIsolationAllocationFailures,
         .{},
     );

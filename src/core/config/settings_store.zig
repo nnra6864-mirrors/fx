@@ -230,7 +230,7 @@ const UserPreferenceField = enum(u4) {
     session_titles,
 
     fn mask(self: UserPreferenceField) u16 {
-        return @as(u16, 1) << @intFromEnum(self);
+        return @as(u16, 1) << @backingInt(self);
     }
 
     fn snapshotName(self: UserPreferenceField) []const u8 {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const contracts = @import("contracts.zig");
 const io_mod = @import("../shared/io.zig");
 
@@ -436,7 +437,7 @@ fn check_preparation_allocation_failures(alloc: Allocator) !void {
 
 test "authority preparation and owned claims cover allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         check_preparation_allocation_failures,
         .{},
     );

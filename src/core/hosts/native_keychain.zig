@@ -4,6 +4,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("host.zig");
 const io_mod = @import("../shared/io.zig");
 const secret = @import("../auth/secret.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const err_sec_success: i32 = 0;
 const err_sec_item_not_found: i32 = -25300;
@@ -809,7 +810,7 @@ test "MCP Keychain storage round-trips values beyond the security prompt limit" 
 
     const alloc = std.testing.allocator;
     const test_mcp_service = "FX_TEST_MCP_OAUTH_CREDENTIALS_V1";
-    const written = "mcp-credential-section-" ** 32;
+    const written = text_utils.repeat("mcp-credential-section-", 32);
 
     storeMcpValueMac(test_mcp_service, written) catch return error.SkipZigTest;
     defer _ = deleteMcpValueMac(alloc, test_mcp_service) catch false;

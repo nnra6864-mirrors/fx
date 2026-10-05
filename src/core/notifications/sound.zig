@@ -33,12 +33,12 @@ fn materializedName(cue: Cue) []const u8 {
 }
 
 var sound_path_mutex: std.Io.Mutex = .init;
-var materialized_paths = [_]?[]const u8{null} ** std.enums.values(Cue).len;
+var materialized_paths: [std.enums.values(Cue).len]?[]const u8 = @splat(null);
 var sound_path_bufs: [std.enums.values(Cue).len][std.fs.max_path_bytes]u8 = undefined;
 
 // Materialize lazily to protect startup latency. Atomic replacement avoids following symlinks.
 fn ensureCueSoundPath(cue: Cue) ?[]const u8 {
-    const idx = @intFromEnum(cue);
+    const idx = @backingInt(cue);
     sound_path_mutex.lockUncancelable(io_mod.getIo());
     defer sound_path_mutex.unlock(io_mod.getIo());
     if (materialized_paths[idx]) |path| return path;
@@ -241,12 +241,12 @@ const ChildWaiter = struct {
             .signal => |signal| debug_trace.logf(
                 "notifications",
                 "sound child signaled signal={d}",
-                .{@intFromEnum(signal)},
+                .{@backingInt(signal)},
             ),
             .stopped => |signal| debug_trace.logf(
                 "notifications",
                 "sound child stopped signal={d}",
-                .{@intFromEnum(signal)},
+                .{@backingInt(signal)},
             ),
             .unknown => |status| debug_trace.logf(
                 "notifications",

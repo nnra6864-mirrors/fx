@@ -219,8 +219,8 @@ fn copy_file_to_clipboard(_: ?*anyopaque, alloc: std.mem.Allocator, path: []cons
             if (code == 0) return true;
             debug_trace.logf("host", "clipboard file copy failed exit_code={d} elapsed_ms={d} stderr={s}", .{ code, elapsed_ms, result.stderr });
         },
-        .signal => |signal| debug_trace.logf("host", "clipboard file copy failed term=signal signal={d} elapsed_ms={d} stderr={s}", .{ @intFromEnum(signal), elapsed_ms, result.stderr }),
-        .stopped => |signal| debug_trace.logf("host", "clipboard file copy failed term=stopped signal={d} elapsed_ms={d} stderr={s}", .{ @intFromEnum(signal), elapsed_ms, result.stderr }),
+        .signal => |signal| debug_trace.logf("host", "clipboard file copy failed term=signal signal={d} elapsed_ms={d} stderr={s}", .{ @backingInt(signal), elapsed_ms, result.stderr }),
+        .stopped => |signal| debug_trace.logf("host", "clipboard file copy failed term=stopped signal={d} elapsed_ms={d} stderr={s}", .{ @backingInt(signal), elapsed_ms, result.stderr }),
         .unknown => |status| debug_trace.logf("host", "clipboard file copy failed term=unknown status={d} elapsed_ms={d} stderr={s}", .{ status, elapsed_ms, result.stderr }),
     }
     return error.CopyFailed;
@@ -244,8 +244,8 @@ fn copySucceeded(term: std.process.Child.Term) bool {
 fn logUnsuccessfulTerm(term: std.process.Child.Term) void {
     switch (term) {
         .exited => |code| debug_trace.logf("host", "clipboard copy failed exit_code={d}", .{code}),
-        .signal => |signal| debug_trace.logf("host", "clipboard copy failed term=signal signal={d}", .{@intFromEnum(signal)}),
-        .stopped => |signal| debug_trace.logf("host", "clipboard copy failed term=stopped signal={d}", .{@intFromEnum(signal)}),
+        .signal => |signal| debug_trace.logf("host", "clipboard copy failed term=signal signal={d}", .{@backingInt(signal)}),
+        .stopped => |signal| debug_trace.logf("host", "clipboard copy failed term=stopped signal={d}", .{@backingInt(signal)}),
         .unknown => |status| debug_trace.logf("host", "clipboard copy failed term=unknown status={d}", .{status}),
     }
 }

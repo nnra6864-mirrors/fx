@@ -10,7 +10,7 @@ const linux_self_exe = "/proc/self/exe";
 /// Returns an owned path that re-execs this process. Linux uses
 /// `/proc/self/exe` so replacing the on-disk binary does not break later spawns.
 pub fn pathForReexec(alloc: Allocator) ![]u8 {
-    if (testProductExe()) |path| return alloc.dupe(u8, path);
+    if (try testProductExe(alloc)) |path| return path;
     return productionPathForReexec(alloc);
 }
 
@@ -22,7 +22,7 @@ fn productionPathForReexec(alloc: Allocator) ![]u8 {
 /// Returns an owned path another process can use to launch fx. Linux prefers
 /// the on-disk path, falling back to `/proc/<pid>/exe` after replacement.
 pub fn pathForPeerReexec(alloc: Allocator) ![]u8 {
-    if (testProductExe()) |path| return alloc.dupe(u8, path);
+    if (try testProductExe(alloc)) |path| return path;
     return productionPathForPeerReexec(alloc);
 }
 
@@ -68,11 +68,11 @@ fn sameFile(left: []const u8, right: []const u8) !bool {
     return left_stat.inode == right_stat.inode;
 }
 
-fn testProductExe() ?[]const u8 {
+/// Returns an owned absolute path to the installed fx binary that
+/// `zig build test` launches, or null outside tests.
+pub fn testProductExe(alloc: Allocator) !?[]u8 {
     if (comptime !builtin.is_test) return null;
-    const path_z = std.c.getenv("FX_TEST_PRODUCT_EXE") orelse return null;
-    const path = std.mem.sliceTo(path_z, 0);
-    return if (path.len == 0) null else path;
+    return try io_mod.realpathAlloc(alloc, @import("test_paths").product_exe);
 }
 
 test "linux re-exec paths name the live inode, not the replaced on-disk file" {

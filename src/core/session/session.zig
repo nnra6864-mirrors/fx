@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const kernel_agent = @import("../agent/runtime/agent.zig");
 const core_types = @import("../shared/types.zig");
 const history_range = @import("../shared/history_range.zig");
@@ -19,6 +20,7 @@ pub const profile_usage_runtime = @import("profile_usage_runtime.zig");
 const command_contract = @import("../execution/command_contract.zig");
 const managed_execution = @import("../execution/managed_execution.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const Allocator = std.mem.Allocator;
 
 test {
@@ -806,7 +808,7 @@ test "legacy image snapshot repair drops unavailable path-only images" {
 }
 
 test "legacy image snapshot repair propagates OOM without changing memory or disk" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const image_bytes = "\x89PNG\r\n\x1a\nlegacy-oom";
@@ -1015,7 +1017,7 @@ test "legacy image repair rewrites three repeated ordinals across persisted turn
 }
 
 test "legacy image repair leaves history unchanged when text reconstruction runs out of memory" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var first_images = [_]ImageAttachment{.{
         .id = 0,
         .path = @constCast("/tmp/first.png"),
@@ -1713,10 +1715,11 @@ pub const SessionRuntime = struct {
         max_history_turns: usize,
         providers: generation_usage_provider.Set,
     ) void {
-        inline for (std.meta.fields(SessionRuntime)) |field| {
-            if (comptime std.mem.eql(u8, field.name, "usage") or
-                std.mem.eql(u8, field.name, "max_history_turns")) continue;
-            @field(self.*, field.name) = field.defaultValue().?;
+        const session_runtime_info = @typeInfo(SessionRuntime).@"struct";
+        inline for (session_runtime_info.field_names, session_runtime_info.field_types, session_runtime_info.field_attrs) |field_name, field_type, field_attrs| {
+            if (comptime std.mem.eql(u8, field_name, "usage") or
+                std.mem.eql(u8, field_name, "max_history_turns")) continue;
+            @field(self.*, field_name) = field_attrs.defaultValue(field_type).?;
         }
         self.usage.initIntoFreshWithProviders(providers);
         self.max_history_turns = max_history_turns;
@@ -2175,7 +2178,7 @@ test "retained context history replacement is allocation-failure atomic" {
             try std.testing.expectEqualStrings("older reply", source[0].assistant.assistant);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Fixture.run, .{});
 }
 
 /// Frees an owned image attachment slice and each attachment field.
@@ -2420,7 +2423,7 @@ test "appendAssistantTurnWithExecution transfers memory and clears the source" {
 }
 
 test "appendAssistantTurnWithExecution keeps source memory on allocation failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
 
     for (0..3) |fail_index| {
         var execution = core_types.ExecutionMemory{
@@ -3092,12 +3095,12 @@ test "resume-history-to-request conversion preserves user assistant ordering" {
 }
 test "appendHistoryMessages frees owned projection text when append fails" {
     const compact = [_]HistoryTurn{.{ .compacted_summary = .{ .summary = @constCast("summary"), .removed_turn_count = 1, .compaction_count = 1 } }};
-    var compact_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var compact_failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 1 });
     var compact_messages: std.ArrayList(message.Message) = .empty;
     try std.testing.expectError(error.OutOfMemory, appendHistoryMessages(compact_failing.allocator(), &compact_messages, &compact));
 }
 test "dupeImageAttachment frees path when media_type allocation fails" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 1 });
     try std.testing.expectError(error.OutOfMemory, dupeImageAttachment(failing.allocator(), .{
         .path = @constCast("/tmp/a.png"),
         .media_type = @constCast("image/png"),
@@ -3135,8 +3138,8 @@ test "history projection keeps system role only for leading summaries" {
             .compaction_count = 1,
         } },
         .{ .assistant = .{
-            .user = .{ .text = @constCast("old request " ++ ("u" ** 800)) },
-            .assistant = @constCast("old answer " ++ ("a" ** 800)),
+            .user = .{ .text = @constCast("old request " ++ text_utils.repeat("u", 800)) },
+            .assistant = @constCast("old answer " ++ text_utils.repeat("a", 800)),
         } },
         .{ .compacted_summary = .{
             .summary = @constCast("nonleading summary marker"),
@@ -3619,7 +3622,7 @@ test "interrupted history projects marker and aborted tool result" {
 
 test "interrupted tool diagnostics remain complete for compaction" {
     const replay_handle = "cancelled-output.bin";
-    const oversized_handle = "h" ** 129;
+    const oversized_handle = text_utils.repeat("h", 129);
     const presentations = [_]?CancelledCommandPresentation{
         null,
         .{},
@@ -4017,7 +4020,7 @@ test "SessionRuntime restore and reset clear stale shell handle state" {
 }
 
 test "SessionRuntime.restore may retain earlier restored turns after later append failure" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 3 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 3 });
     const alloc = failing.allocator();
     var runtime: SessionRuntime = .{ .max_history_turns = 0 };
     defer runtime.deinit(alloc);
@@ -4106,7 +4109,7 @@ test "compacted Unicode history remains conversational context" {
     const alloc = std.testing.allocator;
     const context = [_]HistoryTurn{
         .{ .compacted_summary = .{
-            .summary = @constCast(("a" ** 155) ++ "★"),
+            .summary = @constCast(text_utils.repeat("a", 155) ++ "★"),
             .removed_turn_count = 2,
             .compaction_count = 1,
         } },
@@ -4267,7 +4270,7 @@ test "legacy checkpoint keeps restored provenance conservative" {
 }
 
 test "SessionRuntime context snapshot allocation failure preserves canonical state" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var runtime: SessionRuntime = .{ .max_history_turns = 8 };
     defer runtime.deinit(alloc);
 
@@ -4501,7 +4504,7 @@ fn checkPromptHistorySnapshotAllocationFailures(alloc: Allocator) !void {
 
 test "prompt history snapshot failure preserves canonical ownership" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkPromptHistorySnapshotAllocationFailures,
         .{},
     );
@@ -4601,7 +4604,7 @@ test "prompt history cleanup is independent after snapshot creation" {
     defer freeHistoryTurnSlice(alloc, prompt_history);
 
     try std.testing.checkAllAllocationFailures(
-        alloc,
+        testing_allocator.no_resize,
         checkPromptHistoryMessageProjectionAllocationFailures,
         .{prompt_history},
     );
@@ -4773,14 +4776,14 @@ fn checkWorkProvenanceOwnershipFailures(alloc: Allocator) !void {
 
 test "work provenance user ownership frees every partial allocation" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkWorkProvenanceOwnershipFailures,
         .{},
     );
 }
 
 test "SessionRuntime.snapshotHistory frees partial copies on allocation failure" {
-    const base = std.testing.allocator;
+    const base = testing_allocator.no_resize;
     var runtime: SessionRuntime = .{ .max_history_turns = 8 };
     defer runtime.deinit(base);
 
@@ -4866,7 +4869,7 @@ fn checkImageCatalogHistoryMergeAllocationFailures(alloc: Allocator) !void {
 
 test "image catalog history merge cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkImageCatalogHistoryMergeAllocationFailures,
         .{},
     );
@@ -4921,12 +4924,12 @@ test "full image catalog cleans up every allocation failure" {
         .media_type = @constCast("image/jpeg"),
     }};
 
-    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var probe = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     const probed = try collect_image_catalog(probe.allocator(), &history, &current);
     core_types.freeImageAttachmentSlice(probe.allocator(), probed);
     for (0..probe.alloc_index) |fail_index| {
         var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
+            testing_allocator.no_resize,
             .{ .fail_index = fail_index },
         );
         try std.testing.expectError(
@@ -5071,7 +5074,7 @@ test "SessionRuntime.appendHistoryMessages frees owned system text when append f
         .removed_turn_count = 1,
         .compaction_count = 1,
     } }};
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 1 });
     var messages: std.ArrayList(message.Message) = .empty;
 
     try std.testing.expectError(error.OutOfMemory, SessionRuntime.appendHistoryMessages(failing.allocator(), &messages, &compact));
@@ -5103,7 +5106,7 @@ test "image catalog merges a retained recovery image and rejects changed identit
         .path = @constCast("/missing/original.png"),
         .media_type = @constCast("image/png"),
         .snapshot_path = @constCast("/session/images/saved.bin"),
-        .snapshot_sha256 = @constCast("a" ** 64),
+        .snapshot_sha256 = @constCast(text_utils.repeat("a", 64)),
     }};
     const turn: HistoryTurn = .{ .interrupted = .{ .user = .{ .text = @constCast("recover"), .images = &images } } };
     const catalog = try collect_image_catalog(alloc, &.{turn}, &.{});
@@ -5112,6 +5115,6 @@ test "image catalog merges a retained recovery image and rejects changed identit
     defer core_types.freeImageAttachmentSlice(alloc, merged);
     try std.testing.expectEqual(@as(usize, 1), merged.len);
     try std.testing.expectEqual(@as(usize, 7), merged[0].id);
-    images[0].snapshot_sha256 = @constCast("b" ** 64);
+    images[0].snapshot_sha256 = @constCast(text_utils.repeat("b", 64));
     try std.testing.expectError(error.StaleImageCatalog, merge_image_catalog_history_turn(alloc, catalog, turn));
 }

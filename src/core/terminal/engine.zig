@@ -3,8 +3,10 @@
 //! are intentionally outside this module's contract.
 
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const display_width = @import("../shared/display_width.zig");
 const contracts = @import("contracts.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -309,11 +311,11 @@ pub const Grid = struct {
 
     state: State = .normal,
     /// CSI parameters accumulated from the digit/';' bytes after `\x1b[`.
-    csi_params: [max_csi_params]u16 = [_]u16{0} ** max_csi_params,
+    csi_params: [max_csi_params]u16 = @splat(0),
     csi_param_count: u8 = 0,
     csi_has_digit: bool = false,
     csi_private: u8 = 0,
-    csi_intermediates: [max_csi_intermediates]u8 = [_]u8{0} ** max_csi_intermediates,
+    csi_intermediates: [max_csi_intermediates]u8 = @splat(0),
     csi_intermediate_count: u8 = 0,
     osc_saw_esc: bool = false,
     /// Captured OSC payload bytes (between `\x1b]` and the terminator).
@@ -322,7 +324,7 @@ pub const Grid = struct {
     osc_buffer: std.ArrayList(u8) = .empty,
     dcs_saw_esc: bool = false,
     dcs_buffer: std.ArrayList(u8) = .empty,
-    utf8_buffer: [4]u8 = [_]u8{0} ** 4,
+    utf8_buffer: [4]u8 = @splat(0),
     utf8_len: u8 = 0,
     utf8_expected: u8 = 0,
     /// Allocator-owned URI/parameter pairs indexed by `Style.hyperlink_id`.
@@ -796,11 +798,11 @@ pub const Grid = struct {
     }
 
     fn resetCsi(self: *Grid) void {
-        self.csi_params = [_]u16{0} ** max_csi_params;
+        self.csi_params = @as([max_csi_params]u16, @splat(0));
         self.csi_param_count = 0;
         self.csi_has_digit = false;
         self.csi_private = 0;
-        self.csi_intermediates = [_]u8{0} ** max_csi_intermediates;
+        self.csi_intermediates = @as([max_csi_intermediates]u8, @splat(0));
         self.csi_intermediate_count = 0;
     }
 
@@ -2573,7 +2575,7 @@ fn encodeGridState(encoder: *CheckpointEncoder, grid: Grid) !void {
     try encoder.boolean(grid.autowrap);
     try encoder.boolean(grid.pending_wrap);
     try encoder.boolean(grid.cursor_visible);
-    try encoder.int(u8, @intFromEnum(grid.cursor_shape));
+    try encoder.int(u8, @backingInt(grid.cursor_shape));
     try encoder.boolean(grid.cursor_blinking);
     try encoder.int(u16, grid.scroll_top);
     try encoder.int(u16, grid.scroll_bottom);
@@ -2590,7 +2592,7 @@ fn encodeGridState(encoder: *CheckpointEncoder, grid: Grid) !void {
     try encoder.boolean(grid.defer_sync_updates);
     try encoder.sizedBytes(grid.sync_buffer.items);
     try encodeStyle(encoder, grid.current_style);
-    try encoder.int(u8, @intFromEnum(grid.state));
+    try encoder.int(u8, @backingInt(grid.state));
     for (grid.csi_params) |param| try encoder.int(u16, param);
     try encoder.int(u8, grid.csi_param_count);
     try encoder.boolean(grid.csi_has_digit);
@@ -2678,7 +2680,7 @@ fn encodeSavedScreen(
     try encoder.boolean(saved.autowrap);
     try encoder.boolean(saved.pending_wrap);
     try encoder.boolean(saved.cursor_visible);
-    try encoder.int(u8, @intFromEnum(saved.cursor_shape));
+    try encoder.int(u8, @backingInt(saved.cursor_shape));
     try encoder.boolean(saved.cursor_blinking);
     try encodeStyle(encoder, saved.current_style);
     try encoder.sizedBytes(saved.active_hyperlink_params);
@@ -4134,7 +4136,7 @@ test "hyperlink compaction cadence does not rescan each near-full frame" {
 }
 
 test "hyperlink compaction allocation failure keeps cell links intact" {
-    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var failing = testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     const alloc = failing.allocator();
     var grid = try Grid.init(alloc, 260, 1);
     defer grid.deinit();
@@ -4184,7 +4186,7 @@ test "hyperlink compaction retains saved screen and cursor identities" {
 }
 
 test "OSC 8 parameter replacement is atomic on allocation failure" {
-    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var failing = testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     const alloc = failing.allocator();
     var source = try Grid.init(alloc, 4, 1);
     defer source.deinit();
@@ -4794,7 +4796,7 @@ test "parser and reply collections enforce fixed bounds" {
     defer replies.deinit();
     try testing.expectError(
         error.ReplyEffectCapacityExceeded,
-        replies.feedMode("\x1b[5n" ** 17, .native_live),
+        replies.feedMode(text_utils.repeat("\x1b[5n", 17), .native_live),
     );
 
     var osc = try Grid.init(testing.allocator, 10, 2);
@@ -4822,7 +4824,7 @@ fn checkOwnedEngineAllocationFailures(alloc: Allocator) !void {
 
 test "owned effects snapshots and checkpoints handle allocation failure" {
     try testing.checkAllAllocationFailures(
-        testing.allocator,
+        testing_allocator.no_resize,
         checkOwnedEngineAllocationFailures,
         .{},
     );

@@ -1087,10 +1087,19 @@ pub fn Runtime(comptime App: type) type {
             defer if (app.worker.isCancelRequested()) {
                 app.worker.settleCompactionActivity(operation_id, .{ .outcome = .cancelled });
             };
-            errdefer |err| {
+            compactWithActivity(app, job, gateway_retry_count, operation_id) catch |err| {
                 app.worker.settleCompactionActivity(operation_id, compaction_activity.failure(err, .preparation, app.worker.isCancelRequested()));
                 if (failure_provenance) |out| out.* = .{ .operation_id = operation_id, .turn_id = job.turn_id, .err = err };
-            }
+                return err;
+            };
+        }
+
+        fn compactWithActivity(
+            app: *App,
+            job: worker_runtime.ContextCompactionTask,
+            gateway_retry_count: usize,
+            operation_id: compaction_activity.OperationId,
+        ) anyerror!void {
             var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
             defer arena_state.deinit();
             const arena = arena_state.allocator();
@@ -1577,7 +1586,7 @@ const RefreshContextApp = struct {
         self.session.deinit(self.alloc);
     }
 
-    fn writeDomainNotice(self: *RefreshContextApp, notice: types.SemanticNotice, _: bool) !void {
+    pub fn writeDomainNotice(self: *RefreshContextApp, notice: types.SemanticNotice, _: bool) !void {
         self.context_notice_tone = notice.tone;
         self.context_notice_visibility = notice.visibility;
         try self.context_notices.appendSlice(self.alloc, notice.body);
@@ -1672,7 +1681,7 @@ const FakeApp = struct {
         return app;
     }
 
-    fn toolRegistry(self: *const FakeApp) tool_dispatch.Registry {
+    pub fn toolRegistry(self: *const FakeApp) tool_dispatch.Registry {
         return self.tool_registry;
     }
 
@@ -1680,7 +1689,7 @@ const FakeApp = struct {
         return self.context_registry;
     }
 
-    fn snapshotMcpModelCatalog(
+    pub fn snapshotMcpModelCatalog(
         self: *FakeApp,
         alloc: Allocator,
         _: types.PermissionRuleSet,
@@ -2336,7 +2345,7 @@ test "app agent runtime bounds a large multiline run command activity" {
     var app = try FakeApp.init(alloc);
     defer app.deinit();
 
-    const arguments_json = "{\"action\":\"run\",\"command\":\"" ++ ("x\\n" ** 20_000) ++ "\"}";
+    const arguments_json = "{\"action\":\"run\",\"command\":\"" ++ text_utils.repeat("x\\n", 20_000) ++ "\"}";
     const label = try app.describeToolAction(arena, .{
         .id = "large_command",
         .name = "shell",
@@ -2880,7 +2889,7 @@ test "manual compaction worker call commits a checkpoint without a continuation"
     const steps = [_]types.ToolExecutionStep{.{ .tool_calls = @constCast(&calls), .tool_results = @constCast(&results) }};
     job.history[0] = try types.dupeHistoryTurn(alloc, .{ .assistant = .{
         .user = .{ .text = @constCast("exact user request") },
-        .assistant = @constCast("exact completed response\n" ++ ("evidence " ** 1_000)),
+        .assistant = @constCast("exact completed response\n" ++ text_utils.repeat("evidence ", 1_000)),
         .execution = .{ .tool_steps = @constCast(&steps) },
     } });
     job.history[1] = try types.dupeHistoryTurn(alloc, .{ .assistant = .{

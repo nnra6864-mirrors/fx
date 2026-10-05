@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const command_admission = @import("../permissions/command_admission.zig");
 const command_contract = @import("command_contract.zig");
@@ -1612,7 +1613,7 @@ fn testAuthority(input: StartCapturedInput) command_admission.CommandExecutionAu
 
 test "captured managed execution yields one handle and delivers ordered output once" {
     if (comptime builtin.os.tag == .wasi) return;
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var runtime = Runtime.init(alloc);
     defer runtime.deinit();
     var input = StartCapturedInput{

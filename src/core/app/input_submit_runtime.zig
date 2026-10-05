@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const paste_blocks = @import("../input/pasted_blocks.zig");
 const registered_entities = @import("../input/registered_entities.zig");
 const image_attachments = @import("../images/image_attachments.zig");
@@ -2004,7 +2005,7 @@ fn checkPendingDraftConstructionAllocationFailure(alloc: std.mem.Allocator) !voi
 
 test "pending draft construction frees every partial allocation" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkPendingDraftConstructionAllocationFailure,
         .{},
     );

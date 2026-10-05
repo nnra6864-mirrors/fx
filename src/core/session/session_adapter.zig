@@ -21,6 +21,7 @@
 //!   writable open (D47, `tla/MoveSideFiles.tla`).
 
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const sm = @import("session_manager");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -41,6 +42,7 @@ const session_summary_codec = @import("session_summary_codec.zig");
 const artifact_digest = @import("artifact_digest.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const model_provider = @import("../config/model_provider.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const Event = session_event.ConversationEvent;
@@ -2776,8 +2778,8 @@ fn newestUsage(store: *Store, alloc: Allocator, id: []const u8) !?UsageCheckpoin
 /// Whether a failed write may still have reached the log: after any I/O
 /// fault, whatever its cause, durability is unknown (D29).
 pub fn writeMayHaveLanded(err: anyerror) bool {
-    inline for (@typeInfo(sm.IoFault).error_set.?) |fault| {
-        if (err == @field(sm.IoFault, fault.name)) return true;
+    inline for (comptime @typeInfo(sm.IoFault).error_set.error_names.?) |fault_name| {
+        if (err == @field(sm.IoFault, fault_name)) return true;
     }
     return false;
 }
@@ -2871,8 +2873,8 @@ fn itemType(kind: PieceKind) ?[]const u8 {
 }
 
 fn pieceKind(item_type: []const u8) ?PieceKind {
-    inline for (@typeInfo(PieceKind).@"enum".fields) |field| {
-        const kind: PieceKind = @enumFromInt(field.value);
+    inline for (@typeInfo(PieceKind).@"enum".field_values) |field_value| {
+        const kind: PieceKind = @fromBackingInt(@intCast(field_value));
         if (itemType(kind)) |name| {
             if (std.mem.eql(u8, name, item_type)) return kind;
         }
@@ -2971,10 +2973,10 @@ const WireUser = struct {
 
         pub fn jsonStringify(self: WireImage, writer: *std.json.Stringify) !void {
             try writer.beginObject();
-            inline for (std.meta.fields(WireImage)) |field| {
-                if (!std.mem.eql(u8, field.name, "source_ref") or self.source_ref != null) {
-                    try writer.objectField(field.name);
-                    try writer.write(@field(self, field.name));
+            inline for (@typeInfo(WireImage).@"struct".field_names) |field_name| {
+                if (!std.mem.eql(u8, field_name, "source_ref") or self.source_ref != null) {
+                    try writer.objectField(field_name);
+                    try writer.write(@field(self, field_name));
                 }
             }
             try writer.endObject();
@@ -3130,8 +3132,8 @@ fn deriveTitle(arena: Allocator, history: []const types.HistoryTurn) !?[]const u
 const testing = std.testing;
 
 test "every piece kind but checkpoints maps to one item type and back" {
-    inline for (@typeInfo(PieceKind).@"enum".fields) |field| {
-        const kind: PieceKind = @enumFromInt(field.value);
+    inline for (@typeInfo(PieceKind).@"enum".field_values) |field_value| {
+        const kind: PieceKind = @fromBackingInt(@intCast(field_value));
         if (itemType(kind)) |name| {
             try testing.expectEqual(@as(?PieceKind, kind), pieceKind(name));
         } else {
@@ -3403,7 +3405,7 @@ test "a copy of a parent's children frees every part when memory runs out" {
             freeChildren(alloc, try session.children(alloc));
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Copy.run, .{parent});
+    try testing.checkAllAllocationFailures(testing_allocator.no_resize, Copy.run, .{parent});
 }
 
 fn countItems(manager: *sm.Manager, id: []const u8, item_type: []const u8) !usize {
@@ -4727,7 +4729,7 @@ test "v2 image source refs reject malformed metadata" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    for ([_][]const u8{ "", "bad\nref", "x" ** 513 }) |source_ref| {
+    for ([_][]const u8{ "", "bad\nref", text_utils.repeat("x", 513) }) |source_ref| {
         const images = [_]types.ImageAttachment{.{
             .id = 1,
             .path = @constCast("image.png"),
@@ -4742,8 +4744,8 @@ test "v2 image source refs reject malformed metadata" {
 }
 
 test "only the adapter imports the session manager" {
-    // Set by `zig build test`; tests read the process environment directly.
-    const root = std.mem.span(std.c.getenv("FX_TEST_SOURCE_ROOT") orelse return error.SkipZigTest);
+    // Set by `zig build test`.
+    const root = @import("test_paths").source_root;
     const io = io_mod.getIo();
     var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
     defer dir.close(io);

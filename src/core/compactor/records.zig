@@ -860,7 +860,7 @@ test "conversation outranks tool output, and both a saved ledger, on equal score
 }
 
 test "excerpts of one long line never split a UTF-8 character" {
-    const line = ("é" ** 2000) ++ " needle " ++ ("ü" ** 2000);
+    const line = text_utils.repeat("é", 2000) ++ " needle " ++ text_utils.repeat("ü", 2000);
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -875,7 +875,7 @@ test "long shell results show the matching part of their one JSON line" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const body = "{\"session_id\":null,\"output_delta\":\"" ++ ("noise row here\\n" ** 400) ++ "total sessions: 11,355\\n" ++ ("more noise\\n" ** 400) ++ "\"}";
+    const body = "{\"session_id\":null,\"output_delta\":\"" ++ text_utils.repeat("noise row here\\n", 400) ++ "total sessions: 11,355\\n" ++ text_utils.repeat("more noise\\n", 400) ++ "\"}";
     const query = try prepareQuery(arena, &.{"total sessions"});
     // A word right after an escaped newline is still that word.
     var counts: [max_terms]u32 = @splat(0);

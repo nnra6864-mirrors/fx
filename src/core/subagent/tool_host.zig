@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const approval_registry = @import("approval_registry.zig");
 const authority = @import("authority.zig");
 const child_state = @import("child_state.zig");
@@ -907,7 +908,7 @@ pub const Runtime = struct {
                 .body = try model_contract.encodeResultAlloc(arena, model_contract.feedbackResult(update.delivery)),
                 .max_result_bytes = tool_result_limits.min_configured_tool_result_bytes,
                 .delivered = false,
-                .receipt_sequence = @as(u64, @intFromEnum(update.delivery)) + 1,
+                .receipt_sequence = @as(u64, @backingInt(update.delivery)) + 1,
             });
         }
         return results.toOwnedSlice(arena);
@@ -1182,7 +1183,7 @@ fn checkYieldedOwnership(alloc: Allocator) !void {
 }
 
 test "subagent yielded identity is owned and allocation failures do not leak" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkYieldedOwnership, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkYieldedOwnership, .{});
 }
 
 test "subagent admission preserves an undelivered result before advancing its child" {

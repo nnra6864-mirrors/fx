@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const builtin_skills = @import("../../builtins/skills.zig");
 const skill_invocation = @import("../../core/skills/skill_invocation.zig");
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
@@ -434,7 +435,7 @@ fn checkDecodeAllocationFailures(alloc: Allocator) !void {
 
 test "skill tool decode cleans allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkDecodeAllocationFailures,
         .{},
     );

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../shared/testing_allocator.zig");
 const skill_contract = @import("../../skills/skill_contract.zig");
 const types = @import("../../shared/types.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
@@ -904,7 +905,7 @@ fn checkParallelRunAllocationFailures(alloc: Allocator) !void {
 
 test "parallel run cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkParallelRunAllocationFailures,
         .{},
     );
@@ -975,7 +976,7 @@ fn checkParallelResultDuplicationAllocationFailures(alloc: Allocator) !void {
 
 test "parallel result duplication cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkParallelResultDuplicationAllocationFailures,
         .{},
     );

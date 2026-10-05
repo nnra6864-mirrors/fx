@@ -54,7 +54,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: "0.16.0"
+          version: "0.17.0"
           use-cache: false
 
       - name: Test size reporter
@@ -96,7 +96,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/fx-binary-size-base-bin
-          key: binary-size-base-v1-${{ matrix.target }}-zig-0.16.0-${{ env.BASE_SHA }}
+          key: binary-size-base-v1-${{ matrix.target }}-zig-0.17.0-${{ env.BASE_SHA }}
 
       - name: Build base binary
         if: steps.base-cache.outputs.cache-hit != 'true'
@@ -126,7 +126,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/fx-binary-size-base-bin
-          key: binary-size-base-v1-${{ matrix.target }}-zig-0.16.0-${{ env.BASE_SHA }}
+          key: binary-size-base-v1-${{ matrix.target }}-zig-0.17.0-${{ env.BASE_SHA }}
 
       - name: Measure base binary
         shell: bash

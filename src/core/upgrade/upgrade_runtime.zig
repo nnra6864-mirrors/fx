@@ -271,18 +271,18 @@ const ProgressSnapshot = struct {
 };
 
 const ProgressState = struct {
-    phase: std.atomic.Value(u8) = .init(@intFromEnum(ProgressPhase.checking)),
+    phase: std.atomic.Value(u8) = .init(@backingInt(ProgressPhase.checking)),
     downloaded: std.atomic.Value(u64) = .init(0),
     total: std.atomic.Value(u64) = .init(0),
 
     fn markUpdateFound(self: *ProgressState) void {
-        self.phase.store(@intFromEnum(ProgressPhase.found), .release);
+        self.phase.store(@backingInt(ProgressPhase.found), .release);
     }
 
     fn markDownloadStart(self: *ProgressState, total: ?u64) void {
         self.downloaded.store(0, .release);
         self.total.store(total orelse 0, .release);
-        self.phase.store(@intFromEnum(if (total == null) ProgressPhase.downloading_unknown else ProgressPhase.downloading_known), .release);
+        self.phase.store(@backingInt(if (total == null) ProgressPhase.downloading_unknown else ProgressPhase.downloading_known), .release);
     }
 
     fn markDownloadProgress(self: *ProgressState, downloaded: u64, total: ?u64) void {
@@ -291,7 +291,7 @@ const ProgressState = struct {
     }
 
     fn markFinishing(self: *ProgressState) void {
-        self.phase.store(@intFromEnum(ProgressPhase.finishing), .release);
+        self.phase.store(@backingInt(ProgressPhase.finishing), .release);
     }
 
     fn snapshot(self: *ProgressState) ProgressSnapshot {
@@ -306,11 +306,11 @@ const ProgressState = struct {
 
 fn progressPhaseFromRaw(raw: u8) ProgressPhase {
     return switch (raw) {
-        @intFromEnum(ProgressPhase.checking) => .checking,
-        @intFromEnum(ProgressPhase.found) => .found,
-        @intFromEnum(ProgressPhase.downloading_known) => .downloading_known,
-        @intFromEnum(ProgressPhase.downloading_unknown) => .downloading_unknown,
-        @intFromEnum(ProgressPhase.finishing) => .finishing,
+        @backingInt(ProgressPhase.checking) => .checking,
+        @backingInt(ProgressPhase.found) => .found,
+        @backingInt(ProgressPhase.downloading_known) => .downloading_known,
+        @backingInt(ProgressPhase.downloading_unknown) => .downloading_unknown,
+        @backingInt(ProgressPhase.finishing) => .finishing,
         else => .checking,
     };
 }

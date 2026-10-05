@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const file_picker_path = @import("../input/file_picker_path.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -9,6 +10,7 @@ const skill_contract = @import("skill_contract.zig");
 const context_limits = @import("../config/context_limits.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const catalog_notice_name_count: usize = 8;
@@ -452,7 +454,7 @@ fn collectRootFingerprints(
         const candidate_digest = if (stat.kind == .directory)
             try candidateDirectoryDigest(alloc, root)
         else
-            [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length;
+            @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0));
         fingerprints[filled] = .{
             .path = path,
             .exists = true,
@@ -1553,7 +1555,7 @@ const RootFingerprint = struct {
     inode: std.Io.File.INode = 0,
     mtime: std.Io.Timestamp = .zero,
     candidate_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 =
-        [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
+        @splat(0),
 
     fn deinit(self: *RootFingerprint, alloc: Allocator) void {
         alloc.free(self.path);
@@ -3581,7 +3583,7 @@ test "skill runtime keeps menu count selection and query on one index" {
 }
 
 test "skill menu query navigation and close stay allocation free for ten thousand cycles" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     const skills = [_]Skill{
         .{ .name = "alpha", .description = "first", .path = "/skills/alpha", .source = .global_fx },
         .{ .name = "beta", .description = "second", .path = "/skills/beta", .source = .global_codex },
@@ -3608,16 +3610,16 @@ test "skill menu query navigation and close stay allocation free for ten thousan
 }
 
 test "skill runtime replacement preserves the active catalog when index allocation fails" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     const active = [_]Skill{
         .{ .name = "active", .description = "active", .path = "/skills/active", .source = .global_fx },
     };
-    const replacement = [_]Skill{.{
+    const replacement: [64]Skill = @splat(.{
         .name = "replacement",
         .description = "replacement",
         .path = "/skills/replacement",
         .source = .global_fx,
-    }} ** 64;
+    });
     var runtime = Runtime{ .items = @constCast(&active) };
     defer {
         runtime.items = &.{};
@@ -4025,7 +4027,7 @@ fn createTempFifoOrSkip(alloc: Allocator, tmp: *std.testing.TmpDir, sub_path: []
     const path = try std.fs.path.join(alloc, &.{ root, sub_path });
     defer alloc.free(path);
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_buf, "{s}", .{path});
+    const path_z = try std.fmt.bufPrintSentinel(&path_buf, "{s}", .{path}, 0);
     if (mkfifo(path_z, 0o600) != 0) return error.SkipZigTest;
 }
 
@@ -4169,7 +4171,7 @@ test "explicit skill matching parses natural language once for a large catalog" 
         skill.* = staticSkill(name, "", .workspace_shared);
     }
 
-    var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var counting = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     const allocation_count = count: {
         const matches = try matchExplicitSkillIndices(
             counting.allocator(),
@@ -4482,7 +4484,7 @@ test "skill catalog uses model capacity and preserves explicit byte overrides" {
     var skills: [16]Skill = undefined;
     for (&skills, 0..) |*skill, index| {
         const name = try std.fmt.bufPrint(&storage[index], "entry-{d}", .{index});
-        skill.* = .{ .name = name, .description = "useful instructions " ** 80, .path = name, .source = .global_fx };
+        skill.* = .{ .name = name, .description = text_utils.repeat("useful instructions ", 80), .path = name, .source = .global_fx };
     }
     var unknown = try buildSkillPrompt(alloc, &skills, &.{}, .{}, null);
     defer unknown.deinit(alloc);
@@ -4545,15 +4547,15 @@ fn checkSkillPromptAllocationFailures(alloc: Allocator) !void {
 }
 
 test "skill catalog releases partial projection allocations" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkSkillPromptAllocationFailures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkSkillPromptAllocationFailures, .{});
 }
 
 test "skill catalog shortens descriptions before omitting identities" {
     const alloc = std.testing.allocator;
     var skills = [_]Skill{
-        .{ .name = "alpha", .description = "First useful description. " ** 30, .path = "/tmp/skills/alpha", .source = .global_fx },
-        .{ .name = "beta", .description = "Second useful description. " ** 30, .path = "/tmp/skills/beta", .source = .global_fx },
-        .{ .name = "gamma", .description = "Third useful description. " ** 30, .path = "/tmp/skills/gamma", .source = .global_fx },
+        .{ .name = "alpha", .description = text_utils.repeat("First useful description. ", 30), .path = "/tmp/skills/alpha", .source = .global_fx },
+        .{ .name = "beta", .description = text_utils.repeat("Second useful description. ", 30), .path = "/tmp/skills/beta", .source = .global_fx },
+        .{ .name = "gamma", .description = text_utils.repeat("Third useful description. ", 30), .path = "/tmp/skills/gamma", .source = .global_fx },
     };
     var limits = context_limits.Values{};
     limits.skill_catalog_bytes = .{ .value = .{ .bytes = 768 }, .source = .command_line };
@@ -4647,7 +4649,7 @@ test "skill catalog one-byte overflow reports every omitted name in stable order
 
 test "skill catalog omission notices bound hostile names and list length" {
     const alloc = std.testing.allocator;
-    const huge_name = "n" ** 4096;
+    const huge_name = text_utils.repeat("n", 4096);
     var skills: [20]Skill = undefined;
     for (&skills) |*skill| skill.* = staticSkill(huge_name, "", .workspace_shared);
     var limits = context_limits.Values{};
@@ -4658,7 +4660,7 @@ test "skill catalog omission notices bound hostile names and list length" {
 
     const notice = result.notice orelse return error.TestExpectedEqual;
     try std.testing.expect(notice.len < 16 * 1024);
-    try std.testing.expectEqual(@as(usize, 8), std.mem.count(u8, notice, "n" ** skill_contract.max_name_bytes));
+    try std.testing.expectEqual(@as(usize, 8), std.mem.count(u8, notice, text_utils.repeat("n", skill_contract.max_name_bytes)));
     try std.testing.expect(std.mem.find(u8, notice, "+12 more") != null);
 }
 
@@ -5180,7 +5182,7 @@ test "linked metadata FIFO is rejected before descriptor open" {
     const fifo_path = try std.fs.path.join(alloc, &.{ workspace_root, "metadata.fifo" });
     defer alloc.free(fifo_path);
     var fifo_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const fifo_path_z = try std.fmt.bufPrintZ(&fifo_path_buf, "{s}", .{fifo_path});
+    const fifo_path_z = try std.fmt.bufPrintSentinel(&fifo_path_buf, "{s}", .{fifo_path}, 0);
     const candidate_path = try std.fs.path.join(alloc, &.{ workspace_root, ".codex/skills/fifo" });
     defer alloc.free(candidate_path);
     var candidate_dir = try io_mod.openDirAbsoluteNoFollow(candidate_path, .{});
@@ -5428,7 +5430,7 @@ test "loadVisibleSkills cleans contained-link authority allocation failures" {
     defer alloc.free(managed_root);
 
     try std.testing.checkAllAllocationFailures(
-        alloc,
+        testing_allocator.no_resize,
         checkContainedLinkedSkillAllocationFailures,
         .{ workspace_root, home_root, managed_root },
     );
@@ -5726,7 +5728,7 @@ test "loadVisibleSkills cleans every partial allocation failure" {
     defer alloc.free(managed_root);
 
     try std.testing.checkAllAllocationFailures(
-        alloc,
+        testing_allocator.no_resize,
         checkLoadVisibleSkillsAllocationFailures,
         .{ workspace_root, home_root, managed_root },
     );
@@ -5776,7 +5778,7 @@ test "linked metadata cleans every partial allocation failure" {
 
     const descriptor_count_before = try openFileDescriptorCount();
     try std.testing.checkAllAllocationFailures(
-        alloc,
+        testing_allocator.no_resize,
         checkLinkedMetadataAllocationFailures,
         .{ workspace_root, home_root, managed_root },
     );

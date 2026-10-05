@@ -32,8 +32,9 @@ pub const Name = enum {
     }
 
     pub fn parse(raw: []const u8) ?Name {
-        inline for (std.meta.fields(Name)) |field| {
-            if (std.mem.eql(u8, raw, field.name)) return @enumFromInt(field.value);
+        const name_info = @typeInfo(Name).@"enum";
+        inline for (name_info.field_names, name_info.field_values) |field_name, field_value| {
+            if (std.mem.eql(u8, raw, field_name)) return @fromBackingInt(@intCast(field_value));
         }
         return null;
     }
@@ -105,9 +106,10 @@ pub const Values = struct {
     }
 
     pub fn apply(self: *Values, overrides: Overrides) void {
-        inline for (std.meta.fields(Name)) |field| {
-            const name: Name = @enumFromInt(field.value);
-            if (overrides.get(name)) |value| @field(self, field.name) = value;
+        const name_info = @typeInfo(Name).@"enum";
+        inline for (name_info.field_names, name_info.field_values) |field_name, field_value| {
+            const name: Name = @fromBackingInt(@intCast(field_value));
+            if (overrides.get(name)) |value| @field(self, field_name) = value;
         }
     }
 
@@ -150,14 +152,14 @@ pub const Overrides = struct {
     }
 
     pub fn retag(self: *Overrides, source: Source) void {
-        inline for (std.meta.fields(Name)) |field| {
-            if (@field(self, field.name)) |*value| value.source = source;
+        inline for (@typeInfo(Name).@"enum".field_names) |field_name| {
+            if (@field(self, field_name)) |*value| value.source = source;
         }
     }
 
     pub fn merge(self: *Overrides, incoming: Overrides) void {
-        inline for (std.meta.fields(Name)) |field| {
-            if (@field(incoming, field.name)) |value| @field(self, field.name) = value;
+        inline for (@typeInfo(Name).@"enum".field_names) |field_name| {
+            if (@field(incoming, field_name)) |value| @field(self, field_name) = value;
         }
     }
 };
@@ -223,8 +225,8 @@ pub fn lineSafePrefixLength(bytes: []const u8, max_bytes: usize) usize {
 
 test "defaults match the public context limit contract" {
     const values = Values{};
-    inline for (std.meta.fields(Name)) |field| {
-        const name: Name = @enumFromInt(field.value);
+    inline for (@typeInfo(Name).@"enum".field_values) |field_value| {
+        const name: Name = @fromBackingInt(@intCast(field_value));
         try std.testing.expectEqual(name.defaultBytes(), values.get(name).effectiveBytes());
         try std.testing.expectEqual(Source.compiled_default, values.get(name).source);
     }

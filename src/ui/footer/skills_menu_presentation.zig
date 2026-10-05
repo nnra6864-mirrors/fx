@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
 const list_window = @import("../../core/shared/list_window.zig");
@@ -618,7 +619,7 @@ test "prepared skills menu borrows one indexed query without allocating" {
         .index_ready = true,
     };
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
 

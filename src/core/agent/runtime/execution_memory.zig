@@ -863,7 +863,7 @@ test "request image notices keep clipped source references as JSON text" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const source_ref = "é" ** 256;
+    const source_ref = text_utils.repeat("é", 256);
     var image = try testPngHeaderToolImage(arena, 8001, 1);
     image.source_ref = try arena.dupe(u8, source_ref);
     const images = [_]types.ToolImage{ image, image };
@@ -1481,7 +1481,7 @@ test "saved preparation stores complete output verbatim on cap loss" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var cancel = std.atomic.Value(bool).init(false);
-    const raw = "MY_UNIT_TOKEN=abcdefgh" ** 47;
+    const raw = text_utils.repeat("MY_UNIT_TOKEN=abcdefgh", 47);
     try std.testing.expect(raw.len > tool_result_limits.min_configured_tool_result_bytes);
 
     const prepared = try prepareToolModelOutput(
@@ -1520,7 +1520,7 @@ test "no-save preparation preserves capped output verbatim without a result hand
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var cancel = std.atomic.Value(bool).init(false);
-    const raw = "MY_UNIT_TOKEN=abcdefgh" ** 47;
+    const raw = text_utils.repeat("MY_UNIT_TOKEN=abcdefgh", 47);
 
     const prepared = try prepareToolModelOutput(
         arena,
@@ -1651,7 +1651,7 @@ test "retrieved output storage failure does not publish an unbacked result" {
         .cancel_flag = &cancel,
         .max_tool_result_bytes = 1024,
         .session_child_capability = &readonly,
-    }, toolCall("retrieval-store-error", "read_tool_result", "{}"), "x" ** 1025));
+    }, toolCall("retrieval-store-error", "read_tool_result", "{}"), text_utils.repeat("x", 1025)));
 }
 
 test "saved tool output preparation keeps builtins and dynamic tools compactable" {
@@ -1667,7 +1667,7 @@ test "saved tool output preparation keeps builtins and dynamic tools compactable
         var arena_state = std.heap.ArenaAllocator.init(alloc);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        const raw = "COMPLETE_TOOL_BODY\n" ++ "x" ** 8192;
+        const raw = "COMPLETE_TOOL_BODY\n" ++ text_utils.repeat("x", 8192);
         const prepared = try prepareToolModelOutput(arena, .{
             .system_prompt = "",
             .gateway_retry_count = 0,

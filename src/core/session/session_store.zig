@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const config_runtime = @import("../config/config_runtime.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -26,6 +27,7 @@ const session_display_metadata = @import("session_display_metadata.zig");
 const session_usage = @import("session_usage.zig");
 const session_usage_sidecar = @import("session_usage_sidecar.zig");
 const subagent_child_state = @import("../subagent/child_state.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const Allocator = std.mem.Allocator;
 
 const authority_module = @import("session_authority.zig");
@@ -4737,8 +4739,8 @@ test "recovery copy preserves spilled diff artifacts end to end" {
     );
     defer initial.deinit(alloc);
 
-    const previous = "RECOVERY_PREVIOUS_0123456789abcdef\n" ** 180;
-    const after = "RECOVERY_AFTER_0123456789abcdef\n" ** 180;
+    const previous = text_utils.repeat("RECOVERY_PREVIOUS_0123456789abcdef\n", 180);
+    const after = text_utils.repeat("RECOVERY_AFTER_0123456789abcdef\n", 180);
     const output = "edited source.zig";
     const output_handle = try testStoredResultHandle(
         alloc,
@@ -4969,7 +4971,7 @@ test "resume commits legacy permission state migration before publication" {
 }
 
 fn chmodPath(alloc: Allocator, path: []const u8, mode: std.c.mode_t) !void {
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     if (std.c.chmod(path_z.ptr, mode) != 0) return error.ChmodFailed;
 }
@@ -6592,7 +6594,7 @@ test "recovery command replay allocation failures propagate without changing sou
     var source_file = try source.openFileReadOnly(alloc, .command_artifacts, replay.available.handle);
     defer source_file.deinit();
     const before = try managedFileDigest(&source_file, replay.available.framed_bytes);
-    try std.testing.checkAllAllocationFailures(alloc, struct {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
         fn check(test_alloc: Allocator, input: *session_child_store.SessionChildCapability, output: *session_child_store.SessionChildCapability, value: core_types.CommandOutputReplay) !void {
             // Each failure run starts from the same absent-target state.
             defer output.delete(.command_artifacts, value.available.handle) catch {};
@@ -6769,7 +6771,7 @@ test "recovery rejects unloadable diff artifacts before promotion" {
 
 test "recovery canonicalizes inline diff snapshots to the persisted handle" {
     const alloc = std.testing.allocator;
-    const content = "recovered-inline-snapshot\n" ** 180;
+    const content = text_utils.repeat("recovered-inline-snapshot\n", 180);
     var inline_results = [_]core_types.PersistedToolResult{.{
         .tool_call_id = @constCast("recover-edit"),
         .tool_name = @constCast("edit_file"),
@@ -6902,8 +6904,8 @@ test "recovery copies diff content artifacts and rejects changed content" {
     defer source.deinit();
     var target = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, target_path, .tool_results, .writable);
     defer target.deinit();
-    const previous = "before\n" ** 800;
-    const after = "after\n" ** 800;
+    const previous = text_utils.repeat("before\n", 800);
+    const after = text_utils.repeat("after\n", 800);
     const handle = try result_store.storeDiffContent(
         alloc,
         source_path,
@@ -7530,7 +7532,7 @@ test "missing session ID error and unsupported schema error" {
 }
 
 test "list propagates OOM and access errors" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var ctx = try initTempStore(alloc, &tmp);
@@ -7992,7 +7994,7 @@ test "a FIFO in a session never blocks listing or latest resume" {
             const root = try io_mod.dirRealpathAlloc(alloc, dir.dir, ".");
             defer alloc.free(root);
             var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const path = try std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ root, case.file });
+            const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}", .{ root, case.file }, 0);
             if (mkfifo(path, 0o600) != 0) return error.SkipZigTest;
         }
         // A blocking open of the FIFO would wait for a writer that never comes.
@@ -8377,7 +8379,7 @@ test "first write traces and maps shared layout failure" {
     defer debug_trace.resetForTest();
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
-    const home_z = try alloc.dupeZ(u8, home);
+    const home_z = try alloc.dupeSentinel(u8, home, 0);
     defer alloc.free(home_z);
     if (std.c.chmod(home_z.ptr, 0o500) != 0) return error.TestUnexpectedResult;
     defer _ = std.c.chmod(home_z.ptr, 0o700);
@@ -9232,7 +9234,7 @@ test "history page digest rejects invalid review feedback" {
 }
 
 test "conversation visitation releases turns on consumer and allocation failure" {
-    const backing = std.testing.allocator;
+    const backing = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var ctx = try initTempStore(backing, &tmp);
@@ -9289,7 +9291,7 @@ test "conversation visitation releases turns on consumer and allocation failure"
 }
 
 test "history page allocation failure sweep frees replay and page ownership" {
-    const backing = std.testing.allocator;
+    const backing = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var ctx = try initTempStore(backing, &tmp);

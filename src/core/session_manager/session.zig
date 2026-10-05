@@ -233,7 +233,7 @@ pub const Session = struct {
     /// Written under `mutex`, read under `sync_mutex`.
     written_seq: SeqCell = .{},
     /// A sync that failed outside `mutex`, as a `FaultCode`; `none` until then.
-    sync_fault: std.atomic.Value(u8) = .init(@intFromEnum(FaultCode.none)),
+    sync_fault: std.atomic.Value(u8) = .init(@backingInt(FaultCode.none)),
     /// Under `mutex`: the cause of the write or sync that failed the
     /// session. Every later call reports it (D40).
     fault: ?storage.IoFault = null,
@@ -406,12 +406,16 @@ pub const Session = struct {
     /// durable, then rename it into place and sync the root, so a visible
     /// session always has a durable first line (`tla/Lifecycle.tla`).
     fn publish(session: *Session, bodies: []const schema.Body, ts: u64) AppendError!void {
-        const gpa = session.env.gpa;
-        // Nothing is visible; later calls name the cause (D40).
-        errdefer |err| {
+        session.writeFirstTurn(bodies, ts) catch |err| {
+            // Nothing is visible; later calls name the cause (D40).
             session.phase = .{ .failed = null };
             if (session.fault == null) session.fault = asIoFault(err);
-        }
+            return err;
+        };
+    }
+
+    fn writeFirstTurn(session: *Session, bodies: []const schema.Body, ts: u64) AppendError!void {
+        const gpa = session.env.gpa;
 
         // Frame everything first: line 1, the held lines, then the batch.
         session.batch.clearRetainingCapacity();
@@ -725,7 +729,7 @@ pub const Session = struct {
         session.env.s.sync(file) catch |err| {
             const fault = storage.ioFault(err);
             // Only the first cause is kept; a later failure changes nothing.
-            _ = session.sync_fault.cmpxchgStrong(@intFromEnum(FaultCode.none), @intFromEnum(faultCode(fault)), .release, .monotonic);
+            _ = session.sync_fault.cmpxchgStrong(@backingInt(FaultCode.none), @backingInt(faultCode(fault)), .release, .monotonic);
             return fault;
         };
         session.synced_seq = target;
@@ -905,8 +909,8 @@ fn faultFromCode(code: u8) ?storage.IoFault {
 
 test "a fault code round trips every I/O fault, and none is no fault" {
     const faults = [_]storage.IoFault{ error.Io, error.NoSpaceLeft, error.AccessDenied, error.ReadOnlyFileSystem, error.FileTooBig };
-    for (faults) |fault| try std.testing.expectEqual(fault, faultFromCode(@intFromEnum(faultCode(fault))).?);
-    try std.testing.expectEqual(@as(?storage.IoFault, null), faultFromCode(@intFromEnum(FaultCode.none)));
+    for (faults) |fault| try std.testing.expectEqual(fault, faultFromCode(@backingInt(faultCode(fault))).?);
+    try std.testing.expectEqual(@as(?storage.IoFault, null), faultFromCode(@backingInt(FaultCode.none)));
 }
 
 fn hasBlobRefs(bodies: []const schema.Body) bool {
@@ -2564,7 +2568,7 @@ const session_tests = struct {
         t.init(.{ .snapshot_every_bytes = 256 });
         defer t.deinit();
         const s = try newRoot(&t);
-        const big: fold.Event = .{ .item = .{ .type = "assistant", .data = "{\"text\":\"" ++ "x" ** 200 ++ "\"}" } };
+        const big: fold.Event = .{ .item = .{ .type = "assistant", .data = "{\"text\":\"" ++ &@as([200]u8, @splat('x')) ++ "\"}" } };
         _ = try s.append(&.{ .turn_started, big, .turn_committed });
         _ = try s.append(&.{ .turn_started, .{ .compacted = "{}" }, big, .turn_committed });
         _ = try s.append(&.{ .turn_started, big, .turn_committed });

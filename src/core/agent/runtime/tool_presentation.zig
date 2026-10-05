@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../shared/testing_allocator.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const managed_execution = @import("../../execution/managed_execution.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
@@ -2352,7 +2353,7 @@ fn checkProvisionalLifecycleAllocationFailures(alloc: Allocator) !void {
 
 test "provisional lifecycle cleans up every copied-id allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkProvisionalLifecycleAllocationFailures,
         .{},
     );

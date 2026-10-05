@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const build_checkpoint = @import("../render_engine/build_checkpoint.zig");
 const transcript_blocks = @import("../render_engine/transcript_blocks.zig");
 const types = @import("../../core/shared/types.zig");
@@ -9,6 +10,7 @@ const sort_utils = @import("../../core/shared/sort_utils.zig");
 const ui_render = @import("../render.zig");
 const code_highlight = @import("../../core/agent/presentation/code_highlight.zig");
 const code_highlight_languages = @import("../../core/agent/presentation/code_highlight_languages.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 
 const TranscriptEntry = transcript_blocks.TranscriptEntry;
 const ToolDetailRecord = transcript_blocks.ToolDetailRecord;
@@ -1768,7 +1770,7 @@ test "completed command rows shell-highlight quoted strings without coloring the
 
 test "minimal completed command rows reproject stored arguments at the current width" {
     const alloc = std.testing.allocator;
-    const command = "printf " ++ ("alpha-beta-gamma-delta-" ** 8);
+    const command = "printf " ++ text_utils.repeat("alpha-beta-gamma-delta-", 8);
     const arguments_json = try std.fmt.allocPrint(
         alloc,
         "{{\"command\":{f}}}",
@@ -1806,7 +1808,7 @@ test "minimal completed command rows reproject stored arguments at the current w
     var wide = try build(alloc, &entries, &details, 240);
     defer wide.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mprintf\x1b[39m " ++ ("alpha-beta-gamma-delta-" ** 8),
+        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mprintf\x1b[39m " ++ text_utils.repeat("alpha-beta-gamma-delta-", 8),
         wide.entry_actions.items[0].override.bytes,
     );
 
@@ -1822,7 +1824,7 @@ test "minimal completed command rows reproject stored arguments at the current w
     defer legacy.deinit(alloc);
     try std.testing.expect(std.mem.endsWith(u8, legacy.entry_actions.items[0].override.bytes, "..."));
 
-    const relative_command = "cd ./packages/cli && " ++ ("printf relative-path " ** 6);
+    const relative_command = "cd ./packages/cli && " ++ text_utils.repeat("printf relative-path ", 6);
     const relative_arguments_json = try std.fmt.allocPrint(
         alloc,
         "{{\"command\":{f}}}",
@@ -1852,7 +1854,7 @@ test "minimal completed command rows reproject stored arguments at the current w
     var relative = try build(alloc, &relative_entries, &relative_details, 240);
     defer relative.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mcd\x1b[39m ./packages/cli \x1b[38;5;252m&&\x1b[39m \x1b[38;5;252mprintf\x1b[39m" ++ (" relative-path printf" ** 5) ++ " relative-path ",
+        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mcd\x1b[39m ./packages/cli \x1b[38;5;252m&&\x1b[39m \x1b[38;5;252mprintf\x1b[39m" ++ text_utils.repeat(" relative-path printf", 5) ++ " relative-path ",
         relative.entry_actions.items[0].override.bytes,
     );
 
@@ -1877,15 +1879,15 @@ test "minimal completed command rows reproject stored arguments at the current w
     var compatibility = try build(alloc, &compatibility_entries, &compatibility_details, 240);
     defer compatibility.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Installed skill \x1b[38;5;252mprintf\x1b[39m " ++ ("alpha-beta-gamma-delta-" ** 8),
+        "● 1 tool call · 1 command\n└ Installed skill \x1b[38;5;252mprintf\x1b[39m " ++ text_utils.repeat("alpha-beta-gamma-delta-", 8),
         compatibility.entry_actions.items[0].override.bytes,
     );
 }
 
 test "completed session and tty command rows reproject stored commands at the current width" {
     const alloc = std.testing.allocator;
-    const tty_command = "bun run " ++ ("pipeline-stage-" ** 10);
-    const observe_command = "npm run " ++ ("dev-server-" ** 12);
+    const tty_command = "bun run " ++ text_utils.repeat("pipeline-stage-", 10);
+    const observe_command = "npm run " ++ text_utils.repeat("dev-server-", 12);
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{
             .id = 1,
@@ -1941,15 +1943,15 @@ test "completed session and tty command rows reproject stored commands at the cu
     defer wide.deinit(alloc);
     try std.testing.expectEqualStrings(
         "● 2 tool calls · 2 commands\n" ++
-            "├ Ran \x1b[38;5;252mbun\x1b[39m run " ++ ("pipeline-stage-" ** 10) ++ "\n" ++
-            "└ Observed \x1b[38;5;252mnpm\x1b[39m run " ++ ("dev-server-" ** 12),
+            "├ Ran \x1b[38;5;252mbun\x1b[39m run " ++ text_utils.repeat("pipeline-stage-", 10) ++ "\n" ++
+            "└ Observed \x1b[38;5;252mnpm\x1b[39m run " ++ text_utils.repeat("dev-server-", 12),
         wide.entry_actions.items[0].override.bytes,
     );
 }
 
 test "expanded group children reproject stored commands at the current width" {
     const alloc = std.testing.allocator;
-    const command = "bun run " ++ ("pipeline-stage-" ** 10);
+    const command = "bun run " ++ text_utils.repeat("pipeline-stage-", 10);
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{
             .id = 1,
@@ -1971,7 +1973,7 @@ test "expanded group children reproject stored commands at the current width" {
     var wide = try buildExpandedStyledInterruptible(alloc, &entries, &details, 400, .{}, .{}, null);
     defer wide.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mbun\x1b[39m run " ++ ("pipeline-stage-" ** 10),
+        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mbun\x1b[39m run " ++ text_utils.repeat("pipeline-stage-", 10),
         wide.entry_actions.items[0].override.bytes,
     );
 
@@ -2010,7 +2012,7 @@ test "command reprojection rejects a record carrying a different command" {
 
 test "command reprojection keeps the row's own label across lifecycle states" {
     const alloc = std.testing.allocator;
-    const command = "printf " ++ ("alpha-beta-gamma-delta-" ** 8);
+    const command = "printf " ++ text_utils.repeat("alpha-beta-gamma-delta-", 8);
     const frozen_tail = "printf alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-";
 
     const Case = struct {
@@ -2459,7 +2461,7 @@ fn checkPresentationGroupingAllocationFailures(alloc: std.mem.Allocator) !void {
 
 test "presentation grouping is atomic across allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkPresentationGroupingAllocationFailures,
         .{},
     );

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const builtin_context = @import("../../../../builtins/context.zig");
 const builtin_tools = @import("../../../../builtins/tools.zig");
@@ -35,6 +36,7 @@ const permission_auto_classifier = @import("../../../permissions/auto_classifier
 const auto_classifier_context = @import("../../../permissions/auto_classifier_context.zig");
 
 const test_support = @import("support.zig");
+const text_utils = @import("../../../shared/text_utils.zig");
 
 const ChatMessage = types.ChatMessage;
 const PermissionGrant = types.PermissionGrant;
@@ -2062,7 +2064,7 @@ fn expectRejectedPrompt(completion: FakeCompletion, expected_error: anyerror) !v
 }
 
 test "processQueuedPrompt rejects unstorable tool batches before permissions or execution" {
-    const oversized = [_]u8{'i'} ** 257;
+    const oversized: [257]u8 = @splat('i');
     const invalid = [_]ToolCall{
         .{ .id = "bad", .name = "", .arguments_json = "{}" },
         .{ .id = &oversized, .name = "read_file", .arguments_json = "{}" },
@@ -2264,7 +2266,7 @@ test "vision uses generic lifecycle execution memory persistence and reprojectio
 }
 
 test "vision OOM propagates through assembled orchestrator without a tool result" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     const calls = [_]ToolCall{toolCall(
         "call_vision_oom",
         "vision",
@@ -5314,7 +5316,7 @@ test "processQueuedPrompt caps chatty grep_files model output" {
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     hooks.exec_plans = &.{.{ .result = .{
-        .model_output = "match\n" ++ ("x" ** 2048),
+        .model_output = "match\n" ++ text_utils.repeat("x", 2048),
     } }};
     defer hooks.deinit();
     var fixture = PromptFixture{};
@@ -5338,7 +5340,7 @@ test "processQueuedPrompt caps chatty terminal exec result with explicit marker"
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     hooks.exec_plans = &.{.{ .result = .{
-        .model_output = "{\"truncated\":true,\"stdout\":\"" ++ ("x" ** 2048) ++ "\",\"stderr\":\"\",\"stdout_bytes\":2048}",
+        .model_output = "{\"truncated\":true,\"stdout\":\"" ++ text_utils.repeat("x", 2048) ++ "\",\"stderr\":\"\",\"stdout_bytes\":2048}",
     } }};
     defer hooks.deinit();
     var fixture = PromptFixture{};
@@ -5544,7 +5546,7 @@ test "PreToolUse rewrite is authoritative for validation permission execution hi
 }
 
 test "PreToolUse allocation failure escapes before history validation permission or execution" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     const calls = [_]ToolCall{
         toolCall("call_read", "read_file", "{\"path\":\"src/main.zig\"}"),
     };
@@ -5918,7 +5920,7 @@ test "owner cancellation wins over PreToolUse outcome allocation failure" {
         }
     };
 
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var cancel_flag = std.atomic.Value(bool).init(false);
     var handler = CancelRewriteHandler{ .cancel_flag = &cancel_flag };
     var lifecycle_runtime = lifecycle_hooks.Runtime.init(alloc);

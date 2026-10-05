@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const types = @import("../core/shared/types.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
@@ -9,6 +10,7 @@ const sse = @import("sse.zig");
 const configured_provider = @import("../core/config/configured_provider.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
+const text_utils = @import("../core/shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -263,7 +265,7 @@ test "chat completions error masking survives JSON and recovery decoding" {
     const duplicate = try redact_error_detail(alloc, "{\"error\":{\"message\":\"alpha\\/beta\"},\"alpha/beta\":0,\"alpha\\/beta\":1}", "alpha/beta");
     defer alloc.free(duplicate);
     try std.testing.expectEqualStrings("Provider error details could not be decoded", duplicate);
-    const nested = "[" ** 65 ++ "0" ++ "]" ** 65;
+    const nested = text_utils.repeat("[", 65) ++ "0" ++ text_utils.repeat("]", 65);
     const bounded = try redact_error_detail(alloc, nested, "alpha");
     defer alloc.free(bounded);
     try std.testing.expectEqualStrings("Provider error details exceeded the nesting limit", bounded);
@@ -280,7 +282,7 @@ test "chat completions error masking releases partial allocations" {
             defer alloc.free(plain);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Probe.run, .{});
 }
 
 fn validate_arguments(alloc: Allocator, text: []const u8) Error!void {
@@ -1244,7 +1246,7 @@ test "chat completions replay-only assistant supports silent-tool continuation a
         }
     };
     try Probe.run(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Probe.run, .{});
 }
 
 test "chat completions stripped replay-only rows are omitted without changing canonical history" {
@@ -1302,7 +1304,7 @@ test "chat completions replay-only input rejects missing malformed over-limit or
         .{ .raw = "{\"reasoning\":[],\"_tool_call_ids\":[]}", .failure = error.InvalidProviderState },
         .{ .raw = "{\"reasoning\":\"text\",\"_tool_call_ids\":[\"missing-call\"]}", .failure = error.InvalidProviderState },
         .{ .raw = "{\"reasoning\":\"text\",\"_tool_call_ids\":[],\"role\":\"system\"}", .failure = error.InvalidProviderState },
-        .{ .raw = "{\"reasoning_details\":[" ++ "{\"nested\":" ** 64 ++ "0" ++ "}" ** 64 ++ "],\"_tool_call_ids\":[]}", .failure = error.JsonTooDeep },
+        .{ .raw = "{\"reasoning_details\":[" ++ text_utils.repeat("{\"nested\":", 64) ++ "0" ++ text_utils.repeat("}", 64) ++ "],\"_tool_call_ids\":[]}", .failure = error.JsonTooDeep },
         .{ .raw = oversized, .failure = error.ReplayTooLarge },
     }) |case| {
         request.messages = &.{.{ .role = .assistant, .provider_replay = .{
@@ -1403,7 +1405,7 @@ test "chat completions recovered replay rejects injection malformed associations
         try std.testing.expectError(error.InvalidProviderState, build_request(alloc, request, .{ .provider = &provider }));
         try std.testing.expectError(error.InvalidProviderState, project_replay(alloc, replay, &.{}, true, true));
     }
-    const deep = "{\"reasoning_details\":[" ++ "{\"nested\":" ** 64 ++ "0" ++ "}" ** 64 ++ "],\"_tool_call_ids\":[]}";
+    const deep = "{\"reasoning_details\":[" ++ text_utils.repeat("{\"nested\":", 64) ++ "0" ++ text_utils.repeat("}", 64) ++ "],\"_tool_call_ids\":[]}";
     try std.testing.expectError(error.JsonTooDeep, parse_replay(alloc, deep));
     const oversized = try alloc.alloc(u8, types.ProviderReplay.max_bytes + 1);
     defer alloc.free(oversized);
@@ -1423,7 +1425,7 @@ test "chat completions replay accepts exactly the byte and nesting limits" {
     var parsed = try parse_replay(alloc, raw);
     defer parsed.deinit();
     try std.testing.expectEqual(raw.len - prefix.len - suffix.len, parsed.value.object.get("reasoning").?.string.len);
-    const deepest = "{\"reasoning_details\":[" ++ "{\"nested\":" ** 62 ++ "0" ++ "}" ** 62 ++ "],\"_tool_call_ids\":[]}";
+    const deepest = "{\"reasoning_details\":[" ++ text_utils.repeat("{\"nested\":", 62) ++ "0" ++ text_utils.repeat("}", 62) ++ "],\"_tool_call_ids\":[]}";
     var nested = try parse_replay(alloc, deepest);
     defer nested.deinit();
 }
@@ -1486,7 +1488,7 @@ test "chat completions reasoning replay releases all partial allocations" {
             defer alloc.free(stripped);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Probe.run, .{});
 }
 
 test "chat completions reasoning presentation checks cancellation before content from the same event" {
@@ -1820,7 +1822,7 @@ test "chat completions nested builtin additional and dynamic tool wire" {
 
 test "chat completions bounds dynamic schema traversal before serialization" {
     const alloc = std.testing.allocator;
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"items\":" ** 65 ++ "{}" ++ "}" ** 65, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, text_utils.repeat("{\"items\":", 65) ++ "{}" ++ text_utils.repeat("}", 65), .{});
     defer parsed.deinit();
     var request = test_request();
     request.tools.selected_dynamic = &.{.{ .name = "deep", .description = "Deep schema.", .input_schema = parsed.value }};
@@ -2311,11 +2313,11 @@ test "chat completions stream framing handles chunks trailers truncation and wir
         try std.testing.expectError(error.IncompleteStream, consume_stream(alloc, &source, test_request(), .{}, null, &cancelled));
     }
     {
-        var source = std.Io.Reader.fixed(": comment\n" ** 20);
+        var source = std.Io.Reader.fixed(text_utils.repeat(": comment\n", 20));
         try std.testing.expectError(error.EventTooLarge, consume_stream(alloc, &source, test_request(), .{ .event_bytes = 30 }, null, &cancelled));
     }
     {
-        var source = std.Io.Reader.fixed(": comment\n\n" ** 20);
+        var source = std.Io.Reader.fixed(text_utils.repeat(": comment\n\n", 20));
         try std.testing.expectError(error.StreamTooLarge, consume_stream(alloc, &source, test_request(), .{ .total_wire_bytes = 30 }, null, &cancelled));
     }
     {
@@ -2340,7 +2342,7 @@ test "chat completions reducer caps events content identities arguments tools an
         .{ .limits = .{ .content_bytes = 4 }, .chunk = test_text, .failure = error.ContentTooLarge },
         .{ .limits = .{ .arguments_bytes = 2 }, .chunk = test_call, .failure = error.ArgumentsTooLarge },
         .{ .limits = .{ .tool_calls = 0 }, .chunk = test_call, .failure = error.TooManyTools },
-        .{ .limits = .{}, .chunk = "[" ** 65 ++ "]" ** 65, .failure = error.JsonTooDeep },
+        .{ .limits = .{}, .chunk = text_utils.repeat("[", 65) ++ text_utils.repeat("]", 65), .failure = error.JsonTooDeep },
     }) |case| {
         var reducer = try Reducer.init(alloc, test_tool_request(), case.limits);
         defer reducer.deinit();
@@ -2397,7 +2399,7 @@ fn test_allocation_paths(alloc: Allocator) !void {
 }
 
 test "chat completions allocation failure cleanup covers serialization framing reduction and result transfer" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, test_allocation_paths, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, test_allocation_paths, .{});
 }
 
 test "chat completions name fragments preserve repeated bytes and shared prefixes" {
@@ -2433,7 +2435,7 @@ test "chat completions accepts empty name fragments without losing arguments" {
 test "chat completions accepts echoed models up to the request model limit" {
     const alloc = std.testing.allocator;
     var request = test_request();
-    request.model = "m" ** configured_provider.max_model_bytes;
+    request.model = text_utils.repeat("m", configured_provider.max_model_bytes);
     const body = try build_request(alloc, request, .{});
     defer alloc.free(body);
     var reducer = try Reducer.init(alloc, request, .{});
@@ -2450,11 +2452,11 @@ test "chat completions accepts echoed models up to the request model limit" {
 test "chat completions model bounds and serializer ignore external cancellation state" {
     const alloc = std.testing.allocator;
     var request = test_request();
-    for ([_][]const u8{ " leading", "trailing ", "bad\xff", "m" ** (configured_provider.max_model_bytes + 1) }) |invalid| {
+    for ([_][]const u8{ " leading", "trailing ", "bad\xff", text_utils.repeat("m", configured_provider.max_model_bytes + 1) }) |invalid| {
         request.model = invalid;
         try std.testing.expectError(error.InvalidModel, build_request(alloc, request, .{}));
     }
-    request.model = "m" ** configured_provider.max_model_bytes;
+    request.model = text_utils.repeat("m", configured_provider.max_model_bytes);
     var cancelled = std.atomic.Value(bool).init(false);
     request.budget = .{ .cancel_flag = &cancelled };
     const before = try build_request(alloc, request, .{});

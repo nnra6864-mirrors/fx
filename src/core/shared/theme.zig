@@ -13,6 +13,7 @@
 const std = @import("std");
 const debug_trace = @import("debug_trace.zig");
 const io_mod = @import("io.zig");
+const text_utils = @import("text_utils.zig");
 
 pub const Rgb = struct { r: u8, g: u8, b: u8 };
 
@@ -449,16 +450,16 @@ fn jsonString(value: std.json.Value) ?[]const u8 {
 /// `_style` or `_open` ("divider", "inline_code"). Unknown keys are ignored
 /// so newer theme files keep loading on older binaries.
 fn assignSlotEscape(theme: *Theme, json_key: []const u8, escape: []const u8) void {
-    const fields = @typeInfo(Theme).@"struct".fields;
-    inline for (fields) |field| {
-        if (field.type == []const u8 and !std.mem.eql(u8, field.name, "name")) {
+    const info = @typeInfo(Theme).@"struct";
+    inline for (info.field_names, info.field_types) |field_name, field_type| {
+        if (field_type == []const u8 and !std.mem.eql(u8, field_name, "name")) {
             const stripped = comptime blk: {
-                if (std.mem.endsWith(u8, field.name, "_style")) break :blk field.name[0 .. field.name.len - "_style".len];
-                if (std.mem.endsWith(u8, field.name, "_open")) break :blk field.name[0 .. field.name.len - "_open".len];
-                break :blk field.name;
+                if (std.mem.endsWith(u8, field_name, "_style")) break :blk field_name[0 .. field_name.len - "_style".len];
+                if (std.mem.endsWith(u8, field_name, "_open")) break :blk field_name[0 .. field_name.len - "_open".len];
+                break :blk field_name;
             };
             if (std.mem.eql(u8, json_key, stripped)) {
-                @field(theme, field.name) = escape;
+                @field(theme, field_name) = escape;
                 return;
             }
         }
@@ -847,17 +848,17 @@ test "builtin selects the variant matching the light flag" {
 }
 
 test "every theme slot is populated" {
-    const fields = @typeInfo(Theme).@"struct".fields;
-    inline for (fields) |field| {
-        if (field.type == []const u8) {
-            try std.testing.expect(@field(fx_dark, field.name).len > 0);
-            try std.testing.expect(@field(fx_light, field.name).len > 0);
-        } else if (field.type == SyntaxPalette) {
-            const syntax_fields = @typeInfo(SyntaxPalette).@"struct".fields;
-            inline for (syntax_fields) |syntax_field| {
-                if (syntax_field.type != []const u8) continue;
-                try std.testing.expect(@field(fx_dark.syntax, syntax_field.name).len > 0);
-                try std.testing.expect(@field(fx_light.syntax, syntax_field.name).len > 0);
+    const info = @typeInfo(Theme).@"struct";
+    inline for (info.field_names, info.field_types) |field_name, field_type| {
+        if (field_type == []const u8) {
+            try std.testing.expect(@field(fx_dark, field_name).len > 0);
+            try std.testing.expect(@field(fx_light, field_name).len > 0);
+        } else if (field_type == SyntaxPalette) {
+            const syntax_info = @typeInfo(SyntaxPalette).@"struct";
+            inline for (syntax_info.field_names, syntax_info.field_types) |syntax_name, syntax_type| {
+                if (syntax_type != []const u8) continue;
+                try std.testing.expect(@field(fx_dark.syntax, syntax_name).len > 0);
+                try std.testing.expect(@field(fx_light.syntax, syntax_name).len > 0);
             }
         }
     }
@@ -1157,7 +1158,7 @@ test "theme source copies the configured name and pin for live re-resolution" {
     try std.testing.expect(sourceName() == null);
     try std.testing.expect(variantPinned());
 
-    const too_long = "x" ** 65;
+    const too_long = text_utils.repeat("x", 65);
     setSource(too_long, false);
     try std.testing.expect(sourceName() == null);
 }

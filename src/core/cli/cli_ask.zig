@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const std_builtin = @import("builtin");
 const command_admission = @import("../permissions/command_admission.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
@@ -138,7 +139,7 @@ const headless_interrupt = if (supports_headless_interrupt) struct {
     fn handle(signal: std.posix.SIG) callconv(.c) void {
         _ = requested_signal.cmpxchgStrong(
             0,
-            @intCast(@intFromEnum(signal)),
+            @intCast(@backingInt(signal)),
             .seq_cst,
             .seq_cst,
         );
@@ -146,7 +147,7 @@ const headless_interrupt = if (supports_headless_interrupt) struct {
     }
 
     fn exitCode() u8 {
-        return switch (@as(std.posix.SIG, @enumFromInt(requested_signal.load(.seq_cst)))) {
+        return switch (@as(std.posix.SIG, @fromBackingInt(@intCast(requested_signal.load(.seq_cst))))) {
             std.posix.SIG.TERM => headless_termination_exit_code,
             else => headless_interrupt_exit_code,
         };
@@ -192,7 +193,7 @@ const headless_interrupt = if (supports_headless_interrupt) struct {
                 if (test_after_restore) |hook| hook();
             }
             if (redeliver and cancel_requested.load(.seq_cst)) {
-                const signal: std.posix.SIG = @enumFromInt(requested_signal.load(.seq_cst));
+                const signal: std.posix.SIG = @fromBackingInt(@intCast(requested_signal.load(.seq_cst)));
                 _ = std.c.raise(signal);
             }
             coordinator_active = false;
@@ -3394,9 +3395,13 @@ fn setRecoveryCheckpoint(
     checkpoint: session_codec.RecoveryCheckpoint,
 ) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    errdefer |err| if (err == error.SessionPersistenceUncertain) {
-        ctx.prompt_snapshot_committed = true;
+    writeRecoveryCheckpoint(ctx, checkpoint) catch |err| {
+        if (err == error.SessionPersistenceUncertain) ctx.prompt_snapshot_committed = true;
+        return err;
     };
+}
+
+fn writeRecoveryCheckpoint(ctx: *AskContext, checkpoint: session_codec.RecoveryCheckpoint) !void {
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
     const writable = if (ctx.writable) |*value| value else return error.SessionPersistenceUnavailable;
@@ -6039,9 +6044,9 @@ test "runWithDeps reports a missing image before startup after cleaning prior at
     }
     const valid_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "valid.png");
     defer alloc.free(valid_path);
-    const valid_path_z = try alloc.dupeZ(u8, valid_path);
+    const valid_path_z = try alloc.dupeSentinel(u8, valid_path, 0);
     defer alloc.free(valid_path_z);
-    const missing_path_z = try alloc.dupeZ(u8, "/tmp/fx-ask-missing-image.png");
+    const missing_path_z = try alloc.dupeSentinel(u8, "/tmp/fx-ask-missing-image.png", 0);
     defer alloc.free(missing_path_z);
 
     var stdout_capture: TestCapture = .{};
@@ -6079,7 +6084,7 @@ test "runWithDeps reports unsupported images in JSON before startup" {
     }
     const invalid_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "not-image.txt");
     defer alloc.free(invalid_path);
-    const invalid_path_z = try alloc.dupeZ(u8, invalid_path);
+    const invalid_path_z = try alloc.dupeSentinel(u8, invalid_path, 0);
     defer alloc.free(invalid_path_z);
 
     var stdout_capture: TestCapture = .{};
@@ -6118,7 +6123,7 @@ test "runWithDeps assigns image ids and owns the authorized catalog before proce
     }
     const image_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "valid.png");
     defer alloc.free(image_path);
-    const image_path_z = try alloc.dupeZ(u8, image_path);
+    const image_path_z = try alloc.dupeSentinel(u8, image_path, 0);
     defer alloc.free(image_path_z);
 
     var stdout_capture: TestCapture = .{};
@@ -6229,7 +6234,7 @@ test "stdin prompt resource limit accepts exact bytes and rejects one over witho
 
 test "stdin prompt reader propagates allocation failure" {
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     var reader = std.Io.Reader.fixed("prompt");
@@ -7702,7 +7707,7 @@ test "runWithDeps retains full terminal projection with saved capability" {
 
 test "exec-only terminal projection propagates view allocation failure" {
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     try std.testing.expectError(
@@ -7889,7 +7894,7 @@ fn exerciseSavedAskSessionStoreAllocation(
 }
 
 test "saved ask allocation failures keep managed borrows owned" {
-    const backing = std.testing.allocator;
+    const backing = testing_allocator.no_resize;
     var counting = std.testing.FailingAllocator.init(backing, .{});
     try exerciseSavedAskSessionStoreAllocation(counting.allocator(), false);
 
@@ -7980,7 +7985,7 @@ test "saved ask classifies unsafe store failure by request mode" {
 }
 
 test "saved ask propagates store allocation failure" {
-    const setup_alloc = std.testing.allocator;
+    const setup_alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io_mod.getIo(), "home");
@@ -9077,7 +9082,7 @@ test "shell diagnostic codes remain bounded semantic identifiers" {
 
 test "fx ask JSON permission-denied capture is best effort under allocation failure" {
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     var ctx = AskContext.init(
@@ -9242,7 +9247,7 @@ fn checkAskJsonCaptureAllocationFailures(alloc: Allocator) !void {
 
 test "fx ask JSON capture cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkAskJsonCaptureAllocationFailures,
         .{},
     );
@@ -9376,7 +9381,7 @@ test "resumed ask preserves user and image identity after a retained mid-turn ch
             .path = @constCast("/missing/original.png"),
             .media_type = @constCast("image/png"),
             .snapshot_path = @constCast("images/image-7-aaaaaaaaaaaaaaaa.bin"),
-            .snapshot_sha256 = @constCast("a" ** 64),
+            .snapshot_sha256 = @constCast(text_utils.repeat("a", 64)),
         }};
         const old_user = types.UserTurn{
             .text = @constCast("original request"),
@@ -9578,7 +9583,7 @@ test "default fx ask passes canonical image paths as initial context targets" {
     }
     const image_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "target.png");
     defer alloc.free(image_path);
-    const image_path_z = try alloc.dupeZ(u8, image_path);
+    const image_path_z = try alloc.dupeSentinel(u8, image_path, 0);
     defer alloc.free(image_path_z);
 
     var stdout_capture: TestCapture = .{};

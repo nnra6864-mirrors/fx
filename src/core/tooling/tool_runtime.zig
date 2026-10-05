@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const builtin = @import("builtin");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
@@ -5580,7 +5581,7 @@ test "run_command timeout returns model-visible failure" {
 
 test "interactive command replay capture allocation fails open" {
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     const init = try initCommandReplayCapture(
@@ -6753,7 +6754,7 @@ test "skill tool preserves resource and discovery notices separately" {
         defer file.close(io_mod.getIo());
         try file.writeStreamingAll(
             io_mod.getIo(),
-            "---\nname: workflow\ndescription: workflow helper\n---\n\nuse the workflow skill\n" ++ ("bounded instruction line\n" ** 8),
+            "---\nname: workflow\ndescription: workflow helper\n---\n\nuse the workflow skill\n" ++ text_utils.repeat("bounded instruction line\n", 8),
         );
     }
     {
@@ -7241,7 +7242,7 @@ test "Codex vision calls fail before provider access" {
 
 fn visionRequestAllocationCount(args_json: []const u8) !usize {
     var probe = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .resize_fail_index = 0 },
     );
     const alloc = probe.allocator();
@@ -7253,7 +7254,7 @@ fn visionRequestAllocationCount(args_json: []const u8) !usize {
 
 fn visionProviderParseAllocationCount(provider_json: []const u8) !usize {
     var probe = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .resize_fail_index = 0 },
     );
     const alloc = probe.allocator();
@@ -7272,7 +7273,7 @@ fn visionAllocationIndexAtGateway(
     args_json: []const u8,
     provider_json: []const u8,
 ) !usize {
-    const base = std.testing.allocator;
+    const base = testing_allocator.no_resize;
     var probe = std.testing.FailingAllocator.init(
         base,
         .{ .resize_fail_index = 0 },
@@ -7390,7 +7391,7 @@ fn expectVisionOutOfMemoryAt(
     args_json: []const u8,
     provider_json: []const u8,
 ) !void {
-    const base = std.testing.allocator;
+    const base = testing_allocator.no_resize;
     var failing = OneShotFailingAllocator.init(base, fail_index);
     const responses = [_]VisionGatewayResponse{.{ .content = provider_json }};
     var fixture = VisionGatewayFixture{ .alloc = base, .responses = &responses };
@@ -7908,7 +7909,7 @@ test "vision runtime honors configured provider bounds without a hidden twenty K
     defer tmp.cleanup();
     const catalog = try makeVisionCatalog(alloc, tmp.dir, 1);
     defer types.freeImageAttachmentSlice(alloc, catalog);
-    const evidence = "x" ** 3500;
+    const evidence = text_utils.repeat("x", 3500);
     var large_out: std.Io.Writer.Allocating = .init(alloc);
     defer large_out.deinit();
     try large_out.writer.writeAll("{\"images\":[{\"image_id\":1,\"status\":\"ok\",\"summary\":\"large\",\"visible_text\":[");

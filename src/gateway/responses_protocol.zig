@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
@@ -6,6 +7,7 @@ const types = @import("../core/shared/types.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const tool_call_ids = @import("tool_call_ids.zig");
 const json_comparison = @import("../core/shared/json_comparison.zig");
+const text_utils = @import("../core/shared/text_utils.zig");
 
 pub fn selectReplayParts(alloc: std.mem.Allocator, replay: ?types.ProviderReplay, _: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
     const source = replay orelse return null;
@@ -209,7 +211,7 @@ fn write_assistant_text(writer: *std.Io.Writer, first: *bool, content: []const u
 }
 
 test "Responses request projects long call ids with matching outputs" {
-    const source_id = "c" ** 65;
+    const source_id = text_utils.repeat("c", 65);
     const calls = [_]types.ToolCall{.{ .id = source_id, .name = "read_file", .arguments_json = "{}" }};
     const images = [_]types.ToolImage{.{ .data = @constCast("cG5n"), .mime_type = @constCast("image/png") }};
     for ([_]bool{ false, true }) |with_images| {
@@ -301,7 +303,7 @@ test "Responses replay filtering cleans up allocation failures" {
             defer alloc.free(selected.parts_json);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Probe.run, .{});
 }
 
 test "Responses unchanged replay projection borrows reasoning state" {
@@ -549,7 +551,7 @@ test "Responses images release verification allocations on failure" {
     defer tmp.cleanup();
     const attachment = try ImageInputTest.capture(alloc, &tmp, "source.png", "\x89PNG\r\n\x1a\nA", 1);
     defer types.freeImageAttachment(alloc, attachment);
-    try std.testing.checkAllAllocationFailures(alloc, expectImageInputAllocations, .{attachment});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, expectImageInputAllocations, .{attachment});
 }
 
 test "Responses image requests obey cancellation and expired deadlines before loading" {
@@ -1526,7 +1528,7 @@ test "Responses null snapshot preserves separate item kinds without extra replay
             try std.testing.expectEqualStrings("[{\"type\":\"reasoning\",\"encrypted_content\":\"retained\"}]", completion.provider_state_json.?);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Probe.run, .{});
 }
 
 test "Responses message replay preserves separate commentary and final text" {
@@ -1681,7 +1683,7 @@ test "Responses message replay releases request scratch on allocation failure" {
             try std.testing.expect(std.mem.find(u8, wire.written(), "phase") == null);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Probe.run, .{});
 }
 
 test "Responses reasoning replay retains terminal enrichment without duplicates" {
@@ -1822,7 +1824,7 @@ test "Responses reasoning replay frees duplicate comparison and final encoding a
             try std.testing.expect(completion.provider_state_json != null);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Scenario.run, .{});
     var stream = ToolRecordTest.init(std.testing.allocator);
     defer stream.deinit();
     try stream.apply("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}]}}");
@@ -1877,7 +1879,7 @@ test "Responses terminal failure classification is conservative and diagnostics 
         defer stream.deinit();
         const event = try std.json.Stringify.valueAlloc(std.testing.allocator, .{
             .type = "response.failed",
-            .response = .{ .id = "resp_failure", .@"error" = .{ .code = case[0], .message = "é" ** 512 }, .usage = .{ .input_tokens = 7, .output_tokens = 3 } },
+            .response = .{ .id = "resp_failure", .@"error" = .{ .code = case[0], .message = text_utils.repeat("é", 512) }, .usage = .{ .input_tokens = 7, .output_tokens = 3 } },
         }, .{});
         defer std.testing.allocator.free(event);
         try stream.apply(event);
@@ -1944,7 +1946,7 @@ test "Responses terminal failure releases allocations and obeys cancellation" {
             defer stream.freeCompletion(completion);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Scenario.run, .{});
     var stream = ToolRecordTest.init(std.testing.allocator);
     defer stream.deinit();
     stream.cancelled.store(true, .seq_cst);
@@ -2115,7 +2117,7 @@ test "Responses text finalization stops on cancellation within a terminal snapsh
 }
 
 test "Responses text finalization does not retain uncaptured text" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     const text = try alloc.alloc(u8, 32 * 1024);
     defer alloc.free(text);
     @memset(text, 'a');
@@ -2142,7 +2144,7 @@ test "Responses text finalization releases state on allocation failure" {
             try stream.finish("ab\n\ncd");
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Probe.run, .{});
 }
 
 test "Responses text finalization fuzzes chunking and capture boundaries" {
@@ -2429,7 +2431,7 @@ fn expectToolFinalizationAllocations(alloc: std.mem.Allocator) !void {
 }
 
 test "Responses finalization releases owned state on allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, expectToolFinalizationAllocations, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, expectToolFinalizationAllocations, .{});
 }
 
 fn appendTool(

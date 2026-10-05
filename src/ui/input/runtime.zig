@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const question_prompt = @import("../../core/agent/question_prompt.zig");
 const approval_decision = @import("../../core/permissions/approval_decision.zig");
 const paste_blocks = @import("../../core/input/pasted_blocks.zig");
@@ -23,6 +24,7 @@ const visual_layout = @import("visual_layout.zig");
 const escape_parser = @import("escape_parser.zig");
 const shortcuts = @import("shortcuts.zig");
 const terminal_action_decoder = @import("terminal_action_decoder.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 
 const ImageBlocks = kill_ring.ImageBlocks;
 const InputRuntime = core_input_runtime.Runtime;
@@ -499,7 +501,7 @@ test "word and line deletion families remove forward and reverse selections firs
 }
 
 test "history allocation failure preserves deletion and replacement edits" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var runtime: InputRuntime = .{};
     defer runtime.deinit(alloc);
 
@@ -1268,7 +1270,7 @@ test "prompt history recalls previous inputs with up and down" {
 test "prompt history recall restores compact paste backing" {
     const alloc = std.testing.allocator;
     const placeholder = "[Pasted text #1, 1 line]";
-    const backing = "x" ** (paste_blocks.large_paste_char_threshold + 1);
+    const backing = text_utils.repeat("x", paste_blocks.large_paste_char_threshold + 1);
     var runtime = InputRuntime{};
     defer runtime.deinit(alloc);
 
@@ -1490,7 +1492,7 @@ test "prompt history semantic dedupe distinguishes paste and skill provenance" {
 }
 
 test "prompt history capture releases partial semantic entries across allocation failures" {
-    const backing = std.testing.allocator;
+    const backing = testing_allocator.no_resize;
     const text = "[Pasted text #4, 1 line] $review";
     const blocks = [_]paste_blocks.PastedBlock{.{
         .id = 4,
@@ -1580,7 +1582,7 @@ test "prompt history replacement preserves the draft across allocation failures"
             runtime.edit_state.cursor = runtime.edit_state.input.items.len;
         }
     };
-    const backing = std.testing.allocator;
+    const backing = testing_allocator.no_resize;
 
     var probe = std.testing.FailingAllocator.init(backing, .{});
     var replacement_allocations: usize = undefined;
@@ -1810,7 +1812,7 @@ test "prompt history limit rejection preserves active and saved drafts" {
 test "prompt history limit counts registered paste backing text" {
     const alloc = std.testing.allocator;
     const placeholder = "[Pasted text #1, 1 line]";
-    const backing = "x" ** (paste_blocks.large_paste_char_threshold + 1);
+    const backing = text_utils.repeat("x", paste_blocks.large_paste_char_threshold + 1);
     const blocks = [_]paste_blocks.PastedBlock{.{
         .id = 1,
         .text = @constCast(backing),
@@ -2378,7 +2380,7 @@ test "vertical movement never targets inside a registered paste" {
     try runtime.edit_state.input.appendSlice(alloc, input);
     try runtime.entities.pasted_blocks.append(alloc, .{
         .id = 7,
-        .text = try alloc.dupe(u8, "P" ** 1001),
+        .text = try alloc.dupe(u8, text_utils.repeat("P", 1001)),
         .line_count = 1,
         .span = .{
             .raw_start = "x\n".len,
@@ -4257,14 +4259,14 @@ fn checkStructuredKillYankAllocationFailure(
 }
 
 test "structured kill and yank stay atomic across allocation failures" {
-    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var probe = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     try checkStructuredKillYankAllocationFailure(&probe);
     const allocation_count = probe.alloc_index;
     try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
 
     for (0..allocation_count) |fail_index| {
         var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
+            testing_allocator.no_resize,
             .{ .fail_index = fail_index },
         );
         checkStructuredKillYankAllocationFailure(&failing) catch |err| {

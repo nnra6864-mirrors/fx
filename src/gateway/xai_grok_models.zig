@@ -130,7 +130,7 @@ fn fetchCatalogForProvider(
     defer if (modalities_response) |*metadata| metadata.deinit(alloc);
     const modalities_json = if (modalities_response) |metadata| blk: {
         if (metadata.status == .ok) break :blk @as(?[]const u8, metadata.body);
-        debug_trace.logf("catalog", "Grok modality enrichment unavailable status={d}", .{@intFromEnum(metadata.status)});
+        debug_trace.logf("catalog", "Grok modality enrichment unavailable status={d}", .{@backingInt(metadata.status)});
         break :blk null;
     } else null;
     const catalog = parseCatalog(alloc, response.body, modalities_json) catch |err| {

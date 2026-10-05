@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const image_data = @import("../images/image_data.zig");
 const session = @import("session.zig");
@@ -10,6 +11,7 @@ const captured_command = @import("../tooling/captured_command.zig");
 const model_provider = @import("../config/model_provider.zig");
 const context_limits = @import("../config/context_limits.zig");
 const credential_authority = @import("../auth/credential_authority.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -72,9 +74,8 @@ pub fn parse_preferences(alloc: Allocator, value: std.json.Value) !DurableSessio
 }
 
 test "legacy connection preferences decode through the shared state codec" {
-    const alloc = std.testing.allocator;
     const state_json = "{\"id\":\"legacy\",\"origin_workspace_root\":\"/workspace\",\"workspace_root\":\"/workspace\",\"created_at_ms\":1,\"updated_at_ms\":2,\"conversation_language\":\"en\",\"preferences\":{\"connection_id\":\"vercel\",\"model_id\":\"test/model\",\"effort\":\"high\",\"fast_mode\":true},\"history\":[],\"total_input_tokens\":0,\"total_output_tokens\":0}";
-    try std.testing.checkAllAllocationFailures(alloc, struct {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
         fn check(a: Allocator, bytes: []const u8) !void {
             var source = std.Io.Reader.fixed(bytes);
             var state = try decodeState(a, &source, .{});
@@ -1486,7 +1487,7 @@ test "legacy route checkpoints retain history without resumable authority" {
                 .total_output_tokens = 0,
                 .recovery_checkpoint = checkpoint,
             };
-            try std.testing.checkAllAllocationFailures(alloc, struct {
+            try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
                 fn check(a: Allocator, original: DurableSessionState) !void {
                     var state = try original.dupe(a);
                     defer state.deinit(a);
@@ -3722,7 +3723,7 @@ test "non-object saved function inputs are repaired without changing recorded ou
                 try session.repairPersistedToolArguments(alloc, step.tool_calls, step.tool_results, .schema_v3);
                 try std.testing.expectEqualStrings(if (native_kind == 0) "{}" else arguments, step.tool_calls[0].arguments_json);
                 if (native_kind == 0 and status == .failure and std.mem.eql(u8, arguments, "[]")) {
-                    try std.testing.checkAllAllocationFailures(alloc, checkNonObjectHistoryAllocationFailures, .{parsed.value});
+                    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkNonObjectHistoryAllocationFailures, .{parsed.value});
                 }
             }
         }
@@ -3752,7 +3753,7 @@ test "non-object interrupted inputs repair locally and preserve provider-owned r
         const repaired = (try parseOptionalToolCall(alloc, parsed.value)).?;
         defer session.freeToolCall(alloc, repaired);
         try std.testing.expectEqualStrings(if (native) "[]" else "{}", repaired.arguments_json);
-        if (!native) try std.testing.checkAllAllocationFailures(alloc, checkNonObjectInterruptedAllocationFailures, .{parsed.value});
+        if (!native) try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkNonObjectInterruptedAllocationFailures, .{parsed.value});
     }
 }
 
@@ -3794,7 +3795,7 @@ test "current history decode rejects ambiguous malformed tool result pairings" {
 
 test "current history duplicate-key repair preserves allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkCurrentToolArgumentRepairAllocationFailures,
         .{},
     );
@@ -4314,7 +4315,7 @@ fn checkV7SteeringAllocationFailures(alloc: Allocator) !void {
 
 test "v7 steering cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkV7SteeringAllocationFailures,
         .{},
     );
@@ -4445,7 +4446,7 @@ test "durable cancellation provenance roundtrips and cleans allocation failures"
     };
     for (std.enums.values(types.CancellationOrigin)) |origin| {
         for (std.enums.values(types.InterruptedTerminalReason)) |reason| {
-            try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{ origin, reason });
+            try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Case.run, .{ origin, reason });
         }
     }
 }
@@ -5024,7 +5025,7 @@ test "inline image parsing rejects missing digest and mismatched bytes" {
     var digest: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(png, &digest, .{});
     const digest_hex = std.fmt.bytesToHex(digest, .lower);
-    const wrong_digest = "0" ** (Sha256.digest_length * 2);
+    const wrong_digest = text_utils.repeat("0", Sha256.digest_length * 2);
 
     const Template = struct {
         snapshot_sha256: ?[]const u8,
@@ -5405,7 +5406,7 @@ test "durable state usage remains strict and releases partial allocations" {
         \\"models":[{"model":"test/model","first_sequence":1,"total_cost":1,"input_tokens":10,"output_tokens":3,"cache_read_tokens":2,"cache_write_tokens":0,"billable_web_search_calls":0}],"pending":[]},
         \\"last_subagent_work_id":"legacy-work"}
     ;
-    try std.testing.checkAllAllocationFailures(alloc, struct {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
         fn check(a: Allocator, bytes: []const u8) !void {
             var source = std.Io.Reader.fixed(bytes);
             var decoded = try decodeState(a, &source, .{});
@@ -5519,7 +5520,7 @@ test "recovery checkpoint image and tool source refs round trip with independent
     const bytes = try encodeRecoveryCheckpoint(alloc, checkpoint);
     defer alloc.free(bytes);
     try std.testing.expect(std.mem.find(u8, bytes, "\"sourceRef\"") == null);
-    try std.testing.checkAllAllocationFailures(alloc, struct {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
         fn check(a: Allocator, encoded: []const u8) !void {
             var parsed = try std.json.parseFromSlice(std.json.Value, a, encoded, .{});
             defer parsed.deinit();
@@ -5559,7 +5560,7 @@ test "persisted image source refs reject malformed metadata and preserve the byt
         .{ .string = "host\x1fbad" },
         .{ .string = "host\x7fbad" },
         .{ .string = "\xff" },
-        .{ .string = "r" ** 513 },
+        .{ .string = text_utils.repeat("r", 513) },
     };
     const user_ref = user.value.object.getPtr("images").?.array.items[0].object.getPtr("source_ref").?;
     const tool_ref = tools.value.array.items[0].object.getPtr("source_ref").?;
@@ -5569,7 +5570,7 @@ test "persisted image source refs reject malformed metadata and preserve the byt
         try std.testing.expectError(error.InvalidSessionFormat, parseUserTurn(alloc, user.value, null));
         try std.testing.expectError(error.InvalidSourceRef, parsePersistedToolImages(alloc, tools.value.array.items));
     }
-    const boundary = "é" ** 256;
+    const boundary = text_utils.repeat("é", 256);
     user_ref.* = .{ .string = boundary };
     tool_ref.* = .{ .string = boundary };
     const decoded_user = try parseUserTurn(alloc, user.value, null);

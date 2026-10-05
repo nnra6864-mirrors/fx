@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const credentials = @import("credentials.zig");
 const chatgpt_session = @import("chatgpt_session.zig");
@@ -1575,14 +1576,14 @@ fn checkBrowserPreparedAllocationFailures(alloc: Allocator) !void {
 
 test "browser login preparation cleans up allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkBrowserPreparedAllocationFailures,
         .{},
     );
 }
 
 test "team parsing cleans up allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_parse_teams_allocation_failures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, check_parse_teams_allocation_failures, .{});
 }
 
 test "single team selection does not allocate" {
@@ -1594,7 +1595,7 @@ test "single team selection does not allocate" {
         .slug = &slug,
         .name = &name,
     }};
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
 
     try std.testing.expect((try selectTeam(failing.allocator(), &teams, null)) != null);
 }
@@ -1665,7 +1666,7 @@ test "team validation failure prevents the durable selection commit" {
 }
 
 test "login session transfer cleans up allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_take_login_session_allocation_failures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, check_take_login_session_allocation_failures, .{});
 }
 
 fn readLine(alloc: Allocator) ![]u8 {

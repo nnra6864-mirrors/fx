@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const edit_contract = @import("../input/editor_state.zig");
 const io_mod = @import("../shared/io.zig");
@@ -815,7 +816,7 @@ fn checkQuestionPromptSyncAllocationFailures(alloc: Allocator) !void {
 
 test "question prompt frees partial owned-entry allocations" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkQuestionPromptSyncAllocationFailures,
         .{},
     );
@@ -828,7 +829,7 @@ test "question prompt freeform allocation failure preserves prompt state" {
     prompt.moveChoice(-1);
 
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     try std.testing.expectError(
@@ -849,7 +850,7 @@ test "question prompt submission allocation failure preserves the draft" {
     prompt.applyFreeformCursorMove(1, 7);
 
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     try std.testing.expectError(
@@ -1681,7 +1682,7 @@ test "compact submission keeps input distinct from actions and choice prompts cl
 }
 
 test "compact submission allocation failure preserves the unanswered input" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var prompt: QuestionPrompt = .{};
     defer prompt.deinit(alloc);
     try prompt.syncFrom(alloc, &.{.{ .question = "Input", .options = &.{}, .submission = .input }});

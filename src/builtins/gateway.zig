@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const builtin = @import("builtin");
 
 pub const permission_reviewer = @import("gateway/permission_reviewer.zig");
@@ -1752,11 +1753,11 @@ test "gateway worker returns one bounded error for malformed provider result ide
 }
 
 test "gateway worker rejects unstorable provider identities without returning search results" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, expectUnstorableProviderIdentity, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, expectUnstorableProviderIdentity, .{});
 }
 
 fn expectUnstorableProviderIdentity(alloc: Allocator) !void {
-    const oversized = [_]u8{'i'} ** 257;
+    const oversized: [257]u8 = @splat('i');
     var cancel_flag = std.atomic.Value(bool).init(false);
     var response = try normalizeGatewayCompletion(alloc, .{
         .backend = perplexity_search_backend_id,

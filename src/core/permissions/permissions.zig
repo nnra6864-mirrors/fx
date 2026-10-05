@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const command_environment = @import("../execution/command_environment.zig");
 
@@ -2847,12 +2848,12 @@ test "structured file grant offer cleans partial allocations" {
     }
 
     try std.testing.checkAllAllocationFailures(
-        alloc,
+        testing_allocator.no_resize,
         checkStructuredFileGrantOfferAllocationFailures,
         .{},
     );
     try std.testing.checkAllAllocationFailures(
-        alloc,
+        testing_allocator.no_resize,
         checkExternalStructuredFileGrantOfferAllocationFailures,
         .{},
     );
@@ -2961,11 +2962,11 @@ test "formatPermissionsStatus adapts core grants and rules without taking field 
 }
 
 test "allowToolForSession cleans up all partial allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkAllowToolForSessionAllocFailures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkAllowToolForSessionAllocFailures, .{});
 }
 
 test "suggestedSessionGrants cleans up all partial allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkSuggestedSessionGrantsAllocFailures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkSuggestedSessionGrantsAllocFailures, .{});
 }
 
 fn testWriteMutationInput(path: []const u8) file_mutation_contract.FileMutationInput {
@@ -3051,7 +3052,7 @@ test "file target preparation cleans every partial allocation failure" {
     defer alloc.free(workspace);
 
     try std.testing.checkAllAllocationFailures(
-        alloc,
+        testing_allocator.no_resize,
         checkFileTargetPreparationAllocationFailures,
         .{workspace},
     );
@@ -3336,7 +3337,7 @@ test "file target evaluator propagates only operational failures" {
     try std.testing.expectError(error.ProcessFdQuotaExceeded, normalizeDirOpenError(error.ProcessFdQuotaExceeded));
     try std.testing.expectError(error.SystemFdQuotaExceeded, normalizeStatFileError(error.SystemFdQuotaExceeded));
 
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 

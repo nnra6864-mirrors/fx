@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const session_layout = @import("../session/session_layout.zig");
 const types = @import("../shared/types.zig");
 
@@ -2530,7 +2531,7 @@ fn check_owned_action_request_allocation_failures(alloc: Allocator) !void {
 
 test "owned action request cleans every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         check_owned_action_request_allocation_failures,
         .{},
     );
@@ -2767,7 +2768,7 @@ fn check_owned_render_snapshot_allocation_failures(alloc: Allocator) !void {
 
 test "owned render snapshots clean every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         check_owned_render_snapshot_allocation_failures,
         .{},
     );
@@ -3041,7 +3042,7 @@ fn check_owned_result_allocation_failures(alloc: Allocator) !void {
 
 test "owned results clean every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         check_owned_result_allocation_failures,
         .{},
     );
@@ -3059,7 +3060,7 @@ fn test_principal() Principal {
 }
 
 fn test_proof() HolderProof {
-    return .{ .bytes = [_]u8{1} ** 32 };
+    return .{ .bytes = @as([32]u8, @splat(1)) };
 }
 
 test "authority wire encoding excludes host-authenticated process ownership" {

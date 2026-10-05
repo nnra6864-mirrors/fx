@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const image_data = @import("../images/image_data.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -894,7 +895,7 @@ test "large result storage creates stable handle and bounded preview" {
     const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(dir);
 
-    var bytes = [_]u8{'x'} ** (large_result_threshold_bytes + 128);
+    var bytes: [large_result_threshold_bytes + 128]u8 = @splat('x');
     const prepared = try prepare(alloc, dir, "call/1", "run_command", bytes.len, bytes[0..], 64 * 1024);
     defer alloc.free(prepared.model_output);
     defer alloc.free(@constCast(prepared.memory.output_handle.?));
@@ -918,7 +919,7 @@ test "a v2 session stores results and images as blobs named by their hash (D44)"
     var capability = try session_child_store.SessionChildCapability.initBlobs(alloc, memory.blobs(), "", .writable);
     defer capability.deinit();
 
-    var bytes = [_]u8{'x'} ** (large_result_threshold_bytes + 128);
+    var bytes: [large_result_threshold_bytes + 128]u8 = @splat('x');
     bytes[3] = '\n';
     const prepared = try prepareManaged(alloc, &capability, "call/1", "run_command", bytes.len, bytes[0..], 64 * 1024);
     defer alloc.free(prepared.model_output);
@@ -1120,9 +1121,9 @@ test "diff content packs round trip, bound, and reject tampering" {
 }
 
 test "diff content encoding propagates every allocation failure" {
-    const backing = std.testing.allocator;
-    const previous = "before\n" ** 800;
-    const after = "after\n" ** 800;
+    const backing = testing_allocator.no_resize;
+    const previous = text_utils.repeat("before\n", 800);
+    const after = text_utils.repeat("after\n", 800);
     var probe = std.testing.FailingAllocator.init(backing, .{});
     const encoded = try encodeDiffContentPack(
         probe.allocator(),
@@ -1183,7 +1184,7 @@ test "saved preparation externalizes small results" {
 test "inline cap and stored preview keep complete codepoints" {
     const alloc = std.testing.allocator;
 
-    const inline_text = "x" ++ ("\xc3\xa9" ** 300);
+    const inline_text = "x" ++ text_utils.repeat("\xc3\xa9", 300);
     for ([_]usize{ 128, 129 }) |cap| {
         const prepared = try prepare(alloc, null, "call/2", "grep_files", inline_text.len, inline_text, cap);
         defer alloc.free(prepared.model_output);
@@ -1197,7 +1198,7 @@ test "inline cap and stored preview keep complete codepoints" {
     defer tmp.cleanup();
     const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(dir);
-    const stored_text = "x" ++ ("\xc3\xa9" ** 8200);
+    const stored_text = "x" ++ text_utils.repeat("\xc3\xa9", 8200);
     const stored = try prepare(alloc, dir, "call/3", "run_command", stored_text.len, stored_text, 64 * 1024);
     defer alloc.free(stored.model_output);
     defer alloc.free(@constCast(stored.memory.output_handle.?));
@@ -1214,7 +1215,7 @@ test "large result handles never expose token-shaped call ids" {
     const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(dir);
 
-    var bytes = [_]u8{'x'} ** (large_result_threshold_bytes + 1);
+    var bytes: [large_result_threshold_bytes + 1]u8 = @splat('x');
     const secret_id = "sk-abcdefghijklmnop";
     const prepared = try prepare(
         alloc,
@@ -1243,7 +1244,7 @@ const PrepareRoute = enum {
 };
 
 fn expectLargeResultPreparationLeavesNoOrphan(route: PrepareRoute) !void {
-    const base = std.testing.allocator;
+    const base = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io_mod.getIo(), "results");
@@ -1257,7 +1258,7 @@ fn expectLargeResultPreparationLeavesNoOrphan(route: PrepareRoute) !void {
     );
     defer capability.deinit();
 
-    var bytes = [_]u8{'x'} ** (large_result_threshold_bytes + 128);
+    var bytes: [large_result_threshold_bytes + 128]u8 = @splat('x');
     var reached_success = false;
     var fail_index: usize = 0;
     while (fail_index < 128) : (fail_index += 1) {
@@ -1319,7 +1320,7 @@ test "managed large result preparation removes committed files on later allocati
 fn expectExistingLargeResultSurvivesPreparationFailure(
     route: PrepareRoute,
 ) !void {
-    const base = std.testing.allocator;
+    const base = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io_mod.getIo(), "results");
@@ -1333,7 +1334,7 @@ fn expectExistingLargeResultSurvivesPreparationFailure(
     );
     defer capability.deinit();
 
-    var bytes = [_]u8{'x'} ** (large_result_threshold_bytes + 128);
+    var bytes: [large_result_threshold_bytes + 128]u8 = @splat('x');
     const seeded_handle = try storeLargeResultManaged(
         base,
         &capability,

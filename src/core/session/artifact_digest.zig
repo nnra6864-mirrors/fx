@@ -1,4 +1,5 @@
 const std = @import("std");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -134,7 +135,7 @@ test "a v2 handle names its blob by the whole digest and authenticates it" {
     Sha256.hash("xaved output", &digest, .{});
     try std.testing.expect(!handleMatchesContentDigest(handle, ".bin", digest));
     // Anything else names no blob.
-    for ([_][]const u8{ "result-x.txt", "nodash", "result-" ++ "A" ** 64 ++ ".txt", "result-" ++ "a" ** 63 ++ ".txt" }) |other| {
+    for ([_][]const u8{ "result-x.txt", "nodash", "result-" ++ text_utils.repeat("A", 64) ++ ".txt", "result-" ++ text_utils.repeat("a", 63) ++ ".txt" }) |other| {
         try std.testing.expectEqual(@as(?[]const u8, null), blobHash(other));
     }
 }

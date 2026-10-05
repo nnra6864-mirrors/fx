@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const legacy_sse = @import("legacy_sse.zig");
@@ -1414,7 +1415,7 @@ fn checkSseEventIdAllocationFailures(alloc: Allocator) !void {
 
 test "legacy Streamable HTTP replaces event IDs across allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkSseEventIdAllocationFailures,
         .{},
     );

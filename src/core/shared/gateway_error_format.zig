@@ -62,7 +62,7 @@ pub fn formatSchemaDiagnostic(alloc: Allocator, detail: []const u8) !?[]u8 {
 }
 
 pub fn formatHttpErrorMessage(alloc: Allocator, status: std.http.Status, detail: []const u8) ![]u8 {
-    const status_code = @intFromEnum(status);
+    const status_code = @backingInt(status);
     const title = if (status_code == 401 or status_code == 403)
         "API access denied"
     else
@@ -81,7 +81,7 @@ fn formatHttpDiagnostic(
     title: ?[]const u8,
     max_bytes: usize,
 ) ![]u8 {
-    if (detail.len == 0) return std.fmt.allocPrint(alloc, "HTTP {d}", .{@intFromEnum(status)});
+    if (detail.len == 0) return std.fmt.allocPrint(alloc, "HTTP {d}", .{@backingInt(status)});
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, detail, .{}) catch
         return formatFallbackBounded(alloc, status, detail, max_bytes);
@@ -103,7 +103,7 @@ fn formatHttpDiagnostic(
     const raw = try formatParsedHttpMessage(
         alloc,
         title,
-        @intFromEnum(status),
+        @backingInt(status),
         provider,
         code,
         message,
@@ -187,8 +187,8 @@ fn formatFallbackBounded(
     detail: []const u8,
     max_bytes: usize,
 ) ![]u8 {
-    if (detail.len == 0) return std.fmt.allocPrint(alloc, "HTTP {d}", .{@intFromEnum(status)});
-    const raw = try std.fmt.allocPrint(alloc, "HTTP {d}: {s}", .{ @intFromEnum(status), detail });
+    if (detail.len == 0) return std.fmt.allocPrint(alloc, "HTTP {d}", .{@backingInt(status)});
+    const raw = try std.fmt.allocPrint(alloc, "HTTP {d}: {s}", .{ @backingInt(status), detail });
     defer alloc.free(raw);
     return sanitizeExternalText(alloc, raw, max_bytes);
 }

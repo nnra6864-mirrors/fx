@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const diagnostics = @import("../../core/workspace/diagnostics.zig");
 const managed_execution = @import("../../core/execution/managed_execution.zig");
@@ -31,6 +32,7 @@ const transcript_viewport_runtime = @import("viewport_runtime.zig");
 const transcript_writer = @import("writer.zig");
 const ui_render = @import("../render.zig");
 const types = @import("../../core/shared/types.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 
 /// One timestamped full-detail record (session assembly, network call,
 /// recovery transition) shown only in the ctrl+o full transcript. Kept out of
@@ -240,7 +242,7 @@ const TranscriptCommitState = union(enum) {
 };
 
 test "retention rebase carries stable and recovering source boundaries" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var before = try source_preparation.prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "a\nb\nc\nd\ne\nf"), 80, null);
     defer before.deinit(alloc);
     var after = try source_preparation.prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "c\nd\ne\nf"), 80, null);
@@ -2085,7 +2087,7 @@ fn checkAutoPermissionNoticeAllocationFailures(alloc: Allocator) !void {
 
 test "auto permission notice write is atomic across allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkAutoPermissionNoticeAllocationFailures,
         .{},
     );
@@ -2666,7 +2668,7 @@ fn checkToolDetailResultReplacementAllocationFailures(alloc: Allocator) !void {
 
 test "tool detail result replacement preserves the prior allocation on failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkToolDetailResultReplacementAllocationFailures,
         .{},
     );
@@ -3535,7 +3537,7 @@ test "prepared canonical command mutation stays bounded across twenty four thous
 }
 
 test "oversized open command record stops growing after overflow" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var runtime = TranscriptRuntime{
         .layout = .{
             .rows = 24,
@@ -4171,7 +4173,7 @@ const CachedCompactTranscriptSource = struct {
 const CompactTranscriptSourceCache = struct {
     const capacity = 4;
 
-    entries: [capacity]?CachedCompactTranscriptSource = .{null} ** capacity,
+    entries: [capacity]?CachedCompactTranscriptSource = @splat(null),
     next_replacement: usize = 0,
 
     fn deinit(self: *CompactTranscriptSourceCache, alloc: Allocator) void {
@@ -13437,7 +13439,7 @@ test "source rewrite replays unchanged history prefix after footer projection re
 }
 
 test "append pending wrap history replay starts a fresh row at a soft wrap" {
-    try expectHistoryReplayBoundary("12345678" ** 60, true);
+    try expectHistoryReplayBoundary(text_utils.repeat("12345678", 60), true);
 }
 
 fn expectHistoryReplayBoundary(target_flow: []const u8, source_pending_wrap: bool) !void {

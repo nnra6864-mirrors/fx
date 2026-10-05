@@ -3377,8 +3377,6 @@ comptime {
     if (!builtin.is_test and !host_target.is_wasm) {
         @export(&main, .{ .name = "main" });
     }
-    // Replaces compiler_rt's byte-at-a-time memset in Linux executables.
-    _ = @import("core/shared/memset.zig");
 }
 
 pub fn runWasmTerminal(init: std.process.Init) !void {

@@ -224,8 +224,8 @@ class PgsoPipelineTests(unittest.TestCase):
             "zig_darwin_sdk": self.root / "ZigDarwin.sdk",
             "zig_sdk_version": "26.4",
             "profile_runtime": self.root / "libclang_rt.profile_osx.a",
-            "zig_version": "0.16.0",
-            "llvm_version": "21.1.8",
+            "zig_version": "0.17.0",
+            "llvm_version": "22.1.8",
             "target": "aarch64-macos",
             "host_arch": "arm64",
         }

@@ -288,7 +288,7 @@ fn cutUnsynced(io: Io, random: std.Random, tracked: Fault.Tracked) bool {
     tracked.dup.setLength(io, keep) catch return false;
     if (keep < len and random.uintLessThan(u8, 4) == 0) {
         const zeros_len = random.intRangeAtMost(u64, 1, @min(len - keep, 64));
-        const zeros = [_]u8{0} ** 64;
+        const zeros: [64]u8 = @splat(0);
         tracked.dup.writePositionalAll(io, zeros[0..@intCast(zeros_len)], keep) catch {};
     }
     return true;

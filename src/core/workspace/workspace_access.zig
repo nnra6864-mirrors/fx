@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const io_mod = @import("../shared/io.zig");
 const pathing = @import("pathing.zig");
 
@@ -1437,7 +1438,7 @@ test "workspace access reports when a staged replacement removes command line au
 }
 
 test "workspace access releases partial state across allocation failures" {
-    const backing = std.testing.allocator;
+    const backing = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDir(std.testing.io, "primary", .default_dir);

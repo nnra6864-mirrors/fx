@@ -17,9 +17,7 @@ const oauth_transport = @import("core/auth/oauth_transport.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
 const builtin_modes = @import("builtins/modes.zig");
 
-const c = @cImport({
-    @cInclude("node_api.h");
-});
+const c = @import("node_api");
 
 const Allocator = std.mem.Allocator;
 const max_drain_bytes = 1024 * 1024;
@@ -168,11 +166,18 @@ const OutputQueue = struct {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        errdefer |err| if (err != error.OutputClosed) {
-            self.failed = true;
-            self.wake.broadcast(io);
-            self.ready.?.notify();
+        self.writeLocked(alloc, data) catch |err| {
+            if (err != error.OutputClosed) {
+                self.failed = true;
+                self.wake.broadcast(io);
+                self.ready.?.notify();
+            }
+            return err;
         };
+    }
+
+    fn writeLocked(self: *OutputQueue, alloc: Allocator, data: []const u8) !void {
+        const io = io_mod.getIo();
         if (data.len > max_output_message_bytes) return error.OutputMessageTooLarge;
         var written: usize = 0;
         while (written < data.len) {
@@ -1102,7 +1107,7 @@ fn fetch_handle_arg(env: c.napi_env, value: c.napi_value) ?fetch_state.Handle {
 
 fn fetch_operation_value(env: c.napi_env, result: FetchOperationResult) c.napi_value {
     var value: c.napi_value = undefined;
-    if (!statusOk(env, c.napi_create_uint32(env, @intFromEnum(result), &value), "could not create fetch operation result")) return null;
+    if (!statusOk(env, c.napi_create_uint32(env, @backingInt(result), &value), "could not create fetch operation result")) return null;
     return value;
 }
 
@@ -1268,7 +1273,7 @@ fn coreFetchDisposition(env: c.napi_env, info: c.napi_callback_info) callconv(.c
     defer unlockRuntime(runtime_handle);
     const disposition = runtime.fetch.disposition(fetch_handle);
     var value: c.napi_value = undefined;
-    if (!statusOk(env, c.napi_create_int32(env, @intFromEnum(disposition), &value), "could not query fetch disposition")) return null;
+    if (!statusOk(env, c.napi_create_int32(env, @backingInt(disposition), &value), "could not query fetch disposition")) return null;
     return value;
 }
 

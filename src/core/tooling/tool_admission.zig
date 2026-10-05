@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const vision_contracts = @import("../agent/runtime/vision_contracts.zig");
@@ -3461,7 +3462,7 @@ test "prepared file mutation cleans every partial allocation failure" {
     defer alloc.free(workspace);
 
     try std.testing.checkAllAllocationFailures(
-        alloc,
+        testing_allocator.no_resize,
         checkFileMutationPreparationAllocationFailures,
         .{workspace},
     );

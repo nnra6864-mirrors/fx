@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
@@ -194,7 +195,7 @@ test "loadSkills canonicalizes a symlinked HOME before discovering optional root
 }
 
 test "loadSkills propagates allocation failure instead of returning an empty inventory" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io_mod.getIo(), "home/workspace");

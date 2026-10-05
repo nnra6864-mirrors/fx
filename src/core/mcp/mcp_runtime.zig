@@ -7,6 +7,7 @@ const catalog_refresh = @import("catalog_refresh.zig");
 const tool_search = @import("tool_search.zig");
 const server_views = @import("server_views.zig");
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const atomic_value = @import("atomic_value.zig");
 const server_connection = @import("server_connection.zig");
 const builtin = @import("builtin");
@@ -4972,7 +4973,7 @@ test "direct legacy terminal retains only completed tool outcomes" {
 }
 
 test "legacy URL waiter publication is allocator-safe and retirement wakes it" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
     var failed_runtime = McpRuntime.init(failing.allocator());
     defer failed_runtime.deinit();
     const ids = [_][]const u8{"one"};
@@ -5672,7 +5673,7 @@ fn expectResourceText(result: ResourceReadResult, expected: []const u8) !void {
 
 fn expectTestProcessExited(pid: std.posix.pid_t) !void {
     for (0..200) |_| {
-        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+        std.posix.kill(pid, @fromBackingInt(@intCast(0))) catch |err| switch (err) {
             error.ProcessNotFound => return,
             else => {},
         };
@@ -6199,7 +6200,7 @@ test "resource read cache publication OOM releases fetched contents" {
         .name = @constCast("owned"),
     }};
     var server = resourceReadPublicationServerForTest(&descriptors);
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
     var runtime = McpRuntime.init(failing.allocator());
     defer runtime.deinit();
     const snapshot = resourceReadPublicationSnapshotForTest(&server);
@@ -6272,7 +6273,7 @@ test "resource read publication cancellation and deadline release fetched conten
 
 test "cached resource read finalization releases every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkResourceReadFinishAllocationFailures,
         .{true},
     );
@@ -6280,7 +6281,7 @@ test "cached resource read finalization releases every allocation failure" {
 
 test "uncached resource read finalization releases every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkResourceReadFinishAllocationFailures,
         .{false},
     );
@@ -6311,8 +6312,8 @@ fn checkResourceSnapshotWithTemplatesAllocationFailures(alloc: Allocator) !void 
 }
 
 test "resource template matching bounds catalog work and releases the catalog lock" {
-    const malicious_template = "memory://{value}" ++ ("a" ** 2047) ++ "b";
-    const requested_uri = "memory://" ++ ("a" ** 4096);
+    const malicious_template = "memory://{value}" ++ text_utils.repeat("a", 2047) ++ "b";
+    const requested_uri = "memory://" ++ text_utils.repeat("a", 4096);
     var templates = [_]resources_feature.Template{.{
         .uri_template = @constCast(malicious_template),
         .name = @constCast("bounded"),
@@ -6385,7 +6386,7 @@ test "resource template matching propagates operation control and releases the c
 
 test "resource template snapshot allocation failures propagate and clean up" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkResourceSnapshotWithTemplatesAllocationFailures,
         .{},
     );
@@ -6828,7 +6829,7 @@ test "MCP health terminal-encodes external identity and omits secret-bearing con
 
 test "MCP health snapshot cleans up every partial allocation" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkHealthSnapshotAllocationFailures,
         .{},
     );
@@ -6936,7 +6937,7 @@ fn checkModelCatalogSnapshotAllocationFailures(alloc: Allocator) !void {
 
 test "model catalog snapshot cleans up every partial allocation" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkModelCatalogSnapshotAllocationFailures,
         .{},
     );
@@ -7218,16 +7219,16 @@ test "tool name allocation sanitizes truncates and deconflicts" {
     defer alloc.free(space_collision);
     try std.testing.expectEqualStrings("mcp_a_b_c_2", space_collision);
 
-    const long_server = [_]u8{'s'} ** 70;
+    const long_server: [70]u8 = @splat('s');
     const long_first = try used.name(alloc, .{}, long_server[0..], "tool");
     defer alloc.free(long_first);
     try std.testing.expectEqual(@as(usize, 64), long_first.len);
-    try std.testing.expectEqualStrings("mcp_" ++ ("s" ** 60), long_first);
+    try std.testing.expectEqualStrings("mcp_" ++ text_utils.repeat("s", 60), long_first);
 
     const long_second = try used.name(alloc, .{}, long_server[0..], "other");
     defer alloc.free(long_second);
     try std.testing.expectEqual(@as(usize, 64), long_second.len);
-    try std.testing.expectEqualStrings("mcp_" ++ ("s" ** 58) ++ "_2", long_second);
+    try std.testing.expectEqualStrings("mcp_" ++ text_utils.repeat("s", 58) ++ "_2", long_second);
 }
 
 test "MCP tool name allocation reserves registered tool names" {
@@ -7255,7 +7256,7 @@ test "MCP tool name allocation leaves non-conflicting dynamic names unchanged" {
 }
 
 test "tool name allocation collision path cleans up allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkAllocateToolNameCollisionAllocFailures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkAllocateToolNameCollisionAllocFailures, .{});
 }
 
 fn checkToolSnapshotBuildAllocationFailures(alloc: Allocator) !void {
@@ -7295,7 +7296,7 @@ fn checkCursorReplacementAllocationFailures(alloc: Allocator) !void {
 
 test "cursor replacement preserves the previous owner on allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkCursorReplacementAllocationFailures,
         .{},
     );
@@ -7322,7 +7323,7 @@ fn checkServerDiagnosticSnapshotAllocationFailures(alloc: Allocator) !void {
 
 test "server diagnostic snapshots release every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkServerDiagnosticSnapshotAllocationFailures,
         .{},
     );
@@ -7330,7 +7331,7 @@ test "server diagnostic snapshots release every allocation failure" {
 
 test "whole tool snapshot construction releases every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkToolSnapshotBuildAllocationFailures,
         .{},
     );
@@ -7472,10 +7473,10 @@ test "MCP search bounds untrusted description and schema fields" {
         &used,
     );
 
-    const description = "zearly123 " ++ ("x" ** mcp_tool_description_search_bytes) ++ " zlate987";
+    const description = "zearly123 " ++ text_utils.repeat("x", mcp_tool_description_search_bytes) ++ " zlate987";
     const schema =
         "{\"type\":\"object\",\"properties\":{\"zearly456\":{\"type\":\"string\"},\"padding\":{\"description\":\"" ++
-        ("x" ** mcp_tool_schema_search_bytes) ++
+        text_utils.repeat("x", mcp_tool_schema_search_bytes) ++
         "zlate654\"}}}";
     const tool = &runtime.servers.items[0].tool_catalog.tools.items[0];
     alloc.free(tool.description);
@@ -7503,7 +7504,7 @@ test "MCP search bounds untrusted description and schema fields" {
 }
 
 test "MCP search releases request-scoped ranking allocations" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var runtime = McpRuntime.init(alloc);
     defer runtime.deinit();
 
@@ -8117,7 +8118,7 @@ test "MCP access snapshot admits feature-only servers independently of tools" {
 
 test "MCP access snapshot releases every partial allocation" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkAccessSnapshotAllocationFailures,
         .{},
     );
@@ -8362,7 +8363,7 @@ test "MCP exact selection returns one executable schema by prefixed name" {
 
     try runtime.addServer(.{ .name = try alloc.dupe(u8, "fs"), .command = try alloc.dupe(u8, "cmd") });
     runtime.servers.items[0].state.store(.ready, .release);
-    runtime.servers.items[0].instructions = try alloc.dupe(u8, ("i" ** 1500) ++ "instruction tail");
+    runtime.servers.items[0].instructions = try alloc.dupe(u8, text_utils.repeat("i", 1500) ++ "instruction tail");
 
     var used = tool_names.Registry.init(alloc);
     defer used.deinit();
@@ -8756,7 +8757,7 @@ fn checkConfigurationReloadAllocationFailures(alloc: Allocator) !void {
 }
 
 test "configuration reload cleans up every allocation failure without opening a transport" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkConfigurationReloadAllocationFailures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkConfigurationReloadAllocationFailures, .{});
 }
 
 const boundedEncodedScalar = tool_search.boundedEncodedScalar;

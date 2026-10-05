@@ -460,12 +460,14 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn persistFinishedPrompt(app: *App, finished: types.FinishedPrompt) !void {
-            errdefer |err| app_session_runtime.Runtime(App).recordFailedHistoryDelivery(app, err);
-            if (comptime @hasField(App, "session")) {
-                try app_session_runtime.Runtime(App).appendFinishedPrompt(app, finished);
-            } else {
-                try app.appendFinishedPrompt(finished);
-            }
+            const appended = if (comptime @hasField(App, "session"))
+                app_session_runtime.Runtime(App).appendFinishedPrompt(app, finished)
+            else
+                app.appendFinishedPrompt(finished);
+            appended catch |err| {
+                app_session_runtime.Runtime(App).recordFailedHistoryDelivery(app, err);
+                return err;
+            };
         }
 
         fn settleDeferredFinish(app: *App) !void {
@@ -1492,12 +1494,12 @@ const FakeWorker = struct {
     reset_cancel_after_take_events: bool = false,
     admission_snapshot: worker_runtime.InteractiveAdmissionSnapshot = .open,
 
-    fn compactionActivitySnapshot(self: *FakeWorker) @import("../output/compaction_activity.zig").Snapshot {
+    pub fn compactionActivitySnapshot(self: *FakeWorker) @import("../output/compaction_activity.zig").Snapshot {
         self.compaction_reads += 1;
         return self.compaction.snapshot;
     }
 
-    fn expireCompactionActivity(self: *FakeWorker, id: @import("../output/compaction_activity.zig").OperationId, revision: u64, now_ms: i64) bool {
+    pub fn expireCompactionActivity(self: *FakeWorker, id: @import("../output/compaction_activity.zig").OperationId, revision: u64, now_ms: i64) bool {
         return self.compaction.expire(id, revision, now_ms);
     }
 
@@ -1572,7 +1574,7 @@ const FakeWorker = struct {
         };
     }
 
-    fn interactiveAdmissionSnapshot(self: *FakeWorker) worker_runtime.InteractiveAdmissionSnapshot {
+    pub fn interactiveAdmissionSnapshot(self: *FakeWorker) worker_runtime.InteractiveAdmissionSnapshot {
         return self.admission_snapshot;
     }
 
@@ -1605,14 +1607,14 @@ const FakeWorker = struct {
         return self.active_turn_id;
     }
 
-    fn propagateHistoryTurn(self: *FakeWorker, alloc: std.mem.Allocator, turn: types.HistoryTurn, max_history_turns: usize) !void {
+    pub fn propagateHistoryTurn(self: *FakeWorker, alloc: std.mem.Allocator, turn: types.HistoryTurn, max_history_turns: usize) !void {
         _ = alloc;
         _ = turn;
         _ = max_history_turns;
         self.propagated_history_turns += 1;
     }
 
-    fn propagateGrant(self: *FakeWorker, alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8) !void {
+    pub fn propagateGrant(self: *FakeWorker, alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8) !void {
         _ = alloc;
         _ = tool_name;
         _ = target_path;
@@ -1652,7 +1654,7 @@ const FakeApprovalPrompt = struct {
         return changed;
     }
 
-    fn syncReview(self: *FakeApprovalPrompt, review: ?*const diff_mod.FileReview) bool {
+    pub fn syncReview(self: *FakeApprovalPrompt, review: ?*const diff_mod.FileReview) bool {
         const request = self.request orelse {
             const changed = self.review != null;
             self.review = null;
@@ -1849,7 +1851,7 @@ const FakeShell = struct {
         self.command_output_display = .{};
     }
 
-    fn openCommandOutputLifecycleId(self: *const FakeShell) ?types.ToolLifecycleId {
+    pub fn openCommandOutputLifecycleId(self: *const FakeShell) ?types.ToolLifecycleId {
         return self.lifecycle.openCommandOutputLifecycleId();
     }
 };
@@ -1996,7 +1998,7 @@ const FakeApp = struct {
         return false;
     }
 
-    fn dispatchAttentionRequired(
+    pub fn dispatchAttentionRequired(
         self: *FakeApp,
         turn_id: u64,
         kind: @import("../hooks/hooks.zig").AttentionKind,

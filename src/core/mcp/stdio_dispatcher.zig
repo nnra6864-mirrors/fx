@@ -6,6 +6,7 @@ const io_mod = @import("../shared/io.zig");
 const mcp_contract = @import("mcp_contract.zig");
 const docker_run = @import("docker_run.zig");
 const operation_control = @import("operation_control.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const request_poll_ns: u64 = 5 * std.time.ns_per_ms;
@@ -1988,7 +1989,7 @@ fn terminateChild(child_id: std.process.Child.Id) void {
     switch (builtin.os.tag) {
         .windows => {
             const windows = std.os.windows;
-            switch (windows.ntdll.NtTerminateProcess(child_id, @enumFromInt(1))) {
+            switch (windows.ntdll.NtTerminateProcess(child_id, @fromBackingInt(@intCast(1)))) {
                 .SUCCESS, .PROCESS_IS_TERMINATING, .ACCESS_DENIED => {},
                 else => |status| debug_trace.logf(
                     "mcp",
@@ -2354,7 +2355,7 @@ fn createShellDispatcher(script: []const u8) !struct {
 
 fn expectProcessReaped(pid: std.posix.pid_t) !void {
     for (0..100) |_| {
-        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+        std.posix.kill(pid, @fromBackingInt(@intCast(0))) catch |err| switch (err) {
             error.ProcessNotFound => return,
             else => {},
         };
@@ -2886,7 +2887,7 @@ test "MCP stdio keeps the stdout line it rejected as not an MCP message" {
 }
 
 test "rejected stdout keeps a bounded prefix of the line" {
-    const long_line = "x" ** (rejected_output_capacity + 10);
+    const long_line = text_utils.repeat("x", rejected_output_capacity + 10);
     const rejected = RejectedOutput.init(long_line);
     try std.testing.expectEqual(rejected_output_capacity, rejected.slice().len);
     try std.testing.expect(rejected.truncated);
@@ -3000,7 +3001,7 @@ test "MCP stdio exit is not held by a detached descendant that keeps stderr open
     try expectProcessReaped(fixture.pid);
     try std.testing.expect(elapsed_ms < shutdown_grace_ms);
     // Still alive: it escaped the group kill and held stderr the whole time.
-    try std.posix.kill(descendant.?, @enumFromInt(0));
+    try std.posix.kill(descendant.?, @fromBackingInt(@intCast(0)));
 }
 
 test "MCP immediate shutdown kills an uncooperative child without grace waits" {
@@ -3090,7 +3091,7 @@ test "process exit leaves a docker-backed child to the full teardown" {
 
     try std.testing.expect(!killAllForProcessExit());
     try std.testing.expect(fixture.dispatcher.childMayBeRunning());
-    try std.posix.kill(fixture.pid, @enumFromInt(0));
+    try std.posix.kill(fixture.pid, @fromBackingInt(@intCast(0)));
 }
 
 test "process exit waits for a stdio launch under way before killing" {

@@ -481,7 +481,7 @@ pub fn projectFileApproval(
     if (target_count == 0) return result;
 
     var remaining = target_count;
-    var choice_selected = [_]bool{false} ** 3;
+    var choice_selected: [3]bool = @splat(false);
     const choice_rows = @min(@as(usize, 3), remaining);
     const choice_window = picker_presentation.pickerWindow(
         3,
@@ -499,7 +499,7 @@ pub fn projectFileApproval(
     if (question_selected) remaining -= 1;
 
     var preview_selected =
-        [_]bool{false} ** diff_mod.max_preview_lines;
+        @as([diff_mod.max_preview_lines]bool, @splat(false));
     var selected_preview_count: usize = 0;
     if (remaining > 0) {
         for (request.preview.lines[0..preview_count], 0..) |line, index| {
@@ -2398,7 +2398,7 @@ test "inline command panel wraps the complete target before its controls" {
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(alloc);
     try std.testing.expect(try prompt.syncRequest(alloc, .{
-        .label = "shell.run printf 'INLINE_COMMAND_START " ++ "x" ** 55 ++ " INLINE_COMMAND_END'",
+        .label = "shell.run printf 'INLINE_COMMAND_START " ++ text_utils.repeat("x", 55) ++ " INLINE_COMMAND_END'",
     }));
 
     const request = prompt.request.?.view();
@@ -2431,7 +2431,7 @@ test "inline command panel wraps the complete target before its controls" {
 
 test "inline command panel uses full command when label is bounded" {
     const alloc = std.testing.allocator;
-    const command = "printf 'INLINE_FULL_COMMAND_START_" ++ ("x" ** 80) ++ "_INLINE_FULL_COMMAND_END'";
+    const command = "printf 'INLINE_FULL_COMMAND_START_" ++ text_utils.repeat("x", 80) ++ "_INLINE_FULL_COMMAND_END'";
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(alloc);
     try std.testing.expect(try prompt.syncRequest(alloc, .{
@@ -2533,7 +2533,7 @@ test "inline command panel wraps commands at word boundaries" {
 test "inline command panel never truncates the complete command" {
     const alloc = std.testing.allocator;
     const command = "printf 'INLINE_UNBOUNDED_COMMAND_START_" ++
-        ("x" ** (diff_mod.max_request_projection_bytes + 64)) ++
+        text_utils.repeat("x", diff_mod.max_request_projection_bytes + 64) ++
         "_INLINE_UNBOUNDED_COMMAND_END'";
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(alloc);

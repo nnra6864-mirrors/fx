@@ -104,11 +104,11 @@ const ForegroundSessionTerminationRequest = enum(std.c.sig_atomic_t) {
     force,
 };
 var foreground_session_termination_request: std.c.sig_atomic_t =
-    @intFromEnum(ForegroundSessionTerminationRequest.none);
+    @backingInt(ForegroundSessionTerminationRequest.none);
 const foreground_session_replace_error_name_bytes = blk: {
     var max_len: usize = 0;
-    for (std.meta.fields(std.process.ReplaceError)) |field| {
-        max_len = @max(max_len, field.name.len);
+    for (@typeInfo(std.process.ReplaceError).error_set.error_names.?) |error_name| {
+        max_len = @max(max_len, error_name.len);
     }
     break :blk max_len;
 };
@@ -187,7 +187,7 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
     };
 
     @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_request).* =
-        @intFromEnum(ForegroundSessionTerminationRequest.none);
+        @backingInt(ForegroundSessionTerminationRequest.none);
     const supervisor_action: std.posix.Sigaction = .{
         .handler = .{ .handler = recordForegroundSessionTermination },
         .mask = foregroundSupervisorSignalMask(),
@@ -293,8 +293,8 @@ fn writeForegroundTargetScript(target_input: std.Io.File, script: []const u8) vo
 
 fn recordForegroundSessionTermination(signal: std.posix.SIG) callconv(.c) void {
     const request = @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_request);
-    request.* = @intFromEnum(mergeForegroundSessionTerminationRequest(
-        @enumFromInt(request.*),
+    request.* = @backingInt(mergeForegroundSessionTerminationRequest(
+        @fromBackingInt(@intCast(request.*)),
         signal,
     ));
 }
@@ -316,9 +316,9 @@ fn mergeForegroundSessionTerminationRequest(
 }
 
 fn foregroundSessionTerminationRequest() ForegroundSessionTerminationRequest {
-    return @enumFromInt(
+    return @fromBackingInt(@intCast(
         @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_request).*,
-    );
+    ));
 }
 
 const ForegroundTerminationAction = enum {
@@ -463,7 +463,7 @@ fn waitForForegroundTarget(
         );
         if (request == .force) {
             @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_request).* =
-                @intFromEnum(ForegroundSessionTerminationRequest.force);
+                @backingInt(ForegroundSessionTerminationRequest.force);
         }
         try refreshForegroundTargetTree(&descendants, target_pid);
         advanceForegroundTargetTermination(
@@ -683,7 +683,7 @@ fn exitForegroundSessionSupervisor(term: std.process.Child.Term) noreturn {
             std.posix.sigaddset(&signal_mask, signal);
             std.posix.sigprocmask(std.posix.SIG.UNBLOCK, &signal_mask, null);
             std.posix.raise(signal) catch {};
-            std.process.exit(128 + @as(u8, @truncate(@intFromEnum(signal))));
+            std.process.exit(128 + @as(u8, @truncate(@backingInt(signal))));
         },
         .stopped, .unknown => std.process.exit(127),
     }
@@ -1504,9 +1504,7 @@ pub fn spawnDetachedSession(
 
 fn foregroundSessionExecutable(scratch: Allocator) ![]const u8 {
     if (comptime builtin.is_test) {
-        const path_z = std.c.getenv("FX_TEST_PRODUCT_EXE") orelse
-            return error.TestProductExecutableMissing;
-        return std.mem.sliceTo(path_z, 0);
+        return (try self_exe.testProductExe(scratch)) orelse error.TestProductExecutableMissing;
     }
     return self_exe.pathForReexec(scratch);
 }
@@ -2006,7 +2004,7 @@ test "zsh user profile reports natural SIGTERM after alias-safe startup" {
     try std.testing.expect(std.mem.startsWith(u8, signaled.output, "signal=15\n"));
     const foreground = signaled.command_result.?;
     try std.testing.expectEqual(@as(?i64, null), foreground.exit_code);
-    try std.testing.expectEqual(@as(?u32, @intFromEnum(std.posix.SIG.TERM)), foreground.signal);
+    try std.testing.expectEqual(@as(?u32, @backingInt(std.posix.SIG.TERM)), foreground.signal);
 
     // The startup files ran once into the snapshot. The aliased `builtin`
     // could not intercept the alias-safe `\builtin eval` that runs the
@@ -2316,7 +2314,7 @@ fn formatOutputWithStatus(
 fn commandStatusFromTerm(term: std.process.Child.Term) command_contract.CommandStatus {
     return switch (term) {
         .exited => |code| .{ .exit_code = @intCast(code) },
-        .signal => |sig| .{ .signal = @intFromEnum(sig) },
+        .signal => |sig| .{ .signal = @backingInt(sig) },
         .stopped, .unknown => .indeterminate,
     };
 }
@@ -2726,9 +2724,9 @@ const ForegroundLaunchFailureProbe = struct {
 };
 
 fn parseReplaceError(name: []const u8) ?std.process.ReplaceError {
-    inline for (std.meta.fields(std.process.ReplaceError)) |field| {
-        if (std.mem.eql(u8, name, field.name)) {
-            return @field(std.process.ReplaceError, field.name);
+    inline for (comptime @typeInfo(std.process.ReplaceError).error_set.error_names.?) |error_name| {
+        if (std.mem.eql(u8, name, error_name)) {
+            return @field(std.process.ReplaceError, error_name);
         }
     }
     return null;
@@ -3456,7 +3454,7 @@ fn terminateRemainingProcessGroup(pid: std.posix.pid_t) void {
 fn remainingProcessGroupAlive(process_group_id: ?std.posix.pid_t) bool {
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return false;
     const pid = process_group_id orelse return false;
-    std.posix.kill(-pid, @enumFromInt(0)) catch |err| return switch (err) {
+    std.posix.kill(-pid, @fromBackingInt(@intCast(0))) catch |err| return switch (err) {
         error.ProcessNotFound => false,
         else => true,
     };
@@ -3583,6 +3581,7 @@ fn spawnForegroundSessionBootstrapForTest(
     target_script: []const u8,
 ) !std.process.Child {
     const product_path = try foregroundSessionExecutable(std.testing.allocator);
+    defer std.testing.allocator.free(product_path);
     const argv = [_][]const u8{
         product_path,
         foreground_session_token,
@@ -3668,13 +3667,13 @@ fn spawnUnreadyForegroundSessionChildForTest(argv: []const []const u8) !std.proc
 
 fn expectReapedChildForTest(child: *std.process.Child, pid: std.posix.pid_t) !void {
     try std.testing.expect(child.id == null);
-    try std.testing.expectError(error.ProcessNotFound, std.posix.kill(pid, @enumFromInt(0)));
+    try std.testing.expectError(error.ProcessNotFound, std.posix.kill(pid, @fromBackingInt(@intCast(0))));
 }
 
 fn expectProcessGoneWithinForTest(pid: std.posix.pid_t, timeout_ms: i64) !void {
     const deadline_ms = io_mod.milliTimestamp() + timeout_ms;
     while (io_mod.milliTimestamp() < deadline_ms) {
-        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+        std.posix.kill(pid, @fromBackingInt(@intCast(0))) catch |err| switch (err) {
             error.ProcessNotFound => return,
             else => return err,
         };
@@ -5144,7 +5143,7 @@ test "timeout terminates foreground process group descendants" {
 
     const started_ms = io_mod.milliTimestamp();
     while (true) {
-        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+        std.posix.kill(pid, @fromBackingInt(@intCast(0))) catch |err| switch (err) {
             error.ProcessNotFound => break,
             else => return err,
         };

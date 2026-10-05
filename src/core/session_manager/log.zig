@@ -932,7 +932,7 @@ test "crc32c equals std's byte-at-a-time CRC32C at every length and alignment" {
     for (0..300) |len| {
         for (0..8) |start| {
             const slice = buffer[start..][0..len];
-            try testing.expectEqual(std.hash.crc.Crc32Iscsi.hash(slice), crc32c(slice));
+            try testing.expectEqual(std.hash.crc.@"CRC-32/ISCSI".hash(slice), crc32c(slice));
         }
     }
 }

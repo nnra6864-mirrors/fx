@@ -77,7 +77,7 @@ pub fn failureForHttpStatus(status: std.http.Status) Failure {
         return .{ .category = .rate_limited, .http_status = status, .retryable = true };
     }
 
-    const code = @intFromEnum(status);
+    const code = @backingInt(status);
     if (code >= 500 and code < 600) {
         return .{
             .category = .gateway_unavailable,
@@ -298,7 +298,7 @@ fn traceCatalogLoadOutcome(
             "model_catalog_load",
             .{},
             common_format ++ " http_status={d} retryable={s}",
-            common_args ++ .{ @intFromEnum(status), retryable },
+            common_args ++ .{ @backingInt(status), retryable },
         );
     } else {
         debug_trace.eventf(

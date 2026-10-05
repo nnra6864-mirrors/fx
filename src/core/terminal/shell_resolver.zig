@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const contracts = @import("contracts.zig");
 const command_environment = @import("../execution/command_environment.zig");
@@ -706,7 +707,7 @@ fn checkBootstrapAllocationFailures(alloc: Allocator) !void {
 
 test "bootstrap construction cleans every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkBootstrapAllocationFailures,
         .{},
     );

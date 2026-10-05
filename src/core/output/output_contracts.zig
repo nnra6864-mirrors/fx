@@ -1067,7 +1067,7 @@ fn writeUtcTimestamp(writer: *std.Io.Writer, timestamp_ms: i64) !void {
 
     try writer.print("{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>3} UTC", .{
         year_day.year,
-        @intFromEnum(month_day.month),
+        @backingInt(month_day.month),
         month_day.day_index + 1,
         day.getHoursIntoDay(),
         day.getMinutesIntoHour(),
@@ -2365,7 +2365,7 @@ test "core session list snapshot text and json stay stable" {
         script_text,
     );
 
-    const long_title = "a" ** session_display_metadata.max_title_bytes;
+    const long_title = text_utils.repeat("a", session_display_metadata.max_title_bytes);
     var long_session = sessions[0];
     long_session.title = @constCast(long_title);
     const long_text = try (SessionListSnapshot{ .sessions = @as(*const [1]session_store.SessionSummary, &long_session) }).renderText(std.testing.allocator);

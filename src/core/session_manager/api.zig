@@ -561,8 +561,8 @@ pub const Session = struct {
         defer arena.deinit();
         var summary = s.indexSummary(arena.allocator()) catch return m.indexStale(s.id());
         switch (why) {
-            .published => summary.opened_ms[@intFromEnum(summary.host)] = summary.updated_ms,
-            .resumed => |host| summary.opened_ms[@intFromEnum(host)] = m.nowMs(),
+            .published => summary.opened_ms[@backingInt(summary.host)] = summary.updated_ms,
+            .resumed => |host| summary.opened_ms[@backingInt(host)] = m.nowMs(),
             .changed => {},
         }
         m.catalog().put(summary) catch m.indexStale(s.id());
@@ -912,7 +912,7 @@ const api_tests = struct {
         try testing.expectEqual(@as(usize, 0), page.items.len);
         page.deinit();
         try testing.expectError(error.NotFound, f.manager.read(gpa, "AAAAAAAAAAAA", .start, .forward, 10));
-        try testing.expectError(error.NotFound, f.manager.getBlob(gpa, "AAAAAAAAAAAA", "0" ** 64));
+        try testing.expectError(error.NotFound, f.manager.getBlob(gpa, "AAAAAAAAAAAA", &@as([64]u8, @splat('0'))));
         try testing.expectError(error.NotFound, f.manager.openResume(.{ .target = .last, .workspace = "/w", .host = .acp }));
         try testing.expectError(error.NotFound, f.manager.verify("AAAAAAAAAAAA"));
         try testing.expectError(error.NotFound, f.manager.delete("AAAAAAAAAAAA"));
@@ -1485,7 +1485,7 @@ const api_tests = struct {
         defer s.release();
         _ = try s.append(&.{.turn_started});
         try testing.expectError(error.InvalidArgument, s.append(&.{.{ .item = .{ .type = "assistant", .data = "{not json" } }}));
-        for ([_][]const u8{ "", "Steering", "tool-call", "x" ** 33 }) |bad_type| {
+        for ([_][]const u8{ "", "Steering", "tool-call", &@as([33]u8, @splat('x')) }) |bad_type| {
             try testing.expectError(error.InvalidArgument, s.append(&.{.{ .item = .{ .type = bad_type, .data = "{}" } }}));
         }
         try testing.expectError(error.InvalidArgument, s.append(&.{.{ .set = .{ .key = .title, .value = "42" } }}));
@@ -1550,7 +1550,7 @@ const api_tests = struct {
         try expectListedLanguage(m, "\"und-Latn\"");
 
         // Refused: not a string, empty, longer than 24 bytes. Nothing changes.
-        for ([_][]const u8{ "42", "\"\"", "\"" ++ "x" ** 25 ++ "\"" }) |bad| {
+        for ([_][]const u8{ "42", "\"\"", "\"" ++ &@as([25]u8, @splat('x')) ++ "\"" }) |bad| {
             try testing.expectError(error.InvalidArgument, s.append(&.{.{ .set = .{ .key = .language, .value = bad } }}));
         }
         s.release();
@@ -1725,7 +1725,7 @@ const api_tests = struct {
         const m = f.manager;
         const s = try m.openNew(.{ .workspace = "/w", .host = .app });
         // Held before the first turn: nothing is on disk, so no blob exists.
-        const absent = [_][]const u8{"a" ** 64};
+        const absent = [_][]const u8{&@as([64]u8, @splat('a'))};
         try testing.expectError(error.InvalidTransition, s.append(&.{.{ .set = .{ .key = .moved_files, .value = "{}", .blobs = &absent } }}));
         _ = try s.append(&.{ .turn_started, piece, .turn_committed });
         // A malformed hash is refused at the boundary, a missing one by the rule.
@@ -1854,7 +1854,7 @@ const api_tests = struct {
         try testing.expectEqual(@as(std.posix.mode_t, storage.blob_mode), fork_st.permissions.toMode() & 0o777);
 
         // Only a well-formed hash this session holds has a path.
-        try testing.expectError(error.NotFound, m.blobPath(gpa, id, "b" ** 64));
+        try testing.expectError(error.NotFound, m.blobPath(gpa, id, &@as([64]u8, @splat('b'))));
         try testing.expectError(error.InvalidArgument, m.blobPath(gpa, id, "../x"));
         try testing.expectError(error.NotFound, m.blobPath(gpa, "nosuchsession", &hash));
     }

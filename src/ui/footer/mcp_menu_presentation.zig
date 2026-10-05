@@ -174,8 +174,8 @@ fn composeHeader(alloc: Allocator, projection: McpMenuProjection, width: u16) !s
     const title = std.fmt.bufPrint(&title_buf, "MCP {d}", .{projection.servers.len}) catch "MCP";
     try wide.appendSlice(alloc, title);
     try wide.appendSlice(alloc, ui_render.reset_style);
-    inline for (std.meta.fields(mcp_menu_state.Section)) |field| {
-        const section: mcp_menu_state.Section = @enumFromInt(field.value);
+    inline for (@typeInfo(mcp_menu_state.Section).@"enum".field_values) |field_value| {
+        const section: mcp_menu_state.Section = @fromBackingInt(@intCast(field_value));
         try wide.appendSlice(alloc, "  ");
         try appendSectionTab(alloc, &wide, section, section == projection.state.section);
     }

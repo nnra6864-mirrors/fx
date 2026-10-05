@@ -176,7 +176,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
         try pulse(request.cooperative_pulse);
     }
 
-    const status: std.http.Status = @enumFromInt(status_code);
+    const status: std.http.Status = @fromBackingInt(@intCast(status_code));
     if (status != .ok) return .{ .failed = .{
         .kind = failureKind(status),
         .detail = try readBody(

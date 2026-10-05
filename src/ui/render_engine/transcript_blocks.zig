@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const build_checkpoint = @import("build_checkpoint.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const display_width = @import("../../core/shared/display_width.zig");
@@ -4593,7 +4594,7 @@ test "semantic thematic rule fills assistant content width and keeps provenance"
 }
 
 test "semantic table renderer frees rendered output when row prefixing fails" {
-    const base = std.testing.allocator;
+    const base = testing_allocator.no_resize;
 
     var table_entry = TranscriptEntry{ .assistant_table = .{
         .id = 1,
@@ -4638,7 +4639,7 @@ fn checkCodeBlockRenderAllocationFailures(alloc: Allocator) !void {
 
 test "renderEntryToBlock frees all highlighted code allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkCodeBlockRenderAllocationFailures,
         .{},
     );

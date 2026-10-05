@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const json_number = @import("json_number.zig");
 const json_schema_pattern = @import("json_schema_pattern.zig");
 
@@ -2312,7 +2313,7 @@ test "continuation decisions reject stale cross-owner and duplicate answers" {
 }
 
 test "request parsing and validation release every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkAllocationFailures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkAllocationFailures, .{});
 }
 
 test "ACP projection keeps the wire distinctions from modern and legacy MCP" {

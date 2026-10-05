@@ -5,6 +5,7 @@
 //! moved into `McpRuntime`.
 
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const mcp_auth = @import("mcp_auth.zig");
 const mcp_contract = @import("mcp_contract.zig");
 const startup_admission = @import("startup_admission.zig");
@@ -29,8 +30,9 @@ pub fn sameServerConfig(left: McpServerConfig, right: McpServerConfig) bool {
 fn sameConfigValue(comptime T: type, left: T, right: T) bool {
     return switch (@typeInfo(T)) {
         .@"struct" => result: {
-            inline for (std.meta.fields(T)) |field| {
-                if (!sameConfigValue(field.type, @field(left, field.name), @field(right, field.name))) break :result false;
+            const info = @typeInfo(T).@"struct";
+            inline for (info.field_names, info.field_types) |field_name, field_type| {
+                if (!sameConfigValue(field_type, @field(left, field_name), @field(right, field_name))) break :result false;
             }
             break :result true;
         },
@@ -1697,7 +1699,7 @@ test "workspace environment expansion never refunds rejected entry work" {
 }
 
 test "workspace environment expansion rejects exhausted budget before allocation" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var environment = std.process.Environ.Map.init(alloc);
     defer environment.deinit();
     try environment.put("TOKEN", "secret");
@@ -1870,7 +1872,7 @@ test "workspace parsing releases every partial allocation failure" {
     var fail_index: usize = 0;
     while (fail_index < 256) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
+            testing_allocator.no_resize,
             .{ .fail_index = fail_index },
         );
         var result = parseWorkspaceJson(failing.allocator(), json, .workspace, .{}) catch |err| switch (err) {
@@ -1883,7 +1885,7 @@ test "workspace parsing releases every partial allocation failure" {
 }
 
 test "choice parsing and mutation release every partial allocation failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
         alloc,

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const builtin_skills = @import("../../builtins/skills.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const model_context_encoding = @import("../../core/shared/model_context_encoding.zig");
@@ -278,7 +279,7 @@ test "install_skill owner reports no matching skills" {
     try std.testing.expectEqualStrings(expected, output);
 
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkNoMatchAllocationFailures,
         .{repo_root},
     );

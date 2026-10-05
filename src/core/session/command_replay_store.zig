@@ -388,7 +388,7 @@ pub const Capture = struct {
             self.digest_started = true;
         }
         var header: [frame_header_bytes]u8 = undefined;
-        header[0] = @intFromEnum(stream);
+        header[0] = @backingInt(stream);
         std.mem.writeInt(u64, header[1..], @intCast(bytes.len), .little);
         self.content_hasher.update(&header);
         self.content_hasher.update(bytes);
@@ -401,7 +401,7 @@ pub const Capture = struct {
         bytes: []const u8,
     ) !void {
         var header: [frame_header_bytes]u8 = undefined;
-        header[0] = @intFromEnum(stream);
+        header[0] = @backingInt(stream);
         const payload_len = std.math.cast(u64, bytes.len) orelse
             return error.ReplayFrameTooLarge;
         std.mem.writeInt(u64, header[1..], payload_len, .little);
@@ -1595,7 +1595,7 @@ test "a v2 session keeps a replay as one blob named by its hash, spooled or inli
     small.releaseRetained(capture_alloc);
 
     // A name this session never stored is not found.
-    try std.testing.expectError(error.ResultHandleNotFound, Reader.openHandle(alloc, &capability, "fx-command-replay-" ++ "0" ** 64 ++ ".bin"));
+    try std.testing.expectError(error.ResultHandleNotFound, Reader.openHandle(alloc, &capability, "fx-command-replay-" ++ text_utils.repeat("0", 64) ++ ".bin"));
     // Every store's blobs share the session: the same blob under a
     // web-fetch download's `.bin` handle is not a replay.
     const foreign = try std.mem.concat(alloc, u8, &.{ "artifact-", handle["fx-command-replay-".len..] });
@@ -1983,7 +1983,7 @@ test "saved command replay pages and searches beyond eight mebibytes with bounde
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const capture = try Capture.create(arena, 1024, &capability);
-    var chunk = [_]u8{'x'} ** 8192;
+    var chunk: [8192]u8 = @splat('x');
     chunk[chunk.len - 1] = '\n';
     for (0..1025) |_| try capture.appendAcceptedRequired(arena, .stdout, &chunk);
     try capture.appendAcceptedRequired(arena, .stderr, "TAIL-SENTINEL-9MIB\n");
@@ -2063,7 +2063,7 @@ test "command replay reader rejects descriptor and frame corruption" {
     );
 
     const empty_handle = "fx-command-replay-empty-frame.bin";
-    var empty_replay = [_]u8{0} ** (replay_magic.len + frame_header_bytes);
+    var empty_replay: [replay_magic.len + frame_header_bytes]u8 = @splat(0);
     @memcpy(empty_replay[0..replay_magic.len], replay_magic);
     var empty_file = try capability.createExclusiveFile(
         alloc,

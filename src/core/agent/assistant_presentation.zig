@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const Allocator = std.mem.Allocator;
 
 const display_width = @import("../shared/display_width.zig");
@@ -2175,7 +2176,7 @@ fn checkSetextLookaheadAllocationFailures(alloc: Allocator) !void {
 
 test "setext lookahead frees allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkSetextLookaheadAllocationFailures,
         .{},
     );
@@ -2212,7 +2213,7 @@ fn checkDefinitionListAllocationFailures(alloc: Allocator) !void {
 
 test "definition lists free allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkDefinitionListAllocationFailures,
         .{},
     );
@@ -2379,7 +2380,7 @@ fn checkFootnoteAllocationFailures(alloc: Allocator) !void {
 
 test "footnotes free allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkFootnoteAllocationFailures,
         .{},
     );
@@ -3221,7 +3222,7 @@ test "reset clears an unfinished indented code block" {
 }
 
 test "code block payload clone frees language if code allocation fails" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var source = CodeBlockPayload{
         .language = try alloc.dupe(u8, "zig"),
         .code = try alloc.dupe(u8, "const value = 1;\n"),

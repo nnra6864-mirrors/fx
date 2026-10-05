@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
@@ -191,7 +192,7 @@ test "prepared diff payload keeps compact output when full formatting is unavail
         .lifecycle_id = .{ .turn_id = 40, .call_id = "full-format-fallback" },
     };
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
 
@@ -2092,7 +2093,7 @@ const FakeApp = struct {
         self.command_output_count += 1;
     }
 
-    fn writeCommandOutputChunkForLifecycle(self: *FakeApp, lifecycle_id: ?types.ToolLifecycleId, stream: command_output_content.Stream, text: []const u8, record: bool) !void {
+    pub fn writeCommandOutputChunkForLifecycle(self: *FakeApp, lifecycle_id: ?types.ToolLifecycleId, stream: command_output_content.Stream, text: []const u8, record: bool) !void {
         storeLifecycleId(
             &self.last_command_output_lifecycle_turn_id,
             &self.last_command_output_lifecycle_call_id,
@@ -2105,7 +2106,7 @@ const FakeApp = struct {
         try self.flushCommandOutputSummaryForLifecycle(null, record);
     }
 
-    fn flushCommandOutputSummaryForLifecycle(self: *FakeApp, lifecycle_id: ?types.ToolLifecycleId, record: bool) !void {
+    pub fn flushCommandOutputSummaryForLifecycle(self: *FakeApp, lifecycle_id: ?types.ToolLifecycleId, record: bool) !void {
         _ = record;
         storeLifecycleId(
             &self.last_command_output_complete_lifecycle_turn_id,

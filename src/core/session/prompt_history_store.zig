@@ -3,6 +3,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const session_codec = @import("session_codec.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const history_file = profile_paths.prompt_history_file_name;
@@ -967,7 +968,7 @@ test "reverse load scans beyond one mebibyte of newer interleaved workspace reco
         defer alloc.free(line);
         try bytes.appendSlice(alloc, line);
     }
-    const filler = "x" ** 2048;
+    const filler = text_utils.repeat("x", 2048);
     var index: usize = 0;
     while (bytes.items.len < 1200 * 1024) : (index += 1) {
         const line = try fixtureLine(
@@ -997,7 +998,7 @@ test "reverse load reconstructs block-spanning records and ignores malformed or 
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(home);
 
-    const long_text = "block-spanning-" ++ ("x" ** 160);
+    const long_text = "block-spanning-" ++ text_utils.repeat("x", 160);
     const first = try fixtureLine(alloc, 1, "/tmp/workspace", long_text);
     defer alloc.free(first);
     const second = try fixtureLine(alloc, 2, "/tmp/workspace", "newer");
@@ -1106,7 +1107,7 @@ test "compaction retains newest one thousand valid records within one mebibyte" 
         const text = try std.fmt.allocPrint(
             alloc,
             "{d:0>4}-{s}",
-            .{ index, "x" ** 1024 },
+            .{ index, text_utils.repeat("x", 1024) },
         );
         defer alloc.free(text);
         const line = try fixtureLine(alloc, @intCast(index), "/tmp/workspace", text);
@@ -1145,7 +1146,7 @@ test "compaction failure after append reports stale while keeping appended recor
             alloc,
             @intCast(index),
             "/tmp/other",
-            "x" ** (220 * 1024),
+            text_utils.repeat("x", 220 * 1024),
         );
         defer alloc.free(line);
         try fixture.appendSlice(alloc, line);

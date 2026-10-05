@@ -1326,7 +1326,7 @@ test "footer raw geometry windows capped input around the cursor" {
     const alloc = std.testing.allocator;
     var input = InputRuntime{};
     defer input.deinit(alloc);
-    try input.edit_state.input.appendSlice(alloc, "x" ** 5000);
+    try input.edit_state.input.appendSlice(alloc, text_utils.repeat("x", 5000));
     input.edit_state.cursor = input.edit_state.input.items.len;
     const geometry = measureRawInputGeometry(testRenderContext(&input), 80, 8, true, false, false, false);
     try std.testing.expect(geometry.summary.total_rows > geometry.window.row_count);

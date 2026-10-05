@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -20,6 +21,7 @@ const result_store = @import("result_store.zig");
 const session_usage = @import("session_usage.zig");
 const session_usage_sidecar = @import("session_usage_sidecar.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const Identifier = session_event.Identifier;
@@ -1570,7 +1572,7 @@ test "conversation recovery allocation failures do not become corruption" {
         "{\"schema_version\":1,\"seq\":4,\"timestamp_ms\":1,\"event\":{\"context_checkpoint\":{\"covers_through_seq\":1,\"summary\":\"retained fact\"}}}\n" ++
         "{\"schema_version\":1,\"seq\":5,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"pending\"}}}\n" ++
         "{\"schema_version\":1,\"seq\":6,\"timestamp_ms\":1,\"event\":{\"tool_call\":{\"call_id\":\"call1\",\"tool_name\":\"shell\",\"arguments_json\":\"{}\"}}}\ninvalid\n" });
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
         fn check(alloc: Allocator, source: *io_mod.VerifiedDir) !void {
             const boundary = try find_conversation_recovery_boundary(alloc, source);
             try std.testing.expectEqual(@as(u64, 4), boundary.seq);
@@ -1591,7 +1593,7 @@ test "conversation recovery state preserves allocation errors and contains inval
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events_file, .flags = .{ .permissions = private_file_permissions }, .data = prefix ++ "invalid\n" });
     const boundary = try find_conversation_recovery_boundary(alloc, &dir);
     try std.testing.expectError(error.SessionRecoveryBoundaryInvalid, load_conversation_recovery_state(alloc, &dir, "wrong-id", boundary));
-    try std.testing.checkAllAllocationFailures(alloc, struct {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
         fn check(a: Allocator, source: *io_mod.VerifiedDir, cut: ConversationRecoveryBoundary) !void {
             var state = try load_conversation_recovery_state(a, source, "recovery-source", cut);
             defer state.deinit(a);
@@ -4285,8 +4287,8 @@ fn publishSessionDirectory(parent: std.Io.Dir, staging: []const u8, target: []co
     };
     var staging_buffer: [256]u8 = undefined;
     var target_buffer: [256]u8 = undefined;
-    const staging_z = try std.fmt.bufPrintZ(&staging_buffer, "{s}", .{staging});
-    const target_z = try std.fmt.bufPrintZ(&target_buffer, "{s}", .{target});
+    const staging_z = try std.fmt.bufPrintSentinel(&staging_buffer, "{s}", .{staging}, 0);
+    const target_z = try std.fmt.bufPrintSentinel(&target_buffer, "{s}", .{target}, 0);
     while (true) {
         try io_mod.getIo().checkCancel();
         const err = std.posix.errno(Darwin.renameatx_np(parent.handle, staging_z, parent.handle, target_z, 0x4));
@@ -4855,7 +4857,7 @@ test "parked session refuses history and control mutations" {
 }
 
 test "writable resume releases ownership when metadata allocation fails" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var temp = try TempRoot.init(alloc);
     defer temp.deinit(alloc);
     var initial = try testState(alloc, "resume-allocation", 10);
@@ -4877,7 +4879,7 @@ test "writable resume degrades before rename and blocks post-rename uncertainty"
     var initial = try testState(alloc, "resume-compaction-policy", 10);
     defer initial.deinit(alloc);
     var started = try temp.root.startConversationSession(alloc, initial, .{});
-    const fat = "RESUME_COMPACTION_INLINE_0123456789abcdef\n" ** 128;
+    const fat = text_utils.repeat("RESUME_COMPACTION_INLINE_0123456789abcdef\n", 128);
     _ = try started.conversation_writer.append(alloc, 11, .{ .user = .{ .text = "seed" } });
     _ = try started.conversation_writer.append(alloc, 12, .{ .tool_call = .{
         .call_id = "call-edit",
@@ -5393,8 +5395,8 @@ test "legacy import spills committed file snapshots before publishing events" {
     var initial = try testState(alloc, "legacy-diff-spill-import", 20);
     defer initial.deinit(alloc);
 
-    const previous = "LEGACY_PREVIOUS_SNAPSHOT_0123456789abcdef\n" ** 180;
-    const after = "LEGACY_AFTER_SNAPSHOT_0123456789abcdef\n" ** 180;
+    const previous = text_utils.repeat("LEGACY_PREVIOUS_SNAPSHOT_0123456789abcdef\n", 180);
+    const after = text_utils.repeat("LEGACY_AFTER_SNAPSHOT_0123456789abcdef\n", 180);
     var calls = [_]types.ToolCall{.{
         .id = "legacy-edit",
         .name = "edit_file",
@@ -5573,7 +5575,7 @@ test "legacy import file projection cleans up allocation failures" {
             try std.testing.expectEqualStrings("retained.txt", history[0].assistant.execution.files[0].path);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Check.run, .{});
 }
 
 test "legacy import preserves the active retained tail and complete archive" {
@@ -5843,7 +5845,7 @@ test "root session creation never replaces a racing target" {
 }
 
 test "root session creation allocation failures leave no published state" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var temp = try TempRoot.init(alloc);
     defer temp.deinit(alloc);
     var initial = try testState(alloc, "allocation-session", 10);
@@ -6167,7 +6169,7 @@ test "legacy steering prefix records retain their original boundary" {
 }
 
 test "takeExecution frees provider replay on allocation failure" {
-    for ([_]bool{ false, true }) |standalone_response| try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+    for ([_]bool{ false, true }) |standalone_response| try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
         fn run(alloc: Allocator, standalone: bool) !void {
             var builder = ConversationTurnBuilder.init(alloc);
             defer builder.deinit();
@@ -6750,7 +6752,7 @@ test "committed edit diff snapshots spill out of the conversation log" {
 }
 
 test "committed edit spill projection propagates allocation failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{
@@ -6758,7 +6760,7 @@ test "committed edit spill projection propagates allocation failure" {
         .follow_symlinks = false,
     }) };
     defer dir.close();
-    const content = "snapshot-content-0123456789abcdef\n" ** 180;
+    const content = text_utils.repeat("snapshot-content-0123456789abcdef\n", 180);
     const result = types.PersistedToolResult{
         .tool_call_id = @constCast("call-edit"),
         .tool_name = @constCast("edit_file"),
@@ -6787,7 +6789,7 @@ test "committed edit spill projection propagates allocation failure" {
 }
 
 test "recovery checkpoint output spill propagates allocation failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{
@@ -6795,7 +6797,7 @@ test "recovery checkpoint output spill propagates allocation failure" {
         .follow_symlinks = false,
     }) };
     defer dir.close();
-    const output = "checkpoint-output-0123456789abcdef\n" ** 180;
+    const output = text_utils.repeat("checkpoint-output-0123456789abcdef\n", 180);
     const result = types.PersistedToolResult{
         .tool_call_id = @constCast("call-shell"),
         .tool_name = @constCast("shell"),
@@ -6818,7 +6820,7 @@ test "native session seed returns the persisted diff snapshot representation" {
     defer temp.deinit(alloc);
     var initial = try testState(alloc, "native-seed-diff-spill", 10);
     defer initial.deinit(alloc);
-    const content = "native-seed-snapshot-0123456789abcdef\n" ** 180;
+    const content = text_utils.repeat("native-seed-snapshot-0123456789abcdef\n", 180);
     var calls = [_]types.ToolCall{.{
         .id = "seed-edit",
         .name = "edit_file",
@@ -8005,7 +8007,7 @@ fn checkCompleteSkillReplayArtifact(artifact: enum { intact, missing, mismatched
     const runtime_memory = @import("../agent/runtime/execution_memory.zig");
     const execution_memory = @import("../agent/execution_memory.zig");
     const full_output = "<skill_content name=\"workflow\" location=\"/skills/workflow\" resource=\"SKILL.md\" complete=\"true\">\n" ++
-        ("required instruction\n" ** 1200) ++ "COMPLETE_SKILL_TAIL\n</skill_content>";
+        text_utils.repeat("required instruction\n", 1200) ++ "COMPLETE_SKILL_TAIL\n</skill_content>";
     var temp = try TempRoot.init(alloc);
     defer temp.deinit(alloc);
     var initial = try testState(alloc, "complete-skill-replay", 10);

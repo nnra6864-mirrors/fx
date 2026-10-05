@@ -8,6 +8,7 @@
 //! stdin watchdog. Nothing here outlives the process.
 
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const host_target = @import("../hosts/target.zig");
 const contracts = @import("contracts.zig");
@@ -869,7 +870,7 @@ fn checkIntentAllocationFailures(alloc: Allocator) !void {
 
 test "owned admission survives allocation failure and rollback has one owner" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkIntentAllocationFailures,
         .{},
     );
@@ -1079,7 +1080,7 @@ test "ordered mutations run in ticket order" {
 }
 
 /// Drives one real terminal through the in-process runtime. The launcher is
-/// the installed fx binary that `zig build test` names in FX_TEST_PRODUCT_EXE.
+/// the installed fx binary that `zig build test` provides.
 const LiveTerminalFixture = struct {
     const owner_session_id = "terminal-client-owner";
     const action_executor = @import("action_executor.zig");
@@ -1094,7 +1095,6 @@ const LiveTerminalFixture = struct {
         if (comptime !host_capabilities.terminalSupportForOs(builtin.os.tag).isSupported()) {
             return error.SkipZigTest;
         }
-        if (std.c.getenv("FX_TEST_PRODUCT_EXE") == null) return error.SkipZigTest;
         const alloc = std.testing.allocator;
         fixture.tmp = std.testing.tmpDir(.{});
         errdefer fixture.tmp.cleanup();
@@ -1295,7 +1295,7 @@ const LiveTerminalFixture = struct {
 };
 
 fn processGone(pid: std.posix.pid_t) bool {
-    std.posix.kill(pid, @enumFromInt(0)) catch |err| return err == error.ProcessNotFound;
+    std.posix.kill(pid, @fromBackingInt(@intCast(0))) catch |err| return err == error.ProcessNotFound;
     return false;
 }
 
@@ -1358,7 +1358,7 @@ test "in-process registry starts writes to and stops a real terminal" {
     defer signaled.deinit(alloc);
     try std.testing.expect(signaled.view() == .success);
     try std.testing.expectEqual(
-        contracts.ReturnOutcome{ .signal = @intCast(@intFromEnum(std.c.SIG.KILL)) },
+        contracts.ReturnOutcome{ .signal = @intCast(@backingInt(std.c.SIG.KILL)) },
         try fixture.waitForExit(sleeper),
     );
     var closed = try fixture.run(.{ .close = .{

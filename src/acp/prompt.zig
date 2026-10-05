@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const skill_contract = @import("../core/skills/skill_contract.zig");
 const std_builtin = @import("builtin");
 const command_admission = @import("../core/permissions/command_admission.zig");
@@ -2573,9 +2574,15 @@ fn setRecoveryCheckpoint(
     checkpoint: session_codec.RecoveryCheckpoint,
 ) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    errdefer |err| if (err == error.SessionPersistenceUncertain) {
-        if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
+    writeRecoveryCheckpoint(ctx, checkpoint) catch |err| {
+        if (err == error.SessionPersistenceUncertain) {
+            if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
+        }
+        return err;
     };
+}
+
+fn writeRecoveryCheckpoint(ctx: *AcpContext, checkpoint: session_codec.RecoveryCheckpoint) !void {
     const session = if (ctx.state.active_session) |*value| value else return error.SessionPersistenceUnavailable;
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -2714,9 +2721,9 @@ fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u
         null;
     defer if (owned_message) |message| ctx.alloc.free(message);
     const msg = owned_message orelse if (detail.len > 0)
-        std.fmt.bufPrint(&buf, "HTTP {d}: {s}", .{ @intFromEnum(status), detail }) catch "HTTP error"
+        std.fmt.bufPrint(&buf, "HTTP {d}: {s}", .{ @backingInt(status), detail }) catch "HTTP error"
     else
-        std.fmt.bufPrint(&buf, "HTTP {d}", .{@intFromEnum(status)}) catch "HTTP error";
+        std.fmt.bufPrint(&buf, "HTTP {d}", .{@backingInt(status)}) catch "HTTP error";
     ctx.sendAgentText(ctx.operationalMessageId(), msg) catch {};
 }
 
@@ -3866,8 +3873,8 @@ test "parsePromptInput bounds remote resource omissions with a stable summary" {
     try std.testing.expect(std.mem.find(u8, parsed.omissions[parsed.omissions.len - 1].source, "/31") != null);
     const summary = parsed.omission_summary orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(usize, 96), summary.omitted_count);
-    try std.testing.expectEqual(@as(usize, 96), summary.reason_counts[@intFromEnum(context_contract.OmissionReason.unsafe_target)]);
-    const zero_digest = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length;
+    try std.testing.expectEqual(@as(usize, 96), summary.reason_counts[@backingInt(context_contract.OmissionReason.unsafe_target)]);
+    const zero_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = @splat(0);
     try std.testing.expect(!std.mem.eql(u8, &summary.digest, &zero_digest));
 }
 
@@ -3896,7 +3903,7 @@ test "localFileTargetPath canonicalizes a local symlink target" {
 }
 
 test "parsePromptInput releases partial resource state across allocation failures" {
-    const backing = std.testing.allocator;
+    const backing = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var file = try tmp.dir.createFile(std.testing.io, "local.txt", .{});

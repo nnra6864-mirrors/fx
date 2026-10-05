@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../shared/testing_allocator.zig");
 const skill_runtime = @import("../../skills/skill_runtime.zig");
 const skill_contract = @import("../../skills/skill_contract.zig");
 const skill_invocation = @import("../../skills/skill_invocation.zig");
@@ -593,7 +594,7 @@ test "legacy exec argument projection releases temporary allocations" {
             try std.testing.expectEqualStrings(":", request.object.get("command").?.string);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Probe.run, .{});
 }
 
 fn findLegacyCall(
@@ -1289,7 +1290,7 @@ fn check_subagent_history_projection_allocation_failures(alloc: Allocator) !void
 
 test "subagent history projection cleans every partial allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         check_subagent_history_projection_allocation_failures,
         .{},
     );
@@ -2078,7 +2079,7 @@ fn check_legacy_replay_projection_allocations(alloc: Allocator) !void {
 }
 
 test "legacy request projection preserves replay ownership and source binding on failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_legacy_replay_projection_allocations, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, check_legacy_replay_projection_allocations, .{});
 }
 
 test "mixed legacy terminal batches become inert in every order" {
@@ -2261,7 +2262,7 @@ fn check_terminal_request_projection_allocation_failures(alloc: Allocator) !void
 
 test "terminal request projection cleans every partial allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         check_terminal_request_projection_allocation_failures,
         .{},
     );
@@ -2449,7 +2450,7 @@ fn check_terminal_request_normalization_allocation_failures(alloc: Allocator) !v
 
 test "terminal request normalization cleans every partial allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         check_terminal_request_normalization_allocation_failures,
         .{},
     );
@@ -4107,7 +4108,7 @@ test "recovery checkpoints do not accumulate temporary history copies in the tur
         calls[0] = .{ .id = id, .name = "read_file", .arguments_json = "{\"path\":\"evidence.txt\"}" };
         try messages.appendSlice(alloc, &.{
             .{ .role = .assistant, .tool_calls = calls },
-            .{ .role = .tool, .tool_call_id = id, .tool_name = "read_file", .tool_result_status = .success, .content = "current evidence" ** 16 },
+            .{ .role = .tool, .tool_call_id = id, .tool_name = "read_file", .tool_result_status = .success, .content = text_utils.repeat("current evidence", 16) },
         });
         const retained_bytes = turn.queryCapacity();
         try persistRecoveryCheckpoint(&deps, &finalization, fixture.job(), messages.items, "partial", "model", false, false, 10, 1, false, .transport_interrupted, .retry_request, .confirmed, .{});
@@ -4400,7 +4401,7 @@ test "discarded completion prose preserves ownership and fails atomically" {
         }
     };
     try Probe.run(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Probe.run, .{});
 }
 
 fn isRetryableModelFailure(kind: agent_stream_provider.FailureKind) bool {
@@ -4757,7 +4758,7 @@ test "deferred retry cleanup clears status and contains sink errors" {
     clear_deferred_retry_status(&deps);
     try std.testing.expectEqual(@as(usize, 1), normal.route_recovery_clear_count);
 
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
     var failed = support.FakeAgentRuntimeDeps.init(failing.allocator());
     defer failed.deinit();
     const failed_deps = failed.deps();
@@ -6219,7 +6220,7 @@ pub fn compactContext(
         .before_summary = request.before_summary,
     };
     if (progress.operation_id) |id| deps.compaction_activity.?.running(deps.ctx, id, .preparation);
-    errdefer |err| {
+    return compactWithProgress(alloc, deps, request, &progress) catch |err| {
         if (err == error.Cancelled) {
             compactor.traceEvent(trace_ctx, .transaction_failed, "stage={s} origin={s} err={s}", .{ @tagName(progress.stage), @tagName(request.activity_origin), @errorName(err) });
         } else {
@@ -6229,7 +6230,18 @@ pub fn compactContext(
             deps.compaction_activity.?.settle(deps.ctx, id, compaction_activity.failure(err, progress.stage, cancel_flag.load(.seq_cst)));
             if (request.failure_provenance) |out| out.* = .{ .operation_id = id, .turn_id = trace_ctx.turn_id, .err = err };
         }
-    }
+        return err;
+    };
+}
+
+fn compactWithProgress(
+    alloc: Allocator,
+    deps: *const AgentRuntimeDeps,
+    request: ContextCompactionRequest,
+    progress: *CompactionProgress,
+) !?compactor.Result {
+    const trace_ctx = request.compactor.trace_ctx;
+    const cancel_flag = request.compactor.cancel_flag;
     var compactor_request = request.compactor;
     compactor_request.progress = progress.interface();
     var result = try compactor.compact(alloc, compactor_request) orelse {
@@ -6326,7 +6338,7 @@ test "compaction activity automatic error provenance excludes secondary finaliza
             var job = fixture.job();
             job.turn_id = 31;
             job.model = @constCast(model);
-            var steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast("history " ** 19_000) }};
+            var steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast(text_utils.repeat("history ", 19_000)) }};
             var history = [_]HistoryTurn{.{ .assistant = .{
                 .user = .{ .text = @constCast("earlier request") },
                 .assistant = @constCast("earlier answer"),
@@ -6444,7 +6456,7 @@ test "automatic compaction interruption persists transport cancellation and pres
         var job = fixture.job();
         job.turn_id = 37;
         job.model = @constCast(model);
-        var steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast("history " ** 19_000) }};
+        var steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast(text_utils.repeat("history ", 19_000)) }};
         var history = [_]HistoryTurn{.{ .assistant = .{
             .user = .{ .text = @constCast("earlier request") },
             .assistant = @constCast("earlier answer"),
@@ -6595,7 +6607,7 @@ test "compaction activity transaction settles only after publication and preserv
         // A tool call leaves work to summarize, so the model is asked. Its
         // output is larger than the kept budget, so the turn is compacted,
         // while its user message still fits word for word.
-        const notes = "recorded notes " ** 400;
+        const notes = text_utils.repeat("recorded notes ", 400);
         const calls = [_]types.ToolCall{.{ .id = "record-1", .name = "read_file", .arguments_json = "{\"path\":\"notes.md\"}" }};
         const results = [_]types.PersistedToolResult{.{
             .tool_call_id = @constCast("record-1"),
@@ -6607,7 +6619,7 @@ test "compaction activity transaction settles only after publication and preserv
         }};
         const steps = [_]types.ToolExecutionStep{.{ .tool_calls = @constCast(&calls), .tool_results = @constCast(&results) }};
         const turns = [_]HistoryTurn{.{ .assistant = .{
-            .user = .{ .text = @constCast("recorded source " ** 100) },
+            .user = .{ .text = @constCast(text_utils.repeat("recorded source ", 100)) },
             .assistant = @constCast("Recorded it."),
             .execution = .{ .tool_steps = @constCast(&steps) },
         } }};

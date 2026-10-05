@@ -353,7 +353,7 @@ fn matchDelimiters(alloc: Allocator, tokens: []Token, matches: *std.ArrayList(Ma
     var next_seq: u32 = 1;
     // Sequence number of the top entry when a search for this closer kind
     // last failed; entries at or below it stay unusable for that kind.
-    var openers_bottom: [3][2][3]u32 = .{.{.{ 0, 0, 0 }} ** 2} ** 3;
+    var openers_bottom: [3][2][3]u32 = @splat(@splat(@splat(0)));
 
     for (tokens, 0..) |*token, token_index| {
         const closer = switch (token.*) {
@@ -474,7 +474,7 @@ fn emitTokens(
 }
 
 fn emitStyle(alloc: Allocator, out: *std.ArrayList(u8), style: Style, opening: bool, depth: *[3]usize, options: InlineOptions) !void {
-    const slot = @intFromEnum(style);
+    const slot = @backingInt(style);
     const open_seq: []const u8 = switch (style) {
         .bold => ansi.bold_open,
         .italic => ansi.italic_open,

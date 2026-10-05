@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const core_permissions = @import("../permissions/permissions.zig");
@@ -1358,7 +1359,7 @@ fn checkAdmitToolCallAskFailureAllocationFailures(alloc: Allocator) !void {
 
 test "admitToolCall cleans decoded input across ask failure-body allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkAdmitToolCallAskFailureAllocationFailures,
         .{},
     );

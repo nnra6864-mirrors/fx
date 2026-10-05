@@ -368,7 +368,7 @@ test "undoLast reports unavailable when a new file cannot be deleted" {
 
     const dir_path = try tmpPath(alloc, tmp.dir, "locked");
     defer alloc.free(dir_path);
-    const dir_path_z = try alloc.dupeZ(u8, dir_path);
+    const dir_path_z = try alloc.dupeSentinel(u8, dir_path, 0);
     defer alloc.free(dir_path_z);
     if (std.c.chmod(dir_path_z.ptr, 0o500) != 0) return error.SkipZigTest;
     defer _ = std.c.chmod(dir_path_z.ptr, 0o700);
@@ -473,7 +473,7 @@ test "undo refuses a file whose directory denies writes and leaves it intact" {
 
     const dir_path = try tmpPath(alloc, tmp.dir, "locked");
     defer alloc.free(dir_path);
-    const dir_path_z = try alloc.dupeZ(u8, dir_path);
+    const dir_path_z = try alloc.dupeSentinel(u8, dir_path, 0);
     defer alloc.free(dir_path_z);
     if (std.c.chmod(dir_path_z.ptr, 0o500) != 0) return error.SkipZigTest;
     defer _ = std.c.chmod(dir_path_z.ptr, 0o700);
@@ -565,7 +565,7 @@ test "a locked directory plus a failing write never leaves a half-replaced file"
 
     const dir_path = try tmpPath(alloc, tmp.dir, "locked");
     defer alloc.free(dir_path);
-    const dir_path_z = try alloc.dupeZ(u8, dir_path);
+    const dir_path_z = try alloc.dupeSentinel(u8, dir_path, 0);
     defer alloc.free(dir_path_z);
     if (std.c.chmod(dir_path_z.ptr, 0o500) != 0) return error.SkipZigTest;
     defer _ = std.c.chmod(dir_path_z.ptr, 0o700);

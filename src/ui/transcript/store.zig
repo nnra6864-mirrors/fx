@@ -17,6 +17,7 @@
 //   writeTranscriptClassified
 
 const std = @import("std");
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const shared_theme = @import("../../core/shared/theme.zig");
 const io_mod = @import("../../core/shared/io.zig");
@@ -3158,7 +3159,7 @@ fn streamAssistantChunkUncommitted(
 }
 
 test "rewrite publication compatible append and same geometry status retain fast allocation cost" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     const Runtime = @import("runtime.zig").TranscriptRuntime;
     for ([_]bool{ false, true }) |status_update| {
         var runtime = Runtime{
@@ -3259,7 +3260,7 @@ test "rewrite publication retirement allocation failures preserve the old receip
 }
 
 fn checkRewritePublicationContinuation(command: bool, retire: bool) !void {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     const Runtime = @import("runtime.zig").TranscriptRuntime;
     var runtime = Runtime{
         .layout = .{ .cols = 40, .rows = 12, .content_bottom = 8, .divider_top_row = 9, .input_row = 10, .divider_bottom_row = 11, .hint_row = 12 },
@@ -3356,7 +3357,7 @@ fn checkRewritePublicationContinuation(command: bool, retire: bool) !void {
 }
 
 test "rewrite publication recovering partial trim is atomic across allocation failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     const Runtime = @import("runtime.zig").TranscriptRuntime;
     var runtime = Runtime{
         .layout = .{ .cols = 40, .rows = 12, .content_bottom = 8, .divider_top_row = 9, .input_row = 10, .divider_bottom_row = 11, .hint_row = 12 },
@@ -3796,11 +3797,12 @@ fn retintTokens(
 
 const theme_retint_field_count: usize = blk: {
     var count: usize = 0;
-    for (@typeInfo(shared_theme.Theme).@"struct".fields) |field| {
-        if (field.type == []const u8 and !std.mem.eql(u8, field.name, "name")) count += 1;
+    const theme_info = @typeInfo(shared_theme.Theme).@"struct";
+    for (theme_info.field_names, theme_info.field_types) |field_name, field_type| {
+        if (field_type == []const u8 and !std.mem.eql(u8, field_name, "name")) count += 1;
     }
-    for (@typeInfo(shared_theme.SyntaxPalette).@"struct".fields) |field| {
-        if (field.type == []const u8) count += 1;
+    for (@typeInfo(shared_theme.SyntaxPalette).@"struct".field_types) |field_type| {
+        if (field_type == []const u8) count += 1;
     }
     break :blk count;
 };
@@ -3809,15 +3811,17 @@ const theme_retint_field_count: usize = blk: {
 /// expand another copy of duplicate detection and token insertion.
 noinline fn themeRetintField(theme: *const shared_theme.Theme, index: usize) []const u8 {
     comptime var field_index: usize = 0;
-    inline for (@typeInfo(shared_theme.Theme).@"struct".fields) |field| {
-        if (comptime field.type == []const u8 and !std.mem.eql(u8, field.name, "name")) {
-            if (index == field_index) return @field(theme.*, field.name);
+    const theme_info = @typeInfo(shared_theme.Theme).@"struct";
+    inline for (theme_info.field_names, theme_info.field_types) |field_name, field_type| {
+        if (comptime field_type == []const u8 and !std.mem.eql(u8, field_name, "name")) {
+            if (index == field_index) return @field(theme.*, field_name);
             field_index += 1;
         }
     }
-    inline for (@typeInfo(shared_theme.SyntaxPalette).@"struct".fields) |field| {
-        if (comptime field.type == []const u8) {
-            if (index == field_index) return @field(theme.syntax, field.name);
+    const syntax_palette_info = @typeInfo(shared_theme.SyntaxPalette).@"struct";
+    inline for (syntax_palette_info.field_names, syntax_palette_info.field_types) |field_name, field_type| {
+        if (comptime field_type == []const u8) {
+            if (index == field_index) return @field(theme.syntax, field_name);
             field_index += 1;
         }
     }

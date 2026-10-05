@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const io_mod = @import("../shared/io.zig");
 const permissions = @import("../permissions/permissions.zig");
@@ -669,7 +670,7 @@ test "retained context targets use bounded typed history without executing calls
         .execution = .{ .tool_steps = @constCast(&steps) },
     } }};
     try checkRetainedTargetsAllocations(alloc, &history, workspace, registry);
-    try std.testing.checkAllAllocationFailures(alloc, checkRetainedTargetsAllocations, .{ &history, workspace, registry });
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkRetainedTargetsAllocations, .{ &history, workspace, registry });
     var cancelled = std.atomic.Value(bool).init(true);
     try std.testing.expectError(error.Cancelled, retainedContextTargets(alloc, &history, null, workspace, registry, &cancelled));
 
@@ -1145,7 +1146,7 @@ test "preparation cancellation and allocation failures clean owned state" {
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
     try std.testing.checkAllAllocationFailures(
-        alloc,
+        testing_allocator.no_resize,
         checkPreparationAllocationFailures,
         .{workspace},
     );

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const health = @import("health.zig");
 const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
@@ -457,7 +458,7 @@ fn checkRenderAllocationFailures(alloc: Allocator) !void {
 
 test "render cleans up every partial allocation" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkRenderAllocationFailures,
         .{},
     );

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const acp_types = @import("types.zig");
 const builtin_tools = @import("../builtins/tools.zig");
 const mcp_contract = @import("../core/mcp/mcp_contract.zig");
@@ -564,7 +565,7 @@ fn checkPreparationOwnershipAllocFailures(alloc: Allocator) !void {
 
 test "ACP MCP preparation releases heap runtime ownership on allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkPreparationOwnershipAllocFailures,
         .{},
     );

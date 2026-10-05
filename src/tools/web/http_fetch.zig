@@ -614,7 +614,7 @@ fn readResponse(
 
         const head_end = complete_head_end.?;
         var parsed = try parseHead(alloc, received.items[0 .. head_end - "\r\n\r\n".len]);
-        const status_code = @intFromEnum(parsed.status);
+        const status_code = @backingInt(parsed.status);
         if (status_code >= 100 and status_code < 200) {
             if (status_code == 101) {
                 parsed.deinit(alloc);
@@ -867,7 +867,7 @@ fn responseBodyFraming(status: StatusLine, framing: ResponseFramingState) !BodyF
     if (status.version == .http_1_0 and transfer_coding.present)
         return error.InvalidHttpResponse;
 
-    const status_code = @intFromEnum(status.status);
+    const status_code = @backingInt(status.status);
     return if (status_code == 204 or status_code == 304)
         .no_body
     else if (transfer_coding.present and framing.content_length_present)
@@ -904,7 +904,7 @@ fn parseStatusLine(line: []const u8) !StatusLine {
     }
     return .{
         .version = version,
-        .status = @enumFromInt(code),
+        .status = @fromBackingInt(@intCast(code)),
     };
 }
 
@@ -1341,7 +1341,7 @@ fn checkSocketError(fd: posix.fd_t) !void {
     var len: std.c.socklen_t = @sizeOf(c_int);
     if (std.c.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, &value, &len) != 0) return error.ConnectionFailed;
     if (value == 0) return;
-    const socket_error: posix.E = @enumFromInt(value);
+    const socket_error: posix.E = @fromBackingInt(@intCast(value));
     return classifyConnectErrno(socket_error);
 }
 
@@ -1671,7 +1671,7 @@ fn pollSocketError(fd: posix.fd_t) !void {
     if (std.c.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, &value, &len) != 0)
         return error.UnexpectedClose;
     if (value == 0) return error.UnexpectedClose;
-    const socket_error: posix.E = @enumFromInt(value);
+    const socket_error: posix.E = @fromBackingInt(@intCast(value));
     return switch (socket_error) {
         .CONNREFUSED => error.ConnectionRefused,
         .CONNRESET => error.ConnectionResetByPeer,
@@ -1766,7 +1766,7 @@ fn expectResponseBody(payload: []const u8, expected_status: u16, expected_body: 
     var response = try readResponse(alloc, &reader, max_body_bytes, .{}, &failure_stage);
     defer response.deinit(alloc);
 
-    try std.testing.expectEqual(expected_status, @intFromEnum(response.status));
+    try std.testing.expectEqual(expected_status, @backingInt(response.status));
     try std.testing.expectEqualStrings(expected_body, response.body);
 }
 
@@ -2685,7 +2685,7 @@ const FakeResolver = struct {
     calls: usize = 0,
     last_host: ?[]u8 = null,
     last_port: ?u16 = null,
-    deadlines: [fake_recorded_calls]?i64 = [_]?i64{null} ** fake_recorded_calls,
+    deadlines: [fake_recorded_calls]?i64 = @splat(null),
 
     fn resolver(self: *@This()) Resolver {
         return .{ .ctx = @ptrCast(self), .resolve = resolve };
@@ -2722,7 +2722,7 @@ const FakeConnector = struct {
     last_first_admitted_address: ?IpAddress = null,
     last_max_body_bytes: ?usize = null,
     last_deadline_ms: ?i64 = null,
-    deadlines: [fake_recorded_calls]?i64 = [_]?i64{null} ** fake_recorded_calls,
+    deadlines: [fake_recorded_calls]?i64 = @splat(null),
     sleep_after_first_call_ms: u64 = 0,
 
     fn connector(self: *@This()) Connector {
@@ -3455,7 +3455,7 @@ const ScriptedDialer = struct {
     errors: []const ?anyerror,
     returned_fds: []const posix.fd_t,
     attempts: [4]IpAddress = undefined,
-    deadlines: [4]?i64 = [_]?i64{null} ** 4,
+    deadlines: [4]?i64 = @splat(null),
     calls: usize = 0,
     cancel_after_call: ?usize = null,
     cancel_flag: ?*std.atomic.Value(bool) = null,

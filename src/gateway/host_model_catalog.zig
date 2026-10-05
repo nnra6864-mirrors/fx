@@ -34,7 +34,7 @@ fn fetch(raw: ?*anyopaque, alloc: Allocator, input: model_catalog.FetchInput) Al
         if (state == 1) break;
         if (state < 0) return .{ .failure = .{ .category = if (state == -2) .cancellation else .transport } };
     }
-    if (status != 200) return .{ .failure = model_catalog.failureForHttpStatus(@enumFromInt(status)) };
+    if (status != 200) return .{ .failure = model_catalog.failureForHttpStatus(@fromBackingInt(@intCast(status))) };
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(alloc);
     var chunk: [16 * 1024]u8 = undefined;

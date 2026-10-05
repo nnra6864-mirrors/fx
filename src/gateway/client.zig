@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const secret = @import("../core/auth/secret.zig");
@@ -11,6 +12,7 @@ const types = @import("../core/shared/types.zig");
 const atomic_value = @import("../core/mcp/atomic_value.zig");
 const json_comparison = @import("../core/shared/json_comparison.zig");
 const sse = @import("sse.zig");
+const text_utils = @import("../core/shared/text_utils.zig");
 
 pub fn isRetryableGatewayError(err: anyerror) bool {
     return err == error.HttpConnectionClosing or
@@ -693,7 +695,7 @@ pub fn postGatewayCompletion(
 
         if (isRetryableGatewayStatus(result.status) and attempt + 1 < retry_count) {
             const delay_ns = retryBackoffDelayNs(attempt);
-            debug_trace.logf("stream", "retrying status={d} attempt={d} delay_ms={d}", .{ @intFromEnum(result.status), attempt + 1, delay_ns / std.time.ns_per_ms });
+            debug_trace.logf("stream", "retrying status={d} attempt={d} delay_ms={d}", .{ @backingInt(result.status), attempt + 1, delay_ns / std.time.ns_per_ms });
             io_mod.sleep(delay_ns);
             continue;
         }
@@ -1711,19 +1713,19 @@ fn streamGatewayCompletionCoreWithOptions(
         if (active_connected_watch) |watch| {
             if (watch.commit_response_head()) |err| return @as(anyerror!StreamResult, err);
         }
-        debug_trace.eventf("gateway", "after_receive_head", trace_ctx, "attempt={d} status={d}", .{ attempt + 1, @intFromEnum(response.head.status) });
+        debug_trace.eventf("gateway", "after_receive_head", trace_ctx, "attempt={d} status={d}", .{ attempt + 1, @backingInt(response.head.status) });
         const resolved_model_seen_in_head = traceResolvedModelHeader(response.head, model, trace_ctx);
 
         if (response.head.status != .ok) {
             const status = response.head.status;
-            if (@intFromEnum(status) >= 500) delivery_ambiguous = true;
+            if (@backingInt(status) >= 500) delivery_ambiguous = true;
             const retry_after_seconds = retryAfterSeconds(response.head);
             const retry_delay_ns = if (request.provider_attempt_owner == .transport and
                 isRetryableGatewayStatus(status) and attempt + 1 < retry_count)
                 retryDelayNsForResponse(response.head, attempt)
             else
                 null;
-            debug_trace.logf("stream", "http status={d} attempt={d}", .{ @intFromEnum(status), attempt + 1 });
+            debug_trace.logf("stream", "http status={d} attempt={d}", .{ @backingInt(status), attempt + 1 });
             var err_out: std.Io.Writer.Allocating = .init(alloc);
             defer err_out.deinit();
             var err_buf: [4096]u8 = undefined;
@@ -1733,7 +1735,7 @@ fn streamGatewayCompletionCoreWithOptions(
             if (retry_delay_ns) |delay_ns| {
                 debug_trace.eventf("gateway", "http_status_retry", trace_ctx, "attempt={d} status={d} delay_ms={d}", .{
                     attempt + 1,
-                    @intFromEnum(status),
+                    @backingInt(status),
                     delay_ns / std.time.ns_per_ms,
                 });
                 try sleepGatewayRetry(delay_ns, cancel_flag);
@@ -4088,7 +4090,7 @@ fn readTraceFileForTest(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
 
 test "SSE text capture keeps arena capacity proportional to the retained response" {
     const alloc = std.testing.allocator;
-    const chunk = "x" ** 256;
+    const chunk = text_utils.repeat("x", 256);
     const chunk_count = 2048;
     const output_bytes = chunk.len * chunk_count;
     var wire: std.Io.Writer.Allocating = .init(alloc);
@@ -4834,7 +4836,7 @@ test "Gateway replay assembly is allocation-safe and rejects incomplete metadata
             try std.testing.expect(std.mem.find(u8, output, "second") != null);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Check.run, .{});
     var replay = GatewayReplayBuilder{ .alloc = std.testing.allocator };
     defer replay.deinit();
     const incomplete = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"type\":\"reasoning-start\",\"id\":\"r\",\"providerMetadata\":{\"anthropic\":{\"signature\":\"partial\"}}}", .{});
@@ -6427,7 +6429,7 @@ fn checkConsumeSseAllocationFailures(alloc: std.mem.Allocator) !void {
 
 test "consumeSseStream frees all response state across allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkConsumeSseAllocationFailures,
         .{},
     );
@@ -8267,7 +8269,7 @@ const keep_alive_sse_payload =
 
 /// Larger than the client's transfer buffer, so it cannot all be read ahead
 /// while the terminal SSE event is parsed.
-const keep_alive_padding = ":" ** (66 * 1024);
+const keep_alive_padding = text_utils.repeat(":", 66 * 1024);
 
 fn readKeepAliveRequest(reader: *std.Io.Reader) !void {
     var header_buf: [16 * 1024]u8 = undefined;

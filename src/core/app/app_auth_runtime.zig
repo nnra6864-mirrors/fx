@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
@@ -2435,7 +2436,7 @@ const TestAuth = struct {
         };
     }
 
-    fn beginPromptCredentialRefresh(self: *TestAuth) auth_runtime.PromptCredentialRefreshStart {
+    pub fn beginPromptCredentialRefresh(self: *TestAuth) auth_runtime.PromptCredentialRefreshStart {
         self.prompt_refresh_start_count += 1;
         return self.prompt_refresh_start;
     }
@@ -2444,7 +2445,7 @@ const TestAuth = struct {
         return .idle;
     }
 
-    fn cancelPromptCredentialRefresh(_: *TestAuth) void {}
+    pub fn cancelPromptCredentialRefresh(_: *TestAuth) void {}
 
     fn selectSource(self: *TestAuth, _: std.mem.Allocator, source: credentials.Source) !?bool {
         self.selected_source = source;
@@ -2480,7 +2481,7 @@ const TestAuth = struct {
         return self.openSignInPicker(alloc);
     }
 
-    fn startupCredentialPending(self: *const TestAuth) bool {
+    pub fn startupCredentialPending(self: *const TestAuth) bool {
         return self.startup_pending;
     }
 
@@ -2540,7 +2541,7 @@ const TestAuth = struct {
         return false;
     }
 
-    fn pickerView(_: *const TestAuth) auth_runtime.PickerView {
+    pub fn pickerView(_: *const TestAuth) auth_runtime.PickerView {
         return .{
             .active = false,
             .available_sources = .empty,
@@ -2620,7 +2621,7 @@ const TestAuth = struct {
             .{ .ready = action };
     }
 
-    fn recordCredentialFailure(
+    pub fn recordCredentialFailure(
         self: *TestAuth,
         failure: auth_runtime.CredentialFailure,
         options: struct { notify: bool = true },
@@ -2638,7 +2639,7 @@ const TestAuth = struct {
         return true;
     }
 
-    fn credentialFailure(self: *const TestAuth) ?auth_runtime.CredentialFailure {
+    pub fn credentialFailure(self: *const TestAuth) ?auth_runtime.CredentialFailure {
         return self.credential_failure;
     }
 
@@ -2765,7 +2766,7 @@ const TestApp = struct {
         self.transcript.deinit(self.alloc);
     }
 
-    fn startModelCacheWarmup(self: *TestApp) void {
+    pub fn startModelCacheWarmup(self: *TestApp) void {
         self.model_cache_warmup_count += 1;
     }
 
@@ -2785,12 +2786,12 @@ const TestApp = struct {
         return self.test_url_opener.opener();
     }
 
-    fn persistCredentialSourcePreference(self: *TestApp, source: credentials.Source) void {
+    pub fn persistCredentialSourcePreference(self: *TestApp, source: credentials.Source) void {
         self.preference_write_count += 1;
         if (self.preference_write_succeeds) self.last_preference_source = source;
     }
 
-    fn providerCatalog(self: *TestApp, _: model_provider.ProviderId) ?model_catalog.Provider {
+    pub fn providerCatalog(self: *TestApp, _: model_provider.ProviderId) ?model_catalog.Provider {
         return .{ .context = self, .fetch_fn = fetchTestCatalog };
     }
 
@@ -2880,7 +2881,7 @@ test "provider inventory completion does not reclaim a changed composer" {
 }
 
 test "provider picker preparation failure starts no inventory task" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
     var app: TestApp = .{ .alloc = failing.allocator() };
     defer app.deinit();
 
@@ -3675,7 +3676,7 @@ const StartupCredentialApp = struct {
         self.notices += 1;
     }
 
-    fn startModelCacheWarmup(self: *@This()) void {
+    pub fn startModelCacheWarmup(self: *@This()) void {
         self.warmups += 1;
     }
 

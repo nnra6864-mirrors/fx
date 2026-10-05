@@ -1944,7 +1944,7 @@ const FakeApp = struct {
         return makeStringList(self.alloc, self.fetch_ids);
     }
 
-    fn loadDetailedSettingsForNotice(self: *FakeApp) !config_runtime.DetailedSettings {
+    pub fn loadDetailedSettingsForNotice(self: *FakeApp) !config_runtime.DetailedSettings {
         self.post_commit_resolution_count += 1;
         if (self.post_commit_resolution_error) |err| return err;
         if (self.post_commit_resolution_diagnostic) |cause| {
@@ -1958,7 +1958,7 @@ const FakeApp = struct {
         return config_runtime.loadMergedSettingsDetailed(self.alloc, self.workspace_root);
     }
 
-    fn persistRuntimePreferences(
+    pub fn persistRuntimePreferences(
         self: *FakeApp,
         patch: app_session_runtime.SessionPreferencePatch,
     ) app_session_runtime.PreferenceCommitResult {

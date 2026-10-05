@@ -187,10 +187,10 @@ fn outputChannels(color_type: ColorType, has_palette_alpha: bool) u32 {
 
 fn outputColorType(channels: u32) u8 {
     return switch (channels) {
-        1 => @intFromEnum(ColorType.gray),
-        2 => @intFromEnum(ColorType.gray_alpha),
-        3 => @intFromEnum(ColorType.rgb),
-        4 => @intFromEnum(ColorType.rgba),
+        1 => @backingInt(ColorType.gray),
+        2 => @backingInt(ColorType.gray_alpha),
+        3 => @backingInt(ColorType.rgb),
+        4 => @backingInt(ColorType.rgba),
         else => unreachable,
     };
 }
@@ -529,7 +529,7 @@ fn testEncode(alloc: Allocator, width: u32, height: u32, color_type: ColorType, 
     std.mem.writeInt(u32, ihdr[0..4], width, .big);
     std.mem.writeInt(u32, ihdr[4..8], height, .big);
     ihdr[8] = bit_depth;
-    ihdr[9] = @intFromEnum(color_type);
+    ihdr[9] = @backingInt(color_type);
     @memset(ihdr[10..13], 0);
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
@@ -633,7 +633,7 @@ test "downscale reverses every scanline filter" {
     // same target pixels, so every reconstructed row must be identical.
     const target = [_]u8{ 10, 20, 30, 255, 200, 100, 50, 128 };
     var scanlines: [5 * 9]u8 = undefined;
-    var previous = [_]u8{0} ** 8;
+    var previous: [8]u8 = @splat(0);
     for (0..5) |filter| {
         const row = scanlines[filter * 9 ..][0..9];
         row[0] = @intCast(filter);
@@ -745,7 +745,7 @@ test "downscale stays bounded on mutated PNGs" {
         .{ "tRNS", "\x00\x80" },
     });
     defer alloc.free(palette);
-    const rgba = try testEncode(alloc, 2, 2, .rgba, 16, &([_]u8{3} ++ [_]u8{0x40} ** 16 ++ [_]u8{2} ++ [_]u8{0x90} ** 16), &.{});
+    const rgba = try testEncode(alloc, 2, 2, .rgba, 16, &([_]u8{3} ++ @as([16]u8, @splat(0x40)) ++ [_]u8{2} ++ @as([16]u8, @splat(0x90))), &.{});
     defer alloc.free(rgba);
     const seeds = [_][]const u8{ gray, palette, rgba };
     var prng = std.Random.DefaultPrng.init(0x1049);

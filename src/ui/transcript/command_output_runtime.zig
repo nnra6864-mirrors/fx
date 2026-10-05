@@ -1348,7 +1348,7 @@ test "unbounded command output admission does not scan retained state" {
         command_output_blocks: std.ArrayList(CommandOutputBlock) = .empty,
         retained_scan_count: usize = 0,
 
-        fn retainedStructuredBytesForCommandOutput(self: *@This()) usize {
+        pub fn retainedStructuredBytesForCommandOutput(self: *@This()) usize {
             self.retained_scan_count += 1;
             return 123;
         }

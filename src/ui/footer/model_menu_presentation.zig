@@ -205,7 +205,7 @@ const ProviderTabs = struct {
     fn build(items: []const model_cache_runtime.ModelMenuItem) ProviderTabs {
         var tabs: ProviderTabs = .{};
         for (0..model_cache_runtime.model_provider_filter_count) |index| {
-            const filter: model_cache_runtime.ModelProviderFilter = @enumFromInt(index);
+            const filter: model_cache_runtime.ModelProviderFilter = @fromBackingInt(@intCast(index));
             if (!model_cache_runtime.modelProviderFilterAvailable(items, filter)) continue;
             tabs.indices[tabs.len] = index;
             tabs.len += 1;
@@ -253,7 +253,7 @@ fn appendProviderOverflowMarker(alloc: Allocator, row: *std.ArrayList(u8)) !void
 }
 
 fn providerTabLabel(index: usize) []const u8 {
-    const filter: model_cache_runtime.ModelProviderFilter = @enumFromInt(index);
+    const filter: model_cache_runtime.ModelProviderFilter = @fromBackingInt(@intCast(index));
     return switch (filter) {
         .all => "All",
         .anthropic => "Anthropic",

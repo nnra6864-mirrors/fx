@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -3069,7 +3070,7 @@ test "project prompt display escapes repository control bytes" {
 }
 
 test "project prompt allocation failure releases the runtime lease" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var state: State = .{};
     const runtime = try alloc.create(mcp_runtime.McpRuntime);
     runtime.* = mcp_runtime.McpRuntime.init(alloc);

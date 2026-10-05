@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const auto_classifier_context = @import("../permissions/auto_classifier_context.zig");
@@ -1319,7 +1320,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (std.meta.fields(Persistence).len != 30) {
+            if (@typeInfo(Persistence).@"struct".field_names.len != 30) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -2955,11 +2956,20 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             checkpoint: session_codec.RecoveryCheckpoint,
         ) !void {
-            errdefer |err| if (err == error.SessionPersistenceUncertain) {
-                if (comptime @hasDecl(@TypeOf(app.worker), "preservePromptSnapshots")) {
-                    app.worker.preservePromptSnapshots(checkpoint.turn_id, checkpoint.user.images);
+            writeRecoveryCheckpoint(app, checkpoint) catch |err| {
+                if (err == error.SessionPersistenceUncertain) {
+                    if (comptime @hasDecl(@TypeOf(app.worker), "preservePromptSnapshots")) {
+                        app.worker.preservePromptSnapshots(checkpoint.turn_id, checkpoint.user.images);
+                    }
                 }
+                return err;
             };
+        }
+
+        fn writeRecoveryCheckpoint(
+            app: *App,
+            checkpoint: session_codec.RecoveryCheckpoint,
+        ) !void {
             if (comptime !@hasField(App, "session_persistence")) {
                 return error.SessionPersistenceUnavailable;
             }
@@ -6484,7 +6494,7 @@ test "session transition retires queued and running compaction only after worker
             .history = try app.alloc.alloc(types.HistoryTurn, 0),
         });
         const next = app.worker.compactionActivitySnapshot();
-        try std.testing.expect(@intFromEnum(next.operation.?.id) > @intFromEnum(old.operation.?.id));
+        try std.testing.expect(@backingInt(next.operation.?.id) > @backingInt(old.operation.?.id));
         try std.testing.expect(next.revision > retired.revision);
         app.worker.settleCompactionActivity(old.operation.?.id, .{ .outcome = .failed });
         try std.testing.expect(!app.worker.dismissCompactionActivity(old.operation.?.id, terminal.revision));
@@ -6703,7 +6713,7 @@ const TestApp = struct {
         );
     }
 
-    fn snapshotMcpToolNames(self: *TestApp, alloc: Allocator) ![][]u8 {
+    pub fn snapshotMcpToolNames(self: *TestApp, alloc: Allocator) ![][]u8 {
         const names = try alloc.alloc([]u8, self.mcp_tool_names.items.len);
         var initialized: usize = 0;
         errdefer {
@@ -6717,7 +6727,7 @@ const TestApp = struct {
         return names;
     }
 
-    fn terminalTitle(self: *TestApp) host_capability.TerminalTitle {
+    pub fn terminalTitle(self: *TestApp) host_capability.TerminalTitle {
         return .{
             .context = self,
             .set_fn = setTerminalTitleLabelForTest,
@@ -6784,7 +6794,7 @@ const TestApp = struct {
         self.* = undefined;
     }
 
-    fn writeDomainNotice(self: *TestApp, notice: types.SemanticNotice, _: bool) !void {
+    pub fn writeDomainNotice(self: *TestApp, notice: types.SemanticNotice, _: bool) !void {
         if (self.fail_system_notice) {
             self.writable_seen_during_notice_failure =
                 self.session_persistence.writable != null;
@@ -6858,7 +6868,7 @@ const TestApp = struct {
         try self.replay_events.append(self.alloc, .completed_tool_status);
     }
 
-    fn writeCompletedToolStatusReturningEntryId(
+    pub fn writeCompletedToolStatusReturningEntryId(
         self: *TestApp,
         kind: types.ToolOutcomeKind,
         text: []const u8,
@@ -6868,7 +6878,7 @@ const TestApp = struct {
         return self.allocateTranscriptEntryId();
     }
 
-    fn writeHistoricalQuestionResolution(
+    pub fn writeHistoricalQuestionResolution(
         self: *TestApp,
         answers: []const types.QuestionAnswer,
     ) !u32 {
@@ -6878,7 +6888,7 @@ const TestApp = struct {
         return entry_id;
     }
 
-    fn attachHistoricalToolDetail(
+    pub fn attachHistoricalToolDetail(
         self: *TestApp,
         entry_id: u32,
         _: types.ToolCall,
@@ -6887,7 +6897,7 @@ const TestApp = struct {
         try self.historical_tool_detail_entry_ids.append(self.alloc, entry_id);
     }
 
-    fn attachHistoricalCancelledCommandDetail(
+    pub fn attachHistoricalCancelledCommandDetail(
         self: *TestApp,
         entry_id: u32,
         _: types.ToolCall,
@@ -7769,7 +7779,7 @@ test "resume handoff requires no derived cache write" {
     const session_dir = (try Runtime(TestApp).activeSessionDisplayPath(&app, alloc)) orelse
         return error.TestExpectedSessionDirectory;
     defer alloc.free(session_dir);
-    const session_dir_z = try alloc.dupeZ(u8, session_dir);
+    const session_dir_z = try alloc.dupeSentinel(u8, session_dir, 0);
     defer alloc.free(session_dir_z);
     if (std.c.chmod(session_dir_z.ptr, 0o500) != 0) return error.TestChmodFailed;
     defer _ = std.c.chmod(session_dir_z.ptr, 0o700);
@@ -7782,7 +7792,7 @@ test "resume handoff requires no derived cache write" {
 }
 
 test "resume handoff suppresses session id allocation failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const paths = try testPaths(alloc, &tmp);
@@ -8198,7 +8208,7 @@ test "resume projection stores reflow metadata for session action rows" {
         .labels = &labels,
     };
 
-    const command = "bun run " ++ ("pipeline-stage-" ** 10);
+    const command = "bun run " ++ text_utils.repeat("pipeline-stage-", 10);
     const run_output = "{\"session_id\":\"shell-4\",\"state\":\"running\",\"backend\":\"captured\"}";
     var run_calls = [_]types.ToolCall{.{
         .id = "call_run",
@@ -8292,7 +8302,7 @@ test "resume projection restores session action rows with labels seeded from the
         .labels = &labels,
     };
 
-    const command = "cd /workspace/packages/cli && " ++ ("printf relative-path " ** 6);
+    const command = "cd /workspace/packages/cli && " ++ text_utils.repeat("printf relative-path ", 6);
     const run_output = "{\"session_id\":\"shell-4\",\"state\":\"running\",\"backend\":\"captured\"}";
     var run_calls = [_]types.ToolCall{.{
         .id = "call_run",
@@ -8369,7 +8379,7 @@ test "resume projection stores reflow metadata after the session moved workspace
         .labels = &labels,
     };
 
-    const command = "cd /workspace/packages/cli && " ++ ("printf relative-path " ** 6);
+    const command = "cd /workspace/packages/cli && " ++ text_utils.repeat("printf relative-path ", 6);
     var run_calls = [_]types.ToolCall{.{
         .id = "call_run",
         .name = "shell",
@@ -8684,7 +8694,7 @@ test "resume falls back to saved command output when replay contains an empty fr
         "exit_code=0\n<stdout>\nFALLBACK_STDOUT_MARKER\n</stdout>\n" ++
         "<stderr>\n</stderr>\n";
     const replay_handle = "fx-command-replay-empty-frame.bin";
-    var empty_replay = [_]u8{0} ** ("FXRPLY01".len + 9);
+    var empty_replay: ["FXRPLY01".len + 9]u8 = @splat(0);
     @memcpy(empty_replay[0.."FXRPLY01".len], "FXRPLY01");
 
     var calls = [_]types.ToolCall{.{
@@ -9761,7 +9771,7 @@ test "subagent host publication requires successful registry recovery" {
             return error.HostAuthorityUnavailable;
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &app.session_persistence.store.?, parent_id });
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, AllocationCheck.run, .{ &app.session_persistence.store.?, parent_id });
 }
 
 test "interactive session resume uses the live transition and shared restore path" {
@@ -10229,7 +10239,7 @@ test "cancelled command presentation survives a persisted session restart" {
 }
 
 test "cancelled command metadata allocation failure preserves core presentation" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var failing = std.testing.FailingAllocator.init(alloc, .{});
     const app_alloc = failing.allocator();
     var app = try TestApp.init(app_alloc, "/workspace");
@@ -10567,7 +10577,7 @@ test "cancelled command replay rejects unsafe handles without partial output" {
 }
 
 test "authoritative cancelled replay survives history insertion failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const paths = try testPaths(alloc, &tmp);
@@ -10957,7 +10967,7 @@ test "appendFinishedPrompt transfers snapshot ownership after history acceptance
 }
 
 test "appendFinishedPrompt does not transfer snapshot ownership when history insertion fails" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var app = try TestApp.init(alloc, "/tmp/workspace");
     defer app.deinit();
     var probe = SnapshotOwnershipProbe{};
@@ -11842,7 +11852,7 @@ test "session picker clears selection feedback when the target context changes" 
 }
 
 test "session picker summary append releases ownership when cloning fails" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var summary = session_store.SessionSummary{
         .id = try alloc.dupe(u8, "allocation-failure"),
         .created_at_ms = 1,
@@ -12191,7 +12201,7 @@ test "validateSessionTitle accepts printable text and rejects malformed input" {
     try std.testing.expectError(error.InvalidTitle, V("bad\ttitle"));
     try std.testing.expectError(error.InvalidTitle, V("bad\x07title"));
 
-    const long = "x" ** (session_display_metadata.max_title_bytes + 1);
+    const long = text_utils.repeat("x", session_display_metadata.max_title_bytes + 1);
     try std.testing.expectError(error.TitleTooLong, V(long));
 }
 
@@ -12288,7 +12298,7 @@ const ReconciliationOriginUsage = struct {
     replaced_provider: ?model_provider.ProviderId = null,
     replaced_source: ?types.CredentialSource = null,
 
-    fn replaceProviderReconciliationCredential(
+    pub fn replaceProviderReconciliationCredential(
         self: *@This(),
         _: Allocator,
         provider: model_provider.ProviderId,
@@ -12304,7 +12314,7 @@ const ReconciliationOriginUsage = struct {
 const ReconciliationOriginAuth = struct {
     source: types.CredentialSource,
 
-    fn credentialSource(self: *const @This()) ?types.CredentialSource {
+    pub fn credentialSource(self: *const @This()) ?types.CredentialSource {
         return self.source;
     }
 
@@ -12312,7 +12322,7 @@ const ReconciliationOriginAuth = struct {
         return "origin-bound-token";
     }
 
-    fn accountId(_: *const @This()) ?[]const u8 {
+    pub fn accountId(_: *const @This()) ?[]const u8 {
         return null;
     }
 
@@ -12427,7 +12437,7 @@ const TitleGenerationFakeApp = struct {
             return .{ .api_key = "test-key", .gateway_team = null, .source = .ai_gateway_api_key };
         }
 
-        fn accountId(_: *const TitleTestAuth) ?[]const u8 {
+        pub fn accountId(_: *const TitleTestAuth) ?[]const u8 {
             return null;
         }
     };
@@ -12447,11 +12457,11 @@ const TitleGenerationFakeApp = struct {
         self.alloc.free(self.workspace_root);
     }
 
-    fn agentStreamProvider(self: *TitleGenerationFakeApp) @import("../agent/stream_provider.zig").Provider {
+    pub fn agentStreamProvider(self: *TitleGenerationFakeApp) @import("../agent/stream_provider.zig").Provider {
         return .{ .context = self, .stream_fn = titleStream };
     }
 
-    fn sessionTitleModel(_: *TitleGenerationFakeApp) ?[]const u8 {
+    pub fn sessionTitleModel(_: *TitleGenerationFakeApp) ?[]const u8 {
         return "test/title-model";
     }
 
@@ -12774,10 +12784,10 @@ test "terminal title shows the session title once cached and keeps model context
     var app = try TestApp.init(alloc, paths.workspace);
     defer app.deinit();
 
-    try app.selected_model.appendSlice(alloc, "provider/" ++ ("model" ** 20));
-    try Runtime(TestApp).setCachedSessionTitle(&app, "session-" ++ ("title" ** 20));
+    try app.selected_model.appendSlice(alloc, "provider/" ++ text_utils.repeat("model", 20));
+    try Runtime(TestApp).setCachedSessionTitle(&app, "session-" ++ text_utils.repeat("title", 20));
 
-    const expected = "session-" ++ ("title" ** 20);
+    const expected = "session-" ++ text_utils.repeat("title", 20);
     try std.testing.expectEqualStrings(expected, app.terminalTitleLabelText());
     try std.testing.expect(std.mem.find(u8, app.terminalTitleLabelText(), "model") == null);
 }

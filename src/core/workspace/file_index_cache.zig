@@ -177,7 +177,7 @@ pub fn saveTo(alloc: Allocator, home: []const u8, roots: []const []const u8, can
         if (written > 0) try writer.writeByte(',');
         try writer.writeAll("{\"path\":");
         try std.json.Stringify.value(candidate.path, .{}, writer);
-        try writer.print(",\"kind\":{d}}}", .{@intFromEnum(candidate.kind)});
+        try writer.print(",\"kind\":{d}}}", .{@backingInt(candidate.kind)});
         written += 1;
         if (payload.written().len > max_bytes) return error.IndexCacheTooLarge;
     }

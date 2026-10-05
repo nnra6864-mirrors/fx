@@ -2,6 +2,7 @@ const std = @import("std");
 const config_runtime = @import("../config/config_runtime.zig");
 const io_mod = @import("../shared/io.zig");
 const session_child_store = @import("session_child_store.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -463,8 +464,8 @@ test "web_fetch on a v2 session keeps a download as a blob the model opens by pa
     defer alloc.free(read_back);
     try std.testing.expectEqualSlices(u8, bytes, read_back);
     try std.testing.expect(try store.contains(artifact.handle));
-    try std.testing.expect(!try store.contains("artifact-" ++ "0" ** 64 ++ ".pdf"));
-    try std.testing.expectError(error.ArtifactNotFound, store.read(alloc, "artifact-" ++ "0" ** 64 ++ ".pdf", 1024));
+    try std.testing.expect(!try store.contains("artifact-" ++ text_utils.repeat("0", 64) ++ ".pdf"));
+    try std.testing.expectError(error.ArtifactNotFound, store.read(alloc, "artifact-" ++ text_utils.repeat("0", 64) ++ ".pdf", 1024));
 
     // The same download is the same blob; the limits still count.
     var again = try store.write(alloc, "application/pdf", bytes);

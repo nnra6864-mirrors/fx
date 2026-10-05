@@ -142,8 +142,8 @@ fn composeHeaderRow(alloc: Allocator, projection: HelpMenuProjection, width: u16
     try appendHeaderTitle(alloc, &wide, projection.filteredItemCount());
     try wide.appendSlice(alloc, "  ");
     try appendCategoryTab(alloc, &wide, null, projection.category == null);
-    inline for (std.meta.fields(command_specs.SlashPresentationCategory)) |field| {
-        const category: command_specs.SlashPresentationCategory = @enumFromInt(field.value);
+    inline for (@typeInfo(command_specs.SlashPresentationCategory).@"enum".field_values) |field_value| {
+        const category: command_specs.SlashPresentationCategory = @fromBackingInt(@intCast(field_value));
         try wide.appendSlice(alloc, "  ");
         try appendCategoryTab(alloc, &wide, category, projection.category == category);
     }
@@ -151,7 +151,7 @@ fn composeHeaderRow(alloc: Allocator, projection: HelpMenuProjection, width: u16
         return cloneClippedRow(alloc, wide.items, width);
     }
 
-    const category_count = std.meta.fields(command_specs.SlashPresentationCategory).len + 1;
+    const category_count = @typeInfo(command_specs.SlashPresentationCategory).@"enum".field_names.len + 1;
     const active_index = helpCategoryIndex(projection.category);
     var packed_row: std.ArrayList(u8) = .empty;
     defer packed_row.deinit(alloc);
@@ -193,11 +193,11 @@ fn composeHeaderRow(alloc: Allocator, projection: HelpMenuProjection, width: u16
 
 fn helpCategoryAt(index: usize) ?command_specs.SlashPresentationCategory {
     if (index == 0) return null;
-    return @enumFromInt(index - 1);
+    return @fromBackingInt(@intCast(index - 1));
 }
 
 fn helpCategoryIndex(category: ?command_specs.SlashPresentationCategory) usize {
-    return if (category) |value| @intFromEnum(value) + 1 else 0;
+    return if (category) |value| @backingInt(value) + 1 else 0;
 }
 
 fn appendHeaderTitle(alloc: Allocator, row: *std.ArrayList(u8), count: usize) !void {

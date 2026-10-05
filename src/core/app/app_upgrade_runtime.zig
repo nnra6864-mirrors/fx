@@ -185,7 +185,7 @@ const TestUpgrader = struct {
         self.stop_count += 1;
     }
 
-    fn takeRenderDirty(self: *TestUpgrader) bool {
+    pub fn takeRenderDirty(self: *TestUpgrader) bool {
         const dirty = self.render_dirty;
         self.render_dirty = false;
         return dirty;
@@ -196,7 +196,7 @@ const TestWorker = struct {
     queued_count: usize = 0,
     shutdown_count: usize = 0,
 
-    fn queuedPromptCount(self: *const TestWorker) usize {
+    pub fn queuedPromptCount(self: *const TestWorker) usize {
         return self.queued_count;
     }
 

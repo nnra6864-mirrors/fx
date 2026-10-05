@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const file_picker_path = @import("../input/file_picker_path.zig");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -10,6 +11,7 @@ const io_mod = @import("../shared/io.zig");
 const png_downscale = @import("png_downscale.zig");
 const types = @import("../shared/types.zig");
 const pathing = @import("../workspace/pathing.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 pub const max_image_bytes: usize = 20 * 1024 * 1024;
 const max_encoded_image_bytes: usize = 5 * 1024 * 1024;
@@ -2232,7 +2234,7 @@ test "authorized image lookup cleans up allocation failure" {
         .media_type = @constCast("image/png"),
     }};
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     try std.testing.expectError(
@@ -2601,7 +2603,7 @@ test "inline image edits are pure lossless replacements with half open maps" {
     try std.testing.expectEqualStrings(" \t\r\n[Image #9] \n", unchanged.text);
     try std.testing.expectEqual(@as(usize, 0), unchanged.edits.len);
     try std.testing.expectError(error.InvalidImageOccurrence, rewrite_inline_images(alloc, source, &.{ replacements[1], replacements[0] }));
-    try std.testing.checkAllAllocationFailures(alloc, struct {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
         fn check(a: std.mem.Allocator, text: []const u8, edits: []const InlineImageReplacement) !void {
             const rewritten = try rewrite_inline_images(a, text, edits);
             defer a.free(rewritten.text);
@@ -3100,7 +3102,7 @@ test "request cache still withholds a snapshot deleted after dimension lookup" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "image-1-0000000000000001.bin", .data = &wide });
     const wide_path = try io_mod.dirRealpathAlloc(arena, tmp.dir, "image-1-0000000000000001.bin");
     const images = [_]types.ImageAttachment{
-        .{ .id = 1, .path = @constCast("photo.jpg"), .media_type = @constCast("image/jpeg"), .snapshot_path = wide_path, .snapshot_sha256 = @constCast("a" ** 64) },
+        .{ .id = 1, .path = @constCast("photo.jpg"), .media_type = @constCast("image/jpeg"), .snapshot_path = wide_path, .snapshot_sha256 = @constCast(text_utils.repeat("a", 64)) },
     };
     const messages = [_]types.ChatMessage{
         .{ .role = .user, .content = "[Image #1]", .images = &images },
@@ -3824,7 +3826,7 @@ test "capture derives media type from captured bytes" {
 }
 
 test "capture removes final snapshot when digest allocation fails after rename" {
-    const base_alloc = std.testing.allocator;
+    const base_alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     {
@@ -3887,7 +3889,7 @@ test "writeImageFilePartJson preserves attached bytes after source replacement" 
 }
 
 test "image file part serialization obeys the caller allocator" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{

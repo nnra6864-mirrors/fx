@@ -847,7 +847,7 @@ const TestApp = struct {
         return .{ .handoff = handoff, .failure = active_capture.?.shutdown_failure };
     }
 
-    fn takeUpgradeRelaunchRequest(_: *TestApp) ?auto_upgrade.RelaunchRequest {
+    pub fn takeUpgradeRelaunchRequest(_: *TestApp) ?auto_upgrade.RelaunchRequest {
         const path = active_capture.?.upgrade_relaunch_path orelse return null;
         var request = auto_upgrade.RelaunchRequest{
             .executable_path_len = path.len,
@@ -870,19 +870,19 @@ const TestApp = struct {
         appendTestEvent("resume-reconciliation");
     }
 
-    fn startAutoUpgrade(_: *TestApp) void {
+    pub fn startAutoUpgrade(_: *TestApp) void {
         appendTestEvent("auto-upgrade");
     }
 
-    fn startFileIndex(_: *TestApp) void {
+    pub fn startFileIndex(_: *TestApp) void {
         appendTestEvent("file-index");
     }
 
-    fn startMcpDiscovery(_: *TestApp) void {
+    pub fn startMcpDiscovery(_: *TestApp) void {
         appendTestEvent("mcp-discovery");
     }
 
-    fn rebindAfterInit(_: *TestApp) void {
+    pub fn rebindAfterInit(_: *TestApp) void {
         appendTestEvent("rebind-after-init");
     }
 

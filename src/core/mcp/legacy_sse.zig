@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -268,7 +269,7 @@ fn checkCompleteEventAllocationFailures(alloc: Allocator) !void {
 
 test "legacy SSE parser releases complete event fields across allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkCompleteEventAllocationFailures,
         .{},
     );

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host_contract = @import("../hosts/host.zig");
@@ -1373,7 +1374,7 @@ test "JS host OAuth session revision conflict does not take session ownership" {
 }
 
 test "oauth session parse cleans up allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_parse_allocation_failures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, check_parse_allocation_failures, .{});
 }
 
 test "oauth session parse rejects non-object JSON" {
@@ -1394,7 +1395,7 @@ test "oauth session loading propagates allocation failures" {
     file.close(std.testing.io);
 
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         check_load_allocation_failures,
         .{&tmp.dir},
     );

@@ -99,8 +99,8 @@ pub fn Runtime(comptime App: type) type {
                     // `current` always means "used for inference right now",
                     // so a key is only current while the gateway is active.
                     const active = if (active_provider == .gateway) app.auth.credentialSource() else null;
-                    inline for (@typeInfo(provider_picker_catalog.KeySource).@"enum".fields) |field| {
-                        const key_source = @field(provider_picker_catalog.KeySource, field.name);
+                    inline for (@typeInfo(provider_picker_catalog.KeySource).@"enum".field_names) |field_name| {
+                        const key_source = @field(provider_picker_catalog.KeySource, field_name);
                         const credential = provider_picker_catalog.keySourceCredential(key_source);
                         const detected = if (credential) |value| view.available_sources.contains(value) else true;
                         if (detected) {

@@ -153,7 +153,7 @@ pub const FailureSnapshot = struct {
             },
         });
         if (self.http_status) |status| {
-            try out.writer.print(" · HTTP {d}", .{@intFromEnum(status)});
+            try out.writer.print(" · HTTP {d}", .{@backingInt(status)});
         }
         return try out.toOwnedSlice();
     }
@@ -173,7 +173,7 @@ pub const FailureSnapshot = struct {
         try writer.writeAll(",\"reason\":");
         try std.json.Stringify.value(@tagName(self.reason), .{}, writer);
         if (self.http_status) |status| {
-            try writer.print(",\"http_status\":{d}", .{@intFromEnum(status)});
+            try writer.print(",\"http_status\":{d}", .{@backingInt(status)});
         }
         try writer.writeByte('}');
     }
@@ -197,7 +197,7 @@ fn stampNowMs() u32 {
 }
 
 fn noteRequestPathCredentialVerified(source: credentials.Source) void {
-    request_path_verified_source.store(@intFromEnum(source), .seq_cst);
+    request_path_verified_source.store(@backingInt(source), .seq_cst);
     request_path_verified_ms.store(stampNowMs(), .seq_cst);
 }
 
@@ -207,7 +207,7 @@ fn noteRequestPathCredentialVerified(source: credentials.Source) void {
 pub fn requestPathCredentialVerifiedRecently(source: credentials.Source) bool {
     const verified_ms = request_path_verified_ms.load(.seq_cst);
     if (verified_ms == 0) return false;
-    if (request_path_verified_source.load(.seq_cst) != @intFromEnum(source)) return false;
+    if (request_path_verified_source.load(.seq_cst) != @backingInt(source)) return false;
     return stampNowMs() -% verified_ms < request_path_verified_window_ms;
 }
 
@@ -1799,7 +1799,7 @@ pub const Runtime = struct {
         auth_mode: credentials.AuthMode,
     ) void {
         comptime {
-            if (std.meta.fields(Self).len != 33) {
+            if (@typeInfo(Self).@"struct".field_names.len != 33) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
@@ -4902,7 +4902,7 @@ test "api key stage zeroes its allocation on every exit path" {
     const sentinel = "FX_API_KEY_ZERO_SENTINEL";
 
     {
-        var backing: [16384]u8 = [_]u8{0xa5} ** 16384;
+        var backing: [16384]u8 = @splat(0xa5);
         var fixed = std.heap.FixedBufferAllocator.init(&backing);
         const alloc = fixed.allocator();
         var runtime: Runtime = .{};
@@ -4914,7 +4914,7 @@ test "api key stage zeroes its allocation on every exit path" {
     }
 
     {
-        var backing: [16384]u8 = [_]u8{0xa5} ** 16384;
+        var backing: [16384]u8 = @splat(0xa5);
         var fixed = std.heap.FixedBufferAllocator.init(&backing);
         const alloc = fixed.allocator();
         var runtime: Runtime = .{};
@@ -4943,7 +4943,7 @@ test "api key stage zeroes its allocation on every exit path" {
     }
 
     {
-        var backing: [16384]u8 = [_]u8{0xa5} ** 16384;
+        var backing: [16384]u8 = @splat(0xa5);
         var fixed = std.heap.FixedBufferAllocator.init(&backing);
         const alloc = fixed.allocator();
         var runtime: Runtime = .{};
@@ -4972,7 +4972,7 @@ test "api key stage zeroes its allocation on every exit path" {
     }
 
     {
-        var backing: [16384]u8 = [_]u8{0xa5} ** 16384;
+        var backing: [16384]u8 = @splat(0xa5);
         var fixed = std.heap.FixedBufferAllocator.init(&backing);
         const alloc = fixed.allocator();
         var runtime: Runtime = .{};
@@ -5001,7 +5001,7 @@ test "api key stage zeroes its allocation on every exit path" {
     }
 
     {
-        var backing: [16384]u8 = [_]u8{0xa5} ** 16384;
+        var backing: [16384]u8 = @splat(0xa5);
         var fixed = std.heap.FixedBufferAllocator.init(&backing);
         const alloc = fixed.allocator();
         var runtime: Runtime = .{};
@@ -5030,7 +5030,7 @@ test "api key stage zeroes its allocation on every exit path" {
     }
 
     {
-        var backing: [16384]u8 = [_]u8{0xa5} ** 16384;
+        var backing: [16384]u8 = @splat(0xa5);
         var fixed = std.heap.FixedBufferAllocator.init(&backing);
         const alloc = fixed.allocator();
         var runtime: Runtime = .{};
@@ -5058,7 +5058,7 @@ test "api key stage zeroes its allocation on every exit path" {
     }
 
     {
-        var backing: [16384]u8 = [_]u8{0xa5} ** 16384;
+        var backing: [16384]u8 = @splat(0xa5);
         var fixed = std.heap.FixedBufferAllocator.init(&backing);
         const alloc = fixed.allocator();
         var runtime: Runtime = .{};
@@ -5070,7 +5070,7 @@ test "api key stage zeroes its allocation on every exit path" {
     }
 
     {
-        var backing: [16384]u8 = [_]u8{0xa5} ** 16384;
+        var backing: [16384]u8 = @splat(0xa5);
         var fixed = std.heap.FixedBufferAllocator.init(&backing);
         const alloc = fixed.allocator();
         var runtime: Runtime = .{};

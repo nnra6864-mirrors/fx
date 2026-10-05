@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const update_target = @import("update_target.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -459,10 +460,10 @@ test "extractChecksumHex parses sha256sum format" {
 }
 
 test "extractChecksumHex parses raw hex" {
-    const raw = "a" ** 64 ++ "\n";
+    const raw = text_utils.repeat("a", 64) ++ "\n";
     const hex = extractChecksumHex(raw).?;
     try std.testing.expectEqual(@as(usize, 64), hex.len);
-    try std.testing.expectEqualStrings("a" ** 64, hex);
+    try std.testing.expectEqualStrings(text_utils.repeat("a", 64), hex);
 }
 
 test "extractChecksumHex rejects short raw checksum" {
@@ -470,9 +471,9 @@ test "extractChecksumHex rejects short raw checksum" {
 }
 
 test "bytesToHex renders lowercase sha256 digest" {
-    const bytes = [_]u8{0x0f} ** 32;
+    const bytes: [32]u8 = @splat(0x0f);
     const hex = bytesToHex(&bytes);
-    try std.testing.expectEqualStrings("0f" ** 32, &hex);
+    try std.testing.expectEqualStrings(text_utils.repeat("0f", 32), &hex);
 }
 
 test "replaceBinary moves replacement over target path" {

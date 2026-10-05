@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const image_attachments = @import("image_attachments.zig");
 const types = @import("../shared/types.zig");
 const entity_spans = @import("../shared/entity_spans.zig");
@@ -241,7 +242,7 @@ const FakeInput = struct {
     vertical_navigation: FakeVerticalNavigation = .{},
     history_boundary_count: usize = 0,
 
-    fn historyBoundary(self: *FakeInput, _: std.mem.Allocator) void {
+    pub fn historyBoundary(self: *FakeInput, _: std.mem.Allocator) void {
         self.history_boundary_count += 1;
     }
 
@@ -693,7 +694,7 @@ fn checkImageInsertionAllocationFailureIsAtomic(
 }
 
 test "insertImageAtCursor stays atomic across allocation failures" {
-    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var probe = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     var allocation_count: usize = 0;
     try checkImageInsertionAllocationFailureIsAtomic(
         &probe,
@@ -704,7 +705,7 @@ test "insertImageAtCursor stays atomic across allocation failures" {
 
     for (0..allocation_count) |fail_offset| {
         var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
+            testing_allocator.no_resize,
             .{},
         );
         var ignored_count: usize = 0;

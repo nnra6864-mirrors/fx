@@ -162,7 +162,7 @@ test "describeToolCall flags internal discovery and names MCP identity" {
 }
 
 test "toolUpdateContentText clips long output and guards unsafe bytes" {
-    const long = "x" ** 500;
+    const long = text_utils.repeat("x", 500);
     const clipped = toolUpdateContentText(false, long);
     try std.testing.expectEqual(@as(usize, 200), clipped.len);
 

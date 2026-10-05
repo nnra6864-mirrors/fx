@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const lexical_relevance = @import("../shared/lexical_relevance.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 
@@ -448,8 +449,8 @@ fn catalogFingerprint(documents: []const Document) u64 {
 fn requestHash(request: Request, domain: Domain) u64 {
     var hash = std.hash.Wyhash.init(0x7265717565737421);
     updateHashField(&hash, request.query.raw);
-    hash.update(&.{@intFromEnum(domain)});
-    hash.update(&.{@intFromEnum(request.relevance_policy)});
+    hash.update(&.{@backingInt(domain)});
+    hash.update(&.{@backingInt(request.relevance_policy)});
     if (request.server) |server| updateHashField(&hash, server);
     return hash.final();
 }
@@ -855,5 +856,5 @@ test "retrieval releases every allocation failure" {
             alloc.free(cursor);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Case.run, .{});
 }

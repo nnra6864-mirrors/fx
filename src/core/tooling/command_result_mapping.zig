@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const command_contract = @import("../execution/command_contract.zig");
 const io_mod = @import("../shared/io.zig");
@@ -198,7 +199,7 @@ test "command result mapping reports indeterminate termination with structured e
 
 test "cancelled command mapping survives metadata serialization failure" {
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     const result = (try Command.cancelledFailure(failing.allocator(), .{

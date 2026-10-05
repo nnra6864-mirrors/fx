@@ -30,7 +30,7 @@ When running fx for verification, **always use the freshly-built binary at** **`
 
 ## Language and Toolchain
 
-This project is written in **Zig 0.16+**. There is no Node.js runtime, no `package.json` at the root, and no JavaScript build step for the main binary.
+This project is written in **Zig 0.17+**. There is no Node.js runtime, no `package.json` at the root, and no JavaScript build step for the main binary.
 
 Build and test commands:
 
@@ -180,6 +180,8 @@ Do not bypass the permission system for new tools.
 
 * Zig strings are `[]const u8`. There is no implicit null termination.
 
+* Zig 0.17 removed the `**` operator. Fill arrays with `@splat` and build repeated comptime strings with `text_utils.repeat` from `src/core/shared/text_utils.zig`.
+
 * For JSON serialization, use `std.json.Stringify.value` with an allocating writer (`std.Io.Writer.Allocating`).
 
 * For JSON string escaping (writing raw JSON), use the project's `writeJsonStr` helper in `src/acp/jsonrpc.zig` rather than assuming `std.json.encodeJsonString` exists.
@@ -223,6 +225,8 @@ Do not bypass the permission system for new tools.
 * In test blocks, use `std.testing.io` for the `Io` parameter. `io_mod.getIo()` automatically returns `std.testing.io` in test builds.
 
 * Use `io_mod.dirRealpathAlloc(alloc, dir, sub_path)` to resolve paths within `std.testing.tmpDir()`.
+
+* Back `std.testing.checkAllAllocationFailures`, hand-written `FailingAllocator` sweeps, and allocation-count comparisons with `testing_allocator.no_resize` from `src/core/shared/testing_allocator.zig`. `std.testing.allocator` may grow an allocation in place on one run and not the next, which changes the allocation sequence and makes those tests flaky.
 
 ## Testing (TypeScript)
 

@@ -246,7 +246,7 @@ test "session files open without waiting on a FIFO" {
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/events.jsonl", .{root});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/events.jsonl", .{root}, 0);
     if (mkfifo(path, 0o600) != 0) return error.SkipZigTest;
     var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .follow_symlinks = false }) };
     defer dir.close();

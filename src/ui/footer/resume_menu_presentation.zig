@@ -270,8 +270,8 @@ fn composeHeaderRow(alloc: Allocator, projection: SessionMenuProjection, width: 
     var wide: std.ArrayList(u8) = .empty;
     defer wide.deinit(alloc);
     try appendHeaderTitle(alloc, &wide, projection.filteredItemCount());
-    inline for (std.meta.fields(session_catalog.Scope)) |field| {
-        const scope: session_catalog.Scope = @enumFromInt(field.value);
+    inline for (@typeInfo(session_catalog.Scope).@"enum".field_values) |field_value| {
+        const scope: session_catalog.Scope = @fromBackingInt(@intCast(field_value));
         try wide.appendSlice(alloc, "  ");
         try appendScopeTab(alloc, &wide, scope, scope == projection.scope);
     }

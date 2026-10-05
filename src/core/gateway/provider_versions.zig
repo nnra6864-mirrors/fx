@@ -20,7 +20,7 @@ pub const Version = struct {
     pub fn parse(raw: []const u8) ?Version {
         const value = update_target.normalizeVersion(std.mem.trim(u8, raw, " \r\n\t"));
         if (!update_target.isValidVersion(value)) return null;
-        var version: Version = .{ .bytes = [_]u8{0} ** update_target.max_version_bytes, .len = @intCast(value.len) };
+        var version: Version = .{ .bytes = @as([update_target.max_version_bytes]u8, @splat(0)), .len = @intCast(value.len) };
         @memcpy(version.bytes[0..value.len], value);
         return version;
     }
@@ -202,7 +202,7 @@ test "provider version cache rejects directories symlinks and hardlinks" {
                 .directory => try tmp.dir.createDir(std.testing.io, name, .fromMode(0o700)),
                 .symlink => try tmp.dir.symLink(std.testing.io, "target", name, .{}),
                 .hardlink => {
-                    const name_z = try alloc.dupeZ(u8, name);
+                    const name_z = try alloc.dupeSentinel(u8, name, 0);
                     defer alloc.free(name_z);
                     try std.testing.expectEqual(@as(c_int, 0), std.c.linkat(tmp.dir.handle, "target", tmp.dir.handle, name_z, 0));
                 },

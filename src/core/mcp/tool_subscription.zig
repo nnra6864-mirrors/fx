@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const host_target = @import("../hosts/target.zig");
 const atomic_value = @import("atomic_value.zig");
 const builtin = @import("builtin");
@@ -1258,7 +1259,7 @@ test "subscription server identity ownership releases every allocation failure" 
             state.stopAndDestroy();
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Case.run, .{});
 }
 
 const StdioCreateAttempt = struct {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 
 const builtin_tools = @import("tools.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
@@ -1429,7 +1430,7 @@ test "MCP config diagnostic preserves the startup parser error" {
 }
 
 test "MCP config diagnostic propagates allocation failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     const test_home = try TestHome.install(alloc, "/tmp");
     defer test_home.deinit();
 
@@ -1445,7 +1446,7 @@ test "MCP config diagnostic propagates allocation failure" {
 
 test "MCP config diagnostic preserves parser allocation failure" {
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     try std.testing.expectError(
@@ -1577,7 +1578,7 @@ test "built-in MCP runtime loading leaves enabled servers disconnected" {
 }
 
 test "built-in MCP runtime config transfer cleans its unvisited suffix on append failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var configs = try loadConfigFromJson(alloc,
         \\{"mcp":{"first":{"type":"local","command":["node"],"enabled":false},"second":{"type":"local","command":["node"],"environment":{"TOKEN":"value"},"enabled":false}}}
     );

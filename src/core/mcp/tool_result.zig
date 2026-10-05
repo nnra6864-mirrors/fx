@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
@@ -637,7 +638,7 @@ fn check_input_required_allocation_failures(alloc: Allocator) !void {
 
 test "input-required result releases every allocation failure path" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         check_input_required_allocation_failures,
         .{},
     );
@@ -659,7 +660,7 @@ fn check_legacy_url_required_allocation_failures(alloc: Allocator) !void {
 
 test "2025-11 URL-required errors become retry input only on that wire" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         check_legacy_url_required_allocation_failures,
         .{},
     );
@@ -697,7 +698,7 @@ test "invalid tool responses retain bounded protocol failures" {
 test "large tool results stay valid, bounded, and verbatim" {
     const alloc = std.testing.allocator;
     const needle = "MY_NOTE_TOKEN=abcdefgh";
-    const large_text = needle ++ ("x" ** 1800);
+    const large_text = needle ++ text_utils.repeat("x", 1800);
     const response = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"" ++ large_text ++ "\"}]}}";
     var result = try extract(alloc, .{
         .server_name = "filesystem",

@@ -2,6 +2,7 @@
 //! `vt_emulator.Grid` without a TTY or signals.
 
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 
 const question_prompt = @import("../core/agent/question_prompt.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
@@ -33,6 +34,7 @@ const transcript_painter = @import("transcript/painter.zig");
 const transcript_runtime = @import("transcript/runtime.zig");
 const full_transcript_screen = @import("full_transcript_screen.zig");
 const vt_emulator = @import("../core/terminal/engine.zig");
+const text_utils = @import("../core/shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const Layout = types.Layout;
@@ -1435,7 +1437,7 @@ test "active hard-newline footer survives every valid tiny height" {
 }
 
 test "active soft-wrapped footer survives every valid tiny height" {
-    const input = "FX_SOFT_START " ++ ("filler " ** 16) ++ "FX_SOFT_END";
+    const input = "FX_SOFT_START " ++ text_utils.repeat("filler ", 16) ++ "FX_SOFT_END";
     for ([_]u16{ 5, 6, 7, 8 }) |target_height| {
         try expectActiveInputSurvivesResize(input, target_height, 1);
     }
@@ -3818,7 +3820,7 @@ test "structured command-output rewrite materializes committed transcript scroll
     try std.testing.expectEqual(bytes_before_mutation, try h.file.length(std.testing.io));
     try std.testing.expectEqualStrings("", probe.history.items);
 
-    var seen_follow_up = [_]bool{false} ** 60;
+    var seen_follow_up: [60]bool = @splat(false);
     var accepted_rows: usize = 0;
     for (0..8) |_| {
         // Settlement may translate coordinates only for rows already exported.
@@ -4808,7 +4810,7 @@ fn checkNextPromptAdmissionPreservesCommittedHistory(resize_before_cancel: bool)
         "SCROLLBACK_LINE_19\nSCROLLBACK_LINE_20\nSCROLLBACK_LINE_21\n" ++
         "SCROLLBACK_LINE_22\nSCROLLBACK_LINE_23\n" ++
         "\x1b[1mSCROLLBACK_LINE_24";
-    const draft = "unsent composer draft " ** 8;
+    const draft = text_utils.repeat("unsent composer draft ", 8);
 
     try h.shell.initViewport(&h.metrics, 1);
     _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, response);
@@ -4903,7 +4905,7 @@ test "long context notice survives full transcript growth and later compact resi
     defer approval.deinit(alloc);
 
     try h.shell.initViewport(&h.metrics, 1);
-    const notice_body = ("x" ** 377) ++ "\n";
+    const notice_body = text_utils.repeat("x", 377) ++ "\n";
     h.shell.setCommandOutputRenderPolicy(commandOutputAnsiStyles());
     _ = try h.shell.appendSemanticNotice(alloc, .{
         .topic = "context",
@@ -6615,7 +6617,7 @@ test "compact command completion keeps restored history footer stable" {
     defer approval.deinit(alloc);
 
     try h.shell.initViewport(&h.metrics, 1);
-    _ = try h.shell.appendRawTranscriptEntry(alloc, "history\n" ** 30);
+    _ = try h.shell.appendRawTranscriptEntry(alloc, text_utils.repeat("history\n", 30));
     const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "command" };
     _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
         .id = id,
@@ -7528,10 +7530,10 @@ test "large tabbed user turn keeps frame scroll plan aligned" {
 
     const raw_prompt =
         "\tTAB_START_0001\tquoted=\"value 1\"\tansi_like=\\x1b[32mgreen\\x1b[0m\n" ++
-        "LONGTOKEN_" ++ ("X" ** 220) ++ "_0003\n" ++
+        "LONGTOKEN_" ++ text_utils.repeat("X", 220) ++ "_0003\n" ++
         "    indented code block tok0 tok1 tok2 tok3 tok4 tok5 tok6 tok7 tok8 tok9 tok10 tok11\n" ++
         "Pathish ~/tmp/example/nested/nested/nested/nested/nested/nested/nested/nested/file_12.txt\n" ++
-        "MARKER_0013 " ++ ("word " ** 24) ++ "word\n" ++
+        "MARKER_0013 " ++ text_utils.repeat("word ", 24) ++ "word\n" ++
         "\tTAB_START_0015\tquoted=\"value 15\"\tansi_like=\\x1b[32mgreen\\x1b[0m\n" ++
         "\tTAB_START_0029\tquoted=\"value 29\"\tansi_like=\\x1b[32mgreen\\x1b[0m\n" ++
         "\tTAB_START_0043\tquoted=\"value 43\"\tansi_like=\\x1b[32mgreen\\x1b[0m\n" ++
@@ -7609,7 +7611,7 @@ test "paint regenerates assistant text with wraps at current cols" {
 
     const assistant_id = try h.shell.appendAssistantTurnEntry(alloc);
     const segs = h.shell.lookupAssistantSegments(assistant_id) orelse unreachable;
-    const body = "abcdefghijklmnopqrstuvwxyz0123456789" ** 4;
+    const body = text_utils.repeat("abcdefghijklmnopqrstuvwxyz0123456789", 4);
     try segs.text.appendSlice(alloc, body[0..120]);
 
     try h.renderTranscriptFrame();
@@ -7892,7 +7894,7 @@ test "partial-tail emission fills top rows when an entry overflows the band" {
 
     const assistant_id = try h.shell.appendAssistantTurnEntry(alloc);
     const segs = h.shell.lookupAssistantSegments(assistant_id) orelse unreachable;
-    const body = "abcdefghijklmnopqrstuvwxyz0123456789" ** 6;
+    const body = text_utils.repeat("abcdefghijklmnopqrstuvwxyz0123456789", 6);
     try segs.text.appendSlice(alloc, body[0..200]);
 
     try h.renderTranscriptFrame();
@@ -7916,7 +7918,7 @@ test "partial-tail emission drops SGR state from the oldest-visible line" {
 
     try h.shell.initViewport(&h.metrics, 1);
 
-    const line = "\x1b[1m" ++ ("X" ** 200) ++ "\x1b[0m\n";
+    const line = "\x1b[1m" ++ text_utils.repeat("X", 200) ++ "\x1b[0m\n";
     try h.shell.writeTranscript(alloc, &h.metrics, line, true);
     try h.flush();
 
@@ -7971,9 +7973,9 @@ test "narrow-drag resize pins overflowing content to content_bottom" {
     defer h.deinit();
     try h.shell.initViewport(&h.metrics, 1);
 
-    try h.shell.writeTranscript(alloc, &h.metrics, ("A" ** 3000) ++ "\n", true);
-    try h.shell.writeTranscript(alloc, &h.metrics, ("B" ** 3000) ++ "\n", true);
-    try h.shell.writeTranscript(alloc, &h.metrics, ("C" ** 3000) ++ "\n", true);
+    try h.shell.writeTranscript(alloc, &h.metrics, text_utils.repeat("A", 3000) ++ "\n", true);
+    try h.shell.writeTranscript(alloc, &h.metrics, text_utils.repeat("B", 3000) ++ "\n", true);
+    try h.shell.writeTranscript(alloc, &h.metrics, text_utils.repeat("C", 3000) ++ "\n", true);
     try h.flush();
 
     try h.driveResize(30, 40, 4, true);
@@ -8086,7 +8088,7 @@ fn assertCapacityInvariantUnderWrites(path: CapacityWritePath) !void {
     try std.testing.expect(h.shell.transcript.capacity >= cap);
     const initial_capacity = h.shell.transcript.capacity;
 
-    const chunk = "x" ** 512 ++ "\n";
+    const chunk = text_utils.repeat("x", 512) ++ "\n";
     var i: usize = 0;
     while (i < cap * 10 / chunk.len) : (i += 1) {
         switch (path) {
@@ -8525,7 +8527,7 @@ test "append pending wrap repeated recorded continuations retain every old margi
     try h.shell.writeTranscriptBytes(h.alloc, &h.metrics, "A\nB\nC\n12345678", true);
     try h.renderTranscriptFrame();
     try capturePhysicalFrame(&h, &probe);
-    const expected = "A\nB\nC\n12345678\n" ++ ("X\nY\nZ\n12345678\n" ** 3);
+    const expected = "A\nB\nC\n12345678\n" ++ text_utils.repeat("X\nY\nZ\n12345678\n", 3);
     for (0..4) |i| {
         try h.shell.writeTranscriptBytes(h.alloc, &h.metrics, "X\nY\nZ\n12345678", true);
         try h.renderTranscriptFrame();
@@ -8737,7 +8739,7 @@ fn expectUnpaintedRetentionIdentity(reflow: bool) !void {
     var probe = try PhysicalHistoryProbe.init(cols, 12);
     defer probe.deinit();
     try h.shell.initViewport(&h.metrics, 1);
-    _ = try h.shell.appendRawTranscriptEntry(alloc, "old\n" ** 20);
+    _ = try h.shell.appendRawTranscriptEntry(alloc, text_utils.repeat("old\n", 20));
     _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, if (reflow) "alpha beta gamma delta" else "alpha beta gamma");
     try h.renderTranscriptFrame();
     try capturePhysicalFrame(&h, &probe);
@@ -8785,7 +8787,7 @@ test "assistant retention deleted soft wrapped entry preserves the next physical
     var probe = try PhysicalHistoryProbe.init(12, 12);
     defer probe.deinit();
     try h.shell.initViewport(&h.metrics, 1);
-    const retired_id = try h.shell.appendRawTranscriptEntry(alloc, "abcdefghijkl" ** 10);
+    const retired_id = try h.shell.appendRawTranscriptEntry(alloc, text_utils.repeat("abcdefghijkl", 10));
     _ = try h.shell.appendRawTranscriptEntry(alloc, "KEEP00000001KEEP00000002KEEP00000003");
     try h.renderTranscriptFrame();
     try capturePhysicalFrame(&h, &probe);
@@ -8804,7 +8806,7 @@ test "assistant retention deleted soft wrapped entry preserves the next physical
     try h.renderTranscriptFrame();
     try capturePhysicalFrame(&h, &probe);
     h.shell.max_retained_transcript_bytes = std.math.maxInt(usize);
-    _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, "next\n" ** 12);
+    _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, text_utils.repeat("next\n", 12));
     for (0..3) |_| {
         try h.renderTranscriptFrame();
         try capturePhysicalFrame(&h, &probe);
@@ -8856,7 +8858,7 @@ test "assistant retention partial compact group preserves surviving physical chi
     try h.renderTranscriptFrame();
     try capturePhysicalFrame(&h, &probe);
     h.shell.max_retained_transcript_bytes = std.math.maxInt(usize);
-    _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, "later\n" ** 16);
+    _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, text_utils.repeat("later\n", 16));
     for (0..3) |_| {
         try h.renderTranscriptFrame();
         try capturePhysicalFrame(&h, &probe);
@@ -8884,7 +8886,7 @@ fn expectAssistantRetentionPreservesToolProjection(collapsed: bool) !void {
     defer probe.deinit();
     try h.shell.initViewport(&h.metrics, 1);
     h.shell.collapse_tool_calls = collapsed;
-    const prefix_id = try h.shell.appendRawTranscriptEntry(alloc, "PRUNE\n" ** 20);
+    const prefix_id = try h.shell.appendRawTranscriptEntry(alloc, text_utils.repeat("PRUNE\n", 20));
     try h.renderTranscriptFrame();
     try capturePhysicalFrame(&h, &probe);
     for ([_][]const u8{ "● CHILD_ONE\n", "● CHILD_TWO\n", "● CHILD_THREE\n" }) |text| {
@@ -8942,7 +8944,7 @@ fn checkAssistantRetentionAllocationFailure(operation_alloc: Allocator) !void {
     var h = try Harness.init(alloc, 60, 12, 4);
     defer h.deinit();
     try h.shell.initViewport(&h.metrics, 1);
-    _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, "before\n" ** 24);
+    _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, text_utils.repeat("before\n", 24));
     try h.renderTranscriptFrame();
     try h.flush();
     var before = try h.shell.prepareTranscriptSource(alloc, null);
@@ -8963,7 +8965,7 @@ fn checkAssistantRetentionAllocationFailure(operation_alloc: Allocator) !void {
 }
 
 test "assistant retention allocation failures leave source and boundaries unchanged" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkAssistantRetentionAllocationFailure, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkAssistantRetentionAllocationFailure, .{});
 }
 
 fn wrappedRetentionRow(alloc: Allocator, id: usize) ![]u8 {
@@ -9028,9 +9030,9 @@ test "command tool rows reclip to live width across lifecycle states" {
 
     // A 152-byte command: past the 120-byte compact activity bound, so its
     // status phrases carry the frozen "..." marker at generation time.
-    const command = "printf '" ++ ("x" ** 60) ++ "' && sleep 1 && printf '" ++ ("y" ** 60) ++ "'";
+    const command = "printf '" ++ text_utils.repeat("x", 60) ++ "' && sleep 1 && printf '" ++ text_utils.repeat("y", 60) ++ "'";
     const frozen_command = command[0..117] ++ "...";
-    const full_tail = "y" ** 60;
+    const full_tail = text_utils.repeat("y", 60);
 
     const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "cmd-live" };
     const args_json = try std.fmt.allocPrint(alloc, "{{\"command\":{f}}}", .{std.json.fmt(command, .{})});

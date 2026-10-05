@@ -383,7 +383,7 @@ fn sendReview(
     };
     if (cancel_flag.load(.seq_cst)) return .cancelled;
 
-    const status_code: u16 = @intFromEnum(result.status);
+    const status_code: u16 = @backingInt(result.status);
     if (result.status != .ok) {
         const outcome: permission_auto_classifier.TransportOutcome =
             if (status_code == 408 or status_code == 425 or status_code == 429 or status_code >= 500)

@@ -10,6 +10,7 @@
 //! The file is disposable: a missing, corrupt, or older-version index is
 //! rebuilt from the session directories, which remain the only authority.
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const child_state = @import("../subagent/child_state.zig");
@@ -19,6 +20,7 @@ const session_discovery = @import("session_discovery.zig");
 const session_layout = @import("session_layout.zig");
 const session_store = @import("session_store.zig");
 const summary_codec = @import("session_summary_codec.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -493,7 +495,7 @@ fn sameStat(a: std.Io.File.Stat, b: std.Io.File.Stat) bool {
 }
 
 fn addStat(hash: *Sha256, stat: std.Io.File.Stat) void {
-    const values = [_]u128{ stat.inode, stat.nlink, stat.size, @intFromEnum(stat.kind), stat.permissions.toMode(), @bitCast(@as(i128, stat.mtime.nanoseconds)), @bitCast(@as(i128, stat.ctime.nanoseconds)) };
+    const values = [_]u128{ stat.inode, stat.nlink, stat.size, @backingInt(stat.kind), stat.permissions.toMode(), @bitCast(@as(i128, stat.mtime.nanoseconds)), @bitCast(@as(i128, stat.ctime.nanoseconds)) };
     var bytes: [16]u8 = undefined;
     for (values) |value| {
         std.mem.writeInt(u128, &bytes, value, .little);
@@ -798,8 +800,8 @@ test "actionable catalog preserves discovery and child visibility" {
             try std.testing.expectEqual(@as(?bool, false), result.subagent_child);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{store});
-    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.candidate, .{store});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, AllocationCheck.run, .{store});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, AllocationCheck.candidate, .{store});
 
     stopped.store(false, .release);
     var empty_cache: Loaded = .{};
@@ -1028,7 +1030,7 @@ test "catalog cache ignores a FIFO without blocking" {
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ root, file_name });
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}", .{ root, file_name }, 0);
     if (mkfifo(path, 0o600) != 0) return error.SkipZigTest;
     var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true, .follow_symlinks = false }) };
     defer dir.close();
@@ -1135,7 +1137,7 @@ test "catalog rows reject a v5 JSON payload relabelled v6" {
     defer tmp.cleanup();
     var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true, .follow_symlinks = false }) };
     defer dir.close();
-    const payload = "[{\"id\":\"legacy\",\"fingerprint\":\"" ++ "1" ** 64 ++ "\",\"value\":{\"legacy_ranking\":{\"workspace_root\":\"/workspace\",\"updated_at_ms\":20}}}]";
+    const payload = "[{\"id\":\"legacy\",\"fingerprint\":\"" ++ text_utils.repeat("1", 64) ++ "\",\"value\":{\"legacy_ranking\":{\"workspace_root\":\"/workspace\",\"updated_at_ms\":20}}}]";
     var digest: Fingerprint = undefined;
     Sha256.hash(payload, &digest, .{});
     var bytes: std.Io.Writer.Allocating = .init(alloc);
