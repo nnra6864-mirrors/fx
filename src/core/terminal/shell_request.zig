@@ -740,26 +740,23 @@ const FakeLocator = struct {
     const locator: ShellLocator = .{ .find_fn = find };
 };
 
+// Mismatches go through std.testing, which prints both sides.
 fn expectRequest(arena: Allocator, args: []const u8, expected_internal: []const u8) !void {
-    const outcome = try read(arena, args, FakeLocator.locator);
-    switch (outcome) {
-        .request => |request| try testing.expectEqualStrings(expected_internal, try internalArguments(arena, request)),
-        .problem => |text| {
-            std.debug.print("unexpected problem for {s}: {s}\n", .{ args, text });
-            return error.TestUnexpectedResult;
-        },
-    }
+    const found = switch (try read(arena, args, FakeLocator.locator)) {
+        .request => |request| try internalArguments(arena, request),
+        .problem => |text| text,
+    };
+    try testing.expectEqualStrings(expected_internal, found);
 }
 
 fn expectProblem(arena: Allocator, args: []const u8, needle: []const u8) !void {
     switch (try read(arena, args, FakeLocator.locator)) {
         .request => |request| {
-            std.debug.print("unexpected request for {s}: {s}\n", .{ args, try internalArguments(arena, request) });
+            try testing.expectEqualStrings("a problem", try internalArguments(arena, request));
             return error.TestUnexpectedResult;
         },
         .problem => |text| if (std.mem.find(u8, text, needle) == null) {
-            std.debug.print("problem for {s} lacks \"{s}\": {s}\n", .{ args, needle, text });
-            return error.TestUnexpectedResult;
+            try testing.expectEqualStrings(needle, text);
         },
     }
 }
