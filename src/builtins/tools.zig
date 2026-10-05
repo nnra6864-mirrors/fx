@@ -67,7 +67,7 @@ const shell_interactive_property = model_tool_schema.Property{ .name = "interact
 const shell_timeout_property = model_tool_schema.Property{ .name = "timeout", .json_type = .integer, .bounds = &.{ .minimum = 1 }, .description = "Seconds before the command is killed. Leave out unless a deadline is wanted." };
 const shell_wait_property = model_tool_schema.Property{ .name = "wait", .json_type = .integer, .bounds = &.{ .minimum = 0, .maximum = managed_execution_contract.max_wait_ceiling_ms / 1000 }, .description = "Seconds to wait for output before returning: up to 30 with command (default 30), up to 300 with session_id (default 5)." };
 const shell_session_id_property = model_tool_schema.Property{ .name = "session_id", .json_type = .string, .description = "A running command returned earlier. Send it alone to check for new output, with input to type into it, or with stop to end it." };
-const shell_input_property = model_tool_schema.Property{ .name = "input", .json_type = .string, .bounds = &.{ .max_length = terminal_contracts.max_write_bytes }, .description = "With session_id: exact characters to type. Use \\n for Enter and \\u0003 for Ctrl-C." };
+const shell_input_property = model_tool_schema.Property{ .name = "input", .json_type = .string, .bounds = &.{ .max_length = terminal_contracts.max_write_bytes }, .description = "With session_id: exact characters to type. Press Enter with a real newline (the JSON escape \\n, not a typed backslash and n) and Ctrl-C with \\u0003." };
 const shell_stop_property = model_tool_schema.Property{ .name = "stop", .json_type = .boolean, .description = "With session_id: true ends that command." };
 
 const shell_properties = [_]model_tool_schema.Property{
@@ -884,7 +884,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "d3625ee92d16f0f8f390b2c1c0a3c2910b63b5df81704b1131149975a32977ee",
+        "259a77e875ac175f0721c6e9b98f351686169ad129e3c0a4e88540899304b2aa",
         &actual_hex,
     );
 }
