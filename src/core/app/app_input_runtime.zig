@@ -6926,8 +6926,8 @@ test "app_input_runtime bare model Tab keeps current selection across catalog re
 
 test "app_input_runtime bare model Tab keeps current selection beyond completion window" {
     const alloc = std.testing.allocator;
-    const current_model = "anthropic/claude-opus-4.8";
-    var completions: [33][]const u8 = @splat("anthropic/claude-opus-4.8-preview");
+    const current_model = "provider/current-model";
+    var completions: [33][]const u8 = @splat("provider/current-model-preview");
     completions[completions.len - 1] = current_model;
 
     var app = try RoutingFakeApp.init(alloc);
