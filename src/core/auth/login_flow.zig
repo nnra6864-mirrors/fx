@@ -1427,7 +1427,7 @@ const TeamPickerRawMode = struct {
         }
 
         var self = TeamPickerRawMode{};
-        self.original = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
+        self.original = try io_mod.tcgetattr(std.posix.STDIN_FILENO);
         var raw = self.original;
 
         raw.iflag.BRKINT = false;
@@ -1451,14 +1451,14 @@ const TeamPickerRawMode = struct {
             raw.cc[vtime_idx] = 0;
         }
 
-        try std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
+        try io_mod.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
         self.active = true;
         return self;
     }
 
     fn disable(self: *TeamPickerRawMode) void {
         if (!self.active) return;
-        std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
+        io_mod.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
         self.active = false;
     }
 };

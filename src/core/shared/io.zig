@@ -946,6 +946,47 @@ pub fn sleep(ns: u64) void {
     getIo().sleep(.{ .nanoseconds = @intCast(ns) }, .real) catch {};
 }
 
+/// Reads terminal attributes. Linux issues the kernel ioctl directly because
+/// Zig 0.17 sizes `std.posix.termios` to the kernel struct, while
+/// `std.posix.tcgetattr` calls into libc, which writes its larger struct and
+/// overruns the caller's stack.
+pub fn tcgetattr(fd: std.posix.fd_t) std.posix.TermiosGetError!std.posix.termios {
+    if (builtin.os.tag != .linux) return std.posix.tcgetattr(fd);
+    var term = std.mem.zeroes(std.posix.termios);
+    while (true) switch (std.os.linux.errno(std.os.linux.tcgetattr(fd, &term))) {
+        .SUCCESS => return term,
+        .INTR => continue,
+        .BADF => unreachable,
+        .NOTTY => return error.NotATerminal,
+        else => |err| return std.posix.unexpectedErrno(err),
+    };
+}
+
+/// Sets terminal attributes. See `tcgetattr` for why Linux bypasses libc.
+pub fn tcsetattr(
+    fd: std.posix.fd_t,
+    action: std.posix.TCSA,
+    term: std.posix.termios,
+) std.posix.TermiosSetError!void {
+    if (builtin.os.tag != .linux) return std.posix.tcsetattr(fd, action, term);
+    while (true) switch (std.os.linux.errno(std.os.linux.tcsetattr(fd, action, &term))) {
+        .SUCCESS => return,
+        .INTR => continue,
+        .BADF, .INVAL => unreachable,
+        .NOTTY => return error.NotATerminal,
+        .IO => return error.ProcessOrphaned,
+        else => |err| return std.posix.unexpectedErrno(err),
+    };
+}
+
+test "tcgetattr reports a regular file as not a terminal" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "plain", .{});
+    defer file.close(std.testing.io);
+    try std.testing.expectError(error.NotATerminal, tcgetattr(file.handle));
+}
+
 pub fn makeDirRecursive(path: []const u8) !void {
     const zio = getIo();
     if (std.fs.path.isAbsolute(path)) {

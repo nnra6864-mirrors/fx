@@ -3530,9 +3530,9 @@ fn resizeFd(fd: std.posix.fd_t, dimensions: contracts.Dimensions) !void {
 }
 
 fn setEcho(fd: std.posix.fd_t, enabled: bool) !void {
-    var termios = try std.posix.tcgetattr(fd);
+    var termios = try io_mod.tcgetattr(fd);
     termios.lflag.ECHO = enabled;
-    try std.posix.tcsetattr(fd, .NOW, termios);
+    try io_mod.tcsetattr(fd, .NOW, termios);
 }
 
 fn closeFd(fd: std.posix.fd_t) void {
