@@ -49,6 +49,7 @@ from scripts.pgso.pipeline import (
     split_ir_argv,
     verify_release_safe_ir,
     zig_build_argv,
+    zig_build_env,
 )
 from scripts.pgso.toolchain import Toolchain
 
@@ -410,6 +411,11 @@ class PgsoPipelineTests(unittest.TestCase):
         self.assertNotEqual(
             control[control.index("--cache-dir") + 1],
             ir[ir.index("--cache-dir") + 1],
+        )
+        self.assertNotIn("--global-cache-dir", control)
+        self.assertEqual(
+            str(self.paths.global_cache),
+            zig_build_env(self.paths)["ZIG_GLOBAL_CACHE_DIR"],
         )
 
     def test_benchmark_artifacts_use_their_existing_build_owners_and_names(self) -> None:

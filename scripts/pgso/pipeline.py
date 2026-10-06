@@ -333,11 +333,16 @@ def zig_build_argv(
             str(prefix),
             "--cache-dir",
             str(cache),
-            "--global-cache-dir",
-            str(paths.global_cache),
         )
     )
     return tuple(argv)
+
+
+def zig_build_env(paths: PipelinePaths) -> dict[str, str]:
+    # `zig build` takes its global cache only from the environment.
+    environment = os.environ.copy()
+    environment["ZIG_GLOBAL_CACHE_DIR"] = str(paths.global_cache)
+    return environment
 
 
 def instrumentation_argv(
@@ -794,7 +799,7 @@ def build_control(
     run_checked(
         zig_build_argv(toolchain, spec, paths, emit_ir=False),
         cwd=spec.repo_root,
-        env=os.environ.copy(),
+        env=zig_build_env(paths),
         timeout_s=900,
         log_path=paths.logs / "build-control.json",
     )
@@ -812,7 +817,7 @@ def emit_bitcode(
     run_checked(
         zig_build_argv(toolchain, spec, paths, emit_ir=True),
         cwd=spec.repo_root,
-        env=os.environ.copy(),
+        env=zig_build_env(paths),
         timeout_s=900,
         log_path=paths.logs / "emit-bitcode.json",
     )
