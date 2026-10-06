@@ -22,8 +22,13 @@ from scripts.pgso.toolchain import SUPPORTED_TARGET, Toolchain
 # Zig 0.17 emits array bitcasts as per-element loops that the optimizer later
 # folds into single loads. Instrumentation runs before loop unrolling, so it
 # would count every element. Unroll constant-trip loops first, in both the
-# generation and use pipelines, so their CFG hashes keep matching.
-PROFILE_PREPARATION_PASSES = "function(sroa,loop-unroll-full)"
+# generation and use pipelines, so their CFG hashes keep matching. Unrolling
+# without the surrounding instcombine and simplifycfg left the ui-activity
+# benchmark about 11% slower than a plain O2 build.
+PROFILE_PREPARATION_PASSES = (
+    "function(sroa,instcombine<no-verify-fixpoint>,loop-unroll-full,"
+    "instcombine<no-verify-fixpoint>,simplifycfg)"
+)
 
 GENERATION_FLAGS = (
     "--disable-vp",

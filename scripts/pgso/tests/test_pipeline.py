@@ -277,7 +277,7 @@ class PgsoPipelineTests(unittest.TestCase):
                 "--runtime-counter-relocation",
                 "--pgo-temporal-instrumentation",
                 "-pgo-kind=pgo-instr-gen-pipeline",
-                "-passes=function(sroa,loop-unroll-full),default<O2>",
+                "-passes=function(sroa,instcombine<no-verify-fixpoint>,loop-unroll-full,instcombine<no-verify-fixpoint>,simplifycfg),default<O2>",
             ),
             GENERATION_FLAGS,
         )
@@ -287,7 +287,7 @@ class PgsoPipelineTests(unittest.TestCase):
                 "-pgo-kind=pgo-instr-use-pipeline",
                 "-pgo-cold-func-opt=minsize",
                 "-profile-summary-cutoff-cold=600000",
-                "-passes=function(sroa,loop-unroll-full),default<O2>,mergefunc",
+                "-passes=function(sroa,instcombine<no-verify-fixpoint>,loop-unroll-full,instcombine<no-verify-fixpoint>,simplifycfg),default<O2>,mergefunc",
             ),
             USE_FLAGS,
         )
@@ -306,7 +306,7 @@ class PgsoPipelineTests(unittest.TestCase):
                 "-pgo-kind=pgo-instr-use-pipeline",
                 "-pgo-cold-func-opt=minsize",
                 "-profile-summary-cutoff-cold=990000",
-                "-passes=function(sroa,loop-unroll-full),default<O2>,mergefunc,iroutliner",
+                "-passes=function(sroa,instcombine<no-verify-fixpoint>,loop-unroll-full,instcombine<no-verify-fixpoint>,simplifycfg),default<O2>,mergefunc,iroutliner",
             ),
             BENCHMARK_USE_FLAGS,
         )
@@ -820,7 +820,7 @@ print('_main T ---------------- 0')""",
         self.assertEqual(b"bitcode", result.read_bytes())
         lines = actions.read_text().splitlines()
         self.assertEqual(8, len(lines))
-        self.assertIn("-passes=function(sroa,loop-unroll-full),default<O2>,mergefunc", lines[0])
+        self.assertIn("-passes=function(sroa,instcombine<no-verify-fixpoint>,loop-unroll-full,instcombine<no-verify-fixpoint>,simplifycfg),default<O2>,mergefunc", lines[0])
         self.assertNotIn("iroutliner", lines[0])
         self.assertEqual("nm", lines[1])
         self.assertTrue(lines[2].startswith("split -j 2 -o "))
