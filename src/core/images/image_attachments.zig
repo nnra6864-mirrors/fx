@@ -3265,14 +3265,11 @@ test "capture keeps the original when a PNG conversion would grow" {
     try std.testing.expectEqual(@as(usize, 1), try countSnapshotFiles(snapshot_dir));
 }
 
-test "in-memory capture keeps the original when its downscaled copy is over the byte limit" {
+test "in-memory capture keeps the original of a palette PNG over 2000 pixels" {
     const alloc = std.testing.allocator;
     const png = try png_downscale.testRandomPalettePng(alloc, 2001, 1300);
     defer alloc.free(png);
     try std.testing.expect(image_data.fitsEncodedImageLimit(png.len));
-    const smaller = (try png_downscale.downscaleOversized(alloc, "image/png", png)).?;
-    defer alloc.free(smaller.png);
-    try std.testing.expect(!image_data.fitsEncodedImageLimit(smaller.png.len));
 
     const attachment = try captureInlineImageBytesInMemory(alloc, 1, "image/png", png);
     defer types.freeImageAttachment(alloc, attachment);

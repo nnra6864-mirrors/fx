@@ -604,6 +604,10 @@ fn writeNewSessionResponse(
         try out.writer.writeAll(",");
         try writeEffortConfigOption(&out.writer, config.efforts, config.current);
     }
+    if (fastConfigState(state)) |current| {
+        try out.writer.writeAll(",");
+        try writeFastConfigOption(&out.writer, current);
+    }
     if (ultrafastConfigState(state)) |current| {
         try out.writer.writeAll(",");
         try writeUltrafastConfigOption(&out.writer, current);
@@ -1263,6 +1267,10 @@ fn writeLoadSessionResponse(
     if (effortConfigState(state)) |config| {
         try out.writer.writeAll(",");
         try writeEffortConfigOption(&out.writer, config.efforts, config.current);
+    }
+    if (fastConfigState(state)) |current| {
+        try out.writer.writeAll(",");
+        try writeFastConfigOption(&out.writer, current);
     }
     if (ultrafastConfigState(state)) |current| {
         try out.writer.writeAll(",");
@@ -2363,6 +2371,41 @@ pub fn effortConfigState(state: *server.ServerState) ?EffortConfigState {
     );
     if (capabilities.reasoning_efforts.len == 0) return null;
     return .{ .efforts = capabilities.reasoning_efforts, .current = active.effort };
+}
+
+/// Active-session Fast selector state. Like the CLI's speed picker, the option
+/// is exposed only when the active model offers a Fast lane.
+pub fn fastConfigState(state: *server.ServerState) ?bool {
+    const active = if (state.active_session) |*session| session else return null;
+    const bundle = state.cfg.provider_set.select(active.provider);
+    const capabilities = state.capability_resolver.available(
+        active.model,
+        bundle.fallbackModelCapabilities(active.model),
+    );
+    if (!capabilities.supports_fast_mode) return null;
+    return active.fast_mode;
+}
+
+pub fn writeFastConfigOption(w: *std.Io.Writer, current: bool) !void {
+    try w.writeAll("{\"id\":\"fast\",\"name\":\"Fast Mode\",\"description\":\"Uses the model's fast lane\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":");
+    try writeJsonStr(if (current) "true" else "false", w);
+    try w.writeAll(",\"options\":[{\"value\":\"false\",\"name\":\"off\"},{\"value\":\"true\",\"name\":\"on\"}]}");
+}
+
+test "writeFastConfigOption produces an off/on select with the current value" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeFastConfigOption(&out.writer, true);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
+    defer parsed.deinit();
+    const option = parsed.value.object;
+    try std.testing.expectEqualStrings("fast", option.get("id").?.string);
+    try std.testing.expectEqualStrings("true", option.get("currentValue").?.string);
+    const choices = option.get("options").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), choices.len);
+    try std.testing.expectEqualStrings("false", choices[0].object.get("value").?.string);
+    try std.testing.expectEqualStrings("true", choices[1].object.get("value").?.string);
 }
 
 /// Active-session ultrafast selector state. The option is exposed only for a

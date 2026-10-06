@@ -190,28 +190,7 @@ pub const Dimensions = struct {
     pub fn exceeds(self: Dimensions, limit: u32) bool {
         return self.width > limit or self.height > limit;
     }
-
-    pub fn exceedsModelLimit(self: Dimensions) bool {
-        return self.exceeds(max_image_dimension);
-    }
 };
-
-/// Writes the model-visible note for an image downscaled from `original` to
-/// `smaller`, including the factor that maps its coordinates back.
-pub fn writeDownscaledNotice(writer: *std.Io.Writer, original: Dimensions, smaller: Dimensions) std.Io.Writer.Error!void {
-    try writer.print(
-        "[Image downscaled from {d}x{d} to {d}x{d} pixels to fit the {d}-pixel limit per side. Multiply coordinates in this image by {d:.2} to get original pixels.]\n",
-        .{ original.width, original.height, smaller.width, smaller.height, max_image_dimension, coordinateScale(original, smaller) },
-    );
-}
-
-/// Ratio from downscaled to original pixels along the longer side.
-fn coordinateScale(original: Dimensions, smaller: Dimensions) f64 {
-    if (original.width >= original.height) {
-        return @as(f64, @floatFromInt(original.width)) / @as(f64, @floatFromInt(smaller.width));
-    }
-    return @as(f64, @floatFromInt(original.height)) / @as(f64, @floatFromInt(smaller.height));
-}
 
 /// Reads pixel dimensions from a PNG, JPEG, GIF, or WebP header without
 /// decoding pixels. Returns null for unsupported, truncated, or malformed

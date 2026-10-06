@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { strict as assert } from "node:assert";
 import { spawnSync } from "node:child_process";
-import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,6 +24,13 @@ function run(command, args, options = {}) {
 }
 
 try {
+  const workflow = await readFile(resolve(repoRoot, ".github/workflows/publish-libfx.yml"), "utf8");
+  const packageJob = workflow.split("\n  package:\n")[1]?.split("\n  publish:\n")[0];
+  assert.ok(packageJob, "publisher package job must exist");
+  const bunSetup = packageJob.indexOf("uses: oven-sh/setup-bun@");
+  const assembly = packageJob.indexOf("- name: Assemble package");
+  assert.ok(bunSetup >= 0 && bunSetup < assembly, "publisher must install Bun before building the CommonJS entry");
+
   run(process.execPath, [resolve(repoRoot, "sdk/scripts/package-libfx.mjs"), packageDir]);
 
   const manifest = JSON.parse(await readFile(join(packageDir, "package.json"), "utf8"));
@@ -38,6 +45,23 @@ try {
   assert.equal(manifest.exports["./mcp"], "./mcp.js");
   assert.equal(manifest.exports["./skills"], "./skills.js");
   assert.equal(manifest.exports["./skills/node"], "./skills-node.js");
+
+  const archiveValidator = packageJob.match(/- name: Validate package archive\n\s+run: \|\n\s+node -e '([\s\S]*?)'/)?.[1];
+  assert.ok(archiveValidator, "publisher archive validation must exist");
+  const reportPath = join(temp, "libfx-pack.json");
+  const archiveFiles = new Set(await readdir(packageDir));
+  for (const platform of ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64"]) {
+    archiveFiles.add(`libfx.${platform}.node`);
+  }
+  const archiveReport = [{ name: manifest.name, version: manifest.version, size: 0, files: [...archiveFiles].map(path => ({ path })) }];
+  await writeFile(reportPath, JSON.stringify(archiveReport));
+  run(process.execPath, ["-e", archiveValidator.replace("/tmp/libfx-pack.json", reportPath)]);
+  archiveReport[0].files = archiveReport[0].files.filter(({ path }) => path !== "fetch-cleanup.js");
+  await writeFile(reportPath, JSON.stringify(archiveReport));
+  assert.throws(
+    () => run(process.execPath, ["-e", archiveValidator.replace("/tmp/libfx-pack.json", reportPath)]),
+    /unexpected package file count|package is missing/,
+  );
 
   const cjs = await readFile(join(packageDir, "node.cjs"), "utf8");
   assert.doesNotMatch(cjs, new RegExp(repoRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
@@ -93,7 +117,7 @@ try {
   const esm = run(process.execPath, ["esm.mjs"], { cwd: consumerDir });
   const cjsResult = run(process.execPath, ["--no-experimental-require-module", "cjs.cjs"], { cwd: consumerDir });
   assert.deepEqual(JSON.parse(cjsResult.stdout), JSON.parse(esm.stdout));
-  console.log("Node package passed: conditional exports, relocated CJS, literal native assets, and bare imports");
+  console.log("Node package passed: publisher prerequisites, archive validation, conditional exports, relocated CJS, literal native assets, and bare imports");
 } finally {
   await rm(temp, { recursive: true, force: true });
 }

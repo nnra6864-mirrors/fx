@@ -2793,6 +2793,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     "Failed to persist session model",
             });
         };
+        if (!try dropUnsupportedSpeeds(state, alloc, msg, session)) return;
     } else if (std.mem.eql(u8, config_id, "provider")) {
         const parsed_provider = model_provider.parse(value) orelse
             return state.writer.writeError(alloc, msg.id, .{
@@ -2918,6 +2919,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 session.api_key = &.{};
                 session.account_id = null;
             }
+            if (!try dropUnsupportedSpeeds(state, alloc, msg, session)) return;
         }
     } else if (std.mem.eql(u8, config_id, "mode")) {
         if (state.active_session) |*session| {
@@ -2936,6 +2938,17 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 .message = "Ultrafast mode must be true or false",
             });
         if (!try applyActiveSessionUltrafast(state, alloc, msg, session, ultrafast)) return;
+    } else if (std.mem.eql(u8, config_id, "fast")) {
+        const session = if (state.active_session) |*active| active else return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "No active session",
+        });
+        const fast = parseConfigBool(value) orelse
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = "Fast mode must be true or false",
+            });
+        if (!try applyActiveSessionFast(state, alloc, msg, session, fast)) return;
     } else if (std.mem.eql(u8, config_id, "effort")) {
         const session = if (state.active_session) |*active| active else return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
@@ -2963,6 +2976,11 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 .message = "Failed to persist session effort",
             });
         };
+    } else {
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Unknown config option",
+        });
     }
 
     try refreshModelCatalogForOptions(state);
@@ -2990,6 +3008,10 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
     if (sessions.effortConfigState(state)) |config| {
         try out.writer.writeAll(",");
         try sessions.writeEffortConfigOption(&out.writer, config.efforts, config.current);
+    }
+    if (sessions.fastConfigState(state)) |current| {
+        try out.writer.writeAll(",");
+        try sessions.writeFastConfigOption(&out.writer, current);
     }
     if (sessions.ultrafastConfigState(state)) |current| {
         try out.writer.writeAll(",");
@@ -3185,17 +3207,175 @@ fn applyActiveSessionUltrafast(
             });
             return false;
         }
+        // Fast and Ultrafast are exclusive, as in the CLI.
+        if (session.fast_mode and !try storeSessionFast(state, alloc, msg, session, false)) return false;
     }
+    return storeSessionUltrafast(state, alloc, msg, session, ultrafast);
+}
+
+/// Saves the session's ultrafast preference without admission checks.
+/// Returns false after writing the error response.
+fn storeSessionUltrafast(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+    session: *ActiveSessionState,
+    ultrafast: bool,
+) !bool {
     if (state.cfg.minimal_kernel and session.writable == null and session.v2 == null and session.wasm_state == null) {
         session.ultrafast_mode = ultrafast;
-    } else {
-        commitActiveSessionUltrafast(alloc, session, ultrafast) catch {
+        return true;
+    }
+    commitActiveSessionUltrafast(alloc, session, ultrafast) catch {
+        try state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.internal_error,
+            .message = "Failed to persist session ultrafast preference",
+        });
+        return false;
+    };
+    return true;
+}
+
+/// Applies a Fast-mode transition to the active session, mirroring the CLI's
+/// `/fast`: enabling requires the model's Fast lane and turns Ultrafast off;
+/// disabling always succeeds. Returns false after writing the error response.
+fn applyActiveSessionFast(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+    session: *ActiveSessionState,
+    fast: bool,
+) !bool {
+    if (fast) {
+        if (!activeSessionCapabilities(state, session).supports_fast_mode) {
+            const message = try std.fmt.allocPrint(alloc, "Fast mode is not available for model \"{s}\"", .{session.model});
+            defer alloc.free(message);
             try state.writer.writeError(alloc, msg.id, .{
-                .code = ErrorCode.internal_error,
-                .message = "Failed to persist session ultrafast preference",
+                .code = ErrorCode.invalid_params,
+                .message = message,
+                .data = .{
+                    .code = "LIBFX_MODEL_UNSUPPORTED_FAST",
+                    .model = session.model,
+                    .capability = "fast",
+                },
             });
             return false;
+        }
+        if (session.ultrafast_mode and !try storeSessionUltrafast(state, alloc, msg, session, false)) return false;
+    }
+    return storeSessionFast(state, alloc, msg, session, fast);
+}
+
+/// Saves the session's fast preference without admission checks.
+/// Returns false after writing the error response.
+fn storeSessionFast(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+    session: *ActiveSessionState,
+    fast: bool,
+) !bool {
+    if (state.cfg.minimal_kernel and session.writable == null and session.v2 == null and session.wasm_state == null) {
+        session.fast_mode = fast;
+        return true;
+    }
+    commitActiveSessionFast(alloc, session, fast) catch {
+        try state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.internal_error,
+            .message = "Failed to persist session fast preference",
+        });
+        return false;
+    };
+    return true;
+}
+
+fn commitActiveSessionFast(alloc: Allocator, session: *ActiveSessionState, fast: bool) !void {
+    if (host_target.is_wasm and session.writable == null) {
+        const previous = session.fast_mode;
+        session.fast_mode = fast;
+        sessions.commitWasmSession(alloc, session) catch |err| {
+            session.fast_mode = previous;
+            return err;
         };
+        return;
+    }
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    if (session.v2) |v2| {
+        var preferences = try v2.currentPreferences(alloc);
+        defer preferences.deinit(alloc);
+        preferences.fast_mode = fast;
+        try v2.setPreferences(preferences);
+    } else {
+        const writable = if (session.writable) |*active| active else return error.SessionPersistenceUnavailable;
+        _ = try writable.appendEvent(
+            alloc,
+            .{ .preferences_changed = .{ .fast_mode = fast } },
+            io_mod.milliTimestamp(),
+        );
+    }
+    session.fast_mode = fast;
+}
+
+fn activeSessionCapabilities(state: *ServerState, session: *const ActiveSessionState) model_capabilities.Capabilities {
+    const bundle = state.cfg.provider_set.select(session.provider);
+    return state.capability_resolver.available(session.model, bundle.fallbackModelCapabilities(session.model));
+}
+
+const SessionSpeed = struct {
+    fast: bool,
+    ultrafast: bool,
+};
+
+/// Pure policy: the lanes a session keeps after switching to a model with
+/// `capabilities` under `provider`. Ultrafast is a Gateway-only lane.
+fn speedSupportedBy(
+    speed: SessionSpeed,
+    provider: model_provider.ProviderId,
+    capabilities: model_capabilities.Capabilities,
+) SessionSpeed {
+    return .{
+        .fast = speed.fast and capabilities.supports_fast_mode,
+        .ultrafast = speed.ultrafast and provider == .gateway and capabilities.supports_ultrafast_mode,
+    };
+}
+
+test "speedSupportedBy keeps only the lanes the new model offers" {
+    const both = model_capabilities.Capabilities{ .supports_fast_mode = true, .supports_ultrafast_mode = true };
+    const fast_only = model_capabilities.Capabilities{ .supports_fast_mode = true };
+    const plain = model_capabilities.Capabilities{};
+    const on: SessionSpeed = .{ .fast = true, .ultrafast = true };
+
+    try std.testing.expectEqual(on, speedSupportedBy(on, .gateway, both));
+    try std.testing.expectEqual(SessionSpeed{ .fast = true, .ultrafast = false }, speedSupportedBy(on, .gateway, fast_only));
+    try std.testing.expectEqual(SessionSpeed{ .fast = false, .ultrafast = false }, speedSupportedBy(on, .gateway, plain));
+    try std.testing.expectEqual(SessionSpeed{ .fast = true, .ultrafast = false }, speedSupportedBy(on, .codex, both));
+    const standard: SessionSpeed = .{ .fast = false, .ultrafast = false };
+    try std.testing.expectEqual(standard, speedSupportedBy(standard, .gateway, both));
+}
+
+/// After a model or provider switch, turns off any lane the new model lacks,
+/// like the CLI model picker. A hidden lane would otherwise stay on: Ultrafast
+/// would fail the next prompt and Fast would return on a later switch back.
+/// Returns false after writing the error response.
+fn dropUnsupportedSpeeds(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+    session: *ActiveSessionState,
+) !bool {
+    const kept = speedSupportedBy(
+        .{ .fast = session.fast_mode, .ultrafast = session.ultrafast_mode },
+        session.provider,
+        activeSessionCapabilities(state, session),
+    );
+    if (session.ultrafast_mode and !kept.ultrafast) {
+        debug_trace.logf("acp", "ultrafast mode turned off: model={s} does not offer it", .{session.model});
+        if (!try storeSessionUltrafast(state, alloc, msg, session, false)) return false;
+    }
+    if (session.fast_mode and !kept.fast) {
+        debug_trace.logf("acp", "fast mode turned off: model={s} does not offer it", .{session.model});
+        if (!try storeSessionFast(state, alloc, msg, session, false)) return false;
     }
     return true;
 }

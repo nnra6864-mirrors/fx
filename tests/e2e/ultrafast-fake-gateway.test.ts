@@ -1304,3 +1304,197 @@ describe("ultrafast fake Gateway", () => {
     );
   });
 });
+
+const FAST_ONLY_MODEL = "provider/fast-lane-model";
+const PLAIN_MODEL = "provider/plain-model";
+
+function fastOnlyCatalogModel() {
+  return {
+    id: FAST_ONLY_MODEL,
+    type: "language" as const,
+    owned_by: "provider",
+    tags: ["tool-use"],
+    pricing: { fast: { input: "0.00003", output: "0.00015" } },
+  };
+}
+
+function plainCatalogModel() {
+  return { id: PLAIN_MODEL, type: "language" as const, owned_by: "provider", tags: ["tool-use"] };
+}
+
+function speedCatalog() {
+  return [ultrafastCatalogModel(), fastOnlyCatalogModel(), plainCatalogModel()];
+}
+
+function expectFastRequest(body: string) {
+  expectStandardRequest(body);
+  const request = JSON.parse(body) as { providerOptions?: { gateway?: { speed?: string } } };
+  expect(request.providerOptions?.gateway?.speed).toBe("fast");
+}
+
+function expectNoLaneRequest(body: string) {
+  expectStandardRequest(body);
+  const request = JSON.parse(body) as { providerOptions?: { gateway?: { speed?: string } } };
+  expect(request.providerOptions?.gateway?.speed).toBeUndefined();
+}
+
+function speedOptions(result: { configOptions?: Array<{ id: string; currentValue?: string }> } | undefined) {
+  const options = result?.configOptions ?? [];
+  const value = (id: string) => options.find((option) => option.id === id)?.currentValue ?? "absent";
+  return { fast: value("fast"), ultrafast: value("ultrafast") };
+}
+
+describe("ACP speed options", () => {
+  test(
+    "lists Fast and Ultrafast only for models that offer them and keeps them exclusive",
+    async () => {
+      const root = createIsolatedRoot();
+      const gateway = startFakeGateway(
+        [fakeGatewayFinalText("fast answer"), fakeGatewayFinalText("ultra answer"), fakeGatewayFinalText("plain answer")],
+        { models: speedCatalog() },
+      );
+      const client = AcpClient.create(root.workspace, fakeGatewayEnv(root, gateway));
+      try {
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request("session/new", { mcpServers: [] }, 2);
+        const sessionId = created.result.sessionId as string;
+        expect(speedOptions(created.result)).toEqual({ fast: "false", ultrafast: "false" });
+
+        const set = (id: number, configId: string, value: string) =>
+          client.request("session/set_config_option", { sessionId, configId, value }, id);
+        expect(speedOptions((await set(3, "fast", "true")).result)).toEqual({ fast: "true", ultrafast: "false" });
+        await client.prompt(sessionId, "Use Fast.", 4);
+        expectFastRequest(gateway.requests[0]!.body);
+
+        expect(speedOptions((await set(5, "ultrafast", "true")).result)).toEqual({ fast: "false", ultrafast: "true" });
+        await client.prompt(sessionId, "Use Ultrafast.", 6);
+        expectUltrafastRequest(gateway.requests[1]!.body);
+
+        expect(speedOptions((await set(7, "fast", "true")).result)).toEqual({ fast: "true", ultrafast: "false" });
+        expect(speedOptions((await set(8, "model", FAST_ONLY_MODEL)).result)).toEqual({ fast: "true", ultrafast: "absent" });
+        expect(speedOptions((await set(9, "model", PLAIN_MODEL)).result)).toEqual({ fast: "absent", ultrafast: "absent" });
+        await client.prompt(sessionId, "Plain model.", 10);
+        expectNoLaneRequest(gateway.requests[2]!.body);
+        expect(speedOptions((await set(11, "model", FAST_ONLY_MODEL)).result)).toEqual({ fast: "false", ultrafast: "absent" });
+        expect(gateway.requests).toHaveLength(3);
+      } finally {
+        try {
+          await client.close();
+        } finally {
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "rejects unsupported lanes and unknown config ids without changing the session",
+    async () => {
+      const root = createIsolatedRoot();
+      const gateway = startFakeGateway([fakeGatewayFinalText("standard answer")], { models: speedCatalog() });
+      const client = AcpClient.create(root.workspace, fakeGatewayEnv(root, gateway, { FX_MODEL: PLAIN_MODEL }));
+      try {
+        const sessionId = await startAcpSession(client);
+        const fast = await client.request("session/set_config_option", { sessionId, configId: "fast", value: "true" }, 3);
+        expect(fast.error).toMatchObject({
+          code: -32602,
+          data: { code: "LIBFX_MODEL_UNSUPPORTED_FAST", model: PLAIN_MODEL, capability: "fast" },
+        });
+        const off = await client.request("session/set_config_option", { sessionId, configId: "fast", value: "false" }, 4);
+        expect(off.error).toBeUndefined();
+        const unknown = await client.request("session/set_config_option", { sessionId, configId: "speed", value: "fast" }, 5);
+        expect(unknown.error).toMatchObject({ code: -32602, message: "Unknown config option" });
+        const invalid = await client.request("session/set_config_option", { sessionId, configId: "fast", value: "on" }, 6);
+        expect(invalid.error).toMatchObject({ code: -32602 });
+        expect(gateway.requests).toEqual([]);
+        await client.prompt(sessionId, "Still standard.", 7);
+        expectNoLaneRequest(gateway.requests[0]!.body);
+      } finally {
+        try {
+          await client.close();
+        } finally {
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "turns Ultrafast off when switching to a model without it so the next prompt runs",
+    async () => {
+      const root = createIsolatedRoot();
+      const gateway = startFakeGateway([fakeGatewayFinalText("plain after ultra")], { models: speedCatalog() });
+      const client = AcpClient.create(root.workspace, fakeGatewayEnv(root, gateway));
+      try {
+        const sessionId = await startAcpSession(client);
+        const set = (id: number, configId: string, value: string) =>
+          client.request("session/set_config_option", { sessionId, configId, value }, id);
+        expect((await set(3, "ultrafast", "true")).error).toBeUndefined();
+        expect(speedOptions((await set(4, "model", PLAIN_MODEL)).result)).toEqual({ fast: "absent", ultrafast: "absent" });
+        await client.prompt(sessionId, "Run on the plain model.", 5);
+        expectNoLaneRequest(gateway.requests[0]!.body);
+        expect(speedOptions((await set(6, "model", ULTRA_MODEL)).result)).toEqual({ fast: "false", ultrafast: "false" });
+      } finally {
+        try {
+          await client.close();
+        } finally {
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      }
+    },
+    TIMEOUT,
+  );
+
+  for (const backend of ["0", "1"]) {
+    test(
+      `saves Fast across resume with FX_SESSIONS_V2=${backend}`,
+      async () => {
+        const root = createIsolatedRoot({ models: { gateway: FAST_ONLY_MODEL } });
+        const gateway = startFakeGateway(
+          [fakeGatewayFinalText("saved fast"), fakeGatewayFinalText("resumed fast"), fakeGatewayFinalText("resumed standard")],
+          { models: speedCatalog() },
+        );
+        const env = fakeGatewayEnv(root, gateway, { FX_MODEL: undefined, FX_SESSIONS_V2: backend });
+        let client = AcpClient.create(root.workspace, env);
+        try {
+          const sessionId = await startAcpSession(client);
+          const enabled = await client.request("session/set_config_option", { sessionId, configId: "fast", value: "true" }, 3);
+          expect(speedOptions(enabled.result)).toEqual({ fast: "true", ultrafast: "absent" });
+          await client.prompt(sessionId, "Save Fast.", 4);
+          expectFastRequest(gateway.requests[0]!.body);
+          await client.close();
+
+          client = AcpClient.create(root.workspace, env);
+          expect((await client.request("initialize", { protocolVersion: 1 }, 1)).error).toBeUndefined();
+          const resumed = await client.request("session/resume", { sessionId, mcpServers: [] }, 2);
+          expect(speedOptions(resumed.result)).toEqual({ fast: "true", ultrafast: "absent" });
+          await client.prompt(sessionId, "Resume Fast.", 3);
+          expectFastRequest(gateway.requests[1]!.body);
+          const disabled = await client.request("session/set_config_option", { sessionId, configId: "fast", value: "false" }, 4);
+          expect(disabled.error).toBeUndefined();
+          await client.close();
+
+          client = AcpClient.create(root.workspace, env);
+          expect((await client.request("initialize", { protocolVersion: 1 }, 1)).error).toBeUndefined();
+          const standard = await client.request("session/resume", { sessionId, mcpServers: [] }, 2);
+          expect(speedOptions(standard.result)).toEqual({ fast: "false", ultrafast: "absent" });
+          await client.prompt(sessionId, "Resume standard.", 3);
+          expectNoLaneRequest(gateway.requests[2]!.body);
+        } finally {
+          try {
+            await client.close();
+          } finally {
+            gateway.stop();
+            rmSync(root.root, { recursive: true, force: true });
+          }
+        }
+      },
+      TIMEOUT,
+    );
+  }
+});
