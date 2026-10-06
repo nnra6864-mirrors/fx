@@ -948,8 +948,6 @@ pub const State = struct {
     last_reload_completion_origin: PresentationOrigin = .command,
     last_authentication_completion_origin: PresentationOrigin = .command,
     project_prompts_suppressed: bool = false,
-    /// Main-thread only. The project trust prompt answers keys only after the
-    /// user focuses it with ctrl+t, so typed or pasted text reaches the composer.
     project_prompt_focused: bool = false,
     menu: mcp_menu_state.State = .{},
     menu_health: ?mcp_health.Snapshot = null,

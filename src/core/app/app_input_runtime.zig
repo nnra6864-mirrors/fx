@@ -87,6 +87,7 @@ const ToolPermissionDecision = types.ToolPermissionDecision;
 
 pub const file_picker_completion_cap = input_completion_runtime.file_picker_completion_cap;
 const ctrl_g_upgrade_byte: u8 = 7;
+const ctrl_t_project_mcp_prompt_byte: u8 = 20;
 
 fn classifyResumeFailure(err: anyerror) session_catalog.ResumeFailure {
     return switch (err) {
@@ -130,24 +131,18 @@ fn projectMcpPromptMayOwnInput(state: ProjectMcpPromptInputState) bool {
         !state.authentication_active;
 }
 
-const project_mcp_prompt_focus_byte: u8 = 20; // ctrl+t
-
 const ProjectMcpPromptByteRoute = enum {
-    /// The composer receives the byte unchanged.
     composer,
     focus,
     blur,
-    /// Leaves the prompt and hands the byte to the composer.
     blur_to_composer,
     approve,
     approve_all,
     reject,
 };
 
-/// The project trust prompt never takes plain typing from an unfocused
-/// composer: answers count only after an explicit ctrl+t.
 fn projectMcpPromptByteRoute(focused: bool, byte: u8) ProjectMcpPromptByteRoute {
-    if (byte == project_mcp_prompt_focus_byte) return if (focused) .blur else .focus;
+    if (byte == ctrl_t_project_mcp_prompt_byte) return if (focused) .blur else .focus;
     if (!focused) return .composer;
     return switch (byte) {
         '1' => .approve,
@@ -885,8 +880,6 @@ pub fn Runtime(comptime App: type) type {
             return false;
         }
 
-        /// The prompt is pending and no other surface holds input. It still
-        /// answers keys only after ctrl+t focuses it.
         fn projectMcpPromptAvailable(app: *App) bool {
             if (comptime !@hasDecl(App, "projectMcpPromptActive")) return false;
             const menu_active = activeCompactCommandMenu(app) != null or
@@ -3878,11 +3871,11 @@ test "project MCP prompt leaves typing to the composer until ctrl+t focuses it" 
     for ("1234 hello\r\x1b") |byte| {
         try std.testing.expectEqual(ProjectMcpPromptByteRoute.composer, projectMcpPromptByteRoute(false, byte));
     }
-    try std.testing.expectEqual(ProjectMcpPromptByteRoute.focus, projectMcpPromptByteRoute(false, 20));
+    try std.testing.expectEqual(ProjectMcpPromptByteRoute.focus, projectMcpPromptByteRoute(false, ctrl_t_project_mcp_prompt_byte));
     try std.testing.expectEqual(ProjectMcpPromptByteRoute.approve, projectMcpPromptByteRoute(true, '1'));
     try std.testing.expectEqual(ProjectMcpPromptByteRoute.approve_all, projectMcpPromptByteRoute(true, '2'));
     try std.testing.expectEqual(ProjectMcpPromptByteRoute.reject, projectMcpPromptByteRoute(true, '3'));
-    try std.testing.expectEqual(ProjectMcpPromptByteRoute.blur, projectMcpPromptByteRoute(true, 20));
+    try std.testing.expectEqual(ProjectMcpPromptByteRoute.blur, projectMcpPromptByteRoute(true, ctrl_t_project_mcp_prompt_byte));
     for ("4h\r") |byte| {
         try std.testing.expectEqual(ProjectMcpPromptByteRoute.blur_to_composer, projectMcpPromptByteRoute(true, byte));
     }
