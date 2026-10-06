@@ -70,7 +70,7 @@ fn sameFile(left: []const u8, right: []const u8) !bool {
 
 /// Returns an owned absolute path to the installed fx binary that
 /// `zig build test` launches, or null outside tests.
-pub fn testProductExe(alloc: Allocator) !?[]u8 {
+fn testProductExe(alloc: Allocator) !?[]u8 {
     if (comptime !builtin.is_test) return null;
     return try io_mod.realpathAlloc(alloc, @import("test_paths").product_exe);
 }

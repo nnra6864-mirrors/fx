@@ -1503,9 +1503,6 @@ pub fn spawnDetachedSession(
 }
 
 fn foregroundSessionExecutable(scratch: Allocator) ![]const u8 {
-    if (comptime builtin.is_test) {
-        return (try self_exe.testProductExe(scratch)) orelse error.TestProductExecutableMissing;
-    }
     return self_exe.pathForReexec(scratch);
 }
 
