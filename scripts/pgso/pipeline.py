@@ -19,12 +19,18 @@ from scripts.pgso.runner import hermetic_environment, run_checked
 from scripts.pgso.toolchain import SUPPORTED_TARGET, Toolchain
 
 
+# Zig 0.17 emits array bitcasts as per-element loops that the optimizer later
+# folds into single loads. Instrumentation runs before loop unrolling, so it
+# would count every element. Unroll constant-trip loops first, in both the
+# generation and use pipelines, so their CFG hashes keep matching.
+PROFILE_PREPARATION_PASSES = "function(sroa,loop-unroll-full)"
+
 GENERATION_FLAGS = (
     "--disable-vp",
     "--runtime-counter-relocation",
     "--pgo-temporal-instrumentation",
     "-pgo-kind=pgo-instr-gen-pipeline",
-    "-passes=default<O2>",
+    f"-passes={PROFILE_PREPARATION_PASSES},default<O2>",
 )
 
 # Apply the profile before partitioning so every part inherits the accepted
@@ -34,7 +40,7 @@ USE_FLAGS = (
     "-pgo-kind=pgo-instr-use-pipeline",
     "-pgo-cold-func-opt=minsize",
     "-profile-summary-cutoff-cold=600000",
-    "-passes=default<O2>,mergefunc",
+    f"-passes={PROFILE_PREPARATION_PASSES},default<O2>,mergefunc",
 )
 
 OUTLINE_PARTITIONS = 2
@@ -53,7 +59,7 @@ BENCHMARK_USE_FLAGS = (
     "-pgo-kind=pgo-instr-use-pipeline",
     "-pgo-cold-func-opt=minsize",
     "-profile-summary-cutoff-cold=990000",
-    "-passes=default<O2>,mergefunc,iroutliner",
+    f"-passes={PROFILE_PREPARATION_PASSES},default<O2>,mergefunc,iroutliner",
 )
 
 FX_MACHINE_OUTLINER_FLAGS = (
