@@ -292,6 +292,21 @@ prefix = pathlib.Path(sys.argv[sys.argv.index('--prefix') + 1])
         self.assertFalse(self.paths.bitcode.with_name("fx.bc.staged").exists())
         emit_bitcode(toolchain, self.spec, self.paths, expected_sha256=digest)
 
+    def test_emitted_bitcode_accepts_the_darwin_bitcode_wrapper(self) -> None:
+        actions = self.root / "emit-wrapper"
+        wrapped = b"\xde\xc0\x17\x0bwrapped"
+        toolchain = dataclasses.replace(
+            self.toolchain,
+            zig=self.write_bitcode_zig(actions),
+            ir_size=self.write_ir_size(actions, output=wrapped),
+        )
+        self.spec.repo_root.mkdir(parents=True)
+
+        digest = emit_bitcode(toolchain, self.spec, self.paths)
+
+        self.assertEqual(wrapped, self.paths.bitcode.read_bytes())
+        self.assertEqual(sha256_file(self.paths.bitcode), digest)
+
     def test_emitted_bitcode_rejects_a_failed_or_invalid_helper_pass(self) -> None:
         actions = self.root / "emit-failures"
         self.spec.repo_root.mkdir(parents=True)

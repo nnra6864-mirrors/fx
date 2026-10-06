@@ -49,6 +49,10 @@ OUTLINE_CLEANUP_FLAGS = (
     "-internalize-public-api-list=main,_mh_execute_header",
 )
 
+# Zig writes raw bitcode. LLVM's own writer, which the IR size passes use,
+# wraps Darwin bitcode in the 0x0B17C0DE wrapper header.
+BITCODE_MAGICS = (b"BC\xc0\xde", b"\xde\xc0\x17\x0b")
+
 # Drop the constants that `ir_size.py sparse-constants` left without uses.
 SPARSE_CLEANUP_FLAGS = (
     "-passes=globaldce,verify",
@@ -865,7 +869,7 @@ def emit_bitcode(
 
 def _require_bitcode_header(path: pathlib.Path) -> None:
     with path.open("rb") as stream:
-        if stream.read(4) != b"BC\xc0\xde":
+        if stream.read(4) not in BITCODE_MAGICS:
             raise PgsoError(f"invalid LLVM bitcode header: {path}")
 
 

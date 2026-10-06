@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 
+from scripts.pgso.pipeline import _require_bitcode_header
 from scripts.pgso.toolchain import IR_SIZE_SCRIPT
 
 LLVM_BIN = pathlib.Path(os.environ.get("FX_PGSO_LLVM_BIN", "/opt/homebrew/opt/llvm@21/bin"))
@@ -133,6 +134,8 @@ class IrSizeTests(unittest.TestCase):
 
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn('"marked_functions": 5', result.stdout)
+        # The pipeline validates this output before it records the identity.
+        _require_bitcode_header(output)
         ir = subprocess.run(
             [str(LLVM_BIN / "llvm-dis"), str(output), "-o", "-"], check=True, capture_output=True, text=True
         ).stdout
