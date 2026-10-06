@@ -135,6 +135,11 @@ pub fn build(b: *std.Build) void {
         "Run the MCP stdio dispatcher E2E driver",
     );
     mcp_dispatcher_e2e_step.dependOn(&run_mcp_dispatcher_e2e.step);
+    const build_mcp_dispatcher_e2e_step = b.step(
+        "build-mcp-stdio-dispatcher-e2e",
+        "Build the MCP stdio dispatcher E2E driver",
+    );
+    build_mcp_dispatcher_e2e_step.dependOn(&mcp_dispatcher_e2e.step);
 
     // --- file_index search benchmark ---
     const benchmark_exports_mod = b.createModule(.{
