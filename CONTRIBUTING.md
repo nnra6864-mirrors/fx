@@ -214,7 +214,12 @@ leave an approved server unloaded and appear in the `/mcp` and `/mcp list`
 menu without exposing values.
 
 Interactive sessions keep pending workspace servers disconnected and request
-project trust before any project-defined process or network effect. Pending
+project trust before any project-defined process or network effect. The trust
+notice never takes composer input: typed and pasted text, Enter, and Escape
+keep their normal composer behavior. Press `ctrl+t` to review the first pending
+server, then press `1` to approve it, `2` to approve all pending servers, `3` to
+reject it, or `esc` to dismiss the remaining prompts for this process. Any other
+key returns focus to the composer and goes to the draft. Pending
 resource, prompt, completion, and authentication commands require explicit
 `/mcp trust approve <name>` and a retry. Rejected servers remain disconnected.
 Choices live only in profile `settings.json` under the canonical workspace key,

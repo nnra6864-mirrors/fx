@@ -514,6 +514,8 @@ describe.skipIf(!tmuxAvailable())("tui: MCP commands", () => {
         env: { HOME: home, FX_AUTO_UPGRADE: "0" },
       });
       await session.waitForText("is defined in .mcp.json.", 10_000);
+      await session.sendKeys("C-t");
+      await session.waitForText("[esc] dismiss remaining prompts", 5_000);
       await session.sendKeys("Escape");
       await session.waitForText("Project MCP approval prompts dismissed for this process.", 5_000);
       await session.sendText("/mcp");
@@ -909,6 +911,8 @@ describe.skipIf(!tmuxAvailable())("tui: MCP commands", () => {
           "Project MCP server 'project_fixture' is defined in .mcp.json.",
           10_000,
         );
+        await session.sendKeys("C-t");
+        await session.waitForText("[esc] dismiss remaining prompts", 5_000);
         await session.sendKeys("Escape");
         await session.waitForText(
           "Project MCP approval prompts dismissed for this process.",

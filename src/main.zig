@@ -1820,10 +1820,17 @@ const App = struct {
         defer self.alloc.free(name);
         var notice: std.Io.Writer.Allocating = .init(self.alloc);
         defer notice.deinit();
-        try notice.writer.print(
-            "Project MCP server '{s}' is defined in .mcp.json.\n  [1] approve  [2] approve all  [3] reject  [esc] dismiss remaining prompts\n",
-            .{name},
-        );
+        if (self.mcp.project_prompt_focused) {
+            try notice.writer.print(
+                "Review project MCP server '{s}':\n  [1] approve  [2] approve all  [3] reject  [esc] dismiss remaining prompts  (any other key returns to the composer)\n",
+                .{name},
+            );
+        } else {
+            try notice.writer.print(
+                "Project MCP server '{s}' is defined in .mcp.json. It stays disconnected until approved.\n  press ctrl+t to review\n",
+                .{name},
+            );
+        }
         try self.writeTranscriptClassified(
             notice.writer.buffered(),
             true,

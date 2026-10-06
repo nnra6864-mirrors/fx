@@ -2820,6 +2820,8 @@ describe("MCP remote authentication lifecycle", () => {
         "Project MCP server 'fixture' is defined in .mcp.json",
         10_000,
       );
+      await tui.sendKeys("C-t");
+      await tui.waitForText("[esc] dismiss remaining prompts", 10_000);
       await tui.sendKeys("Escape");
       await tui.waitForText(
         "Project MCP approval prompts dismissed for this process",

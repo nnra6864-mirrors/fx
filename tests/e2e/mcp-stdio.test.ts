@@ -1034,10 +1034,12 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       await tui.waitForText("Project MCP server 'fixture' is defined in .mcp.json", 10_000);
       expect(existsSync(root.launchLogPath)).toBe(false);
 
+      await tui.sendKeys("C-t");
+      await tui.waitForText("[1] approve  [2] approve all  [3] reject", 10_000);
       await tui.sendLiteral("1");
       await Bun.sleep(250);
       expect(readFileSync(root.traceLogPath, "utf8")).toContain(
-        "project prompt input byte=49 owns_input=true",
+        "project prompt input byte=49 route=approve",
       );
       await tui.waitForText("MCP configuration reloaded successfully", 15_000);
       await tui.sendText("/mcp list");
@@ -1054,6 +1056,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         pane.split("MCP configuration reloaded successfully").length - 1 >= 2 &&
         pane.split("Project MCP server 'fixture' is defined in .mcp.json").length - 1 >= 2,
       15_000);
+      await tui.sendKeys("C-t");
       await tui.sendLiteral("3");
       await tui.waitForText("MCP configuration reloaded successfully", 15_000);
       await tui.sendText("/mcp list");
@@ -1117,6 +1120,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         text.includes("Project MCP server 'fixture' is defined in .mcp.json"),
       10_000);
       expect(pane).not.toContain("Project MCP approval prompts dismissed");
+      await tui.sendKeys("C-t");
       await tui.sendLiteral("3");
       await tui.waitForPane((text) => text.includes("Rejecting project MCP server"), 10_000);
       const settings = JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8"));
@@ -1165,6 +1169,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       const pane = await tui.waitForPane((text) => !/^MCP \d+\s/m.test(text) &&
         text.includes("Project MCP server 'fixture' is defined in .mcp.json"), 10_000);
       expect(pane).toContain("RESOURCE_TEXT");
+      await tui.sendKeys("C-t");
       await tui.sendLiteral("3");
       await tui.waitForText("Rejecting project MCP server", 10_000);
       expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8"))
@@ -1178,13 +1183,15 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
   );
 
   test.skipIf(process.platform === "win32" || !tmuxAvailable())(
-    "Escape suppresses project MCP prompts only for the current process",
+    "project MCP prompt keeps typed input in the composer and dismisses only for the current process",
     async () => {
       const root = createRoot("workspace-escape", MODERN_FIXTURE, {
         recordLaunchAttempts: true,
       });
       moveProfileFixtureToWorkspace(root);
-      gateway = startFakeGateway([], {
+      gateway = startFakeGateway([
+        fakeGatewayFinalText("TYPED_PROMPT_REACHED_MODEL"),
+      ], {
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
       });
       const env = fixtureEnv(root, gateway);
@@ -1196,13 +1203,19 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         env,
       });
       await tui.waitForComposer(15_000);
-      await tui.waitForText("[esc] dismiss remaining prompts", 10_000);
-      await tui.pasteText("2");
-      await Bun.sleep(250);
-      expect((await tui.capturePane())).toContain("[2] approve all");
+      await tui.waitForText("press ctrl+t to review", 10_000);
+      // Typed and pasted bytes, including the old answer keys, belong to the composer.
+      await tui.sendLiteral("1 3 typed ");
+      await tui.pasteText("2 pasted");
+      await tui.waitForText("1 3 typed 2 pasted", 5_000);
+      await tui.sendKeys("Enter");
+      await tui.waitForText("TYPED_PROMPT_REACHED_MODEL", 15_000);
       expect(existsSync(root.launchLogPath)).toBe(false);
       expect(readFileSync(join(root.home, ".fx", "settings.json"), "utf8"))
         .not.toContain("enableAllProjectMcpServers");
+      expect(await tui.captureFullScrollback()).not.toContain("Project MCP approval prompts dismissed");
+      await tui.sendKeys("C-t");
+      await tui.waitForText("[esc] dismiss remaining prompts", 10_000);
       await tui.sendKeys("Escape");
       await tui.waitForText("Project MCP approval prompts dismissed for this process", 10_000);
       expect(existsSync(root.launchLogPath)).toBe(false);

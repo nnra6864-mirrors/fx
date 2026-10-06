@@ -130,6 +130,33 @@ fn projectMcpPromptMayOwnInput(state: ProjectMcpPromptInputState) bool {
         !state.authentication_active;
 }
 
+const project_mcp_prompt_focus_byte: u8 = 20; // ctrl+t
+
+const ProjectMcpPromptByteRoute = enum {
+    /// The composer receives the byte unchanged.
+    composer,
+    focus,
+    blur,
+    /// Leaves the prompt and hands the byte to the composer.
+    blur_to_composer,
+    approve,
+    approve_all,
+    reject,
+};
+
+/// The project trust prompt never takes plain typing from an unfocused
+/// composer: answers count only after an explicit ctrl+t.
+fn projectMcpPromptByteRoute(focused: bool, byte: u8) ProjectMcpPromptByteRoute {
+    if (byte == project_mcp_prompt_focus_byte) return if (focused) .blur else .focus;
+    if (!focused) return .composer;
+    return switch (byte) {
+        '1' => .approve,
+        '2' => .approve_all,
+        '3' => .reject,
+        else => .blur_to_composer,
+    };
+}
+
 fn parseExplicitModelSelection(input: []const u8) ExplicitModelSelectionParse {
     const trimmed = std.mem.trim(u8, input, " \t\r\n");
     if (!std.ascii.startsWithIgnoreCase(trimmed, "/model")) return .none;
@@ -858,7 +885,9 @@ pub fn Runtime(comptime App: type) type {
             return false;
         }
 
-        fn projectMcpPromptOwnsInput(app: *App) bool {
+        /// The prompt is pending and no other surface holds input. It still
+        /// answers keys only after ctrl+t focuses it.
+        fn projectMcpPromptAvailable(app: *App) bool {
             if (comptime !@hasDecl(App, "projectMcpPromptActive")) return false;
             const menu_active = activeCompactCommandMenu(app) != null or
                 settingsMenuActive(app) or
@@ -881,17 +910,43 @@ pub fn Runtime(comptime App: type) type {
             });
         }
 
+        fn projectMcpPromptOwnsInput(app: *App) bool {
+            if (comptime !@hasDecl(App, "projectMcpPromptActive")) return false;
+            return app.mcp.project_prompt_focused and projectMcpPromptAvailable(app);
+        }
+
+        fn blurProjectMcpPrompt(app: *App) void {
+            if (comptime !@hasDecl(App, "projectMcpPromptActive")) return;
+            app.mcp.project_prompt_focused = false;
+        }
+
         fn routeProjectMcpPromptByte(app: *App, byte: u8) !bool {
             if (comptime !@hasDecl(App, "projectMcpPromptName")) return false;
-            const owns_input = projectMcpPromptOwnsInput(app);
-            debug_trace.logf(
-                "mcp",
-                "project prompt input byte={d} owns_input={s}",
-                .{ byte, if (owns_input) "true" else "false" },
-            );
-            if (!owns_input) return false;
-            const action: project_config.ProjectMcpAction = switch (byte) {
-                '1' => {
+            if (!projectMcpPromptAvailable(app)) {
+                blurProjectMcpPrompt(app);
+                return false;
+            }
+            const route = projectMcpPromptByteRoute(app.mcp.project_prompt_focused, byte);
+            debug_trace.logf("mcp", "project prompt input byte={d} route={s}", .{ byte, @tagName(route) });
+            switch (route) {
+                .composer => return false,
+                .blur_to_composer => {
+                    blurProjectMcpPrompt(app);
+                    return false;
+                },
+                .blur => {
+                    blurProjectMcpPrompt(app);
+                    return true;
+                },
+                .focus => {
+                    app.mcp.project_prompt_focused = true;
+                    try app.presentProjectMcpPrompt();
+                    return true;
+                },
+                .approve, .approve_all, .reject => blurProjectMcpPrompt(app),
+            }
+            const action: project_config.ProjectMcpAction = switch (route) {
+                .approve => {
                     const name = (try app.projectMcpPromptName(app.alloc)) orelse return true;
                     defer app.alloc.free(name);
                     const display = try text_utils.encodeTerminalSafe(app.alloc, name, 256);
@@ -909,8 +964,8 @@ pub fn Runtime(comptime App: type) type {
                     );
                     return true;
                 },
-                '2' => .approve_all,
-                '3' => {
+                .approve_all => .approve_all,
+                .reject => {
                     const name = (try app.projectMcpPromptName(app.alloc)) orelse return true;
                     defer app.alloc.free(name);
                     const display = try text_utils.encodeTerminalSafe(app.alloc, name, 256);
@@ -928,7 +983,7 @@ pub fn Runtime(comptime App: type) type {
                     );
                     return true;
                 },
-                else => return true,
+                .composer, .focus, .blur, .blur_to_composer => unreachable,
             };
             try app_commands.Handlers(App).applyProjectMcpAction(
                 app,
@@ -1035,6 +1090,10 @@ pub fn Runtime(comptime App: type) type {
                 expireEscClearArm(app, now);
                 try resolveEscape(app, was_cancel_pending, now);
                 return .done;
+            }
+            switch (resolved) {
+                .remapped_byte, .ignore, .paste_end => {},
+                else => blurProjectMcpPrompt(app),
             }
 
             if (app_auth_runtime.Runtime(App).routeAuthPickerEscapeAction(app, resolved)) {
@@ -2046,7 +2105,7 @@ pub fn Runtime(comptime App: type) type {
                             .inserted => {
                                 if (comptime @hasDecl(App, "closeMcpMenu")) app.closeMcpMenu();
                                 if (comptime @hasDecl(App, "presentProjectMcpPrompt")) {
-                                    if (projectMcpPromptOwnsInput(app)) try app.presentProjectMcpPrompt();
+                                    if (projectMcpPromptAvailable(app)) try app.presentProjectMcpPrompt();
                                 }
                             },
                             .limit_exceeded => try input_limit_feedback.report(
@@ -3284,7 +3343,7 @@ pub fn Runtime(comptime App: type) type {
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
             if (comptime @hasDecl(App, "presentProjectMcpPrompt")) {
-                if (projectMcpPromptOwnsInput(app)) try app.presentProjectMcpPrompt();
+                if (projectMcpPromptAvailable(app)) try app.presentProjectMcpPrompt();
             }
             return true;
         }
@@ -3813,6 +3872,20 @@ test "project MCP prompt waits for every existing modal owner" {
     var inactive = base;
     inactive.active = false;
     try std.testing.expect(!projectMcpPromptMayOwnInput(inactive));
+}
+
+test "project MCP prompt leaves typing to the composer until ctrl+t focuses it" {
+    for ("1234 hello\r\x1b") |byte| {
+        try std.testing.expectEqual(ProjectMcpPromptByteRoute.composer, projectMcpPromptByteRoute(false, byte));
+    }
+    try std.testing.expectEqual(ProjectMcpPromptByteRoute.focus, projectMcpPromptByteRoute(false, 20));
+    try std.testing.expectEqual(ProjectMcpPromptByteRoute.approve, projectMcpPromptByteRoute(true, '1'));
+    try std.testing.expectEqual(ProjectMcpPromptByteRoute.approve_all, projectMcpPromptByteRoute(true, '2'));
+    try std.testing.expectEqual(ProjectMcpPromptByteRoute.reject, projectMcpPromptByteRoute(true, '3'));
+    try std.testing.expectEqual(ProjectMcpPromptByteRoute.blur, projectMcpPromptByteRoute(true, 20));
+    for ("4h\r") |byte| {
+        try std.testing.expectEqual(ProjectMcpPromptByteRoute.blur_to_composer, projectMcpPromptByteRoute(true, byte));
+    }
 }
 
 const RoutingFakeApp = struct {
