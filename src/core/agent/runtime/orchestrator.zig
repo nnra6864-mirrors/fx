@@ -686,10 +686,8 @@ fn complete_projected_tool_exchanges(
     }
 }
 
-// The three per-request history walks are noinline so their hot loops keep
-// their own profile and the rest of the turn loop can compile for size.
 /// Returns source unchanged or an owned projection released by free_terminal_request_projection.
-noinline fn project_terminal_request_messages(
+fn project_terminal_request_messages(
     alloc: Allocator,
     registry: tool_dispatch.Registry,
     attempt_eligible: bool,
@@ -969,7 +967,7 @@ fn subagent_history_summary(
 }
 
 /// Returns source unchanged or an owned projection released by free_terminal_request_projection.
-noinline fn project_subagent_request_messages(
+fn project_subagent_request_messages(
     alloc: Allocator,
     registry: tool_dispatch.Registry,
     attempt_eligible: bool,
@@ -1297,7 +1295,7 @@ test "subagent history projection cleans every partial allocation failure" {
     );
 }
 
-noinline fn project_read_tool_result_request_messages(
+fn project_read_tool_result_request_messages(
     arena: Allocator,
     eligible: bool,
     source: []const ChatMessage,
