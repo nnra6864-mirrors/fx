@@ -466,8 +466,8 @@ fn addSessionManager(
 
 fn readAppVersion(b: *std.Build) []const u8 {
     b.dependOnFileContents(b.path("src/main.zig"));
-    const main_path = b.root.joinString(b.allocator, "src/main.zig") catch @panic("OOM");
-    const bytes = std.Io.Dir.cwd().readFileAlloc(b.graph.io, main_path, b.allocator, .limited(1024 * 1024)) catch
+    const main_path = b.pathJoin(&.{ b.root.sub_path, "src/main.zig" });
+    const bytes = b.root.root_dir.handle.readFileAlloc(b.graph.io, main_path, b.allocator, .limited(1024 * 1024)) catch
         @panic("could not read src/main.zig to resolve app version");
     defer b.allocator.free(bytes);
 
