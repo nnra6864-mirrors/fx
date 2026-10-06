@@ -492,11 +492,31 @@ def candidate_runtime_probe_argv(
     return (*command[:2], "-###", *command[2:])
 
 
+_STUB_TARGET_LIST = re.compile(r"(targets:\s*)\[([^\]]*)\]")
+
+
+def apple_ld_system_stub(text: str) -> str:
+    # Zig 0.17's macOS 27 stub lists arm64e.x1 targets, which the Xcode 16.4
+    # linker rejects as an unknown architecture. An arm64 link never uses them.
+    def drop_arm64e_x1(match: re.Match[str]) -> str:
+        targets = [target.strip() for target in match.group(2).split(",")]
+        kept = [t for t in targets if t and not t.startswith("arm64e.x1-")]
+        if not kept:
+            raise PgsoError("system stub section targets only arm64e.x1")
+        return f"{match.group(1)}[ {', '.join(kept)} ]"
+
+    result = _STUB_TARGET_LIST.sub(drop_arm64e_x1, text)
+    if "arm64e.x1" in result:
+        raise PgsoError("system stub names arm64e.x1 outside a target list")
+    return result
+
+
 def temporal_candidate_link_argv(
     toolchain: Toolchain,
     paths: PipelinePaths,
     compiler_runtime: pathlib.Path,
     contract: MacosLinkContract,
+    system_stub: pathlib.Path,
 ) -> tuple[str, ...]:
     return (
         str(toolchain.apple_ld),
@@ -521,7 +541,7 @@ def temporal_candidate_link_argv(
         str(paths.logs / "candidate-link.map"),
         str(paths.profile_use_object),
         str(compiler_runtime),
-        str(toolchain.zig_darwin_sdk / "libSystem.tbd"),
+        str(system_stub),
         "-o",
         str(paths.candidate_binary),
     )
@@ -1313,6 +1333,13 @@ def _link_temporal_candidate(toolchain: Toolchain, paths: PipelinePaths) -> None
     system_stub = toolchain.zig_darwin_sdk / "libSystem.tbd"
     _require_nonempty_file(system_stub, "pinned Zig system library stub")
     stub_hash = sha256_file(system_stub)
+    linked_stub = paths.candidate_binary.parent / "system-stub" / "libSystem.tbd"
+    linked_stub.parent.mkdir(parents=True, exist_ok=True)
+    linked_stub.write_text(
+        apple_ld_system_stub(system_stub.read_text(encoding="utf-8")),
+        encoding="utf-8",
+    )
+    linked_stub_hash = sha256_file(linked_stub)
     order_path = paths.logs / "candidate-profile.order"
     run_checked(
         (str(toolchain.llvm_profdata), "order", str(paths.merged_profile), "-o", str(order_path)),
@@ -1345,7 +1372,7 @@ def _link_temporal_candidate(toolchain: Toolchain, paths: PipelinePaths) -> None
         json.dumps(mapping, indent=2) + "\n", encoding="utf-8",
     )
     result = run_checked(
-        temporal_candidate_link_argv(toolchain, paths, runtime_object, contract),
+        temporal_candidate_link_argv(toolchain, paths, runtime_object, contract, linked_stub),
         cwd=paths.root,
         env=os.environ.copy(),
         timeout_s=900,
@@ -1365,7 +1392,11 @@ def _link_temporal_candidate(toolchain: Toolchain, paths: PipelinePaths) -> None
     )
     validate_macos_link_contract(linked_contract, contract)
     validate_archive_unchanged(runtime, runtime_hash)
-    if sha256_file(runtime_object) != runtime_object_hash or sha256_file(system_stub) != stub_hash:
+    if (
+        sha256_file(runtime_object) != runtime_object_hash
+        or sha256_file(system_stub) != stub_hash
+        or sha256_file(linked_stub) != linked_stub_hash
+    ):
         raise PgsoError("candidate runtime object or system stub changed during link")
     evidence = {
         "linker": "apple-ld",
@@ -1378,6 +1409,7 @@ def _link_temporal_candidate(toolchain: Toolchain, paths: PipelinePaths) -> None
         "sysroot": str(toolchain.sdk),
         "system_stub": str(system_stub),
         "system_stub_sha256": stub_hash,
+        "linked_system_stub_sha256": linked_stub_hash,
         "runtime_archive_sha256": runtime_hash,
         "runtime_object_sha256": runtime_object_hash,
         "profile_sha256": sha256_file(paths.merged_profile),

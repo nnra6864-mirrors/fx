@@ -22,6 +22,7 @@ from scripts.pgso.pipeline import (
     MacosLinkContract,
     PipelinePaths,
     apply_profile,
+    apple_ld_system_stub,
     cleanup_outlined_ir_argv,
     candidate_object_argv,
     candidate_link_argv,
@@ -155,11 +156,40 @@ class PgsoPipelineTests(unittest.TestCase):
         with self.assertRaises(PgsoError):
             validate_temporal_link_map(link_map, self.root / "other.o", ("_alpha",))
 
+    def test_apple_ld_system_stub_drops_only_arm64e_x1_targets(self) -> None:
+        stub = (
+            "--- !tapi-tbd\n"
+            "targets:         [ x86_64-macos, arm64e-macos, \n"
+            "                   arm64e.x1-macos, arm64e.x1-maccatalyst ]\n"
+            "install-name:    '/usr/lib/libSystem.B.dylib'\n"
+            "exports:\n"
+            "  - targets:         [ arm64e.x1-macos, arm64e-macos ]\n"
+            "    symbols:         [ _a, _b ]\n"
+        )
+        self.assertEqual(
+            "--- !tapi-tbd\n"
+            "targets:         [ x86_64-macos, arm64e-macos ]\n"
+            "install-name:    '/usr/lib/libSystem.B.dylib'\n"
+            "exports:\n"
+            "  - targets:         [ arm64e-macos ]\n"
+            "    symbols:         [ _a, _b ]\n",
+            apple_ld_system_stub(stub),
+        )
+        older = "targets:         [ x86_64-macos, arm64e-macos ]\n"
+        self.assertEqual(older, apple_ld_system_stub(older))
+        for invalid in (
+            "  - targets:         [ arm64e.x1-macos, arm64e.x1-maccatalyst ]\n",
+            "    symbols:         [ _arm64e.x1 ]\n",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(PgsoError):
+                apple_ld_system_stub(invalid)
+
     def test_temporal_link_preserves_the_control_platform_and_original_object(self) -> None:
         runtime = self.root / "libcompiler_rt_zcu.o"
         contract = MacosLinkContract(1, "13.3", "26.4", 16 * 1024 * 1024, ())
         toolchain = dataclasses.replace(self.toolchain, sdk_version="15.5")
-        command = temporal_candidate_link_argv(toolchain, self.paths, runtime, contract)
+        stub = self.root / "linked" / "libSystem.tbd"
+        command = temporal_candidate_link_argv(toolchain, self.paths, runtime, contract, stub)
         self.assertEqual(str(self.toolchain.apple_ld), command[0])
         platform = command.index("-platform_version")
         self.assertEqual(("macos", "13.3", "26.4"), command[platform + 1:platform + 4])
@@ -168,7 +198,8 @@ class PgsoPipelineTests(unittest.TestCase):
         self.assertNotIn(str(self.paths.instrumented_object), command)
         self.assertNotIn(str(self.toolchain.profile_runtime), command)
         self.assertEqual("1000000", command[command.index("-stack_size") + 1])
-        self.assertIn(str(toolchain.zig_darwin_sdk / "libSystem.tbd"), command)
+        self.assertIn(str(stub), command)
+        self.assertNotIn(str(toolchain.zig_darwin_sdk / "libSystem.tbd"), command)
         self.assertIn(str(self.paths.logs / "candidate-order.txt"), command)
         for flag in ("-order_file", "-no_deduplicate", "-no_function_starts", "-map"):
             self.assertIn(flag, command)
@@ -615,6 +646,7 @@ pathlib.Path(sys.argv[sys.argv.index('-map') + 1]).write_bytes({link_map!r}.enco
                     toolchain, self.paths,
                     self.paths.candidate_binary.parent / "compiler-runtime" / "libcompiler_rt_zcu.o",
                     self.good_link_contract(),
+                    self.paths.candidate_binary.parent / "system-stub" / "libSystem.tbd",
                 )[1:]),
                 f"strip -S -x {self.paths.candidate_binary}",
                 "codesign --force --sign - --options linker-signed "
@@ -627,6 +659,10 @@ pathlib.Path(sys.argv[sys.argv.index('-map') + 1]).write_bytes({link_map!r}.enco
         layout = json.loads((self.paths.logs / "candidate-layout.json").read_text())
         self.assertEqual("26.4", layout["sdk_version"])
         self.assertEqual("15.5", layout["sysroot_sdk_version"])
+        self.assertEqual(
+            sha256_file(self.paths.candidate_binary.parent / "system-stub" / "libSystem.tbd"),
+            layout["linked_system_stub_sha256"],
+        )
         self.assertEqual(16777216, layout["main_stack_size"])
         self.assertEqual(8, layout["ordered_bytes"])
         self.assertIn(
