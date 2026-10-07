@@ -442,7 +442,7 @@ const AcpContext = struct {
             .ultrafast_mode = session.ultrafast_mode,
             .effort = session.effort,
             .first_call_tool_choice = session.first_call_tool_choice,
-            .permission_mode = self.captured_permission_mode orelse session.permission_mode,
+            .permission_mode = self.captured_permission_mode orelse session.mode.permission_mode,
             .permission_grants = session.session_grants,
             .permission_rules = session.permission_rules,
             .tool_registry = self.toolRegistry(),
@@ -1103,7 +1103,7 @@ pub fn runSubagentChild(
         return error.ProviderFailed;
     };
     const session_id = active.session_id;
-    const captured_mode = active.mode;
+    const captured_mode = active.mode.id;
     state.subagent_authority_mutex.unlock(io_mod.getIo());
     var ctx = AcpContext{
         .alloc = alloc,
@@ -1918,7 +1918,7 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
         .workspace_root = ctx.state.workspace_root,
         .access_scope = ctx.state.workspace_access.scope(ctx.state.workspace_root),
         .interactive = false,
-        .permission_mode = ctx.captured_permission_mode orelse session.permission_mode,
+        .permission_mode = ctx.captured_permission_mode orelse session.mode.permission_mode,
     }, arena, messages);
 }
 
@@ -1957,7 +1957,7 @@ fn resolveUnselectedMcpTool(raw_ctx: *anyopaque, arena: Allocator, name: []const
 fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     if (ctx.state.active_session) |session| {
-        const mode = ctx.captured_mode orelse session.mode;
+        const mode = ctx.captured_mode orelse session.mode.id;
         if (try ctx.state.cfg.mode_registry.toolPolicyDeniedJson(arena, activeToolSet(ctx.state), mode, call.name)) |reason| {
             return .{ .failure = reason };
         }
@@ -4235,7 +4235,7 @@ test "ACP plan mode validates registered tools against mode policy" {
     const alloc = std.testing.allocator;
     var state = try initTestAcpState(alloc, "/tmp/fx-acp-plan-mode", .ask);
     defer state.deinit();
-    state.active_session.?.mode = "plan";
+    state.active_session.?.mode = test_acp_mode_registry.lookup("plan").?;
     var ctx = AcpContext{
         .alloc = alloc,
         .state = &state,
@@ -4309,6 +4309,7 @@ const test_acp_context_registry = context_contract.Registry{ .default_provider =
 } };
 
 const test_acp_modes = [_]mode_registry.ModeSpec{
+    .{ .id = "code", .name = "Code", .permission_mode = .auto },
     .{ .id = "normal", .name = "Normal" },
     .{
         .id = "plan",
@@ -4379,7 +4380,7 @@ fn initTestAcpState(alloc: Allocator, workspace_root: []const u8, mode: Permissi
         .active_session = .{
             .session_id = session_id,
             .model = model,
-            .mode = "normal",
+            .mode = test_acp_mode_registry.startingMode(mode),
             .workspace_root = owned_workspace,
             .api_key = api_key,
             .credential_source = .ai_gateway_api_key,
@@ -4388,7 +4389,6 @@ fn initTestAcpState(alloc: Allocator, workspace_root: []const u8, mode: Permissi
             .fast_mode = false,
             .effort = .auto,
             .first_call_tool_choice = .auto,
-            .permission_mode = mode,
             .permission_rules = .{},
             .session_rt = .{ .max_history_turns = 8 },
             .cancel_flag = std.atomic.Value(bool).init(false),
@@ -4729,7 +4729,7 @@ test "ACP registry callbacks preserve snapshot bytes before transient context" {
         .session_id = state.active_session.?.session_id,
         .captured_permission_mode = .auto,
     };
-    state.active_session.?.permission_mode = .ask;
+    state.active_session.?.mode = test_acp_mode_registry.lookup("normal").?;
     const deps = agentRuntimeDeps(&ctx);
     try std.testing.expect(deps.context_enabled);
     try std.testing.expectEqualStrings(

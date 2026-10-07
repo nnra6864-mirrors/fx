@@ -38,6 +38,9 @@ test "built-in modes register exact ACP order and permission policy" {
     try std.testing.expectEqual(ToolPolicy.full, lookup("code").?.tool_policy);
     try std.testing.expectEqual(ToolPolicy.full, lookup("ask").?.tool_policy);
     try std.testing.expect(lookup("unknown") == null);
+    try std.testing.expectEqualStrings("ask", registry.startingMode(.ask).id);
+    try std.testing.expectEqualStrings("code", registry.startingMode(.auto).id);
+    try std.testing.expectEqualStrings("code", registry.startingMode(.yolo).id);
 }
 
 test "ask and code mode projections carry included custom provider guidance" {

@@ -430,6 +430,13 @@ Ultra eligibility.
   session record. Model, provider, credentials, and permission policy stay as
   resolved at `initialize` from the launch directory. A client without a
   project can pass an empty directory it owns.
+* **Session mode:** `session/new`, `session/load`, and `session/resume` start
+  the session in the mode that matches the configured `permission_mode`. The
+  `auto` setting starts in `code`, and `ask` starts in `ask`. ACP has no
+  full-access mode, so `full-access` starts in `code` and runs with `auto`
+  permissions. The `mode` config option and `modes.currentModeId` report the
+  mode that fx enforces. `session/set_mode` or `session/set_config_option`
+  with the `mode` config option changes it for the next prompt.
 * **Profile MCP servers:** ACP sessions use only client-supplied and approved
   project servers. Set `_meta.fx.profileMcpServers` to `true` on a session
   request to add the user's `~/.fx/mcp.json` servers. Request entries win name

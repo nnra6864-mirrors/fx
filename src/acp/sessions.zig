@@ -75,7 +75,7 @@ pub fn handleNewLibfxSession(
         .session_id = session_id,
         .model = model,
         .provider = state.provider,
-        .mode = state.cfg.mode_registry.default_mode_id,
+        .mode = state.cfg.mode_registry.startingMode(state.permission_mode),
         .workspace_root = state.workspace_root,
         .api_key = state.api_key,
         .credential_source = state.credential_source,
@@ -86,7 +86,6 @@ pub fn handleNewLibfxSession(
         .ultrafast_mode = state.ultrafast_mode,
         .effort = state.effort,
         .first_call_tool_choice = state.first_call_tool_choice,
-        .permission_mode = state.permission_mode,
         .permission_rules = state.permission_rules,
         .session_rt = session_rt,
         .cancel_flag = std.atomic.Value(bool).init(false),
@@ -130,7 +129,7 @@ pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *
         .wasm_revision = revision,
         .model = model,
         .provider = durable.preferences.provider,
-        .mode = state.cfg.mode_registry.default_mode_id,
+        .mode = state.cfg.mode_registry.startingMode(state.permission_mode),
         .workspace_root = state.workspace_root,
         .api_key = state.api_key,
         .credential_source = state.credential_source,
@@ -142,7 +141,6 @@ pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *
         .ultrafast_mode = state.ultrafast_mode,
         .effort = state.effort,
         .first_call_tool_choice = state.first_call_tool_choice,
-        .permission_mode = state.permission_mode,
         .permission_rules = state.permission_rules,
         .session_rt = session_rt,
         .cancel_flag = std.atomic.Value(bool).init(false),
@@ -255,7 +253,7 @@ test "ACP ultrafast WASM saves preserve baselines and failed preference writes r
         .session_id = @constCast("wasm-test"),
         .wasm_state = try freshAcpState(&state, alloc, "/workspace"),
         .model = @constCast("openai/test"),
-        .mode = "default",
+        .mode = state.cfg.mode_registry.startingMode(.ask),
         .workspace_root = "/workspace",
         .api_key = "",
         .agent_step_limit = 1,
@@ -264,7 +262,6 @@ test "ACP ultrafast WASM saves preserve baselines and failed preference writes r
         .ultrafast_mode = false,
         .effort = .auto,
         .first_call_tool_choice = .auto,
-        .permission_mode = .ask,
         .permission_rules = .{},
         .session_rt = session_runtime.SessionRuntime.initWithProviders(4, state.cfg.provider_set.deferredUsageProviders()),
         .cancel_flag = .init(false),
@@ -598,7 +595,7 @@ fn writeNewSessionResponse(
     try writeModeConfigOption(
         &out.writer,
         state.cfg.mode_registry,
-        state.cfg.mode_registry.default_mode_id,
+        state.active_session.?.mode.id,
     );
     if (effortConfigState(state)) |config| {
         try out.writer.writeAll(",");
@@ -613,7 +610,7 @@ fn writeNewSessionResponse(
         try writeUltrafastConfigOption(&out.writer, current);
     }
     try out.writer.writeAll("],\"modes\":{\"currentModeId\":");
-    try writeJsonStr(state.cfg.mode_registry.default_mode_id, &out.writer);
+    try writeJsonStr(state.active_session.?.mode.id, &out.writer);
     try out.writer.writeAll(",\"availableModes\":");
     try writeModesArray(&out.writer, state.cfg.mode_registry);
     try out.writer.writeAll("}}");
@@ -682,7 +679,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
         .wasm_revision = loaded.revision,
         .model = model_copy,
         .provider = loaded.state.preferences.provider,
-        .mode = state.cfg.mode_registry.default_mode_id,
+        .mode = state.cfg.mode_registry.startingMode(state.permission_mode),
         .workspace_root = state.workspace_root,
         .api_key = state.api_key,
         .credential_source = state.credential_source,
@@ -694,7 +691,6 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
         .ultrafast_mode = restoredUltrafastMode(state, loaded.state.preferences.ultrafast_mode),
         .effort = loaded.state.preferences.effort,
         .first_call_tool_choice = state.first_call_tool_choice,
-        .permission_mode = state.permission_mode,
         .permission_rules = state.permission_rules,
         .session_rt = session_rt,
         .cancel_flag = std.atomic.Value(bool).init(false),
@@ -863,11 +859,7 @@ fn handleRestoreSession(
             const previous_mcp = active.mcp;
             active.mcp = session_mcp;
             session_mcp_owned = false;
-            server.applySessionMode(
-                state.cfg.mode_registry,
-                active,
-                state.cfg.mode_registry.default_mode_id,
-            );
+            active.mode = state.cfg.mode_registry.startingMode(state.permission_mode);
             state.subagent_authority_mutex.unlock(io_mod.getIo());
             if (previous_mcp) |runtime| {
                 runtime.retireAndWait();
@@ -1262,7 +1254,7 @@ fn writeLoadSessionResponse(
     try writeModeConfigOption(
         &out.writer,
         state.cfg.mode_registry,
-        state.cfg.mode_registry.default_mode_id,
+        state.active_session.?.mode.id,
     );
     if (effortConfigState(state)) |config| {
         try out.writer.writeAll(",");
@@ -1277,7 +1269,7 @@ fn writeLoadSessionResponse(
         try writeUltrafastConfigOption(&out.writer, current);
     }
     try out.writer.writeAll("],\"modes\":{\"currentModeId\":");
-    try writeJsonStr(state.cfg.mode_registry.default_mode_id, &out.writer);
+    try writeJsonStr(state.active_session.?.mode.id, &out.writer);
     try out.writer.writeAll(",\"availableModes\":");
     try writeModesArray(&out.writer, state.cfg.mode_registry);
     try out.writer.writeAll("}}");
@@ -1468,7 +1460,7 @@ fn activateSession(
         .tool_identities = tool_identities,
         .model = activation.model,
         .provider = activation.provider,
-        .mode = state.cfg.mode_registry.default_mode_id,
+        .mode = state.cfg.mode_registry.startingMode(state.permission_mode),
         .workspace_root = state.workspace_root,
         .api_key = state.api_key,
         .credential_source = state.credential_source,
@@ -1480,7 +1472,6 @@ fn activateSession(
         .ultrafast_mode = activation.ultrafast_mode,
         .effort = activation.effort,
         .first_call_tool_choice = state.first_call_tool_choice,
-        .permission_mode = state.permission_mode,
         .permission_rules = state.permission_rules,
         .session_rt = activation.session_rt,
         .mcp = activation.mcp,
@@ -2988,6 +2979,7 @@ const test_session_context_registry = context_contract.Registry{ .default_provid
 const test_session_modes = [_]mode_registry.ModeSpec{
     .{ .id = "review", .name = "Review", .description = "Review changes" },
     .{ .id = "inspect", .name = "Inspect", .description = "Inspect a workspace" },
+    .{ .id = "code", .name = "Code", .description = "Write and modify code", .permission_mode = .auto },
 };
 
 const test_session_mode_registry = mode_registry.Registry{
@@ -3333,14 +3325,14 @@ test "ACP new and loaded sessions provide a writable subagent host" {
         const new_writable = &new_active.writable.?;
         try std.testing.expectEqualStrings(
             test_session_mode_registry.default_mode_id,
-            new_active.mode,
+            new_active.mode.id,
         );
         server.applySessionMode(
             state.cfg.mode_registry,
             new_active,
             "review",
         );
-        try std.testing.expectEqualStrings("review", new_active.mode);
+        try std.testing.expectEqualStrings("review", new_active.mode.id);
         try std.testing.expect(new_writable.state.usage != null);
         try std.testing.expect(
             new_active.session_rt.usage.generation_usage_providers.select(.gateway).?.lookup_fn ==
@@ -3387,7 +3379,7 @@ test "ACP new and loaded sessions provide a writable subagent host" {
         try std.testing.expectEqual(@as(usize, 0), loaded_writable.state.history.len);
         try std.testing.expectEqualStrings(
             test_session_mode_registry.default_mode_id,
-            loaded_active.mode,
+            loaded_active.mode.id,
         );
         try std.testing.expect(loaded_writable.state.usage != null);
         try std.testing.expect(state.subagent_store != null);
@@ -3413,6 +3405,69 @@ test "ACP new and loaded sessions provide a writable subagent host" {
     defer alloc.free(captured);
     try std.testing.expect(std.mem.find(u8, captured, "\"id\":1") != null);
     try std.testing.expect(std.mem.find(u8, captured, "\"id\":2") != null);
+}
+
+test "ACP new session starts on the most permissive mode that does not exceed configured permission" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(
+        alloc,
+        tmp.dir,
+        "workspace",
+    );
+    defer alloc.free(workspace_path);
+    const test_home = try AcpSessionTestHome.install(alloc, home_path);
+    defer test_home.deinit();
+
+    var capture = try tmp.dir.createFile(
+        io_mod.getIo(),
+        "acp-starting-mode.jsonl",
+        .{ .read = true },
+    );
+    defer capture.close(io_mod.getIo());
+    {
+        var state = try initAcpSessionTestState(arena, workspace_path, capture);
+        defer state.deinit();
+        state.permission_mode = .auto;
+
+        var new_msg = jsonrpc.Message{
+            .id = .{ .integer = 1 },
+            .method = "session/new",
+            .params_raw = "{\"mcpServers\":[]}",
+        };
+        try handleNewSession(&state, arena, &new_msg);
+
+        try std.testing.expectEqualStrings("code", state.active_session.?.mode.id);
+        try std.testing.expectEqual(types.PermissionMode.auto, state.active_session.?.mode.permission_mode);
+        try capture.sync(io_mod.getIo());
+    }
+    var captured_file = try tmp.dir.openFile(
+        io_mod.getIo(),
+        "acp-starting-mode.jsonl",
+        .{},
+    );
+    defer captured_file.close(io_mod.getIo());
+    const captured = try io_mod.readFileToEnd(
+        alloc,
+        &captured_file,
+        64 * 1024,
+    );
+    defer alloc.free(captured);
+    try std.testing.expect(std.mem.find(
+        u8,
+        captured,
+        "\"id\":\"mode\",\"name\":\"Session Mode\",\"description\":\"Controls how the agent requests permission\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":\"code\"",
+    ) != null);
+    try std.testing.expect(std.mem.find(u8, captured, "\"currentModeId\":\"code\"") != null);
 }
 
 test "ACP same-session restore retires the replaced MCP runtime after active users drain" {

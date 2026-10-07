@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const mode_contract = @import("mode_contract.zig");
+const types = @import("../shared/types.zig");
 const tool_projection = @import("../tooling/tool_projection.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
@@ -17,6 +18,24 @@ pub const Registry = struct {
             if (std.mem.eql(u8, mode.id, id)) return mode;
         }
         return null;
+    }
+
+    pub fn startingMode(self: Registry, configured: types.PermissionMode) *const ModeSpec {
+        const limit = permissionRank(configured);
+        var best: ?*const ModeSpec = null;
+        var best_rank: u8 = 0;
+        for (self.modes) |*mode| {
+            const rank = permissionRank(mode.permission_mode);
+            if (rank > limit) continue;
+            if (best == null or rank > best_rank or
+                (rank == best_rank and std.mem.eql(u8, mode.id, self.default_mode_id)))
+            {
+                best = mode;
+                best_rank = rank;
+            }
+        }
+        if (best) |mode| return mode;
+        return self.lookup(self.default_mode_id).?;
     }
 
     pub fn buildModelToolProjection(
@@ -70,6 +89,14 @@ fn nameInSet(names: []const []const u8, wanted: []const u8) bool {
     return false;
 }
 
+fn permissionRank(mode: types.PermissionMode) u8 {
+    return switch (mode) {
+        .ask => 0,
+        .auto => 1,
+        .yolo => 2,
+    };
+}
+
 test "mode registry looks up modes by id" {
     const modes = [_]ModeSpec{
         .{ .id = "ask", .name = "Ask", .permission_mode = .ask },
@@ -82,6 +109,38 @@ test "mode registry looks up modes by id" {
     try std.testing.expectEqualStrings("Code", found.name);
     try std.testing.expectEqual(@as(@TypeOf(found.permission_mode), .auto), found.permission_mode);
     try std.testing.expect(registry.lookup("missing") == null);
+}
+
+test "startingMode picks the most permissive registered mode that does not exceed configured permission" {
+    const modes = [_]ModeSpec{
+        .{ .id = "code", .name = "Code", .permission_mode = .auto },
+        .{ .id = "ask", .name = "Ask", .permission_mode = .ask },
+    };
+    const registry = Registry{ .default_mode_id = "ask", .modes = modes[0..] };
+
+    try std.testing.expectEqualStrings("ask", registry.startingMode(.ask).id);
+    try std.testing.expectEqualStrings("code", registry.startingMode(.auto).id);
+    try std.testing.expectEqualStrings("code", registry.startingMode(.yolo).id);
+}
+
+test "startingMode prefers the default mode among equally permissive candidates" {
+    const modes = [_]ModeSpec{
+        .{ .id = "review", .name = "Review", .permission_mode = .auto },
+        .{ .id = "code", .name = "Code", .permission_mode = .auto },
+    };
+    const registry = Registry{ .default_mode_id = "code", .modes = modes[0..] };
+
+    try std.testing.expectEqualStrings("code", registry.startingMode(.auto).id);
+}
+
+test "startingMode falls back to the default mode when nothing qualifies" {
+    const modes = [_]ModeSpec{
+        .{ .id = "code", .name = "Code", .permission_mode = .auto },
+        .{ .id = "agent", .name = "Agent", .permission_mode = .yolo },
+    };
+    const registry = Registry{ .default_mode_id = "code", .modes = modes[0..] };
+
+    try std.testing.expectEqualStrings("code", registry.startingMode(.ask).id);
 }
 
 test "mode registry applies tool policy to the supplied tool set" {

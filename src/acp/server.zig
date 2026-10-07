@@ -210,7 +210,7 @@ pub const ActiveSessionState = struct {
     session_write_mutex: std.Io.Mutex = .init,
     model: []u8,
     provider: model_provider.ProviderId = .gateway,
-    mode: []const u8,
+    mode: *const mode_registry.ModeSpec,
     workspace_root: []const u8,
     api_key: []const u8,
     credential_source: ?types.CredentialSource = null,
@@ -222,7 +222,6 @@ pub const ActiveSessionState = struct {
     ultrafast_mode: bool = false,
     effort: types.ReasoningEffort,
     first_call_tool_choice: types.ToolChoice,
-    permission_mode: types.PermissionMode,
     permission_rules: types.PermissionRuleSet,
     /// Runtime-only "allow for this session" grants. Never persisted to
     /// profile or project configuration.
@@ -264,10 +263,7 @@ const ActivePrompt = struct {
     state: *ServerState,
     alloc: Allocator,
     msg: jsonrpc.Message,
-    /// Mode and permission policy captured when the prompt was dispatched.
-    /// Mid-turn mode changes apply to the next prompt, never the running one.
-    mode: []const u8,
-    permission_mode: types.PermissionMode,
+    captured_mode: *const mode_registry.ModeSpec,
     thread: if (host_target.is_wasm) void else std.Thread = if (host_target.is_wasm) {} else undefined,
     reapable: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
@@ -786,7 +782,7 @@ fn resolveSubagentAuthority(
             root_id,
             root_id,
             active.permission_rules,
-            state.cfg.mode_registry.toolAllowed(builtin_tools.advertisement_set, active.mode, "mcp_features") and
+            state.cfg.mode_registry.toolAllowed(builtin_tools.advertisement_set, active.mode.id, "mcp_features") and
                 !permissions.rulesDenyAllTargetsForTool(active.permission_rules, "mcp_features"),
         )
     else
@@ -804,7 +800,7 @@ fn resolveSubagentAuthority(
             .mode = .{
                 .active = .{
                     .registry = state.cfg.mode_registry,
-                    .id = active.mode,
+                    .id = active.mode.id,
                 },
             },
         },
@@ -1740,8 +1736,7 @@ fn startPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Messag
         .state = state,
         .alloc = alloc,
         .msg = try cloneMessage(alloc, msg),
-        .mode = session.mode,
-        .permission_mode = session.permission_mode,
+        .captured_mode = session.mode,
     };
     errdefer jsonrpc.freeMessage(alloc, &active.msg);
 
@@ -1837,8 +1832,8 @@ fn promptWorkerMain(active: *ActivePrompt) void {
         active.state,
         active.alloc,
         &active.msg,
-        active.mode,
-        active.permission_mode,
+        active.captured_mode.id,
+        active.captured_mode.permission_mode,
     ) catch |err| .{
         .rpc_error = .{
             .code = ErrorCode.internal_error,
@@ -2984,7 +2979,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
 
     try refreshModelCatalogForOptions(state);
     const current_model = if (state.active_session) |s| s.model else state.selected_model;
-    const current_mode: []const u8 = if (state.active_session) |s| s.mode else state.cfg.mode_registry.default_mode_id;
+    const current_mode: []const u8 = if (state.active_session) |s| s.mode.id else state.cfg.mode_registry.default_mode_id;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -3456,9 +3451,7 @@ fn handleSetMode(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !
 }
 
 pub fn applySessionMode(registry: mode_registry.Registry, session: *ActiveSessionState, id: []const u8) void {
-    const mode = registry.lookup(id) orelse return;
-    session.mode = mode.id;
-    session.permission_mode = mode.permission_mode;
+    session.mode = registry.lookup(id) orelse return;
 }
 
 test "applySessionMode uses registered mode policy and ignores unknown modes" {
@@ -3473,7 +3466,7 @@ test "applySessionMode uses registered mode policy and ignores unknown modes" {
     var session = ActiveSessionState{
         .session_id = @constCast("session"),
         .model = @constCast("model"),
-        .mode = registry.default_mode_id,
+        .mode = registry.lookup(registry.default_mode_id).?,
         .workspace_root = "/tmp/workspace",
         .api_key = "",
         .agent_step_limit = 0,
@@ -3481,7 +3474,6 @@ test "applySessionMode uses registered mode policy and ignores unknown modes" {
         .fast_mode = false,
         .effort = .auto,
         .first_call_tool_choice = .auto,
-        .permission_mode = .ask,
         .permission_rules = .{},
         .session_rt = .{ .max_history_turns = 0 },
         .cancel_flag = std.atomic.Value(bool).init(false),
@@ -3489,21 +3481,21 @@ test "applySessionMode uses registered mode policy and ignores unknown modes" {
     };
 
     applySessionMode(registry, &session, "apply");
-    try std.testing.expectEqualStrings("apply", session.mode);
-    try std.testing.expectEqual(types.PermissionMode.auto, session.permission_mode);
+    try std.testing.expectEqualStrings("apply", session.mode.id);
+    try std.testing.expectEqual(types.PermissionMode.auto, session.mode.permission_mode);
 
     applySessionMode(registry, &session, "inspect");
-    try std.testing.expectEqualStrings("inspect", session.mode);
-    try std.testing.expectEqual(types.PermissionMode.ask, session.permission_mode);
+    try std.testing.expectEqualStrings("inspect", session.mode.id);
+    try std.testing.expectEqual(types.PermissionMode.ask, session.mode.permission_mode);
 
     applySessionMode(registry, &session, "unknown");
-    try std.testing.expectEqualStrings("inspect", session.mode);
-    try std.testing.expectEqual(types.PermissionMode.ask, session.permission_mode);
+    try std.testing.expectEqualStrings("inspect", session.mode.id);
+    try std.testing.expectEqual(types.PermissionMode.ask, session.mode.permission_mode);
 
     applySessionMode(registry, &session, "apply");
-    try std.testing.expectEqual(types.PermissionMode.auto, session.permission_mode);
+    try std.testing.expectEqual(types.PermissionMode.auto, session.mode.permission_mode);
     applySessionMode(registry, &session, "inspect");
-    try std.testing.expectEqual(types.PermissionMode.ask, session.permission_mode);
+    try std.testing.expectEqual(types.PermissionMode.ask, session.mode.permission_mode);
 }
 
 test "ACP notifications with absent id are not response targets" {
