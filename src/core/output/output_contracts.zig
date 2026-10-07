@@ -2,6 +2,7 @@ const std = @import("std");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const doctor_runtime = @import("../cli/doctor_runtime.zig");
+const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mcp_health = @import("../mcp/health.zig");
@@ -785,8 +786,19 @@ pub const PermissionsSnapshot = struct {
     }
 };
 
+/// What fx offers for one listed model: the same efforts and speed lanes a session on that model
+/// exposes. `efforts` excludes `auto`, which every model accepts.
+pub const ModelDetail = struct {
+    name: ?[]const u8 = null,
+    efforts: model_capabilities.ReasoningEffortOptions = .{},
+    fast: bool = false,
+    ultrafast: bool = false,
+};
+
 pub const ModelListSnapshot = struct {
     ids: []const []const u8,
+    /// One per id when the provider's catalog describes its models; empty otherwise.
+    details: []const ModelDetail = &.{},
     provider: model_provider.ProviderId = .gateway,
     limit: ?usize = null,
     private_models_hidden: bool = false,
@@ -867,19 +879,36 @@ pub const ModelListSnapshot = struct {
             if (i > 0) try out.writer.writeByte(',');
             try std.json.Stringify.value(id, .{}, &out.writer);
         }
-        if (self.provider != .gateway) {
+        const has_details = self.ids.len > 0 and self.details.len == self.ids.len;
+        if (self.provider != .gateway or has_details) {
             try out.writer.writeAll("],\"models\":[");
             for (self.ids[0..shown], 0..) |id, i| {
                 if (i > 0) try out.writer.writeByte(',');
                 try out.writer.writeAll("{\"id\":");
                 try std.json.Stringify.value(id, .{}, &out.writer);
-                try out.writer.writeAll(",\"source\":");
-                try std.json.Stringify.value(providerDisplayName(&self.provider), .{}, &out.writer);
+                if (self.provider != .gateway) {
+                    try out.writer.writeAll(",\"source\":");
+                    try std.json.Stringify.value(providerDisplayName(&self.provider), .{}, &out.writer);
+                }
+                if (has_details) try writeModelDetailJson(&out.writer, &self.details[i]);
                 try out.writer.writeByte('}');
             }
         }
         try out.writer.writeAll("]}");
         return try out.toOwnedSlice();
+    }
+
+    fn writeModelDetailJson(w: *std.Io.Writer, detail: *const ModelDetail) !void {
+        if (detail.name) |name| {
+            try w.writeAll(",\"name\":");
+            try std.json.Stringify.value(name, .{}, w);
+        }
+        try w.writeAll(",\"efforts\":[");
+        for (detail.efforts.slice(), 0..) |effort, i| {
+            if (i > 0) try w.writeByte(',');
+            try std.json.Stringify.value(effort.label(), .{}, w);
+        }
+        try w.print("],\"fast\":{},\"ultrafast\":{}", .{ detail.fast, detail.ultrafast });
     }
 
     fn shownCount(self: ModelListSnapshot) usize {
@@ -2248,6 +2277,29 @@ test "model list explains public-only and rejected-credential catalogs" {
     const quiet_body = try shown.renderInteractiveBody(alloc);
     defer alloc.free(quiet_body);
     try std.testing.expect(std.mem.find(u8, quiet_body, "team-private") == null);
+}
+
+test "model list json describes each shown model when details are known" {
+    const ids = [_][]const u8{ "openai/gpt-6-astra", "provider/plain", "provider/hidden" };
+    const details = [_]ModelDetail{
+        .{
+            .name = "GPT-6 Astra",
+            .efforts = .fromSlice(&.{ types.ReasoningEffort.literal("low"), types.ReasoningEffort.literal("xhigh") }),
+            .fast = true,
+            .ultrafast = true,
+        },
+        .{},
+        .{ .name = "Hidden" },
+    };
+    const json = try (ModelListSnapshot{ .ids = &ids, .details = &details, .limit = 2 }).renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"models\",\"count\":3,\"shown_count\":2,\"more_count\":1,\"private_models_hidden\":false," ++
+            "\"ids\":[\"openai/gpt-6-astra\",\"provider/plain\"],\"models\":[" ++
+            "{\"id\":\"openai/gpt-6-astra\",\"name\":\"GPT-6 Astra\",\"efforts\":[\"low\",\"xhigh\"],\"fast\":true,\"ultrafast\":true}," ++
+            "{\"id\":\"provider/plain\",\"efforts\":[],\"fast\":false,\"ultrafast\":false}]}",
+        json,
+    );
 }
 
 test "core model list snapshot handles limits and empty lists" {

@@ -3238,6 +3238,7 @@ describe("cli: models", () => {
             more_count: 0,
             private_models_hidden: true,
             ids: ["public/fallback"],
+            models: [{ id: "public/fallback", efforts: [], fast: false, ultrafast: false }],
           });
 
           expect(gateway.modelRequests).toHaveLength(2);
@@ -3258,6 +3259,53 @@ describe("cli: models", () => {
           gateway.stop();
           cleanupIsolatedTestHome(home);
         }
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx models --json describes each Gateway model's name, efforts, and speed lanes",
+    async () => {
+      const home = createIsolatedTestHome();
+      const gateway = startFakeGateway([], {
+        models: () => [
+          {
+            id: "openai/astra",
+            name: "Astra ",
+            type: "language",
+            owned_by: "openai",
+            tags: ["tool-use"],
+            reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+            pricing: {
+              service_tiers: {
+                priority: { input: "1", output: "2" },
+                ultrafast: { input: "3", output: "4" },
+              },
+            },
+          },
+          { id: "provider/plain", type: "language", tags: ["tool-use"] },
+        ],
+      });
+
+      try {
+        const result = await runFx(["models", "--json"], {
+          env: modelsGatewayEnv(home, `${gateway.baseUrl}/coding-agent/v1/models`),
+        });
+
+        expect(result.code).toBe(0);
+        expect(result.stderr).toBe("");
+        const json = JSON.parse(result.stdout.trim());
+        expect(json.models).toHaveLength(2);
+        expect(json.models).toEqual(
+          expect.arrayContaining([
+            { id: "openai/astra", name: "Astra", efforts: ["low", "high"], fast: true, ultrafast: true },
+            { id: "provider/plain", efforts: [], fast: false, ultrafast: false },
+          ]),
+        );
+      } finally {
+        gateway.stop();
+        cleanupIsolatedTestHome(home);
       }
     },
     TIMEOUT,
