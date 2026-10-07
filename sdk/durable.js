@@ -134,7 +134,8 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
   // with: an untaken steer becomes a turn.
   const contexts = new Map();
   for (const input of base?.pending ?? []) if (input.context !== undefined) contexts.set(input.messageId, input.context);
-  // How many times a prompt's harness stopped before its turn wrote anything.
+  // How many times each turn's engine stopped under it, or could not open
+  // to continue it.
   const stops = new Map();
   const failed = new Map();
   let maxCursor = 0;
@@ -247,8 +248,8 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
   // stopped even then can never go on, and the session runs no more turns.
   const openFailed = openTurn !== null && failed.has(openTurn.id);
   const openStops = openTurn === null ? 0 : stops.get(openTurn.id) ?? 0;
-  const broken = openStops >= maxHarnessStops + maxCancelStops;
-  const stuck = openStops >= maxHarnessStops && !broken;
+  const halted = openStops >= maxHarnessStops + maxCancelStops;
+  const stuck = openStops >= maxHarnessStops && !halted;
   return {
     // Inputs no turn has taken, as written: what a checkpoint keeps.
     unconsumed: inputs.filter((input) => !consumed.has(input.messageId)),
@@ -274,10 +275,10 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
     inputKeys: seenInputs,
     maxCursor,
     stuck,
-    broken,
-    hasWork: (openTurn !== null && !broken && (!openFailed || cancelOpen || stuck))
+    halted,
+    hasWork: (openTurn !== null && !halted && (!openFailed || cancelOpen || stuck))
       || pending.length > 0
-      || (broken && !openFailed),
+      || (halted && !openFailed),
   };
 }
 
@@ -936,7 +937,7 @@ class SessionWorker {
       return "failed";
     };
     try {
-      if (state.broken) {
+      if (state.halted) {
         // Even cancelling the open turn stopped its engine, so the session
         // can run no more turns. The turn and every prompt waiting end with
         // an error, without starting an engine.
@@ -966,6 +967,11 @@ class SessionWorker {
           const summary = errorSummary(error);
           await log.append({ k: "failed", messageId: waiting, error: summary });
           ui.push({ type: "turn_end", messageId: waiting, stopReason: "error", usage: {}, error: summary });
+        } else if (state.openTurn) {
+          // Nothing is left to fail, but the failed open turn is still due a
+          // cancel: each open that fails counts against it, so the session
+          // ends up running no more turns instead of opening forever.
+          await log.append({ k: "stopped", messageId: state.openTurn.id });
         }
         agent.emit("session.error", { sessionId: this.sessionId, error: errorSummary(error) });
         return "done";
@@ -1059,6 +1065,7 @@ class SessionWorker {
           await harness.close().catch(() => {});
           harness = null;
           await chain;
+          if (failed) return broken();
           state = this.fold(await log.read());
           if (state.openTurn?.id !== messageId && state.consumed.has(messageId)) {
             // Its end landed before its engine stopped, so it ended, though

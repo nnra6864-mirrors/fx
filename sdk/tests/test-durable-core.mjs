@@ -520,23 +520,41 @@ test("a started turn whose engine keeps stopping is cancelled, and the prompts b
   await agent.close();
 });
 
-test("an engine that cannot open again fails the open turn once, then each prompt waiting", async () => {
-  // The first engine dies mid-turn; no later one opens.
+// An agent whose first `works` engines open and whose later ones cannot.
+function agentWhoseEnginesFailAfter(works, durability) {
   const scripted = scriptedHarness();
-  let opens = 0;
-  const createFailing = createDurableAgentFactory({
+  const counts = { opens: 0 };
+  const create = createDurableAgentFactory({
     harness: (options) => {
       const base = scripted(options);
       return { open: async (args) => {
-        opens += 1;
-        if (opens > 1) throw new Error("no engine");
+        counts.opens += 1;
+        if (counts.opens > works) throw new Error("no engine");
         return base.open(args);
       } };
     },
     defaultDurability: async () => memory(),
     name: "createFailingAgent",
   });
-  const agent = createFailing({ durability: await durabilityFor() });
+  return { agent: create({ durability }), counts };
+}
+
+// Engines stop opening within a bounded number of tries: the count holds
+// still for 2.5 s, within 10 s, and stays within `limit`.
+async function opensSettle(counts, limit) {
+  for (let tries = 0; tries < 4; tries += 1) {
+    const before = counts.opens;
+    await sleep(2500);
+    if (counts.opens === before) break;
+  }
+  const settled = counts.opens;
+  await sleep(2500);
+  assert.equal(counts.opens, settled, "no more engines once nothing can run");
+  assert.ok(counts.opens <= limit, `opened ${counts.opens} engines`);
+}
+
+test("an engine that cannot open again fails the open turn once, then each prompt waiting", async () => {
+  const { agent, counts } = agentWhoseEnginesFailAfter(1, await durabilityFor());
   const session = agent.session();
   const open = session.prompt(shattered, { messageId: "turn-dies" });
   await open.accepted;
@@ -547,10 +565,26 @@ test("an engine that cannot open again fails the open turn once, then each promp
   const second = await behind.result;
   assert.equal(second.stopReason, "error");
   assert.match(second.error?.message ?? "", /no engine/);
-  const settledOpens = opens;
-  await sleep(2500);
-  assert.equal(opens, settledOpens, "no more engines once nothing waits");
-  assert.ok(opens <= 3, `opened ${opens} engines`);
+  await opensSettle(counts, 3);
+  await agent.close();
+});
+
+test("a stuck turn whose engine then cannot open is not opened forever", async () => {
+  const { agent, counts } = agentWhoseEnginesFailAfter(3, await durabilityFor());
+  const session = agent.session();
+  const ended = await session.prompt(shattered, { messageId: "turn-stuck" }).result;
+  assert.equal(ended.stopReason, "error");
+  await opensSettle(counts, 8);
+  await agent.close();
+});
+
+test("a cancel for a turn whose engine cannot open is not retried forever", async () => {
+  const { agent, counts } = agentWhoseEnginesFailAfter(1, await durabilityFor());
+  const session = agent.session();
+  const ended = await session.prompt(shattered, { messageId: "turn-cancelled" }).result;
+  assert.equal(ended.stopReason, "error");
+  await session.cancel();
+  await opensSettle(counts, 8);
   await agent.close();
 });
 
