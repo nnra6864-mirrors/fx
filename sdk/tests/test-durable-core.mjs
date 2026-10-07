@@ -21,6 +21,8 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const ran = [];
 // Every turn a harness session was asked to start, by id.
 const prompted = [];
+// Inputs whose first prompt throws, as a harness that cannot run does.
+const flaky = new Set(["flaky"]);
 // Steps that wait until a test lets them go, by text.
 const holds = new Map();
 
@@ -84,9 +86,10 @@ function scriptedHarness({ steps = 3 } = {}) {
       return {
         prompt(input, { turnId, yieldAt } = {}) {
           prompted.push(turnId);
-          // A harness can refuse an input before it writes anything, as fx's
-          // kernel refuses an empty prompt, or throw on one it cannot take.
-          if (input === "throw") throw new TypeError("the harness cannot take this input");
+          // A harness refuses an input with a turn that ends in an error
+          // before it writes anything, as fx's kernel refuses an empty
+          // prompt. One that throws cannot run a turn at all.
+          if (flaky.delete(input)) throw new Error("the harness stopped");
           if (input === "refuse") return scriptedTurn(async () => ({ stopReason: "error", error: { name: "Error", message: "refused" } }), () => {});
           const started = append({ turnId, start: true, input }, [{ start: turnId }]);
           return chain(started, () => run(turnId, input, yieldAt));
@@ -298,14 +301,20 @@ test("a turn that ends before writing a record runs once, and the session goes o
   await agent.close();
 });
 
-test("a prompt the harness throws on fails its own turn only", async () => {
-  const agent = createAgent({ durability: await durabilityFor() });
+test("a harness that throws instead of starting a turn is replaced, and no prompt is lost", async () => {
+  const events = [];
+  const agent = createAgent({ durability: await durabilityFor(), onEvent: (event) => events.push(event.type) });
   const session = agent.session();
-  const thrown = await session.prompt("throw", { messageId: "turn-x" }).result;
-  assert.equal(thrown.stopReason, "error");
-  assert.match(thrown.error?.message ?? "", /cannot take this input/);
-  const { result } = await textOf(session.prompt("eta", { messageId: "turn-eta0" }));
+  const before = prompted.length;
+  const flakyTurn = session.prompt("flaky", { messageId: "turn-flaky" });
+  await flakyTurn.accepted;
+  const queued = session.prompt("eta", { messageId: "turn-eta0" });
+  const { text, result } = await textOf(flakyTurn);
   assert.equal(result.stopReason, "end_turn");
+  assert.equal(text, "flaky-0 flaky-1 flaky-2");
+  assert.equal((await queued.result).stopReason, "end_turn", "the prompt behind it ran too");
+  assert.deepEqual(prompted.slice(before), ["turn-flaky", "turn-flaky", "turn-eta0"], "a new harness ran the turn");
+  assert.ok(events.includes("session.error"), JSON.stringify(events));
   await agent.close();
 });
 

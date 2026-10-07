@@ -60,10 +60,30 @@ function fxTurn(turn) {
   };
 }
 
+// A turn the engine would not start because of its input: it ends at once
+// with an error and stores nothing.
+function refusedTurn(error) {
+  return {
+    result: Promise.resolve({ stopReason: "error", usage: {}, error: { name: error?.name ?? "Error", message: String(error?.message ?? error) } }),
+    steer: async () => {},
+    cancel() {},
+    async *[Symbol.asyncIterator]() {},
+  };
+}
+
 function fxSession(engine, idempotent) {
   const internals = engine[engineInternals];
   return {
-    prompt: (input, options) => fxTurn(engine.prompt(input, options)),
+    prompt: (input, options) => {
+      try {
+        return fxTurn(engine.prompt(input, options));
+      } catch (error) {
+        // The engine refuses an input it cannot take with a TypeError or a
+        // RangeError. Any other throw means it cannot run a turn at all.
+        if (error instanceof TypeError || error instanceof RangeError) return refusedTurn(error);
+        throw error;
+      }
+    },
     // A call left running reruns only when running it twice is safe. Any
     // other call is never run again: the model is told it may have partly
     // run, and the turn goes on.

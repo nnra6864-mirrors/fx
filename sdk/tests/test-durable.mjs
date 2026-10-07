@@ -597,6 +597,18 @@ test("each agent.session() call carries its own context to the tools", async () 
     assert.equal((await agent.session(first.id, { context: { user } }).prompt("use lookup").result).stopReason, "end_turn");
   }
   assert.deepEqual(contexts.slice(before), [{ user: "a" }, { user: "b" }]);
+  // A prompt queued behind another caller's running turn still runs with
+  // its own caller's context.
+  const held = gate("lookup");
+  const running = agent.session(first.id, { context: { user: "c" } }).prompt("use lookup");
+  await held.started;
+  const queued = agent.session(first.id, { context: { user: "d" } }).prompt("use lookup");
+  await queued.accepted;
+  gates.delete("lookup");
+  held.open();
+  assert.equal((await running.result).stopReason, "end_turn");
+  assert.equal((await queued.result).stopReason, "end_turn");
+  assert.deepEqual(contexts.slice(-2), [{ user: "c" }, { user: "d" }]);
   await agent.close();
 });
 

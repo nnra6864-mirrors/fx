@@ -219,6 +219,17 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
       } else if (forOpenTurn) cancelOpen = true;
     }
   }
+  // A cancel is spent once it can no longer apply: a prompt's own cancel
+  // once its turn ended, and a session cancel once the turn open when it
+  // landed ended. Its id is kept like a turn's, so a late delivery of the
+  // same message is not taken as a new cancel.
+  for (const input of inputs) {
+    if (input.type !== "cancel" || consumed.has(input.messageId)) continue;
+    const live = typeof input.target === "string"
+      ? !consumed.has(input.target) || openTurn?.id === input.target
+      : openTurn !== null && input.cursor > openTurn.at;
+    if (!live) consume(input.messageId);
+  }
   // An open turn whose harness could not start waits for a cancel.
   const openFailed = openTurn !== null && failed.has(openTurn.id);
   return {
@@ -696,7 +707,8 @@ async function recordMessage(log, state, message) {
     await log.append({ k: "context", value: message.context });
   }
   const key = `${message.type}:${message.messageId}`;
-  if ((message.type === "prompt" || message.type === "steer" || message.type === "cancel") && !state.inputKeys.has(key)) {
+  const known = state.inputKeys.has(key) || state.consumed.has(message.messageId);
+  if ((message.type === "prompt" || message.type === "steer" || message.type === "cancel") && !known) {
     await log.append({
       k: "input",
       key,
@@ -704,6 +716,7 @@ async function recordMessage(log, state, message) {
       messageId: message.messageId,
       ...(message.input === undefined ? {} : { input: message.input }),
       ...(typeof message.target === "string" ? { target: message.target } : {}),
+      ...(message.type === "prompt" && message.context !== undefined ? { context: message.context } : {}),
     });
   }
 }
@@ -896,10 +909,18 @@ class SessionWorker {
       ? setTimeout(this.stopNow, deadline - stopMargin - Date.now())
       : null;
     let harness = null;
+    let harnessContext = null;
     this.settled = () => (harness ? harness.settled() : Promise.resolve());
+    // A harness that throws instead of returning a turn cannot run one; the
+    // same message runs the session again with a new harness.
+    const unusable = (error) => {
+      agent.emit("session.error", { sessionId: this.sessionId, error: errorSummary(error) });
+      return "failed";
+    };
     try {
       try {
         harness = await agent.openHarness(this.sessionId, store, state.context);
+        harnessContext = state.context;
       } catch (error) {
         // A harness that cannot start fails the turn waiting on it, once.
         const waiting = state.openTurn?.id ?? state.pending[0]?.messageId;
@@ -937,13 +958,7 @@ class SessionWorker {
           try {
             turn = harness.resume({ yieldAt });
           } catch (error) {
-            // The open turn waits for a cancel, as one whose harness could
-            // not start does.
-            const summary = errorSummary(error);
-            await log.append({ k: "failed", messageId, error: summary });
-            ui.push({ type: "turn_end", messageId, stopReason: "error", error: summary });
-            agent.emit("session.error", { sessionId: this.sessionId, error: summary });
-            break;
+            return unusable(error);
           }
         }
         if (!turn) {
@@ -958,17 +973,20 @@ class SessionWorker {
             state = this.fold(await log.read());
             continue;
           }
-          ui.push({ type: "turn_start", messageId, sessionId: this.sessionId, ...(typeof next.input === "string" ? { input: next.input } : {}) });
+          // Each prompt runs with the context its caller gave.
+          const wanted = next.context !== undefined ? next.context : state.context;
+          if (JSON.stringify(wanted ?? null) !== JSON.stringify(harnessContext ?? null)) {
+            await harness.close();
+            harness = null;
+            harness = await agent.openHarness(this.sessionId, store, wanted);
+            harnessContext = wanted;
+          }
           try {
             turn = harness.prompt(next.input ?? "", { turnId: messageId, yieldAt });
           } catch (error) {
-            // An input the harness refuses ends its turn at once.
-            await log.append({ k: "ended", messageId });
-            ui.push({ type: "turn_end", messageId, stopReason: "error", usage: {}, error: errorSummary(error) });
-            await ui.settle();
-            state = this.fold(await log.read());
-            continue;
+            return unusable(error);
           }
+          ui.push({ type: "turn_start", messageId, sessionId: this.sessionId, ...(typeof next.input === "string" ? { input: next.input } : {}) });
           fresh = true;
         }
         turnNow = turn;
@@ -986,18 +1004,23 @@ class SessionWorker {
           await release();
           return failed ? broken() : "yielded";
         }
+        const { result } = outcome;
         state = this.fold(await log.read());
+        if (fresh && !failed && !state.consumed.has(messageId)) {
+          // A turn that ended before writing a record, such as a prompt the
+          // harness refused or one a cancel stopped first, is done too. The
+          // log says so before its viewers hear it ended, so a retry that
+          // reads the log finds it ended.
+          await log.append({ k: "ended", messageId });
+          state = this.fold(await log.read());
+        }
+        ui.push({ type: "turn_end", messageId, stopReason: result.stopReason, usage: result.usage ?? {}, ...(result.error ? { error: result.error } : {}) });
+        await ui.settle();
         if (!fresh && !failed && harness.openTurn?.id === messageId) {
           // A harness that leaves a turn open after it ended would run it
           // again forever; the worker stops instead.
           agent.emit("session.error", { sessionId: this.sessionId, error: { name: "Error", message: `turn ${messageId} ended but stayed open` } });
           break;
-        }
-        if (fresh && !failed && !state.consumed.has(messageId)) {
-          // A turn that ended before writing a record, such as a prompt the
-          // harness rejected or one a cancel stopped first, is done too.
-          await log.append({ k: "ended", messageId });
-          state = this.fold(await log.read());
         }
         if (state.lastLease?.holder !== this.holder && !failed) return "fenced";
       }
@@ -1005,7 +1028,7 @@ class SessionWorker {
       harness = null;
       if (failed) return broken();
       await release();
-      return "done";
+      return failed ? broken() : "done";
     } finally {
       if (hardStop) clearTimeout(hardStop);
       this.stopNow = null;
@@ -1014,8 +1037,9 @@ class SessionWorker {
       if (harness) await harness.close().catch(() => {});
       await ui.settle().catch(() => {});
       // A worker that stops on an error still lets the next one in. One
-      // whose write failed releases outside its broken chain, so the retry
-      // need not wait out the lease; a fenced one holds nothing to release.
+      // whose write failed before its release releases outside its broken
+      // chain, so the retry need not wait out the lease; a fenced one holds
+      // nothing to release.
       if (!failed && !released) await release().catch(() => {});
       else if (failed && !isFenced(failed) && !released) {
         released = true;
@@ -1025,7 +1049,8 @@ class SessionWorker {
   }
 
   // Streams one turn to the session's viewers and applies the steers and
-  // cancels the log receives while it runs.
+  // cancels the log receives while it runs. Returns "fenced", "yielded", or
+  // `{ result }` for a turn that ended, whose end the caller writes.
   async drive(log, harness, turn, messageId, state, ui) {
     const applied = new Set();
     let since = String(state.maxCursor);
@@ -1087,9 +1112,7 @@ class SessionWorker {
       await ui.settle();
       return "yielded";
     }
-    ui.push({ type: "turn_end", messageId, stopReason: result.stopReason, usage: result.usage ?? {}, ...(result.error ? { error: result.error } : {}) });
-    await ui.settle();
-    return "ended";
+    return { result };
   }
 }
 
@@ -1428,11 +1451,6 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
           start: async () => {
             try {
               const { created, id: sessionId } = await resolved;
-              if (aborted) {
-                // A prompt whose signal had aborted is never stored.
-                accept.resolve({ messageId, sessionId });
-                return { settled: { messageId, stopReason: "cancelled", usage: {} } };
-              }
               const log = await created.session(sessionId);
               let attaching = type === "resume";
               let from = null;
@@ -1442,7 +1460,8 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
                 // turn that ends after it has its end in view.
                 from = await log.ui.length();
                 const state = foldSessionLog(await log.read());
-                if (state.openTurn?.id === messageId) attaching = true;
+                // One still waiting or running: follow it.
+                if (state.openTurn?.id === messageId || (state.inputKeys.has(`prompt:${messageId}`) && !state.consumed.has(messageId))) attaching = true;
                 else if (state.consumed.has(messageId)) {
                   accept.resolve({ messageId, sessionId });
                   const ended = await turnEndIn(log, messageId, from);
@@ -1451,6 +1470,11 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
                   if (error) return { settled: { messageId, stopReason: "error", error, repeated: true } };
                   return { log, from, attaching: true, endWithinMs: retryEndWaitMs };
                 }
+              }
+              if (aborted && !attaching) {
+                // A new prompt whose signal had aborted is never stored.
+                accept.resolve({ messageId, sessionId });
+                return { settled: { messageId, stopReason: "cancelled", usage: {} } };
               }
               // The viewer starts where the stream is now, before the
               // message can produce anything.

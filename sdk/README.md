@@ -77,7 +77,8 @@ One process runs a session's turns at a time, one turn after another. A
 second process that receives a prompt for a busy session queues it behind the
 running turn. Pass `context` to hand JSON to the session's tools:
 `agent.session(id, { context: { userId } })` gives every tool call
-`context` beside its `executionId`.
+`context` beside its `executionId`. Each prompt's turn runs with the context
+of the `session()` call it came from.
 
 ### Turns
 
@@ -97,13 +98,18 @@ view has:
 
 Dropping a turn view cancels nothing: the turn runs to its end whether or not
 anyone reads it. Call `session.cancel()` to stop it. A prompt's `signal`
-cancels the turn when it aborts.
+cancels that prompt's turn when it aborts, whether the turn is running or still
+waiting behind another, and never a later turn. A prompt whose `signal` had
+already aborted is not stored: its `result` resolves with the stop reason
+`cancelled`.
 
 Give a prompt a `messageId` when the same request can reach your server more
 than once, such as a client retry. A second `prompt()` with an id the session
 already accepted runs nothing: while that turn runs, the view follows it, and
-after it ends, `result` resolves to its outcome with `repeated: true`. An id
-follows the session id rule.
+after it ends, `result` resolves to its outcome with `repeated: true`. When the
+process that ran the turn stopped before writing how it ended, `result`
+resolves with the stop reason `unknown` after 30 seconds. An id follows the
+session id rule.
 
 `session.stream(cursor)` returns every event the session has produced from
 `cursor` on, as NDJSON, and stays open for the events after them. Any process
