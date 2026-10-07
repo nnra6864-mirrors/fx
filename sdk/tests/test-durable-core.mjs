@@ -661,6 +661,45 @@ test("a turn whose end is still landing when its engine stops ends as unknown", 
   await agent.close();
 });
 
+test("a World stream that takes forever to cancel holds no view or retry", async () => {
+  if (durabilityKind !== "local") return;
+  // As Vercel's live stream reads can: cancelling one never settles.
+  const base = await durabilityFor();
+  const stalled = {
+    ...base,
+    world: async () => {
+      const world = await base.world();
+      const get = world.streams.get.bind(world.streams);
+      const streams = Object.assign(Object.create(world.streams), {
+        async get(...args) {
+          const reader = (await get(...args)).getReader();
+          return new ReadableStream({
+            async pull(controller) {
+              const { value, done } = await reader.read();
+              if (done) controller.close();
+              else controller.enqueue(value);
+            },
+            cancel: () => new Promise(() => {}),
+          });
+        },
+      });
+      return Object.assign(Object.create(world), { streams });
+    },
+  };
+  const agent = createAgent({ durability: stalled });
+  const session = agent.session();
+  const within = (promise, label) => Promise.race([promise, sleep(5000).then(() => { throw new Error(`${label} did not finish`); })]);
+  const turn = session.prompt("xi2", { messageId: "turn-xi2" });
+  // Its readable closes once the turn ends.
+  const reader = turn.readable.getReader();
+  await within((async () => { for (;;) { const { done } = await reader.read(); if (done) return; } })(), "the view's readable");
+  assert.equal((await turn.result).stopReason, "end_turn");
+  const again = await within(session.prompt("xi2", { messageId: "turn-xi2" }).result, "the retry");
+  assert.equal(again.repeated, true);
+  assert.equal(again.stopReason, "end_turn");
+  await agent.close();
+});
+
 test("each prompt's turn runs with its own caller's context, resumed or not", async () => {
   const seen = [];
   const contextual = createDurableAgentFactory({

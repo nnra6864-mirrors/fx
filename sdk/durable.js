@@ -645,9 +645,11 @@ function createWorldBackend(world, { name, reserveMs, pollMs, alive, holderInfo,
                 if (done) controller.close();
                 else controller.enqueue(typeof value === "string" ? encoder.encode(value) : value);
               },
-              async cancel() {
+              // A live World read can take minutes to cancel, so nothing
+              // waits for it: a viewer that has its turn's end is done.
+              cancel() {
                 cancelled = true;
-                await reader?.cancel().catch(() => {});
+                void reader?.cancel().catch(() => {});
               },
             });
           },
@@ -1228,7 +1230,7 @@ async function uiRankerAt(log, count) {
       }
     }
   } finally {
-    await reader.cancel().catch(() => {});
+    void reader.cancel().catch(() => {});
   }
   return shows;
 }
@@ -1257,7 +1259,7 @@ async function turnEndIn(log, messageId, count) {
       }
     }
   } finally {
-    await reader.cancel().catch(() => {});
+    void reader.cancel().catch(() => {});
   }
   if (!found) return null;
   const { type: _type, ...rest } = found;
@@ -1330,7 +1332,7 @@ function turnView({ messageId, resumeRequest = null, start }) {
           if (!shows(event)) continue;
           if (id === null) {
             if (event.type === "idle" && event.requestId === resumeRequest) {
-              await reader.cancel().catch(() => {});
+              void reader.cancel().catch(() => {});
               return finish({ stopReason: "idle", usage: {} });
             }
             if (event.type !== "turn_resume" && event.type !== "turn_start") continue;
@@ -1341,7 +1343,7 @@ function turnView({ messageId, resumeRequest = null, start }) {
           wake();
           if (event.type === "turn_end") {
             if (gaveUp) clearTimeout(gaveUp);
-            await reader.cancel().catch(() => {});
+            void reader.cancel().catch(() => {});
             const { type: _type, messageId: _id, ...rest } = event;
             return finish({ messageId: id, ...rest });
           }
@@ -1642,7 +1644,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
                 buffered += decoder.decode(value, { stream: true });
               }
             },
-            async cancel() { await reader?.cancel().catch(() => {}); },
+            cancel() { void reader?.cancel().catch(() => {}); },
           });
         },
         /** Guidance for the running turn, or the next turn when none runs. */
