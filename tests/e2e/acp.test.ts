@@ -9871,6 +9871,64 @@ describe("acp: model-independent", () => {
     },
     TIMEOUT,
   );
+
+  for (const backend of SESSION_BACKENDS) {
+    test(
+      `a default session enforces the code mode it reports, including after a cold load${backend.suffix}`,
+      async () => {
+        const root = createIsolatedRoot("fx-acp-default-code-");
+        const first = join(root.workspace, "first.txt");
+        const second = join(root.workspace, "second.txt");
+        const gateway = startFakeGateway([
+          fileToolCall("acp_default_code_write", first, "first"),
+          finalText("first write complete"),
+          fileToolCall("acp_loaded_ask_write", second, "second"),
+          finalText("second write complete"),
+        ]);
+        const env = {
+          ...fakeGatewayEnv(root, gateway),
+          ...backend.env,
+          FX_PERMISSION_MODE: undefined,
+        };
+        const permissionCalls = (messages: any[]) => messages
+          .filter((message) => message.method === "session/request_permission")
+          .map((message) => message.params.toolCall.toolCallId);
+        try {
+          client = await AcpClient.create({ cwd: root.workspace, env });
+          await client.request("initialize", { protocolVersion: 1 }, 1);
+          const created = await client.request("session/new", { mcpServers: [] }, 2) as any;
+          await client.readLine();
+          expect(created.result.modes.currentModeId).toBe("code");
+          const firstTurn = await runPrompt(client, `Create ${first}.`, TIMEOUT);
+          expect(permissionCalls(firstTurn.messages)).toEqual([]);
+          expect(readFileSync(first, "utf8")).toBe("first");
+          expect(client.stderr).toBe("");
+          client.endStdin();
+          expect(await client.waitForExit()).toBe(0);
+
+          client = await AcpClient.create({ cwd: root.workspace, env });
+          client.setPermissionOption("allow_once");
+          await client.request("initialize", { protocolVersion: 1 }, 1);
+          const loaded = await client.request(
+            "session/load",
+            { sessionId: created.result.sessionId, mcpServers: [] },
+            2,
+          ) as any;
+          expect(loaded.result.modes.currentModeId).toBe("code");
+          await client.request("session/set_mode", { modeId: "ask" }, 3);
+          const secondTurn = await runPrompt(client, `Create ${second}.`, TIMEOUT);
+          expect(permissionCalls(secondTurn.messages)).toEqual(["acp_loaded_ask_write"]);
+          expect(readFileSync(second, "utf8")).toBe("second");
+          expect(client.stderr).toBe("");
+        } finally {
+          await client?.close();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      },
+      TIMEOUT,
+    );
+  }
 });
 
 describe("acp: model catalog authentication", () => {
