@@ -243,7 +243,7 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
     if (!live) consume(input.messageId);
   }
   // An open turn whose harness could not start has ended for its viewers; a
-  // cancel it is due waits for the next input's engine. One whose engine
+  // cancel it is due waits for the next prompt's engine. One whose engine
   // stopped each time it continued it is cancelled; one whose engine stopped
   // even then can never go on, and the session runs no more turns.
   const openFailed = openTurn !== null && failed.has(openTurn.id);
@@ -276,9 +276,8 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
     maxCursor,
     stuck,
     halted,
-    hasWork: (openTurn !== null && !halted && !openFailed)
-      || pending.length > 0
-      || (halted && !openFailed),
+    // A halted session's open turn is work until it ends with an error.
+    hasWork: (openTurn !== null && !openFailed) || pending.length > 0,
   };
 }
 

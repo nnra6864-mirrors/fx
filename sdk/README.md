@@ -194,6 +194,11 @@ the session continues the turn from its last record:
   turn, the session can run no more turns: the turn and every prompt sent to
   the session end with an error. A turn whose engine stops after storing its
   end resolves with the stop reason `unknown`.
+- When an engine cannot open, the turn waiting on it ends with an error, and
+  each later engine that cannot open ends the next waiting prompt the same
+  way. A started turn that ended this way stays open in the session. The
+  next prompt's engine first continues it, or cancels it when it was
+  cancelled or its engine kept stopping, and then runs that prompt.
 - On `memory()`, sessions end with the process.
 
 The model is told when its turn was interrupted, so it can check what
