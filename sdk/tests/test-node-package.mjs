@@ -3,7 +3,7 @@ import { strict as assert } from "node:assert";
 import { spawnSync } from "node:child_process";
 import { cp, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
@@ -49,7 +49,10 @@ try {
   const archiveValidator = packageJob.match(/- name: Validate package archive\n\s+run: \|\n\s+node -e '([\s\S]*?)'/)?.[1];
   assert.ok(archiveValidator, "publisher archive validation must exist");
   const reportPath = join(temp, "libfx-pack.json");
-  const archiveFiles = new Set(await readdir(packageDir));
+  // Every file, at its path in the package, as `npm pack` reports them.
+  const archiveFiles = new Set((await readdir(packageDir, { recursive: true, withFileTypes: true }))
+    .filter((entry) => entry.isFile())
+    .map((entry) => relative(packageDir, join(entry.parentPath, entry.name)).split(sep).join("/")));
   for (const platform of ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64"]) {
     archiveFiles.add(`libfx.${platform}.node`);
   }

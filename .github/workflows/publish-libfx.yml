@@ -285,6 +285,7 @@ jobs:
             const required = [
               "package.json", "README.md", "LICENSE", "browser.js", "node.js", "node.cjs", "fx-sdk.js", "wasm-module.js",
               "core-output.js", "fetch-cleanup.js", "mcp.js", "skills.js", "skills-node.js",
+              "durable.js", "fx-harness.js", "durable/local.mjs", "durable/vercel.mjs",
               "fx-core.wasm", "fx-term.wasm",
               "libfx.linux-x64.node", "libfx.linux-arm64.node",
               "libfx.darwin-x64.node", "libfx.darwin-arm64.node",
