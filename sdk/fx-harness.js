@@ -1,7 +1,7 @@
 // fx as a harness of the durable core in durable.js: `createFxAgent` is that
 // core running fx engines. Everything the core needs to know about fx is
 // here; the core itself knows only the harness contract.
-import { engineInternals, journalMarksWanted } from "./fx-sdk.js";
+import { coreAnswered, engineInternals, journalMarksWanted } from "./fx-sdk.js";
 
 const encoder = new TextEncoder();
 
@@ -43,8 +43,26 @@ export function fxHarness({ createEngine, defaultApiKey = async () => undefined 
 // the core knows a fence by its own `FX_FENCED` code.
 const unwrapFence = (error) => (error?.cause?.code === "FX_FENCED" ? error.cause : error);
 
-function fxTurn(turn) {
-  const result = turn.result.catch((error) => { throw unwrapFence(error); });
+// How long a failed turn waits to learn whether its core exited.
+const exitWaitMs = 1000;
+
+// A failed turn's error as the core reads it: a fence; a turn the core
+// ended with an error; or, when the core exited under it, a harness that
+// stopped, which the next delivery replaces.
+async function turnError(error, exited) {
+  const unwrapped = unwrapFence(error);
+  if (unwrapped?.code === "FX_FENCED" || unwrapped?.[coreAnswered]) return unwrapped;
+  let timer;
+  const gone = await Promise.race([
+    exited.then(() => true, () => true),
+    new Promise((resolve) => { timer = setTimeout(() => resolve(false), exitWaitMs); }),
+  ]).finally(() => clearTimeout(timer));
+  if (!gone) return unwrapped;
+  return Object.assign(new Error(String(unwrapped?.message ?? unwrapped), { cause: unwrapped }), { code: "FX_HARNESS_STOPPED" });
+}
+
+function fxTurn(turn, exited) {
+  const result = turn.result.catch(async (error) => { throw await turnError(error, exited); });
   void result.catch(() => {});
   return {
     result,
@@ -54,7 +72,7 @@ function fxTurn(turn) {
       try {
         for await (const event of turn) yield event;
       } catch (error) {
-        throw unwrapFence(error);
+        throw await turnError(error, exited);
       }
     },
   };
@@ -76,7 +94,7 @@ function fxSession(engine, idempotent) {
   return {
     prompt: (input, options) => {
       try {
-        return fxTurn(engine.prompt(input, options));
+        return fxTurn(engine.prompt(input, options), internals.exited);
       } catch (error) {
         // The engine refuses an input it cannot take with a TypeError or a
         // RangeError. Any other throw means it cannot run a turn at all.
@@ -87,7 +105,7 @@ function fxSession(engine, idempotent) {
     // A call left running reruns only when running it twice is safe. Any
     // other call is never run again: the model is told it may have partly
     // run, and the turn goes on.
-    resume: (options) => fxTurn(engine.resume({ ...options, onAmbiguous: (call) => (idempotent.has(call.name) ? "rerun" : undefined) })),
+    resume: (options) => fxTurn(engine.resume({ ...options, onAmbiguous: (call) => (idempotent.has(call.name) ? "rerun" : undefined) }), internals.exited),
     get openTurn() {
       return internals.openTurn;
     },

@@ -89,7 +89,9 @@ base64 string, because the prompt is stored as JSON before it runs. A turn
 view has:
 
 - `messageId`: the turn's id, which libfx chooses unless you pass one.
-- `accepted`: resolves to `{ messageId, sessionId }` once the prompt is stored.
+- `accepted`: resolves to `{ messageId, sessionId }` once the prompt is stored,
+  or at once for a prompt whose `signal` had already aborted, which is never
+  stored.
 - `result`: resolves to `{ messageId, stopReason, usage }` when the turn ends.
 - Async iteration over the turn's events, as
   [model and tool events](#prompt-input) describes.
@@ -183,6 +185,9 @@ the session continues the turn from its last record:
   at its next write, and `onEvent` receives `session.fenced`. Until then it
   can finish a model request or a call to an idempotent tool; it never starts
   a tool with effects, because that waits for its record to be stored.
+- When a write fails for any other reason, or the engine running a turn stops,
+  `onEvent` receives `session.error`, and the same queue message runs the
+  session again with a new engine, so no accepted prompt is lost.
 - On `memory()`, sessions end with the process.
 
 The model is told when its turn was interrupted, so it can check what

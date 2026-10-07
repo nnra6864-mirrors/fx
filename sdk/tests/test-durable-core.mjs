@@ -21,8 +21,10 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const ran = [];
 // Every turn a harness session was asked to start, by id.
 const prompted = [];
-// Inputs whose first prompt throws, as a harness that cannot run does.
+// Inputs whose first prompt throws, as a harness that cannot run does, and
+// whose first turn stops under them, as one whose engine exited does.
 const flaky = new Set(["flaky"]);
+const stopping = new Set(["halting"]);
 // Steps that wait until a test lets them go, by text.
 const holds = new Map();
 
@@ -90,6 +92,12 @@ function scriptedHarness({ steps = 3 } = {}) {
           // before it writes anything, as fx's kernel refuses an empty
           // prompt. One that throws cannot run a turn at all.
           if (flaky.delete(input)) throw new Error("the harness stopped");
+          if (stopping.delete(input)) {
+            const stopped = Object.assign(new Error("the engine exited"), { code: "FX_HARNESS_STOPPED" });
+            const result = Promise.reject(stopped);
+            result.catch(() => {});
+            return { result, steer: async () => {}, cancel() {}, async *[Symbol.asyncIterator]() { throw stopped; } };
+          }
           if (input === "refuse") return scriptedTurn(async () => ({ stopReason: "error", error: { name: "Error", message: "refused" } }), () => {});
           const started = append({ turnId, start: true, input }, [{ start: turnId }]);
           return chain(started, () => run(turnId, input, yieldAt));
@@ -417,6 +425,50 @@ if (durabilityKind === "local") {
     await agent.close();
   });
 }
+
+test("a turn whose harness stops under it, and the prompts behind it, still run", async () => {
+  const events = [];
+  const agent = createAgent({ durability: await durabilityFor(), onEvent: (event) => events.push(event.type) });
+  const session = agent.session();
+  const before = prompted.length;
+  const first = session.prompt("halting", { messageId: "turn-halt" });
+  await first.accepted;
+  const behind = session.prompt("tau", { messageId: "turn-tau" });
+  const { text, result } = await textOf(first);
+  assert.equal(result.stopReason, "end_turn");
+  assert.equal(text, "halting-0 halting-1 halting-2");
+  assert.equal((await behind.result).stopReason, "end_turn");
+  assert.deepEqual(prompted.slice(before), ["turn-halt", "turn-halt", "turn-tau"]);
+  assert.ok(events.includes("session.error"), JSON.stringify(events));
+  await agent.close();
+});
+
+test("each prompt's turn runs with its own caller's context, resumed or not", async () => {
+  const seen = [];
+  const contextual = createDurableAgentFactory({
+    harness: () => {
+      const base = scriptedHarness()();
+      return { open: async (options) => { const session = await base.open(options); return { ...session, prompt: (input, opts) => { seen.push([input, options.context]); return session.prompt(input, opts); }, resume: (opts) => { seen.push(["resume", options.context]); return session.resume(opts); }, get openTurn() { return session.openTurn; } }; } };
+    },
+    defaultDurability: async () => memory(),
+  });
+  const agent = contextual({ durability: await durabilityFor({ maxDurationMs: 1, reserveMs: 0 }) });
+  const opened = agent.session(undefined, { context: { user: "a" } });
+  assert.equal((await opened.prompt("upsilon").result).stopReason, "end_turn");
+  const id = opened.id;
+  assert.equal((await agent.session(id).prompt("phi").result).stopReason, "end_turn");
+  assert.equal((await agent.session(id, { context: { user: "b" } }).prompt("chi").result).stopReason, "end_turn");
+  assert.deepEqual(seen.filter(([input]) => input === "upsilon").map(([, c]) => c), [{ user: "a" }]);
+  assert.deepEqual(seen.filter(([input]) => input === "phi").map(([, c]) => c), [null], "a call without context passes none");
+  assert.deepEqual(seen.filter(([input]) => input === "chi").map(([, c]) => c), [{ user: "b" }]);
+  // Every turn yielded at each step; each resume ran with its own turn's context.
+  const order = seen.map(([input, context]) => `${input}:${JSON.stringify(context)}`);
+  for (const [word, context] of [["upsilon", { user: "a" }], ["phi", null], ["chi", { user: "b" }]]) {
+    const at = order.indexOf(`${word}:${JSON.stringify(context)}`);
+    assert.deepEqual(order.slice(at + 1, at + 3), [`resume:${JSON.stringify(context)}`, `resume:${JSON.stringify(context)}`], `${word} resumed with its own context`);
+  }
+  await agent.close();
+});
 
 test("a worker lives only while a delivery runs it", async () => {
   const agent = createAgent({ durability: await durabilityFor() });

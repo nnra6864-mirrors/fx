@@ -588,6 +588,33 @@ test("a prompt the engine refuses ends its own turn once, and the session goes o
   await agent.close();
 });
 
+test("the fx harness tells a refused turn from one whose core exited under it", async () => {
+  const { fxHarness } = await import("../fx-harness.js");
+  const { coreAnswered, engineInternals } = await import("../fx-sdk.js");
+  // A stand-in engine whose one turn fails, and whose core may then exit.
+  const engineWith = ({ error, exits }) => {
+    let exit;
+    const exited = new Promise((resolve) => { exit = resolve; });
+    const result = Promise.reject(error);
+    result.catch(() => {});
+    if (exits) setTimeout(() => exit(1), 10);
+    return {
+      prompt: () => ({ result, steer: async () => {}, cancel() {}, async *[Symbol.asyncIterator]() {} }),
+      close: async () => {},
+      [engineInternals]: { exited, openTurn: null, settled: async () => {}, checkpoint: async () => {} },
+    };
+  };
+  const failure = async (engine) => {
+    const session = await fxHarness({ createEngine: async () => engine })({}).open({ sessionId: "s", store: {}, context: null });
+    return session.prompt("x").result.catch((error) => error);
+  };
+  assert.equal((await failure(engineWith({ error: new Error("write to a closed core"), exits: true }))).code, "FX_HARNESS_STOPPED");
+  assert.notEqual((await failure(engineWith({ error: new Error("a request failed"), exits: false }))).code, "FX_HARNESS_STOPPED", "a live core ended the turn");
+  const answered = await failure(engineWith({ error: Object.assign(new Error("Empty prompt"), { [coreAnswered]: true }), exits: true }));
+  assert.equal(answered.message, "Empty prompt");
+  assert.notEqual(answered.code, "FX_HARNESS_STOPPED", "the core answered, so it refused the turn");
+});
+
 test("each agent.session() call carries its own context to the tools", async () => {
   const agent = createFxAgent(agentOptions(await durabilityFor()));
   const first = agent.session();

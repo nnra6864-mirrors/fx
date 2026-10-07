@@ -121,10 +121,12 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
   const inputs = [];
   const records = [];
   // A checkpoint taken where a turn yielded leaves that turn open.
-  let openTurn = typeof base?.openTurn?.id === "string" ? { id: base.openTurn.id, at: Number(base.openTurn.at) || 0 } : null;
+  let openTurn = typeof base?.openTurn?.id === "string" ? { id: base.openTurn.id, at: Number(base.openTurn.at) || 0, context: base.openTurn.context ?? null } : null;
   let lastTurnId = base?.lastTurnId ?? null;
   let yielded = base?.yielded === true;
-  let context = base?.context ?? null;
+  // The context each prompt's caller gave, which its turn runs with.
+  const contexts = new Map();
+  for (const input of base?.pending ?? []) if (input.type === "prompt" && input.context !== undefined) contexts.set(input.messageId, input.context);
   const failed = new Map();
   let maxCursor = 0;
   const consume = (id) => {
@@ -145,6 +147,7 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
         if (seenInputs.has(entry.key)) break;
         seenInputs.add(entry.key);
         inputs.push({ ...entry, cursor: position });
+        if (entry.type === "prompt" && entry.context !== undefined) contexts.set(entry.messageId, entry.context);
         break;
       case "lease":
       case "release":
@@ -162,7 +165,7 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
           records.push({ cursor, data: entry.data });
           for (const mark of entry.marks ?? []) {
             if (typeof mark.start === "string") {
-              openTurn = { id: mark.start, at: position };
+              openTurn = { id: mark.start, at: position, context: contexts.get(mark.start) ?? null };
               consume(mark.start);
               yielded = false;
             } else if (mark.end === true) {
@@ -188,9 +191,6 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
         // the harness refused or its cancel stopped first. Its outcome is on
         // the UI stream.
         consume(entry.messageId);
-        break;
-      case "context":
-        context = entry.value ?? null;
         break;
       default:
         break;
@@ -253,7 +253,6 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
     recent: recent.slice(-recentIdsKept),
     consumed,
     failed,
-    context,
     inputKeys: seenInputs,
     maxCursor,
     hasWork: (openTurn !== null && (!openFailed || cancelOpen)) || pending.length > 0,
@@ -697,14 +696,12 @@ const errorSummary = (error) => ({ name: error?.name ?? "Error", message: String
 const isFenced = (error) => error?.code === "FX_FENCED";
 
 // Writes what a queue message adds to its session: a restored agent's first
-// checkpoint, a changed context, and the message's input. It writes nothing
-// the log already holds, so the sender and the consumer can both call it.
+// checkpoint and the message's input, a prompt with its caller's context. It
+// writes nothing the log already holds, so the sender and the consumer can
+// both call it.
 async function recordMessage(log, state, message) {
   if (message.seed && state.checkpoint === null && state.records.length === 0) {
     await log.append({ k: "checkpoint", through: null, data: message.seed });
-  }
-  if (message.context !== undefined && JSON.stringify(state.context) !== JSON.stringify(message.context)) {
-    await log.append({ k: "context", value: message.context });
   }
   const key = `${message.type}:${message.messageId}`;
   const known = state.inputKeys.has(key) || state.consumed.has(message.messageId);
@@ -880,7 +877,6 @@ class SessionWorker {
           recent: now.recent,
           lastTurnId: now.lastTurnId,
           ...(now.openTurn ? { openTurn: now.openTurn, yielded: now.yielded } : {}),
-          context: now.context,
           lease: { holder: this.holder, epoch: lease.epoch, expiresAt: lease.expiresAt, pid: lease.pid, host: lease.host },
         });
       },
@@ -919,8 +915,10 @@ class SessionWorker {
     };
     try {
       try {
-        harness = await agent.openHarness(this.sessionId, store, state.context);
-        harnessContext = state.context;
+        // The context of the turn it runs first: the open turn's, or the
+        // next prompt's.
+        harnessContext = (state.openTurn ? state.openTurn.context : state.pending[0]?.context) ?? null;
+        harness = await agent.openHarness(this.sessionId, store, harnessContext);
       } catch (error) {
         // A harness that cannot start fails the turn waiting on it, once.
         const waiting = state.openTurn?.id ?? state.pending[0]?.messageId;
@@ -974,7 +972,7 @@ class SessionWorker {
             continue;
           }
           // Each prompt runs with the context its caller gave.
-          const wanted = next.context !== undefined ? next.context : state.context;
+          const wanted = next.context ?? null;
           if (JSON.stringify(wanted ?? null) !== JSON.stringify(harnessContext ?? null)) {
             await harness.close();
             harness = null;
@@ -1004,6 +1002,7 @@ class SessionWorker {
           await release();
           return failed ? broken() : "yielded";
         }
+        if (outcome.stopped) return unusable(outcome.stopped);
         const { result } = outcome;
         state = this.fold(await log.read());
         if (fresh && !failed && !state.consumed.has(messageId)) {
@@ -1049,8 +1048,9 @@ class SessionWorker {
   }
 
   // Streams one turn to the session's viewers and applies the steers and
-  // cancels the log receives while it runs. Returns "fenced", "yielded", or
-  // `{ result }` for a turn that ended, whose end the caller writes.
+  // cancels the log receives while it runs. Returns "fenced", "yielded",
+  // `{ stopped }` when its harness stopped under it, or `{ result }` for a
+  // turn that ended, whose end the caller writes.
   async drive(log, harness, turn, messageId, state, ui) {
     const applied = new Set();
     let since = String(state.maxCursor);
@@ -1091,6 +1091,9 @@ class SessionWorker {
       result = await turn.result;
     } catch (error) {
       if (isFenced(error)) return "fenced";
+      // The harness stopped under the turn; the next delivery continues it
+      // with a new one.
+      if (error?.code === "FX_HARNESS_STOPPED") return { stopped: error };
       result = { stopReason: "error", error: errorSummary(error) };
     } finally {
       stopped = true;
@@ -1352,6 +1355,12 @@ function turnView({ messageId, resumeRequest = null, start }) {
  * next worker continues it. It stops before a model request once `yieldAt`
  * has passed, with the stop reason `yielded`.
  *
+ * An input the harness refuses is a turn that ends with an error.
+ * `prompt()` and `resume()` throw only when the harness cannot run a turn,
+ * and a turn whose harness stopped under it rejects with a
+ * `FX_HARNESS_STOPPED` code; either way the same message runs the session
+ * again with a new harness.
+ *
  * `defaultDurability()` picks the durability when the caller names none,
  * `name` is the factory's name in errors, and `label` the agent's.
  */
@@ -1586,7 +1595,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
             }),
             append: async () => { throw new Error("a checkpoint reads the session without changing it"); },
           };
-          const harness = await agent.openHarness(sessionId, readOnly, state.context);
+          const harness = await agent.openHarness(sessionId, readOnly, null);
           try {
             return await harness.exportCheckpoint();
           } finally {

@@ -169,6 +169,9 @@ export function normalizeAgentOptions(value) {
 // public surface.
 export const engineInternals = Symbol.for("libfx.engineInternals");
 export const journalMarksWanted = Symbol.for("libfx.journalMarks");
+// Marks an error the core answered a request with, as opposed to one from a
+// core that stopped answering.
+export const coreAnswered = Symbol.for("libfx.coreAnswered");
 
 /**
  * Another writer took over the session after this agent loaded it. A
@@ -417,6 +420,7 @@ function agentEnvironment(options) {
 
 function agentRpcError(response) {
   const error = new Error(response.message);
+  error[coreAnswered] = true;
   const data = response.data;
   if (data && ["LIBFX_MODEL_UNSUPPORTED_EFFORT", "LIBFX_MODEL_UNSUPPORTED_FAST", "LIBFX_MODEL_UNSUPPORTED_ULTRAFAST"].includes(data.code) &&
     typeof data.model === "string" &&
@@ -2723,6 +2727,8 @@ export async function createFxEngine(options = {}) {
       checkpoint() {
         return maybeCheckpoint(true);
       },
+      // Resolves when the core this agent runs on exits.
+      exited: runtime.exited,
       // The turn the journal left open, if any, and the calls it left
       // running, as `{ executionId, name, input }`.
       get openTurn() {
