@@ -196,9 +196,10 @@ the session continues the turn from its last record:
   end resolves with the stop reason `unknown`.
 - When an engine cannot open, the turn waiting on it ends with an error, and
   each later engine that cannot open ends the next waiting prompt the same
-  way. A started turn that ended this way stays open in the session. The
-  next prompt's engine first continues it, or cancels it when it was
-  cancelled or its engine kept stopping, and then runs that prompt.
+  way. A started turn that ended this way stays open in the session, and
+  `session.resume()` answers `idle` for it. The next prompt's engine first
+  continues it, or cancels it when it was cancelled or its engine kept
+  stopping, and then runs that prompt.
 - On `memory()`, sessions end with the process.
 
 The model is told when its turn was interrupted, so it can check what
@@ -235,6 +236,9 @@ An idempotent call that was running runs again when the turn continues. Any
 other call never runs again on its own: the turn continues at once, and the
 model receives that call's result as an error saying it may have partly run,
 so it can check the call's effects before calling it again or ask the user.
+A call that runs again does not ask `onPermission` again, so do not mark a
+tool `idempotent: true` when its calls need a permission decision, such as a
+tool named `write_file` or `edit_file`.
 
 `executionId` is the same for a call each time it runs, including after a
 crash. Pass it to the service the tool calls, as an idempotency key, so a call
@@ -779,7 +783,9 @@ the same time and returns their results to the model in the order it called
 them. Mark a tool `writes: true` when its calls must not overlap others: it
 starts after every earlier call in the response finishes, and later calls
 wait for it. WebAssembly runs calls one at a time. Every call still goes
-through its own permission check before any of them starts.
+through its own permission check before any of them starts, except a call
+that runs again after a crash, as [Tools with effects](#tools-with-effects)
+describes.
 
 `execute` receives `{ signal, executionId }`, plus `context` when the turn
 has one. `executionId` is the model's id for the call and stays the same when
