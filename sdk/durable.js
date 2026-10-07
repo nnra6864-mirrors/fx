@@ -96,9 +96,11 @@ async function createBackend(durability) {
 // so a lease this process took is judged by whether its worker still runs.
 const liveHolders = (globalThis[Symbol.for("libfx.liveHolders")] ??= new Set());
 
-// Times a turn's engine may stop under it; after that the turn ends with an
-// error, so the session does not retry it forever.
+// Times a turn's engine may stop under it before the turn is cancelled, or
+// ends with an error when it never started; and further times it may stop
+// while that cancel runs before the session can run no more turns.
 const maxHarnessStops = 3;
+const maxCancelStops = 2;
 
 // ---------------------------------------------------------------------------
 // The session log, folded. Pure: the same entries always fold the same way.
@@ -240,10 +242,13 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
       : openTurn !== null && input.cursor > openTurn.at;
     if (!live) consume(input.messageId);
   }
-  // An open turn whose harness could not start waits for a cancel; one whose
-  // engine stopped each time it continued it can never go on.
+  // An open turn whose harness could not start waits for a cancel. One whose
+  // engine stopped each time it continued it is cancelled; one whose engine
+  // stopped even then can never go on, and the session runs no more turns.
   const openFailed = openTurn !== null && failed.has(openTurn.id);
-  const stuck = openTurn !== null && (stops.get(openTurn.id) ?? 0) >= maxHarnessStops;
+  const openStops = openTurn === null ? 0 : stops.get(openTurn.id) ?? 0;
+  const broken = openStops >= maxHarnessStops + maxCancelStops;
+  const stuck = openStops >= maxHarnessStops && !broken;
   return {
     // Inputs no turn has taken, as written: what a checkpoint keeps.
     unconsumed: inputs.filter((input) => !consumed.has(input.messageId)),
@@ -269,7 +274,10 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
     inputKeys: seenInputs,
     maxCursor,
     stuck,
-    hasWork: (openTurn !== null && !stuck && (!openFailed || cancelOpen)) || pending.length > 0,
+    broken,
+    hasWork: (openTurn !== null && !broken && (!openFailed || cancelOpen || stuck))
+      || pending.length > 0
+      || (broken && !openFailed),
   };
 }
 
@@ -928,18 +936,36 @@ class SessionWorker {
       return "failed";
     };
     try {
+      if (state.broken) {
+        // Even cancelling the open turn stopped its engine, so the session
+        // can run no more turns. The turn and every prompt waiting end with
+        // an error, without starting an engine.
+        const id = state.openTurn.id;
+        if (!state.failed.has(id)) {
+          const error = { name: "Error", message: "the engine stopped each time it continued this turn, even to cancel it" };
+          await log.append({ k: "failed", messageId: id, error });
+          ui.push({ type: "turn_end", messageId: id, stopReason: "error", usage: {}, error });
+        }
+        for (const waiting of state.pending) {
+          await log.append({ k: "ended", messageId: waiting.messageId });
+          ui.push({ type: "turn_end", messageId: waiting.messageId, stopReason: "error", usage: {}, error: { name: "Error", message: "the session's open turn cannot continue" } });
+        }
+        await ui.settle();
+        return "done";
+      }
       try {
         // The context of the turn it runs first: the open turn's, or the
         // next prompt's.
         harnessContext = (state.openTurn ? state.openTurn.context : state.pending[0]?.context) ?? null;
         harness = await agent.openHarness(this.sessionId, store, harnessContext);
       } catch (error) {
-        // A harness that cannot start fails the turn waiting on it, once.
-        const waiting = state.openTurn?.id ?? state.pending[0]?.messageId;
+        // A harness that cannot start fails the turn waiting on it, once:
+        // the open turn, or after it failed, the next prompt.
+        const waiting = state.openTurn && !state.openFailed ? state.openTurn.id : state.pending[0]?.messageId;
         if (waiting) {
           const summary = errorSummary(error);
           await log.append({ k: "failed", messageId: waiting, error: summary });
-          ui.push({ type: "turn_end", messageId: waiting, stopReason: "error", error: summary });
+          ui.push({ type: "turn_end", messageId: waiting, stopReason: "error", usage: {}, error: summary });
         }
         agent.emit("session.error", { sessionId: this.sessionId, error: errorSummary(error) });
         return "done";
@@ -953,23 +979,6 @@ class SessionWorker {
           await release();
           // A worker replaced without knowing it learns so at the release.
           return failed ? broken() : "yielded";
-        }
-        if (state.stuck) {
-          // An engine that stops each time it continues the open turn would
-          // hold the session forever. The turn ends with an error, and so do
-          // the prompts behind it, which cannot run while it stays open.
-          const id = state.openTurn.id;
-          const error = { name: "Error", message: `the engine stopped each of the ${maxHarnessStops} times it continued this turn` };
-          if (!state.failed.has(id)) {
-            await log.append({ k: "failed", messageId: id, error });
-            ui.push({ type: "turn_end", messageId: id, stopReason: "error", usage: {}, error });
-          }
-          for (const waiting of state.pending) {
-            await log.append({ k: "ended", messageId: waiting.messageId });
-            ui.push({ type: "turn_end", messageId: waiting.messageId, stopReason: "error", usage: {}, error: { name: "Error", message: "the session's open turn cannot continue" } });
-          }
-          await ui.settle();
-          break;
         }
         const open = harness.openTurn;
         let turn = null;
@@ -1139,7 +1148,9 @@ class SessionWorker {
       applied.add(steer.key);
       if (typeof steer.input === "string") void turn.steer(steer.input, steer.messageId).catch(() => {});
     }
-    if (state.cancelOpen) turn.cancel();
+    // An open turn whose engine kept stopping is cancelled the way a user
+    // would, so the prompts behind it can run.
+    if (state.cancelOpen || (state.stuck && state.openTurn?.id === messageId)) turn.cancel();
     const unwatch = log.watch?.(() => { void apply(); });
     const timer = this.backend.pollMs ? setInterval(() => { void apply(); }, this.backend.pollMs) : null;
     void apply();
@@ -1417,8 +1428,9 @@ function turnView({ messageId, resumeRequest = null, start }) {
  * `prompt()` and `resume()` throw only when the harness cannot run a turn,
  * and a turn whose harness stopped under it rejects with a
  * `FX_HARNESS_STOPPED` code; either way the same message runs the session
- * again with a new harness, up to 3 times for one turn, after which the turn
- * ends with an error.
+ * again with a new harness. After 3 stops a turn is resumed and cancelled at
+ * once, or ends with an error when it never started; when its harness stops
+ * twice more, even to cancel it, the session runs no more turns.
  *
  * `defaultDurability()` picks the durability when the caller names none,
  * `name` is the factory's name in errors, and `label` the agent's.
@@ -1529,7 +1541,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
                 from = await log.ui.length();
                 const state = foldSessionLog(await log.read());
                 // One still waiting or running: follow it.
-                if (state.openTurn?.id === messageId || (state.inputKeys.has(`prompt:${messageId}`) && !state.consumed.has(messageId))) attaching = true;
+                if ((state.openTurn?.id === messageId && !state.failed.has(messageId)) || (state.inputKeys.has(`prompt:${messageId}`) && !state.consumed.has(messageId))) attaching = true;
                 else if (state.consumed.has(messageId)) {
                   accept.resolve({ messageId, sessionId });
                   const ended = await turnEndIn(log, messageId, from);

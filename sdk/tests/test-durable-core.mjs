@@ -29,10 +29,14 @@ const stopping = new Set(["halting"]);
 // stops right after the turn's end lands.
 const doomed = "doomed";
 const stopsAfterEnd = new Set(["omega"]);
-// An input whose engine stops each time once its turn has started, and one
+// An input whose engine stops each time it continues its started turn unless
+// the turn is being cancelled, one whose engine stops even then, and one
 // whose end record is still landing when its engine stops.
 const brittle = "brittle";
+const shattered = "shattered";
 const endsLate = new Set(["late"]);
+// How many engines the scripted harness opened.
+const opened = { count: 0 };
 const harnessStopped = (message) => Object.assign(new Error(message), { code: "FX_HARNESS_STOPPED" });
 // Steps that wait until a test lets them go, by text.
 const holds = new Map();
@@ -45,6 +49,7 @@ const holds = new Map();
 function scriptedHarness({ steps = 3 } = {}) {
   return () => ({
     async open({ store }) {
+      opened.count += 1;
       const loaded = await store.load();
       const records = loaded.journal.map((record) => JSON.parse(decoder.decode(record.data)));
       let handedOff = false;
@@ -67,13 +72,20 @@ function scriptedHarness({ steps = 3 } = {}) {
         try {
           return await steps_(turnId, input, yieldAt, push, signal);
         } catch (error) {
-          // A cancel ends the turn; a handoff stores nothing more.
-          if (signal.aborted && !handedOff) await append({ turnId, end: true }, [{ end: true }]).catch(() => {});
+          // A cancel ends the turn; a handoff, or an engine that stopped,
+          // stores nothing more.
+          if (signal.aborted && !handedOff && error?.code !== "FX_HARNESS_STOPPED") await append({ turnId, end: true }, [{ end: true }]).catch(() => {});
           throw error;
         }
       }, () => { handedOff = true; });
       const steps_ = async (turnId, input, yieldAt, push, signal) => {
-        if (input === brittle) throw harnessStopped("the engine exited mid-turn");
+        if (input === brittle || input === shattered) {
+          // The engine dies at its next model request, which a cancel that
+          // arrives first avoids, as fx's kernel does.
+          await sleep(5);
+          if (input === brittle && signal.aborted) throw new Error("aborted");
+          throw harnessStopped("the engine exited mid-turn");
+        }
         let first = true;
         for (let step = turnOf(turnId).length; step < steps; step += 1) {
           if (!first && yieldAt !== undefined && Date.now() >= yieldAt) {
@@ -494,21 +506,72 @@ test("a turn whose engine stops after its end landed still ends for its viewers"
   await agent.close();
 });
 
-test("an engine that stops each time it continues a started turn ends it, and the prompts behind it", async () => {
+test("a started turn whose engine keeps stopping is cancelled, and the prompts behind it run", async () => {
   const agent = createAgent({ durability: await durabilityFor() });
   const session = agent.session();
   const stuck = session.prompt(brittle, { messageId: "turn-brittle" });
   await stuck.accepted;
   const behind = session.prompt("zeta2", { messageId: "turn-zeta2" });
-  const ended = await stuck.result;
+  assert.equal((await stuck.result).stopReason, "cancelled");
+  assert.equal((await behind.result).stopReason, "end_turn");
+  assert.equal((await session.prompt("eta2").result).stopReason, "end_turn");
+  // A retry by id answers from the log.
+  assert.equal((await session.prompt(brittle, { messageId: "turn-brittle" }).result).repeated, true);
+  await agent.close();
+});
+
+test("an engine that cannot open again fails the open turn once, then each prompt waiting", async () => {
+  // The first engine dies mid-turn; no later one opens.
+  const scripted = scriptedHarness();
+  let opens = 0;
+  const createFailing = createDurableAgentFactory({
+    harness: (options) => {
+      const base = scripted(options);
+      return { open: async (args) => {
+        opens += 1;
+        if (opens > 1) throw new Error("no engine");
+        return base.open(args);
+      } };
+    },
+    defaultDurability: async () => memory(),
+    name: "createFailingAgent",
+  });
+  const agent = createFailing({ durability: await durabilityFor() });
+  const session = agent.session();
+  const open = session.prompt(shattered, { messageId: "turn-dies" });
+  await open.accepted;
+  const behind = session.prompt("iota2", { messageId: "turn-iota2" });
+  const first = await open.result;
+  assert.equal(first.stopReason, "error");
+  assert.match(first.error?.message ?? "", /no engine/);
+  const second = await behind.result;
+  assert.equal(second.stopReason, "error");
+  assert.match(second.error?.message ?? "", /no engine/);
+  const settledOpens = opens;
+  await sleep(2500);
+  assert.equal(opens, settledOpens, "no more engines once nothing waits");
+  assert.ok(opens <= 3, `opened ${opens} engines`);
+  await agent.close();
+});
+
+test("a lone started turn whose engine stops even when cancelled ends, and the session refuses more turns", async () => {
+  const agent = createAgent({ durability: await durabilityFor() });
+  const session = agent.session();
+  const ended = await session.prompt(shattered, { messageId: "turn-shattered" }).result;
   assert.equal(ended.stopReason, "error");
-  assert.match(ended.error?.message ?? "", /stopped each of the 3 times it continued/);
-  const waited = await behind.result;
-  assert.equal(waited.stopReason, "error");
-  assert.match(waited.error?.message ?? "", /open turn cannot continue/);
-  // A prompt sent later fails at once instead of starting the engine again.
-  const later = await session.prompt("eta2", { messageId: "turn-eta2" }).result;
+  assert.match(ended.error?.message ?? "", /even to cancel it/);
+  // Later prompts end with an error without starting an engine.
+  const engines = opened.count;
+  const later = await session.prompt("theta2").result;
   assert.equal(later.stopReason, "error");
+  assert.match(later.error?.message ?? "", /open turn cannot continue/);
+  assert.equal(opened.count, engines, "no engine started");
+  const retried = await Promise.race([
+    session.prompt(shattered, { messageId: "turn-shattered" }).result,
+    sleep(5000).then(() => { throw new Error("the retry did not answer"); }),
+  ]);
+  assert.equal(retried.repeated, true);
+  assert.equal(retried.stopReason, "error");
   await agent.close();
 });
 

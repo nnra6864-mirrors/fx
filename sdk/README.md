@@ -188,10 +188,12 @@ the session continues the turn from its last record:
   a tool with effects, because that waits for its record to be stored.
 - When a write fails for any other reason, or the engine running a turn stops,
   `onEvent` receives `session.error`, and the same queue message runs the
-  session again with a new engine. A turn whose engine stops 3 times ends with
-  an error, and so do the prompts waiting behind it when the turn had already
-  started, so a failing engine never holds a session forever. A turn whose
-  engine stops after storing its end resolves with the stop reason `unknown`.
+  session again with a new engine. A turn whose engine stops 3 times is
+  cancelled, and the prompts behind it run; one that never got started ends
+  with an error instead. When the engine stops twice more, even to cancel the
+  turn, the session can run no more turns: the turn and every prompt sent to
+  the session end with an error. A turn whose engine stops after storing its
+  end resolves with the stop reason `unknown`.
 - On `memory()`, sessions end with the process.
 
 The model is told when its turn was interrupted, so it can check what
