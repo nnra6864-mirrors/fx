@@ -9769,6 +9769,108 @@ describe("acp: model-independent", () => {
     },
     TIMEOUT,
   );
+
+  for (const backend of SESSION_BACKENDS) {
+    test(
+      `session/new and session/load report the configured permission mode${backend.suffix}`,
+      async () => {
+        const modeValue = (result: any) =>
+          result.configOptions.find((option: any) => option.id === "mode").currentValue;
+        const reported: Record<string, string[]> = {};
+        for (const configured of [undefined, "auto", "ask", "full-access"]) {
+          const root = createIsolatedRoot("fx-acp-mode-report-");
+          const gateway = startFakeGateway([]);
+          try {
+            client = await AcpClient.create({
+              cwd: root.workspace,
+              env: {
+                ...fakeGatewayEnv(root, gateway),
+                ...backend.env,
+                FX_PERMISSION_MODE: configured,
+              },
+            });
+            await client.request("initialize", { protocolVersion: 1 }, 1);
+            const created = await client.request("session/new", { mcpServers: [] }, 2) as any;
+            await client.readLine();
+            const loaded = await client.request(
+              "session/load",
+              { sessionId: created.result.sessionId, mcpServers: [] },
+              3,
+            ) as any;
+            reported[configured ?? "unset"] = [
+              modeValue(created.result),
+              created.result.modes.currentModeId,
+              modeValue(loaded.result),
+              loaded.result.modes.currentModeId,
+            ];
+            expect(client.stderr).toBe("");
+          } finally {
+            await client?.close();
+            gateway.stop();
+            rmSync(root.root, { recursive: true, force: true });
+          }
+        }
+        expect(reported).toEqual({
+          unset: ["code", "code", "code", "code"],
+          auto: ["code", "code", "code", "code"],
+          ask: ["ask", "ask", "ask", "ask"],
+          "full-access": ["code", "code", "code", "code"],
+        });
+      },
+      TIMEOUT,
+    );
+  }
+
+  test(
+    "a new session in ask mode requests permission before a write",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-ask-default-write-");
+      const target = join(root.workspace, "out", "hello.txt");
+      const gateway = startFakeGateway([
+        fileToolCall("acp_ask_default_write", target, "hello"),
+        finalText("ask default write complete"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_PERMISSION_MODE: "ask" },
+        });
+        client.setPermissionOption("allow_once");
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request("session/new", { mcpServers: [] }, 2) as any;
+        await client.readLine();
+        expect(created.result.modes.currentModeId).toBe("ask");
+
+        const result = await runPrompt(
+          client,
+          `Create the file ${target} containing the word hello.`,
+          TIMEOUT,
+        );
+
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        const permissionIndex = result.messages.findIndex(
+          (message: any) => message.method === "session/request_permission",
+        );
+        const completedIndex = result.messages.findIndex((message: any) =>
+          message.method === "session/update" &&
+          message.params?.update?.sessionUpdate === "tool_call_update" &&
+          message.params.update.toolCallId === "acp_ask_default_write" &&
+          message.params.update.status === "completed"
+        );
+        expect(result.messages[permissionIndex]?.params.toolCall.toolCallId).toBe(
+          "acp_ask_default_write",
+        );
+        expect(completedIndex).toBeGreaterThan(permissionIndex);
+        expect(readFileSync(target, "utf8")).toBe("hello");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
 });
 
 describe("acp: model catalog authentication", () => {
@@ -10300,7 +10402,7 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
         expect(loadResp.result).toBeDefined();
         expect(Array.isArray(loadResp.result.configOptions)).toBe(true);
         expect(loadResp.result.modes).toBeDefined();
-        expect(loadResp.result.modes.currentModeId).toBe("ask");
+        expect(loadResp.result.modes.currentModeId).toBe("code");
       } finally {
         await client?.close();
         gateway.stop();
