@@ -29,6 +29,10 @@ const stopping = new Set(["halting"]);
 // stops right after the turn's end lands.
 const doomed = "doomed";
 const stopsAfterEnd = new Set(["omega"]);
+// An input whose engine stops each time once its turn has started, and one
+// whose end record is still landing when its engine stops.
+const brittle = "brittle";
+const endsLate = new Set(["late"]);
 const harnessStopped = (message) => Object.assign(new Error(message), { code: "FX_HARNESS_STOPPED" });
 // Steps that wait until a test lets them go, by text.
 const holds = new Map();
@@ -45,6 +49,7 @@ function scriptedHarness({ steps = 3 } = {}) {
       const records = loaded.journal.map((record) => JSON.parse(decoder.decode(record.data)));
       let handedOff = false;
       let key = 0;
+      const landing = new Set();
       const append = async (record, marks) => {
         if (handedOff) throw new Error("handed off");
         await store.append({ idempotencyKey: `scripted:${Date.now()}:${key++}`, data: encoder.encode(JSON.stringify(record)), marks });
@@ -68,6 +73,7 @@ function scriptedHarness({ steps = 3 } = {}) {
         }
       }, () => { handedOff = true; });
       const steps_ = async (turnId, input, yieldAt, push, signal) => {
+        if (input === brittle) throw harnessStopped("the engine exited mid-turn");
         let first = true;
         for (let step = turnOf(turnId).length; step < steps; step += 1) {
           if (!first && yieldAt !== undefined && Date.now() >= yieldAt) {
@@ -85,7 +91,15 @@ function scriptedHarness({ steps = 3 } = {}) {
           await sleep(2);
           if (signal.aborted) throw new Error("aborted");
           ran.push(`${turnId}:${step}`);
-          await append({ turnId, step, word, ...(step === steps - 1 ? { end: true } : {}) }, step === steps - 1 ? [{ end: true }] : []);
+          const last = step === steps - 1;
+          if (last && endsLate.delete(input)) {
+            // The end record is still on its way when the engine stops.
+            const write = sleep(150).then(() => append({ turnId, step, word, end: true }, [{ end: true }]));
+            landing.add(write);
+            push({ type: "text_delta", delta: `${word} ` });
+            throw harnessStopped("the engine exited as the turn ended");
+          }
+          await append({ turnId, step, word, ...(last ? { end: true } : {}) }, last ? [{ end: true }] : []);
           push({ type: "text_delta", delta: `${word} ` });
         }
         if (stopsAfterEnd.delete(input)) throw harnessStopped("the engine exited after the turn ended");
@@ -119,7 +133,8 @@ function scriptedHarness({ steps = 3 } = {}) {
         settled: async () => {},
         saveCheckpoint: async () => {},
         exportCheckpoint: async () => encoder.encode(JSON.stringify(records.filter((record) => record.word !== undefined).map((record) => record.word))),
-        close: async () => {},
+        // Closing waits for the records still landing, as fx's engine does.
+        close: async () => { await Promise.allSettled([...landing]); },
       };
     },
   });
@@ -476,6 +491,34 @@ test("a turn whose engine stops after its end landed still ends for its viewers"
   assert.equal(result.stopReason, "unknown");
   assert.equal(text, "omega-0 omega-1 omega-2");
   assert.equal((await session.prompt("after", { messageId: "turn-after" }).result).stopReason, "end_turn");
+  await agent.close();
+});
+
+test("an engine that stops each time it continues a started turn ends it, and the prompts behind it", async () => {
+  const agent = createAgent({ durability: await durabilityFor() });
+  const session = agent.session();
+  const stuck = session.prompt(brittle, { messageId: "turn-brittle" });
+  await stuck.accepted;
+  const behind = session.prompt("zeta2", { messageId: "turn-zeta2" });
+  const ended = await stuck.result;
+  assert.equal(ended.stopReason, "error");
+  assert.match(ended.error?.message ?? "", /stopped each of the 3 times it continued/);
+  const waited = await behind.result;
+  assert.equal(waited.stopReason, "error");
+  assert.match(waited.error?.message ?? "", /open turn cannot continue/);
+  // A prompt sent later fails at once instead of starting the engine again.
+  const later = await session.prompt("eta2", { messageId: "turn-eta2" }).result;
+  assert.equal(later.stopReason, "error");
+  await agent.close();
+});
+
+test("a turn whose end is still landing when its engine stops ends as unknown", async () => {
+  const agent = createAgent({ durability: await durabilityFor() });
+  const session = agent.session();
+  const { text, result } = await textOf(session.prompt("late", { messageId: "turn-late" }));
+  assert.equal(result.stopReason, "unknown");
+  assert.equal(text, "late-0 late-1 late-2");
+  assert.equal((await session.prompt("after late", { messageId: "turn-after-late" }).result).stopReason, "end_turn");
   await agent.close();
 });
 
