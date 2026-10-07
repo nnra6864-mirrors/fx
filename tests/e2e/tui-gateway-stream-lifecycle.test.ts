@@ -3432,6 +3432,170 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
+    "idle pasted prompt taller than the viewport keeps every line in scrollback",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-tall-idle-submit-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const promptLines = [
+        "TALL_PROMPT_HEAD_SENTINEL",
+        ...Array.from(
+          { length: 78 },
+          (_, index) => `tall prompt body ${String(index + 1).padStart(2, "0")}`,
+        ),
+        "TALL_PROMPT_TAIL_SENTINEL",
+      ];
+      const hold: HoldState = { started: false, cancelled: false };
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+
+      const heldGateway = startFakeGateway([() => heldGatewayResponse(hold)]);
+      gateway = heldGateway;
+      session = await TmuxSession.create({
+        cwd: realpathSync(workspace),
+        width: 96,
+        height: 28,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-tall-idle-submit-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          // A recording notice would add transcript rows above the prompt.
+          FX_DEBUG_RECORD: undefined,
+          FX_RECORD: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_GATEWAY_BASE_URL: heldGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: heldGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: heldGateway.chatUrl,
+          FX_MODEL: MODEL,
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.pasteText(promptLines.join("\n"));
+      await session.sendKeys("Enter");
+      await waitForCondition(
+        () => heldGateway.requests.length === 1 && hold.started,
+        "held tall idle prompt stream",
+      );
+      await session.waitForText("Thinking", TIMEOUT);
+      // The preview already shows the tail, so wait for the head too.
+      const scrollback = await waitForScrollback(
+        session,
+        (value) => value.includes(promptLines[0]!) && value.includes(promptLines.at(-1)!),
+        "tall idle prompt head and tail",
+        10_000,
+      );
+      const rows = scrollback.split("\n").map((row) => row.trimEnd());
+      let previous = rows.findIndex((row) => row.includes("Run /help for commands"));
+      expect(previous).toBeGreaterThanOrEqual(0);
+      for (const line of promptLines) {
+        const matches = rows.flatMap((row, index) => (row.endsWith(line) ? [index] : []));
+        expect({ line, matches: matches.length }).toEqual({ line, matches: 1 });
+        expect(matches[0]).toBeGreaterThan(previous);
+        previous = matches[0];
+      }
+
+      await session.sendKeys("C-c");
+      await session.waitForText("What can fx do differently?", TIMEOUT);
+      expect(hold.cancelled).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(session.isAlive()).toBe(true);
+      expect(session.isPaneAlive()).toBe(true);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "steering taller than the viewport keeps earlier rows in scrollback",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-tall-steering-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const firstPrompt = "TALL_STEERING_FIRST_PROMPT";
+      const steeringLines = [
+        "TALL_STEERING_HEAD_SENTINEL",
+        ...Array.from(
+          { length: 78 },
+          (_, index) => `tall steering body ${String(index + 1).padStart(2, "0")}`,
+        ),
+        "TALL_STEERING_TAIL_SENTINEL",
+      ];
+      const hold: HoldState = { started: false, cancelled: false };
+      const continued: HoldState = { started: false, cancelled: false };
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+
+      const heldGateway = startFakeGateway([
+        () => heldGatewayResponse(hold),
+        () => heldGatewayResponse(continued),
+      ]);
+      gateway = heldGateway;
+      session = await TmuxSession.create({
+        cwd: realpathSync(workspace),
+        width: 96,
+        height: 28,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-tall-steering-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_DEBUG_RECORD: undefined,
+          FX_RECORD: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_GATEWAY_BASE_URL: heldGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: heldGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: heldGateway.chatUrl,
+          FX_MODEL: MODEL,
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText(firstPrompt);
+      await waitForCondition(
+        () => heldGateway.requests.length === 1 && hold.started,
+        "held turn before tall steering",
+      );
+      await session.waitForText("Thinking", TIMEOUT);
+      await session.pasteText(steeringLines.join("\n"));
+      await session.sendKeys("Enter");
+      await waitForCondition(
+        () => heldGateway.requests.length === 2 && continued.started,
+        "held continuation after tall steering",
+      );
+      // The preview already shows the tail, so wait for the head too.
+      const scrollback = await waitForScrollback(
+        session,
+        (value) => value.includes(steeringLines[0]!) && value.includes(steeringLines.at(-1)!),
+        "tall steering head and tail",
+        10_000,
+      );
+      const rows = scrollback.split("\n").map((row) => row.trimEnd());
+      let previous = rows.findIndex((row) => row.includes("Run /help for commands"));
+      expect(previous).toBeGreaterThanOrEqual(0);
+      for (const line of [firstPrompt, ...steeringLines]) {
+        const matches = rows.flatMap((row, index) => (row.endsWith(line) ? [index] : []));
+        expect({ line, matches: matches.length }).toEqual({ line, matches: 1 });
+        expect(matches[0]).toBeGreaterThan(previous);
+        previous = matches[0];
+      }
+
+      await session.sendKeys("C-c");
+      await session.waitForText("What can fx do differently?", TIMEOUT);
+      expect(continued.cancelled).toBe(true);
+      expect(heldGateway.requests).toHaveLength(2);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(session.isAlive()).toBe(true);
+      expect(session.isPaneAlive()).toBe(true);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "visible assistant prefix precedes immediate steering in scrollback",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-prompt-boundary-")));
