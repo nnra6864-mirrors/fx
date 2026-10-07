@@ -2331,11 +2331,7 @@ pub fn writeToolCalls(writer: *std.Io.Writer, calls: []const session.ToolCall) !
 }
 
 /// Parses the array `writeToolCalls` writes. The caller owns the result.
-pub fn parseToolCallArray(alloc: Allocator, value: std.json.Value) ![]session.ToolCall {
-    return parseToolCalls(alloc, value);
-}
-
-fn parseToolCalls(alloc: Allocator, value: std.json.Value) ![]session.ToolCall {
+pub fn parseToolCalls(alloc: Allocator, value: std.json.Value) ![]session.ToolCall {
     if (value != .array) return error.InvalidSessionFormat;
     if (value.array.items.len == 0) return &.{};
     const calls = try alloc.alloc(session.ToolCall, value.array.items.len);

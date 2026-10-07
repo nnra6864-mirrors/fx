@@ -100,6 +100,8 @@ const loopbackFetch = (input, init) => {
 
 // Tools. A gate holds a call until the test opens it.
 const runs = [];
+// The `context` each lookup call received.
+const contexts = [];
 const gates = new Map();
 const gate = (name) => {
   let open;
@@ -114,8 +116,9 @@ const lookup = {
   description: "Looks up a key",
   idempotent: true,
   inputSchema: { type: "object", properties: { key: { type: "string" } } },
-  execute: async ({ key }, { executionId }) => {
+  execute: async ({ key }, { executionId, context }) => {
     runs.push(["lookup", executionId]);
+    contexts.push(context ?? null);
     const held = gates.get("lookup");
     if (held) {
       held.markStarted();
@@ -569,6 +572,31 @@ test("an option the backend rejects fails the first turn once", async () => {
   assert.equal(result.error?.code, "LIBFX_MODEL_UNSUPPORTED_EFFORT");
   assert.equal(events.length, 1);
   assert.equal(requests.length, sent, "no model request was made");
+  await agent.close();
+});
+
+test("a prompt the engine refuses ends its own turn once, and the session goes on", async () => {
+  const agent = createFxAgent(agentOptions(await durabilityFor()));
+  const session = agent.session();
+  const empty = await session.prompt("").result;
+  assert.equal(empty.stopReason, "error");
+  const malformed = await session.prompt([{ type: "text" }]).result;
+  assert.equal(malformed.stopReason, "error");
+  const { text, result } = await collect(session.prompt("hello again"));
+  assert.equal(result.stopReason, "end_turn");
+  assert.equal(text, "echo: hello again");
+  await agent.close();
+});
+
+test("each agent.session() call carries its own context to the tools", async () => {
+  const agent = createFxAgent(agentOptions(await durabilityFor()));
+  const first = agent.session();
+  await first.prompt("hello").result;
+  const before = contexts.length;
+  for (const user of ["a", "b"]) {
+    assert.equal((await agent.session(first.id, { context: { user } }).prompt("use lookup").result).stopReason, "end_turn");
+  }
+  assert.deepEqual(contexts.slice(before), [{ user: "a" }, { user: "b" }]);
   await agent.close();
 });
 

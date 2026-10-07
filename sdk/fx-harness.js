@@ -39,18 +39,39 @@ export function fxHarness({ createEngine, defaultApiKey = async () => undefined 
   };
 }
 
+// The engine reports a fenced write as the cause of the append that failed;
+// the core knows a fence by its own `FX_FENCED` code.
+const unwrapFence = (error) => (error?.cause?.code === "FX_FENCED" ? error.cause : error);
+
+function fxTurn(turn) {
+  const result = turn.result.catch((error) => { throw unwrapFence(error); });
+  void result.catch(() => {});
+  return {
+    result,
+    steer: (text, id) => turn.steer(text, id),
+    cancel: (options) => turn.cancel(options),
+    async *[Symbol.asyncIterator]() {
+      try {
+        for await (const event of turn) yield event;
+      } catch (error) {
+        throw unwrapFence(error);
+      }
+    },
+  };
+}
+
 function fxSession(engine, idempotent) {
   const internals = engine[engineInternals];
   return {
-    prompt: (input, options) => engine.prompt(input, options),
+    prompt: (input, options) => fxTurn(engine.prompt(input, options)),
     // A call left running reruns only when running it twice is safe. Any
     // other call is never run again: the model is told it may have partly
     // run, and the turn goes on.
-    resume: (options) => engine.resume({ ...options, onAmbiguous: (call) => (idempotent.has(call.name) ? "rerun" : undefined) }),
+    resume: (options) => fxTurn(engine.resume({ ...options, onAmbiguous: (call) => (idempotent.has(call.name) ? "rerun" : undefined) })),
     get openTurn() {
       return internals.openTurn;
     },
-    settled: () => internals.settled(),
+    settled: () => internals.settled().catch((error) => { throw unwrapFence(error); }),
     saveCheckpoint: () => internals.checkpoint(),
     exportCheckpoint: () => engine.checkpoint(),
     close: () => engine.close(),

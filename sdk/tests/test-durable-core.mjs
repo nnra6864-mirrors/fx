@@ -19,6 +19,8 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Every step any harness session ran, as `turnId:step`.
 const ran = [];
+// Every turn a harness session was asked to start, by id.
+const prompted = [];
 // Steps that wait until a test lets them go, by text.
 const holds = new Map();
 
@@ -48,6 +50,15 @@ function scriptedHarness({ steps = 3 } = {}) {
         return null;
       };
       const run = (turnId, input, yieldAt) => scriptedTurn(async (push, signal) => {
+        try {
+          return await steps_(turnId, input, yieldAt, push, signal);
+        } catch (error) {
+          // A cancel ends the turn; a handoff stores nothing more.
+          if (signal.aborted && !handedOff) await append({ turnId, end: true }, [{ end: true }]).catch(() => {});
+          throw error;
+        }
+      }, () => { handedOff = true; });
+      const steps_ = async (turnId, input, yieldAt, push, signal) => {
         let first = true;
         for (let step = turnOf(turnId).length; step < steps; step += 1) {
           if (!first && yieldAt !== undefined && Date.now() >= yieldAt) {
@@ -69,9 +80,14 @@ function scriptedHarness({ steps = 3 } = {}) {
           push({ type: "text_delta", delta: `${word} ` });
         }
         return { stopReason: "end_turn" };
-      }, () => { handedOff = true; });
+      };
       return {
         prompt(input, { turnId, yieldAt } = {}) {
+          prompted.push(turnId);
+          // A harness can refuse an input before it writes anything, as fx's
+          // kernel refuses an empty prompt, or throw on one it cannot take.
+          if (input === "throw") throw new TypeError("the harness cannot take this input");
+          if (input === "refuse") return scriptedTurn(async () => ({ stopReason: "error", error: { name: "Error", message: "refused" } }), () => {});
           const started = append({ turnId, start: true, input }, [{ start: turnId }]);
           return chain(started, () => run(turnId, input, yieldAt));
         },
@@ -249,6 +265,156 @@ test("a retried message runs its turn once", async () => {
   const again = await session.prompt("epsilon", { messageId: "turn-e" }).result;
   assert.equal(again.stopReason, "end_turn");
   assert.equal(ran.length - before, 3, "the retry ran nothing");
+  await agent.close();
+});
+
+// A step a test holds until it lets it go.
+function holdStep(word) {
+  let started;
+  let release;
+  const holding = new Promise((resolve) => { started = resolve; });
+  const released = new Promise((resolve) => { release = resolve; });
+  holds.set(word, { started: () => started(), released });
+  return { holding, release: () => { holds.delete(word); release(); } };
+}
+
+// How long a test waits for a cancel to reach the log.
+const landMs = durabilityKind === "memory" ? 50 : 400;
+
+test("a turn that ends before writing a record runs once, and the session goes on", async () => {
+  const agent = createAgent({ durability: await durabilityFor() });
+  const session = agent.session();
+  const before = prompted.length;
+  const refused = await session.prompt("refuse", { messageId: "turn-r" }).result;
+  assert.equal(refused.stopReason, "error");
+  const { text, result } = await textOf(session.prompt("zeta", { messageId: "turn-z" }));
+  assert.equal(result.stopReason, "end_turn");
+  assert.equal(text, "zeta-0 zeta-1 zeta-2");
+  assert.deepEqual(prompted.slice(before), ["turn-r", "turn-z"], "the refused turn ran once");
+  const again = await session.prompt("refuse", { messageId: "turn-r" }).result;
+  assert.equal(again.stopReason, "error", "a retry reports the turn's own outcome");
+  assert.equal(again.repeated, true);
+  assert.deepEqual(prompted.slice(before), ["turn-r", "turn-z"], "the retry ran nothing");
+  await agent.close();
+});
+
+test("a prompt the harness throws on fails its own turn only", async () => {
+  const agent = createAgent({ durability: await durabilityFor() });
+  const session = agent.session();
+  const thrown = await session.prompt("throw", { messageId: "turn-x" }).result;
+  assert.equal(thrown.stopReason, "error");
+  assert.match(thrown.error?.message ?? "", /cannot take this input/);
+  const { result } = await textOf(session.prompt("eta", { messageId: "turn-eta0" }));
+  assert.equal(result.stopReason, "end_turn");
+  await agent.close();
+});
+
+test("a prompt's signal cancels its own turn, whether it runs or waits, and never another", async () => {
+  const agent = createAgent({ durability: await durabilityFor() });
+  const session = agent.session();
+  const before = ran.length;
+  // An abort while the prompt waits behind a running turn.
+  const held = holdStep("theta-1");
+  const running = session.prompt("theta", { messageId: "turn-theta" });
+  await held.holding;
+  const waiting = new AbortController();
+  const queued = session.prompt("iota", { messageId: "turn-iota", signal: waiting.signal });
+  await queued.accepted;
+  waiting.abort();
+  await sleep(landMs);
+  held.release();
+  assert.equal((await running.result).stopReason, "end_turn", "the turn ahead ran to its end");
+  assert.equal((await queued.result).stopReason, "cancelled");
+  const retried = await session.prompt("iota", { messageId: "turn-iota" }).result;
+  assert.equal(retried.stopReason, "cancelled", "a retry reports the cancel");
+  // An abort while the prompt's own turn runs.
+  const own = holdStep("kappa-1");
+  const stopping = new AbortController();
+  const kappa = session.prompt("kappa", { messageId: "turn-kappa", signal: stopping.signal });
+  await own.holding;
+  stopping.abort();
+  assert.equal((await kappa.result).stopReason, "cancelled");
+  own.release();
+  // An abort after its turn ended stops nothing later.
+  const ended = new AbortController();
+  assert.equal((await session.prompt("lambda", { messageId: "turn-lambda", signal: ended.signal }).result).stopReason, "end_turn");
+  const later = holdStep("mu-1");
+  const mu = session.prompt("mu", { messageId: "turn-mu" });
+  await later.holding;
+  ended.abort();
+  await sleep(landMs);
+  later.release();
+  assert.equal((await mu.result).stopReason, "end_turn");
+  // A signal that had already aborted runs nothing.
+  assert.equal((await session.prompt("nu", { messageId: "turn-nu", signal: AbortSignal.abort() }).result).stopReason, "cancelled");
+  assert.deepEqual(ran.slice(before).filter((step) => /iota|nu/.test(step)), [], "the cancelled prompts ran no step");
+  await agent.close();
+});
+
+if (durabilityKind === "memory") {
+  test("a write that fails for a reason other than a takeover is retried", async () => {
+    const durability = memory({ maxDurationMs: 1, reserveMs: 0 });
+    // The backend the agent shares, with the first release it writes refused.
+    const backend = durability.create();
+    const open = backend.session.bind(backend);
+    let refusals = 0;
+    backend.session = async (id) => {
+      const log = await open(id);
+      return {
+        ...log,
+        append: async (entry) => {
+          if (entry.k === "release" && refusals === 0) {
+            refusals += 1;
+            throw new Error("the store is briefly unavailable");
+          }
+          return log.append(entry);
+        },
+      };
+    };
+    const events = [];
+    const agent = createAgent({ durability, onEvent: (event) => events.push(event.type) });
+    const { text, result } = await textOf(agent.session().prompt("xi", { messageId: "turn-xi" }));
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(text, "xi-0 xi-1 xi-2");
+    assert.equal(refusals, 1);
+    assert.ok(!events.includes("session.fenced"), "a failed write is not a takeover");
+    assert.ok(events.includes("session.error"), JSON.stringify(events));
+    await agent.close();
+  });
+}
+
+if (durabilityKind === "local") {
+  test("a session stream that cannot be read fails its view instead of waiting", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-core-"));
+    dirs.push(dir);
+    const durability = local({ dir });
+    const worldOf = durability.world;
+    const bound = (target, overrides) => new Proxy(target, {
+      get(object, key) {
+        if (key in overrides) return overrides[key];
+        const value = object[key];
+        return typeof value === "function" ? value.bind(object) : value;
+      },
+    });
+    durability.world = async () => {
+      const world = await worldOf();
+      const denied = async () => { throw Object.assign(new Error("forbidden"), { status: 403 }); };
+      return bound(world, { streams: bound(world.streams, { get: denied }) });
+    };
+    const agent = createAgent({ durability });
+    const started = performance.now();
+    await assert.rejects(agent.session().prompt("omicron", { messageId: "turn-o" }).result, /forbidden/);
+    assert.ok(performance.now() - started < 10_000, "the view failed promptly");
+    await agent.close();
+  });
+}
+
+test("a worker lives only while a delivery runs it", async () => {
+  const agent = createAgent({ durability: await durabilityFor() });
+  const internals = agent[Symbol.for("libfx.durableInternals")];
+  for (const name of ["pi", "rho", "sigma"]) await agent.session().prompt(name).result;
+  for (let waited = 0; internals.liveWorkers() > 0 && waited < 2000; waited += 20) await sleep(20);
+  assert.equal(internals.liveWorkers(), 0);
   await agent.close();
 });
 

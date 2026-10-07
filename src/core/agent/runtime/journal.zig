@@ -1,7 +1,8 @@
 //! The libfx journal: one session as the ordered events a host stores.
 //!
-//! A host passes `journal` to `createFxAgent`; fx appends an event for each
-//! state change and rebuilds the session from the stored events. This file
+//! A host passes a `persistence` store to `createFxEngine`; fx appends an
+//! event for each state change and rebuilds the session from the stored
+//! events. This file
 //! only encodes and folds events. Sending them is the ACP layer's job.
 //!
 //! Each event is one JSON object:
@@ -533,7 +534,7 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
         else => return error.InvalidJournal,
     };
     errdefer if (open_turn) |*checkpoint| checkpoint.deinit(alloc);
-    const announced = session_codec.parseToolCallArray(alloc, .{ .array = .{
+    const announced = session_codec.parseToolCalls(alloc, .{ .array = .{
         .items = running.items,
         .capacity = running.items.len,
         .allocator = alloc,

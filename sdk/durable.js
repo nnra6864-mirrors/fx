@@ -183,6 +183,12 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
         failed.set(entry.messageId, entry.error ?? { name: "Error", message: "the turn failed" });
         consume(entry.messageId);
         break;
+      case "ended":
+        // A turn that ended before writing a record of its own, such as one
+        // the harness refused or its cancel stopped first. Its outcome is on
+        // the UI stream.
+        consume(entry.messageId);
+        break;
       case "context":
         context = entry.value ?? null;
         break;
@@ -190,19 +196,28 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
         break;
     }
   }
-  // What the inputs ask for, given the turns the records started.
+  // What the inputs ask for, given the turns the records started. A
+  // prompt's own cancel names its turn, in whichever order the two land.
+  const cancelTargets = new Set();
+  for (const input of inputs) {
+    if (input.type === "cancel" && typeof input.target === "string") cancelTargets.add(input.target);
+  }
   const pending = [];
   const steers = [];
   let cancelOpen = false;
   for (const input of inputs) {
     if (consumed.has(input.messageId)) continue;
     const forOpenTurn = openTurn !== null && input.cursor > openTurn.at;
-    if (input.type === "prompt") pending.push(input);
+    if (input.type === "prompt") pending.push(cancelTargets.has(input.messageId) ? { ...input, cancelled: true } : input);
     else if (input.type === "steer") {
       // A steer its turn never took becomes the next turn.
       if (forOpenTurn) steers.push(input);
       else pending.push({ ...input, type: "prompt" });
-    } else if (input.type === "cancel" && forOpenTurn) cancelOpen = true;
+    } else if (input.type === "cancel") {
+      if (typeof input.target === "string") {
+        if (openTurn?.id === input.target) cancelOpen = true;
+      } else if (forOpenTurn) cancelOpen = true;
+    }
   }
   // An open turn whose harness could not start waits for a cancel.
   const openFailed = openTurn !== null && failed.has(openTurn.id);
@@ -404,6 +419,8 @@ function logEntryOf(event) {
 }
 
 const missingRun = (error) => error?.status === 404 || /not found|does not exist|ENOENT/i.test(String(error?.message ?? ""));
+// Tries for a failed UI stream read that is not a missing stream.
+const streamReadRetries = 5;
 
 function createWorldBackend(world, { name, reserveMs, pollMs, alive, holderInfo, livenessKnown = false, queueDurable = false, maxDurationMs }) {
   const spec = world.specVersion === undefined ? {} : { specVersion: world.specVersion };
@@ -577,12 +594,18 @@ function createWorldBackend(world, { name, reserveMs, pollMs, alive, holderInfo,
             let cancelled = false;
             return new ReadableStream({
               async pull(controller) {
-                for (let delay = 50; !reader; delay = Math.min(delay * 2, 1000)) {
+                for (let delay = 50, failures = 0; !reader; delay = Math.min(delay * 2, 1000)) {
                   if (cancelled) return;
                   try {
                     reader = (await world.streams.get(runId, uiStreamOf(runId), from)).getReader();
                   } catch (error) {
-                    // A stream nobody wrote yet appears with the turn's first event.
+                    // A stream nobody wrote yet appears with the turn's first
+                    // event; any other failure gets a few tries, then ends
+                    // the read, so its viewer hears of it.
+                    if (!missingRun(error) && ++failures > streamReadRetries) {
+                      controller.error(error);
+                      return;
+                    }
                     await new Promise((resolve) => setTimeout(resolve, delay));
                   }
                 }
@@ -633,7 +656,6 @@ function createWorldBackend(world, { name, reserveMs, pollMs, alive, holderInfo,
 // ---------------------------------------------------------------------------
 // The worker: runs a session's turns while it holds the lease.
 
-// UI events go out in batches, one stream chunk per event.
 // Lines a worker writes to the session's UI stream, sent in small batches.
 // Each carries the worker's lease epoch, so a reader can tell a replaced
 // worker's late lines from its successor's.
@@ -660,7 +682,8 @@ function uiWriter(log, onError, epoch) {
 }
 
 const errorSummary = (error) => ({ name: error?.name ?? "Error", message: String(error?.message ?? error), ...(error?.code ? { code: error.code } : {}) });
-const isFenced = (error) => error?.code === "FX_FENCED" || error?.name === "FxFencedError" || error?.cause?.code === "FX_FENCED";
+// The harness contract: a fenced write rejects with this code.
+const isFenced = (error) => error?.code === "FX_FENCED";
 
 // Writes what a queue message adds to its session: a restored agent's first
 // checkpoint, a changed context, and the message's input. It writes nothing
@@ -680,6 +703,7 @@ async function recordMessage(log, state, message) {
       type: message.type,
       messageId: message.messageId,
       ...(message.input === undefined ? {} : { input: message.input }),
+      ...(typeof message.target === "string" ? { target: message.target } : {}),
     });
   }
 }
@@ -702,6 +726,8 @@ class SessionWorker {
     this.sessionId = sessionId;
     // Set while this process runs the session; each run holds its own lease.
     this.running = false;
+    // Deliveries in progress for the session in this process.
+    this.deliveries = 0;
     this.holder = null;
   }
 
@@ -711,14 +737,9 @@ class SessionWorker {
 
   // One queue delivery. Its input reaches the log at once, even while this
   // process runs the session, so a steer or cancel reaches the running turn.
-  consume(message) {
-    return this.consumeOne(message);
-  }
-
-  // Adds the message's input to the log, then runs the session when no live
-  // worker holds it. Returns `{ timeoutSeconds }` to have the same message
-  // delivered again later.
-  async consumeOne(message) {
+  // Then it runs the session when no live worker holds it. Returns
+  // `{ timeoutSeconds }` to have the same message delivered again later.
+  async consume(message) {
     const log = await this.backend.session(this.sessionId);
     await this.backend.refreshDeadline?.();
     // When this delivery's function stops, if it does.
@@ -767,6 +788,9 @@ class SessionWorker {
         this.running = false;
       }
       if (outcome === "yielded") return { timeoutSeconds: 0 };
+      // A write that failed for any other reason: the same message runs the
+      // session again shortly.
+      if (outcome === "failed") return { timeoutSeconds: 1 };
       if (outcome === "fenced") {
         // Another worker took the session over; this one stops.
         this.agent.emit("session.fenced", { sessionId: this.sessionId, epoch: lease.epoch });
@@ -778,7 +802,7 @@ class SessionWorker {
 
   // A resume with nothing to continue still answers its viewer.
   async answerIdle(log, message) {
-    const ui = uiWriter(log, () => {});
+    const ui = uiWriter(log, (error) => this.agent.emit("ui.error", { sessionId: this.sessionId, error: error?.name ?? "Error" }));
     ui.push({ type: "idle", requestId: message.messageId });
     await ui.settle();
   }
@@ -812,6 +836,13 @@ class SessionWorker {
       if (failed || released) return;
       released = true;
       await chained({ k: "release", holder: this.holder }).catch(() => {});
+    };
+    // Why the chain broke: another worker's write fenced this one out, or a
+    // write failed for another reason, which the same message retries.
+    const broken = () => {
+      if (isFenced(failed)) return "fenced";
+      agent.emit("session.error", { sessionId: this.sessionId, error: errorSummary(failed) });
+      return "failed";
     };
     let state = this.fold(await log.read());
     if (state.lastLease?.holder !== this.holder) return "fenced";
@@ -882,17 +913,18 @@ class SessionWorker {
       }
       const yieldAt = deadline === null ? undefined : Math.max(1, deadline - this.backend.reserveMs);
       for (;;) {
-        if (failed) return "fenced";
+        if (failed) return broken();
         if (this.stopping) {
           await harness.close();
           harness = null;
           await release();
           // A worker replaced without knowing it learns so at the release.
-          return failed ? "fenced" : "yielded";
+          return failed ? broken() : "yielded";
         }
         const open = harness.openTurn;
         let turn = null;
         let messageId = null;
+        let fresh = false;
         if (open?.id) {
           // A call left running reruns only when running it twice is safe.
           // Any other call is never run again: the model is told it may have
@@ -902,14 +934,42 @@ class SessionWorker {
           // It lands before the turn goes on, so any line the replaced
           // worker writes after it ranks below it and stays hidden.
           await ui.settle();
-          turn = harness.resume({ yieldAt });
+          try {
+            turn = harness.resume({ yieldAt });
+          } catch (error) {
+            // The open turn waits for a cancel, as one whose harness could
+            // not start does.
+            const summary = errorSummary(error);
+            await log.append({ k: "failed", messageId, error: summary });
+            ui.push({ type: "turn_end", messageId, stopReason: "error", error: summary });
+            agent.emit("session.error", { sessionId: this.sessionId, error: summary });
+            break;
+          }
         }
         if (!turn) {
           const next = state.pending[0];
           if (!next) break;
           messageId = next.messageId;
+          if (next.cancelled) {
+            // Its own cancel came before it started, so it never runs.
+            await log.append({ k: "ended", messageId });
+            ui.push({ type: "turn_end", messageId, stopReason: "cancelled", usage: {} });
+            await ui.settle();
+            state = this.fold(await log.read());
+            continue;
+          }
           ui.push({ type: "turn_start", messageId, sessionId: this.sessionId, ...(typeof next.input === "string" ? { input: next.input } : {}) });
-          turn = harness.prompt(next.input ?? "", { turnId: messageId, yieldAt });
+          try {
+            turn = harness.prompt(next.input ?? "", { turnId: messageId, yieldAt });
+          } catch (error) {
+            // An input the harness refuses ends its turn at once.
+            await log.append({ k: "ended", messageId });
+            ui.push({ type: "turn_end", messageId, stopReason: "error", usage: {}, error: errorSummary(error) });
+            await ui.settle();
+            state = this.fold(await log.read());
+            continue;
+          }
+          fresh = true;
         }
         turnNow = turn;
         if (this.stopping) turn.cancel({ reason: "handoff" });
@@ -924,14 +984,26 @@ class SessionWorker {
           await harness.close();
           harness = null;
           await release();
-          return failed ? "fenced" : "yielded";
+          return failed ? broken() : "yielded";
         }
         state = this.fold(await log.read());
+        if (!fresh && !failed && harness.openTurn?.id === messageId) {
+          // A harness that leaves a turn open after it ended would run it
+          // again forever; the worker stops instead.
+          agent.emit("session.error", { sessionId: this.sessionId, error: { name: "Error", message: `turn ${messageId} ended but stayed open` } });
+          break;
+        }
+        if (fresh && !failed && !state.consumed.has(messageId)) {
+          // A turn that ended before writing a record, such as a prompt the
+          // harness rejected or one a cancel stopped first, is done too.
+          await log.append({ k: "ended", messageId });
+          state = this.fold(await log.read());
+        }
         if (state.lastLease?.holder !== this.holder && !failed) return "fenced";
       }
       await harness.close();
       harness = null;
-      if (failed) return "fenced";
+      if (failed) return broken();
       await release();
       return "done";
     } finally {
@@ -941,8 +1013,14 @@ class SessionWorker {
       if (renew) clearInterval(renew);
       if (harness) await harness.close().catch(() => {});
       await ui.settle().catch(() => {});
-      // A worker that stops on an error still lets the next one in.
+      // A worker that stops on an error still lets the next one in. One
+      // whose write failed releases outside its broken chain, so the retry
+      // need not wait out the lease; a fenced one holds nothing to release.
       if (!failed && !released) await release().catch(() => {});
+      else if (failed && !isFenced(failed) && !released) {
+        released = true;
+        await log.append({ k: "release", a: head, holder: this.holder }).catch(() => {});
+      }
     }
   }
 
@@ -967,7 +1045,7 @@ class SessionWorker {
             if (entry?.k !== "input" || applied.has(entry.key)) continue;
             applied.add(entry.key);
             if (entry.type === "steer" && typeof entry.input === "string") void turn.steer(entry.input, entry.messageId).catch(() => {});
-            else if (entry.type === "cancel") turn.cancel();
+            else if (entry.type === "cancel" && (entry.target === undefined || entry.target === messageId)) turn.cancel();
           }
         } while (again && !stopped);
       } catch {} finally {
@@ -1059,10 +1137,46 @@ async function uiRankerAt(log, count) {
   return shows;
 }
 
+// The end a turn's worker wrote, among the first `count` lines of the
+// stream, as a reader shows them; null when none did.
+async function turnEndIn(log, messageId, count) {
+  if (count === 0) return null;
+  const shows = uiRanker();
+  const reader = log.ui.read(0).getReader();
+  let buffered = "";
+  let seen = 0;
+  let found = null;
+  try {
+    while (seen < count) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffered += decoder.decode(value, { stream: true });
+      for (let index = buffered.indexOf("\n"); index >= 0 && seen < count; index = buffered.indexOf("\n")) {
+        const line = buffered.slice(0, index);
+        buffered = buffered.slice(index + 1);
+        seen += 1;
+        let event;
+        try { event = JSON.parse(line); } catch { continue; }
+        if (shows(event) && event.type === "turn_end" && event.messageId === messageId) found = event;
+      }
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+  if (!found) return null;
+  const { type: _type, ...rest } = found;
+  return rest;
+}
+
+// How long a retried turn waits for an end the log already holds.
+const retryEndWaitMs = 30_000;
+
 // One turn as its viewer sees it: the session stream from `from` on, its
 // events only, until its end. `start` queues the turn and returns the
 // stream; a resume learns its turn from the first one the stream shows.
 function turnView({ messageId, resumeRequest = null, start }) {
+  // A retried turn reports the outcome of the turn its id already ran.
+  let repeated = false;
   const events = [];
   const waiters = [];
   let done = false;
@@ -1078,12 +1192,13 @@ function turnView({ messageId, resumeRequest = null, start }) {
     if (error) {
       failure = error;
       settle.reject(error);
-    } else settle.resolve(value);
+    } else settle.resolve(repeated ? { ...value, repeated: true } : value);
     wake();
   };
   void (async () => {
     try {
-      const { log, from, settled, attaching } = await start();
+      const { log, from, settled, attaching, endWithinMs } = await start();
+      repeated = settled?.repeated === true || endWithinMs !== undefined;
       if (settled) {
         // A turn that already ended still tells a viewer how, so a route
         // returning `readable` sends its outcome.
@@ -1095,6 +1210,15 @@ function turnView({ messageId, resumeRequest = null, start }) {
       // a new turn's takeovers all come after its own start.
       const shows = attaching ? await uiRankerAt(log, from) : uiRanker();
       const reader = log.ui.read(from).getReader();
+      // A turn whose end the log holds but no line shows yet: a worker that
+      // stopped between the two never writes it, so the outcome is unknown.
+      let gaveUp = null;
+      if (endWithinMs !== undefined) {
+        gaveUp = setTimeout(() => {
+          void reader.cancel().catch(() => {});
+          finish({ messageId, stopReason: "unknown", usage: {} });
+        }, endWithinMs);
+      }
       let buffered = "";
       let cursor = from;
       for (;;) {
@@ -1120,12 +1244,14 @@ function turnView({ messageId, resumeRequest = null, start }) {
           events.push({ ...event, cursor });
           wake();
           if (event.type === "turn_end") {
+            if (gaveUp) clearTimeout(gaveUp);
             await reader.cancel().catch(() => {});
             const { type: _type, messageId: _id, ...rest } = event;
             return finish({ messageId: id, ...rest });
           }
         }
       }
+      if (gaveUp) clearTimeout(gaveUp);
       finish(null, new Error("the session stream ended before the turn did"));
     } catch (error) {
       finish(null, error);
@@ -1243,9 +1369,18 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
             worker = new SessionWorker(agent, created, message.sessionId);
             workers.set(message.sessionId, worker);
           }
+          worker.deliveries += 1;
           const work = worker.consume(message);
           active.add(work);
-          void work.catch(() => {}).finally(() => active.delete(work));
+          void work.catch((error) => {
+            // Its queue delivers the message again; the host hears why.
+            emit("session.error", { sessionId: message.sessionId, error: errorSummary(error) });
+          }).finally(() => {
+            active.delete(work);
+            worker.deliveries -= 1;
+            // A worker lives while a delivery runs it.
+            if (worker.deliveries === 0 && !worker.running && workers.get(message.sessionId) === worker) workers.delete(message.sessionId);
+          });
           return work;
         });
         return created;
@@ -1283,7 +1418,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
         await created.queue.send(full, { idempotencyKey: `${sessionId}:${message.type}:${message.messageId}` });
         seeded = true;
       };
-      const startTurn = (type, messageId, input, retried = false) => {
+      const startTurn = (type, messageId, input, retried = false, aborted = false) => {
         let accept;
         const accepted = new Promise((resolve, reject) => { accept = { resolve, reject }; });
         void accepted.catch(() => {});
@@ -1293,22 +1428,33 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
           start: async () => {
             try {
               const { created, id: sessionId } = await resolved;
+              if (aborted) {
+                // A prompt whose signal had aborted is never stored.
+                accept.resolve({ messageId, sessionId });
+                return { settled: { messageId, stopReason: "cancelled", usage: {} } };
+              }
               const log = await created.session(sessionId);
               let attaching = type === "resume";
+              let from = null;
               if (retried) {
                 // A turn this id already ran answers from the log, without
-                // queueing it again.
+                // queueing it again. The viewer's start is read first, so a
+                // turn that ends after it has its end in view.
+                from = await log.ui.length();
                 const state = foldSessionLog(await log.read());
                 if (state.openTurn?.id === messageId) attaching = true;
-                if (state.consumed.has(messageId) && state.openTurn?.id !== messageId) {
+                else if (state.consumed.has(messageId)) {
                   accept.resolve({ messageId, sessionId });
+                  const ended = await turnEndIn(log, messageId, from);
+                  if (ended) return { settled: { ...ended, repeated: true } };
                   const error = state.failed.get(messageId);
-                  return { settled: error ? { messageId, stopReason: "error", error, repeated: true } : { messageId, stopReason: "end_turn", usage: {}, repeated: true } };
+                  if (error) return { settled: { messageId, stopReason: "error", error, repeated: true } };
+                  return { log, from, attaching: true, endWithinMs: retryEndWaitMs };
                 }
               }
               // The viewer starts where the stream is now, before the
               // message can produce anything.
-              const from = await log.ui.length();
+              from ??= await log.ui.length();
               await send({ type, messageId, ...(input === undefined ? {} : { input }) });
               accept.resolve({ messageId, sessionId });
               return { log, from, attaching };
@@ -1337,13 +1483,15 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
           if (Array.isArray(input) && input.some((block) => block?.type === "image" && block.data !== undefined && typeof block.data !== "string")) {
             throw new TypeError("a durable prompt carries image data as a base64 string");
           }
-          const turn = startTurn("prompt", messageId, input, promptOptions.messageId !== undefined);
           const signal = promptOptions.signal;
-          if (signal !== undefined) {
-            if (typeof signal?.addEventListener !== "function") throw new TypeError("prompt signal must be an AbortSignal");
-            const stop = () => { void session.cancel().catch(() => {}); };
-            if (signal.aborted) stop();
-            else signal.addEventListener("abort", stop, { once: true });
+          if (signal !== undefined && typeof signal?.addEventListener !== "function") throw new TypeError("prompt signal must be an AbortSignal");
+          const turn = startTurn("prompt", messageId, input, promptOptions.messageId !== undefined, signal?.aborted === true);
+          if (signal !== undefined && !signal.aborted) {
+            // The prompt's own cancel: it stops this turn whether it runs or
+            // still waits, and never a later one.
+            const stop = () => { void send({ type: "cancel", messageId: newId("cnl"), target: messageId }).catch(() => {}); };
+            signal.addEventListener("abort", stop, { once: true });
+            void turn.result.finally(() => signal.removeEventListener("abort", stop)).catch(() => {});
           }
           return turn;
         },
@@ -1425,7 +1573,6 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
       return session;
     };
 
-    const sessions = new Map();
     let defaultSession = null;
     const durableAgent = {
       // For tests and drivers: stops a session's running worker as its
@@ -1433,17 +1580,14 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
       [durableInternals]: {
         stopAtDeadline: (sessionId) => workers.get(sessionId)?.stopNow?.(),
         settled: async (sessionId) => { await workers.get(sessionId)?.settled?.(); },
+        liveWorkers: () => workers.size,
       },
       /** Opens session `id`, or a new one; no I/O until it is used. */
       session(id, sessionOptions) {
         if (closed) throw new Error(`${label} is closed`);
-        if (id === undefined || id === null) return openSession(undefined, sessionOptions);
-        let session = sessions.get(id);
-        if (!session) {
-          session = openSession(id, sessionOptions);
-          sessions.set(id, session);
-        }
-        return session;
+        // A session object holds nothing a later call needs, so each call
+        // gets its own, with its own context.
+        return openSession(id ?? undefined, sessionOptions);
       },
       /** The agent's own session, for code that holds one conversation. */
       get sessionId() {

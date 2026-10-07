@@ -165,6 +165,11 @@ export function normalizeAgentOptions(value) {
   return options;
 }
 
+// Keys for libfx's own session worker; symbols keep them off the engine's
+// public surface.
+export const engineInternals = Symbol.for("libfx.engineInternals");
+export const journalMarksWanted = Symbol.for("libfx.journalMarks");
+
 /**
  * Another writer took over the session after this agent loaded it. A
  * persistence store rejects an append whose `expected` cursor is not its head
@@ -172,11 +177,6 @@ export function normalizeAgentOptions(value) {
  * effect or write. Check `code === "FX_FENCED"` when the error may come from
  * another copy of libfx.
  */
-// Keys for libfx's own session worker; symbols keep them off the engine's
-// public surface.
-export const engineInternals = Symbol.for("libfx.engineInternals");
-export const journalMarksWanted = Symbol.for("libfx.journalMarks");
-
 export class FxFencedError extends Error {
   constructor(message) {
     super(message);
@@ -1975,8 +1975,6 @@ function normalizeSteeringInput(input) {
   return text;
 }
 
-// `tools` is an array of descriptors, or an object of descriptors keyed by
-// name.
 // A tool set's shape, so a checkpoint can tell when the tools it continues
 // with changed since it was saved.
 function toolSchemaHash(descriptors) {
@@ -1986,6 +1984,8 @@ function toolSchemaHash(descriptors) {
   return hash.toString(16).padStart(8, "0");
 }
 
+// `tools` is an array of descriptors, or an object of descriptors keyed by
+// name.
 function normalizeHostTools(value) {
   if (value === undefined) return { descriptors: [], executors: new Map() };
   let entries;
@@ -2711,8 +2711,6 @@ export async function createFxEngine(options = {}) {
     get sessionId() {
       return sessionId;
     },
-    // The turn the journal left open, if any, and the calls it left running,
-    // as `{ executionId, name, input }`.
     // What libfx's session worker needs beyond the public surface.
     [engineInternals]: {
       // Resolves once every record the session started has landed: a

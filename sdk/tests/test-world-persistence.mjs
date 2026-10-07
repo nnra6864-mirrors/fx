@@ -6,8 +6,8 @@
 //
 //   node sdk/tests/test-world-persistence.mjs <world-root> [native|wasm]
 //
-// <world-root> holds node_modules/@workflow/world-local, installed at test
-// time; libfx itself depends on no @workflow package.
+// <world-root> holds node_modules/@workflow/world-local, such as sdk/durable
+// after `npm ci --prefix sdk/durable`: the World libfx bundles.
 import { strict as assert } from "node:assert";
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdtempSync, readFileSync } from "node:fs";
