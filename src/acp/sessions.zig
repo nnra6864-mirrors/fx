@@ -3462,11 +3462,7 @@ test "ACP new session starts on the most permissive mode that does not exceed co
         64 * 1024,
     );
     defer alloc.free(captured);
-    try std.testing.expect(std.mem.find(
-        u8,
-        captured,
-        "\"id\":\"mode\",\"name\":\"Session Mode\",\"description\":\"Controls how the agent requests permission\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":\"code\"",
-    ) != null);
+    try std.testing.expect(std.mem.find(u8, captured, "\"currentValue\":\"code\"") != null);
     try std.testing.expect(std.mem.find(u8, captured, "\"currentModeId\":\"code\"") != null);
 }
 

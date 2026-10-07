@@ -20,12 +20,24 @@ pub const Registry = struct {
         return null;
     }
 
+    /// Most permissive registered mode with rank <= `configured`, preferring
+    /// `default_mode_id` on ties. When none qualify, the least permissive
+    /// registered mode, again preferring `default_mode_id`. The returned
+    /// pointer borrows from `modes`.
     pub fn startingMode(self: Registry, configured: types.PermissionMode) *const ModeSpec {
         const limit = permissionRank(configured);
         var best: ?*const ModeSpec = null;
         var best_rank: u8 = 0;
+        var least: ?*const ModeSpec = null;
+        var least_rank: u8 = 0;
         for (self.modes) |*mode| {
             const rank = permissionRank(mode.permission_mode);
+            if (least == null or rank < least_rank or
+                (rank == least_rank and std.mem.eql(u8, mode.id, self.default_mode_id)))
+            {
+                least = mode;
+                least_rank = rank;
+            }
             if (rank > limit) continue;
             if (best == null or rank > best_rank or
                 (rank == best_rank and std.mem.eql(u8, mode.id, self.default_mode_id)))
@@ -35,7 +47,7 @@ pub const Registry = struct {
             }
         }
         if (best) |mode| return mode;
-        return self.lookup(self.default_mode_id).?;
+        return least.?;
     }
 
     pub fn buildModelToolProjection(
@@ -133,12 +145,12 @@ test "startingMode prefers the default mode among equally permissive candidates"
     try std.testing.expectEqualStrings("code", registry.startingMode(.auto).id);
 }
 
-test "startingMode falls back to the default mode when nothing qualifies" {
+test "startingMode falls back to the least permissive mode when nothing qualifies" {
     const modes = [_]ModeSpec{
-        .{ .id = "code", .name = "Code", .permission_mode = .auto },
         .{ .id = "agent", .name = "Agent", .permission_mode = .yolo },
+        .{ .id = "code", .name = "Code", .permission_mode = .auto },
     };
-    const registry = Registry{ .default_mode_id = "code", .modes = modes[0..] };
+    const registry = Registry{ .default_mode_id = "agent", .modes = modes[0..] };
 
     try std.testing.expectEqualStrings("code", registry.startingMode(.ask).id);
 }
