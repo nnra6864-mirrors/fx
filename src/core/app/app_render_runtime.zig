@@ -2717,7 +2717,7 @@ fn expectTallPendingPromptReachesScrollback(rows: u16, preview_tail: usize) !voi
 
     const first_line = "FIRST_PROMPT_LINE";
     const last_line = "LAST_PROMPT_LINE";
-    const prompt = first_line ++ "\n" ++ ("PASTE_BODY\n" ** 60) ++ last_line;
+    const prompt = first_line ++ "\n" ++ text_utils.repeat("PASTE_BODY\n", 60) ++ last_line;
     app.submission.pending = .{ .draft = .{
         .turn_id = 1,
         .prompt = try alloc.dupe(u8, prompt),
