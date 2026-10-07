@@ -1586,7 +1586,7 @@ const RefreshContextApp = struct {
         return self.context_registry;
     }
 
-    fn workspaceHostInfo(self: *const RefreshContextApp) ?*const js_host_workspace.Info {
+    pub fn workspaceHostInfo(self: *const RefreshContextApp) ?*const js_host_workspace.Info {
         return if (self.host_info) |*info| info else null;
     }
 
