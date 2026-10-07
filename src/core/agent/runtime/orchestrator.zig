@@ -5760,6 +5760,9 @@ fn processQueuedPromptInner(
         &stop_state,
         agent,
     ) catch |err| {
+        // A turn that yielded stays open for the host to resume, so nothing
+        // it did is finished as a failure.
+        if (err == error.TurnYielded) return err;
         if (stop_state.retained_candidate != null and
             !stop_state.terminal_materializing and
             finalization.state == .open)
@@ -9855,7 +9858,8 @@ fn processQueuedPromptLoop(
                 .none => false,
                 .read_only => root_action_permission_mode == .auto or
                     root_action_permission_mode == .yolo,
-                .subagent => true,
+                // Each call is reviewed before the group starts.
+                .subagent, .host => true,
             };
             const parallel_candidate_len = if (parallel_permission_eligible)
                 parallel_group.len

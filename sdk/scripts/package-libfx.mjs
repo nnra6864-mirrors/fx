@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,6 +30,8 @@ const files = [
   ["sdk/browser.js", "browser.js"],
   ["sdk/node.js", "node.js"],
   ["sdk/fx-sdk.js", "fx-sdk.js"],
+  ["sdk/durable.js", "durable.js"],
+  ["sdk/fx-harness.js", "fx-harness.js"],
   ["sdk/wasm-module.js", "wasm-module.js"],
   ["sdk/core-output.js", "core-output.js"],
   ["sdk/fetch-cleanup.js", "fetch-cleanup.js"],
@@ -74,6 +77,14 @@ for (const addon of nativeAddons) {
   await cp(addon, resolve(outputDir, destination));
 }
 
+// Each durability module carries the World it wraps; see bundle-durable.mjs.
+if (!existsSync(resolve(repoRoot, "sdk/durable/node_modules/@workflow"))) {
+  throw new Error("bundling the durable Worlds needs `npm ci --prefix sdk/durable` first");
+}
+const bundle = spawnSync(process.env.BUN_BIN || "bun", [resolve(repoRoot, "sdk/scripts/bundle-durable.mjs"), outputDir], { cwd: repoRoot, stdio: "inherit" });
+if (bundle.error) throw bundle.error;
+if (bundle.status !== 0) process.exit(bundle.status ?? 1);
+
 const manifest = JSON.parse(await readFile(resolve(outputDir, "package.json"), "utf8"));
 manifest.files = undefined;
 await writeFile(resolve(outputDir, "package.json"), `${JSON.stringify(manifest, null, 2)}\n`);
@@ -81,6 +92,8 @@ await writeFile(resolve(outputDir, "package.json"), `${JSON.stringify(manifest, 
 console.log(`packaged ${manifest.name} in ${outputDir}`);
 console.log("  node.cjs");
 for (const [, destination] of files) console.log(`  ${destination}`);
+console.log("  durable/local.mjs");
+console.log("  durable/vercel.mjs");
 for (const addon of nativeAddons) {
   console.log(`  ${requestedNativeAddons.length ? basename(addon) : localNativeName}`);
 }

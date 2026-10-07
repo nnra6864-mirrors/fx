@@ -246,6 +246,9 @@ jobs:
           name: libfx-wasm
           path: wasm-artifacts
 
+      - name: Install the durable Worlds
+        run: npm ci --prefix sdk/durable
+
       - name: Assemble package
         env:
           LIBFX_VERSION: ${{ needs.metadata.outputs.version }}

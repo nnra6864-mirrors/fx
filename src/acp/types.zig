@@ -34,6 +34,12 @@ pub fn fxMetaBool(object: std.json.ObjectMap, key: []const u8) ?bool {
     return if (value == .bool) value.bool else null;
 }
 
+/// Returns `_meta.fx.<key>` when it is a JSON integer.
+pub fn fxMetaInteger(object: std.json.ObjectMap, key: []const u8) ?i64 {
+    const value = fxMetaField(object, key) orelse return null;
+    return if (value == .integer) value.integer else null;
+}
+
 pub fn writeModelRecoveryInfoUpdate(
     writer: *std.Io.Writer,
     status: ?core_types.RouteRecoveryStatus,
@@ -92,6 +98,9 @@ pub const StopReason = enum {
     max_model_turns,
     refused,
     cancelled,
+    /// The host gave the turn a time to stop at, and it stopped before its
+    /// next model request with the turn kept open for a later resume.
+    yielded,
 
     pub fn jsonString(self: StopReason) []const u8 {
         return switch (self) {
@@ -100,6 +109,7 @@ pub const StopReason = enum {
             .max_model_turns => "max_model_turns",
             .refused => "refused",
             .cancelled => "cancelled",
+            .yielded => "yielded",
         };
     }
 };
@@ -446,6 +456,7 @@ test "StopReason jsonString values" {
     try std.testing.expectEqualStrings("end_turn", StopReason.end_turn.jsonString());
     try std.testing.expectEqualStrings("cancelled", StopReason.cancelled.jsonString());
     try std.testing.expectEqualStrings("max_output_tokens", StopReason.max_output_tokens.jsonString());
+    try std.testing.expectEqualStrings("yielded", StopReason.yielded.jsonString());
 }
 
 test "ToolCallKind jsonString values" {

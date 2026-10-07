@@ -1,0 +1,292 @@
+---------------------------- MODULE DurableSession ----------------------------
+(***************************************************************************)
+(* One libfx session, one turn, two workers sharing one World.             *)
+(*                                                                         *)
+(* The turn is: a model step that calls one tool, the tool, then a model   *)
+(* step that answers. Workers take the session with a lease whose entries  *)
+(* form a chain in the session log. The World accepts every write (the     *)
+(* "bump and report" behavior of world-vercel 5.0.1 and world-local), so a *)
+(* write counts only when its writer still heads the chain, and a writer   *)
+(* that does not learns it at that write and stops.                        *)
+(*                                                                         *)
+(* The UI stream is a separate World stream with no fencing, so a replaced *)
+(* worker's late lines land in it. A worker that takes the session over    *)
+(* writes its first line, turn_resume or turn_start, before it continues,  *)
+(* and readers hide any line whose epoch is lower than one before it.      *)
+(*                                                                         *)
+(* A worker can freeze while it waits on the model or a tool; others then  *)
+(* treat its lease as dead and may take the session over. A frozen worker  *)
+(* that never wakes is a crash. One that wakes carries on until its next   *)
+(* write, so two workers can be active at once (the witness below).        *)
+(*                                                                         *)
+(* Shortly before its deadline a worker's own timer stops it: it cuts off  *)
+(* the call still running, hands the open turn back to the log, and the    *)
+(* same message comes back for a new delivery. So a lease that runs out at *)
+(* the deadline never leaves its worker running, and two workers are       *)
+(* active at once only when one of them froze. With SelfStop = FALSE the   *)
+(* platform ends the lease while the worker runs on (Witness-NoSelfStop).  *)
+(*                                                                         *)
+(* `act` names each step and its worker, so a driver can replay any path   *)
+(* of the state graph against the real code and compare every state:       *)
+(* sdk/tests/model/drive.mjs.                                              *)
+(***************************************************************************)
+EXTENDS Naturals, Sequences
+
+CONSTANTS
+    Workers,     \* the processes that can run the session
+    Tool,        \* "lookup" (safe to run twice) or "send" (has effects)
+    MaxEpoch,    \* bound on lease claims
+    MaxFreezes,  \* bound on freezes
+    SelfStop     \* whether a worker stops itself before its deadline
+
+ASSUME Tool \in {"lookup", "send"}
+ASSUME SelfStop \in BOOLEAN
+
+None == "none"
+Waiting == {"announce", "model1", "tool", "model2"}
+Busy == {"model1", "tool", "model2"}
+
+VARIABLES
+    pc,        \* where each worker is in the turn
+    epoch,     \* the lease epoch each worker last claimed
+    frozen,    \* whether a worker is frozen
+    lease,     \* the lease at the head of the chain
+    progress,  \* how far the chain has recorded the turn
+    runs,      \* how many times the tool has started
+    ui,        \* each line in the UI stream: its writer's epoch, and whether
+               \* that writer still headed the chain when it wrote
+    freezes,   \* freezes so far
+    froze,     \* whether a worker froze since it last claimed the session
+    act        \* the step that led here
+
+vars == <<pc, epoch, frozen, lease, progress, runs, ui, freezes, froze, act>>
+
+TypeOK ==
+    /\ pc \in [Workers -> {"none", "announce", "model1", "tool", "model2", "done", "stopped"}]
+    /\ epoch \in [Workers -> 0..MaxEpoch]
+    /\ frozen \in [Workers -> BOOLEAN]
+    /\ lease \in [holder: Workers \cup {None}, epoch: 0..MaxEpoch, live: BOOLEAN]
+    /\ progress \in {"start", "intent", "result", "done"}
+    /\ runs \in 0..(MaxEpoch + 1)
+    /\ ui \in Seq([e: 0..MaxEpoch, legit: BOOLEAN])
+    /\ freezes \in 0..MaxFreezes
+    /\ froze \in [Workers -> BOOLEAN]
+    /\ act \in [name: {"Init", "Claim", "Announce", "Model1", "ToolEnd", "Model2",
+                       "Freeze", "Wake", "Deadline", "Expire"},
+                w: Workers \cup {None}]
+
+Init ==
+    /\ pc = [w \in Workers |-> "none"]
+    /\ epoch = [w \in Workers |-> 0]
+    /\ frozen = [w \in Workers |-> FALSE]
+    /\ lease = [holder |-> None, epoch |-> 0, live |-> FALSE]
+    /\ progress = "start"
+    /\ runs = 0
+    /\ ui = <<>>
+    /\ freezes = 0
+    /\ froze = [w \in Workers |-> FALSE]
+    /\ act = [name |-> "Init", w |-> None]
+
+\* A worker's writes count while its claim heads the lease chain.
+Heads(w) == lease.holder = w /\ lease.epoch = epoch[w]
+
+\* A line w writes now.
+Line(w) == [e |-> epoch[w], legit |-> Heads(w)]
+
+\* A write that does not count may still have put a line in the UI stream.
+MaybeLine(w) == ui' \in {ui, Append(ui, Line(w))}
+
+\* The lines every reader shows: each line no earlier line outranks. The
+\* same stored stream always shows the same lines.
+ShownAt(lines) == {i \in 1..Len(lines) : \A j \in 1..(i - 1) : lines[j].e <= lines[i].e}
+
+\* w receives work for the session while no live worker holds it and claims
+\* the lease. Its first line follows; until then a replaced worker's late
+\* lines still show.
+Claim(w) ==
+    /\ pc[w] \in {"none", "stopped"}
+    /\ ~frozen[w]
+    /\ progress # "done"
+    /\ lease.holder = None \/ ~lease.live
+    /\ lease.epoch < MaxEpoch
+    /\ lease' = [holder |-> w, epoch |-> lease.epoch + 1, live |-> TRUE]
+    /\ epoch' = [epoch EXCEPT ![w] = lease.epoch + 1]
+    /\ pc' = [pc EXCEPT ![w] = "announce"]
+    /\ froze' = [froze EXCEPT ![w] = FALSE]
+    /\ UNCHANGED <<frozen, progress, runs, ui, freezes>>
+    /\ act' = [name |-> "Claim", w |-> w]
+
+\* w writes turn_start or turn_resume and waits for it to land, then
+\* continues the turn from what the chain recorded. A call left running is
+\* rerun only when it is safe to run twice; otherwise the model is told it
+\* may have partly run, and the turn goes on to the answer.
+Announce(w) ==
+    /\ pc[w] = "announce"
+    /\ ~frozen[w]
+    /\ LET rerun == progress = "intent" /\ Tool = "lookup"
+       IN /\ pc' = [pc EXCEPT ![w] =
+                       CASE progress = "start" -> "model1"
+                         [] progress = "intent" -> IF rerun THEN "tool" ELSE "model2"
+                         [] progress \in {"result", "done"} -> "model2"]
+          /\ runs' = IF rerun THEN runs + 1 ELSE runs
+          \* then tool_start for a rerun
+          /\ ui' = IF rerun THEN ui \o <<Line(w), Line(w)>> ELSE Append(ui, Line(w))
+    /\ UNCHANGED <<epoch, frozen, lease, progress, freezes, froze>>
+    /\ act' = [name |-> "Announce", w |-> w]
+
+\* The model asks for the tool. A call with effects starts only once its
+\* intent is in the chain; a safe one starts at once, its intent behind it.
+Model1(w) ==
+    /\ pc[w] = "model1"
+    /\ ~frozen[w]
+    /\ IF Tool = "send"
+          THEN IF Heads(w)
+                  THEN /\ progress' = "intent"
+                       /\ runs' = runs + 1
+                       /\ pc' = [pc EXCEPT ![w] = "tool"]
+                       /\ ui' = Append(ui, Line(w))
+                  ELSE /\ pc' = [pc EXCEPT ![w] = "stopped"]
+                       /\ MaybeLine(w)
+                       /\ UNCHANGED <<progress, runs>>
+          ELSE /\ runs' = runs + 1
+               /\ ui' = Append(ui, Line(w))
+               /\ IF Heads(w)
+                     THEN /\ progress' = "intent"
+                          /\ pc' = [pc EXCEPT ![w] = "tool"]
+                     ELSE /\ pc' = [pc EXCEPT ![w] = "stopped"]
+                          /\ UNCHANGED progress
+    /\ UNCHANGED <<epoch, frozen, lease, freezes, froze>>
+    /\ act' = [name |-> "Model1", w |-> w]
+
+\* The tool returns, and its result goes to the chain.
+ToolEnd(w) ==
+    /\ pc[w] = "tool"
+    /\ ~frozen[w]
+    /\ IF Heads(w)
+          THEN /\ progress' = "result"
+               /\ pc' = [pc EXCEPT ![w] = "model2"]
+               /\ ui' = Append(ui, Line(w))
+          ELSE /\ pc' = [pc EXCEPT ![w] = "stopped"]
+               /\ MaybeLine(w)
+               /\ UNCHANGED progress
+    /\ UNCHANGED <<epoch, frozen, lease, runs, freezes, froze>>
+    /\ act' = [name |-> "ToolEnd", w |-> w]
+
+\* The model answers; the turn ends and the worker lets the session go.
+Model2(w) ==
+    /\ pc[w] = "model2"
+    /\ ~frozen[w]
+    /\ IF Heads(w)
+          THEN /\ progress' = "done"
+               /\ pc' = [pc EXCEPT ![w] = "done"]
+               /\ lease' = [lease EXCEPT !.holder = None, !.live = FALSE]
+               \* the answer's text, then turn_end
+               /\ ui' = ui \o <<Line(w), Line(w)>>
+          ELSE /\ pc' = [pc EXCEPT ![w] = "stopped"]
+               /\ MaybeLine(w)
+               /\ UNCHANGED <<progress, lease>>
+    /\ UNCHANGED <<epoch, frozen, runs, freezes, froze>>
+    /\ act' = [name |-> "Model2", w |-> w]
+
+\* w freezes while it waits; its lease no longer counts as alive.
+Freeze(w) ==
+    /\ pc[w] \in Waiting
+    /\ ~frozen[w]
+    /\ freezes < MaxFreezes
+    /\ frozen' = [frozen EXCEPT ![w] = TRUE]
+    /\ freezes' = freezes + 1
+    /\ froze' = [froze EXCEPT ![w] = TRUE]
+    /\ lease' = IF lease.holder = w THEN [lease EXCEPT !.live = FALSE] ELSE lease
+    /\ UNCHANGED <<pc, epoch, progress, runs, ui>>
+    /\ act' = [name |-> "Freeze", w |-> w]
+
+\* w wakes and carries on from where it waited.
+Wake(w) ==
+    /\ frozen[w]
+    /\ frozen' = [frozen EXCEPT ![w] = FALSE]
+    /\ UNCHANGED <<pc, epoch, lease, progress, runs, ui, freezes, froze>>
+    /\ act' = [name |-> "Wake", w |-> w]
+
+\* Shortly before its deadline, w's own timer stops it and cuts off the call
+\* still running; a frozen worker's timer does not run. w writes turn_yield,
+\* hands the open turn back to the log and releases the session, and the
+\* same message comes back at once. w takes it again, or, where the platform
+\* routes it elsewhere, any worker may. A worker that was replaced without
+\* knowing it learns so at the release and stops.
+Deadline(w) ==
+    /\ SelfStop
+    /\ pc[w] \in Busy
+    /\ ~frozen[w]
+    /\ IF Heads(w)
+          THEN /\ ui' = Append(ui, Line(w))
+               /\ \/ /\ lease.epoch < MaxEpoch
+                     /\ lease' = [holder |-> w, epoch |-> lease.epoch + 1, live |-> TRUE]
+                     /\ epoch' = [epoch EXCEPT ![w] = lease.epoch + 1]
+                     /\ pc' = [pc EXCEPT ![w] = "announce"]
+                     /\ froze' = [froze EXCEPT ![w] = FALSE]
+                  \/ /\ lease' = [lease EXCEPT !.holder = None, !.live = FALSE]
+                     /\ pc' = [pc EXCEPT ![w] = "none"]
+                     /\ UNCHANGED <<epoch, froze>>
+          ELSE /\ pc' = [pc EXCEPT ![w] = "stopped"]
+               /\ MaybeLine(w)
+               /\ UNCHANGED <<epoch, lease, froze>>
+    /\ UNCHANGED <<frozen, progress, runs, freezes>>
+    /\ act' = [name |-> "Deadline", w |-> w]
+
+\* Without the self-stop: the deadline passes while w is still busy, and its
+\* lease runs out while it runs on.
+Expire(w) ==
+    /\ ~SelfStop
+    /\ pc[w] \in Busy
+    /\ ~frozen[w]
+    /\ Heads(w)
+    /\ lease.live
+    /\ lease' = [lease EXCEPT !.live = FALSE]
+    /\ UNCHANGED <<pc, epoch, frozen, progress, runs, ui, freezes, froze>>
+    /\ act' = [name |-> "Expire", w |-> w]
+
+Next ==
+    \E w \in Workers :
+        \/ Claim(w) \/ Announce(w) \/ Model1(w) \/ ToolEnd(w) \/ Model2(w)
+        \/ Freeze(w) \/ Wake(w) \/ Deadline(w) \/ Expire(w)
+
+Spec == Init /\ [][Next]_vars
+
+-----------------------------------------------------------------------------
+(* Properties *)
+
+\* A call with effects never starts twice.
+EffectsAtMostOnce == Tool = "send" => runs <= 1
+
+\* A call with effects starts only after its intent counts in the chain.
+EffectsAfterIntent == Tool = "send" /\ runs > 0 => progress # "start"
+
+\* Only the chain's head ends the turn.
+DoneByHead == progress = "done" => \E w \in Workers : pc[w] = "done"
+
+\* No reader hides a line its writer wrote while it headed the chain.
+LegitShown == \A i \in 1..Len(ui) : ui[i].legit => i \in ShownAt(ui)
+
+Active(w) == pc[w] \in Waiting /\ ~frozen[w]
+
+\* Two workers are active at once only when one of them froze since it
+\* claimed the session. A clock that stops is the one case left, and only a
+\* World that refuses stale writes closes it.
+TwoActiveNeedsFreeze ==
+    \A v, w \in Workers : v # w /\ Active(v) /\ Active(w) => froze[v] \/ froze[w]
+
+\* Witness, expected to FAIL: a replaced worker's line can still show when
+\* it lands between its successor's claim and first line. Only a World
+\* that refuses stale stream writes closes that window.
+NoStaleShown == \A i \in ShownAt(ui) : ui[i].legit
+
+\* The stream as stored, expected to FAIL: late lines land out of order.
+UiInOrder == \A i \in 1..(Len(ui) - 1) : ui[i].e <= ui[i + 1].e
+
+\* Witness, expected to FAIL: two workers active at once.
+NotTwoActive ==
+    ~(\E v, w \in Workers :
+        /\ v # w
+        /\ Active(v)
+        /\ Active(w))
+=============================================================================

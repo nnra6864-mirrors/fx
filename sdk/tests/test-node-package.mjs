@@ -80,15 +80,15 @@ try {
   await writeFile(join(consumerDir, "esm.mjs"), `
     import * as libfx from "libfx";
     import * as nodeEntry from "libfx/node";
-    const { createFxAgent, createFxTerminal, getBackendInfo } = libfx;
+    const { createFxEngine, createFxTerminal, getBackendInfo } = libfx;
     if (JSON.stringify(Object.keys(libfx).sort()) !== JSON.stringify(Object.keys(nodeEntry).sort())) {
       throw new Error("root and Node subpath ESM exports differ");
     }
     const info = await getBackendInfo({ backend: "native" });
-    if (typeof createFxAgent !== "function" || typeof createFxTerminal !== "function" || info.backend !== "native") {
+    if (typeof createFxEngine !== "function" || typeof createFxTerminal !== "function" || info.backend !== "native") {
       throw new Error(JSON.stringify(info));
     }
-    const agent = await createFxAgent({ backend: "native", apiKey: "package-test-key" });
+    const agent = await createFxEngine({ backend: "native", apiKey: "package-test-key" });
     const checkpoint = await agent.checkpoint();
     await agent.close();
     if (!(checkpoint instanceof Uint8Array) || checkpoint.length === 0) throw new Error("empty checkpoint");
@@ -97,16 +97,16 @@ try {
   await writeFile(join(consumerDir, "cjs.cjs"), `
     const libfx = require("libfx");
     const nodeEntry = require("libfx/node");
-    const { createFxAgent, createFxTerminal, getBackendInfo } = libfx;
+    const { createFxEngine, createFxTerminal, getBackendInfo } = libfx;
     (async () => {
       if (JSON.stringify(Object.keys(libfx).sort()) !== JSON.stringify(Object.keys(nodeEntry).sort())) {
         throw new Error("root and Node subpath CommonJS exports differ");
       }
       const info = await getBackendInfo({ backend: "native" });
-      if (typeof createFxAgent !== "function" || typeof createFxTerminal !== "function" || info.backend !== "native") {
+      if (typeof createFxEngine !== "function" || typeof createFxTerminal !== "function" || info.backend !== "native") {
         throw new Error(JSON.stringify(info));
       }
-      const agent = await createFxAgent({ backend: "native", apiKey: "package-test-key" });
+      const agent = await createFxEngine({ backend: "native", apiKey: "package-test-key" });
       const checkpoint = await agent.checkpoint();
       await agent.close();
       if (!(checkpoint instanceof Uint8Array) || checkpoint.length === 0) throw new Error("empty checkpoint");
