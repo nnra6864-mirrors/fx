@@ -124,9 +124,12 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
   let openTurn = typeof base?.openTurn?.id === "string" ? { id: base.openTurn.id, at: Number(base.openTurn.at) || 0, context: base.openTurn.context ?? null } : null;
   let lastTurnId = base?.lastTurnId ?? null;
   let yielded = base?.yielded === true;
-  // The context each prompt's caller gave, which its turn runs with.
+  // The context each prompt's or steer's caller gave, which its turn runs
+  // with: an untaken steer becomes a turn.
   const contexts = new Map();
-  for (const input of base?.pending ?? []) if (input.type === "prompt" && input.context !== undefined) contexts.set(input.messageId, input.context);
+  for (const input of base?.pending ?? []) if (input.context !== undefined) contexts.set(input.messageId, input.context);
+  // How many times a prompt's harness stopped before its turn wrote anything.
+  const stops = new Map();
   const failed = new Map();
   let maxCursor = 0;
   const consume = (id) => {
@@ -147,7 +150,7 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
         if (seenInputs.has(entry.key)) break;
         seenInputs.add(entry.key);
         inputs.push({ ...entry, cursor: position });
-        if (entry.type === "prompt" && entry.context !== undefined) contexts.set(entry.messageId, entry.context);
+        if (entry.context !== undefined) contexts.set(entry.messageId, entry.context);
         break;
       case "lease":
       case "release":
@@ -191,6 +194,9 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
         // the harness refused or its cancel stopped first. Its outcome is on
         // the UI stream.
         consume(entry.messageId);
+        break;
+      case "stopped":
+        stops.set(entry.messageId, (stops.get(entry.messageId) ?? 0) + 1);
         break;
       default:
         break;
@@ -253,6 +259,7 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
     recent: recent.slice(-recentIdsKept),
     consumed,
     failed,
+    stops,
     inputKeys: seenInputs,
     maxCursor,
     hasWork: (openTurn !== null && (!openFailed || cancelOpen)) || pending.length > 0,
@@ -713,10 +720,14 @@ async function recordMessage(log, state, message) {
       messageId: message.messageId,
       ...(message.input === undefined ? {} : { input: message.input }),
       ...(typeof message.target === "string" ? { target: message.target } : {}),
-      ...(message.type === "prompt" && message.context !== undefined ? { context: message.context } : {}),
+      ...((message.type === "prompt" || message.type === "steer") && message.context !== undefined ? { context: message.context } : {}),
     });
   }
 }
+
+// Times a prompt's engine may stop before its turn writes anything; after
+// that the turn ends with an error, so the session goes on.
+const maxHarnessStops = 3;
 
 // How long before its deadline a worker stops itself, at most: it cancels
 // the model or tool call still running, so it never runs on after its lease
@@ -963,6 +974,15 @@ class SessionWorker {
           const next = state.pending[0];
           if (!next) break;
           messageId = next.messageId;
+          if ((state.stops.get(messageId) ?? 0) >= maxHarnessStops) {
+            // An engine that stops each time it starts this turn would hold
+            // the session forever; the turn ends with an error instead.
+            await log.append({ k: "ended", messageId });
+            ui.push({ type: "turn_end", messageId, stopReason: "error", usage: {}, error: { name: "Error", message: `the engine stopped each of the ${maxHarnessStops} times it started this turn` } });
+            await ui.settle();
+            state = this.fold(await log.read());
+            continue;
+          }
           if (next.cancelled) {
             // Its own cancel came before it started, so it never runs.
             await log.append({ k: "ended", messageId });
@@ -982,6 +1002,7 @@ class SessionWorker {
           try {
             turn = harness.prompt(next.input ?? "", { turnId: messageId, yieldAt });
           } catch (error) {
+            await log.append({ k: "stopped", messageId });
             return unusable(error);
           }
           ui.push({ type: "turn_start", messageId, sessionId: this.sessionId, ...(typeof next.input === "string" ? { input: next.input } : {}) });
@@ -1002,7 +1023,18 @@ class SessionWorker {
           await release();
           return failed ? broken() : "yielded";
         }
-        if (outcome.stopped) return unusable(outcome.stopped);
+        if (outcome.stopped) {
+          state = this.fold(await log.read());
+          if (state.openTurn?.id !== messageId && state.consumed.has(messageId)) {
+            // Its end landed before its engine stopped, so it ended, though
+            // how is unknown.
+            ui.push({ type: "turn_end", messageId, stopReason: "unknown", usage: {} });
+            await ui.settle();
+          } else if (fresh && !state.consumed.has(messageId)) {
+            await log.append({ k: "stopped", messageId });
+          }
+          return unusable(outcome.stopped);
+        }
         const { result } = outcome;
         state = this.fold(await log.read());
         if (fresh && !failed && !state.consumed.has(messageId)) {

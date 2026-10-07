@@ -25,6 +25,11 @@ const prompted = [];
 // whose first turn stops under them, as one whose engine exited does.
 const flaky = new Set(["flaky"]);
 const stopping = new Set(["halting"]);
+// An input whose engine stops every time it starts it, and one whose engine
+// stops right after the turn's end lands.
+const doomed = "doomed";
+const stopsAfterEnd = new Set(["omega"]);
+const harnessStopped = (message) => Object.assign(new Error(message), { code: "FX_HARNESS_STOPPED" });
 // Steps that wait until a test lets them go, by text.
 const holds = new Map();
 
@@ -83,6 +88,7 @@ function scriptedHarness({ steps = 3 } = {}) {
           await append({ turnId, step, word, ...(step === steps - 1 ? { end: true } : {}) }, step === steps - 1 ? [{ end: true }] : []);
           push({ type: "text_delta", delta: `${word} ` });
         }
+        if (stopsAfterEnd.delete(input)) throw harnessStopped("the engine exited after the turn ended");
         return { stopReason: "end_turn" };
       };
       return {
@@ -92,8 +98,8 @@ function scriptedHarness({ steps = 3 } = {}) {
           // before it writes anything, as fx's kernel refuses an empty
           // prompt. One that throws cannot run a turn at all.
           if (flaky.delete(input)) throw new Error("the harness stopped");
-          if (stopping.delete(input)) {
-            const stopped = Object.assign(new Error("the engine exited"), { code: "FX_HARNESS_STOPPED" });
+          if (stopping.delete(input) || input === doomed) {
+            const stopped = harnessStopped("the engine exited");
             const result = Promise.reject(stopped);
             result.catch(() => {});
             return { result, steer: async () => {}, cancel() {}, async *[Symbol.asyncIterator]() { throw stopped; } };
@@ -128,8 +134,13 @@ function scriptedTurn(body, onHandoff) {
   const controller = new AbortController();
   let cancelled = false;
   const result = body((event) => { queue.push(event); wake?.(); }, controller.signal)
-    .catch((error) => (cancelled ? { stopReason: "cancelled" } : { stopReason: "error", error: { name: "Error", message: String(error?.message ?? error) } }))
+    .catch((error) => {
+      // A stopped harness is not a turn's outcome; it reaches the core as is.
+      if (error?.code === "FX_HARNESS_STOPPED") throw error;
+      return cancelled ? { stopReason: "cancelled" } : { stopReason: "error", error: { name: "Error", message: String(error?.message ?? error) } };
+    })
     .finally(() => { finished = true; wake?.(); });
+  void result.catch(() => {});
   return {
     result,
     steer: async () => {},
@@ -443,6 +454,31 @@ test("a turn whose harness stops under it, and the prompts behind it, still run"
   await agent.close();
 });
 
+test("an engine that stops each time it starts a turn ends that turn, and the session goes on", async () => {
+  const agent = createAgent({ durability: await durabilityFor() });
+  const session = agent.session();
+  const before = prompted.length;
+  const stuck = session.prompt(doomed, { messageId: "turn-doomed" });
+  await stuck.accepted;
+  const behind = session.prompt("psi", { messageId: "turn-psi" });
+  const ended = await stuck.result;
+  assert.equal(ended.stopReason, "error");
+  assert.match(ended.error?.message ?? "", /stopped each of the 3 times/);
+  assert.equal((await behind.result).stopReason, "end_turn", "the prompt behind it ran");
+  assert.deepEqual(prompted.slice(before), ["turn-doomed", "turn-doomed", "turn-doomed", "turn-psi"]);
+  await agent.close();
+});
+
+test("a turn whose engine stops after its end landed still ends for its viewers", async () => {
+  const agent = createAgent({ durability: await durabilityFor() });
+  const session = agent.session();
+  const { text, result } = await textOf(session.prompt("omega", { messageId: "turn-omega" }));
+  assert.equal(result.stopReason, "unknown");
+  assert.equal(text, "omega-0 omega-1 omega-2");
+  assert.equal((await session.prompt("after", { messageId: "turn-after" }).result).stopReason, "end_turn");
+  await agent.close();
+});
+
 test("each prompt's turn runs with its own caller's context, resumed or not", async () => {
   const seen = [];
   const contextual = createDurableAgentFactory({
@@ -461,6 +497,10 @@ test("each prompt's turn runs with its own caller's context, resumed or not", as
   assert.deepEqual(seen.filter(([input]) => input === "upsilon").map(([, c]) => c), [{ user: "a" }]);
   assert.deepEqual(seen.filter(([input]) => input === "phi").map(([, c]) => c), [null], "a call without context passes none");
   assert.deepEqual(seen.filter(([input]) => input === "chi").map(([, c]) => c), [{ user: "b" }]);
+  // A steer to an idle session starts a turn with the steering call's context.
+  await agent.session(id, { context: { user: "s" } }).steer("guide");
+  assert.equal((await agent.session(id).prompt("after guide").result).stopReason, "end_turn");
+  assert.deepEqual(seen.filter(([input]) => input === "guide").map(([, c]) => c), [{ user: "s" }]);
   // Every turn yielded at each step; each resume ran with its own turn's context.
   const order = seen.map(([input, context]) => `${input}:${JSON.stringify(context)}`);
   for (const [word, context] of [["upsilon", { user: "a" }], ["phi", null], ["chi", { user: "b" }]]) {

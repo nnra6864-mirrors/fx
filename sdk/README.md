@@ -77,8 +77,9 @@ One process runs a session's turns at a time, one turn after another. A
 second process that receives a prompt for a busy session queues it behind the
 running turn. Pass `context` to hand JSON to the session's tools:
 `agent.session(id, { context: { userId } })` gives every tool call
-`context` beside its `executionId`. Each prompt's turn runs with the context
-of the `session()` call it came from.
+`context` beside its `executionId`. Each turn runs with the context of the
+`session()` call whose prompt or steer started it, and a call without
+`context` gives its turns none.
 
 ### Turns
 
@@ -770,7 +771,7 @@ starts after every earlier call in the response finishes, and later calls
 wait for it. WebAssembly runs calls one at a time. Every call still goes
 through its own permission check before any of them starts.
 
-`execute` receives `{ signal, executionId }`, plus `context` when the session
+`execute` receives `{ signal, executionId }`, plus `context` when the turn
 has one. `executionId` is the model's id for the call and stays the same when
 the call runs again after a crash, so a tool with an external effect can pass
 it on as an idempotency key. [Tools with effects](#tools-with-effects)
