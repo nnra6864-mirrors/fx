@@ -134,8 +134,7 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
   // with: an untaken steer becomes a turn.
   const contexts = new Map();
   for (const input of base?.pending ?? []) if (input.context !== undefined) contexts.set(input.messageId, input.context);
-  // How many times each turn's engine stopped under it, or could not open
-  // to continue it.
+  // How many times each turn's engine stopped under it.
   const stops = new Map();
   const failed = new Map();
   let maxCursor = 0;
@@ -243,9 +242,10 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
       : openTurn !== null && input.cursor > openTurn.at;
     if (!live) consume(input.messageId);
   }
-  // An open turn whose harness could not start waits for a cancel. One whose
-  // engine stopped each time it continued it is cancelled; one whose engine
-  // stopped even then can never go on, and the session runs no more turns.
+  // An open turn whose harness could not start has ended for its viewers; a
+  // cancel it is due waits for the next input's engine. One whose engine
+  // stopped each time it continued it is cancelled; one whose engine stopped
+  // even then can never go on, and the session runs no more turns.
   const openFailed = openTurn !== null && failed.has(openTurn.id);
   const openStops = openTurn === null ? 0 : stops.get(openTurn.id) ?? 0;
   const halted = openStops >= maxHarnessStops + maxCancelStops;
@@ -276,7 +276,7 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
     maxCursor,
     stuck,
     halted,
-    hasWork: (openTurn !== null && !halted && (!openFailed || cancelOpen || stuck))
+    hasWork: (openTurn !== null && !halted && !openFailed)
       || pending.length > 0
       || (halted && !openFailed),
   };
@@ -967,11 +967,6 @@ class SessionWorker {
           const summary = errorSummary(error);
           await log.append({ k: "failed", messageId: waiting, error: summary });
           ui.push({ type: "turn_end", messageId: waiting, stopReason: "error", usage: {}, error: summary });
-        } else if (state.openTurn) {
-          // Nothing is left to fail, but the failed open turn is still due a
-          // cancel: each open that fails counts against it, so the session
-          // ends up running no more turns instead of opening forever.
-          await log.append({ k: "stopped", messageId: state.openTurn.id });
         }
         agent.emit("session.error", { sessionId: this.sessionId, error: errorSummary(error) });
         return "done";

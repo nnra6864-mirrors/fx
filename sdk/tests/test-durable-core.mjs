@@ -520,16 +520,18 @@ test("a started turn whose engine keeps stopping is cancelled, and the prompts b
   await agent.close();
 });
 
-// An agent whose first `works` engines open and whose later ones cannot.
+// An agent whose first `works` engines open and whose later ones cannot,
+// or, given a function, whose engines open when `opens(n)` says so.
 function agentWhoseEnginesFailAfter(works, durability) {
   const scripted = scriptedHarness();
   const counts = { opens: 0 };
+  const opens = typeof works === "function" ? works : (n) => n <= works;
   const create = createDurableAgentFactory({
     harness: (options) => {
       const base = scripted(options);
       return { open: async (args) => {
         counts.opens += 1;
-        if (counts.opens > works) throw new Error("no engine");
+        if (!opens(counts.opens)) throw new Error("no engine");
         return base.open(args);
       } };
     },
@@ -585,6 +587,46 @@ test("a cancel for a turn whose engine cannot open is not retried forever", asyn
   assert.equal(ended.stopReason, "error");
   await session.cancel();
   await opensSettle(counts, 8);
+  await agent.close();
+});
+
+// Engines that open, except during a 1.5 s outage that starts once engine
+// `after` has opened.
+function outageAfter(after) {
+  const outage = { until: Infinity };
+  const opens = (n) => {
+    if (n === after) outage.until = Date.now() + 1500;
+    return n <= after || Date.now() >= outage.until;
+  };
+  return { opens, over: () => sleep(Math.max(0, outage.until - Date.now()) + 50) };
+}
+
+test("an outage while a stuck turn is cancelled does not halt the session", async () => {
+  // Three engines stop under the turn; the next ones cannot open for a while.
+  const outage = outageAfter(3);
+  const { agent } = agentWhoseEnginesFailAfter(outage.opens, await durabilityFor());
+  const session = agent.session();
+  const stuck = await session.prompt(brittle, { messageId: "turn-outage" }).result;
+  assert.equal(stuck.stopReason, "error");
+  assert.match(stuck.error?.message ?? "", /no engine/);
+  await outage.over();
+  // The next prompt's engine cancels the open turn, then runs the prompt.
+  assert.equal((await session.prompt("kappa2").result).stopReason, "end_turn");
+  assert.equal((await session.prompt("lambda2").result).stopReason, "end_turn");
+  await agent.close();
+});
+
+test("an outage while a cancel waits does not halt the session", async () => {
+  // The first engine stops under the turn; the next ones cannot open for a while.
+  const outage = outageAfter(1);
+  const { agent } = agentWhoseEnginesFailAfter(outage.opens, await durabilityFor());
+  const session = agent.session();
+  const ended = await session.prompt(brittle, { messageId: "turn-blip" }).result;
+  assert.equal(ended.stopReason, "error");
+  await session.cancel();
+  await outage.over();
+  assert.equal((await session.prompt("mu2").result).stopReason, "end_turn");
+  assert.equal((await session.prompt("nu2").result).stopReason, "end_turn");
   await agent.close();
 });
 
