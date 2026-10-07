@@ -72,10 +72,12 @@ test("signed macOS variants preserve the image flow and native resource accounti
         const prompt = JSON.parse(gateway.requests.at(-1)!.body).prompt;
         const result = prompt.flatMap((message: any) => message.content ?? [])
           .find((part: any) => part.type === "tool-result" && part.toolCallId === "image_call");
+        expect(result.output.type).toBe("content");
         expect(result.output.value.every((part: any) => part.type === "text")).toBe(true);
         const image = prompt.find((message: any) => message.role === "user" && Array.isArray(message.content) &&
           message.content.some((part: any) => part.type === "file"))?.content.find((part: any) => part.type === "file");
         expect(image?.mediaType).toBe("image/png");
+        expect(image?.data?.type).toBe("data");
         expect(typeof image?.data?.data).toBe("string");
         expect(sample).not.toBeNull();
         if (round >= 0) rows.push({ label, round, ...sample! });
