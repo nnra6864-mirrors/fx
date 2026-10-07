@@ -73,6 +73,7 @@ test("signed macOS variants preserve the image flow and native resource accounti
         const result = prompt.flatMap((message: any) => message.content ?? [])
           .find((part: any) => part.type === "tool-result" && part.toolCallId === "image_call");
         expect(result.output.type).toBe("content");
+        expect(result.output.value.length).toBeGreaterThan(0);
         expect(result.output.value.every((part: any) => part.type === "text")).toBe(true);
         const image = prompt.find((message: any) => message.role === "user" && Array.isArray(message.content) &&
           message.content.some((part: any) => part.type === "file"))?.content.find((part: any) => part.type === "file");
