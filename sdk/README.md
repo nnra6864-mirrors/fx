@@ -163,11 +163,15 @@ createFxAgent({ durability: memory() }); // nothing survives the process
 them, and libfx loads one only when a session first needs it, so your app
 installs no other package and an app with no sessions loads neither.
 
-libfx records each step of a turn as it happens. A turn's prompt is stored
-before the model sees it, and a tool call with effects is stored before it
-runs, so a crash never loses a prompt the caller was told was accepted and
-never repeats a tool call silently. Other records are written while the model
-works, without holding up the turn. A session also saves a checkpoint at the
+libfx records each step of a turn as it happens. A prompt is stored before
+the caller hears it was accepted, and a tool call with effects is stored
+before it runs, so a crash never loses an accepted prompt and never repeats a
+tool call silently. When a session has no turn in progress, the process that
+takes it sends the next turn's first model request while it writes its claim
+on the session, and it writes, shows, and runs nothing for that turn until
+the claim lands. If another process's claim lands first, the late claim
+counts for nothing and its model request is cancelled. Other records are
+written while the model works, without holding up the turn. A session also saves a checkpoint at the
 end of every turn and wherever a turn yields, so the process that continues it
 reads the checkpoint and the few records after it, not the whole history.
 

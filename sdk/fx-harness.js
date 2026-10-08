@@ -19,11 +19,12 @@ export function fxHarness({ createEngine, defaultApiKey = async () => undefined 
     const idempotent = idempotentTools(engineOptions.tools);
     return {
       ...(checkpoint === undefined ? {} : { seed: snapshotOf(checkpointBytesOf(checkpoint)) }),
-      async open({ sessionId, store, context, durability }) {
+      async open({ sessionId, store, context, durability, ready }) {
         const apiKey = engineOptions.apiKey ?? await defaultApiKey(durability);
         const engine = await createEngine({
           ...engineOptions,
           ...(apiKey === undefined ? {} : { apiKey }),
+          ...(ready === undefined || engineOptions.tools === undefined ? {} : { tools: claimedTools(engineOptions.tools, ready) }),
           sessionId,
           // The core folds the session from the marks on each record.
           persistence: { ...store, [journalMarksWanted]: true },
@@ -120,6 +121,21 @@ function toolEntries(tools) {
   if (Array.isArray(tools)) return tools;
   if (tools && typeof tools === "object") return Object.entries(tools).map(([name, tool]) => ({ ...tool, name: tool?.name ?? name }));
   return [];
+}
+
+// The tools as a worker runs them: a turn can start before the worker's
+// claim on the session lands, and no tool runs before it does.
+function claimedTools(tools, ready) {
+  const claimed = (tool) => (typeof tool?.execute !== "function" ? tool : {
+    ...tool,
+    async execute(...args) {
+      if (!(await ready)) throw new Error("this worker's claim on the session failed");
+      return tool.execute(...args);
+    },
+  });
+  if (Array.isArray(tools)) return tools.map(claimed);
+  if (tools && typeof tools === "object") return Object.fromEntries(Object.entries(tools).map(([name, tool]) => [name, claimed(tool)]));
+  return tools;
 }
 
 function idempotentTools(tools) {

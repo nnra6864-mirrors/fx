@@ -191,10 +191,14 @@ function scriptedTurn(body, onHandoff) {
 function chain(before, next) {
   let turn = null;
   const ready = before.then(() => { turn = next(); return turn; });
+  // A turn whose start was refused rejects; the core may never ask.
+  const result = ready.then((value) => value.result);
+  void result.catch(() => {});
   return {
-    result: ready.then((value) => value.result),
+    result,
     steer: async (...args) => (await ready).steer(...args),
-    cancel: (options) => { void ready.then((value) => value.cancel(options)); },
+    // A turn whose start was refused has nothing to cancel.
+    cancel: (options) => { ready.then((value) => value.cancel(options), () => {}); },
     async *[Symbol.asyncIterator]() { yield* await ready; },
   };
 }

@@ -9,6 +9,15 @@
 (* write counts only when its writer still heads the chain, and a writer   *)
 (* that does not learns it at that write and stops.                        *)
 (*                                                                         *)
+(* A worker reads the log, then claims: it writes the input and its lease, *)
+(* which continues the chain where the worker read it. Its first model     *)
+(* request goes out while the claim is written, and the turn continues     *)
+(* from what the worker read; until the claim lands it writes nothing,     *)
+(* shows nothing and runs no tool. A claim counts only when the chain has  *)
+(* not moved since the read; a refused one leaves the worker to read       *)
+(* again. With ClaimFenced = FALSE a claim counts on a stale read          *)
+(* (Witness-NoClaimFence).                                                 *)
+(*                                                                         *)
 (* The UI stream is a separate World stream with no fencing, so a replaced *)
 (* worker's late lines land in it. A worker that takes the session over    *)
 (* writes its first line, turn_resume or turn_start, before it continues,  *)
@@ -37,14 +46,17 @@ CONSTANTS
     Tool,        \* "lookup" (safe to run twice) or "send" (has effects)
     MaxEpoch,    \* bound on lease claims
     MaxFreezes,  \* bound on freezes
-    SelfStop     \* whether a worker stops itself before its deadline
+    SelfStop,    \* whether a worker stops itself before its deadline
+    ClaimFenced  \* whether a claim on a stale read is refused
 
 ASSUME Tool \in {"lookup", "send"}
 ASSUME SelfStop \in BOOLEAN
+ASSUME ClaimFenced \in BOOLEAN
 
 None == "none"
 Waiting == {"announce", "model1", "tool", "model2"}
 Busy == {"model1", "tool", "model2"}
+Progress == {"start", "intent", "result", "done"}
 
 VARIABLES
     pc,        \* where each worker is in the turn
@@ -57,21 +69,25 @@ VARIABLES
                \* that writer still headed the chain when it wrote
     freezes,   \* freezes so far
     froze,     \* whether a worker froze since it last claimed the session
+    chain,     \* how many counted writes the chain holds
+    seen,      \* what each worker read before its claim
     act        \* the step that led here
 
-vars == <<pc, epoch, frozen, lease, progress, runs, ui, freezes, froze, act>>
+vars == <<pc, epoch, frozen, lease, progress, runs, ui, freezes, froze, chain, seen, act>>
 
 TypeOK ==
-    /\ pc \in [Workers -> {"none", "announce", "model1", "tool", "model2", "done", "stopped"}]
+    /\ pc \in [Workers -> {"none", "early", "announce", "model1", "tool", "model2", "done", "stopped"}]
     /\ epoch \in [Workers -> 0..MaxEpoch]
     /\ frozen \in [Workers -> BOOLEAN]
     /\ lease \in [holder: Workers \cup {None}, epoch: 0..MaxEpoch, live: BOOLEAN]
-    /\ progress \in {"start", "intent", "result", "done"}
+    /\ progress \in Progress
     /\ runs \in 0..(MaxEpoch + 1)
     /\ ui \in Seq([e: 0..MaxEpoch, legit: BOOLEAN])
     /\ freezes \in 0..MaxFreezes
     /\ froze \in [Workers -> BOOLEAN]
-    /\ act \in [name: {"Init", "Claim", "Announce", "Model1", "ToolEnd", "Model2",
+    /\ chain \in Nat
+    /\ seen \in [Workers -> [chain: Nat, progress: Progress, epoch: 0..MaxEpoch]]
+    /\ act \in [name: {"Init", "Start", "Claim", "Announce", "Model1", "ToolEnd", "Model2",
                        "Freeze", "Wake", "Deadline", "Expire"},
                 w: Workers \cup {None}]
 
@@ -85,6 +101,8 @@ Init ==
     /\ ui = <<>>
     /\ freezes = 0
     /\ froze = [w \in Workers |-> FALSE]
+    /\ chain = 0
+    /\ seen = [w \in Workers |-> [chain |-> 0, progress |-> "start", epoch |-> 0]]
     /\ act = [name |-> "Init", w |-> None]
 
 \* A worker's writes count while its claim heads the lease chain.
@@ -100,38 +118,69 @@ MaybeLine(w) == ui' \in {ui, Append(ui, Line(w))}
 \* same stored stream always shows the same lines.
 ShownAt(lines) == {i \in 1..Len(lines) : \A j \in 1..(i - 1) : lines[j].e <= lines[i].e}
 
-\* w receives work for the session while no live worker holds it and claims
-\* the lease. Its first line follows; until then a replaced worker's late
-\* lines still show.
-Claim(w) ==
+\* What w reads now: where the chain stands and how far it recorded the turn.
+Read == [chain |-> chain, progress |-> progress, epoch |-> lease.epoch]
+
+\* Whether w, reading now, finds work it can claim.
+CanClaim == progress # "done" /\ (lease.holder = None \/ ~lease.live)
+
+\* w receives work for the session, reads the log, and finds no live worker
+\* holding it. It writes its claim and sends its first model request at
+\* once; nothing it does shows or counts until the claim lands.
+Start(w) ==
     /\ pc[w] \in {"none", "stopped"}
     /\ ~frozen[w]
-    /\ progress # "done"
-    /\ lease.holder = None \/ ~lease.live
+    /\ CanClaim
     /\ lease.epoch < MaxEpoch
-    /\ lease' = [holder |-> w, epoch |-> lease.epoch + 1, live |-> TRUE]
-    /\ epoch' = [epoch EXCEPT ![w] = lease.epoch + 1]
-    /\ pc' = [pc EXCEPT ![w] = "announce"]
-    /\ froze' = [froze EXCEPT ![w] = FALSE]
+    /\ pc' = [pc EXCEPT ![w] = "early"]
+    /\ seen' = [seen EXCEPT ![w] = Read]
+    /\ UNCHANGED <<epoch, frozen, lease, progress, runs, ui, freezes, froze, chain>>
+    /\ act' = [name |-> "Start", w |-> w]
+
+\* w's claim lands. Its lease continues the chain where w read it, so it
+\* counts only when nothing counted since. Its first line follows; until
+\* then a replaced worker's late lines still show. A refused claim wrote
+\* nothing that counts, and w reads the log again in the same delivery.
+\* MaxEpoch bounds only the model: a claim that would pass it never lands.
+Claim(w) ==
+    /\ pc[w] = "early"
+    /\ ~frozen[w]
+    /\ IF chain = seen[w].chain \/ ~ClaimFenced
+          THEN /\ seen[w].epoch < MaxEpoch
+               /\ lease' = [holder |-> w, epoch |-> seen[w].epoch + 1, live |-> TRUE]
+               /\ epoch' = [epoch EXCEPT ![w] = seen[w].epoch + 1]
+               /\ chain' = chain + 1
+               /\ pc' = [pc EXCEPT ![w] = "announce"]
+               /\ froze' = [froze EXCEPT ![w] = FALSE]
+               /\ UNCHANGED seen
+          ELSE /\ UNCHANGED <<lease, epoch, chain, froze>>
+               /\ IF CanClaim
+                     THEN /\ pc' = [pc EXCEPT ![w] = "early"]
+                          /\ seen' = [seen EXCEPT ![w] = Read]
+                     ELSE /\ pc' = [pc EXCEPT ![w] = "none"]
+                          /\ UNCHANGED seen
     /\ UNCHANGED <<frozen, progress, runs, ui, freezes>>
     /\ act' = [name |-> "Claim", w |-> w]
 
 \* w writes turn_start or turn_resume and waits for it to land, then
-\* continues the turn from what the chain recorded. A call left running is
-\* rerun only when it is safe to run twice; otherwise the model is told it
-\* may have partly run, and the turn goes on to the answer.
+\* continues the turn from what it read before its claim. A call left
+\* running is rerun only when it is safe to run twice; otherwise the model
+\* is told it may have partly run, and the turn goes on to the answer. The
+\* records this writes are left out of `chain`: in the code it follows its
+\* claim at once, and fewer chain moves only let the model do more.
 Announce(w) ==
     /\ pc[w] = "announce"
     /\ ~frozen[w]
-    /\ LET rerun == progress = "intent" /\ Tool = "lookup"
+    /\ LET from == seen[w].progress
+           rerun == from = "intent" /\ Tool = "lookup"
        IN /\ pc' = [pc EXCEPT ![w] =
-                       CASE progress = "start" -> "model1"
-                         [] progress = "intent" -> IF rerun THEN "tool" ELSE "model2"
-                         [] progress \in {"result", "done"} -> "model2"]
+                       CASE from = "start" -> "model1"
+                         [] from = "intent" -> IF rerun THEN "tool" ELSE "model2"
+                         [] from \in {"result", "done"} -> "model2"]
           /\ runs' = IF rerun THEN runs + 1 ELSE runs
           \* then tool_start for a rerun
           /\ ui' = IF rerun THEN ui \o <<Line(w), Line(w)>> ELSE Append(ui, Line(w))
-    /\ UNCHANGED <<epoch, frozen, lease, progress, freezes, froze>>
+    /\ UNCHANGED <<epoch, frozen, lease, progress, freezes, froze, chain, seen>>
     /\ act' = [name |-> "Announce", w |-> w]
 
 \* The model asks for the tool. A call with effects starts only once its
@@ -155,7 +204,8 @@ Model1(w) ==
                           /\ pc' = [pc EXCEPT ![w] = "tool"]
                      ELSE /\ pc' = [pc EXCEPT ![w] = "stopped"]
                           /\ UNCHANGED progress
-    /\ UNCHANGED <<epoch, frozen, lease, freezes, froze>>
+    /\ chain' = IF Heads(w) THEN chain + 1 ELSE chain
+    /\ UNCHANGED <<epoch, frozen, lease, freezes, froze, seen>>
     /\ act' = [name |-> "Model1", w |-> w]
 
 \* The tool returns, and its result goes to the chain.
@@ -169,7 +219,8 @@ ToolEnd(w) ==
           ELSE /\ pc' = [pc EXCEPT ![w] = "stopped"]
                /\ MaybeLine(w)
                /\ UNCHANGED progress
-    /\ UNCHANGED <<epoch, frozen, lease, runs, freezes, froze>>
+    /\ chain' = IF Heads(w) THEN chain + 1 ELSE chain
+    /\ UNCHANGED <<epoch, frozen, lease, runs, freezes, froze, seen>>
     /\ act' = [name |-> "ToolEnd", w |-> w]
 
 \* The model answers; the turn ends and the worker lets the session go.
@@ -185,7 +236,8 @@ Model2(w) ==
           ELSE /\ pc' = [pc EXCEPT ![w] = "stopped"]
                /\ MaybeLine(w)
                /\ UNCHANGED <<progress, lease>>
-    /\ UNCHANGED <<epoch, frozen, runs, freezes, froze>>
+    /\ chain' = IF Heads(w) THEN chain + 1 ELSE chain
+    /\ UNCHANGED <<epoch, frozen, runs, freezes, froze, seen>>
     /\ act' = [name |-> "Model2", w |-> w]
 
 \* w freezes while it waits; its lease no longer counts as alive.
@@ -197,14 +249,14 @@ Freeze(w) ==
     /\ freezes' = freezes + 1
     /\ froze' = [froze EXCEPT ![w] = TRUE]
     /\ lease' = IF lease.holder = w THEN [lease EXCEPT !.live = FALSE] ELSE lease
-    /\ UNCHANGED <<pc, epoch, progress, runs, ui>>
+    /\ UNCHANGED <<pc, epoch, progress, runs, ui, chain, seen>>
     /\ act' = [name |-> "Freeze", w |-> w]
 
 \* w wakes and carries on from where it waited.
 Wake(w) ==
     /\ frozen[w]
     /\ frozen' = [frozen EXCEPT ![w] = FALSE]
-    /\ UNCHANGED <<pc, epoch, lease, progress, runs, ui, freezes, froze>>
+    /\ UNCHANGED <<pc, epoch, lease, progress, runs, ui, freezes, froze, chain, seen>>
     /\ act' = [name |-> "Wake", w |-> w]
 
 \* Shortly before its deadline, w's own timer stops it and cuts off the call
@@ -219,17 +271,20 @@ Deadline(w) ==
     /\ ~frozen[w]
     /\ IF Heads(w)
           THEN /\ ui' = Append(ui, Line(w))
+               /\ chain' = chain + 1
                /\ \/ /\ lease.epoch < MaxEpoch
                      /\ lease' = [holder |-> w, epoch |-> lease.epoch + 1, live |-> TRUE]
                      /\ epoch' = [epoch EXCEPT ![w] = lease.epoch + 1]
                      /\ pc' = [pc EXCEPT ![w] = "announce"]
                      /\ froze' = [froze EXCEPT ![w] = FALSE]
+                     \* it reads the log after its release and continues from there
+                     /\ seen' = [seen EXCEPT ![w] = [chain |-> chain + 1, progress |-> progress, epoch |-> lease.epoch]]
                   \/ /\ lease' = [lease EXCEPT !.holder = None, !.live = FALSE]
                      /\ pc' = [pc EXCEPT ![w] = "none"]
-                     /\ UNCHANGED <<epoch, froze>>
+                     /\ UNCHANGED <<epoch, froze, seen>>
           ELSE /\ pc' = [pc EXCEPT ![w] = "stopped"]
                /\ MaybeLine(w)
-               /\ UNCHANGED <<epoch, lease, froze>>
+               /\ UNCHANGED <<epoch, lease, froze, chain, seen>>
     /\ UNCHANGED <<frozen, progress, runs, freezes>>
     /\ act' = [name |-> "Deadline", w |-> w]
 
@@ -242,12 +297,12 @@ Expire(w) ==
     /\ Heads(w)
     /\ lease.live
     /\ lease' = [lease EXCEPT !.live = FALSE]
-    /\ UNCHANGED <<pc, epoch, frozen, progress, runs, ui, freezes, froze>>
+    /\ UNCHANGED <<pc, epoch, frozen, progress, runs, ui, freezes, froze, chain, seen>>
     /\ act' = [name |-> "Expire", w |-> w]
 
 Next ==
     \E w \in Workers :
-        \/ Claim(w) \/ Announce(w) \/ Model1(w) \/ ToolEnd(w) \/ Model2(w)
+        \/ Start(w) \/ Claim(w) \/ Announce(w) \/ Model1(w) \/ ToolEnd(w) \/ Model2(w)
         \/ Freeze(w) \/ Wake(w) \/ Deadline(w) \/ Expire(w)
 
 Spec == Init /\ [][Next]_vars

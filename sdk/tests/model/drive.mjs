@@ -11,11 +11,12 @@
 //
 // `./check.sh` model-checks the spec and writes graphs/<tool>.dot. Each walk
 // starts two agents, A and B, on one local() World directory. Every model
-// request and tool call waits until the driver releases it, so the driver
-// decides the interleaving: it performs the step the walk chose, waits for
-// the code to settle, reads back each worker's position, the tool runs, and
-// the epoch of every UI line, and moves to the successor state that matches.
-// A step the model has no matching successor for is a conformance failure.
+// request and tool call waits until the driver releases it, and so does each
+// worker's claim on the session, so the driver decides the interleaving: it
+// performs the step the walk chose, waits for the code to settle, reads back
+// each worker's position, the tool runs, and the epoch of every UI line, and
+// moves to the successor state that matches. A step the model has no
+// matching successor for is a conformance failure.
 import { strict as assert } from "node:assert";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -23,6 +24,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createFxAgent } from "../../node.js";
 import { local } from "../../durable/local.mjs";
+import { holdWrites } from "../hold-writes.mjs";
 
 const args = process.argv.slice(2);
 const option = (name, fallback) => {
@@ -186,6 +188,28 @@ const until = async (check, ms = stepTimeoutMs) => {
 };
 const sleep = (ms) => new Promise((resolveWait) => setTimeout(resolveWait, ms));
 
+// The queue as the driver runs it: a message the code asks to have delivered
+// again later, as a backstop, is not, so nothing runs that the driver did not
+// start. One handed back at a deadline still comes back at once.
+function withoutBackstops(durability) {
+  return {
+    ...durability,
+    async world() {
+      const world = await durability.world();
+      return new Proxy(world, {
+        get(target, key) {
+          const value = Reflect.get(target, key);
+          if (key !== "createQueueHandler") return typeof value === "function" ? value.bind(target) : value;
+          return (prefix, handler) => value.call(target, prefix, async (...args) => {
+            const result = await handler(...args);
+            return result?.timeoutSeconds > 0 ? undefined : result;
+          });
+        },
+      });
+    },
+  };
+}
+
 async function harness() {
   const dir = await mkdtemp(join(tmpdir(), "libfx-model-"));
   const requests = [];
@@ -194,6 +218,9 @@ async function harness() {
   const holders = { A: [], B: [] };
   const claimed = { A: null, B: null };
   const frozen = { A: false, B: false };
+  // Each worker's claims on the session: a holder's first lease waits until
+  // the driver lets it land.
+  const writes = {};
   let runs = 0;
   let sessionId = null;
   const remove = (list, entry) => {
@@ -202,6 +229,13 @@ async function harness() {
   };
   const agents = {};
   for (const w of Workers) {
+    const claims = new Set();
+    const [durability, held] = holdWrites(withoutBackstops(remote ? vercelStorage({ dir }) : local({ dir })), (entry) => {
+      if (entry.k !== "lease" || claims.has(entry.holder)) return false;
+      claims.add(entry.holder);
+      return true;
+    });
+    writes[w] = held;
     agents[w] = createFxAgent({
       backend,
       nativeAddon: addon,
@@ -234,7 +268,7 @@ async function harness() {
           });
         },
       }],
-      durability: remote ? vercelStorage({ dir }) : local({ dir }),
+      durability,
       onEvent: (event) => { if (event.type === "session.fenced") fenced[w] += 1; },
     });
   }
@@ -261,8 +295,10 @@ async function harness() {
     return lines;
   }
 
-  // Where each worker is, by what it waits on.
+  // Where each worker is, by what it waits on. A worker whose claim is held
+  // may already wait on its first model request.
   const position = (w, lines) => {
+    if (writes[w].held.length > 0) return "early";
     if (claimed[w] === null) return "none";
     if (fenced[w] > claimed[w].fenced) return "stopped";
     if (lines.some((line) => line.type === "turn_end" && line.epoch === claimed[w].epoch)) return "done";
@@ -272,6 +308,7 @@ async function harness() {
     return "busy";
   };
   const waiting = (w) => requests.some((entry) => entry.w === w) || calls.some((entry) => entry.w === w);
+  const newHolders = (before) => [...liveHolders].filter((holder) => !before.has(holder));
 
   async function observe() {
     const lines = await streamLines();
@@ -292,9 +329,9 @@ async function harness() {
   // One step of the model, done to the code.
   async function perform({ name, w }, expectedEpoch) {
     const stopped = () => claimed[w] !== null && fenced[w] > claimed[w].fenced;
-    if (name === "Claim") {
+    if (name === "Start") {
+      // w receives work for the session; its claim waits for the driver.
       const before = new Set(liveHolders);
-      claimed[w] = { fenced: fenced[w], epoch: expectedEpoch };
       if (!sessionId) {
         const turn = agents[w].session().prompt(`use ${tool}`, { messageId: "turn-1" });
         void turn.result.catch(() => {});
@@ -302,8 +339,23 @@ async function harness() {
       } else {
         void agents[w].session(sessionId).resume().result.catch(() => {});
       }
-      await until(() => waiting(w) || stopped());
-      holders[w] = [...liveHolders].filter((holder) => !before.has(holder));
+      await until(() => writes[w].held.length > 0);
+      holders[w] = newHolders(before);
+    } else if (name === "Claim") {
+      // w's claim lands, and the log says whether it counted. One that did
+      // goes on with the turn; a refused one leaves w to read the log again,
+      // and to claim again or let the message go.
+      const holder = writes[w].held.at(-1).holder;
+      const before = new Set(liveHolders);
+      await writes[w].releaseHeld();
+      if ((await agents[w][durableInternals].lastLease(sessionId))?.holder === holder) {
+        claimed[w] = { fenced: fenced[w], epoch: expectedEpoch };
+        await until(() => waiting(w) || stopped());
+      } else {
+        await until(() => writes[w].held.length > 0 || agents[w][durableInternals].liveWorkers() === 0);
+        holders[w] = newHolders(before);
+        claimed[w] = null;
+      }
     } else if (name === "Model1" || name === "Model2") {
       const request = requests.find((entry) => entry.w === w);
       assert.ok(request, `${w} has a model request to answer`);
@@ -329,7 +381,11 @@ async function harness() {
       const fencedBefore = fenced[w];
       agents[w][durableInternals].stopAtDeadline(sessionId);
       const reclaimed = () => [...liveHolders].some((holder) => !before.has(holder));
-      await until(() => (reclaimed() && waiting(w)) || fenced[w] > fencedBefore);
+      // The same message comes back to w, and its claim lands at once.
+      await until(() => {
+        if (writes[w].held.length > 0) writes[w].releaseHeld();
+        return (reclaimed() && waiting(w) && writes[w].held.length === 0) || fenced[w] > fencedBefore;
+      });
       if (reclaimed()) {
         claimed[w] = { fenced: fenced[w], epoch: expectedEpoch };
         holders[w] = [...liveHolders].filter((holder) => !before.has(holder));
@@ -340,6 +396,7 @@ async function harness() {
   }
 
   async function close() {
+    for (const w of Workers) writes[w].release();
     for (const entry of [...requests]) entry.answer([{ type: "error", errorText: "walk over" }]);
     for (const entry of [...calls]) entry.end();
     await Promise.race([Promise.all(Workers.map((w) => agents[w].close().catch(() => {}))), sleep(3000)]);

@@ -12,6 +12,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createFxAgent, memory } from "../node.js";
 import { foldSessionLog } from "../durable.js";
+import { holdWrites } from "./hold-writes.mjs";
 
 const durabilityKind = process.argv[2] || "memory";
 const engineBackend = process.argv[3] || "native";
@@ -66,8 +67,6 @@ function framesFor(prompt) {
 }
 
 const requests = [];
-let inFlight = 0;
-let maxInFlight = 0;
 const server = createServer((request, response) => {
   let body = "";
   request.setEncoding("utf8");
@@ -80,11 +79,8 @@ const server = createServer((request, response) => {
     }
     const prompt = JSON.parse(body).prompt;
     requests.push(prompt);
-    inFlight += 1;
-    maxInFlight = Math.max(maxInFlight, inFlight);
-    // Each answer takes a moment, so overlapping workers would overlap here.
+    // Each answer takes a moment, as a model's does.
     setTimeout(() => {
-      inFlight -= 1;
       response.writeHead(200, { "content-type": "text/event-stream" });
       response.end(framesFor(prompt).map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join("") + "data: [DONE]\n\n");
     }, 15);
@@ -288,7 +284,6 @@ test("two servers prompting one session run its turns one at a time, in one hist
   const two = createFxAgent(agentOptions(durability));
   const session = one.session();
   await session.prompt("first").result;
-  maxInFlight = 0;
   const id = session.id;
   const [a, b] = await Promise.all([
     collect(one.session(id).prompt("from one")),
@@ -296,13 +291,152 @@ test("two servers prompting one session run its turns one at a time, in one hist
   ]);
   assert.equal(a.result.stopReason, "end_turn");
   assert.equal(b.result.stopReason, "end_turn");
-  assert.equal(maxInFlight, 1, "only one worker ran the session at a time");
+  // Both workers may send a model request before either claim lands; only
+  // the one whose claim lands runs a turn, so the stream holds each turn
+  // whole, one after the other.
+  const lines = await readLines(one.session(id).stream(0), 30);
+  const order = [];
+  for (const line of lines) if (order.at(-1) !== line.messageId) order.push(line.messageId);
+  assert.equal(order.length, 3, `each turn's lines are together: ${lines.map((line) => `${line.type}:${line.messageId}`).join(" ")}`);
   const last = requests.at(-1);
   const users = userTexts(last);
   assert.equal(users[0], "first");
   assert.ok(users.includes("from one") && users.includes("from two"), "the later turn saw the earlier one");
   await one.close();
   await two.close();
+});
+
+test("a prompt's model request goes out before its claim lands, and nothing shows until it does", async () => {
+  const [durability, writes] = holdWrites(await durabilityFor(), (entry) => entry.k === "lease");
+  const agent = createFxAgent(agentOptions(durability));
+  const before = requests.length;
+  const turn = agent.session().prompt("hello");
+  const { sessionId } = await turn.accepted;
+  await writes.next();
+  await until(() => requests.length > before, "the model request while the lease is held");
+  // The model answered by now, but its turn has not shown or ended.
+  await new Promise((wait) => setTimeout(wait, 100 * timeScale));
+  assert.deepEqual(await readLines(agent.session(sessionId).stream(0), 1, 150), [], "nothing shows before the claim lands");
+  writes.release();
+  const { text, result } = await collect(turn);
+  assert.equal(text, "echo: hello");
+  assert.equal(result.stopReason, "end_turn");
+  assert.equal(requests.length - before, 1, "the turn sent one model request");
+  const lines = await readLines(agent.session(sessionId).stream(0), 3);
+  assert.deepEqual(lines.map((line) => line.type), ["turn_start", "text_delta", "turn_end"]);
+  await agent.close();
+});
+
+test("a claim another worker's write came before runs no tool and writes nothing", async () => {
+  const shared = await durabilityFor();
+  const [held, writes] = holdWrites(shared, (entry) => entry.k === "lease");
+  const events = [];
+  const first = createFxAgent(agentOptions(held, { onEvent: (event) => events.push(event.type) }));
+  const before = runs.length;
+  const turn = first.session().prompt("use lookup");
+  const { sessionId } = await turn.accepted;
+  await writes.next();
+  // The model asks for the tool while the first worker's claim is held.
+  await new Promise((wait) => setTimeout(wait, 150 * timeScale));
+  assert.equal(runs.length, before, "no tool runs before the claim lands");
+  // Another worker takes the session and runs the turn.
+  const second = createFxAgent(agentOptions(shared));
+  const resumed = await collect(second.session(sessionId).resume());
+  assert.equal(resumed.result.stopReason, "end_turn");
+  assert.equal(runs.length - before, 1);
+  // The first claim lands after it and counts for nothing.
+  writes.release();
+  const { result } = await collect(turn);
+  assert.equal(result.stopReason, "end_turn", "the first caller sees the turn the other worker ran");
+  // Closing waits for the first worker's delivery to finish.
+  await first.close();
+  assert.equal(runs.length - before, 1, "the tool ran once");
+  assert.ok(!events.includes("session.fenced") && !events.includes("session.error"), `a refused claim is neither fenced nor an error: ${events.join(", ")}`);
+  const lines = await readLines(second.session(sessionId).stream(0), 20);
+  assert.deepEqual(lines.filter((line) => line.type === "turn_start" || line.type === "turn_end" || line.type === "tool_start").map((line) => line.type), ["turn_start", "tool_start", "turn_end"]);
+  await second.close();
+});
+
+// A durability whose UI stream length reads wait until `open()`, so a turn's
+// view can open after the turn began.
+function lateLengthReads(durability) {
+  let open;
+  const opened = new Promise((resolveOpened) => { open = resolveOpened; });
+  if (typeof durability.create === "function") {
+    const create = durability.create;
+    return [{
+      ...durability,
+      create() {
+        const backend = create();
+        return {
+          ...backend,
+          async session(id) {
+            const log = await backend.session(id);
+            return { ...log, ui: { ...log.ui, length: async () => { await opened; return log.ui.length(); } } };
+          },
+        };
+      },
+    }, open];
+  }
+  return [{
+    ...durability,
+    async world() {
+      const world = await durability.world();
+      const streams = new Proxy(world.streams, {
+        get: (target, key) => (key === "getInfo"
+          ? async (...args) => { await opened; return target.getInfo(...args); }
+          : typeof target[key] === "function" ? target[key].bind(target) : target[key]),
+      });
+      return new Proxy(world, { get: (target, key) => (key === "streams" ? streams : typeof target[key] === "function" ? target[key].bind(target) : target[key]) });
+    },
+  }, open];
+}
+
+test("a turn's view that opens after the turn began still shows the whole turn", async () => {
+  const [durability, open] = lateLengthReads(await durabilityFor());
+  const held = gate("lookup");
+  const agent = createFxAgent(agentOptions(durability));
+  try {
+    const turn = agent.session().prompt("use lookup");
+    const { sessionId } = await turn.accepted;
+    // The turn has started and its call is running before the view knows
+    // where the stream is.
+    await held.started;
+    await until(async () => (await readLines(agent.session(sessionId).stream(0), 2, 100)).length === 2, "the turn's first lines");
+    open();
+    held.open();
+    const { text, types, result } = await collect(turn);
+    assert.equal(result.stopReason, "end_turn");
+    assert.ok(types.includes("tool_start") && types.includes("tool_end"), `the view shows the turn from its start: ${types.join(", ")}`);
+    assert.match(text, /^done: /);
+  } finally {
+    gates.delete("lookup");
+    await agent.close();
+  }
+});
+
+test("a prompt with the caller's messageId is accepted once it is sent, and a retry still answers from the log", async () => {
+  const [durability, open] = lateLengthReads(await durabilityFor());
+  const agent = createFxAgent(agentOptions(durability));
+  try {
+    const session = agent.session();
+    const turn = session.prompt("hello", { messageId: "sent-first" });
+    const accepted = await Promise.race([turn.accepted, new Promise((wait) => setTimeout(() => wait(null), 2000 * timeScale))]);
+    assert.ok(accepted, "accepted before its view reads where the stream is");
+    open();
+    const { text, result } = await collect(turn);
+    assert.equal(text, "echo: hello");
+    assert.equal(result.repeated, undefined);
+    const before = requests.length;
+    const again = await collect(session.prompt("hello", { messageId: "sent-first" }));
+    assert.equal(again.result.stopReason, "end_turn");
+    assert.equal(again.result.repeated, true);
+    await agent.close();
+    assert.equal(requests.length, before, "the retry ran nothing");
+  } finally {
+    open();
+    await agent.close();
+  }
 });
 
 test("a steer reaches the running turn at its next model request", async () => {

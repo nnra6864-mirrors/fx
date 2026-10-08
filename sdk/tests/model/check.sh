@@ -33,12 +33,17 @@ for tool in send lookup; do
     fi
     grep -E 'distinct states|depth of' "$work/$tool.log"
 done
-# Each witness must be violated: it shows the model reaches that state.
-# NoSelfStop breaks TwoActiveNeedsFreeze: without the self-stop, two workers
-# are active at once with no freeze at all.
-for witness in UiInOrder NoStaleShown NotTwoActive NoSelfStop; do
+# Each witness must break the invariant named after it: it shows the model
+# reaches that state. NoSelfStop breaks TwoActiveNeedsFreeze: without the
+# self-stop, two workers are active at once with no freeze at all.
+# NoClaimFence breaks EffectsAtMostOnce: a claim that counts on a stale read
+# continues the turn from before a call with effects started, and runs it
+# again.
+for pair in UiInOrder:UiInOrder NoStaleShown:NoStaleShown NotTwoActive:NotTwoActive \
+    NoSelfStop:TwoActiveNeedsFreeze NoClaimFence:EffectsAtMostOnce; do
+    witness="${pair%%:*}" invariant="${pair#*:}"
     if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/w-$witness" \
-        -config "Witness-$witness.cfg" DurableSession.tla 2>&1 | grep -q -E "Invariant ($witness|TwoActiveNeedsFreeze) is violated"; then
+        -config "Witness-$witness.cfg" DurableSession.tla 2>&1 | grep -q -E "Invariant $invariant is violated"; then
         echo "== witness $witness reached"
     else
         echo "== witness $witness NOT reached" >&2; status=1
