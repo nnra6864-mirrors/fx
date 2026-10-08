@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const ignored_dirs = @import("ignored_dirs.zig");
 const io_mod = @import("../shared/io.zig");
+const safe_git = @import("../shell_command/safe_git.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 
 const Allocator = std.mem.Allocator;
@@ -257,27 +258,7 @@ fn runGitRawList(
     }
 }
 
-fn trustedGitExecutable() ?[]const u8 {
-    const candidates = switch (builtin.os.tag) {
-        .windows => &[_][]const u8{
-            "C:\\Program Files\\Git\\cmd\\git.exe",
-            "C:\\Program Files\\Git\\bin\\git.exe",
-        },
-        else => &[_][]const u8{
-            "/usr/bin/git",
-            "/bin/git",
-            "/usr/local/bin/git",
-            "/opt/homebrew/bin/git",
-            "/opt/local/bin/git",
-            "/run/current-system/sw/bin/git",
-        },
-    };
-    for (candidates) |candidate| {
-        const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), candidate, .{ .follow_symlinks = true }) catch continue;
-        if (stat.kind == .file) return candidate;
-    }
-    return null;
-}
+const trustedGitExecutable = safe_git.trustedExecutable;
 
 fn runCancellable(
     alloc: Allocator,

@@ -4864,6 +4864,7 @@ test {
     _ = @import("core/shared/message.zig");
     _ = @import("core/shared/token_estimate.zig");
     _ = @import("core/shell_command/command_effect.zig");
+    _ = @import("core/shell_command/safe_git.zig");
     _ = @import("core/execution/router.zig");
     _ = @import("core/execution/command_runner.zig");
     _ = @import("core/permissions/direct_command.zig");

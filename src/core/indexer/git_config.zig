@@ -623,6 +623,7 @@ fn testRepo(arena: Allocator, tmp: *std.testing.TmpDir, repo_path: []const u8, b
     const head = try std.fmt.allocPrint(arena, "{s}/.git/HEAD", .{repo_path});
     try writeTestFile(tmp.dir, head, try std.fmt.allocPrint(arena, "ref: refs/heads/{s}\n", .{branch}));
     try tmp.dir.createDirPath(std.testing.io, try std.fmt.allocPrint(arena, "{s}/.git/objects", .{repo_path}));
+    try tmp.dir.createDirPath(std.testing.io, try std.fmt.allocPrint(arena, "{s}/.git/refs", .{repo_path}));
     try tmp.dir.createDirPath(std.testing.io, "home");
     const root = try io_mod.dirRealpathAlloc(arena, tmp.dir, ".");
     const layout = (try layout_mod.discover(arena, try std.fs.path.join(arena, &.{ root, repo_path }))).?;

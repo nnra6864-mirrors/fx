@@ -86,13 +86,20 @@ fn readGitFile(arena: Allocator, dir: []const u8, dot_git: []const u8) Allocator
 
 const GitDirs = struct { git_dir: []const u8, common_dir: []const u8 };
 
-/// A light form of git's is_git_directory: `HEAD` in the git directory and
-/// `objects` in the common directory, which `commondir` may relocate.
+/// git's is_git_directory: a valid `HEAD` in the git directory, and `objects`
+/// and `refs` directories in the common directory, which `commondir` may
+/// relocate. Discovery must accept exactly the directories git accepts, or git
+/// would walk past one fx stopped at and use another repository's config. A
+/// symlinked `HEAD`, which git accepts when it points into `refs/`, is
+/// rejected here; safe git then refuses because git and fx disagree.
 fn gitDirs(arena: Allocator, git_dir: []const u8) Allocator.Error!?GitDirs {
     var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), git_dir, .{}) catch return null;
     defer dir.close(io_mod.getIo());
-    const head = dir.statFile(io_mod.getIo(), "HEAD", .{ .follow_symlinks = false }) catch return null;
-    if (head.kind != .file) return null;
+    const head = switch (try bounded_read.readAt(arena, dir, "HEAD", max_metadata_bytes)) {
+        .content => |bytes| bytes,
+        .missing, .unavailable => return null,
+    };
+    if (!validHead(head[0..@min(head.len, max_head_bytes)])) return null;
     const common_dir = switch (try bounded_read.readAt(arena, dir, "commondir", max_metadata_bytes)) {
         .content => |bytes| blk: {
             const raw = std.mem.trimEnd(u8, bytes, " \t\r\n");
@@ -102,10 +109,32 @@ fn gitDirs(arena: Allocator, git_dir: []const u8) Allocator.Error!?GitDirs {
         .missing => git_dir,
         .unavailable => return null,
     };
-    const objects = try std.fs.path.join(arena, &.{ common_dir, "objects" });
-    const objects_stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), objects, .{ .follow_symlinks = true }) catch return null;
-    if (objects_stat.kind != .directory) return null;
+    for ([_][]const u8{ "objects", "refs" }) |name| {
+        const path = try std.fs.path.join(arena, &.{ common_dir, name });
+        const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{ .follow_symlinks = true }) catch return null;
+        if (stat.kind != .directory) return null;
+    }
     return .{ .git_dir = git_dir, .common_dir = common_dir };
+}
+
+/// git reads at most 255 bytes of `HEAD` when validating it.
+const max_head_bytes: usize = 255;
+
+/// git's validate_headref for a regular file: a symbolic ref into `refs/`,
+/// or a detached object id in either hash format.
+fn validHead(content: []const u8) bool {
+    if (content.len < 4) return false;
+    if (std.mem.startsWith(u8, content, "ref:")) {
+        const target = std.mem.trimStart(u8, content["ref:".len..], " \t\r\n\x0b\x0c");
+        if (std.mem.startsWith(u8, target, "refs/")) return true;
+    }
+    return hexPrefix(content, 40) or hexPrefix(content, 64);
+}
+
+fn hexPrefix(content: []const u8, len: usize) bool {
+    if (content.len < len) return false;
+    for (content[0..len]) |byte| if (!std.ascii.isHex(byte)) return false;
+    return true;
 }
 
 /// Returns the branch `HEAD` points at (`refs/heads/<name>`), or null when
@@ -131,9 +160,11 @@ fn makeTestRepo(dir: std.Io.Dir, git_dir: []const u8) !void {
     const head = try std.fs.path.join(std.testing.allocator, &.{ git_dir, "HEAD" });
     defer std.testing.allocator.free(head);
     try writeTestFile(dir, head, "ref: refs/heads/main\n");
-    const objects = try std.fs.path.join(std.testing.allocator, &.{ git_dir, "objects" });
-    defer std.testing.allocator.free(objects);
-    try dir.createDirPath(std.testing.io, objects);
+    for ([_][]const u8{ "objects", "refs" }) |name| {
+        const path = try std.fs.path.join(std.testing.allocator, &.{ git_dir, name });
+        defer std.testing.allocator.free(path);
+        try dir.createDirPath(std.testing.io, path);
+    }
 }
 
 test "layout discovery finds the innermost repository and the workspace prefix" {
@@ -199,5 +230,35 @@ test "layout discovery rejects bad gitdir files and skips non-git .git directori
     // that discovery does not stop inside it.
     if (try discover(arena, try std.fs.path.join(arena, &.{ root, "plain/sub" }))) |enclosing| {
         try std.testing.expect(!std.mem.startsWith(u8, enclosing.worktree_root, root));
+    }
+}
+
+test "layout discovery accepts exactly the git directories git accepts" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeTestRepo(tmp.dir, "outer/.git");
+    // Without `refs`, git skips the inner directory and uses the outer one.
+    try writeTestFile(tmp.dir, "outer/no-refs/.git/HEAD", "ref: refs/heads/main\n");
+    try tmp.dir.createDirPath(std.testing.io, "outer/no-refs/.git/objects");
+    try makeTestRepo(tmp.dir, "outer/bad-head/.git");
+    try writeTestFile(tmp.dir, "outer/bad-head/.git/HEAD", "ref: heads/main\n");
+    try makeTestRepo(tmp.dir, "outer/detached/.git");
+    try writeTestFile(tmp.dir, "outer/detached/.git/HEAD", "0123456789abcdef0123456789abcdef01234567\n");
+    try makeTestRepo(tmp.dir, "outer/spaced/.git");
+    try writeTestFile(tmp.dir, "outer/spaced/.git/HEAD", "ref:\t refs/heads/main\n");
+    const root = try io_mod.dirRealpathAlloc(arena, tmp.dir, ".");
+
+    const cases = [_]struct { start: []const u8, worktree: []const u8 }{
+        .{ .start = "outer/no-refs", .worktree = "outer" },
+        .{ .start = "outer/bad-head", .worktree = "outer" },
+        .{ .start = "outer/detached", .worktree = "outer/detached" },
+        .{ .start = "outer/spaced", .worktree = "outer/spaced" },
+    };
+    for (cases) |case| {
+        const found = (try discover(arena, try std.fs.path.join(arena, &.{ root, case.start }))).?;
+        try std.testing.expectEqualStrings(try std.fs.path.join(arena, &.{ root, case.worktree }), found.worktree_root);
     }
 }

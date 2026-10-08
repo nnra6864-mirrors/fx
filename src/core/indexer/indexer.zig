@@ -12,26 +12,30 @@ const layout = @import("layout.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const FilterNames = struct {
-    /// The slice and every name are owned by the allocator passed to
-    /// `repoFilterNames`.
+pub const RepoFilters = struct {
+    /// Absolute git directory of the repository containing the root, found
+    /// the way git discovers one, or null outside a repository.
+    git_dir: ?[]const u8,
+    /// Filter driver names with a `clean`, `smudge` or `process` command.
     names: []const []const u8,
 
-    pub fn deinit(self: FilterNames, alloc: Allocator) void {
+    /// Frees memory owned by the allocator passed to `repoFilters`.
+    pub fn deinit(self: RepoFilters, alloc: Allocator) void {
+        if (self.git_dir) |git_dir| alloc.free(git_dir);
         for (self.names) |name| alloc.free(name);
         alloc.free(self.names);
     }
 };
 
-pub const RepoFilterNamesError = error{ OutOfMemory, RepoConfigUnavailable };
+pub const RepoFiltersError = error{ OutOfMemory, RepoConfigUnavailable };
 
-/// Returns every filter driver name with a `clean`, `smudge` or `process`
-/// command in the repository's own config: `config`, `config.worktree` and
-/// the files they include, counting every `includeIf` as included so no
-/// condition can hide a driver. Empty outside a git repository. A repository
-/// config file that cannot be read within bounds, a malformed one, or an
-/// invalid `.git` file fails closed with `error.RepoConfigUnavailable`.
-pub fn repoFilterNames(alloc: Allocator, workspace_root: []const u8) RepoFilterNamesError!FilterNames {
+/// Finds the repository containing the absolute `workspace_root` and every
+/// filter driver its own config defines: `config`, `config.worktree` and the
+/// files they include, counting every `includeIf` as included so no condition
+/// can hide a driver. A repository config file that cannot be read within
+/// bounds, a malformed one, or an invalid `.git` file fails closed with
+/// `error.RepoConfigUnavailable`.
+pub fn repoFilters(alloc: Allocator, workspace_root: []const u8) RepoFiltersError!RepoFilters {
     if (!std.fs.path.isAbsolute(workspace_root)) return error.RepoConfigUnavailable;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -54,6 +58,8 @@ pub fn repoFilterNames(alloc: Allocator, workspace_root: []const u8) RepoFilterN
     }
 
     const names = try git_config.filterDriverNames(arena, loaded);
+    const git_dir: ?[]const u8 = if (found) |repository| try alloc.dupe(u8, repository.git_dir) else null;
+    errdefer if (git_dir) |path| alloc.free(path);
     const owned = try alloc.alloc([]const u8, names.len);
     var copied: usize = 0;
     errdefer {
@@ -64,7 +70,7 @@ pub fn repoFilterNames(alloc: Allocator, workspace_root: []const u8) RepoFilterN
         owned[copied] = try alloc.dupe(u8, name);
         copied += 1;
     }
-    return .{ .names = owned };
+    return .{ .git_dir = git_dir, .names = owned };
 }
 
 test {
@@ -81,30 +87,38 @@ fn writeTestFile(dir: std.Io.Dir, path: []const u8, content: []const u8) !void {
     try dir.writeFile(std.testing.io, .{ .sub_path = path, .data = content });
 }
 
-test "repoFilterNames returns repository drivers and fails closed on unreadable config" {
+fn makeTestRepo(dir: std.Io.Dir, name: []const u8) !void {
+    var buffer: [64]u8 = undefined;
+    try writeTestFile(dir, try std.fmt.bufPrint(&buffer, "{s}/.git/HEAD", .{name}), "ref: refs/heads/main\n");
+    try dir.createDirPath(std.testing.io, try std.fmt.bufPrint(&buffer, "{s}/.git/objects", .{name}));
+    try dir.createDirPath(std.testing.io, try std.fmt.bufPrint(&buffer, "{s}/.git/refs", .{name}));
+}
+
+test "repoFilters returns the repository and its drivers and fails closed on unreadable config" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try writeTestFile(tmp.dir, "repo/.git/HEAD", "ref: refs/heads/main\n");
-    try tmp.dir.createDirPath(std.testing.io, "repo/.git/objects");
+    try makeTestRepo(tmp.dir, "repo");
     try writeTestFile(tmp.dir, "repo/.git/config", "[includeIf \"gitdir:/nowhere/\"]\npath = extra\n");
     try writeTestFile(tmp.dir, "repo/.git/extra", "[filter \"x\"]\nclean = /tmp/run-me\n");
     try tmp.dir.createDirPath(std.testing.io, "repo/src");
-    try writeTestFile(tmp.dir, "bad/.git/HEAD", "ref: refs/heads/main\n");
-    try tmp.dir.createDirPath(std.testing.io, "bad/.git/objects");
+    try makeTestRepo(tmp.dir, "bad");
     try tmp.dir.createDirPath(std.testing.io, "bad/.git/config");
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
 
     const repo_src = try std.fs.path.join(alloc, &.{ root, "repo/src" });
     defer alloc.free(repo_src);
-    const names = try repoFilterNames(alloc, repo_src);
-    defer names.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), names.names.len);
-    try std.testing.expectEqualStrings("x", names.names[0]);
+    const filters = try repoFilters(alloc, repo_src);
+    defer filters.deinit(alloc);
+    const expected_git_dir = try std.fs.path.join(alloc, &.{ root, "repo/.git" });
+    defer alloc.free(expected_git_dir);
+    try std.testing.expectEqualStrings(expected_git_dir, filters.git_dir.?);
+    try std.testing.expectEqual(@as(usize, 1), filters.names.len);
+    try std.testing.expectEqualStrings("x", filters.names[0]);
 
     const bad = try std.fs.path.join(alloc, &.{ root, "bad" });
     defer alloc.free(bad);
-    try std.testing.expectError(error.RepoConfigUnavailable, repoFilterNames(alloc, bad));
-    try std.testing.expectError(error.RepoConfigUnavailable, repoFilterNames(alloc, "relative"));
+    try std.testing.expectError(error.RepoConfigUnavailable, repoFilters(alloc, bad));
+    try std.testing.expectError(error.RepoConfigUnavailable, repoFilters(alloc, "relative"));
 }

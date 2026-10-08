@@ -85,6 +85,7 @@ test "repository-wide ignore sources load in git's precedence and report unreada
     defer tmp.cleanup();
     try writeTestFile(tmp.dir, "repo/.git/HEAD", "ref: refs/heads/main\n");
     try tmp.dir.createDirPath(std.testing.io, "repo/.git/objects");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.git/refs");
     try writeTestFile(tmp.dir, "repo/.git/info/exclude", "!keep.tmp\n");
     try writeTestFile(tmp.dir, "global-ignore", "*.tmp\n");
     const root = try io_mod.dirRealpathAlloc(arena, tmp.dir, ".");
