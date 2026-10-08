@@ -453,6 +453,10 @@ function logEntryOf(event) {
 const missingRun = (error) => error?.status === 404 || /not found|does not exist|ENOENT/i.test(String(error?.message ?? ""));
 // Tries for a failed UI stream read that is not a missing stream.
 const streamReadRetries = 5;
+// How often a viewer looks for a session stream that does not exist yet,
+// and for how long before it backs off.
+const missingStreamPollMs = 50;
+const missingStreamFastMs = 2000;
 
 // Events a session-log read lists per page: the first page, then the rest.
 const firstPageEvents = 10;
@@ -642,9 +646,10 @@ function createWorldBackend(world, { name, reserveMs, pollMs, alive, holderInfo,
           read(from) {
             let reader = null;
             let cancelled = false;
+            const opened = Date.now();
             return new ReadableStream({
               async pull(controller) {
-                for (let delay = 50, failures = 0; !reader; delay = Math.min(delay * 2, 1000)) {
+                for (let delay = missingStreamPollMs, failures = 0; !reader;) {
                   if (cancelled) return;
                   try {
                     reader = (await world.streams.get(runId, uiStreamOf(runId), from)).getReader();
@@ -652,11 +657,15 @@ function createWorldBackend(world, { name, reserveMs, pollMs, alive, holderInfo,
                     // A stream nobody wrote yet appears with the turn's first
                     // event; any other failure gets a few tries, then ends
                     // the read, so its viewer hears of it.
-                    if (!missingRun(error) && ++failures > streamReadRetries) {
+                    const missing = missingRun(error);
+                    if (!missing && ++failures > streamReadRetries) {
                       controller.error(error);
                       return;
                     }
                     await new Promise((resolve) => setTimeout(resolve, delay));
+                    // A new session's stream appears within moments of its
+                    // first prompt, so it is looked for often at first.
+                    delay = missing && Date.now() - opened < missingStreamFastMs ? missingStreamPollMs : Math.min(delay * 2, 1000);
                   }
                 }
                 const { value, done } = await reader.read();
@@ -982,6 +991,8 @@ class SessionWorker {
     });
     const log = gatedLog(raw, ready, () => failed);
     let chain = ready;
+    // The turns a record this worker stored started.
+    const started = new Set();
     // Every chained entry, the harness's records included, continues the
     // newest one this worker wrote.
     const chained = (entry) => {
@@ -989,6 +1000,7 @@ class SessionWorker {
         if (failed) throw failed;
         try {
           head = await log.append({ ...entry, a: head });
+          for (const mark of entry.marks ?? []) if (typeof mark.start === "string") started.add(mark.start);
           return head;
         } catch (error) {
           failed = error;
@@ -1215,17 +1227,19 @@ class SessionWorker {
           return unusable(outcome.stopped);
         }
         const { result } = outcome;
-        state = this.fold(await log.read());
-        if (fresh && !failed && !state.consumed.has(messageId)) {
+        if (fresh && !failed && !started.has(messageId)) {
           // A turn that ended before writing a record, such as a prompt the
           // harness refused or one a cancel stopped first, is done too. The
           // log says so before its viewers hear it ended, so a retry that
           // reads the log finds it ended.
-          await log.append({ k: "ended", messageId });
           state = this.fold(await log.read());
+          if (!state.consumed.has(messageId)) await log.append({ k: "ended", messageId });
         }
+        // The turn's records have landed, so its viewers hear it ended now;
+        // the log is read after, for what comes next.
         ui.push({ type: "turn_end", messageId, stopReason: result.stopReason, usage: result.usage ?? {}, ...(result.error ? { error: result.error } : {}) });
         await ui.settle();
+        state = this.fold(await log.read());
         if (!fresh && !failed && harness.openTurn?.id === messageId) {
           // A harness that leaves a turn open after it ended would run it
           // again forever; the worker stops instead.
@@ -1436,8 +1450,10 @@ function turnView({ messageId, resumeRequest = null, start }) {
   };
   void (async () => {
     try {
-      const { log, from, settled, attaching, endWithinMs } = await start();
-      repeated = settled?.repeated === true || endWithinMs !== undefined;
+      const { log, from, settled, attaching, endWithinMs, unsure } = await start();
+      // A turn whose end this view finds after its own start may be the
+      // message's first run, so only an end found before it is a repeat.
+      repeated = settled?.repeated === true || (endWithinMs !== undefined && !unsure);
       if (settled) {
         // A turn that already ended still tells a viewer how, so a route
         // returning `readable` sends its outcome.
@@ -1681,6 +1697,29 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
               const log = await created.session(sessionId);
               let attaching = type === "resume";
               let from = null;
+              if (retried && !aborted) {
+                // The viewer's start is read before the message is queued, so
+                // every line this message's own turn writes comes after it,
+                // and an end for this id before it can only be from a turn
+                // this id already ran. The log, for that answer, is read
+                // alongside the one queue send.
+                from = await log.ui.length();
+                const [state] = await Promise.all([
+                  log.read().then(foldSessionLog),
+                  send({ type, messageId, ...(input === undefined ? {} : { input }) }).then(() => accept.resolve({ messageId, sessionId })),
+                ]);
+                // One still waiting or running: follow it. One the log does
+                // not know yet is this send's own.
+                if ((state.openTurn?.id === messageId && !state.failed.has(messageId)) || (state.inputKeys.has(`prompt:${messageId}`) && !state.consumed.has(messageId))) {
+                  return { log, from, attaching: true };
+                }
+                if (!state.consumed.has(messageId)) return { log, from, attaching: false };
+                const ended = await turnEndIn(log, messageId, from);
+                if (ended) return { settled: { ...ended, repeated: true } };
+                // Either this send's own turn already ended, its end after
+                // `from`, or a turn this id ran before never wrote its end.
+                return { log, from, attaching: true, endWithinMs: retryEndWaitMs, unsure: true };
+              }
               if (retried) {
                 // A turn this id already ran answers from the log, without
                 // queueing it again. The viewer's start is read first, so a

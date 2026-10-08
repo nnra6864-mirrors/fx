@@ -171,6 +171,96 @@ const listingsOf = (durability) => {
   }, listed];
 };
 
+// A memory() durability whose session logs the test can reach into: `hold`
+// holds the next log read until `release`, and `onAppend`, `slowReads` and
+// `onUiWrite` watch or slow the rest.
+const probeLogs = (durability) => {
+  const probe = { armed: false, held: null, reached: null, slowReadsMs: 0, onAppend: null, onUiWrite: null };
+  probe.hold = () => {
+    probe.armed = true;
+    let reached;
+    probe.reached = new Promise((resolve) => { reached = resolve; });
+    probe.held = new Promise((resolve) => { probe.release = resolve; });
+    probe.arrive = reached;
+  };
+  const create = durability.create;
+  const wrapped = new WeakMap();
+  return [{
+    ...durability,
+    create() {
+      const backend = create();
+      if (!wrapped.has(backend)) {
+        wrapped.set(backend, {
+          ...backend,
+          async session(id) {
+            const log = await backend.session(id);
+            return {
+              ...log,
+              async read() {
+                if (probe.armed) {
+                  probe.armed = false;
+                  probe.arrive();
+                  await probe.held;
+                }
+                if (probe.slowReadsMs) await new Promise((resolve) => setTimeout(resolve, probe.slowReadsMs));
+                return log.read();
+              },
+              async append(entry) {
+                const cursor = await log.append(entry);
+                probe.onAppend?.(entry);
+                return cursor;
+              },
+              ui: {
+                ...log.ui,
+                async write(lines) {
+                  probe.onUiWrite?.(lines);
+                  return log.ui.write(lines);
+                },
+              },
+            };
+          },
+        });
+      }
+      return wrapped.get(backend);
+    },
+  }, probe];
+};
+
+// A World durability whose session streams answer "not found" until their
+// first write, as Vercel's World does; `firstWrite` says when that was.
+const streamsAppearOnWrite = (durability) => {
+  const seen = { firstWrite: null };
+  const bound = (target, key) => {
+    const value = Reflect.get(target, key);
+    return typeof value === "function" ? value.bind(target) : value;
+  };
+  return [{
+    ...durability,
+    async world() {
+      const world = await durability.world();
+      const streams = new Proxy(world.streams, {
+        get(target, key) {
+          const value = Reflect.get(target, key);
+          if (key === "write" || key === "writeMulti") {
+            return async (...args) => {
+              seen.firstWrite ??= Date.now();
+              return value.apply(target, args);
+            };
+          }
+          if (key === "get") {
+            return async (...args) => {
+              if (seen.firstWrite === null) throw Object.assign(new Error("stream not found"), { status: 404 });
+              return value.apply(target, args);
+            };
+          }
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      return new Proxy(world, { get: (target, key) => (key === "streams" ? streams : bound(target, key)) });
+    },
+  }, seen];
+};
+
 // A memory() durability whose queue counts as outliving the process.
 const queueOutlivesProcess = (durability) => {
   const create = durability.create;
@@ -490,6 +580,76 @@ if (durabilityKind !== "memory") {
     assert.equal(text, "echo: one more");
     assert.ok(listed.length > 0, "the turn read its log");
     assert.ok(Math.max(...listed) <= 10, `each read stopped at the newest checkpoint within one page: ${listed.join(", ")}`);
+    await agent.close();
+  });
+}
+
+if (durabilityKind === "memory") {
+  test("a prompt with a messageId is accepted after its one send, and its first run is no repeat", async () => {
+    const [durability, probe] = probeLogs(await durabilityFor());
+    const agent = createFxAgent(agentOptions(durability));
+    const session = agent.session();
+    assert.equal((await session.prompt("before").result).stopReason, "end_turn");
+    // The route's check of the log is held; the prompt is accepted anyway.
+    probe.hold();
+    const turn = session.prompt("first try", { messageId: "first-try" });
+    await probe.reached;
+    await Promise.race([
+      turn.accepted,
+      new Promise((_, fail) => setTimeout(() => fail(new Error("accepted waited for the log check")), 2000 * timeScale)),
+    ]);
+    // The turn runs to its end while the check is held, so the check finds
+    // it already ended.
+    await until(async () => (await readLines(session.stream(0), 64, 100)).some((line) => line.type === "turn_end" && line.messageId === "first-try"), "the turn's end");
+    probe.release();
+    const { text, result } = await collect(turn);
+    assert.equal(text, "echo: first try");
+    assert.equal(result.stopReason, "end_turn");
+    assert.notEqual(result.repeated, true, "a message's first run is no repeat");
+    // A real retry still answers from the turn that ran.
+    const again = await session.prompt("first try", { messageId: "first-try" }).result;
+    assert.equal(again.repeated, true);
+    await agent.close();
+  });
+
+  test("a turn's end shows once its records land, before the worker reads the log again", async () => {
+    const [durability, probe] = probeLogs(await durabilityFor());
+    let endRecord = null;
+    let endLine = null;
+    probe.onAppend = (entry) => {
+      if (entry.k === "record" && (entry.marks ?? []).some((mark) => mark.end === true) && endRecord === null) {
+        endRecord = Date.now();
+        probe.slowReadsMs = 400;
+      }
+    };
+    probe.onUiWrite = (lines) => {
+      if (endLine === null && lines.some((line) => JSON.parse(line).type === "turn_end")) endLine = Date.now();
+    };
+    const agent = createFxAgent(agentOptions(durability));
+    const { text } = await collect(agent.session().prompt("hello"));
+    assert.equal(text, "echo: hello");
+    assert.ok(endRecord !== null && endLine !== null, "the turn stored its end and showed it");
+    assert.ok(endLine - endRecord < 200, `the end showed ${endLine - endRecord} ms after its record landed`);
+    probe.slowReadsMs = 0;
+    await agent.close();
+  });
+}
+
+if (durabilityKind !== "memory") {
+  test("a new session's first line reaches its viewer moments after it is written", async () => {
+    const [appearing, seen] = streamsAppearOnWrite(await durabilityFor());
+    const [durability, writes] = holdWrites(appearing, (entry) => entry.k === "lease");
+    const agent = createFxAgent(agentOptions(durability));
+    const turn = agent.session().prompt("hello");
+    await writes.next();
+    // The viewer has looked for the session's stream for a while before
+    // the claim lands and the first line is written.
+    await new Promise((wait) => setTimeout(wait, 900 * timeScale));
+    writes.release();
+    let firstSeen = null;
+    for await (const _event of turn) firstSeen ??= Date.now();
+    assert.ok(seen.firstWrite !== null && firstSeen !== null);
+    assert.ok(firstSeen - seen.firstWrite < 250 * timeScale, `the first line arrived ${firstSeen - seen.firstWrite} ms after it was written`);
     await agent.close();
   });
 }
