@@ -8,9 +8,14 @@
 //   await writes.next();          // a write is held
 //   await writes.releaseHeld();   // the held ones go out, and settle
 //   writes.release();             // every held and later one goes out
+//
+// With `landFirst`, a held write lands at once and only its result waits, so
+// the log holds it before its worker hears so. With `unreported`, a held
+// memory() write the chain refuses resolves as if it landed, as a World that
+// takes a write without reporting a competing one would.
 const decoder = new TextDecoder();
 
-export function holdWrites(durability, held) {
+export function holdWrites(durability, held, { landFirst = false, unreported = false } = {}) {
   const waiting = [];
   const arrivals = [];
   let open = false;
@@ -27,9 +32,17 @@ export function holdWrites(durability, held) {
     return done;
   };
   const after = async (entry, write) => {
+    if (landFirst) {
+      const landed = await write();
+      (await pause(entry))();
+      return landed;
+    }
     const done = await pause(entry);
     try {
       return await write();
+    } catch (error) {
+      if (unreported && error?.code === "FX_FENCED" && held(entry)) return entry.a;
+      throw error;
     } finally {
       done();
     }

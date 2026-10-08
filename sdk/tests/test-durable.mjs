@@ -357,6 +357,60 @@ test("a claim another worker's write came before runs no tool and writes nothing
   await second.close();
 });
 
+test("an early claim another worker took over before its check runs no tool and is fenced", async () => {
+  const shared = await durabilityFor();
+  const [held, writes] = holdWrites(shared, (entry) => entry.k === "lease", { landFirst: true });
+  const events = [];
+  const first = createFxAgent(agentOptions(held, { onEvent: (event) => events.push(event.type) }));
+  const before = runs.length;
+  const turn = first.session().prompt("use lookup");
+  const { sessionId } = await turn.accepted;
+  // The first worker's lease is in the log, but the worker has not heard so.
+  await writes.next();
+  // The platform gives up on it, and another worker takes the session over
+  // from its lease and runs the turn.
+  const holders = globalThis[Symbol.for("libfx.liveHolders")];
+  for (const holder of [...holders]) holders.delete(holder);
+  const second = createFxAgent(agentOptions(shared));
+  const resumed = await collect(second.session(sessionId).resume());
+  assert.equal(resumed.result.stopReason, "end_turn");
+  assert.equal(runs.length - before, 1);
+  // The first worker hears its lease landed, and its check finds the takeover.
+  writes.release();
+  const { result } = await collect(turn);
+  assert.equal(result.stopReason, "end_turn", "the first caller sees the turn the other worker ran");
+  await first.close();
+  assert.equal(runs.length - before, 1, "the tool ran once");
+  assert.ok(events.includes("session.fenced") && !events.includes("session.error"), `a worker taken over is fenced: ${events.join(", ")}`);
+  const lines = await readLines(second.session(sessionId).stream(0), 20);
+  assert.deepEqual(lines.filter((line) => line.type === "turn_start" || line.type === "turn_end" || line.type === "tool_start").map((line) => line.type), ["turn_start", "tool_start", "turn_end"]);
+  await second.close();
+});
+
+if (durabilityKind === "memory") {
+  test("an early claim whose log hid a competing claim runs no tool and writes nothing", async () => {
+    const shared = await durabilityFor();
+    const [held, writes] = holdWrites(shared, (entry) => entry.k === "lease", { unreported: true });
+    const events = [];
+    const first = createFxAgent(agentOptions(held, { onEvent: (event) => events.push(event.type) }));
+    const before = runs.length;
+    const turn = first.session().prompt("use lookup");
+    const { sessionId } = await turn.accepted;
+    await writes.next();
+    const second = createFxAgent(agentOptions(shared));
+    const resumed = await collect(second.session(sessionId).resume());
+    assert.equal(resumed.result.stopReason, "end_turn");
+    // The chain refuses the first claim, but its log reports it landed.
+    writes.release();
+    const { result } = await collect(turn);
+    assert.equal(result.stopReason, "end_turn", "the first caller sees the turn the other worker ran");
+    await first.close();
+    assert.equal(runs.length - before, 1, "the tool ran once");
+    assert.ok(!events.includes("session.fenced") && !events.includes("session.error"), `a refused claim is neither fenced nor an error: ${events.join(", ")}`);
+    await second.close();
+  });
+}
+
 test("a steer reaches the running turn at its next model request", async () => {
   const agent = createFxAgent(agentOptions(await durabilityFor()));
   const held = gate("lookup");

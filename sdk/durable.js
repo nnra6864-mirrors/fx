@@ -885,8 +885,9 @@ class SessionWorker {
   // Claims the session where `state` read it, with a lease that continues
   // the chain there, and runs it. With `early`, what `earlyStart` returned,
   // the message's input is written with the lease and the next turn starts
-  // before either lands. Returns what run() returns, or "refused" when
-  // another worker's write came before the claim.
+  // before either lands. Returns what run() returns, "refused" when another
+  // worker's write came before the claim, or "fenced" when another worker
+  // took the session over from an early claim before it was checked.
   async claim(log, state, deadline, early) {
     // Claimed before the first await, so a delivery that arrives meanwhile
     // sees the session running here.
@@ -914,7 +915,12 @@ class SessionWorker {
         // checked against the log, as run() checks one taken first.
         try {
           const now = this.fold(await log.read());
-          return { head, error: now.lastLease?.holder === this.holder ? null : new FencedError(`another worker continued session ${this.sessionId}`) };
+          if (now.lastLease?.holder === this.holder) return { head, error: null };
+          // A later epoch took the session over from this lease; the same
+          // epoch forked from the entry this one continued, so this claim
+          // never counted.
+          const fenced = new FencedError(`another worker continued session ${this.sessionId}`);
+          return { head, error: now.lastEpoch > lease.epoch ? Object.assign(fenced, { takeover: true }) : fenced };
         } catch (readError) {
           return { head, error: readError };
         }
@@ -929,10 +935,10 @@ class SessionWorker {
       if (settled.error === null) return outcome;
       // A claim that failed counts for nothing, whatever its turn did: it
       // wrote nothing and showed nothing. A fenced one leaves the delivery
-      // to read the log and try again; after any other failure the same
-      // message runs the session again shortly, once a lease that landed is
-      // let go.
-      if (isFenced(settled.error)) return "refused";
+      // to read the log and try again, unless another worker took the
+      // session over from it; after any other failure the same message runs
+      // the session again shortly, once a lease that landed is let go.
+      if (isFenced(settled.error)) return settled.error.takeover ? "fenced" : "refused";
       this.agent.emit("session.error", { sessionId: this.sessionId, error: errorSummary(settled.error) });
       if (settled.head !== null) await log.append({ k: "release", a: settled.head, holder: this.holder }).catch(() => {});
       return "failed";
