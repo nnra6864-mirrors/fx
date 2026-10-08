@@ -145,6 +145,19 @@ async function durabilityFor(options = {}) {
   dirs.push(dir);
   return durabilityAt(dir, options);
 }
+// A memory() durability whose queue counts as outliving the process.
+const queueOutlivesProcess = (durability) => {
+  const create = durability.create;
+  const wrapped = new WeakMap();
+  return {
+    ...durability,
+    create() {
+      const backend = create();
+      if (!wrapped.has(backend)) wrapped.set(backend, { ...backend, queueDurable: true });
+      return wrapped.get(backend);
+    },
+  };
+};
 const agentOptions = (durability, extra = {}) => ({
   backend: engineBackend,
   nativeAddon: addon,
@@ -357,7 +370,7 @@ test("a claim another worker's write came before runs no tool and writes nothing
   await second.close();
 });
 
-test("an early claim another worker took over before its check runs no tool and is fenced", async () => {
+test("an early claim another worker took over before its check runs no tool and writes nothing", async () => {
   const shared = await durabilityFor();
   const [held, writes] = holdWrites(shared, (entry) => entry.k === "lease", { landFirst: true });
   const events = [];
@@ -375,13 +388,13 @@ test("an early claim another worker took over before its check runs no tool and 
   const resumed = await collect(second.session(sessionId).resume());
   assert.equal(resumed.result.stopReason, "end_turn");
   assert.equal(runs.length - before, 1);
-  // The first worker hears its lease landed, and its check finds the takeover.
+  // The first worker hears its lease landed, and its check refuses the claim.
   writes.release();
   const { result } = await collect(turn);
   assert.equal(result.stopReason, "end_turn", "the first caller sees the turn the other worker ran");
   await first.close();
   assert.equal(runs.length - before, 1, "the tool ran once");
-  assert.ok(events.includes("session.fenced") && !events.includes("session.error"), `a worker taken over is fenced: ${events.join(", ")}`);
+  assert.ok(!events.includes("session.fenced") && !events.includes("session.error"), `a refused claim is neither fenced nor an error: ${events.join(", ")}`);
   const lines = await readLines(second.session(sessionId).stream(0), 20);
   assert.deepEqual(lines.filter((line) => line.type === "turn_start" || line.type === "turn_end" || line.type === "tool_start").map((line) => line.type), ["turn_start", "tool_start", "turn_end"]);
   await second.close();
@@ -408,6 +421,35 @@ if (durabilityKind === "memory") {
     assert.equal(runs.length - before, 1, "the tool ran once");
     assert.ok(!events.includes("session.fenced") && !events.includes("session.error"), `a refused claim is neither fenced nor an error: ${events.join(", ")}`);
     await second.close();
+  });
+
+  // With a queue that outlives the process, as on Vercel, a message's input
+  // is written with its claim's lease, so the lease can land first.
+  test("a prompt whose input landed after another worker took the session over still runs", async () => {
+    const base = queueOutlivesProcess(await durabilityFor());
+    const [held, writes] = holdWrites(base, (entry) => entry.k === "input");
+    const first = createFxAgent(agentOptions(held));
+    const turn = first.session().prompt("one");
+    const { sessionId } = await turn.accepted;
+    await writes.next();
+    await until(async () => (await first[Symbol.for("libfx.durableInternals")].lastLease(sessionId)) !== null, "the first worker's lease");
+    // The platform gives up on the first worker, and another takes the
+    // session over for a prompt of its own and finishes it.
+    const holders = globalThis[Symbol.for("libfx.liveHolders")];
+    for (const holder of [...holders]) holders.delete(holder);
+    const second = createFxAgent(agentOptions(base));
+    assert.equal((await collect(second.session(sessionId).prompt("two"))).result.stopReason, "end_turn");
+    // Closing waits for its delivery to finish, so it cannot take the first
+    // prompt as well.
+    await second.close();
+    // The first prompt lands only now; its worker reads the log again and
+    // runs it.
+    writes.release();
+    let timer;
+    const stranded = new Promise((_, fail) => { timer = setTimeout(() => fail(new Error("the first prompt never ran")), 10_000 * timeScale); });
+    const ran = await Promise.race([collect(turn), stranded]).finally(() => clearTimeout(timer));
+    assert.equal(ran.text, "echo: one");
+    await first.close();
   });
 }
 
