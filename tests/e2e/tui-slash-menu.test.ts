@@ -1934,7 +1934,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendText("/usage");
       const pane = (await waitForUsageMenu(session)).join("\n");
       expect(pane).not.toContain("Usage unavailable");
-      expect(pane).toContain("Partial data · some usage may be missing");
+      expect(pane).toContain("Known totals may be incomplete");
       expect(pane).toMatch(/0 tokens/);
 
       await session.sendKeys("Escape");
@@ -2126,13 +2126,13 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       );
       expect(pane).toContain("[30 days]");
 
-      await session.sendKeys("Left");
+      await session.sendKeys("Right");
       pane = await session.waitForText("[7 days]", TIMEOUT);
       expect(pane).toContain("Usage unavailable · press r to retry");
-      await session.sendKeys("Left");
+      await session.sendKeys("Right");
       pane = await session.waitForText("[24 hours]", TIMEOUT);
       expect(pane).toContain("Usage unavailable · press r to retry");
-      await session.sendKeys("Left");
+      await session.sendKeys("Right");
       pane = await session.waitForText("[Session]", TIMEOUT);
       expect(pane).toMatch(/0 tokens/);
       expect(pane).toContain("Session activity");
@@ -2251,7 +2251,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).toContain("Session activity");
       await session.sendKeys("BTab");
       await session.waitForText("[24 hours]", TIMEOUT);
-      await session.sendKeys("Right");
+      await session.sendKeys("Left");
       await session.waitForText("[7 days]", TIMEOUT);
 
       await session.sendKeys("Down");

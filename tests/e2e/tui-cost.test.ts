@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -39,8 +41,19 @@ afterEach(async () => {
   }
 });
 
+// The fake gateway answers every request with the same generation, so a
+// session title call would share the turn's generation id. These tests
+// count exact turn totals, so they run without session titles.
+function disableSessionTitles(home: string) {
+  const settings = join(home, ".fx", "settings.json");
+  if (existsSync(settings)) return;
+  mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+  writeFileSync(settings, JSON.stringify({ session_titles: false }), { mode: 0o600 });
+}
+
 function gatewayEnvironment(home: string) {
   if (!gateway) throw new Error("fake gateway not started");
+  disableSessionTitles(home);
   return {
     HOME: home,
     AI_GATEWAY_API_KEY: "test-key",
@@ -207,6 +220,7 @@ test(
               gateway: {
                 generationId: GENERATION_ID,
                 cost: "0.0123",
+                gatewayCost: "0.0123",
                 routing: { canonicalSlug: MODEL },
               },
             },
@@ -615,11 +629,11 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
       expect(firstCost).toMatch(/25 output/);
       expect(firstCost).toMatch(/20 cache read/);
       expect(firstCost).toMatch(/10 cache write/);
-      await session.sendKeys("Left");
+      await session.sendKeys("Right");
       await session.waitForText("[7 days]", TIMEOUT);
-      await session.sendKeys("Left");
+      await session.sendKeys("Right");
       await session.waitForText("[24 hours]", TIMEOUT);
-      await session.sendKeys("Left");
+      await session.sendKeys("Right");
       const firstSession = await session.waitForText("[Session]", TIMEOUT);
       expect(firstSession).toMatch(/5 reasoning/);
       expect(firstSession).toMatch(/1 request/);
@@ -642,11 +656,11 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
       expect(resumedCost).toMatch(/25 output/);
       expect(resumedCost).toMatch(/20 cache read/);
       expect(resumedCost).toMatch(/10 cache write/);
-      await session.sendKeys("Left");
+      await session.sendKeys("Right");
       await session.waitForText("[7 days]", TIMEOUT);
-      await session.sendKeys("Left");
+      await session.sendKeys("Right");
       await session.waitForText("[24 hours]", TIMEOUT);
-      await session.sendKeys("Left");
+      await session.sendKeys("Right");
       const resumedSession = await session.waitForText(
         "[Session]",
         TIMEOUT,
