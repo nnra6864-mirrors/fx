@@ -189,7 +189,9 @@ the session continues the turn from its last record:
   process that freezes and wakes after another took its session over stops
   at its next write, and `onEvent` receives `session.fenced`. Until then it
   can finish a model request or a call to an idempotent tool; it never starts
-  a tool with effects, because that waits for its record to be stored.
+  a tool with effects, because that waits for its record to be stored. One
+  taken over before its own claim was confirmed has written and run nothing,
+  so it reads the session's log again instead.
 - When a write fails for any other reason, or the engine running a turn stops,
   `onEvent` receives `session.error`, and the same queue message runs the
   session again with a new engine. A turn whose engine stops 3 times is
