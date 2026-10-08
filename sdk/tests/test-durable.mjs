@@ -145,6 +145,32 @@ async function durabilityFor(options = {}) {
   dirs.push(dir);
   return durabilityAt(dir, options);
 }
+// A World durability that records how many events each listing returned.
+const listingsOf = (durability) => {
+  const listed = [];
+  const bound = (target, key) => {
+    const value = Reflect.get(target, key);
+    return typeof value === "function" ? value.bind(target) : value;
+  };
+  return [{
+    ...durability,
+    async world() {
+      const world = await durability.world();
+      const events = new Proxy(world.events, {
+        get(target, key) {
+          if (key !== "list") return bound(target, key);
+          return async (...args) => {
+            const page = await target.list(...args);
+            listed.push(page.data.length);
+            return page;
+          };
+        },
+      });
+      return new Proxy(world, { get: (target, key) => (key === "events" ? events : bound(target, key)) });
+    },
+  }, listed];
+};
+
 // A memory() durability whose queue counts as outliving the process.
 const queueOutlivesProcess = (durability) => {
   const create = durability.create;
@@ -450,6 +476,21 @@ if (durabilityKind === "memory") {
     const ran = await Promise.race([collect(turn), stranded]).finally(() => clearTimeout(timer));
     assert.equal(ran.text, "echo: one");
     await first.close();
+  });
+}
+
+if (durabilityKind !== "memory") {
+  test("a session's log reads stay one small page however long its history grows", async () => {
+    const [durability, listed] = listingsOf(await durabilityFor());
+    const agent = createFxAgent(agentOptions(durability));
+    const session = agent.session();
+    for (let turn = 0; turn < 8; turn += 1) assert.equal((await session.prompt(`turn ${turn}`).result).stopReason, "end_turn");
+    listed.length = 0;
+    const { text } = await collect(session.prompt("one more"));
+    assert.equal(text, "echo: one more");
+    assert.ok(listed.length > 0, "the turn read its log");
+    assert.ok(Math.max(...listed) <= 10, `each read stopped at the newest checkpoint within one page: ${listed.join(", ")}`);
+    await agent.close();
   });
 }
 

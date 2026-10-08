@@ -454,6 +454,10 @@ const missingRun = (error) => error?.status === 404 || /not found|does not exist
 // Tries for a failed UI stream read that is not a missing stream.
 const streamReadRetries = 5;
 
+// Events a session-log read lists per page: the first page, then the rest.
+const firstPageEvents = 10;
+const laterPageEvents = 100;
+
 function createWorldBackend(world, { name, reserveMs, pollMs, alive, holderInfo, livenessKnown = false, queueDurable = false, maxDurationMs }) {
   const spec = world.specVersion === undefined ? {} : { specVersion: world.specVersion };
   const created = new Set();
@@ -466,9 +470,9 @@ function createWorldBackend(world, { name, reserveMs, pollMs, alive, holderInfo,
   let handler = null;
   let removeHandler = null;
   const route = typeof world.registerHandler !== "function";
-  const listEvents = (runId, cursor) => world.events.list({
+  const listEvents = (runId, cursor, limit) => world.events.list({
     runId,
-    pagination: { sortOrder: "desc", limit: 100, ...(cursor ? { cursor } : {}) },
+    pagination: { sortOrder: "desc", limit, ...(cursor ? { cursor } : {}) },
     resolveData: "all",
   });
   const queueHandler = world.createQueueHandler(queuePrefix, async (message) => {
@@ -548,10 +552,14 @@ function createWorldBackend(world, { name, reserveMs, pollMs, alive, holderInfo,
       const newestFirst = async (stopBelow, stopAtCheckpoint) => {
         const events = [];
         let through = null;
-        for (let cursor; ;) {
+        // A session's newest checkpoint is usually among its last few
+        // entries, so a read starts with a small page and fetches more only
+        // while it has not reached where it stops; every page carries its
+        // entries' payloads, a checkpoint holding the whole conversation.
+        for (let cursor, limit = firstPageEvents; ; limit = laterPageEvents) {
           let page;
           try {
-            page = await listEvents(runId, cursor);
+            page = await listEvents(runId, cursor, limit);
           } catch (error) {
             if (missingRun(error)) return { events, through };
             throw error;
