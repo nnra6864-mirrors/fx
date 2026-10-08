@@ -171,9 +171,10 @@ takes it sends the next turn's first model request while it writes its claim
 on the session, and it writes, shows, and runs nothing for that turn until
 the claim lands. If another process's claim lands first, the late claim
 counts for nothing and its model request is cancelled. Other records are
-written while the model works, without holding up the turn. A session also saves a checkpoint at the
-end of every turn and wherever a turn yields, so the process that continues it
-reads the checkpoint and the few records after it, not the whole history.
+written while the model works, without holding up the turn. A session also
+saves a checkpoint at the end of every turn and wherever a turn yields, so the
+process that continues it reads the checkpoint and the few records after it,
+not the whole history.
 
 When the process running a turn stops, the next process to receive work for
 the session continues the turn from its last record:
@@ -189,9 +190,10 @@ the session continues the turn from its last record:
   process that freezes and wakes after another took its session over stops
   at its next write, and `onEvent` receives `session.fenced`. Until then it
   can finish a model request or a call to an idempotent tool; it never starts
-  a tool with effects, because that waits for its record to be stored. One
-  taken over before its own claim was confirmed has written and run nothing,
-  so it reads the session's log again instead.
+  a tool with effects, because that waits for its record to be stored. A
+  process that started a new turn on an idle session and was taken over
+  while still claiming the session runs nothing for that turn and reads the
+  session's log again instead, so the prompt it brought is not lost.
 - When a write fails for any other reason, or the engine running a turn stops,
   `onEvent` receives `session.error`, and the same queue message runs the
   session again with a new engine. A turn whose engine stops 3 times is
