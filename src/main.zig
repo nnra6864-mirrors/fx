@@ -4844,6 +4844,7 @@ test {
     _ = @import("core/workspace/file_index.zig");
     _ = @import("core/workspace/path_completion.zig");
     _ = @import("core/workspace/directory_completion_job.zig");
+    _ = @import("core/indexer/indexer.zig");
     _ = @import("core/input/file_completion_state.zig");
     _ = @import("gateway/vercel_protocol.zig");
     _ = @import("core/gateway/provider_set.zig");
