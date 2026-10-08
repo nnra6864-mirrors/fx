@@ -311,12 +311,32 @@ async function harness() {
   const newHolders = (before) => [...liveHolders].filter((holder) => !before.has(holder));
 
   async function observe() {
-    const lines = await streamLines();
+    // Every worker now waits on the driver, but a line it wrote can still be
+    // landing: read until two reads agree.
+    let lines = await streamLines();
+    for (let reads = 0; reads < 5; reads += 1) {
+      const again = await streamLines();
+      if (JSON.stringify(again) === JSON.stringify(lines)) break;
+      lines = again;
+    }
     // A reader that reconnects from any cursor sees the same lines after it.
     if (lines.length > 0) {
       const cursor = lines[Math.floor(random() * lines.length)].cursor;
       const again = await streamLines(cursor);
-      assert.deepEqual(again, lines.filter((line) => line.cursor > cursor), `reconnecting from cursor ${cursor} shows the same lines`);
+      const expected = lines.filter((line) => line.cursor > cursor);
+      if (JSON.stringify(again) !== JSON.stringify(expected)) {
+        // Which worker wrote what, and what each still waits on, tells a
+        // line written late from one a read missed.
+        const brief = (items) => items.map((line) => `${line.type}:e${line.epoch ?? 0}@${line.cursor}`).join(" ");
+        const now = await streamLines();
+        assert.fail([
+          `reconnecting from cursor ${cursor} shows different lines`,
+          `  first read: ${brief(lines)}`,
+          `  reconnect:  ${brief(again)}`,
+          `  read again: ${brief(now)}`,
+          `  waiting: requests ${JSON.stringify(requests.map((entry) => `${entry.w}:${entry.kind}`))}, calls ${JSON.stringify(calls.map((entry) => entry.w))}, runs ${runs}, fenced ${JSON.stringify(fenced)}`,
+        ].join("\n"));
+      }
     }
     return {
       pc: Object.fromEntries(Workers.map((w) => [w, position(w, lines)])),
