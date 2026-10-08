@@ -9,11 +9,12 @@ const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const file_index = @import("file_index.zig");
 const indexer = @import("../indexer/indexer.zig");
+const pathing = @import("pathing.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const default_candidate_cap: usize = 100_000;
-pub const max_relative_path_bytes: usize = 2048;
+const max_relative_path_bytes: usize = 2048;
 pub const default_skipped_names: []const []const u8 = &indexer.default_skipped_names;
 
 pub const Options = struct {
@@ -61,10 +62,8 @@ pub fn list(alloc: Allocator, arena: Allocator, workspace_root: []const u8, abso
 /// `absolute_root` relative to `workspace_root`, "" for the root itself, or
 /// null when it lies outside.
 fn relativeInside(workspace_root: []const u8, absolute_root: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, absolute_root, workspace_root)) return "";
-    if (absolute_root.len <= workspace_root.len + 1 or !std.mem.startsWith(u8, absolute_root, workspace_root)) return null;
-    if (absolute_root[workspace_root.len] != '/') return null;
-    return absolute_root[workspace_root.len + 1 ..];
+    if (workspace_root.len == 0 or !pathing.pathInside(workspace_root, absolute_root)) return null;
+    return std.mem.trimStart(u8, absolute_root[workspace_root.len..], "/");
 }
 
 /// Whether the workspace tree's entries below `subtree` are exactly what a

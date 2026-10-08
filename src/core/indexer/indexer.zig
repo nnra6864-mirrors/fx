@@ -17,7 +17,6 @@ const Allocator = std.mem.Allocator;
 
 pub const Kind = scan_mod.Kind;
 pub const Entry = scan_mod.Entry;
-pub const ScanOptions = scan_mod.Options;
 pub const ScanResult = scan_mod.Result;
 pub const ScanError = scan_mod.Error;
 pub const default_skipped_names = scan_mod.default_skipped_names;
@@ -38,7 +37,6 @@ pub const FolderStamp = tree_mod.FolderStamp;
 pub const isCurrent = tree_mod.isCurrent;
 
 pub const Snapshot = snapshot_mod.Snapshot;
-pub const snapshot_max_bytes = snapshot_mod.max_bytes;
 /// Loads the saved trees for exactly `roots` from the absolute path the
 /// caller chose, or null when missing or not admissible.
 pub const loadSnapshot = snapshot_mod.load;

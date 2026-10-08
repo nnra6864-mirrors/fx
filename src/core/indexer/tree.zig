@@ -77,7 +77,7 @@ fn clampNs(value: anytype) i64 {
     return std.math.cast(i64, value) orelse if (value < 0) std.math.minInt(i64) else std.math.maxInt(i64);
 }
 
-pub fn reusableTimes(mtime_ns: i64, ctime_ns: i64, scan_started_ns: i64) bool {
+fn reusableTimes(mtime_ns: i64, ctime_ns: i64, scan_started_ns: i64) bool {
     const limit = scan_started_ns -| granularity_margin_ns;
     return mtime_ns < limit and ctime_ns < limit;
 }

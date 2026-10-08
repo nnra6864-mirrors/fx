@@ -16,7 +16,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Tree = tree_mod.Tree;
 
 const magic = "fx-file-index-v2\n";
-pub const max_bytes: usize = 64 * 1024 * 1024;
+const max_bytes: usize = 64 * 1024 * 1024;
 const max_path_bytes: usize = 4096;
 
 pub const Snapshot = struct {

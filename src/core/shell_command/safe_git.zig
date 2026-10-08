@@ -135,7 +135,7 @@ pub fn environment(alloc: Allocator) Allocator.Error!std.process.Environ.Map {
 
 /// The first git found at a fixed system location. git from PATH is never
 /// used, because PATH can include directories a repository controls.
-pub fn trustedExecutable() ?[]const u8 {
+fn trustedExecutable() ?[]const u8 {
     const candidates = switch (builtin.os.tag) {
         .windows => &[_][]const u8{
             "C:\\Program Files\\Git\\cmd\\git.exe",
@@ -500,7 +500,9 @@ test "safe git blocks repository clean, process and smudge filters" {
     try repo.plain(repo.repo, &.{ "config", "--unset", "filter.evil.clean" });
 
     try repo.plain(repo.repo, &.{ "config", "filter.evil.process", repo.sentinel });
-    try repo.write("repo/a.txt", "four\n");
+    // Same size as the committed "one\n": with a different size, git status
+    // can report the change from the index stat alone and skip the filter.
+    try repo.write("repo/a.txt", "ten\n");
     try repo.expectBlocked(repo.repo, .status, &.{"--short"}, &.{ "status", "--short" });
     try repo.plain(repo.repo, &.{ "config", "--unset", "filter.evil.process" });
 

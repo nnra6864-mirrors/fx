@@ -9,7 +9,7 @@ const bounded_read = @import("bounded_read.zig");
 const Allocator = std.mem.Allocator;
 
 /// D7: the index is never read beyond this size.
-pub const max_index_bytes: usize = 128 * 1024 * 1024;
+const max_index_bytes: usize = 128 * 1024 * 1024;
 
 const mode_type_mask: u32 = 0o170000;
 const mode_gitlink: u32 = 0o160000;

@@ -18,8 +18,8 @@ const wildmatch = @import("wildmatch.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const max_config_file_bytes: usize = 1024 * 1024;
-pub const max_include_depth: usize = 10;
+const max_config_file_bytes: usize = 1024 * 1024;
+const max_include_depth: usize = 10;
 
 pub const Entry = struct {
     /// Lowercase.
@@ -213,7 +213,7 @@ fn parseValue(arena: Allocator, reader: *Reader) ParseError![]const u8 {
 }
 
 /// git's git_config_bool. Null for a value git rejects.
-pub fn parseBool(value: ?[]const u8) ?bool {
+fn parseBool(value: ?[]const u8) ?bool {
     const v = value orelse return true;
     if (v.len == 0) return false;
     for ([_][]const u8{ "true", "yes", "on" }) |word| {
