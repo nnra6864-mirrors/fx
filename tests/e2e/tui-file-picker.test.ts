@@ -9,6 +9,7 @@ import {
   realpathSync,
   rmSync,
   unlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -359,7 +360,7 @@ function expectFileDiscoveryOffMainThread(trace: string): void {
   );
   const discoveryThreads = traceThreadIds(
     trace,
-    /workspace file discovery process spawning thread=(\d+)/g,
+    /file index root (?:scanned|reused) root=\d+ .*thread=(\d+)/g,
   );
   const mainThreads = new Set(callerThreads);
 
@@ -679,7 +680,14 @@ describe("@ file picker", () => {
         }
       })();
 
+      // A refresh of an unchanged tree reuses the saved listing in a few
+      // milliseconds. Touching the git index, as `git add` would, makes each
+      // refresh rescan every file without changing the result, so frames can
+      // observe a replacement in flight.
+      const gitIndexPath = join(current.workspace, ".git", "index");
       const injectCycle = () => {
+        const now = new Date();
+        utimesSync(gitIndexPath, now, now);
         active.sendKeysImmediate(["Escape", "C-u"]);
         active.sendLiteralImmediate(`${LIFECYCLE_QUERY.slice(0, -1)}`);
         active.sendLiteralImmediate(LIFECYCLE_QUERY.slice(-1));
@@ -838,8 +846,15 @@ describe("@ file picker", () => {
       for (const snapshot of activeQueryFrames) {
         expect(snapshot.pane).not.toContain("indexing files...");
       }
+      // A replacement finishes in tens of milliseconds, close to one frame
+      // capture, so a frame inside it is luck. What must hold is that
+      // replacements began while the query was on screen and every frame
+      // around them kept the completed result.
       expect(
-        activeQueryFrames.some((snapshot) => replacementIncomplete(snapshot.trace)),
+        activeQueryFrames.some((snapshot) =>
+          traceGenerationNumbers(snapshot.trace, "file index generation started")
+            .some((generation) => generation >= firstReplacementGeneration)
+        ),
       ).toBe(true);
 
       let acceptedFilePrompt = "";
