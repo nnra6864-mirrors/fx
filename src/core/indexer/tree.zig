@@ -30,6 +30,10 @@ pub const FolderStamp = struct {
     mtime_ns: i64,
     ctime_ns: i64,
     reusable: bool,
+    /// A folder with its own repository, listed but not entered.
+    boundary: bool = false,
+    /// Ignored, so only its tracked files are listed.
+    excluded: bool = false,
 };
 
 pub const SourceStamp = struct {
@@ -51,9 +55,11 @@ pub const Tree = struct {
     root_inode: u64,
     scan_started_ns: i64,
     repository: bool,
-    /// The cap, an unreadable source or an unreadable folder left something
-    /// out. An incomplete tree is never reused.
+    /// An unreadable source or folder, or a walk stopped at its reading limit,
+    /// left something out. An incomplete tree is never reused.
     incomplete: bool,
+    /// The entries were cut to the cap. The walk still read everything, so for
+    /// unchanged stamps the cut is the same and the tree can be reused.
     cap_reached: bool,
     skipped_overlong: usize,
     skipped_names: []const []const u8,

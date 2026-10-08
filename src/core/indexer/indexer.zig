@@ -29,6 +29,7 @@ pub const default_skipped_names = scan_mod.default_skipped_names;
 pub const scan = scan_mod.scan;
 
 pub const Tree = tree_mod.Tree;
+pub const FolderStamp = tree_mod.FolderStamp;
 /// Whether a tree from `scan` or a snapshot still describes its root under
 /// the same skipped names, checked through its folder and source stamps
 /// without reading any folder. With a subtree, only folders at or below it

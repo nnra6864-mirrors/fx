@@ -4,6 +4,9 @@
 # imports only the standard library, its own files, and fx's shared io.zig and
 # debug_trace.zig, and it never starts a process: it reads repository metadata
 # as data, so a repository's configuration can never make it run a program.
+# @-completion and the glob and grep tools list files only through it, so
+# their production code, everything above each file's first test, never
+# starts a process either.
 
 set -euo pipefail
 
@@ -37,5 +40,24 @@ fi
 spawning="$(git grep --untracked -n -E 'std\.process|posix_spawn|execv[pe]*\(|fork\(|popen\(' -- "$folder" || true)"
 if [[ -n "$spawning" ]]; then
   printf 'The indexer must never start a process:\n%s\n' "$spawning" >&2
+  exit 1
+fi
+
+listing_features=(
+  src/core/workspace/file_index.zig
+  src/core/workspace/tool_files.zig
+  src/core/workspace/grep_search.zig
+  src/tools/filesystem/glob_files.zig
+  src/tools/filesystem/grep_files.zig
+)
+feature_spawning=""
+for file in "${listing_features[@]}"; do
+  found="$(awk '/^test "/ { exit } /std\.process\.(run|spawn|Child)|safe_git/ { print FILENAME ":" FNR ": " $0 }' "$file")"
+  if [[ -n "$found" ]]; then
+    feature_spawning+="$found"$'\n'
+  fi
+done
+if [[ -n "$feature_spawning" ]]; then
+  printf '@-completion, glob_files and grep_files must list files through the indexer and never start a process:\n%s' "$feature_spawning" >&2
   exit 1
 fi

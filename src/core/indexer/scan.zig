@@ -253,12 +253,12 @@ pub fn scan(alloc: Allocator, root: []const u8, options: Options, stop: ?*std.at
         cap_reached = true;
     }
     if (shared.limit_reached.load(.acquire)) cap_reached = true;
-    incomplete = incomplete or cap_reached or shared.incomplete.load(.acquire);
+    incomplete = incomplete or shared.limit_reached.load(.acquire) or shared.incomplete.load(.acquire);
 
     var folders: std.ArrayList(tree_mod.FolderStamp) = .empty;
     for (listings) |listing| {
         const stamp = listing.stamp orelse continue;
-        try folders.append(arena, .{ .rel = try arena.dupe(u8, stamp.rel), .inode = stamp.inode, .mtime_ns = stamp.mtime_ns, .ctime_ns = stamp.ctime_ns, .reusable = stamp.reusable });
+        try folders.append(arena, .{ .rel = try arena.dupe(u8, stamp.rel), .inode = stamp.inode, .mtime_ns = stamp.mtime_ns, .ctime_ns = stamp.ctime_ns, .reusable = stamp.reusable, .boundary = listing.boundary, .excluded = listing.excluded });
         if (listing.ignore_file) |path| try rules.sources.append(arena, .{ .path = try arena.dupe(u8, path), .identity_only = false });
     }
     const stamps = try arena.alloc(tree_mod.SourceStamp, rules.sources.items.len);
@@ -765,7 +765,8 @@ test "scan caps, skips overlong paths, cancels and is the same with one worker o
     // Within the collection limit the cap keeps the sorted prefix.
     var capped = try scan(std.testing.allocator, root, .{ .candidate_cap = 200 }, null);
     defer capped.deinit();
-    try std.testing.expect(capped.tree.incomplete and capped.tree.cap_reached);
+    // Below it the walk read everything, so only the cap was reached.
+    try std.testing.expect(!capped.tree.incomplete and capped.tree.cap_reached);
     try std.testing.expectEqual(@as(usize, 200), capped.tree.entries.len);
     for (capped.tree.entries, serial.tree.entries[0..200]) |a, b| try std.testing.expectEqualStrings(b.path, a.path);
     // Past it, reading stops early: still capped, sorted and incomplete.

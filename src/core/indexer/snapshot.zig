@@ -152,7 +152,7 @@ fn encode(writer: *std.Io.Writer, trees: []const Tree) !void {
             try writeInt(writer, u64, folder.inode);
             try writeInt(writer, i64, folder.mtime_ns);
             try writeInt(writer, i64, folder.ctime_ns);
-            try writer.writeByte(@intFromBool(folder.reusable));
+            try writer.writeByte(@as(u8, @intFromBool(folder.reusable)) | @as(u8, @intFromBool(folder.boundary)) << 1 | @as(u8, @intFromBool(folder.excluded)) << 2);
         }
         try writeInt(writer, u32, @intCast(tree.sources.len));
         for (tree.sources) |source| {
@@ -221,16 +221,19 @@ fn decode(arena: Allocator, bytes: []const u8, roots: []const []const u8) (Alloc
         const folders = try arena.alloc(tree_mod.FolderStamp, try decoder.count(29));
         for (folders) |*folder| {
             const rel = try decoder.string(arena, max_path_bytes, true);
+            const inode = try decoder.int(u64);
+            const mtime_ns = try decoder.int(i64);
+            const ctime_ns = try decoder.int(i64);
+            const folder_flags = (try decoder.take(1))[0];
+            if (folder_flags & ~@as(u8, 7) != 0) return error.InvalidSnapshot;
             folder.* = .{
                 .rel = rel,
-                .inode = try decoder.int(u64),
-                .mtime_ns = try decoder.int(i64),
-                .ctime_ns = try decoder.int(i64),
-                .reusable = switch ((try decoder.take(1))[0]) {
-                    0 => false,
-                    1 => true,
-                    else => return error.InvalidSnapshot,
-                },
+                .inode = inode,
+                .mtime_ns = mtime_ns,
+                .ctime_ns = ctime_ns,
+                .reusable = folder_flags & 1 != 0,
+                .boundary = folder_flags & 2 != 0,
+                .excluded = folder_flags & 4 != 0,
             };
         }
         const stamps = try arena.alloc(tree_mod.SourceStamp, try decoder.count(37));
@@ -280,7 +283,7 @@ fn testTree(root: []const u8, entries: []const tree_mod.Entry) Tree {
         .entries = entries,
         .folders = &.{
             .{ .rel = "", .inode = 7, .mtime_ns = 5, .ctime_ns = 6, .reusable = true },
-            .{ .rel = "src", .inode = 9, .mtime_ns = 5, .ctime_ns = 900, .reusable = false },
+            .{ .rel = "src", .inode = 9, .mtime_ns = 5, .ctime_ns = 900, .reusable = false, .boundary = true, .excluded = true },
         },
         .sources = &.{
             .{ .path = "/w/.gitignore", .exists = true, .identity_only = false, .inode = 3, .size = 10, .mtime_ns = 4, .ctime_ns = 4, .reusable = true },
@@ -319,7 +322,8 @@ test "snapshot round trips, rejects tampering, other scopes and v1 files, and an
         try std.testing.expectEqualStrings("src", first.entries[1].path);
         try std.testing.expectEqual(tree_mod.Kind.directory, first.entries[1].kind);
         try std.testing.expectEqualStrings("", first.folders[0].rel);
-        try std.testing.expect(!first.folders[1].reusable);
+        try std.testing.expect(!first.folders[1].reusable and first.folders[1].boundary and first.folders[1].excluded);
+        try std.testing.expect(!first.folders[0].boundary and !first.folders[0].excluded);
         try std.testing.expect(first.sources[1].identity_only and !first.sources[2].exists);
         try std.testing.expectEqualStrings("b.txt", loaded.trees[1].entries[0].path);
     }

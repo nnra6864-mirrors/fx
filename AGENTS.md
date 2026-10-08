@@ -69,7 +69,9 @@ Key rules:
 
 * `src/core/compactor/` owns context compaction. Outside code imports only its front door, `compactor.zig`, and the compactor imports only shared basics and model configuration; its caller hands in the model caller, the record store, and the session's projection of saved turns into chat messages. `scripts/check-compactor-boundary.sh` enforces this in CI.
 
-* `src/core/indexer/` is the native workspace indexer. It reads git's ignore rules, repository layout, and git config as data and never starts a process, so a repository's configuration cannot make it run a program. Outside code imports only its front door, `indexer.zig`, and the indexer imports only the standard library, its own files, `io.zig`, and `debug_trace.zig`. `scripts/check-indexer-boundary.sh` enforces this in CI.
+* `src/core/indexer/` is the native workspace indexer. It reads git's ignore rules, repository layout, and git config as data and never starts a process, so a repository's configuration cannot make it run a program. Outside code imports only its front door, `indexer.zig`, and the indexer imports only the standard library, its own files, `io.zig`, and `debug_trace.zig`. `@`-completion, `glob_files`, and `grep_files` list files only through it and never start a process. `scripts/check-indexer-boundary.sh` enforces this in CI.
+
+* `src/core/shell_command/safe_git.zig` is the only way fx runs git itself, for the agent's auto-run read-only git commands and the `fx pr` and `fx issue` snapshot. It turns off every program a repository's own config can name and refuses to run when git would use a different repository than the one fx read.
 
 * `src/tools/` owns built-in tool implementations. Generic tool contracts and dispatch live in `src/core/tooling/`. Default tool specs are centralized in `src/core/tooling/tool_specs.zig` or `src/builtins/tools.zig`, not in individual tool files.
 
