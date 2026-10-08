@@ -906,10 +906,19 @@ class SessionWorker {
       // claim settles once both have, with the lease's cursor if it landed
       // and the first failure.
       const writes = [log.append(lease), ...(early?.writes ?? []).map((entry) => log.append(entry))];
-      const claimed = Promise.allSettled(writes).then(([leased, ...rest]) => ({
-        head: leased.status === "fulfilled" ? leased.value : null,
-        error: leased.status === "rejected" ? leased.reason : rest.find((item) => item.status === "rejected")?.reason ?? null,
-      }));
+      const claimed = Promise.allSettled(writes).then(async ([leased, ...rest]) => {
+        const head = leased.status === "fulfilled" ? leased.value : null;
+        const error = leased.status === "rejected" ? leased.reason : rest.find((item) => item.status === "rejected")?.reason ?? null;
+        if (error || !early) return { head, error };
+        // A lease the World took without reporting a competing one is
+        // checked against the log, as run() checks one taken first.
+        try {
+          const now = this.fold(await log.read());
+          return { head, error: now.lastLease?.holder === this.holder ? null : new FencedError(`another worker continued session ${this.sessionId}`) };
+        } catch (readError) {
+          return { head, error: readError };
+        }
+      });
       let outcome;
       try {
         outcome = await this.run(log, claimed, lease, deadline, early?.state ?? null);
@@ -1427,13 +1436,8 @@ function turnView({ messageId, resumeRequest = null, start }) {
       }
       // A view of a turn already running ranks from what came before it;
       // a new turn's takeovers all come after its own start.
-      let shows = attaching ? await uiRankerAt(log, from) : uiRanker();
-      let reader = log.ui.read(from).getReader();
-      // A new turn's first line is its start, a takeover's resume, or the
-      // end of a turn that never started. Any other line first means the
-      // view opened after the turn began; it reads the stream again from
-      // the start, once.
-      let reread = attaching;
+      const shows = attaching ? await uiRankerAt(log, from) : uiRanker();
+      const reader = log.ui.read(from).getReader();
       // A turn whose end the log holds but no line shows yet: a worker that
       // stopped between the two never writes it, so the outcome is unknown.
       let gaveUp = null;
@@ -1445,7 +1449,7 @@ function turnView({ messageId, resumeRequest = null, start }) {
       }
       let buffered = "";
       let cursor = from;
-      reading: for (;;) {
+      for (;;) {
         const { value, done: ended } = await reader.read();
         if (ended) break;
         buffered += decoder.decode(value, { stream: true });
@@ -1465,17 +1469,6 @@ function turnView({ messageId, resumeRequest = null, start }) {
             id = event.messageId;
           }
           if (event.messageId !== id) continue;
-          if (!reread) {
-            reread = true;
-            if (event.type !== "turn_start" && event.type !== "turn_resume" && event.type !== "turn_end") {
-              void reader.cancel().catch(() => {});
-              shows = uiRanker();
-              reader = log.ui.read(0).getReader();
-              buffered = "";
-              cursor = 0;
-              continue reading;
-            }
-          }
           events.push({ ...event, cursor });
           wake();
           if (event.type === "turn_end") {
@@ -1677,39 +1670,13 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
               const log = await created.session(sessionId);
               let attaching = type === "resume";
               let from = null;
-              if (retried && !aborted) {
-                // A message with the caller's id is one queue send, and the
-                // queue and the log both drop it the second time, so it goes
-                // out at once. Meanwhile the log says what the viewer
-                // follows: a turn this id already ran answers from it, and
-                // one still waiting or running is followed. The viewer's
-                // start is read first, so a turn that ends after it has its
-                // end in view.
-                const checked = (async () => {
-                  const start = await log.ui.length();
-                  return { start, state: foldSessionLog(await log.read()) };
-                })();
-                void checked.catch(() => {});
-                await send({ type, messageId, ...(input === undefined ? {} : { input }) });
-                accept.resolve({ messageId, sessionId });
-                const { start: length, state } = await checked;
-                from = length;
-                if (state.consumed.has(messageId) && !(state.openTurn?.id === messageId && !state.failed.has(messageId))) {
-                  const ended = await turnEndIn(log, messageId, from);
-                  if (ended) return { settled: { ...ended, repeated: true } };
-                  const error = state.failed.get(messageId);
-                  if (error) return { settled: { messageId, stopReason: "error", error, repeated: true } };
-                  return { log, from, attaching: true, endWithinMs: retryEndWaitMs };
-                }
-                // One still waiting or running: follow it.
-                if ((state.openTurn?.id === messageId && !state.failed.has(messageId)) || (state.inputKeys.has(`prompt:${messageId}`) && !state.consumed.has(messageId))) attaching = true;
-                return { log, from, attaching };
-              }
               if (retried) {
-                // A retry whose signal had aborted is never stored; the log
-                // says whether its id ran.
+                // A turn this id already ran answers from the log, without
+                // queueing it again. The viewer's start is read first, so a
+                // turn that ends after it has its end in view.
                 from = await log.ui.length();
                 const state = foldSessionLog(await log.read());
+                // One still waiting or running: follow it.
                 if ((state.openTurn?.id === messageId && !state.failed.has(messageId)) || (state.inputKeys.has(`prompt:${messageId}`) && !state.consumed.has(messageId))) attaching = true;
                 else if (state.consumed.has(messageId)) {
                   accept.resolve({ messageId, sessionId });
@@ -1725,15 +1692,11 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
                 accept.resolve({ messageId, sessionId });
                 return { settled: { messageId, stopReason: "cancelled", usage: {} } };
               }
-              // The viewer starts where the stream is now. The read goes out
-              // before the message, so it lands before the message can
-              // produce anything, and the caller hears the message was
-              // accepted once it is sent; a view that opened late anyway
-              // reads its turn from the stream's start.
-              const length = from === null ? log.ui.length() : null;
+              // The viewer starts where the stream is now, before the
+              // message can produce anything.
+              from ??= await log.ui.length();
               await send({ type, messageId, ...(input === undefined ? {} : { input }) });
               accept.resolve({ messageId, sessionId });
-              from ??= await length;
               return { log, from, attaching };
             } catch (error) {
               accept.reject(error);
