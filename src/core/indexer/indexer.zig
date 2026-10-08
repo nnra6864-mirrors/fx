@@ -9,8 +9,22 @@ const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const git_config = @import("git_config.zig");
 const layout = @import("layout.zig");
+const scan_mod = @import("scan.zig");
 
 const Allocator = std.mem.Allocator;
+
+pub const Kind = scan_mod.Kind;
+pub const Entry = scan_mod.Entry;
+pub const ScanOptions = scan_mod.Options;
+pub const ScanResult = scan_mod.Result;
+pub const ScanError = scan_mod.Error;
+pub const default_skipped_names = scan_mod.default_skipped_names;
+
+/// Lists the files and folders under the absolute `root`: inside a git
+/// repository exactly what git shows, elsewhere everything except `.gitignore`
+/// matches and `options.skipped_names`. See `scan.zig` for the rules. `alloc`
+/// must be safe to use from several threads.
+pub const scan = scan_mod.scan;
 
 pub const RepoFilters = struct {
     /// Absolute git directory of the repository containing the root, found
@@ -78,6 +92,9 @@ test {
     _ = @import("wildmatch.zig");
     _ = @import("ignore.zig");
     _ = @import("sources.zig");
+    _ = @import("git_index.zig");
+    _ = @import("tree.zig");
+    _ = scan_mod;
     _ = layout;
     _ = git_config;
 }

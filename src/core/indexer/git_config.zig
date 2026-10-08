@@ -245,6 +245,9 @@ pub const Loaded = struct {
     /// In file order, with included files spliced in at their directive.
     entries: []const LoadedEntry,
     unavailable: []const Unavailable,
+    /// Every config file read or looked for, missing ones included, so a
+    /// later change to any of them can be detected.
+    paths: []const []const u8 = &.{},
 
     /// The last entry for the key, or null when unset.
     pub fn last(self: Loaded, section: []const u8, subsection: ?[]const u8, name: []const u8) ?*const Entry {
@@ -311,12 +314,14 @@ const Loader = struct {
     mode: Mode,
     entries: std.ArrayList(LoadedEntry) = .empty,
     unavailable: std.ArrayList(Unavailable) = .empty,
+    paths: std.ArrayList([]const u8) = .empty,
 
     fn readFile(self: *Loader, path: []const u8, scope: Scope, depth: usize) Allocator.Error!void {
         if (depth > max_include_depth) return self.markUnavailable(path, "include_depth");
         // git reads /dev/null as an empty file; it is commonly used to
         // disable a config level.
         if (std.mem.eql(u8, path, "/dev/null")) return;
+        try self.paths.append(self.arena, path);
         const content = switch (try bounded_read.readAbsolute(self.arena, path, max_config_file_bytes)) {
             .content => |bytes| bytes,
             .missing => return,
@@ -418,6 +423,7 @@ const Loader = struct {
         return .{
             .entries = try self.entries.toOwnedSlice(self.arena),
             .unavailable = try self.unavailable.toOwnedSlice(self.arena),
+            .paths = try self.paths.toOwnedSlice(self.arena),
         };
     }
 };

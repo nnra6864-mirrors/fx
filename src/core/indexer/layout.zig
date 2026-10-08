@@ -53,6 +53,17 @@ pub fn discover(arena: Allocator, start: []const u8) DiscoverError!?Layout {
     }
 }
 
+/// Whether the absolute directory `dir` holds a repository of its own, as
+/// git's is_nonbare_repository_dir decides: a `.git` git directory or a valid
+/// `gitdir:` file. An invalid `.git` file does not count.
+pub fn hasOwnRepository(arena: Allocator, dir: []const u8) Allocator.Error!bool {
+    const found = layoutAt(arena, dir) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidGitFile => return false,
+    };
+    return found != null;
+}
+
 fn layoutAt(arena: Allocator, dir: []const u8) DiscoverError!?Layout {
     const dot_git = try std.fs.path.join(arena, &.{ dir, ".git" });
     const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), dot_git, .{ .follow_symlinks = true }) catch return null;
