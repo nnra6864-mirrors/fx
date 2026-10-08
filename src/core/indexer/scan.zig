@@ -806,3 +806,56 @@ test "repository scan reports an unusable index as incomplete and keeps untracke
         .{ .path = "kept.txt", .kind = .file },
     });
 }
+
+test "refresh trusts an old unchanged tree and rejects every kind of change" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tree = try TestTree.init(arena);
+    defer tree.tmp.cleanup();
+    const cases = [_][]const u8{ "unchanged", "new_file", "ignore_edit", "index", "config", "replaced", "future" };
+    for (cases) |name| {
+        try tree.repo(arena, name, &.{.{ .path = "src/a.txt" }});
+        try tree.file(try std.fmt.allocPrint(arena, "{s}/.gitignore", .{name}), "*.log\n");
+        try tree.file(try std.fmt.allocPrint(arena, "{s}/src/a.txt", .{name}), "a");
+        try tree.file(try std.fmt.allocPrint(arena, "{s}/docs/b.md", .{name}), "b");
+    }
+    const future: std.Io.Timestamp = .{ .nanoseconds = @as(i96, tree_mod.nowNs()) + 3600 * std.time.ns_per_s };
+    try tree.tmp.dir.setTimestamps(std.testing.io, "future/docs", .{ .modify_timestamp = .{ .new = future } });
+
+    // A tree scanned right after its files changed is never reused.
+    {
+        const root = try std.fs.path.join(arena, &.{ tree.root, "unchanged" });
+        var racy = try scan(std.testing.allocator, root, .{}, null);
+        defer racy.deinit();
+        try std.testing.expect(!tree_mod.isCurrent(&racy.tree, root, &default_skipped_names, null));
+    }
+
+    io_mod.sleep(@intCast(tree_mod.granularity_margin_ns + std.time.ns_per_s / 2));
+    var results: [cases.len]Result = undefined;
+    var roots: [cases.len][]const u8 = undefined;
+    for (cases, 0..) |name, i| {
+        roots[i] = try std.fs.path.join(arena, &.{ tree.root, name });
+        results[i] = try scan(std.testing.allocator, roots[i], .{}, null);
+    }
+    defer for (&results) |*result| result.deinit();
+
+    try std.testing.expect(tree_mod.isCurrent(&results[0].tree, roots[0], &default_skipped_names, null));
+    try std.testing.expect(!tree_mod.isCurrent(&results[0].tree, roots[0], &.{"node_modules"}, null));
+
+    try tree.file("new_file/src/c.txt", "c");
+    try tree.file("ignore_edit/.gitignore", "*.md\n");
+    try tree.file("index/.git/index", try git_index.buildForTest(arena, 2, .sha1, &.{ .{ .path = "src/a.txt" }, .{ .path = "docs/b.md" } }, ""));
+    try tree.file("config/.git/config", "[core]\n\tignorecase = true\n");
+    try tree.tmp.dir.rename("replaced", tree.tmp.dir, "replaced-old", std.testing.io);
+    try tree.repo(arena, "replaced", &.{.{ .path = "src/a.txt" }});
+
+    // A change in `src` leaves a check of `docs` alone.
+    try std.testing.expect(tree_mod.isCurrent(&results[1].tree, roots[1], &default_skipped_names, "docs"));
+    for (results[1..], roots[1..], cases[1..]) |*result, root, name| {
+        if (tree_mod.isCurrent(&result.tree, root, &default_skipped_names, null)) {
+            std.debug.print("stale tree reported current: {s}\n", .{name});
+            return error.TestExpectedStale;
+        }
+    }
+}

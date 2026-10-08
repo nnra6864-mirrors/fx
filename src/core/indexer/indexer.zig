@@ -10,6 +10,8 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const git_config = @import("git_config.zig");
 const layout = @import("layout.zig");
 const scan_mod = @import("scan.zig");
+const snapshot_mod = @import("snapshot.zig");
+const tree_mod = @import("tree.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -25,6 +27,22 @@ pub const default_skipped_names = scan_mod.default_skipped_names;
 /// matches and `options.skipped_names`. See `scan.zig` for the rules. `alloc`
 /// must be safe to use from several threads.
 pub const scan = scan_mod.scan;
+
+pub const Tree = tree_mod.Tree;
+/// Whether a tree from `scan` or a snapshot still describes its root under
+/// the same skipped names, checked through its folder and source stamps
+/// without reading any folder. With a subtree, only folders at or below it
+/// are checked. A stamp recorded within the granularity margin of its scan is
+/// never trusted, so a change in the same clock tick always forces a scan.
+pub const isCurrent = tree_mod.isCurrent;
+
+pub const Snapshot = snapshot_mod.Snapshot;
+pub const snapshot_max_bytes = snapshot_mod.max_bytes;
+/// Loads the saved trees for exactly `roots` from the absolute path the
+/// caller chose, or null when missing or not admissible.
+pub const loadSnapshot = snapshot_mod.load;
+/// Saves trees atomically to the absolute path; an all-empty save deletes it.
+pub const saveSnapshot = snapshot_mod.save;
 
 pub const RepoFilters = struct {
     /// Absolute git directory of the repository containing the root, found
@@ -93,7 +111,8 @@ test {
     _ = @import("ignore.zig");
     _ = @import("sources.zig");
     _ = @import("git_index.zig");
-    _ = @import("tree.zig");
+    _ = tree_mod;
+    _ = snapshot_mod;
     _ = scan_mod;
     _ = layout;
     _ = git_config;
