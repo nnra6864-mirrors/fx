@@ -4,6 +4,7 @@
 //! than tidiness here.
 
 const std = @import("std");
+const debug_trace = @import("../shared/debug_trace.zig");
 
 pub const Flags = struct {
     /// `WM_PATHNAME`: `*`, `?` and bracket expressions never match `/`, and
@@ -15,10 +16,22 @@ pub const Flags = struct {
 
 const Result = enum { match, no_match, abort_all, abort_to_starstar };
 
+/// Recursive steps one match may take. Git's algorithm backtracks
+/// exponentially on patterns such as many chained `**/`, and a repository
+/// chooses its own ignore patterns, so a match that runs out counts as no
+/// match: the path is listed rather than hidden, and the cost per path stays
+/// bounded. Ordinary patterns need a small fraction of this.
+const max_steps: u32 = 20_000;
+
 /// Reports whether `text` matches `pattern`. Like git, a NUL byte ends either
 /// string.
 pub fn match(pattern: []const u8, text: []const u8, flags: Flags) bool {
-    return doWild(pattern, 0, text, 0, flags) == .match;
+    var budget: u32 = max_steps;
+    const result = doWild(pattern, 0, text, 0, flags, &budget);
+    if (budget == 0 and result != .match) {
+        debug_trace.logf("indexer", "wildmatch step budget exhausted pattern_bytes={d} text_bytes={d}", .{ pattern.len, text.len });
+    }
+    return result == .match;
 }
 
 fn at(s: []const u8, i: usize) u8 {
@@ -41,7 +54,9 @@ fn hasSlashFrom(s: []const u8, start: usize) ?usize {
     return null;
 }
 
-fn doWild(pattern: []const u8, p_start: usize, text: []const u8, t_start: usize, flags: Flags) Result {
+fn doWild(pattern: []const u8, p_start: usize, text: []const u8, t_start: usize, flags: Flags, budget: *u32) Result {
+    if (budget.* == 0) return .abort_all;
+    budget.* -= 1;
     var p = p_start;
     var t = t_start;
     outer: while (at(pattern, p) != 0) : ({
@@ -76,7 +91,7 @@ fn doWild(pattern: []const u8, p_start: usize, text: []const u8, t_start: usize,
                         (next == '\\' and at(pattern, p + 1) == '/')))
                     {
                         // `**/` may match no directories at all.
-                        if (next == '/' and doWild(pattern, p + 1, text, t, flags) == .match) return .match;
+                        if (next == '/' and doWild(pattern, p + 1, text, t, flags, budget) == .match) return .match;
                         match_slash = true;
                     } else {
                         match_slash = !flags.pathname;
@@ -115,7 +130,7 @@ fn doWild(pattern: []const u8, p_start: usize, text: []const u8, t_start: usize,
                         }
                         if (t_ch != literal) return if (match_slash) .abort_all else .abort_to_starstar;
                     }
-                    const matched = doWild(pattern, p, text, t, flags);
+                    const matched = doWild(pattern, p, text, t, flags, budget);
                     if (matched != .no_match) {
                         if (!match_slash or matched != .abort_to_starstar) return matched;
                     } else if (!match_slash and t_ch == '/') {
@@ -301,4 +316,16 @@ test "wildmatch case folding is ASCII-only and keeps git's escape quirk" {
 
 test "wildmatch stops at a NUL byte like git's C strings" {
     try std.testing.expect(match("ab\x00zz", "ab", .{ .pathname = true }));
+}
+
+test "hostile patterns stop at the step budget instead of backtracking forever" {
+    const long_text = "a/" ** 200 ++ "b";
+    const hostile = [_][]const u8{ "*/" ** 40 ++ "c", "**/" ** 30 ++ "c", "*a*a*a*a*a*a*a*a*a*a*a*a*c", "a/**/a/**/a/**/a/**/a/**/a/**/c" };
+    for (hostile) |pattern| {
+        try std.testing.expect(!match(pattern, long_text, .{ .pathname = true }));
+        try std.testing.expect(!match(pattern, long_text, .{}));
+    }
+    // Ordinary patterns on a long path still match.
+    try std.testing.expect(match("**/b", long_text, .{ .pathname = true }));
+    try std.testing.expect(match("a/**/a/b", long_text, .{ .pathname = true }));
 }
