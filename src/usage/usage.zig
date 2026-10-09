@@ -25,6 +25,8 @@ pub const trace = @import("trace.zig");
 const checkpoint = @import("checkpoint.zig");
 const core = @import("core/ledger.zig");
 const durable = @import("io/durable.zig");
+const gateway_history = @import("gateway_history.zig");
+const history_store = @import("io/history_store.zig");
 const markers = @import("io/markers.zig");
 const profile_store = @import("io/profile.zig");
 const receipt = @import("receipt.zig");
@@ -1009,16 +1011,244 @@ fn subscriptionId(provider: Provider, external_id: []const u8) ?core.GenerationI
 }
 
 // ---------------------------------------------------------------------------
+// History
+
+/// Usage history from AI Gateway reports, for the dashboard and `fx usage`:
+/// the stored snapshot, renewed through the host's transport when due.
+/// Safe from any thread.
+pub const History = struct {
+    gpa: Allocator,
+    io: Io,
+    home: Io.Dir,
+    lookup: ?host.Lookup,
+    origin: []const u8,
+    lock: Io.Mutex = .init,
+    // Guarded by `lock`.
+    held: Held = .{},
+    failed_at_ms: ?i64 = null,
+
+    const Held = struct {
+        state: enum { needs_api_key, subscription, ready } = .needs_api_key,
+        user: [gateway_user_len]u8 = undefined,
+        secret: [host.Credential.max_secret_bytes]u8 = undefined,
+        /// Null for host-managed auth: no bearer.
+        secret_len: ?usize = null,
+        team: [core.max_team_bytes]u8 = undefined,
+        team_len: ?usize = null,
+
+        fn wipe(held: *Held) void {
+            std.crypto.secureZero(u8, &held.secret);
+            held.* = .{};
+        }
+
+        fn same(a: *const Held, b: *const Held) bool {
+            if (a.state != b.state) return false;
+            if (a.state != .ready) return true;
+            return std.mem.eql(u8, &a.user, &b.user) and
+                optionalEql(a.secret[0 .. a.secret_len orelse 0], a.secret_len, b.secret[0 .. b.secret_len orelse 0], b.secret_len) and
+                optionalEql(a.team[0 .. a.team_len orelse 0], a.team_len, b.team[0 .. b.team_len orelse 0], b.team_len);
+        }
+
+        fn optionalEql(a: []const u8, a_len: ?usize, b: []const u8, b_len: ?usize) bool {
+            if ((a_len == null) != (b_len == null)) return false;
+            return std.mem.eql(u8, a, b);
+        }
+    };
+
+    pub const Options = struct {
+        /// The directory that holds `.fx` (the user's HOME). Borrowed.
+        home: Io.Dir,
+        /// fx's AI Gateway transport. Null shows only the stored snapshot.
+        lookup: ?host.Lookup = null,
+        /// Borrowed for the life of the history.
+        origin: []const u8 = default_origin,
+    };
+
+    pub const Error = report.BuildError || error{Canceled};
+
+    pub const Mode = enum {
+        /// The stored snapshot only: no network.
+        stored,
+        /// Fetch new reports first when the snapshot is due.
+        refresh_if_due,
+        /// Fetch new reports first, as the user asked, unless a refresh
+        /// ran in the last 30 seconds.
+        refresh_now,
+    };
+
+    /// Does no I/O.
+    pub fn init(gpa: Allocator, io: Io, options: Options) History {
+        return .{ .gpa = gpa, .io = io, .home = options.home, .lookup = options.lookup, .origin = options.origin };
+    }
+
+    pub fn deinit(h: *History) void {
+        h.held.wipe();
+        h.* = undefined;
+    }
+
+    /// Whose history to show: an AI Gateway API key's fx user. Any other
+    /// credential has no history, and the views say why. Copies the secret.
+    /// The same credential again changes nothing, so a refresh that just
+    /// failed still waits before fx tries again on its own.
+    pub fn setCredential(h: *History, credential: Ledger.Credential) void {
+        var next: Held = .{};
+        defer next.wipe();
+        hold(&next, credential);
+        h.lock.lockUncancelable(h.io);
+        defer h.lock.unlock(h.io);
+        if (h.held.same(&next)) return;
+        h.held.wipe();
+        h.held = next;
+        h.failed_at_ms = null;
+    }
+
+    fn hold(held: *Held, credential: Ledger.Credential) void {
+        const source = credential.source orelse return;
+        switch (source) {
+            .chatgpt_subscription, .grok_subscription => held.state = .subscription,
+            .ai_gateway_api_key, .stored_key => {
+                const secret = switch (credential.credential) {
+                    .bearer => |value| value,
+                    .signed_out, .host_managed => return,
+                };
+                if (secret.len > host.Credential.max_secret_bytes) return;
+                if (credential.team) |team| {
+                    if (team.len > core.max_team_bytes) return;
+                    @memcpy(held.team[0..team.len], team);
+                    held.team_len = team.len;
+                }
+                _ = gatewayUser(source, secret, &held.user) orelse return;
+                @memcpy(held.secret[0..secret.len], secret);
+                held.secret_len = secret.len;
+                held.state = .ready;
+            },
+            .vercel_oidc_token, .fx_login, .host_managed, .configured => {},
+        }
+    }
+
+    /// The three history views at `now_ms`, in `Scope.rolling` order, or
+    /// null in `stored` mode when nothing is stored yet. Blocks while a
+    /// refresh runs, which `cancel` stops. The caller owns the views.
+    pub fn views(h: *History, gpa: Allocator, now_ms: i64, mode: Mode, cancel: *const std.atomic.Value(bool)) Error!?[Scope.rolling.len]View {
+        // A copy, so the lock is never held across the network.
+        var held: Held = undefined;
+        const failed_at_ms = blk: {
+            h.lock.lockUncancelable(h.io);
+            defer h.lock.unlock(h.io);
+            held = h.held;
+            break :blk h.failed_at_ms;
+        };
+        defer std.crypto.secureZero(u8, &held.secret);
+        switch (held.state) {
+            .needs_api_key => return try unavailableViews(gpa, now_ms, .needs_api_key),
+            .subscription => return try unavailableViews(gpa, now_ms, .subscription),
+            .ready => {},
+        }
+        const user: []const u8 = &held.user;
+        const team = if (held.team_len) |len| held.team[0..len] else null;
+
+        var arena_state = std.heap.ArenaAllocator.init(h.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var stored = history_store.read(h.io, h.home, arena, gateway_history.identityOf(user, team));
+        // Until a refresh succeeds, the last one's failure stands.
+        var refresh_failed = failed_at_ms != null;
+        const due = mode != .stored and h.lookup != null and gateway_history.refreshDue(.{
+            .snapshot = if (stored) |*value| value else null,
+            .failed_at_ms = failed_at_ms,
+        }, now_ms, mode == .refresh_now);
+        if (due) {
+            const body = try arena.alloc(u8, history_store.max_body_bytes);
+            const credential: history_store.Credential = .{
+                .secret = if (held.secret_len) |len| held.secret[0..len] else null,
+                .team = team,
+                .user = user,
+            };
+            switch (history_store.fetch(arena, h.lookup.?, h.origin, credential, now_ms, cancel, body)) {
+                .fetched, .refused => |fresh| {
+                    // A snapshot that fails to save still shows; the next
+                    // refresh writes again.
+                    history_store.write(h.io, h.home, h.gpa, fresh) catch {};
+                    stored = fresh;
+                    refresh_failed = false;
+                    h.setFailedAt(null);
+                },
+                .failed => {
+                    refresh_failed = true;
+                    h.setFailedAt(now_ms);
+                },
+                .canceled => return error.Canceled,
+            }
+        }
+        const latest = stored orelse {
+            if (mode == .stored) return null;
+            return try unavailableViews(gpa, now_ms, .failed);
+        };
+        if (latest.refused) return try unavailableViews(gpa, now_ms, .refused);
+        return try historyViews(gpa, latest, refresh_failed);
+    }
+
+    fn setFailedAt(h: *History, at_ms: ?i64) void {
+        h.lock.lockUncancelable(h.io);
+        defer h.lock.unlock(h.io);
+        h.failed_at_ms = at_ms;
+    }
+
+    fn periodOf(scope: Scope) gateway_history.Period {
+        return switch (scope) {
+            .today => .today,
+            .days_7 => .days_7,
+            .days_30 => .days_30,
+            .session => unreachable,
+        };
+    }
+
+    fn historyViews(gpa: Allocator, latest: gateway_history.Snapshot, refresh_failed: bool) report.BuildError![Scope.rolling.len]View {
+        var out: [Scope.rolling.len]View = undefined;
+        var built: usize = 0;
+        errdefer for (out[0..built]) |*one| one.deinit(gpa);
+        for (Scope.rolling, &out) |scope, *dst| {
+            const period = periodOf(scope);
+            dst.* = try report.historyView(
+                gpa,
+                scope,
+                latest.periods[@intFromEnum(period)],
+                latest.fetched_at_ms,
+                gateway_history.firstDay(period, latest.today),
+                refresh_failed,
+            );
+            built += 1;
+        }
+        return out;
+    }
+
+    fn unavailableViews(gpa: Allocator, now_ms: i64, reason: report.Unavailable) Allocator.Error![Scope.rolling.len]View {
+        var out: [Scope.rolling.len]View = undefined;
+        var built: usize = 0;
+        errdefer for (out[0..built]) |*one| one.deinit(gpa);
+        for (Scope.rolling, &out) |scope, *dst| {
+            dst.* = try report.unavailableView(gpa, scope, now_ms, reason);
+            built += 1;
+        }
+        return out;
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Dashboard views
 
-/// Builds the three rolling views off the owner's thread, for the TUI
-/// dashboard. `refresh`, `poll`, `view`, and `deinit` are called from one
-/// thread; the load runs as a task when the host can run one, else inline.
+/// Builds the three history views off the owner's thread, for the TUI
+/// dashboard: first from the stored snapshot, then again after a refresh
+/// when one is due. `refresh`, `poll`, `view`, and `deinit` are called from
+/// one thread; the load runs as a task when the host can run one, else
+/// inline.
 pub const ViewLoader = struct {
-    profile: *Profile,
+    history: *History,
     gpa: Allocator,
     lock: Io.Mutex = .init,
     task: ?Io.Future(void) = null,
+    /// Set by `deinit` to stop a refresh in progress.
+    cancel: std.atomic.Value(bool) = .init(false),
     // Guarded by `lock`.
     loading: bool = false,
     finished: ?Result = null,
@@ -1029,7 +1259,7 @@ pub const ViewLoader = struct {
     retired: ?[Scope.rolling.len]View = null,
     last_error: ?ViewsError = null,
 
-    pub const ViewsError = @typeInfo(@typeInfo(@TypeOf(Profile.views)).@"fn".return_type.?).error_union.error_set;
+    pub const ViewsError = History.Error;
 
     const Result = union(enum) {
         ready: [Scope.rolling.len]View,
@@ -1038,13 +1268,15 @@ pub const ViewLoader = struct {
 
     pub const Transition = enum { none, ready, failed };
 
-    pub fn init(profile: *Profile, gpa: Allocator) ViewLoader {
-        return .{ .profile = profile, .gpa = gpa };
+    pub fn init(history: *History, gpa: Allocator) ViewLoader {
+        return .{ .history = history, .gpa = gpa };
     }
 
-    /// Waits for a load in progress, then frees every view.
+    /// Stops a refresh in progress, waits for the load, then frees every
+    /// view.
     pub fn deinit(v: *ViewLoader) void {
-        if (v.task) |*task| task.await(v.profile.io);
+        v.cancel.store(true, .release);
+        if (v.task) |*task| task.await(v.history.io);
         if (v.finished) |*result| v.freeResult(result);
         if (v.current) |*views| v.freeViews(views);
         if (v.retired) |*views| v.freeViews(views);
@@ -1052,36 +1284,59 @@ pub const ViewLoader = struct {
     }
 
     /// Starts loading the views at `now_ms` unless a load is running.
-    /// Returns whether it started one.
-    pub fn refresh(v: *ViewLoader, now_ms: i64) bool {
+    /// `asked` is a refresh the user asked for. Returns whether it started.
+    pub fn refresh(v: *ViewLoader, now_ms: i64, asked: bool) bool {
         {
-            v.lock.lockUncancelable(v.profile.io);
-            defer v.lock.unlock(v.profile.io);
+            v.lock.lockUncancelable(v.history.io);
+            defer v.lock.unlock(v.history.io);
             if (v.loading) return false;
             v.loading = true;
         }
         // The last load cleared `loading` as its final step.
-        if (v.task) |*done| done.await(v.profile.io);
-        v.task = v.profile.io.concurrent(load, .{ v, now_ms }) catch blk: {
-            load(v, now_ms);
+        if (v.task) |*done| done.await(v.history.io);
+        v.task = v.history.io.concurrent(load, .{ v, now_ms, asked }) catch blk: {
+            load(v, now_ms, asked);
             break :blk null;
         };
         return true;
     }
 
-    fn load(v: *ViewLoader, now_ms: i64) void {
-        const result: Result = if (v.profile.views(v.gpa, now_ms)) |views| .{ .ready = views } else |err| .{ .failed = err };
-        v.lock.lockUncancelable(v.profile.io);
-        defer v.lock.unlock(v.profile.io);
+    fn load(v: *ViewLoader, now_ms: i64, asked: bool) void {
+        // The stored snapshot first, so the dashboard never waits on the
+        // network.
+        if (v.history.views(v.gpa, now_ms, .stored, &v.cancel)) |stored| {
+            if (stored) |views| v.publish(.{ .ready = views }, false);
+        } else |err| {
+            v.publish(.{ .failed = err }, false);
+        }
+        const mode: History.Mode = if (asked) .refresh_now else .refresh_if_due;
+        const result: ?Result = if (v.history.views(v.gpa, now_ms, mode, &v.cancel)) |views|
+            (if (views) |ready| .{ .ready = ready } else null)
+        else |err| switch (err) {
+            error.Canceled => null,
+            else => .{ .failed = err },
+        };
+        if (result) |value| v.publish(value, true) else v.finish();
+    }
+
+    fn publish(v: *ViewLoader, result: Result, last: bool) void {
+        v.lock.lockUncancelable(v.history.io);
+        defer v.lock.unlock(v.history.io);
         if (v.finished) |*old| v.freeResult(old);
         v.finished = result;
+        if (last) v.loading = false;
+    }
+
+    fn finish(v: *ViewLoader) void {
+        v.lock.lockUncancelable(v.history.io);
+        defer v.lock.unlock(v.history.io);
         v.loading = false;
     }
 
     /// Whether a load is running.
     pub fn isLoading(v: *ViewLoader) bool {
-        v.lock.lockUncancelable(v.profile.io);
-        defer v.lock.unlock(v.profile.io);
+        v.lock.lockUncancelable(v.history.io);
+        defer v.lock.unlock(v.history.io);
         return v.loading;
     }
 
@@ -1090,8 +1345,8 @@ pub const ViewLoader = struct {
     /// After `.failed`, the old views stay and `lastError` says why.
     pub fn poll(v: *ViewLoader) Transition {
         const result = blk: {
-            v.lock.lockUncancelable(v.profile.io);
-            defer v.lock.unlock(v.profile.io);
+            v.lock.lockUncancelable(v.history.io);
+            defer v.lock.unlock(v.history.io);
             const result = v.finished orelse return .none;
             v.finished = null;
             break :blk result;
@@ -1112,7 +1367,7 @@ pub const ViewLoader = struct {
         }
     }
 
-    /// The loaded view of a rolling scope, or null. Borrowed until the poll
+    /// The loaded view of a history scope, or null. Borrowed until the poll
     /// after the next `.ready`, or `deinit`.
     pub fn view(v: *const ViewLoader, scope: Scope) ?*const View {
         if (v.current) |*views| {
@@ -1146,10 +1401,12 @@ test {
     _ = @import("checkpoint.zig");
     _ = @import("codec/record.zig");
     _ = @import("codec/snapshot.zig");
+    _ = @import("gateway_history.zig");
     _ = @import("core/ledger.zig");
     _ = @import("core/publish.zig");
     _ = @import("host.zig");
     _ = @import("io/durable.zig");
+    _ = @import("io/history_store.zig");
     _ = @import("io/markers.zig");
     _ = @import("io/profile.zig");
     _ = @import("io/worker.zig");
@@ -1323,7 +1580,7 @@ test "a cancelled call with an id waits for a lookup, keeps its marker, and prof
     try testing.expectEqual(@as(u32, 0), lookup.fetches.load(.monotonic));
     try testing.expect(try markerExists(testing.io, tmp.dir));
 
-    var rolling = try profile.view(testing.allocator, .hours_24, wallMs(testing.io) + 1);
+    var rolling = try profile.view(testing.allocator, .today, wallMs(testing.io) + 1);
     defer rolling.deinit(testing.allocator);
     try testing.expectEqual(report.Completeness.pending, rolling.completeness);
     // The pending record and the marked session name the same id once.
@@ -1694,30 +1951,191 @@ test "lines are durable at flushActivity, and code completeness can be lost" {
     try testing.expect(!saved.snapshot.code_complete);
 }
 
-test "the view loader keeps old views on failure and carries them through a refresh" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var profile = Profile.init(testing.allocator, testing.io, .{ .home = tmp.dir, .mode = .read_only });
-    defer profile.deinit();
-    var loader: ViewLoader = .init(&profile, testing.allocator);
-    defer loader.deinit();
-    try testing.expectEqual(ViewLoader.Transition.none, loader.poll());
-    try testing.expect(loader.view(.days_30) == null);
-    try testing.expect(loader.refresh(wallMs(testing.io)));
-    while (loader.isLoading()) try testing.io.sleep(.fromMilliseconds(1), .awake);
-    try testing.expectEqual(ViewLoader.Transition.ready, loader.poll());
-    const first = loader.view(.days_7).?;
-    try testing.expectEqual(Scope.days_7, first.scope);
-    try testing.expect(loader.view(.session) == null);
+/// A fake AI Gateway for history tests: answers in order, or holds until
+/// the request is canceled.
+const FakeReports = struct {
+    answers: []const Answer,
+    used: std.atomic.Value(usize) = .init(0),
 
-    // A ledger file the store refuses: the refresh fails, the views stay.
-    try tmp.dir.createDirPath(testing.io, ".fx");
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = ".fx/usage.jsonl", .data = "not json\n" });
-    try testing.expect(loader.refresh(wallMs(testing.io)));
-    while (loader.isLoading()) try testing.io.sleep(.fromMilliseconds(1), .awake);
-    try testing.expectEqual(ViewLoader.Transition.failed, loader.poll());
-    try testing.expect(loader.lastError() != null);
-    try testing.expect(loader.view(.days_7) == first);
+    const Answer = union(enum) { body: []const u8, status: u16, hold };
+
+    fn lookup(f: *FakeReports) host.Lookup {
+        return .{ .context = f, .vtable = &.{ .trusted = trusted, .fetch = fetch } };
+    }
+
+    fn trusted(_: *anyopaque, _: []const u8) bool {
+        return true;
+    }
+
+    fn fetch(context: *anyopaque, request: *const host.Lookup.Request, body: []u8) host.Lookup.FetchError!host.Lookup.Response {
+        const f: *FakeReports = @ptrCast(@alignCast(context));
+        const index = f.used.fetchAdd(1, .acq_rel);
+        const answer = if (index < f.answers.len) f.answers[index] else Answer{ .status = 500 };
+        switch (answer) {
+            .status => |status| return .{ .status = status, .body_len = 0 },
+            .body => |text| {
+                @memcpy(body[0..text.len], text);
+                return .{ .status = 200, .body_len = text.len };
+            },
+            .hold => {
+                while (!request.cancel.load(.acquire)) {
+                    testing.io.sleep(.fromMilliseconds(1), .awake) catch return error.Canceled;
+                }
+                return error.Canceled;
+            },
+        }
+    }
+};
+
+const history_report =
+    \\{"results":[{"model":"openai/gpt-4.1-nano","total_cost":0.5,"input_tokens":100,"output_tokens":10,"cached_input_tokens":0,"cache_creation_input_tokens":0,"reasoning_tokens":0,"request_count":2}]}
+;
+const history_key: Ledger.Credential = .{ .credential = .{ .bearer = "vck_history_test" }, .source = .stored_key };
+
+fn freeHistoryViews(views: *[Scope.rolling.len]View) void {
+    for (views) |*one| one.deinit(testing.allocator);
+}
+
+test "history views say why a credential has none" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fake: FakeReports = .{ .answers = &.{} };
+    var history: History = .init(testing.allocator, testing.io, .{ .home = tmp.dir, .lookup = fake.lookup() });
+    defer history.deinit();
+    var never: std.atomic.Value(bool) = .init(false);
+    const cases = [_]struct { credential: Ledger.Credential, want: report.Unavailable }{
+        .{ .credential = .{ .credential = .signed_out }, .want = .needs_api_key },
+        .{ .credential = .{ .credential = .{ .bearer = "token" }, .source = .fx_login }, .want = .needs_api_key },
+        .{ .credential = .{ .credential = .{ .bearer = "token" }, .source = .vercel_oidc_token }, .want = .needs_api_key },
+        .{ .credential = .{ .credential = .host_managed, .source = .host_managed }, .want = .needs_api_key },
+        .{ .credential = .{ .credential = .signed_out, .source = .stored_key }, .want = .needs_api_key },
+        .{ .credential = .{ .credential = .signed_out, .source = .chatgpt_subscription }, .want = .subscription },
+        .{ .credential = .{ .credential = .signed_out, .source = .grok_subscription }, .want = .subscription },
+    };
+    for (cases) |case| {
+        history.setCredential(case.credential);
+        var views = (try history.views(testing.allocator, 0, .refresh_if_due, &never)).?;
+        defer freeHistoryViews(&views);
+        for (views) |one| {
+            try testing.expectEqual(case.want, one.history.?.unavailable.?);
+            try testing.expect(one.totals == null);
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), fake.used.load(.acquire));
+}
+
+test "history reads its snapshot, refreshes when due, and keeps it when a refresh fails" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fake: FakeReports = .{ .answers = &.{
+        .{ .body = history_report },
+        .{ .body = history_report },
+        .{ .body = history_report },
+        .{ .status = 503 },
+        .{ .status = 403 },
+    } };
+    var history: History = .init(testing.allocator, testing.io, .{ .home = tmp.dir, .lookup = fake.lookup() });
+    defer history.deinit();
+    history.setCredential(history_key);
+    var never: std.atomic.Value(bool) = .init(false);
+    // 2026-10-09 05:00 UTC.
+    const now: i64 = 1_791_504_000_000 + 5 * std.time.ms_per_hour;
+
+    try testing.expectEqual(null, try history.views(testing.allocator, now, .stored, &never));
+    {
+        var views = (try history.views(testing.allocator, now, .refresh_if_due, &never)).?;
+        defer freeHistoryViews(&views);
+        try testing.expectEqual(@as(usize, 3), fake.used.load(.acquire));
+        for (views) |one| {
+            try testing.expectEqual(now, one.history.?.as_of_ms.?);
+            try testing.expect(!one.history.?.refresh_failed);
+            try testing.expectEqual(@as(f64, 0.5), one.totals.?.total_cost);
+            try testing.expectEqual(@as(?u64, 2), one.totals.?.request_count);
+            try testing.expectEqualStrings("openai/gpt-4.1-nano", one.models[0].model);
+        }
+        try testing.expectEqual(Scope.days_30, views[0].scope);
+        // 30 whole UTC days: 2026-09-10 00:00 UTC on.
+        try testing.expectEqual(@as(i64, 1_788_998_400_000), views[0].window_start_ms);
+    }
+    // Stored, and not due a minute later: no fetch.
+    {
+        var views = (try history.views(testing.allocator, now + std.time.ms_per_min, .refresh_if_due, &never)).?;
+        defer freeHistoryViews(&views);
+        try testing.expectEqual(@as(usize, 3), fake.used.load(.acquire));
+        try testing.expectEqual(now, views[2].history.?.as_of_ms.?);
+    }
+    // Stale: the refresh fails, and the snapshot stays, marked.
+    const later = now + gateway_history.stale_after_ms;
+    {
+        var views = (try history.views(testing.allocator, later, .refresh_if_due, &never)).?;
+        defer freeHistoryViews(&views);
+        try testing.expectEqual(@as(usize, 4), fake.used.load(.acquire));
+        try testing.expect(views[0].history.?.refresh_failed);
+        try testing.expectEqual(now, views[0].history.?.as_of_ms.?);
+    }
+    // fx waits a minute before trying on its own, and still says it failed,
+    // even when a call sets the same key again.
+    history.setCredential(history_key);
+    {
+        var views = (try history.views(testing.allocator, later + 1000, .refresh_if_due, &never)).?;
+        defer freeHistoryViews(&views);
+        try testing.expectEqual(@as(usize, 4), fake.used.load(.acquire));
+        try testing.expect(views[0].history.?.refresh_failed);
+    }
+    // Asked after 30 s: AI Gateway refuses the key, and that is remembered.
+    {
+        var views = (try history.views(testing.allocator, later + 31 * std.time.ms_per_s, .refresh_now, &never)).?;
+        defer freeHistoryViews(&views);
+        try testing.expectEqual(@as(usize, 5), fake.used.load(.acquire));
+        try testing.expectEqual(report.Unavailable.refused, views[1].history.?.unavailable.?);
+    }
+    {
+        var views = (try history.views(testing.allocator, later + std.time.ms_per_hour, .refresh_if_due, &never)).?;
+        defer freeHistoryViews(&views);
+        try testing.expectEqual(@as(usize, 5), fake.used.load(.acquire));
+        try testing.expectEqual(report.Unavailable.refused, views[1].history.?.unavailable.?);
+    }
+    // Another key has no snapshot of its own.
+    history.setCredential(.{ .credential = .{ .bearer = "vck_other" }, .source = .ai_gateway_api_key });
+    try testing.expectEqual(null, try history.views(testing.allocator, later, .stored, &never));
+}
+
+test "the view loader shows the stored snapshot first and cancels a refresh on close" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fake: FakeReports = .{ .answers = &.{ .{ .body = history_report }, .{ .body = history_report }, .{ .body = history_report }, .hold } };
+    var history: History = .init(testing.allocator, testing.io, .{ .home = tmp.dir, .lookup = fake.lookup() });
+    defer history.deinit();
+    history.setCredential(history_key);
+    const now = wallMs(testing.io);
+    {
+        var loader: ViewLoader = .init(&history, testing.allocator);
+        defer loader.deinit();
+        try testing.expectEqual(ViewLoader.Transition.none, loader.poll());
+        try testing.expect(loader.refresh(now, false));
+        while (loader.isLoading()) try testing.io.sleep(.fromMilliseconds(1), .awake);
+        try testing.expectEqual(ViewLoader.Transition.ready, loader.poll());
+        try testing.expectEqual(@as(f64, 0.5), loader.view(.today).?.totals.?.total_cost);
+        try testing.expect(loader.view(.session) == null);
+    }
+    // Asked again: the stored views arrive while the refresh hangs, and
+    // closing the loader stops it.
+    var loader: ViewLoader = .init(&history, testing.allocator);
+    try testing.expect(loader.refresh(now + 31 * std.time.ms_per_s, true));
+    var ready = false;
+    for (0..5000) |_| {
+        if (loader.poll() == .ready) {
+            ready = true;
+            break;
+        }
+        try testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try testing.expect(ready);
+    try testing.expectEqual(now, loader.view(.days_7).?.history.?.as_of_ms.?);
+    while (fake.used.load(.acquire) < 4) try testing.io.sleep(.fromMilliseconds(1), .awake);
+    try testing.expect(loader.isLoading());
+    loader.deinit();
+    try testing.expectEqual(@as(usize, 4), fake.used.load(.acquire));
 }
 
 test "an orphan marker is one incident at its protected time, not a gap in every window" {
@@ -1734,7 +2152,7 @@ test "an orphan marker is one incident at its protected time, not a gap in every
     // No recovery source: the session behind the marker can't be read.
     var profile = Profile.init(testing.allocator, testing.io, .{ .home = tmp.dir, .mode = .read_only });
     defer profile.deinit();
-    var day = try profile.view(testing.allocator, .hours_24, now);
+    var day = try profile.view(testing.allocator, .today, now);
     defer day.deinit(testing.allocator);
     try testing.expectEqual(report.Completeness.complete, day.completeness);
     var month = try profile.view(testing.allocator, .days_30, now);

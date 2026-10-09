@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
 import {
+  fakeGatewayReport,
   fakeGatewaySse,
   startFakeGateway,
   TmuxSession,
@@ -317,7 +318,7 @@ test("fx ask gives immediate generation reconciliation a bounded drain", async (
   expect(usage.pending).toEqual([]);
 });
 
-test("fx usage reports an unresolved delayed fallback as pending", async () => {
+test("fx ask keeps an unresolved delayed fallback pending in the session", async () => {
   root = mkdtempSync(join(tmpdir(), "fx-cost-pending-profile-"));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
@@ -360,25 +361,14 @@ test("fx usage reports an unresolved delayed fallback as pending", async () => {
   expect(await ask.exited, askStderr).toBe(0);
   await waitForProfileUsage(home, GENERATION_ID);
 
-  const usage = Bun.spawn(
-    [FX_BIN, "usage", "--period", "24h", "--json"],
-    {
-      cwd: workspace,
-      env: { ...process.env, HOME: home },
-      stdout: "pipe",
-      stderr: "pipe",
-    },
-  );
-  const usageStdout = await new Response(usage.stdout).text();
-  const usageStderr = await new Response(usage.stderr).text();
-  expect(await usage.exited, usageStderr).toBe(0);
-  const report = JSON.parse(usageStdout);
-  expect(report.completeness).toBe("pending");
-  expect(report.totals.request_count).toBe(0);
+  const usage = latestUsageCheckpoint(home);
+  expect(usage.billing).toBe("pending");
+  expect(usage.pending.map((item) => item.id)).toEqual([GENERATION_ID]);
+  expect(usage.total_cost).toBe(0);
   expect(gateway.generationRequests).toEqual([GENERATION_ID]);
 });
 
-test("fx usage reports a missing generation identity as incomplete", async () => {
+test("fx ask records a call without a generation identity as incomplete", async () => {
   root = mkdtempSync(join(tmpdir(), "fx-cost-incomplete-profile-"));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
@@ -411,21 +401,9 @@ test("fx usage reports a missing generation identity as incomplete", async () =>
   const askStderr = await new Response(ask.stderr).text();
   expect(await ask.exited, askStderr).toBe(0);
 
-  const usage = Bun.spawn(
-    [FX_BIN, "usage", "--period", "24h", "--json"],
-    {
-      cwd: workspace,
-      env: { ...process.env, HOME: home },
-      stdout: "pipe",
-      stderr: "pipe",
-    },
-  );
-  const usageStdout = await new Response(usage.stdout).text();
-  const usageStderr = await new Response(usage.stderr).text();
-  expect(await usage.exited, usageStderr).toBe(0);
-  const report = JSON.parse(usageStdout);
-  expect(report.completeness).toBe("incomplete");
-  expect(report.totals.request_count).toBe(0);
+  const usage = latestUsageCheckpoint(home);
+  expect(usage.billing).toBe("incomplete");
+  expect(usage.total_cost).toBe(0);
   expect(gateway.generationRequests).toEqual([]);
 });
 
@@ -594,6 +572,18 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
         ],
         {
           models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+          // What AI Gateway reports for this turn: cache and reasoning apart.
+          report: () =>
+            fakeGatewayReport([{
+              model: MODEL,
+              total_cost: 0.0123,
+              input_tokens: 100,
+              cached_input_tokens: 20,
+              cache_creation_input_tokens: 10,
+              output_tokens: 20,
+              reasoning_tokens: 5,
+              request_count: 1,
+            }]),
           generationResponse(generationId) {
             generationAttempts += 1;
             if (generationId !== GENERATION_ID) {
@@ -623,7 +613,7 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
       expect(firstCost).toContain("[session]");
       expect(firstCost).toMatch(/\$0\.0123\s+155\s+1\s/);
       await session.sendKeys("Right");
-      await session.waitForText("[24h]", TIMEOUT);
+      await session.waitForText("[today]", TIMEOUT);
       await session.sendKeys("Right");
       await session.waitForText("[7d]", TIMEOUT);
       await session.sendKeys("Right");
@@ -645,7 +635,7 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
       expect(resumedCost).toContain("[session]");
       expect(resumedCost).toMatch(/\$0\.0123\s+155\s+1\s/);
       await session.sendKeys("Right");
-      await session.waitForText("[24h]", TIMEOUT);
+      await session.waitForText("[today]", TIMEOUT);
       await session.sendKeys("Right");
       await session.waitForText("[7d]", TIMEOUT);
       await session.sendKeys("Right");

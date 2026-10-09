@@ -22,6 +22,7 @@ const std = @import("std");
 const record = @import("codec/record.zig");
 const snapshot_codec = @import("codec/snapshot.zig");
 const ledger_core = @import("core/ledger.zig");
+const gateway_history = @import("gateway_history.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -46,20 +47,20 @@ pub const max_recovery_pending: usize = 4096;
 
 pub const Scope = enum {
     session,
-    hours_24,
+    today,
     days_7,
     days_30,
 
     /// Rolling scopes in the order the dashboard loads them.
-    pub const rolling = [_]Scope{ .days_30, .days_7, .hours_24 };
+    pub const rolling = [_]Scope{ .days_30, .days_7, .today };
     /// Dashboard period order, left to right: the session first, since the
     /// dashboard opens on it.
-    pub const tab_order = [_]Scope{ .session, .hours_24, .days_7, .days_30 };
+    pub const tab_order = [_]Scope{ .session, .today, .days_7, .days_30 };
 
     pub fn label(self: Scope) []const u8 {
         return switch (self) {
             .session => "Session",
-            .hours_24 => "24 hours",
+            .today => "Today",
             .days_7 => "7 days",
             .days_30 => "30 days",
         };
@@ -69,7 +70,7 @@ pub const Scope = enum {
     pub fn cliValue(self: Scope) ?[]const u8 {
         return switch (self) {
             .session => null,
-            .hours_24 => "24h",
+            .today => "today",
             .days_7 => "7d",
             .days_30 => "30d",
         };
@@ -77,7 +78,7 @@ pub const Scope = enum {
 
     /// Parses a `--period` value. `session` is not a period.
     pub fn fromCliValue(text: []const u8) ?Scope {
-        inline for (.{ Scope.hours_24, Scope.days_7, Scope.days_30 }) |scope| {
+        inline for (.{ Scope.today, Scope.days_7, Scope.days_30 }) |scope| {
             if (std.mem.eql(u8, text, scope.cliValue().?)) return scope;
         }
         return null;
@@ -87,19 +88,19 @@ pub const Scope = enum {
     pub fn durationMs(self: Scope) ?i64 {
         return switch (self) {
             .session => null,
-            .hours_24 => std.time.ms_per_hour * 24,
+            .today => std.time.ms_per_hour * 24,
             .days_7 => std.time.ms_per_day * 7,
             .days_30 => std.time.ms_per_day * 30,
         };
     }
 
-    /// The Left key. Periods read session 24h 7d 30d left to right, so Left
+    /// The Left key. Periods read session today 7d 30d left to right, so Left
     /// moves toward the session, without wrapping.
     pub fn previous(self: Scope) Scope {
         return switch (self) {
             .session => .session,
-            .hours_24 => .session,
-            .days_7 => .hours_24,
+            .today => .session,
+            .days_7 => .today,
             .days_30 => .days_7,
         };
     }
@@ -108,8 +109,8 @@ pub const Scope = enum {
     /// way and wraps.
     pub fn next(self: Scope) Scope {
         return switch (self) {
-            .session => .hours_24,
-            .hours_24 => .days_7,
+            .session => .today,
+            .today => .days_7,
             .days_7 => .days_30,
             .days_30 => .days_30,
         };
@@ -118,19 +119,19 @@ pub const Scope = enum {
     pub const Direction = enum { forward, backward };
 
     /// Tab (`forward`) and Shift+Tab (`backward`), wrapping:
-    /// session → 24h → 7d → 30d → session.
+    /// session → today → 7d → 30d → session.
     pub fn cycle(self: Scope, direction: Direction) Scope {
         return switch (direction) {
             .forward => switch (self) {
-                .session => .hours_24,
-                .hours_24 => .days_7,
+                .session => .today,
+                .today => .days_7,
                 .days_7 => .days_30,
                 .days_30 => .session,
             },
             .backward => switch (self) {
                 .session => .days_30,
-                .hours_24 => .session,
-                .days_7 => .hours_24,
+                .today => .session,
+                .days_7 => .today,
                 .days_30 => .days_7,
             },
         };
@@ -263,6 +264,8 @@ pub const View = struct {
     /// What `completeness` reads once those calls finish. Meaningful only
     /// when `in_flight > 0`.
     settled_completeness: Completeness = .complete,
+    /// History views only: where the numbers come from.
+    history: ?History = null,
 
     pub fn deinit(self: *View, alloc: Allocator) void {
         for (self.models) |model| alloc.free(model.model);
@@ -270,6 +273,121 @@ pub const View = struct {
         self.* = undefined;
     }
 };
+
+/// Where a history view's numbers come from.
+pub const History = struct {
+    /// When AI Gateway sent the numbers. Null when there are none.
+    as_of_ms: ?i64 = null,
+    /// Why there are no numbers. Null when there are.
+    unavailable: ?Unavailable = null,
+    /// The last refresh failed, so the numbers, if any, are older.
+    refresh_failed: bool = false,
+};
+
+/// Why a history view has no numbers.
+pub const Unavailable = enum {
+    /// The credential has no API key to tag: a sign-in or a deployment
+    /// token.
+    needs_api_key,
+    /// A ChatGPT or Grok subscription, whose usage never reaches AI Gateway.
+    subscription,
+    /// AI Gateway refused usage reports for this credential.
+    refused,
+    /// No snapshot yet, and the refresh failed.
+    failed,
+};
+
+/// A history view from AI Gateway's rows for `scope`, covering whole UTC
+/// days from `first_day` through the day the snapshot was taken. The
+/// totals add every row; the list keeps the `max_models` largest. The
+/// caller owns the result.
+pub fn historyView(
+    alloc: Allocator,
+    scope: Scope,
+    rows: []const gateway_history.Row,
+    as_of_ms: i64,
+    first_day: i64,
+    refresh_failed: bool,
+) BuildError!View {
+    if (scope == .session or as_of_ms < 0 or first_day < 0) return error.InvalidSnapshotTime;
+    var totals: Totals = .{
+        .total_tokens = 0,
+        .input_tokens = 0,
+        .output_tokens = 0,
+        .cache_read_tokens = 0,
+        .cache_write_tokens = 0,
+        .reasoning_tokens = 0,
+        .request_count = 0,
+        .total_cost = 0,
+    };
+    const models = try alloc.alloc(ModelUsage, rows.len);
+    var built: usize = 0;
+    errdefer {
+        for (models[0..built]) |model| alloc.free(model.model);
+        alloc.free(models);
+    }
+    for (rows, models) |row, *model| {
+        const one: Totals = .{
+            .total_tokens = std.math.add(u64, row.input_tokens, row.output_tokens) catch return error.UsageOverflow,
+            .input_tokens = row.input_tokens,
+            .output_tokens = row.output_tokens,
+            .cache_read_tokens = row.cache_read_tokens,
+            .cache_write_tokens = row.cache_write_tokens,
+            .reasoning_tokens = row.reasoning_tokens,
+            .request_count = row.request_count,
+            .total_cost = row.total_cost,
+        };
+        try addTotals(&totals, one);
+        model.* = .{ .model = try alloc.dupe(u8, row.model), .totals = one };
+        built += 1;
+    }
+    sortModels(models);
+    const kept = @min(models.len, max_models);
+    for (models[kept..]) |model| alloc.free(model.model);
+    const listed = if (alloc.resize(models, kept)) models[0..kept] else blk: {
+        const smaller = try alloc.dupe(ModelUsage, models[0..kept]);
+        alloc.free(models);
+        break :blk smaller;
+    };
+    return .{
+        .scope = scope,
+        .snapshot_time_ms = as_of_ms,
+        .window_start_ms = first_day * std.time.ms_per_day,
+        .coverage_started_at_ms = null,
+        .coverage = .full,
+        .completeness = .complete,
+        .totals = totals,
+        .models = listed,
+        .history = .{ .as_of_ms = as_of_ms, .refresh_failed = refresh_failed },
+    };
+}
+
+/// Adds `part` into `sum`. Both carry reasoning and request counts.
+fn addTotals(sum: *Totals, part: Totals) error{UsageOverflow}!void {
+    inline for (.{ "total_tokens", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens" }) |field| {
+        @field(sum, field) = std.math.add(u64, @field(sum, field), @field(part, field)) catch return error.UsageOverflow;
+    }
+    sum.reasoning_tokens = std.math.add(u64, sum.reasoning_tokens.?, part.reasoning_tokens.?) catch return error.UsageOverflow;
+    sum.request_count = std.math.add(u64, sum.request_count.?, part.request_count.?) catch return error.UsageOverflow;
+    const cost = sum.total_cost + part.total_cost;
+    if (!std.math.isFinite(cost)) return error.UsageOverflow;
+    sum.total_cost = cost;
+}
+
+/// A history view with no numbers, saying why. The caller owns the result.
+pub fn unavailableView(alloc: Allocator, scope: Scope, now_ms: i64, reason: Unavailable) Allocator.Error!View {
+    return .{
+        .scope = scope,
+        .snapshot_time_ms = now_ms,
+        .window_start_ms = now_ms,
+        .coverage_started_at_ms = null,
+        .coverage = .full,
+        .completeness = .complete,
+        .totals = null,
+        .models = try alloc.alloc(ModelUsage, 0),
+        .history = .{ .unavailable = reason },
+    };
+}
 
 pub const BuildError = Allocator.Error || error{
     InvalidGenerationFact,
@@ -1113,7 +1231,7 @@ fn rolling(scope: Scope, now: i64, ledger: LedgerContents, recovery: Recovery) !
 
 test "windows are half-open: the window start is in, the snapshot time is out" {
     const now = 40 * day;
-    inline for (.{ Scope.hours_24, Scope.days_7, Scope.days_30 }) |scope| {
+    inline for (.{ Scope.today, Scope.days_7, Scope.days_30 }) |scope| {
         const start = now - scope.durationMs().?;
         const facts = [_]GenerationFact{
             testFact(id_a, "p/in-first", start, 1, 0, 1),
@@ -1141,7 +1259,7 @@ test "incidents count only inside the half-open window" {
         .{ .at = now, .want = .complete },
     };
     for (cases) |case| {
-        var view = try rolling(.hours_24, now, .{ .coverage_started_at_ms = 0, .incidents = &.{.{ .occurred_at_ms = case.at, .completeness = .incomplete }} }, .{});
+        var view = try rolling(.today, now, .{ .coverage_started_at_ms = 0, .incidents = &.{.{ .occurred_at_ms = case.at, .completeness = .incomplete }} }, .{});
         defer view.deinit(testing.allocator);
         try testing.expectEqual(case.want, view.completeness);
         try testing.expectEqual(@as(u64, @intFromBool(case.want == .incomplete)), view.unpriced.no_receipt);
@@ -1185,11 +1303,11 @@ test "dedupe: exact repeats count once, conflicts make the window incomplete" {
     const original = testFact(id_a, "p/m", now - 1, 4, 2, 0.5);
     var conflict = original;
     conflict.output_tokens = 3;
-    var exact = try rolling(.hours_24, now, .{ .coverage_started_at_ms = 0, .facts = &.{ original, original } }, .{});
+    var exact = try rolling(.today, now, .{ .coverage_started_at_ms = 0, .facts = &.{ original, original } }, .{});
     defer exact.deinit(testing.allocator);
     try testing.expectEqual(@as(u64, 6), exact.totals.?.total_tokens);
     try testing.expectEqual(Completeness.complete, exact.completeness);
-    var conflicted = try rolling(.hours_24, now, .{ .coverage_started_at_ms = 0, .facts = &.{ original, conflict } }, .{});
+    var conflicted = try rolling(.today, now, .{ .coverage_started_at_ms = 0, .facts = &.{ original, conflict } }, .{});
     defer conflicted.deinit(testing.allocator);
     try testing.expectEqual(Completeness.incomplete, conflicted.completeness);
     try testing.expectEqual(@as(u64, 6), conflicted.totals.?.total_tokens);
@@ -1215,10 +1333,10 @@ test "reasoning becomes unknown when any fact lacks it, and with no requests" {
     with.reasoning_tokens = 1;
     var without = testFact(id_b, "p/m", now - 1, 4, 2, 0);
     without.reasoning_tokens = null;
-    var mixed = try rolling(.hours_24, now, .{ .coverage_started_at_ms = 0, .facts = &.{ with, without } }, .{});
+    var mixed = try rolling(.today, now, .{ .coverage_started_at_ms = 0, .facts = &.{ with, without } }, .{});
     defer mixed.deinit(testing.allocator);
     try testing.expectEqual(@as(?u64, null), mixed.totals.?.reasoning_tokens);
-    var empty = try rolling(.hours_24, now, .{ .coverage_started_at_ms = 0 }, .{});
+    var empty = try rolling(.today, now, .{ .coverage_started_at_ms = 0 }, .{});
     defer empty.deinit(testing.allocator);
     try testing.expectEqual(@as(?u64, null), empty.totals.?.reasoning_tokens);
     try testing.expectEqual(@as(?u64, 0), empty.totals.?.request_count);
@@ -1235,29 +1353,29 @@ test "rolling views hold at most 128 models" {
         _ = std.fmt.bufPrint(name, "p/m{d:0>4}", .{index}) catch unreachable;
         fact.* = testFact(id, name, now - 1, 1, 0, 0);
     }
-    var full = try rollingView(alloc, .{ .coverage_started_at_ms = 0, .facts = facts[0..max_models] }, .{}, .hours_24, now, .{});
+    var full = try rollingView(alloc, .{ .coverage_started_at_ms = 0, .facts = facts[0..max_models] }, .{}, .today, now, .{});
     defer full.deinit(alloc);
     try testing.expectEqual(max_models, full.models.len);
-    try testing.expectError(error.UsageCapacityExceeded, rollingView(alloc, .{ .coverage_started_at_ms = 0, .facts = &facts }, .{}, .hours_24, now, .{}));
+    try testing.expectError(error.UsageCapacityExceeded, rollingView(alloc, .{ .coverage_started_at_ms = 0, .facts = &facts }, .{}, .today, now, .{}));
 }
 
 test "invalid facts fail the view even outside the window" {
     var bad = testFact(id_a, "p/m", 0, 1, 1, 0);
     bad.cache_read_tokens = 2;
-    try testing.expectError(error.InvalidGenerationFact, rolling(.hours_24, 40 * day, .{ .coverage_started_at_ms = 0, .facts = &.{bad} }, .{}));
+    try testing.expectError(error.InvalidGenerationFact, rolling(.today, 40 * day, .{ .coverage_started_at_ms = 0, .facts = &.{bad} }, .{}));
 }
 
 test "recovered facts count, extend coverage, and stay pending until durable" {
     const now = 40 * day;
     const recovered = testFact(id_a, "p/m", now - hour, 5, 2, 0.25);
-    var view = try rolling(.hours_24, now, .{}, .{ .facts = &.{recovered} });
+    var view = try rolling(.today, now, .{}, .{ .facts = &.{recovered} });
     defer view.deinit(testing.allocator);
     try testing.expectEqual(Coverage.partial, view.coverage);
     try testing.expectEqual(@as(?i64, now - hour), view.coverage_started_at_ms);
     try testing.expectEqual(Completeness.pending, view.completeness);
     try testing.expectEqual(@as(u64, 7), view.totals.?.total_tokens);
 
-    var settled = try rolling(.hours_24, now, .{ .coverage_started_at_ms = 0, .facts = &.{recovered} }, .{ .facts = &.{recovered} });
+    var settled = try rolling(.today, now, .{ .coverage_started_at_ms = 0, .facts = &.{recovered} }, .{ .facts = &.{recovered} });
     defer settled.deinit(testing.allocator);
     try testing.expectEqual(Completeness.complete, settled.completeness);
     try testing.expectEqual(@as(?u64, 1), settled.totals.?.request_count);
@@ -1281,18 +1399,18 @@ test "recovered facts or markers at the snapshot time make every window incomple
     try testing.expectEqual(Completeness.pending, just_before.completeness);
     try testing.expectEqual(@as(u64, 1), just_before.unpriced.lookup_pending);
 
-    var unknown = try rolling(.hours_24, now, .{ .coverage_started_at_ms = 0 }, Recovery.unknown);
+    var unknown = try rolling(.today, now, .{ .coverage_started_at_ms = 0 }, Recovery.unknown);
     defer unknown.deinit(testing.allocator);
     try testing.expectEqual(Completeness.incomplete, unknown.completeness);
     try testing.expectEqual(@as(u64, 0), unknown.unpriced.count);
 }
 
 test "unknown pending lands at snapshot minus one, floored at zero" {
-    var at_zero = try rolling(.hours_24, 0, .{ .coverage_started_at_ms = 0 }, Recovery.unknown);
+    var at_zero = try rolling(.today, 0, .{ .coverage_started_at_ms = 0 }, Recovery.unknown);
     defer at_zero.deinit(testing.allocator);
     // The incident at 0 is outside [-24h, 0), so the window stays complete.
     try testing.expectEqual(Completeness.complete, at_zero.completeness);
-    var at_one = try rolling(.hours_24, 1, .{ .coverage_started_at_ms = 0 }, Recovery.unknown);
+    var at_one = try rolling(.today, 1, .{ .coverage_started_at_ms = 0 }, Recovery.unknown);
     defer at_one.deinit(testing.allocator);
     try testing.expectEqual(Completeness.incomplete, at_one.completeness);
 }
@@ -1300,7 +1418,7 @@ test "unknown pending lands at snapshot minus one, floored at zero" {
 test "durable facts resolve pending markers" {
     const now = 40 * day;
     const fact = testFact(id_a, "p/m", now - 2 * day, 1, 1, 0);
-    var view = try rolling(.hours_24, now, .{ .coverage_started_at_ms = 0, .facts = &.{fact}, .pending = &.{.{ .id = id_a, .observed_at_ms = now - 1 }} }, .{});
+    var view = try rolling(.today, now, .{ .coverage_started_at_ms = 0, .facts = &.{fact}, .pending = &.{.{ .id = id_a, .observed_at_ms = now - 1 }} }, .{});
     defer view.deinit(testing.allocator);
     try testing.expectEqual(Completeness.complete, view.completeness);
     try testing.expectEqual(Unpriced.none, view.unpriced);
@@ -1313,12 +1431,12 @@ test "unpriced: distinct markers in the window, blocked ids first, then incident
         .pending = &.{ .{ .id = id_a, .observed_at_ms = now - 2 }, .{ .id = id_a, .observed_at_ms = now - 1 }, .{ .id = id_b, .observed_at_ms = now - 1 }, .{ .id = id_c, .observed_at_ms = now - 2 * day } },
         .incidents = &.{ .{ .occurred_at_ms = now - 1, .completeness = .incomplete }, .{ .occurred_at_ms = now - 1, .completeness = .pending } },
     };
-    var plain = try rolling(.hours_24, now, ledger, .{ .pending = &.{.{ .id = id_b, .observed_at_ms = now - 3 }} });
+    var plain = try rolling(.today, now, ledger, .{ .pending = &.{.{ .id = id_b, .observed_at_ms = now - 3 }} });
     defer plain.deinit(testing.allocator);
     try testing.expectEqual(Unpriced.fromCounts(2, 0, 1), plain.unpriced);
     try testing.expectEqual(@as(?UnpricedReason, .lookup_pending), plain.unpriced.reason);
 
-    var blocked = try rollingView(testing.allocator, ledger, .{}, .hours_24, now, .{ .blocked_ids = &.{id_b} });
+    var blocked = try rollingView(testing.allocator, ledger, .{}, .today, now, .{ .blocked_ids = &.{id_b} });
     defer blocked.deinit(testing.allocator);
     try testing.expectEqual(@as(u64, 1), blocked.unpriced.sign_in_cannot_look_up);
     try testing.expectEqual(@as(?UnpricedReason, .sign_in_cannot_look_up), blocked.unpriced.reason);
@@ -1589,25 +1707,25 @@ test "turn usage sums reported counts and saturates" {
 test "scope navigation follows the on-screen tab order" {
     // Right from the session: 24 hours, 7 days, 30 days, then stays.
     var scope: Scope = .session;
-    for ([_]Scope{ .hours_24, .days_7, .days_30, .days_30 }) |want| {
+    for ([_]Scope{ .today, .days_7, .days_30, .days_30 }) |want| {
         scope = scope.next();
         try testing.expectEqual(want, scope);
     }
     // Left from 30 days: back to the session, then stays.
-    for ([_]Scope{ .days_7, .hours_24, .session, .session }) |want| {
+    for ([_]Scope{ .days_7, .today, .session, .session }) |want| {
         scope = scope.previous();
         try testing.expectEqual(want, scope);
     }
     // Tab moves like Right and wraps.
-    for ([_]Scope{ .hours_24, .days_7, .days_30, .session }) |want| {
+    for ([_]Scope{ .today, .days_7, .days_30, .session }) |want| {
         scope = scope.cycle(.forward);
         try testing.expectEqual(want, scope);
     }
-    for ([_]Scope{ .days_30, .days_7, .hours_24, .session }) |want| {
+    for ([_]Scope{ .days_30, .days_7, .today, .session }) |want| {
         scope = scope.cycle(.backward);
         try testing.expectEqual(want, scope);
     }
-    try testing.expectEqualSlices(Scope, &.{ .session, .hours_24, .days_7, .days_30 }, &Scope.tab_order);
+    try testing.expectEqualSlices(Scope, &.{ .session, .today, .days_7, .days_30 }, &Scope.tab_order);
     try testing.expectEqual(@as(?Scope, .days_7), Scope.fromCliValue("7d"));
     try testing.expectEqual(@as(?Scope, null), Scope.fromCliValue("session"));
 }

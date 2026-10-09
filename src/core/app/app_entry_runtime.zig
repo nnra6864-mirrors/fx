@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const app_auth_runtime = @import("app_auth_runtime.zig");
 const app_process_runtime = @import("app_process_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
@@ -318,6 +319,8 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
             .recovery = session_adapter.usage_recovery_readers,
         });
         app.session.usage.startWall();
+        // Usage history needs the startup credential before any call.
+        app_auth_runtime.Runtime(App).reconcileGatewayCredential(app);
     }
     var app_needs_deinit = true;
     defer if (app_needs_deinit) {

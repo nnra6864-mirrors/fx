@@ -80,6 +80,8 @@ pub const Owner = struct {
     wall_start: usage_mod.WallStart = .first_use,
     /// The error the host's last failed persist returned (`@intFromError`).
     persist_error: std.atomic.Value(u16) = .init(0),
+    /// Usage history from AI Gateway, for the dashboard.
+    history: ?usage_mod.History = null,
     dashboard: ?usage_mod.ViewLoader = null,
     lock: std.Io.Mutex = .init,
     bound: bool = false,
@@ -112,12 +114,15 @@ pub const Owner = struct {
             .mode = .read_write,
             .recovery = self.recovery.source(),
         });
+        self.history = openHistory(alloc, self.home.?, self.lookup);
     }
 
     pub fn deinit(self: *Owner) void {
         self.close();
         if (self.dashboard) |*loader| loader.deinit();
         self.dashboard = null;
+        if (self.history) |*history| history.deinit();
+        self.history = null;
         if (self.profile) |*profile| profile.deinit();
         self.profile = null;
         if (self.home) |dir| dir.close(io_mod.getIo());
@@ -344,17 +349,27 @@ pub const Owner = struct {
         return try ledger.snapshot(alloc);
     }
 
-    /// The credential lookups run with, from the host's current auth.
+    /// The credential lookups and usage history run with, from the host's
+    /// current auth.
     pub fn setCredential(self: *Owner, lease: ?types.CredentialLease) void {
+        const credential = ledgerCredential(lease);
+        if (self.history) |*history| history.setCredential(credential);
         const ledger = self.use() orelse return;
-        setLedgerCredential(ledger, lease);
+        // A subscription looks no generation up: lookups see it signed out.
+        const subscription = if (credential.source) |source| source == .chatgpt_subscription or source == .grok_subscription else false;
+        const lookups: usage_mod.Ledger.Credential = if (subscription) .{ .credential = .signed_out } else credential;
+        ledger.setCredential(lookups) catch |err| debug_trace.logf(
+            "usage",
+            "usage credential not set reason={s}",
+            .{@errorName(err)},
+        );
     }
 
-    /// The dashboard's loader, or null when there is no profile.
+    /// The dashboard's loader, or null when there is no HOME.
     pub fn dashboardLoader(self: *Owner) ?*usage_mod.ViewLoader {
         if (self.dashboard) |*loader| return loader;
-        const profile = if (self.profile) |*value| value else return null;
-        self.dashboard = .init(profile, self.alloc);
+        const history = if (self.history) |*value| value else return null;
+        self.dashboard = .init(history, self.alloc);
         return &self.dashboard.?;
     }
 
@@ -424,8 +439,9 @@ pub const Owner = struct {
     }
 };
 
-fn setLedgerCredential(ledger: *usage_mod.Ledger, lease: ?types.CredentialLease) void {
-    const credential: usage_mod.Ledger.Credential = blk: {
+/// What the usage module is told about `lease`. Borrows its bytes.
+fn ledgerCredential(lease: ?types.CredentialLease) usage_mod.Ledger.Credential {
+    return blk: {
         const value = lease orelse break :blk .{ .credential = .signed_out };
         const source = value.credentialSource();
         const transport: usage_mod.host.Credential = if (source) |known| switch (known) {
@@ -442,11 +458,6 @@ fn setLedgerCredential(ledger: *usage_mod.Ledger, lease: ?types.CredentialLease)
             .account_id = value.accountId(),
         };
     };
-    ledger.setCredential(credential) catch |err| debug_trace.logf(
-        "usage",
-        "usage credential not set reason={s}",
-        .{@errorName(err)},
-    );
 }
 
 pub const gateway_user_len = usage_mod.gateway_user_len;
@@ -571,7 +582,7 @@ pub const Invocation = struct {
         const provider = providerOf(credential);
         // Only Gateway entries are looked up, so only a Gateway call's
         // credential is the one lookups run with.
-        if (provider == .gateway) setLedgerCredential(ledger, credential);
+        if (provider == .gateway) self_owner.setCredential(credential);
         const call = ledger.begin(provider) catch |err| return self_owner.beginError(err, ledger);
         return .{ .owner = self_owner, .call = call };
     }
@@ -685,29 +696,39 @@ pub const Recovery = struct {
 
 /// A read-only profile for `fx usage`: never creates `~/.fx`, needs no
 /// credentials.
-pub const ReadOnly = struct {
-    home: std.Io.Dir,
-    recovery: Recovery,
-    profile: usage_mod.Profile,
+fn openHistory(alloc: Allocator, home: std.Io.Dir, lookup: ?Lookup) usage_mod.History {
+    return usage_mod.History.init(alloc, io_mod.getIo(), .{
+        .home = home,
+        .lookup = if (lookup) |value| value.transport else null,
+        .origin = if (lookup) |value| value.origin() else usage_mod.default_origin,
+    });
+}
 
-    pub fn open(self: *ReadOnly, alloc: Allocator, home_path: []const u8, readers: RecoveryReaders) !void {
-        self.home = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home_path, .{ .iterate = true });
-        errdefer self.home.close(io_mod.getIo());
-        self.recovery = .{ .alloc = alloc, .home_path = try alloc.dupe(u8, home_path), .readers = readers };
-        self.profile = usage_mod.Profile.init(alloc, io_mod.getIo(), .{
-            .home = self.home,
-            .mode = .read_only,
-            .recovery = self.recovery.source(),
-        });
+/// `fx usage`: the history view of `scope` for `lease`, refreshed from AI
+/// Gateway first when the stored snapshot is due. Blocks on the network.
+/// The caller owns the view.
+pub fn historyView(
+    alloc: Allocator,
+    home_path: []const u8,
+    lookup: ?Lookup,
+    lease: ?types.CredentialLease,
+    scope: usage_mod.Scope,
+) !usage_mod.View {
+    if (scope == .session) return error.SessionScope;
+    var home = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home_path, .{});
+    defer home.close(io_mod.getIo());
+    var history = openHistory(alloc, home, lookup);
+    defer history.deinit();
+    history.setCredential(ledgerCredential(lease));
+    var never: std.atomic.Value(bool) = .init(false);
+    var views = (try history.views(alloc, @max(io_mod.milliTimestamp(), 0), .refresh_if_due, &never)) orelse
+        return error.ProfileUsageUnavailable;
+    var picked: ?usage_mod.View = null;
+    for (usage_mod.Scope.rolling, &views) |candidate, *view| {
+        if (candidate == scope) picked = view.* else view.deinit(alloc);
     }
-
-    pub fn deinit(self: *ReadOnly) void {
-        self.profile.deinit();
-        self.recovery.deinit();
-        self.home.close(io_mod.getIo());
-        self.* = undefined;
-    }
-};
+    return picked.?;
+}
 
 /// A fresh ledger's snapshot after `added`/`removed` committed lines, for
 /// tests that persist or decode one. The caller owns it.

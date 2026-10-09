@@ -28,6 +28,15 @@ pub const Format = enum { text, json };
 /// `fx usage` text (`UsageSnapshot.renderText`).
 pub fn cliText(writer: *Writer, view: *const View) Writer.Error!void {
     try writer.print("Usage ({s})\n", .{view.scope.label()});
+    if (view.history) |source| {
+        if (source.unavailable) |reason| return writer.print("{s}\n", .{unavailableSentence(reason)});
+        if (source.as_of_ms) |as_of_ms| {
+            var date_buf: [16]u8 = undefined;
+            var time_buf: [16]u8 = undefined;
+            try writer.print("From AI Gateway as of {s} {s} UTC.\n", .{ formatIsoDate(&date_buf, as_of_ms), formatUtcTime(&time_buf, as_of_ms) });
+        }
+        if (source.refresh_failed) try writer.writeAll("The last refresh failed; these are the last numbers fetched.\n");
+    }
     switch (view.coverage) {
         .not_started => try writer.writeAll("Tracking has not started.\n"),
         .partial => {
@@ -81,7 +90,24 @@ pub fn cliJson(writer: *Writer, view: *const View) Writer.Error!void {
         try writeTotalsJson(writer, model.totals);
         try writer.writeByte('}');
     }
-    try writer.writeAll("]}");
+    try writer.writeByte(']');
+    if (view.history) |source| {
+        try writer.writeAll(",\"source\":\"ai_gateway\",\"as_of_ms\":");
+        if (source.as_of_ms) |as_of_ms| try writer.print("{d}", .{as_of_ms}) else try writer.writeAll("null");
+        try writer.print(",\"refresh_failed\":{},\"unavailable\":", .{source.refresh_failed});
+        if (source.unavailable) |reason| try std.json.Stringify.value(@tagName(reason), .{}, writer) else try writer.writeAll("null");
+    }
+    try writer.writeByte('}');
+}
+
+/// `fx usage` text for a history view with no numbers.
+fn unavailableSentence(reason: report.Unavailable) []const u8 {
+    return switch (reason) {
+        .needs_api_key => "Usage history needs an AI Gateway API key. Add one with 'fx setup'.",
+        .subscription => "Usage history isn't available for subscriptions yet.",
+        .refused => "AI Gateway refused usage reports for this key. They need a Pro or Enterprise team.",
+        .failed => "Couldn't load usage from AI Gateway. Try again later.",
+    };
 }
 
 /// Exactly what `fx usage` writes to stdout on success: the text, or the
@@ -483,6 +509,20 @@ const Notes = struct {
 /// Nothing when every request is priced: only gaps get a line.
 fn collectNotes(notes: *Notes, dashboard: Dashboard) void {
     const view = dashboard.view orelse return;
+    if (view.history) |source| {
+        if (source.as_of_ms) |as_of_ms| {
+            var time_buf: [16]u8 = undefined;
+            if (source.refresh_failed) {
+                var date_buf: [16]u8 = undefined;
+                notes.add(.warning, "refresh failed; showing AI Gateway as of {s} {s} UTC", .{ formatIsoDate(&date_buf, as_of_ms), formatUtcTime(&time_buf, as_of_ms) });
+            } else {
+                notes.add(.note, "AI Gateway as of {s} UTC", .{formatUtcTime(&time_buf, as_of_ms)});
+            }
+        }
+        if (source.unavailable) |reason| {
+            if (unavailableHint(reason)) |hint| notes.add(.hint, "{s}", .{hint});
+        }
+    }
     const unpriced = view.unpriced;
     const completeness = shownCompleteness(view);
     notes.starred = view.totals != null and view.models.len > 0 and
@@ -563,10 +603,7 @@ fn buildPlan(plan: *Plan, dashboard: Dashboard, notes: *const Notes, visible_row
     };
     const activity = view.session_activity != null;
     if (view.totals == null or view.models.len == 0) {
-        const message: ?[]const u8 = if (view.totals == null)
-            (if (view.completeness == .legacy) null else "no usage yet")
-        else
-            emptyTableMessage(view);
+        const message: ?[]const u8 = if (view.totals == null) noTotalsMessage(view) else emptyTableMessage(view);
         const lines = 1 + oneIf(message != null) + oneIf(activity) + notes.len;
         const room = if (visible_rows) |rows| lines + 1 <= rows else true;
         if (room) plan.add(.blank);
@@ -657,8 +694,38 @@ fn priorityRow(row: *Row, dashboard: Dashboard, notes: *const Notes, width: u16)
     const view = dashboard.view orelse
         return styledRow(row, if (dashboard.refresh_failed) "usage unavailable; press r to retry" else "loading usage", width, .dim);
     if (view.totals != null and view.models.len > 0) return modelRow(row, dashboard, @min(dashboard.selected_model, view.models.len - 1), width);
+    if (view.history) |source| {
+        if (source.unavailable) |reason| return styledRow(row, unavailableMessage(reason), width, .dim);
+    }
     if (notes.len > 0) return noteRow(row, notes, 0, width);
-    styledRow(row, if (view.totals == null) "no usage yet" else emptyTableMessage(view), width, .dim);
+    styledRow(row, if (view.totals == null) noTotalsMessage(view) orelse "no usage yet" else emptyTableMessage(view), width, .dim);
+}
+
+/// What a view without totals says: why history is unavailable, nothing
+/// for a legacy session, else that there is no usage.
+fn noTotalsMessage(view: *const View) ?[]const u8 {
+    if (view.history) |source| {
+        if (source.unavailable) |reason| return unavailableMessage(reason);
+    }
+    return if (view.completeness == .legacy) null else "no usage yet";
+}
+
+fn unavailableMessage(reason: report.Unavailable) []const u8 {
+    return switch (reason) {
+        .needs_api_key => "history needs an AI Gateway API key",
+        .subscription => "history isn't available for subscriptions yet",
+        .refused => "AI Gateway refused usage reports for this key",
+        .failed => "couldn't load usage from AI Gateway",
+    };
+}
+
+fn unavailableHint(reason: report.Unavailable) ?[]const u8 {
+    return switch (reason) {
+        .needs_api_key => "add one with 'fx setup'",
+        .subscription => null,
+        .refused => "usage reports need a Pro or Enterprise team",
+        .failed => "press r to retry",
+    };
 }
 
 /// A session view's completeness once its open calls finish: an open call
@@ -696,7 +763,7 @@ fn periodsRow(row: *Row, active: Scope, width: u16) void {
 fn periodLabel(scope: Scope) []const u8 {
     return switch (scope) {
         .session => "session",
-        .hours_24 => "24h",
+        .today => "today",
         .days_7 => "7d",
         .days_30 => "30d",
     };
@@ -977,6 +1044,13 @@ fn formatDuration(buf: *[32]u8, duration_ms: u64) []const u8 {
     return std.fmt.bufPrint(buf, "{d}s", .{seconds}) catch "?";
 }
 
+/// `14:05` (UTC).
+fn formatUtcTime(buf: *[16]u8, timestamp_ms: i64) []const u8 {
+    if (timestamp_ms < 0) return "unknown";
+    const seconds_of_day: u64 = @intCast(@mod(@divFloor(timestamp_ms, std.time.ms_per_s), std.time.s_per_day));
+    return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}", .{ seconds_of_day / std.time.s_per_hour, seconds_of_day % std.time.s_per_hour / std.time.s_per_min }) catch "unknown";
+}
+
 /// `2026-10-09` (UTC).
 fn formatIsoDate(buf: *[16]u8, timestamp_ms: i64) []const u8 {
     if (timestamp_ms < 0) return "unknown";
@@ -1076,7 +1150,7 @@ const testdata = struct {
     const Run = struct { scope: Scope, text: []const u8, json: []const u8 };
     fn runs(comptime phase: []const u8) [3]Run {
         return .{
-            .{ .scope = .hours_24, .text = @embedFile("testdata/u07/cli/" ++ phase ++ ".usage_24h.text.stdout"), .json = @embedFile("testdata/u07/cli/" ++ phase ++ ".usage_24h.json.stdout") },
+            .{ .scope = .today, .text = @embedFile("testdata/u07/cli/" ++ phase ++ ".usage_24h.text.stdout"), .json = @embedFile("testdata/u07/cli/" ++ phase ++ ".usage_24h.json.stdout") },
             .{ .scope = .days_7, .text = @embedFile("testdata/u07/cli/" ++ phase ++ ".usage_7d.text.stdout"), .json = @embedFile("testdata/u07/cli/" ++ phase ++ ".usage_7d.json.stdout") },
             .{ .scope = .days_30, .text = @embedFile("testdata/u07/cli/" ++ phase ++ ".usage_30d.text.stdout"), .json = @embedFile("testdata/u07/cli/" ++ phase ++ ".usage_30d.json.stdout") },
         };
@@ -1105,8 +1179,13 @@ fn expectRuns(ledger: report.LedgerContents, recovery: report.Recovery, runs: [3
         const now = try capturedTime(run.json);
         var view = try report.rollingView(testing.allocator, ledger, recovery, run.scope, now, .{});
         defer view.deinit(testing.allocator);
-        try expectOutput(&view, .json, run.json);
-        try expectOutput(&view, .text, run.text);
+        // The captures name the shortest period 24h; it is now today.
+        const json = try std.mem.replaceOwned(u8, testing.allocator, run.json, "\"period\":\"24h\"", "\"period\":\"today\"");
+        defer testing.allocator.free(json);
+        const text = try std.mem.replaceOwned(u8, testing.allocator, run.text, "Usage (24 hours)", "Usage (Today)");
+        defer testing.allocator.free(text);
+        try expectOutput(&view, .json, json);
+        try expectOutput(&view, .text, text);
     }
 }
 
@@ -1164,7 +1243,7 @@ test "golden: the final views also count what is unpriced" {
     defer collector.deinit(testing.allocator);
     try collectFinalRecovery(&collector, null);
     const now = try capturedTime(testdata.runs("final")[0].json);
-    var view = try report.rollingView(testing.allocator, ledger.contents(), collector.recovery(), .hours_24, now, .{});
+    var view = try report.rollingView(testing.allocator, ledger.contents(), collector.recovery(), .today, now, .{});
     defer view.deinit(testing.allocator);
     // Unresolved markers: the v1 and v2 401 lookups and the grok fact held
     // by the lock. No receipt: the torn-tail repair and the no-id call
@@ -1299,9 +1378,9 @@ fn expectRow(want: []const u8, dashboard: Dashboard, row_index: u16, visible_row
 test "dashboard periods put the session first and clip on narrow rows" {
     const dashboard: Dashboard = .{};
     try testing.expectEqual(@as(u16, 3), dashboardDesiredRows(dashboard, 80));
-    try expectRow("<T>[session]</>  <D>24h</>  <D>7d</>  <D>30d</>", dashboard, 0, 3, 80);
-    try expectRow("<T>[session]</>  <D>24</>", dashboard, 0, 3, 13);
-    try expectRow("<D>session</>  <D>24h</>  <T>[7d]</>  <D>30d</>", .{ .scope = .days_7 }, 0, 3, 80);
+    try expectRow("<T>[session]</>  <D>today</>  <D>7d</>  <D>30d</>", dashboard, 0, 3, 80);
+    try expectRow("<T>[session]</>  <D>to</>", dashboard, 0, 3, 13);
+    try expectRow("<D>session</>  <D>today</>  <T>[7d]</>  <D>30d</>", .{ .scope = .days_7 }, 0, 3, 80);
     try expectRow("", dashboard, 1, 3, 80);
     try expectRow("<D>loading usage</>", dashboard, 2, 3, 80);
     try expectRow("<D>usage unavailable; press r to retry</>", .{ .refresh_failed = true }, 2, 3, 80);
@@ -1476,4 +1555,134 @@ test "selection survives refresh by model name" {
     try testing.expectEqual(@as(?usize, 1), selection.expanded_model);
     try testing.expect(selection.toggleExpanded(2, 1));
     try testing.expectEqual(@as(?usize, null), selection.expanded_model);
+}
+
+const gateway_history = @import("gateway_history.zig");
+
+fn dashboardText(dashboard: Dashboard, width: u16) ![]u8 {
+    const rows = dashboardDesiredRows(dashboard, width);
+    var out: Writer.Allocating = .init(testing.allocator);
+    errdefer out.deinit();
+    for (0..rows) |index| {
+        const line = try paintRow(dashboard, @intCast(index), rows, width);
+        defer testing.allocator.free(line);
+        if (index > 0) try out.writer.writeByte('\n');
+        try out.writer.writeAll(line);
+    }
+    return out.toOwnedSlice();
+}
+
+fn expectDashboard(want: []const u8, dashboard: Dashboard, width: u16) !void {
+    const got = try dashboardText(dashboard, width);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings(want, got);
+}
+
+/// The two models AI Gateway reported for one fx turn and its title.
+const history_rows = [_]gateway_history.Row{
+    .{ .model = "openai/gpt-4.1-nano", .input_tokens = 6_098, .output_tokens = 4, .cache_read_tokens = 0, .cache_write_tokens = 0, .reasoning_tokens = 0, .request_count = 1, .total_cost = 0.0007864 },
+    .{ .model = "openai/gpt-5.6-luna", .input_tokens = 71, .output_tokens = 64, .cache_read_tokens = 0, .cache_write_tokens = 0, .reasoning_tokens = 55, .request_count = 1, .total_cost = 0.000266 },
+};
+/// 2026-10-09 14:05 UTC.
+const history_as_of: i64 = 1_791_504_000_000 + 14 * std.time.ms_per_hour + 5 * std.time.ms_per_min;
+
+test "history views say where their numbers came from and when" {
+    var view = try report.historyView(testing.allocator, .today, &history_rows, history_as_of, gateway_history.utcDay(history_as_of), false);
+    defer view.deinit(testing.allocator);
+    try expectDashboard(
+        \\<D>session</>  <T>[today]</>  <D>7d</>  <D>30d</>
+        \\
+        \\<D>     cost   tokens  reqs  model</>
+        \\<L>❯ $0.0008     6.1K     1  openai/gpt-4.1-nano</>
+        \\  $0.0003      135     1  openai/gpt-5.6-luna
+        \\<S>  $0.0011     6.2K     2  total</>
+        \\
+        \\in 6.2K  out 68 (55 reasoning)
+        \\<D>note:</> AI Gateway as of 14:05 UTC
+    , .{ .scope = .today, .view = &view }, 80);
+    try expectOutput(&view, .text,
+        \\Usage (Today)
+        \\From AI Gateway as of 2026-10-09 14:05 UTC.
+        \\Total tokens  6237
+        \\Input         6169
+        \\Output        68
+        \\Cache         0 read · 0 write
+        \\Reasoning     55
+        \\Requests      2
+        \\Spend         $0.0011
+        \\
+        \\By model
+        \\- openai/gpt-4.1-nano  6102 tokens  $0.0008
+        \\- openai/gpt-5.6-luna  135 tokens  $0.0003
+        \\
+    );
+    try expectOutput(&view, .json,
+        \\{"kind":"usage","schema_version":1,"period":"today","snapshot_time_ms":1791554700000,"window_start_ms":1791504000000,"coverage":{"status":"full","started_at_ms":null,"full_window":true},"completeness":"complete","totals":{"total_tokens":6237,"input_tokens":6169,"output_tokens":68,"cache_read_tokens":0,"cache_write_tokens":0,"reasoning_tokens":55,"request_count":2,"spend":0.0010524},"models":[{"model":"openai/gpt-4.1-nano","totals":{"total_tokens":6102,"input_tokens":6098,"output_tokens":4,"cache_read_tokens":0,"cache_write_tokens":0,"reasoning_tokens":0,"request_count":1,"spend":0.0007864}},{"model":"openai/gpt-5.6-luna","totals":{"total_tokens":135,"input_tokens":71,"output_tokens":64,"cache_read_tokens":0,"cache_write_tokens":0,"reasoning_tokens":55,"request_count":1,"spend":0.000266}}],"source":"ai_gateway","as_of_ms":1791554700000,"refresh_failed":false,"unavailable":null}
+        \\
+    );
+
+    var failed = try report.historyView(testing.allocator, .days_7, &history_rows, history_as_of, gateway_history.firstDay(.days_7, gateway_history.utcDay(history_as_of)), true);
+    defer failed.deinit(testing.allocator);
+    const failed_text = try dashboardText(.{ .scope = .days_7, .view = &failed }, 80);
+    defer testing.allocator.free(failed_text);
+    try testing.expect(std.mem.endsWith(u8, failed_text, "\n<W>warning:</> refresh failed; showing AI Gateway as of 2026-10-09 14:05 UTC"));
+    var cli: Writer.Allocating = .init(testing.allocator);
+    defer cli.deinit();
+    try cliOutput(&cli.writer, &failed, .text);
+    try testing.expect(std.mem.startsWith(u8, cli.written(), "Usage (7 days)\nFrom AI Gateway as of 2026-10-09 14:05 UTC.\nThe last refresh failed; these are the last numbers fetched.\n"));
+
+    var empty = try report.historyView(testing.allocator, .days_30, &.{}, history_as_of, gateway_history.firstDay(.days_30, gateway_history.utcDay(history_as_of)), false);
+    defer empty.deinit(testing.allocator);
+    try expectDashboard(
+        \\<D>session</>  <D>today</>  <D>7d</>  <T>[30d]</>
+        \\
+        \\<D>no usage in this period</>
+        \\<D>note:</> AI Gateway as of 14:05 UTC
+    , .{ .scope = .days_30, .view = &empty }, 80);
+}
+
+test "history without numbers says why, with a hint where one helps" {
+    const cases = [_]struct { reason: report.Unavailable, dashboard: []const u8, cli: []const u8 }{
+        .{
+            .reason = .needs_api_key,
+            .dashboard = "<D>history needs an AI Gateway API key</>\n<D>hint:</> add one with 'fx setup'",
+            .cli = "Usage history needs an AI Gateway API key. Add one with 'fx setup'.",
+        },
+        .{
+            .reason = .subscription,
+            .dashboard = "<D>history isn't available for subscriptions yet</>",
+            .cli = "Usage history isn't available for subscriptions yet.",
+        },
+        .{
+            .reason = .refused,
+            .dashboard = "<D>AI Gateway refused usage reports for this key</>\n<D>hint:</> usage reports need a Pro or Enterprise team",
+            .cli = "AI Gateway refused usage reports for this key. They need a Pro or Enterprise team.",
+        },
+        .{
+            .reason = .failed,
+            .dashboard = "<D>couldn't load usage from AI Gateway</>\n<D>hint:</> press r to retry",
+            .cli = "Couldn't load usage from AI Gateway. Try again later.",
+        },
+    };
+    for (cases) |case| {
+        var view = try report.unavailableView(testing.allocator, .today, history_as_of, case.reason);
+        defer view.deinit(testing.allocator);
+        const dashboard: Dashboard = .{ .scope = .today, .view = &view };
+        const want = try std.fmt.allocPrint(testing.allocator, "<D>session</>  <T>[today]</>  <D>7d</>  <D>30d</>\n\n{s}", .{case.dashboard});
+        defer testing.allocator.free(want);
+        try expectDashboard(want, dashboard, 80);
+        // One row leads with the reason, not the hint.
+        const message_end = std.mem.indexOfScalar(u8, case.dashboard, '\n') orelse case.dashboard.len;
+        try expectRow(case.dashboard[0..message_end], dashboard, 0, 1, 80);
+
+        const text = try std.fmt.allocPrint(testing.allocator, "Usage (Today)\n{s}\n", .{case.cli});
+        defer testing.allocator.free(text);
+        try expectOutput(&view, .text, text);
+        var json: Writer.Allocating = .init(testing.allocator);
+        defer json.deinit();
+        try cliOutput(&json.writer, &view, .json);
+        const tail = try std.fmt.allocPrint(testing.allocator, "\"totals\":null,\"models\":[],\"source\":\"ai_gateway\",\"as_of_ms\":null,\"refresh_failed\":false,\"unavailable\":\"{s}\"}}\n", .{@tagName(case.reason)});
+        defer testing.allocator.free(tail);
+        try testing.expect(std.mem.endsWith(u8, json.written(), tail));
+    }
 }
