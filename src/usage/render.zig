@@ -202,9 +202,10 @@ pub fn writeAcpUsageUpdate(writer: *Writer, update: AcpUsageUpdate) Writer.Error
 // ---------------------------------------------------------------------------
 // Dashboard rows
 
-/// The three styles the dashboard uses. fx maps them to
-/// `selected_completion_style`, `dim_style`, and `system_notice_label_style`.
-pub const Style = enum { title, dim, label };
+/// The dashboard's styles. fx maps them to `selected_completion_style`,
+/// `dim_style`, `system_notice_label_style`, `warning_style`, and
+/// `bold_style`.
+pub const Style = enum { title, dim, label, warning, strong };
 
 pub const Op = union(enum) {
     style: Style,
@@ -218,6 +219,8 @@ pub const Palette = struct {
     title: []const u8,
     dim: []const u8,
     label: []const u8,
+    warning: []const u8,
+    strong: []const u8,
     reset: []const u8,
 };
 
@@ -226,19 +229,19 @@ pub const max_model_rows: usize = 20;
 
 /// The usage hint row, widest first (`composeCompactCommandMenuHintRow`).
 pub const hint_variants = [_][]const u8{
-    "tab scope     ↑↓ model     enter expand     r refresh     esc close",
-    "tab scope  ↑↓ model  enter expand  r refresh  esc",
-    "tab ↑↓  enter  r  esc",
+    "tab period  ↑↓ model  enter detail  r refresh  esc close",
+    "tab period  ↑↓ model  enter  r  esc",
+    "tab  ↑↓  enter  r  esc",
 };
 
 /// What the dashboard shows (fx's `UsageMenuProjection`).
 pub const Dashboard = struct {
-    /// The active tab: the view's scope when there is a view, otherwise the
-    /// scope being loaded (`usage_menu.State.scope`).
-    scope: Scope = .days_30,
+    /// The active period: the view's scope when there is a view, otherwise
+    /// the scope being loaded (`usage_menu.State.scope`).
+    scope: Scope = .session,
     view: ?*const View = null,
-    /// A refresh failed: with a view it shows "Refresh failed", without one
-    /// "Usage unavailable".
+    /// A refresh failed: with a view it adds a warning, without one the
+    /// dashboard says usage is unavailable.
     refresh_failed: bool = false,
     selected_model: usize = 0,
     expanded_model: ?usize = null,
@@ -290,6 +293,8 @@ pub const Row = struct {
                 .title => palette.title,
                 .dim => palette.dim,
                 .label => palette.label,
+                .warning => palette.warning,
+                .strong => palette.strong,
             }),
             .reset => try writer.writeAll(palette.reset),
             .text => |bytes| try writer.writeAll(bytes),
@@ -341,14 +346,22 @@ pub const Row = struct {
         self.clip = .{ .remaining = width, .cut = width == 0 };
     }
 
+    /// Ends the clip region, closing a style the cut left open.
     fn endClip(self: *Row) void {
+        const cut = self.dropped();
         self.clip = null;
+        if (cut) self.reset();
     }
 
-    fn clipped(self: *Row, value: []const u8, width: usize) void {
-        self.beginClip(width);
-        self.text(value);
-        self.endClip();
+    /// Clip-aware spaces, for padding inside a clip region.
+    fn blank(self: *Row, n: usize) void {
+        const spaces_text = " " ** 32;
+        var left = n;
+        while (left > 0) {
+            const chunk = @min(left, spaces_text.len);
+            self.text(spaces_text[0..chunk]);
+            left -= chunk;
+        }
     }
 
     /// `row_text.appendSingleLineEllipsized`: trailing `…` when it does not fit.
@@ -359,22 +372,10 @@ pub const Row = struct {
         self.text(prefixCells(value, width - 1));
         self.text("…");
     }
-
-    /// `row_text.appendSpacesToColumn`.
-    fn padTo(self: *Row, target: usize) void {
-        if (self.column >= target) return;
-        self.spaces(target - self.column);
-    }
-
-    fn spaces(self: *Row, n: usize) void {
-        if (n == 0) return;
-        self.push(.{ .spaces = n });
-        self.column += n;
-    }
 };
 
 /// Display cells of dashboard text. Every character the dashboard writes
-/// (printable ASCII, `·`, `❯`, `…`, `↑↓`) is one cell wide in fx.
+/// (printable ASCII, `❯`, `…`, `↑↓`) is one cell wide in fx.
 fn cellCount(text: []const u8) usize {
     var cells: usize = 0;
     for (text) |byte| {
@@ -394,27 +395,29 @@ fn prefixCells(text: []const u8, cells: usize) []const u8 {
     return text;
 }
 
-/// Rows the dashboard wants at this width (`desiredRowCount`).
+/// Rows the dashboard wants (`desiredRowCount`). Lines never wrap, so the
+/// count does not depend on the width.
 pub fn dashboardDesiredRows(dashboard: Dashboard, width: u16) u16 {
-    const view = dashboard.view orelse return 2;
-    if (view.totals == null) return 2 + @as(u16, if (view.session_activity != null) 3 else 0);
-    const model_rows = @min(view.models.len, max_model_rows) + @intFromBool(dashboard.expanded_model != null);
-    const wanted = layoutFor(view, width).model_start + @max(model_rows, 1);
-    return std.math.cast(u16, wanted) orelse std.math.maxInt(u16);
+    _ = width;
+    var notes: Notes = .{};
+    collectNotes(&notes, dashboard);
+    var plan: Plan = .{};
+    buildPlan(&plan, dashboard, &notes, null);
+    return std.math.cast(u16, plan.len) orelse std.math.maxInt(u16);
 }
 
 /// Model rows visible in `visible_rows` (`usageVisibleModelItems`), for
 /// keeping the selection on screen.
 pub fn dashboardVisibleModelItems(dashboard: Dashboard, visible_rows: u16, width: u16) u16 {
+    _ = width;
     const view = dashboard.view orelse return 0;
-    if (view.models.len == 0 or view.totals == null) return 0;
-    const model_start: usize = if (visible_rows == 1) 0 else blk: {
-        const natural = layoutFor(view, width).model_start;
-        break :blk if (visible_rows < natural + 1) constrainedModelStart(visible_rows) else natural;
-    };
-    const area = @as(usize, visible_rows) -| model_start;
-    if (area == 0) return 0;
-    return @intCast(@min(view.models.len, max_model_rows, @max(area -| @intFromBool(dashboard.expanded_model != null), 1)));
+    if (view.totals == null or view.models.len == 0 or visible_rows == 0) return 0;
+    if (visible_rows == 1) return 1;
+    var notes: Notes = .{};
+    collectNotes(&notes, dashboard);
+    var plan: Plan = .{};
+    buildPlan(&plan, dashboard, &notes, visible_rows);
+    return @intCast(plan.model_rows);
 }
 
 /// The usage hint row (`composeCompactCommandMenuHintRow`).
@@ -427,9 +430,11 @@ pub fn dashboardHintRow(row: *Row, width: u16) void {
             break;
         }
     }
+    row.beginClip(width);
     row.style(.dim);
-    row.clipped(hint, width);
+    row.text(hint);
     row.reset();
+    row.endClip();
 }
 
 /// Fills `row` with dashboard row `row_index` of `visible_rows` at `width`
@@ -437,404 +442,405 @@ pub fn dashboardHintRow(row: *Row, width: u16) void {
 pub fn dashboardRow(row: *Row, dashboard: Dashboard, row_index: u16, visible_rows: u16, width: u16) void {
     row.* = .{};
     if (width == 0 or row_index >= visible_rows) return;
-    if (visible_rows == 1) return priorityRow(row, dashboard, width);
-    if (row_index == 0) return headerRow(row, dashboard.scope, width);
+    var notes: Notes = .{};
+    collectNotes(&notes, dashboard);
+    if (visible_rows == 1) return priorityRow(row, dashboard, &notes, width);
+    var plan: Plan = .{};
+    buildPlan(&plan, dashboard, &notes, visible_rows);
+    if (row_index >= plan.len) return;
+    drawLine(row, dashboard, &notes, plan.lines[row_index], width);
+}
+
+// Notes: the note/warning/hint lines under the table
+
+const max_notes = 4;
+
+const NoteKind = enum { note, warning, hint };
+
+/// The lines that say what the totals leave out, most important first.
+/// The text lives in `bufs`, so fill a `Notes` where it stays.
+const Notes = struct {
+    kinds: [max_notes]NoteKind = undefined,
+    lens: [max_notes]usize = undefined,
+    bufs: [max_notes][96]u8 = undefined,
+    len: usize = 0,
+    /// A cost is still missing, so the total cost carries a `*`.
+    starred: bool = false,
+
+    fn add(self: *Notes, kind: NoteKind, comptime fmt: []const u8, args: anytype) void {
+        if (self.len == max_notes) return;
+        const written = std.fmt.bufPrint(&self.bufs[self.len], fmt, args) catch return;
+        self.kinds[self.len] = kind;
+        self.lens[self.len] = written.len;
+        self.len += 1;
+    }
+
+    fn text(self: *const Notes, index: usize) []const u8 {
+        return self.bufs[index][0..self.lens[index]];
+    }
+};
+
+/// Nothing when every request is priced: only gaps get a line.
+fn collectNotes(notes: *Notes, dashboard: Dashboard) void {
+    const view = dashboard.view orelse return;
+    const unpriced = view.unpriced;
+    const completeness = shownCompleteness(view);
+    notes.starred = view.totals != null and view.models.len > 0 and
+        (unpriced.lookup_pending > 0 or unpriced.sign_in_cannot_look_up > 0 or completeness == .pending);
+    const mark: []const u8 = if (notes.starred) " (*)" else "";
+    if (dashboard.refresh_failed) notes.add(.warning, "refresh failed; showing earlier data", .{});
+    if (unpriced.sign_in_cannot_look_up > 0) {
+        const n = unpriced.sign_in_cannot_look_up;
+        notes.add(.warning, "{d} request{s} unpriced{s}: sign-in can't look up costs", .{ n, plural(n), mark });
+        notes.add(.hint, "add an AI Gateway API key with 'fx setup'", .{});
+    }
+    if (unpriced.no_receipt > 0) {
+        const n = unpriced.no_receipt;
+        notes.add(.warning, "{d} request{s} may be billed with no cost", .{ n, plural(n) });
+    } else if (completeness == .incomplete) {
+        notes.add(.warning, "totals may be incomplete", .{});
+    }
+    if (unpriced.lookup_pending > 0) {
+        const n = unpriced.lookup_pending;
+        notes.add(.note, "{d} request{s} awaiting cost from AI Gateway{s}", .{ n, plural(n), mark });
+    } else if (completeness == .pending and unpriced.sign_in_cannot_look_up == 0) {
+        notes.add(.note, "some costs are still pending{s}", .{mark});
+    }
+    if (view.in_flight > 0) notes.add(.note, "{d} request{s} in progress", .{ view.in_flight, plural(view.in_flight) });
+    if (completeness == .legacy) notes.add(.note, "session predates usage tracking", .{});
+    if (view.coverage == .partial) {
+        if (view.coverage_started_at_ms) |started| {
+            var date_buf: [16]u8 = undefined;
+            notes.add(.note, "tracking since {s}", .{formatIsoDate(&date_buf, started)});
+        }
+    }
+}
+
+fn plural(count: u64) []const u8 {
+    return if (count == 1) "" else "s";
+}
+
+// Plan: which line goes on which row
+
+const Line = union(enum) {
+    periods,
+    blank,
+    message: []const u8,
+    header,
+    model: usize,
+    detail: usize,
+    total,
+    breakdown,
+    activity,
+    note: usize,
+};
+
+const max_lines = 9 + max_model_rows + max_notes;
+
+const Plan = struct {
+    lines: [max_lines]Line = undefined,
+    len: usize = 0,
+    model_rows: usize = 0,
+
+    fn add(self: *Plan, line: Line) void {
+        std.debug.assert(self.len < max_lines);
+        self.lines[self.len] = line;
+        self.len += 1;
+        if (line == .model) self.model_rows += 1;
+    }
+};
+
+/// The dashboard's lines, top to bottom. With `visible_rows`, spacing goes
+/// first when the models do not fit, then the in/out and activity lines,
+/// the column header, and the total while fewer than three models fit, and
+/// the model list scrolls to keep the selection on screen.
+fn buildPlan(plan: *Plan, dashboard: Dashboard, notes: *const Notes, visible_rows: ?u16) void {
+    plan.add(.periods);
     const view = dashboard.view orelse {
-        if (row_index == 1) styledRow(row, if (dashboard.refresh_failed) "Usage unavailable · press r to retry" else "Loading usage", width, .dim);
+        plan.add(.blank);
+        plan.add(.{ .message = if (dashboard.refresh_failed) "usage unavailable; press r to retry" else "loading usage" });
         return;
     };
-    if (view.totals == null) {
-        if (row_index == 1) return statusRow(row, dashboard, view, width);
-        const activity = view.session_activity orelse return;
-        _ = activityRow(row, activity, row_index, 2, width);
-        return;
-    }
-    const layout = layoutFor(view, width);
-    if (visible_rows < layout.model_start + 1) return constrainedRow(row, dashboard, view, row_index, visible_rows, width);
-    if (row_index == 1) return statusRow(row, dashboard, view, width);
-    if (row_index >= layout.overview_start and row_index < layout.overview_start + layout.overview_rows) {
-        return overviewRow(row, view.totals.?, layout.overview_mode, row_index - layout.overview_start, width);
-    }
-    if (layout.activity_start) |activity_start| {
-        if (activityRow(row, view.session_activity.?, row_index, activity_start, width)) return;
-    }
-    if (row_index == layout.models_header) return modelsHeaderRow(row, view.models.len, width);
-    if (layout.model_columns) |column_row| {
-        if (row_index == column_row) {
-            const columns = modelColumns(view, width) orelse return;
-            return modelColumnsRow(row, "Model", "Tokens", "Share", "Spend", false, columns, width);
-        }
-    }
-    if (row_index < layout.model_start) return;
-    if (view.models.len == 0) {
-        if (row_index == layout.model_start) styledRow(row, "  No model usage in this scope.", width, .dim);
-        return;
-    }
-    modelRow(row, dashboard, view, @as(usize, row_index) - layout.model_start, @as(usize, visible_rows) -| layout.model_start, width);
-}
-
-fn styledRow(row: *Row, value: []const u8, width: u16, style: Style) void {
-    row.style(style);
-    row.ellipsized(value, width);
-    row.reset();
-}
-
-/// One visible row: the first model, or the status.
-fn priorityRow(row: *Row, dashboard: Dashboard, width: u16) void {
-    const view = dashboard.view orelse return styledRow(row, if (dashboard.refresh_failed) "Usage unavailable · press r to retry" else "Loading usage", width, .dim);
-    if (view.models.len > 0) return modelRow(row, dashboard, view, 0, 1, width);
-    statusRow(row, dashboard, view, width);
-}
-
-fn headerRow(row: *Row, active: Scope, width: u16) void {
-    var wide_cells: usize = "Usage".len;
-    for (Scope.tab_order) |scope| wide_cells += 2 + scope.label().len + @as(usize, if (scope == active) 2 else 0);
-    if (width >= 64 and wide_cells <= width) {
-        row.style(.title);
-        row.text("Usage");
-        row.reset();
-        for (Scope.tab_order) |scope| {
-            row.text("  ");
-            tab(row, scope, scope == active);
-        }
-        return;
-    }
-    // Narrow: only the active tab, clipped to the width.
-    row.beginClip(width);
-    row.style(.title);
-    row.text("Usage");
-    row.reset();
-    row.text("  ");
-    tab(row, active, true);
-    row.endClip();
-    row.reset();
-}
-
-fn tab(row: *Row, scope: Scope, active: bool) void {
-    row.style(if (active) .title else .dim);
-    if (active) {
-        var buf: [16]u8 = undefined;
-        row.text(std.fmt.bufPrint(&buf, "[{s}]", .{scope.label()}) catch unreachable);
-    } else {
-        row.text(scope.label());
-    }
-    row.reset();
-}
-
-/// The status line, in `fx usage`'s words without the trailing period.
-/// Completeness outranks a partial window. Rows too narrow for the full
-/// sentence (plus an 8-column margin) get a short form.
-fn statusRow(row: *Row, dashboard: Dashboard, view: *const View, width: u16) void {
-    var window_buf: [64]u8 = undefined;
-    const status: []const u8 = if (dashboard.refresh_failed)
-        "Refresh failed · showing previous data"
-    else if (view.coverage == .not_started)
-        "Tracking has not started"
-    else switch (view.completeness) {
-        .pending => fitted(width, "Known totals exclude pending Gateway reconciliation", "Pending Gateway reconciliation"),
-        .incomplete => "Known totals may be incomplete",
-        .legacy => fitted(width, "This session predates complete usage tracking", "Predates usage tracking"),
-        .complete => if (view.coverage == .partial) partialWindow(&window_buf, view, width) else "Local fx activity",
-    };
-    styledRow(row, status, width, .dim);
-}
-
-fn fitted(width: u16, full: []const u8, short: []const u8) []const u8 {
-    return if (@as(usize, width) >= full.len + 8) full else short;
-}
-
-/// `Tracking since Oct 7, 2026 (partial window)`, or `Partial window` when
-/// that doesn't fit. Partial coverage always has a start (report invariant).
-fn partialWindow(buf: *[64]u8, view: *const View, width: u16) []const u8 {
-    var date_buf: [24]u8 = undefined;
-    const date = report.formatUtcDate(&date_buf, view.coverage_started_at_ms.?);
-    const full = std.fmt.bufPrint(buf, "Tracking since {s} (partial window)", .{date}) catch return "Partial window";
-    return fitted(width, full, "Partial window");
-}
-
-fn constrainedModelStart(visible_rows: u16) usize {
-    if (visible_rows <= 4) return visible_rows -| 1;
-    return 4;
-}
-
-/// Too few rows for the full layout: status, summary, models header, models.
-fn constrainedRow(row: *Row, dashboard: Dashboard, view: *const View, row_index: u16, visible_rows: u16, width: u16) void {
-    const model_start = constrainedModelStart(visible_rows);
-    if (row_index == 1 and row_index < model_start) return statusRow(row, dashboard, view, width);
-    if (row_index == 2 and row_index < model_start) return compactSummaryRow(row, view, width);
-    if (row_index == 3 and row_index < model_start) return modelsHeaderRow(row, view.models.len, width);
-    if (row_index < model_start) return;
-    if (view.models.len == 0) return statusRow(row, dashboard, view, width);
-    modelRow(row, dashboard, view, row_index - model_start, visible_rows - model_start, width);
-}
-
-fn compactSummaryRow(row: *Row, view: *const View, width: u16) void {
-    const totals = view.totals orelse return styledRow(row, "Usage unavailable", width, .dim);
-    var token_buf: [32]u8 = undefined;
-    var spend_buf: [32]u8 = undefined;
-    var buf: [96]u8 = undefined;
-    const summary = std.fmt.bufPrint(&buf, "{s} tokens · {s}", .{ formatCompact(&token_buf, totals.total_tokens), formatMoney(&spend_buf, totals.total_cost) }) catch "Usage summary unavailable";
-    styledRow(row, summary, width, .dim);
-}
-
-/// Session activity rows at `start`; false when `row_index` is not one.
-fn activityRow(row: *Row, activity: report.SessionActivity, row_index: u16, start: usize, width: u16) bool {
-    if (row_index == start) {
-        styledRow(row, "Session activity", width, .label);
-        return true;
-    }
-    var api_buf: [32]u8 = undefined;
-    var wall_buf: [32]u8 = undefined;
-    var row_buf: [128]u8 = undefined;
-    if (row_index == start + 1) {
-        const value = std.fmt.bufPrint(&row_buf, "API {s} · Wall {s}", .{
-            if (activity.api_duration_complete) formatDuration(&api_buf, activity.api_duration_ms) else "Unavailable",
-            if (activity.wall_duration_complete) formatDuration(&wall_buf, activity.wall_duration_ms) else "Unavailable",
-        }) catch "Session timing unavailable";
-        styledRow(row, value, width, .dim);
-        return true;
-    }
-    if (row_index == start + 2) {
-        const value = if (activity.code_complete)
-            std.fmt.bufPrint(&row_buf, "Code +{d} · -{d}", .{ activity.lines_added, activity.lines_removed }) catch "Code activity unavailable"
+    const activity = view.session_activity != null;
+    if (view.totals == null or view.models.len == 0) {
+        const message: ?[]const u8 = if (view.totals == null)
+            (if (view.completeness == .legacy) null else "no usage yet")
         else
-            "Code activity unavailable";
-        styledRow(row, value, width, .dim);
-        return true;
-    }
-    return false;
-}
-
-fn modelsHeaderRow(row: *Row, model_count: usize, width: u16) void {
-    var buf: [64]u8 = undefined;
-    const value = if (width < 48) "Models" else std.fmt.bufPrint(&buf, "Models {d}", .{model_count}) catch "Models";
-    styledRow(row, value, width, .label);
-}
-
-// Layout
-
-const column_gap: usize = 4;
-
-const OverviewMode = enum { wide, medium, narrow };
-const ModelMode = enum { columns, facts, compact, name_only };
-
-const Layout = struct {
-    overview_mode: OverviewMode,
-    overview_start: usize,
-    overview_rows: usize,
-    activity_start: ?usize,
-    models_header: usize,
-    model_columns: ?usize,
-    model_start: usize,
-};
-
-const OverviewColumns = struct { second: usize, third: usize };
-const ModelColumns = struct { token: usize, share: usize, spend: usize };
-
-fn layoutFor(view: *const View, width: u16) Layout {
-    const totals = view.totals.?;
-    const overview_mode: OverviewMode = if (width >= 110 and overviewColumns(totals, width) != null)
-        .wide
-    else if (width >= 48)
-        .medium
-    else
-        .narrow;
-    const overview_start: usize = if (overview_mode == .narrow) 2 else 3;
-    const overview_rows: usize = if (overview_mode == .narrow) 2 else 3;
-    var cursor = overview_start + overview_rows;
-    var activity_start: ?usize = null;
-    if (view.session_activity != null) {
-        if (overview_mode != .narrow) cursor += 1;
-        activity_start = cursor;
-        cursor += 3;
-    }
-    if (overview_mode != .narrow) cursor += 1;
-    const models_header = cursor;
-    cursor += 1;
-    const model_columns: ?usize = if (modelModeFor(view, width) == .columns) blk: {
-        cursor += 1;
-        break :blk cursor - 1;
-    } else null;
-    return .{
-        .overview_mode = overview_mode,
-        .overview_start = overview_start,
-        .overview_rows = overview_rows,
-        .activity_start = activity_start,
-        .models_header = models_header,
-        .model_columns = model_columns,
-        .model_start = cursor,
-    };
-}
-
-const Cells = struct {
-    first: [64]u8 = undefined,
-    second: [64]u8 = undefined,
-    third: [64]u8 = undefined,
-
-    fn get(self: *Cells, totals: Totals, mode: OverviewMode, index: usize) [3][]const u8 {
-        if (mode == .narrow) return switch (index) {
-            0 => .{ formatTokenLabel(&self.first, totals.total_tokens, "tokens"), formatMoney(&self.second, totals.total_cost), "" },
-            else => .{ formatRequestLabel(&self.third, totals.request_count), "", "" },
-        };
-        return switch (index) {
-            0 => .{
-                formatTokenLabel(&self.first, totals.total_tokens, "tokens"),
-                formatMoneyLabel(&self.second, totals.total_cost, "spent"),
-                formatRequestLabel(&self.third, totals.request_count),
-            },
-            1 => .{
-                formatTokenLabel(&self.first, totals.input_tokens, "input"),
-                formatTokenLabel(&self.second, totals.output_tokens, "output"),
-                if (totals.reasoning_tokens) |value| formatTokenLabel(&self.third, value, "reasoning") else "Reasoning unavailable",
-            },
-            else => .{
-                formatTokenLabel(&self.first, totals.cache_read_tokens, "cache read"),
-                formatTokenLabel(&self.second, totals.cache_write_tokens, "cache write"),
-                "",
-            },
-        };
-    }
-};
-
-fn overviewColumns(totals: Totals, width: u16) ?OverviewColumns {
-    var widths = [3]usize{ 0, 0, 0 };
-    for (0..3) |index| {
-        var cells: Cells = .{};
-        for (cells.get(totals, .wide, index), &widths) |cell, *widest| widest.* = @max(widest.*, cellCount(cell));
-    }
-    const indent: usize = if (width <= 2) 0 else 2;
-    const second = indent + widths[0] + column_gap;
-    const third = second + widths[1] + column_gap;
-    if (third + widths[2] > width) return null;
-    return .{ .second = second, .third = third };
-}
-
-fn overviewRow(row: *Row, totals: Totals, mode: OverviewMode, index: usize, width: u16) void {
-    var cells: Cells = .{};
-    const values = cells.get(totals, mode, index);
-    if (mode == .wide) {
-        const columns = overviewColumns(totals, width).?;
-        row.style(.dim);
-        if (width > 2) row.text("  ");
-        row.ellipsized(values[0], columns.second -| 3);
-        row.padTo(columns.second);
-        row.ellipsized(values[1], columns.third -| columns.second -| 1);
-        if (values[2].len > 0) {
-            row.padTo(columns.third);
-            row.ellipsized(values[2], @as(usize, width) -| columns.third);
-        }
-        row.reset();
+            emptyTableMessage(view);
+        const lines = 1 + oneIf(message != null) + oneIf(activity) + notes.len;
+        const room = if (visible_rows) |rows| lines + 1 <= rows else true;
+        if (room) plan.add(.blank);
+        if (message) |value| plan.add(.{ .message = value });
+        if (activity) plan.add(.activity);
+        for (0..notes.len) |index| plan.add(.{ .note = index });
         return;
     }
-    var buf: [192]u8 = undefined;
-    const joined = if (values[2].len > 0)
-        std.fmt.bufPrint(&buf, "{s} · {s} · {s}", .{ values[0], values[1], values[2] }) catch "Usage unavailable"
-    else if (values[1].len > 0)
-        std.fmt.bufPrint(&buf, "{s} · {s}", .{ values[0], values[1] }) catch "Usage unavailable"
-    else
-        values[0];
-    styledRow(row, joined, width, .dim);
-}
 
-fn modelModeFor(view: *const View, width: u16) ModelMode {
-    if (width >= 110 and modelColumns(view, width) != null) return .columns;
-    if (width >= 48 and infoColumn(view, width, true) != null) return .facts;
-    if (infoColumn(view, width, false) != null) return .compact;
-    return .name_only;
-}
-
-fn safeCells(name: []const u8) usize {
-    var cells: usize = 0;
-    for (name) |byte| cells += if (byte < 0x20 or byte >= 0x7f) 4 else 1;
-    return cells;
-}
-
-fn modelColumns(view: *const View, width: u16) ?ModelColumns {
-    const indent: usize = if (width <= 2) 0 else 2;
-    var longest_model: usize = "Model".len;
-    var token_width: usize = "Tokens".len;
-    var share_width: usize = "Share".len;
-    var spend_width: usize = "Spend".len;
-    const total = view.totals.?.total_tokens;
-    for (view.models) |model| {
-        longest_model = @max(longest_model, safeCells(model.model));
-        var token_buf: [32]u8 = undefined;
-        var share_buf: [32]u8 = undefined;
-        var spend_buf: [32]u8 = undefined;
-        token_width = @max(token_width, cellCount(formatCompact(&token_buf, model.totals.total_tokens)));
-        share_width = @max(share_width, cellCount(formatShare(&share_buf, model.totals.total_tokens, total)));
-        spend_width = @max(spend_width, cellCount(formatMoney(&spend_buf, model.totals.total_cost)));
-    }
-    const fixed = column_gap * 3 + token_width + share_width + spend_width;
-    const minimum_name: usize = 10;
-    if (@as(usize, width) < indent + minimum_name + fixed) return null;
-    const name_width = @min(longest_model, @as(usize, width) - indent - fixed);
-    const token = indent + name_width + column_gap;
-    const share = token + token_width + column_gap;
-    const spend = share + share_width + column_gap;
-    return .{ .token = token, .share = share, .spend = spend };
-}
-
-fn infoColumn(view: *const View, width: u16, include_share: bool) ?usize {
-    const indent: usize = if (width <= 2) 0 else 2;
-    var longest_model: usize = 0;
-    var widest_info: usize = 0;
-    for (view.models) |model| {
-        longest_model = @max(longest_model, safeCells(model.model));
-        var info_buf: [128]u8 = undefined;
-        widest_info = @max(widest_info, cellCount(formatFacts(&info_buf, model, view.totals.?.total_tokens, include_share)));
-    }
-    if (widest_info == 0 or @as(usize, width) < indent + 8 + column_gap + widest_info) return null;
-    return @min(indent + longest_model + column_gap, @as(usize, width) - widest_info);
-}
-
-fn modelRow(row: *Row, dashboard: Dashboard, view: *const View, display_row: usize, visible_rows: usize, width: u16) void {
     const models = view.models;
+    const expanded = oneIf(dashboard.expanded_model != null);
+    const all_models = @min(models.len, max_model_rows) + expanded;
+    var keep: struct {
+        top_blank: bool = true,
+        header: bool = true,
+        total: bool,
+        bottom_blank: bool = true,
+        breakdown: bool = true,
+        activity: bool,
+        notes: usize,
+
+        fn fixed(self: @This()) usize {
+            return 1 + oneIf(self.top_blank) + oneIf(self.header) + oneIf(self.total) +
+                oneIf(self.bottom_blank) + oneIf(self.breakdown) + oneIf(self.activity) + self.notes;
+        }
+    } = .{ .total = models.len > 1 or notes.starred, .activity = activity, .notes = notes.len };
+
+    var area: usize = all_models;
+    if (visible_rows) |value| {
+        const rows: usize = value;
+        if (keep.fixed() + all_models > rows) keep.top_blank = false;
+        if (keep.fixed() + all_models > rows) keep.bottom_blank = false;
+        const few = @min(models.len, 3) + expanded;
+        if (keep.fixed() + few > rows) keep.breakdown = false;
+        if (keep.fixed() + few > rows) keep.activity = false;
+        if (keep.fixed() + few > rows) keep.header = false;
+        if (keep.fixed() + few > rows) keep.total = false;
+        while (keep.notes > 0 and keep.fixed() + 1 > rows) keep.notes -= 1;
+        area = rows -| keep.fixed();
+    }
+
     const selected = @min(dashboard.selected_model, models.len - 1);
-    const visible_models = @min(models.len, max_model_rows, @max(visible_rows -| @intFromBool(dashboard.expanded_model != null), 1));
-    const max_start = models.len -| visible_models;
+    const visible_models = @min(models.len, max_model_rows, @max(area -| expanded, 1));
+    const max_start = models.len - visible_models;
     const selection_start = selected -| (visible_models - 1);
     const start = @min(@max(@min(dashboard.model_window_start, selected), selection_start), max_start);
-    var logical_row: usize = 0;
-    var index = start;
-    while (index < models.len) : (index += 1) {
-        if (logical_row == display_row) return modelSummaryRow(row, view, models[index], index == selected, width);
-        logical_row += 1;
-        if (dashboard.expanded_model == index) {
-            if (logical_row == display_row) {
-                var detail_buf: [256]u8 = undefined;
-                return styledRow(row, formatDetail(&detail_buf, models[index].totals), width, .dim);
-            }
-            logical_row += 1;
-        }
-        if (logical_row > display_row) return;
+
+    if (keep.top_blank) plan.add(.blank);
+    if (keep.header) plan.add(.header);
+    for (start..start + visible_models) |index| {
+        plan.add(.{ .model = index });
+        if (dashboard.expanded_model == index) plan.add(.{ .detail = index });
+    }
+    if (keep.total) plan.add(.total);
+    if (keep.bottom_blank) plan.add(.blank);
+    if (keep.breakdown) plan.add(.breakdown);
+    if (keep.activity) plan.add(.activity);
+    for (0..keep.notes) |index| plan.add(.{ .note = index });
+}
+
+fn oneIf(value: bool) usize {
+    return @intFromBool(value);
+}
+
+fn drawLine(row: *Row, dashboard: Dashboard, notes: *const Notes, line: Line, width: u16) void {
+    switch (line) {
+        .periods => periodsRow(row, dashboard.scope, width),
+        .blank => {},
+        .message => |value| styledRow(row, value, width, .dim),
+        .header => tableRow(row, columnsFor(dashboard.view.?, width), .header, "cost", " ", "tokens", "reqs", "model", width),
+        .model => |index| modelRow(row, dashboard, index, width),
+        .detail => |index| detailRow(row, dashboard.view.?, index, width),
+        .total => totalRow(row, dashboard.view.?, notes, width),
+        .breakdown => {
+            var buf: [160]u8 = undefined;
+            styledRow(row, breakdownText(&buf, dashboard.view.?.totals.?), width, null);
+        },
+        .activity => {
+            var buf: [96]u8 = undefined;
+            styledRow(row, activityText(&buf, dashboard.view.?.session_activity.?), width, null);
+        },
+        .note => |index| noteRow(row, notes, index, width),
     }
 }
 
-fn modelSummaryRow(row: *Row, view: *const View, model: ModelUsage, selected: bool, width: u16) void {
-    var name_buf: [report.max_model_bytes * 4]u8 = undefined;
-    const name = escapeName(&name_buf, model.model);
-    const mode = modelModeFor(view, width);
-    const total = view.totals.?.total_tokens;
-    if (mode == .columns) {
-        var token_buf: [32]u8 = undefined;
-        var share_buf: [32]u8 = undefined;
-        var spend_buf: [32]u8 = undefined;
-        return modelColumnsRow(
-            row,
-            name,
-            formatCompact(&token_buf, model.totals.total_tokens),
-            formatShare(&share_buf, model.totals.total_tokens, total),
-            formatMoney(&spend_buf, model.totals.total_cost),
-            selected,
-            modelColumns(view, width).?,
-            width,
-        );
+/// One visible row: the selected model, else the first note, else a message.
+fn priorityRow(row: *Row, dashboard: Dashboard, notes: *const Notes, width: u16) void {
+    const view = dashboard.view orelse
+        return styledRow(row, if (dashboard.refresh_failed) "usage unavailable; press r to retry" else "loading usage", width, .dim);
+    if (view.totals != null and view.models.len > 0) return modelRow(row, dashboard, @min(dashboard.selected_model, view.models.len - 1), width);
+    if (notes.len > 0) return noteRow(row, notes, 0, width);
+    styledRow(row, if (view.totals == null) "no usage yet" else emptyTableMessage(view), width, .dim);
+}
+
+/// A session view's completeness once its open calls finish: an open call
+/// gets its own note instead of an "incomplete" warning.
+fn shownCompleteness(view: *const View) report.Completeness {
+    return if (view.in_flight > 0) view.settled_completeness else view.completeness;
+}
+
+/// What a view with totals but no model rows says.
+fn emptyTableMessage(view: *const View) []const u8 {
+    if (view.unpriced.count > 0 or shownCompleteness(view) != .complete) return "no priced requests yet";
+    return if (view.scope == .session) "no usage yet" else "no usage in this period";
+}
+
+fn styledRow(row: *Row, value: []const u8, width: u16, style: ?Style) void {
+    if (style) |value_style| row.style(value_style);
+    row.ellipsized(value, width);
+    if (style != null) row.reset();
+}
+
+/// `[session]  24h  7d  30d`: the active period bracketed.
+fn periodsRow(row: *Row, active: Scope, width: u16) void {
+    row.beginClip(width);
+    for (Scope.tab_order, 0..) |scope, index| {
+        if (index > 0) row.text("  ");
+        row.style(if (scope == active) .title else .dim);
+        if (scope == active) row.text("[");
+        row.text(periodLabel(scope));
+        if (scope == active) row.text("]");
+        row.reset();
     }
-    const include_share = mode == .facts;
-    var info_buf: [128]u8 = undefined;
-    const info = formatFacts(&info_buf, model, total, include_share);
-    actionRow(row, name, if (mode == .name_only) "" else info, selected, infoColumn(view, width, include_share), width);
+    row.endClip();
+}
+
+fn periodLabel(scope: Scope) []const u8 {
+    return switch (scope) {
+        .session => "session",
+        .hours_24 => "24h",
+        .days_7 => "7d",
+        .days_30 => "30d",
+    };
+}
+
+fn noteRow(row: *Row, notes: *const Notes, index: usize, width: u16) void {
+    const kind = notes.kinds[index];
+    const label: []const u8 = switch (kind) {
+        .note => "note:",
+        .warning => "warning:",
+        .hint => "hint:",
+    };
+    row.beginClip(width);
+    row.style(if (kind == .warning) .warning else .dim);
+    row.text(label);
+    row.reset();
+    row.text(" ");
+    row.endClip();
+    row.ellipsized(notes.text(index), @as(usize, width) -| row.column);
+}
+
+// The table: cost, tokens, requests, then the model in what is left
+
+const marker_cells = 2;
+const column_gap = 2;
+const min_name_cells = 10;
+
+const Columns = struct {
+    cost: usize,
+    tokens: ?usize,
+    reqs: ?usize,
+
+    /// Where model names start.
+    fn model(self: Columns) usize {
+        var cells = marker_cells + self.cost + 1;
+        if (self.tokens) |value| cells += column_gap + value;
+        if (self.reqs) |value| cells += column_gap + value;
+        return cells + column_gap;
+    }
+};
+
+/// Columns as wide as their widest value; narrow rows drop requests, then
+/// tokens, before a name gets fewer than `min_name_cells`.
+fn columnsFor(view: *const View, width: u16) Columns {
+    var columns: Columns = .{ .cost = "cost".len, .tokens = "tokens".len, .reqs = "reqs".len };
+    widen(&columns, view.totals.?);
+    for (view.models) |model| widen(&columns, model.totals);
+    if (width < columns.model() + min_name_cells) columns.reqs = null;
+    if (width < columns.model() + min_name_cells) columns.tokens = null;
+    return columns;
+}
+
+fn widen(columns: *Columns, totals: Totals) void {
+    var cost_buf: [32]u8 = undefined;
+    var token_buf: [32]u8 = undefined;
+    var reqs_buf: [32]u8 = undefined;
+    columns.cost = @max(columns.cost, cellCount(formatCost(&cost_buf, totals.total_cost)));
+    columns.tokens = @max(columns.tokens.?, cellCount(formatCompact(&token_buf, totals.total_tokens)));
+    columns.reqs = @max(columns.reqs.?, cellCount(formatRequests(&reqs_buf, totals.request_count)));
+}
+
+const TableRow = enum { header, model, selected, total };
+
+fn tableRow(row: *Row, columns: Columns, kind: TableRow, cost: []const u8, mark: []const u8, tokens: []const u8, reqs: []const u8, name: []const u8, width: u16) void {
+    const style: ?Style = switch (kind) {
+        .header => .dim,
+        .selected => .label,
+        .total => .strong,
+        .model => null,
+    };
+    row.beginClip(width);
+    if (style) |value| row.style(value);
+    row.text(if (kind == .selected) "❯ " else "  ");
+    rightAligned(row, cost, columns.cost);
+    row.text(mark);
+    if (columns.tokens) |cells| {
+        row.blank(column_gap);
+        rightAligned(row, tokens, cells);
+    }
+    if (columns.reqs) |cells| {
+        row.blank(column_gap);
+        rightAligned(row, reqs, cells);
+    }
+    row.blank(column_gap);
+    const cut = row.dropped();
+    row.endClip();
+    if (!cut) row.ellipsized(name, @as(usize, width) -| row.column);
+    if (style != null and !cut) row.reset();
+}
+
+fn rightAligned(row: *Row, value: []const u8, cells: usize) void {
+    row.blank(cells -| cellCount(value));
+    row.text(value);
+}
+
+fn modelRow(row: *Row, dashboard: Dashboard, index: usize, width: u16) void {
+    const view = dashboard.view.?;
+    const model = view.models[index];
+    const selected = index == @min(dashboard.selected_model, view.models.len - 1);
+    var cost_buf: [32]u8 = undefined;
+    var token_buf: [32]u8 = undefined;
+    var reqs_buf: [32]u8 = undefined;
+    var name_buf: [report.max_model_bytes * 4]u8 = undefined;
+    tableRow(
+        row,
+        columnsFor(view, width),
+        if (selected) .selected else .model,
+        formatCost(&cost_buf, model.totals.total_cost),
+        " ",
+        formatCompact(&token_buf, model.totals.total_tokens),
+        formatRequests(&reqs_buf, model.totals.request_count),
+        escapeName(&name_buf, model.model),
+        width,
+    );
+}
+
+fn totalRow(row: *Row, view: *const View, notes: *const Notes, width: u16) void {
+    const totals = view.totals.?;
+    var cost_buf: [32]u8 = undefined;
+    var token_buf: [32]u8 = undefined;
+    var reqs_buf: [32]u8 = undefined;
+    tableRow(
+        row,
+        columnsFor(view, width),
+        .total,
+        formatCost(&cost_buf, totals.total_cost),
+        if (notes.starred) "*" else " ",
+        formatCompact(&token_buf, totals.total_tokens),
+        formatRequests(&reqs_buf, totals.request_count),
+        "total",
+        width,
+    );
+}
+
+/// The expanded model's split, under its name.
+fn detailRow(row: *Row, view: *const View, index: usize, width: u16) void {
+    var buf: [160]u8 = undefined;
+    const detail = detailText(&buf, view.models[index].totals);
+    row.beginClip(width);
+    row.style(.dim);
+    row.blank(columnsFor(view, width).model());
+    row.text(detail);
+    row.reset();
+    row.endClip();
 }
 
 fn escapeName(buf: *[report.max_model_bytes * 4]u8, name: []const u8) []const u8 {
@@ -844,95 +850,69 @@ fn escapeName(buf: *[report.max_model_bytes * 4]u8, name: []const u8) []const u8
     return writer.buffered();
 }
 
-fn modelColumnsRow(row: *Row, name: []const u8, tokens: []const u8, share: []const u8, spend: []const u8, selected: bool, columns: ModelColumns, width: u16) void {
-    row.style(if (selected) .label else .dim);
-    row.clipped(if (selected) "❯ " else "  ", width);
-    const used = row.column;
-    row.ellipsized(name, columns.token -| used -| 1);
-    row.reset();
-    row.padTo(columns.token);
-    row.style(.dim);
-    row.ellipsized(tokens, columns.share -| columns.token -| 1);
-    row.padTo(columns.share);
-    row.ellipsized(share, columns.spend -| columns.share -| 1);
-    row.padTo(columns.spend);
-    row.ellipsized(spend, @as(usize, width) -| columns.spend);
-    row.reset();
+// Line texts
+
+/// `in 17.2K (4.1K cached, 9.1K written)  out 1.2K (310 reasoning)`; zero
+/// and unknown parts are left out.
+fn breakdownText(buf: *[160]u8, totals: Totals) []const u8 {
+    return writeBreakdown(buf, totals) catch "in/out unavailable";
 }
 
-/// A model name with its facts in a column (`composeWorkspaceActionRow`).
-fn actionRow(row: *Row, label: []const u8, info: []const u8, selected: bool, info_column: ?usize, width: u16) void {
-    row.style(if (selected) .label else .dim);
-    row.clipped(if (selected) "❯ " else "  ", width);
-    const used_prefix = row.column;
-    const total_width: usize = width;
-    if (used_prefix >= total_width) return row.reset();
-    const info_start = info_column orelse {
-        row.ellipsized(label, total_width - used_prefix);
-        return row.reset();
-    };
-    if (info_start <= used_prefix + 2) {
-        row.ellipsized(label, total_width - used_prefix);
-        return row.reset();
+fn writeBreakdown(buf: *[160]u8, totals: Totals) Writer.Error![]const u8 {
+    var writer: Writer = .fixed(buf);
+    var number: [32]u8 = undefined;
+    try writer.print("in {s}", .{formatCompact(&number, totals.input_tokens)});
+    const cached = totals.cache_read_tokens;
+    const written = totals.cache_write_tokens;
+    if (cached > 0 or written > 0) {
+        try writer.writeAll(" (");
+        if (cached > 0) try writer.print("{s} cached", .{formatCompact(&number, cached)});
+        if (cached > 0 and written > 0) try writer.writeAll(", ");
+        if (written > 0) try writer.print("{s} written", .{formatCompact(&number, written)});
+        try writer.writeAll(")");
     }
-    row.ellipsized(label, info_start - used_prefix - 1);
-    row.reset();
-    if (row.column >= info_start) return;
-    row.spaces(info_start - row.column);
-    row.style(.dim);
-    row.ellipsized(info, total_width - info_start);
-    row.reset();
+    try writer.print("  out {s}", .{formatCompact(&number, totals.output_tokens)});
+    if (totals.reasoning_tokens) |reasoning| {
+        if (reasoning > 0) try writer.print(" ({s} reasoning)", .{formatCompact(&number, reasoning)});
+    }
+    return writer.buffered();
 }
 
-// Formats, each into the buffer size fx uses, with fx's fallback text.
+/// `in 11.6K  cached 4.1K  written 9.1K  out 520  reasoning 310`.
+fn detailText(buf: *[160]u8, totals: Totals) []const u8 {
+    return writeDetail(buf, totals) catch "detail unavailable";
+}
 
-fn formatFacts(buf: *[128]u8, model: ModelUsage, total_tokens: u64, include_share: bool) []const u8 {
-    var token_buf: [32]u8 = undefined;
-    var share_buf: [32]u8 = undefined;
-    var spend_buf: [32]u8 = undefined;
-    const tokens = formatCompact(&token_buf, model.totals.total_tokens);
-    const spend = formatMoney(&spend_buf, model.totals.total_cost);
-    return if (include_share)
-        std.fmt.bufPrint(buf, "{s} · {s} · {s}", .{ tokens, formatShare(&share_buf, model.totals.total_tokens, total_tokens), spend }) catch "Unavailable"
+fn writeDetail(buf: *[160]u8, totals: Totals) Writer.Error![]const u8 {
+    var writer: Writer = .fixed(buf);
+    var number: [32]u8 = undefined;
+    try writer.print("in {s}", .{formatCompact(&number, totals.input_tokens)});
+    if (totals.cache_read_tokens > 0) try writer.print("  cached {s}", .{formatCompact(&number, totals.cache_read_tokens)});
+    if (totals.cache_write_tokens > 0) try writer.print("  written {s}", .{formatCompact(&number, totals.cache_write_tokens)});
+    try writer.print("  out {s}", .{formatCompact(&number, totals.output_tokens)});
+    if (totals.reasoning_tokens) |reasoning| {
+        if (reasoning > 0) try writer.print("  reasoning {s}", .{formatCompact(&number, reasoning)});
+    }
+    return writer.buffered();
+}
+
+/// `api 14s  wall 3m12s  lines +48 -12`, with `?` for what is unknown.
+fn activityText(buf: *[96]u8, activity: report.SessionActivity) []const u8 {
+    var api_buf: [32]u8 = undefined;
+    var wall_buf: [32]u8 = undefined;
+    var lines_buf: [48]u8 = undefined;
+    const lines = if (activity.code_complete)
+        std.fmt.bufPrint(&lines_buf, "+{d} -{d}", .{ activity.lines_added, activity.lines_removed }) catch "?"
     else
-        std.fmt.bufPrint(buf, "{s} · {s}", .{ tokens, spend }) catch "Unavailable";
+        "?";
+    return std.fmt.bufPrint(buf, "api {s}  wall {s}  lines {s}", .{
+        if (activity.api_duration_complete) formatDuration(&api_buf, activity.api_duration_ms) else "?",
+        if (activity.wall_duration_complete) formatDuration(&wall_buf, activity.wall_duration_ms) else "?",
+        lines,
+    }) catch "activity unavailable";
 }
 
-fn formatDetail(buf: *[256]u8, totals: Totals) []const u8 {
-    var input_buf: [32]u8 = undefined;
-    var output_buf: [32]u8 = undefined;
-    var read_buf: [32]u8 = undefined;
-    var write_buf: [32]u8 = undefined;
-    var reasoning_buf: [32]u8 = undefined;
-    var request_buf: [32]u8 = undefined;
-    var spend_buf: [32]u8 = undefined;
-    return std.fmt.bufPrint(buf, "Input {s} · Output {s} · Cache {s}/{s} · Reasoning {s} · Requests {s} · {s}", .{
-        formatCompact(&input_buf, totals.input_tokens),
-        formatCompact(&output_buf, totals.output_tokens),
-        formatCompact(&read_buf, totals.cache_read_tokens),
-        formatCompact(&write_buf, totals.cache_write_tokens),
-        if (totals.reasoning_tokens) |value| formatCompact(&reasoning_buf, value) else "n/a",
-        if (totals.request_count) |value| formatGrouped(&request_buf, value) else "n/a",
-        formatMoney(&spend_buf, totals.total_cost),
-    }) catch "Usage details unavailable";
-}
-
-fn formatTokenLabel(buf: *[64]u8, value: u64, label: []const u8) []const u8 {
-    var value_buf: [32]u8 = undefined;
-    return std.fmt.bufPrint(buf, "{s} {s}", .{ formatCompact(&value_buf, value), label }) catch "Unavailable";
-}
-
-fn formatMoneyLabel(buf: *[64]u8, value: f64, label: []const u8) []const u8 {
-    var value_buf: [32]u8 = undefined;
-    return std.fmt.bufPrint(buf, "{s} {s}", .{ formatMoney(&value_buf, value), label }) catch "Unavailable";
-}
-
-fn formatRequestLabel(buf: *[64]u8, value: ?u64) []const u8 {
-    const requests = value orelse return "Requests unavailable";
-    var value_buf: [32]u8 = undefined;
-    // "1 request", "0 requests": today's plural rule.
-    return std.fmt.bufPrint(buf, "{s} {s}", .{ formatGrouped(&value_buf, requests), if (requests == 1) "request" else "requests" }) catch "Requests unavailable";
-}
+// Formats
 
 /// `1.5K`, `43.6M`, `1B`; whole multiples drop the decimal.
 fn formatCompact(buf: *[32]u8, value: u64) []const u8 {
@@ -968,25 +948,43 @@ fn formatGrouped(buf: *[32]u8, value: u64) []const u8 {
     return buf[cursor..];
 }
 
-/// `$x.xx`, or `$?` when it does not fit the buffer.
-fn formatMoney(buf: []u8, value: f64) []const u8 {
-    return std.fmt.bufPrint(buf, "${d:.2}", .{value}) catch "$?";
+fn formatRequests(buf: *[32]u8, value: ?u64) []const u8 {
+    return formatGrouped(buf, value orelse return "?");
 }
 
-fn formatShare(buf: *[32]u8, tokens: u64, total_tokens: u64) []const u8 {
-    const share = if (total_tokens == 0) 0.0 else @as(f64, @floatFromInt(tokens)) * 100.0 / @as(f64, @floatFromInt(total_tokens));
-    return std.fmt.bufPrint(buf, "{d:.1}%", .{share}) catch "?%";
+/// `$12.34` from a dollar up; below it up to four decimals without trailing
+/// zeros (`$0.0298`, `$0.412`, `$0.50`), `<$0.0001` for less, `$0` for none.
+fn formatCost(buf: *[32]u8, value: f64) []const u8 {
+    if (!std.math.isFinite(value) or value < 0) return "$?";
+    if (value == 0) return "$0";
+    if (value < 0.0001) return "<$0.0001";
+    if (value >= 1) return std.fmt.bufPrint(buf, "${d:.2}", .{value}) catch "$?";
+    const text = std.fmt.bufPrint(buf, "${d:.4}", .{value}) catch return "$?";
+    const two_decimals = "$0.00".len;
+    var end = text.len;
+    while (end > two_decimals and text[end - 1] == '0') end -= 1;
+    return text[0..end];
 }
 
-/// `1h 2m 3s`, `2m 3s`, `3s`.
+/// `1h2m3s`, `3m12s`, `14s`.
 fn formatDuration(buf: *[32]u8, duration_ms: u64) []const u8 {
     const total_seconds = duration_ms / 1000;
     const hours = total_seconds / 3600;
     const minutes = (total_seconds % 3600) / 60;
     const seconds = total_seconds % 60;
-    if (hours > 0) return std.fmt.bufPrint(buf, "{d}h {d}m {d}s", .{ hours, minutes, seconds }) catch "Unavailable";
-    if (minutes > 0) return std.fmt.bufPrint(buf, "{d}m {d}s", .{ minutes, seconds }) catch "Unavailable";
-    return std.fmt.bufPrint(buf, "{d}s", .{seconds}) catch "Unavailable";
+    if (hours > 0) return std.fmt.bufPrint(buf, "{d}h{d}m{d}s", .{ hours, minutes, seconds }) catch "?";
+    if (minutes > 0) return std.fmt.bufPrint(buf, "{d}m{d}s", .{ minutes, seconds }) catch "?";
+    return std.fmt.bufPrint(buf, "{d}s", .{seconds}) catch "?";
+}
+
+/// `2026-10-09` (UTC).
+fn formatIsoDate(buf: *[16]u8, timestamp_ms: i64) []const u8 {
+    if (timestamp_ms < 0) return "unknown";
+    const seconds: u64 = @intCast(@divFloor(timestamp_ms, std.time.ms_per_s));
+    const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = seconds };
+    const year_day = epoch_seconds.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    return std.fmt.bufPrint(buf, "{d}-{d:0>2}-{d:0>2}", .{ year_day.year, month_day.month.numeric(), month_day.day_index + 1 }) catch "unknown";
 }
 
 // ---------------------------------------------------------------------------
@@ -1267,16 +1265,21 @@ test "dashboard number formats" {
     for (compact) |case| try testing.expectEqualStrings(case[1], formatCompact(&buf, case[0]));
     try testing.expectEqualStrings("1,234,567", formatGrouped(&buf, 1234567));
     try testing.expectEqualStrings("0", formatGrouped(&buf, 0));
-    try testing.expectEqualStrings("$100.79", formatMoney(&buf, 100.789));
-    try testing.expectEqualStrings("$?", formatMoney(&buf, 1e40));
-    try testing.expectEqualStrings("71.4%", formatShare(&buf, 714, 1000));
-    try testing.expectEqualStrings("0.0%", formatShare(&buf, 0, 0));
-    try testing.expectEqualStrings("1h 2m 3s", formatDuration(&buf, 3_723_999));
-    try testing.expectEqualStrings("2m 0s", formatDuration(&buf, 120_000));
+    try testing.expectEqualStrings("?", formatRequests(&buf, null));
+    const costs = [_]struct { f64, []const u8 }{
+        .{ 0, "$0" },      .{ 0.00005, "<$0.0001" }, .{ 0.0298, "$0.0298" },  .{ 0.412, "$0.412" },
+        .{ 0.5, "$0.50" }, .{ 0.99996, "$1.00" },    .{ 100.789, "$100.79" }, .{ 1e40, "$?" },
+        .{ -1, "$?" },
+    };
+    for (costs) |case| try testing.expectEqualStrings(case[1], formatCost(&buf, case[0]));
+    try testing.expectEqualStrings("1h2m3s", formatDuration(&buf, 3_723_999));
+    try testing.expectEqualStrings("2m0s", formatDuration(&buf, 120_000));
     try testing.expectEqualStrings("0s", formatDuration(&buf, 999));
+    var date: [16]u8 = undefined;
+    try testing.expectEqualStrings("2026-10-07", formatIsoDate(&date, 1791381023000));
 }
 
-const test_palette: Palette = .{ .title = "<T>", .dim = "<D>", .label = "<L>", .reset = "</>" };
+const test_palette: Palette = .{ .title = "<T>", .dim = "<D>", .label = "<L>", .warning = "<W>", .strong = "<S>", .reset = "</>" };
 
 fn paintRow(dashboard: Dashboard, row_index: u16, visible_rows: u16, width: u16) ![]u8 {
     var row: Row = .{};
@@ -1293,68 +1296,154 @@ fn expectRow(want: []const u8, dashboard: Dashboard, row_index: u16, visible_row
     try testing.expectEqualStrings(want, got);
 }
 
-test "dashboard header keeps today's tab order and narrows to the active tab" {
-    const dashboard: Dashboard = .{ .scope = .hours_24 };
-    try expectRow("<T>Usage</>  <D>30 days</>  <D>7 days</>  <T>[24 hours]</>  <D>Session</>", dashboard, 0, 2, 80);
-    try expectRow("<T>Usage</>  <T>[24 hours]</></>", dashboard, 0, 2, 63);
-    try expectRow("<T>Usage</> </>", dashboard, 0, 2, 6);
-    try expectRow("<T>Usa</>", dashboard, 0, 2, 3);
-    try expectRow("<D>Loading usage</>", dashboard, 1, 2, 80);
-    try expectRow("<D>Usage unavailable · press r to retry</>", .{ .refresh_failed = true }, 1, 2, 80);
-    try expectRow("", dashboard, 2, 2, 80);
-    try testing.expectEqual(@as(u16, 2), dashboardDesiredRows(dashboard, 80));
+test "dashboard periods put the session first and clip on narrow rows" {
+    const dashboard: Dashboard = .{};
+    try testing.expectEqual(@as(u16, 3), dashboardDesiredRows(dashboard, 80));
+    try expectRow("<T>[session]</>  <D>24h</>  <D>7d</>  <D>30d</>", dashboard, 0, 3, 80);
+    try expectRow("<T>[session]</>  <D>24</>", dashboard, 0, 3, 13);
+    try expectRow("<D>session</>  <D>24h</>  <T>[7d]</>  <D>30d</>", .{ .scope = .days_7 }, 0, 3, 80);
+    try expectRow("", dashboard, 1, 3, 80);
+    try expectRow("<D>loading usage</>", dashboard, 2, 3, 80);
+    try expectRow("<D>usage unavailable; press r to retry</>", .{ .refresh_failed = true }, 2, 3, 80);
+    try expectRow("", dashboard, 3, 3, 80);
 }
 
-test "dashboard rows cap models at 20 and keep the selection visible" {
+fn tableView(models: []ModelUsage, totals: Totals) View {
+    return .{ .scope = .session, .snapshot_time_ms = 1, .window_start_ms = 0, .coverage_started_at_ms = 0, .coverage = .full, .completeness = .complete, .totals = totals, .models = models };
+}
+
+test "dashboard table: costs first, names last, a total for more than one model" {
+    var models = [_]ModelUsage{
+        .{ .model = "anthropic/claude-haiku-4.5", .totals = .{ .total_tokens = 12_100, .input_tokens = 11_600, .output_tokens = 500, .cache_read_tokens = 4_100, .cache_write_tokens = 9_100, .reasoning_tokens = 310, .request_count = 3, .total_cost = 0.0298 } },
+        .{ .model = "openai/gpt-4.1-mini", .totals = .{ .total_tokens = 6_200, .input_tokens = 5_600, .output_tokens = 600, .cache_read_tokens = 0, .cache_write_tokens = 0, .reasoning_tokens = 0, .request_count = 2, .total_cost = 0.0112 } },
+    };
+    var view = tableView(&models, .{ .total_tokens = 18_300, .input_tokens = 17_200, .output_tokens = 1_100, .cache_read_tokens = 4_100, .cache_write_tokens = 9_100, .reasoning_tokens = 310, .request_count = 5, .total_cost = 0.041 });
+    view.session_activity = .{ .api_duration_complete = true, .wall_duration_complete = true, .code_complete = true, .api_duration_ms = 14_000, .wall_duration_ms = 192_000, .lines_added = 48, .lines_removed = 12 };
+    var dashboard: Dashboard = .{ .view = &view };
+    // Periods, blank, header, two models, total, blank, in/out, activity;
+    // nothing else when every request is priced.
+    try testing.expectEqual(@as(u16, 9), dashboardDesiredRows(dashboard, 80));
+    try expectRow("<D>     cost   tokens  reqs  model</>", dashboard, 2, 9, 80);
+    try expectRow("<L>❯ $0.0298    12.1K     3  anthropic/claude-haiku-4.5</>", dashboard, 3, 9, 80);
+    try expectRow("  $0.0112     6.2K     2  openai/gpt-4.1-mini", dashboard, 4, 9, 80);
+    try expectRow("<S>   $0.041    18.3K     5  total</>", dashboard, 5, 9, 80);
+    try expectRow("", dashboard, 6, 9, 80);
+    try expectRow("in 17.2K (4.1K cached, 9.1K written)  out 1.1K (310 reasoning)", dashboard, 7, 9, 80);
+    try expectRow("api 14s  wall 3m12s  lines +48 -12", dashboard, 8, 9, 80);
+
+    // Enter: the split goes under the selected model's name.
+    dashboard.expanded_model = 0;
+    try testing.expectEqual(@as(u16, 10), dashboardDesiredRows(dashboard, 80));
+    try expectRow("<D>                          in 11.6K  cached 4.1K  written 9.1K  out 500  reasoning 310</>", dashboard, 4, 10, 100);
+
+    // Narrow rows drop requests, then tokens, before names get too short.
+    dashboard.expanded_model = null;
+    try expectRow("<L>❯ $0.0298    12.1K     3  anthropic/cla…</>", dashboard, 3, 9, 40);
+    try expectRow("<L>❯ $0.0298    12.1K  anthropic/c…</>", dashboard, 3, 9, 32);
+    try expectRow("<L>❯ $0.0298   anthropic/c…</>", dashboard, 3, 9, 24);
+}
+
+test "dashboard notes say what the totals leave out" {
+    var models = [_]ModelUsage{.{ .model = "p/m", .totals = testTotals(100, 0.01) }};
+    var view = tableView(&models, testTotals(100, 0.01));
+    var dashboard: Dashboard = .{ .view = &view };
+    // One priced model: no total row, no notes.
+    try testing.expectEqual(@as(u16, 6), dashboardDesiredRows(dashboard, 80));
+
+    // A cost still on its way: the total appears with a * and a note.
+    view.completeness = .pending;
+    view.unpriced = report.Unpriced.fromCounts(1, 0, 0);
+    try testing.expectEqual(@as(u16, 8), dashboardDesiredRows(dashboard, 80));
+    try expectRow("<S>  $0.01*     100     1  total</>", dashboard, 4, 8, 80);
+    try expectRow("<D>note:</> 1 request awaiting cost from AI Gateway (*)", dashboard, 7, 8, 80);
+
+    // A refused lookup: a warning and what to do about it.
+    view.unpriced = report.Unpriced.fromCounts(0, 3, 0);
+    try expectRow("<W>warning:</> 3 requests unpriced (*): sign-in can't look up costs", dashboard, 7, 9, 80);
+    try expectRow("<D>hint:</> add an AI Gateway API key with 'fx setup'", dashboard, 8, 9, 80);
+
+    // A call that may be billed with no cost to look up.
+    view.completeness = .incomplete;
+    view.unpriced = report.Unpriced.fromCounts(0, 0, 1);
+    try testing.expectEqual(@as(u16, 7), dashboardDesiredRows(dashboard, 80));
+    try expectRow("<W>warning:</> 1 request may be billed with no cost", dashboard, 6, 7, 80);
+    view.unpriced = .none;
+    try expectRow("<W>warning:</> totals may be incomplete", dashboard, 6, 7, 80);
+
+    // A call in flight gets its own note, not the checkpoint's "incomplete".
+    view.in_flight = 1;
+    view.settled_completeness = .complete;
+    try expectRow("<D>note:</> 1 request in progress", dashboard, 6, 7, 80);
+    view.settled_completeness = .incomplete;
+    try expectRow("<W>warning:</> totals may be incomplete", dashboard, 6, 8, 80);
+    try expectRow("<D>note:</> 1 request in progress", dashboard, 7, 8, 80);
+    view.in_flight = 0;
+
+    view.completeness = .complete;
+    view.coverage = .partial;
+    view.coverage_started_at_ms = 1791381023000;
+    try expectRow("<D>note:</> tracking since 2026-10-07", dashboard, 6, 7, 80);
+    try expectRow("<D>note:</> tracking since 2026-10-…", dashboard, 6, 7, 30);
+    view.coverage = .full;
+
+    dashboard.refresh_failed = true;
+    try expectRow("<W>warning:</> refresh failed; showing earlier data", dashboard, 6, 7, 80);
+    dashboard.refresh_failed = false;
+
+    view.models = &.{};
+    view.totals = testTotals(0, 0);
+    try expectRow("<D>no usage yet</>", dashboard, 2, 3, 80);
+    view.scope = .days_7;
+    try expectRow("<D>no usage in this period</>", dashboard, 2, 3, 80);
+    view.unpriced = report.Unpriced.fromCounts(1, 0, 0);
+    view.completeness = .pending;
+    try expectRow("<D>no priced requests yet</>", dashboard, 2, 4, 80);
+    try expectRow("<D>note:</> 1 request awaiting cost from AI Gateway", dashboard, 3, 4, 80);
+    view.unpriced = .none;
+    view.scope = .session;
+    view.completeness = .incomplete;
+    view.in_flight = 2;
+    view.settled_completeness = .complete;
+    try expectRow("<D>no usage yet</>", dashboard, 2, 4, 80);
+    try expectRow("<D>note:</> 2 requests in progress", dashboard, 3, 4, 80);
+    view.in_flight = 0;
+    view.completeness = .complete;
+
+    view.totals = null;
+    view.coverage = .not_started;
+    try testing.expectEqual(@as(u16, 3), dashboardDesiredRows(dashboard, 80));
+    try expectRow("<D>no usage yet</>", dashboard, 2, 3, 80);
+    view.completeness = .legacy;
+    try expectRow("<D>note:</> session predates usage tracking", dashboard, 2, 3, 80);
+}
+
+test "dashboard in a short footer drops spacing first and keeps the selection visible" {
     var models: [25]ModelUsage = undefined;
     var names: [25][16]u8 = undefined;
     for (&models, &names, 0..) |*model, *name, index| {
         model.* = .{ .model = std.fmt.bufPrint(name, "provider/m{d:0>2}", .{index}) catch unreachable, .totals = testTotals(25 - index, 0) };
     }
-    const view: View = .{ .scope = .days_30, .snapshot_time_ms = 1, .window_start_ms = 0, .coverage_started_at_ms = 0, .coverage = .full, .completeness = .complete, .totals = testTotals(325, 0), .models = &models };
-    var dashboard: Dashboard = .{ .view = &view };
+    var view = tableView(&models, testTotals(325, 0));
+    view.scope = .days_30;
+    var dashboard: Dashboard = .{ .view = &view, .scope = .days_30 };
+    // Periods, blank, header, 20 models, total, blank, in/out.
     const desired = dashboardDesiredRows(dashboard, 80);
-    // Header, status, blank, 3 overview rows, blank, models header, 20 rows.
-    try testing.expectEqual(@as(u16, 8 + 20), desired);
+    try testing.expectEqual(@as(u16, 26), desired);
     try testing.expectEqual(@as(u16, 20), dashboardVisibleModelItems(dashboard, desired, 80));
-    try expectRow("<D>Local fx activity</>", dashboard, 1, desired, 80);
-    try expectRow("<D>325 tokens · $0.00 spent · 1 request</>", dashboard, 3, desired, 80);
-    try expectRow("<L>Models 25</>", dashboard, 7, desired, 80);
-    try expectRow("<L>❯ provider/m00</>    <D>25 · 7.7% · $0.00</>", dashboard, 8, desired, 80);
+    // 12 rows: the blank lines go first.
+    try testing.expectEqual(@as(u16, 8), dashboardVisibleModelItems(dashboard, 12, 80));
+    try expectRow("<D>  cost   tokens  reqs  model</>", dashboard, 1, 12, 80);
+    // 5 rows: in/out and the header go so three models still fit.
+    try testing.expectEqual(@as(u16, 3), dashboardVisibleModelItems(dashboard, 5, 80));
 
     dashboard.selected_model = 24;
-    const last = try paintRow(dashboard, desired - 1, desired, 80);
+    const last = try paintRow(dashboard, 9, 12, 80);
     defer testing.allocator.free(last);
-    try testing.expect(std.mem.indexOf(u8, last, "❯ provider/m24") != null);
-    const first = try paintRow(dashboard, 8, desired, 80);
-    defer testing.allocator.free(first);
-    try testing.expect(std.mem.indexOf(u8, first, "provider/m05") != null);
-}
-
-test "dashboard status words match fx usage for every state" {
-    var view: View = .{ .scope = .days_7, .snapshot_time_ms = 1, .window_start_ms = 0, .coverage_started_at_ms = 0, .coverage = .full, .completeness = .complete, .totals = testTotals(0, 0), .models = &.{} };
-    const dashboard: Dashboard = .{ .view = &view, .scope = .days_7 };
-    view.completeness = .pending;
-    try expectRow("<D>Known totals exclude pending Gateway reconciliation</>", dashboard, 1, 12, 80);
-    try expectRow("<D>Pending Gateway reconciliation</>", dashboard, 1, 12, 58);
-    view.completeness = .incomplete;
-    try expectRow("<D>Known totals may be incomplete</>", dashboard, 1, 12, 80);
-    view.completeness = .legacy;
-    try expectRow("<D>This session predates complete usage tracking</>", dashboard, 1, 12, 80);
-    try expectRow("<D>Predates usage tracking</>", dashboard, 1, 12, 52);
-    // Completeness outranks a partial window.
-    view.coverage = .partial;
-    view.coverage_started_at_ms = 1791381023000;
-    try expectRow("<D>This session predates complete usage tracking</>", dashboard, 1, 12, 80);
-    view.completeness = .complete;
-    try expectRow("<D>Tracking since Oct 7, 2026 (partial window)</>", dashboard, 1, 12, 80);
-    try expectRow("<D>Partial window</>", dashboard, 1, 12, 48);
-    view.coverage = .full;
-    try expectRow("<D>Local fx activity</>", dashboard, 1, 12, 80);
-    view.coverage = .not_started;
-    view.totals = null;
-    try expectRow("<D>Tracking has not started</>", dashboard, 1, 12, 80);
-    try expectRow("<D>Refresh failed · showing previous data</>", .{ .view = &view, .refresh_failed = true }, 1, 12, 80);
+    try testing.expect(std.mem.indexOf(u8, last, "❯") != null and std.mem.indexOf(u8, last, "provider/m24") != null);
+    // One row: the selected model.
+    const only = try paintRow(dashboard, 0, 1, 80);
+    defer testing.allocator.free(only);
+    try testing.expect(std.mem.indexOf(u8, only, "provider/m24") != null);
 }
 
 test "dashboard hint row picks the widest hint that fits" {
@@ -1363,11 +1452,11 @@ test "dashboard hint row picks the widest hint that fits" {
     defer out.deinit();
     dashboardHintRow(&row, 80);
     try row.paint(&out.writer, test_palette);
-    try testing.expectEqualStrings("<D>tab scope     ↑↓ model     enter expand     r refresh     esc close</>", out.written());
+    try testing.expectEqualStrings("<D>tab period  ↑↓ model  enter detail  r refresh  esc close</>", out.written());
     out.clearRetainingCapacity();
     dashboardHintRow(&row, 10);
     try row.paint(&out.writer, test_palette);
-    try testing.expectEqualStrings("<D>tab ↑↓  en</>", out.written());
+    try testing.expectEqualStrings("<D>tab  ↑↓  e</>", out.written());
 }
 
 test "selection survives refresh by model name" {

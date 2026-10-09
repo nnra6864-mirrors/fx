@@ -2713,20 +2713,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn cycleUsageMenuScope(app: *App, delta: i32) !void {
             const current = app.input_runtime.usage_menu.navigationScope();
-            const next: usage_mod.Scope = if (delta < 0)
-                switch (current) {
-                    .days_30 => .session,
-                    .days_7 => .days_30,
-                    .hours_24 => .days_7,
-                    .session => .hours_24,
-                }
-            else switch (current) {
-                .days_30 => .days_7,
-                .days_7 => .hours_24,
-                .hours_24 => .session,
-                .session => .days_30,
-            };
-            try refreshUsageMenu(app, next);
+            try refreshUsageMenu(app, current.cycle(if (delta < 0) .backward else .forward));
         }
 
         fn submitHelpMenuSelection(app: *App, max_input_len: usize, max_prompt_history: usize) !bool {
@@ -5363,11 +5350,13 @@ test "app_input_runtime Tab cycles usage scopes in both directions" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    app.input_runtime.usage_menu.openError(alloc, .days_30);
+    app.input_runtime.usage_menu.openError(alloc, .session);
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
-    try std.testing.expectEqual(usage_mod.Scope.days_7, app.input_runtime.usage_menu.navigationScope());
+    try std.testing.expectEqual(usage_mod.Scope.hours_24, app.input_runtime.usage_menu.navigationScope());
 
+    try feedRoutingBytes(&app, "\x1b[Z");
+    try std.testing.expectEqual(usage_mod.Scope.session, app.input_runtime.usage_menu.navigationScope());
     try feedRoutingBytes(&app, "\x1b[Z");
     try std.testing.expectEqual(usage_mod.Scope.days_30, app.input_runtime.usage_menu.navigationScope());
 }

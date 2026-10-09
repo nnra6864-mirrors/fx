@@ -104,20 +104,6 @@ pub const Ledger = struct {
 // Index: one parse of whole ledger lines
 
 /// Copies the strings of a record parsed into scratch memory.
-fn ownRecord(gpa: Allocator, borrowed: record.Record) Allocator.Error!record.Record {
-    switch (borrowed) {
-        .coverage, .incident => return borrowed,
-        .pending => |marker| return .{ .pending = .{ .id = try gpa.dupe(u8, marker.id), .observed_at_ms = marker.observed_at_ms } },
-        .generation => |fact| {
-            var owned = fact;
-            owned.id = try gpa.dupe(u8, fact.id);
-            errdefer gpa.free(owned.id);
-            owned.model = try gpa.dupe(u8, fact.model);
-            return .{ .generation = owned };
-        },
-    }
-}
-
 const Variants = struct {
     first: usize,
     second: ?usize = null,
@@ -221,8 +207,9 @@ const Index = struct {
 
     /// fx's `absorbBytes`: whole lines, blank lines skipped, the record and
     /// line limits checked before each parse.
-    /// Each line parses into a scratch arena; only the strings a kept record
-    /// needs are copied into `gpa`.
+    /// A line as fx writes it is read in place; any other line parses into a
+    /// scratch arena. Only the strings a kept record needs are copied into
+    /// `gpa`.
     fn absorbBytes(index: *Index, gpa: Allocator, bytes: []const u8, abandoned: ?*const std.atomic.Value(bool)) !void {
         var scratch: std.heap.ArenaAllocator = .init(gpa);
         defer scratch.deinit();
@@ -236,9 +223,11 @@ const Index = struct {
             parsed += 1;
             index.record_count += 1;
             if (index.record_count > max_records or line.len > max_record_bytes) return error.UsageCapacityExceeded;
-            _ = scratch.reset(.retain_capacity);
-            const borrowed = try record.parseRecord(scratch.allocator(), line);
-            try index.absorb(gpa, try ownRecord(gpa, borrowed));
+            const borrowed = record.parseCanonical(line) orelse blk: {
+                _ = scratch.reset(.retain_capacity);
+                break :blk try record.parseRecord(scratch.allocator(), line);
+            };
+            try index.absorb(gpa, try record.ownedCopy(gpa, borrowed));
         }
     }
 

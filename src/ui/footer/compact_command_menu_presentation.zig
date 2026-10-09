@@ -123,6 +123,8 @@ fn composeUsageRow(
         .title = ui_render.selected_completion_style,
         .dim = ui_render.dim_style,
         .label = ui_render.system_notice_label_style,
+        .warning = ui_render.warning_style,
+        .strong = ui_render.bold_style,
         .reset = ui_render.reset_style,
     }) catch return error.OutOfMemory;
     return out.toArrayList();

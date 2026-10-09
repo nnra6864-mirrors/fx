@@ -567,8 +567,20 @@ pub const Ledger = struct {
         l.worker.copyLedger(&copy);
         const buffers = try gpa.create(checkpoint.Buffers);
         defer gpa.destroy(buffers);
-        const snap = checkpoint.snapshotOf(&copy, .{ .at_ms = now_ms, .opened_at_ms = l.worker.openedAt() }, "", buffers);
-        return report.sessionViewFromSnapshot(gpa, &snap, now_ms, .fromLedger(live.unpriced), turn);
+        const times: checkpoint.Times = .{ .at_ms = now_ms, .opened_at_ms = l.worker.openedAt() };
+        const snap = checkpoint.snapshotOf(&copy, times, "", buffers);
+        var session = try report.sessionViewFromSnapshot(gpa, &snap, now_ms, .fromLedger(live.unpriced), turn);
+        const open = copy.active.items.len;
+        if (open == 0) return session;
+        // `completeness` keeps the checkpoint's reading, so ACP reports no
+        // cost mid-call; the dashboard shows what the session settles to.
+        var settled_times = times;
+        settled_times.live = true;
+        const settled = checkpoint.snapshotOf(&copy, settled_times, "", buffers);
+        session.in_flight = std.math.cast(u32, open) orelse std.math.maxInt(u32);
+        session.settled_completeness = report.billingCompleteness(settled.billing);
+        if (session.session_activity) |*activity| activity.api_duration_complete = settled.api_duration_complete;
+        return session;
     }
 
     /// The session as a checkpoint would persist it now, for a state blob or
@@ -1558,6 +1570,31 @@ test "a detached ledger settles exact calls in memory, starts no task, and write
     try ledger.close();
     var it = tmp.dir.iterate();
     try testing.expect((try it.next(testing.io)) == null);
+}
+
+test "a call in flight reads incomplete, as a checkpoint does, and says what it settles to" {
+    const ledger = try Ledger.openDetached(testing.allocator, testing.io, .{});
+    defer ledger.close() catch {};
+    var done = try ledger.begin(.gateway);
+    done.gatewayEvent(test_id_event);
+    done.gatewayEvent(test_finish);
+    _ = try done.finish(.completed);
+
+    var open = try ledger.begin(.gateway);
+    var during = try ledger.view(testing.allocator, .session, wallMs(testing.io), .{});
+    defer during.deinit(testing.allocator);
+    try testing.expectEqual(report.Completeness.incomplete, during.completeness);
+    try testing.expectEqual(@as(?f64, null), report.completeCost(&during));
+    try testing.expectEqual(@as(u32, 1), during.in_flight);
+    try testing.expectEqual(report.Completeness.complete, during.settled_completeness);
+    try testing.expect(during.session_activity.?.api_duration_complete);
+    try testing.expectEqual(@as(f64, 0.0123), during.totals.?.total_cost);
+
+    _ = try open.finish(.failed_unbilled);
+    var after = try ledger.view(testing.allocator, .session, wallMs(testing.io), .{});
+    defer after.deinit(testing.allocator);
+    try testing.expectEqual(report.Completeness.complete, after.completeness);
+    try testing.expectEqual(@as(u32, 0), after.in_flight);
 }
 
 test "a parsed event observes the same as its text" {

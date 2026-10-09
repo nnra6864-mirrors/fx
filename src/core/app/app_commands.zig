@@ -1035,7 +1035,7 @@ pub fn Handlers(comptime App: type) type {
             closeHelpMenuIfPresent(app);
             app.input_runtime.settings_menu.close();
             closeInlineCommandMenusIfPresent(app);
-            openUsageDashboard(app, .days_30);
+            openUsageDashboard(app, .session);
         }
 
         /// Shows `scope`: the session's view at once, a rolling view from
@@ -1098,6 +1098,17 @@ pub fn Handlers(comptime App: type) type {
         }
 
         fn openUsageDashboard(app: *App, scope: usage_mod.Scope) void {
+            if (scope == .session) {
+                if (app.session.usage.sessionView(app.alloc, .{})) |view| {
+                    installUsageView(app, .{ .owned = view });
+                } else |err| {
+                    app.input_runtime.usage_menu.openLoading(app.alloc, scope);
+                    recordUsageRefreshFailure(app, scope, err);
+                }
+                // The rolling periods load meanwhile, ready for Tab.
+                if (app.session.usage.dashboardLoader()) |loader| _ = loader.refresh(@max(io_mod.milliTimestamp(), 0));
+                return;
+            }
             const loader = app.session.usage.dashboardLoader() orelse {
                 app.input_runtime.usage_menu.openLoading(app.alloc, scope);
                 recordUsageRefreshFailure(app, scope, error.ProfileUsageUnavailable);

@@ -46,6 +46,9 @@ pub const Times = struct {
     at_ms: i64,
     /// When this run opened the session.
     opened_at_ms: i64,
+    /// A live reading, not a checkpoint: calls in flight leave billing and
+    /// API time as they are instead of marking them incomplete.
+    live: bool = false,
 };
 
 /// What `ledger` is persisted as. `bridge_origin` is the session's Gateway
@@ -55,7 +58,7 @@ pub const Times = struct {
 pub fn snapshotOf(ledger: *const core.Ledger, times: Times, bridge_origin: []const u8, buffers: *Buffers) snapshot.Snapshot {
     const at_ms = times.at_ms;
     const opened_at_ms = times.opened_at_ms;
-    const in_flight = ledger.active.items.len > 0;
+    const in_flight = !times.live and ledger.active.items.len > 0;
     const activity = ledger.activity;
     const run_ms: u64 = if (at_ms > opened_at_ms) @intCast(at_ms - opened_at_ms) else 0;
     const wall_ms, const wall_overflow = @addWithOverflow(activity.wall_duration_ms, run_ms);

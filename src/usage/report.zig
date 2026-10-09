@@ -52,8 +52,9 @@ pub const Scope = enum {
 
     /// Rolling scopes in the order the dashboard loads them.
     pub const rolling = [_]Scope{ .days_30, .days_7, .hours_24 };
-    /// Dashboard tab order, left to right.
-    pub const tab_order = [_]Scope{ .days_30, .days_7, .hours_24, .session };
+    /// Dashboard period order, left to right: the session first, since the
+    /// dashboard opens on it.
+    pub const tab_order = [_]Scope{ .session, .hours_24, .days_7, .days_30 };
 
     pub fn label(self: Scope) []const u8 {
         return switch (self) {
@@ -92,20 +93,9 @@ pub const Scope = enum {
         };
     }
 
-    /// The Left key. Tabs read 30d 7d 24h Session left to right, so Left
-    /// moves toward 30 days, without wrapping.
+    /// The Left key. Periods read session 24h 7d 30d left to right, so Left
+    /// moves toward the session, without wrapping.
     pub fn previous(self: Scope) Scope {
-        return switch (self) {
-            .session => .hours_24,
-            .hours_24 => .days_7,
-            .days_7 => .days_30,
-            .days_30 => .days_30,
-        };
-    }
-
-    /// The Right key: toward the session, without wrapping. Tab moves the
-    /// same way and wraps.
-    pub fn next(self: Scope) Scope {
         return switch (self) {
             .session => .session,
             .hours_24 => .session,
@@ -114,23 +104,34 @@ pub const Scope = enum {
         };
     }
 
+    /// The Right key: toward 30 days, without wrapping. Tab moves the same
+    /// way and wraps.
+    pub fn next(self: Scope) Scope {
+        return switch (self) {
+            .session => .hours_24,
+            .hours_24 => .days_7,
+            .days_7 => .days_30,
+            .days_30 => .days_30,
+        };
+    }
+
     pub const Direction = enum { forward, backward };
 
     /// Tab (`forward`) and Shift+Tab (`backward`), wrapping:
-    /// 30d → 7d → 24h → Session → 30d.
+    /// session → 24h → 7d → 30d → session.
     pub fn cycle(self: Scope, direction: Direction) Scope {
         return switch (direction) {
             .forward => switch (self) {
-                .days_30 => .days_7,
-                .days_7 => .hours_24,
-                .hours_24 => .session,
-                .session => .days_30,
+                .session => .hours_24,
+                .hours_24 => .days_7,
+                .days_7 => .days_30,
+                .days_30 => .session,
             },
             .backward => switch (self) {
-                .days_30 => .session,
-                .days_7 => .days_30,
-                .hours_24 => .days_7,
-                .session => .hours_24,
+                .session => .days_30,
+                .hours_24 => .session,
+                .days_7 => .hours_24,
+                .days_30 => .days_7,
             },
         };
     }
@@ -255,6 +256,13 @@ pub const View = struct {
     unpriced: Unpriced = .none,
     /// Session views only.
     turn: ?TurnUsage = null,
+    /// Session views only: calls started and not yet finished. Their cost
+    /// is not in the totals, so `completeness` reads incomplete while any
+    /// are open, as a saved checkpoint does.
+    in_flight: u32 = 0,
+    /// What `completeness` reads once those calls finish. Meaningful only
+    /// when `in_flight > 0`.
+    settled_completeness: Completeness = .complete,
 
     pub fn deinit(self: *View, alloc: Allocator) void {
         for (self.models) |model| alloc.free(model.model);
@@ -790,6 +798,7 @@ fn buildRolling(
 
     var seen: std.StringHashMapUnmanaged(GenerationFact) = .empty;
     defer seen.deinit(alloc);
+    try seen.ensureTotalCapacity(alloc, std.math.cast(u32, facts.len) orelse return error.UsageCapacityExceeded);
     var model_indexes: std.StringHashMapUnmanaged(usize) = .empty;
     defer model_indexes.deinit(alloc);
     var rows: std.ArrayList(struct { model: []const u8, totals: MutableTotals }) = .empty;
@@ -1004,6 +1013,15 @@ pub fn sessionView(alloc: Allocator, source: SessionSource) BuildError!View {
     };
 }
 
+pub fn billingCompleteness(billing: snapshot_codec.Billing) Completeness {
+    return switch (billing) {
+        .complete => .complete,
+        .pending => .pending,
+        .incomplete => .incomplete,
+        .legacy => .legacy,
+    };
+}
+
 /// The session view from a session snapshot (`Usage.reportSnapshot`). The
 /// session "start" is `snapshot_time_ms` minus the wall time, floored at 0;
 /// a wall time beyond `i64` counts as the whole snapshot time.
@@ -1032,12 +1050,7 @@ pub fn sessionViewFromSnapshot(
     return sessionView(alloc, .{
         .snapshot_time_ms = snapshot_time_ms,
         .session_started_at_ms = @max(snapshot_time_ms -| wall_ms, 0),
-        .completeness = switch (snapshot.billing) {
-            .complete => .complete,
-            .pending => .pending,
-            .incomplete => .incomplete,
-            .legacy => .legacy,
-        },
+        .completeness = billingCompleteness(snapshot.billing),
         .total_cost = snapshot.total_cost,
         .input_tokens = snapshot.input_tokens,
         .output_tokens = snapshot.output_tokens,
@@ -1574,27 +1587,27 @@ test "turn usage sums reported counts and saturates" {
 }
 
 test "scope navigation follows the on-screen tab order" {
-    // Right from 30 days: 7 days, 24 hours, Session, then stays.
-    var scope: Scope = .days_30;
-    for ([_]Scope{ .days_7, .hours_24, .session, .session }) |want| {
+    // Right from the session: 24 hours, 7 days, 30 days, then stays.
+    var scope: Scope = .session;
+    for ([_]Scope{ .hours_24, .days_7, .days_30, .days_30 }) |want| {
         scope = scope.next();
         try testing.expectEqual(want, scope);
     }
-    // Left from the session: back to 30 days, then stays.
-    for ([_]Scope{ .hours_24, .days_7, .days_30, .days_30 }) |want| {
+    // Left from 30 days: back to the session, then stays.
+    for ([_]Scope{ .days_7, .hours_24, .session, .session }) |want| {
         scope = scope.previous();
         try testing.expectEqual(want, scope);
     }
     // Tab moves like Right and wraps.
-    scope = .days_30;
-    for ([_]Scope{ .days_7, .hours_24, .session, .days_30 }) |want| {
+    for ([_]Scope{ .hours_24, .days_7, .days_30, .session }) |want| {
         scope = scope.cycle(.forward);
         try testing.expectEqual(want, scope);
     }
-    for ([_]Scope{ .session, .hours_24, .days_7, .days_30 }) |want| {
+    for ([_]Scope{ .days_30, .days_7, .hours_24, .session }) |want| {
         scope = scope.cycle(.backward);
         try testing.expectEqual(want, scope);
     }
+    try testing.expectEqualSlices(Scope, &.{ .session, .hours_24, .days_7, .days_30 }, &Scope.tab_order);
     try testing.expectEqual(@as(?Scope, .days_7), Scope.fromCliValue("7d"));
     try testing.expectEqual(@as(?Scope, null), Scope.fromCliValue("session"));
 }

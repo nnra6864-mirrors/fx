@@ -117,12 +117,15 @@ pub const MarkerError = error{InvalidUsageRecoveryMarker};
 /// `gen_` plus 26 Crockford base32 characters (no I, L, O, U).
 pub fn validGenerationId(id: []const u8) bool {
     if (id.len != generation_id_len or !std.mem.startsWith(u8, id, generation_id_prefix)) return false;
-    for (id[generation_id_prefix.len..]) |char| switch (char) {
-        '0'...'9', 'A'...'H', 'J'...'K', 'M'...'N', 'P'...'T', 'V'...'Z' => {},
-        else => return false,
-    };
+    for (id[generation_id_prefix.len..]) |char| if (!crockford[char]) return false;
     return true;
 }
+
+const crockford: [256]bool = blk: {
+    var table: [256]bool = @splat(false);
+    for ("0123456789ABCDEFGHJKMNPQRSTVWXYZ") |char| table[char] = true;
+    break :blk table;
+};
 
 pub fn validateFact(fact: GenerationFact) FactError!void {
     if (!validGenerationId(fact.id) or
@@ -270,6 +273,158 @@ pub fn writeRecord(
 /// the result. Line-length and record-count limits are the caller's, as in
 /// fx (`max_record_bytes`, `max_records`).
 pub fn parseRecord(alloc: Allocator, line: []const u8) (Allocator.Error || RecordError)!Record {
+    if (parseCanonical(line)) |borrowed| return ownedCopy(alloc, borrowed);
+    return parseTree(alloc, line);
+}
+
+/// A copy of `borrowed` that owns its strings.
+pub fn ownedCopy(alloc: Allocator, borrowed: Record) Allocator.Error!Record {
+    switch (borrowed) {
+        .coverage, .incident => return borrowed,
+        .pending => |marker| return .{ .pending = .{ .id = try alloc.dupe(u8, marker.id), .observed_at_ms = marker.observed_at_ms } },
+        .generation => |fact| {
+            var owned = fact;
+            owned.id = try alloc.dupe(u8, fact.id);
+            errdefer alloc.free(owned.id);
+            owned.model = try alloc.dupe(u8, fact.model);
+            return .{ .generation = owned };
+        },
+    }
+}
+
+/// A line exactly as `writeRecord` writes it, read without a JSON tree; null
+/// for any other line, which `parseRecord` then decides. Strings borrow
+/// `line`. Whatever this accepts, the tree parser accepts with the same
+/// result: the keys and their order are the writer's, strings carry no
+/// escapes, numbers have JSON's syntax and convert with the tree parser's
+/// functions, and the same validation runs.
+pub fn parseCanonical(line: []const u8) ?Record {
+    var c: Cursor = .{ .rest = line };
+    if (!c.literal("{\"schema_version\":1,\"kind\":\"")) return null;
+    if (c.literal("generation\",\"fact\":{\"id\":\"")) {
+        const id = c.plainString() orelse return null;
+        if (!c.literal(",\"created_at_ms\":")) return null;
+        const created_at_ms = c.integer(i64) orelse return null;
+        if (!c.literal(",\"model\":\"")) return null;
+        const model = c.plainString() orelse return null;
+        if (!c.literal(",\"input_tokens\":")) return null;
+        const input_tokens = c.integer(u64) orelse return null;
+        if (!c.literal(",\"output_tokens\":")) return null;
+        const output_tokens = c.integer(u64) orelse return null;
+        if (!c.literal(",\"cache_read_tokens\":")) return null;
+        const cache_read_tokens = c.integer(u64) orelse return null;
+        if (!c.literal(",\"cache_write_tokens\":")) return null;
+        const cache_write_tokens = c.integer(u64) orelse return null;
+        if (!c.literal(",\"reasoning_tokens\":")) return null;
+        const reasoning_tokens: ?u64 = if (c.literal("null")) null else c.integer(u64) orelse return null;
+        if (!c.literal(",\"billable_web_search_calls\":")) return null;
+        const billable_web_search_calls = c.integer(u64) orelse return null;
+        if (!c.literal(",\"total_cost\":")) return null;
+        const total_cost = c.number() orelse return null;
+        if (!c.literal("}}") or c.rest.len != 0) return null;
+        const fact: GenerationFact = .{
+            .id = id,
+            .created_at_ms = created_at_ms,
+            .model = model,
+            .input_tokens = input_tokens,
+            .output_tokens = output_tokens,
+            .cache_read_tokens = cache_read_tokens,
+            .cache_write_tokens = cache_write_tokens,
+            .reasoning_tokens = reasoning_tokens,
+            .billable_web_search_calls = billable_web_search_calls,
+            .total_cost = total_cost,
+        };
+        validateFact(fact) catch return null;
+        return .{ .generation = fact };
+    }
+    if (c.literal("pending\",\"id\":\"")) {
+        const id = c.plainString() orelse return null;
+        if (!c.literal(",\"observed_at_ms\":")) return null;
+        const observed_at_ms = c.integer(i64) orelse return null;
+        if (!c.literal("}") or c.rest.len != 0) return null;
+        const marker: PendingMarker = .{ .id = id, .observed_at_ms = observed_at_ms };
+        validatePendingMarker(marker) catch return null;
+        return .{ .pending = marker };
+    }
+    if (c.literal("incident\",\"occurred_at_ms\":")) {
+        const occurred_at_ms = c.integer(i64) orelse return null;
+        if (!c.literal(",\"completeness\":\"")) return null;
+        const completeness: IncidentCompleteness = if (c.literal("pending")) .pending else if (c.literal("incomplete")) .incomplete else return null;
+        if (!c.literal("\"}") or c.rest.len != 0) return null;
+        return .{ .incident = .{ .occurred_at_ms = occurred_at_ms, .completeness = completeness } };
+    }
+    if (c.literal("coverage\",\"started_at_ms\":")) {
+        const started_at_ms = c.integer(i64) orelse return null;
+        if (!c.literal("}") or c.rest.len != 0) return null;
+        return .{ .coverage = started_at_ms };
+    }
+    return null;
+}
+
+/// Reads the fixed shape `writeRecord` writes, front to back. Each reader
+/// moves past what it read, or returns false or null and moves nowhere.
+const Cursor = struct {
+    rest: []const u8,
+
+    fn literal(c: *Cursor, comptime text: []const u8) bool {
+        if (!std.mem.startsWith(u8, c.rest, text)) return false;
+        c.rest = c.rest[text.len..];
+        return true;
+    }
+
+    /// A string through its closing quote, when its JSON value is its own
+    /// bytes: no escapes, no control characters, and valid UTF-8.
+    fn plainString(c: *Cursor) ?[]const u8 {
+        const end = std.mem.findScalar(u8, c.rest, '"') orelse return null;
+        const text = c.rest[0..end];
+        for (text) |char| if (char < 0x20 or char == '\\') return null;
+        if (!std.unicode.utf8ValidateSlice(text)) return null;
+        c.rest = c.rest[end + 1 ..];
+        return text;
+    }
+
+    /// An unsigned JSON integer (`0`, or digits without a leading zero),
+    /// converted as `jsonU64` converts a number string.
+    fn integer(c: *Cursor, comptime T: type) ?T {
+        const len = digitsAt(c.rest, 0);
+        if (len == 0 or (len > 1 and c.rest[0] == '0')) return null;
+        const value = std.fmt.parseInt(u64, c.rest[0..len], 10) catch return null;
+        const cast = std.math.cast(T, value) orelse return null;
+        c.rest = c.rest[len..];
+        return cast;
+    }
+
+    /// A non-negative JSON number, converted as `factCost` converts a number
+    /// string.
+    fn number(c: *Cursor) ?f64 {
+        var len = digitsAt(c.rest, 0);
+        if (len == 0 or (len > 1 and c.rest[0] == '0')) return null;
+        if (len < c.rest.len and c.rest[len] == '.') {
+            const fraction = digitsAt(c.rest, len + 1);
+            if (fraction == 0) return null;
+            len += 1 + fraction;
+        }
+        if (len < c.rest.len and (c.rest[len] == 'e' or c.rest[len] == 'E')) {
+            var at = len + 1;
+            if (at < c.rest.len and (c.rest[at] == '+' or c.rest[at] == '-')) at += 1;
+            const exponent = digitsAt(c.rest, at);
+            if (exponent == 0) return null;
+            len = at + exponent;
+        }
+        const value = std.fmt.parseFloat(f64, c.rest[0..len]) catch return null;
+        c.rest = c.rest[len..];
+        return value;
+    }
+};
+
+fn digitsAt(text: []const u8, start: usize) usize {
+    var end = start;
+    while (end < text.len and std.ascii.isDigit(text[end])) end += 1;
+    return end - start;
+}
+
+/// The line through a JSON tree: every line `parseCanonical` doesn't take.
+fn parseTree(alloc: Allocator, line: []const u8) (Allocator.Error || RecordError)!Record {
     var parsed = std.json.parseFromSlice(
         std.json.Value,
         alloc,
@@ -515,6 +670,153 @@ test "differential corpus: every ledger reader rule agrees with fx" {
     try testing.expectEqual(@as(usize, 49), rejected);
 }
 
+test "lines as fx writes them read in place, and the tree reads whatever that takes the same" {
+    const alloc = testing.allocator;
+    var root = try openFixtures();
+    defer root.close(testing.io);
+    const ledger = try readFixture(alloc, root, "fx-home/usage.jsonl");
+    defer alloc.free(ledger);
+    const corpus = try readFixture(alloc, root, "cases/record.jsonl");
+    defer alloc.free(corpus);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var prng = std.Random.DefaultPrng.init(0x1195);
+    const random = prng.random();
+    const replacements = "0129.eE+-\"\\ }{,nx\x01\x7f\xc3\xff";
+    var edited: [max_record_bytes + 1]u8 = undefined;
+    var lines = std.mem.splitScalar(u8, ledger[0 .. ledger.len - 1], '\n');
+    var taken: usize = 0;
+    while (lines.next()) |line| {
+        // Every captured line is fx's own writing.
+        try expectAgreement(arena, line, true);
+        taken += 1;
+        // Single-byte edits: whatever still reads in place reads the same.
+        for (0..64) |_| {
+            const at = random.uintLessThan(usize, line.len);
+            const byte = replacements[random.uintLessThan(usize, replacements.len)];
+            const len = switch (random.uintLessThan(u8, 3)) {
+                0 => blk: {
+                    @memcpy(edited[0..line.len], line);
+                    edited[at] = byte;
+                    break :blk line.len;
+                },
+                1 => blk: {
+                    @memcpy(edited[0..at], line[0..at]);
+                    @memcpy(edited[at .. line.len - 1], line[at + 1 ..]);
+                    break :blk line.len - 1;
+                },
+                else => blk: {
+                    @memcpy(edited[0..at], line[0..at]);
+                    edited[at] = byte;
+                    @memcpy(edited[at + 1 .. line.len + 1], line[at..]);
+                    break :blk line.len + 1;
+                },
+            };
+            try expectAgreement(arena, edited[0..len], false);
+        }
+        _ = arena_state.reset(.retain_capacity);
+    }
+    try testing.expect(taken >= 12);
+
+    // fx's reader corpus, valid and invalid lines alike.
+    var cases = std.mem.splitScalar(u8, corpus, '\n');
+    while (cases.next()) |case_line| {
+        if (case_line.len == 0) continue;
+        const case = try std.json.parseFromSliceLeaky(CorpusCase, arena, case_line, .{});
+        try expectAgreement(arena, case.input, false);
+    }
+}
+
+test "every record the writer emits reads in place back to itself" {
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const random = prng.random();
+    const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    // The last model needs escapes, so its fact goes to the tree.
+    const models = [_][]const u8{ "openai/gpt-4.1-nano", "anthropic/claude-haiku-4.5", "x", "p/a\"b\\c" };
+    const special_costs = [_]f64{ 0, 5e-324, 1e-300, 0.1, 0.0123, 1.7976931348623157e308 };
+    var buffer: [max_record_bytes]u8 = undefined;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    for (0..2000) |i| {
+        var id: [generation_id_len]u8 = undefined;
+        @memcpy(id[0..generation_id_prefix.len], generation_id_prefix);
+        for (id[generation_id_prefix.len..]) |*char| char.* = alphabet[random.uintLessThan(usize, alphabet.len)];
+        const input = random.int(u64);
+        const output = random.int(u64);
+        const cost = if (i < special_costs.len)
+            special_costs[i]
+        else
+            random.float(f64) * std.math.pow(f64, 10, @floatFromInt(random.intRangeAtMost(i32, -12, 6)));
+        const at_ms = random.intRangeAtMost(i64, 0, std.math.maxInt(i64));
+        const records = [_]Record{
+            .{ .generation = .{
+                .id = &id,
+                .created_at_ms = at_ms,
+                .model = models[i % models.len],
+                .input_tokens = input,
+                .output_tokens = output,
+                .cache_read_tokens = random.uintAtMost(u64, input),
+                .cache_write_tokens = random.uintAtMost(u64, input),
+                .reasoning_tokens = if (random.boolean()) null else random.uintAtMost(u64, output),
+                .billable_web_search_calls = random.int(u8),
+                .total_cost = cost,
+            } },
+            .{ .pending = .{ .id = &id, .observed_at_ms = at_ms } },
+            .{ .incident = .{ .occurred_at_ms = at_ms, .completeness = if (random.boolean()) .pending else .incomplete } },
+            .{ .coverage = at_ms },
+        };
+        for (records) |want| {
+            var writer: std.Io.Writer = .fixed(&buffer);
+            try writeRecord(&writer, want);
+            const written = writer.buffered();
+            const line = written[0 .. written.len - 1];
+            if (want == .generation and std.mem.findAny(u8, want.generation.model, "\"\\") != null) {
+                try testing.expectEqual(@as(?Record, null), parseCanonical(line));
+                try testing.expect(recordEql(want, try parseTree(arena_state.allocator(), line)));
+                continue;
+            }
+            const got = parseCanonical(line) orelse {
+                std.debug.print("not read in place: {s}\n", .{line});
+                return error.NotReadInPlace;
+            };
+            try testing.expect(recordEql(want, got));
+            try expectAgreement(arena_state.allocator(), line, true);
+            _ = arena_state.reset(.retain_capacity);
+        }
+    }
+}
+
+/// When `parseCanonical` takes `line`, the tree reads the same record;
+/// `taken` also requires that it takes the line.
+fn expectAgreement(arena: Allocator, line: []const u8, taken: bool) !void {
+    const fast = parseCanonical(line) orelse {
+        if (!taken) return;
+        std.debug.print("not read in place: {s}\n", .{line});
+        return error.NotReadInPlace;
+    };
+    const tree = parseTree(arena, line) catch |err| {
+        std.debug.print("read in place, but the tree says {s}: {s}\n", .{ @errorName(err), line });
+        return err;
+    };
+    if (!recordEql(fast, tree)) {
+        std.debug.print("read in place differently from the tree: {s}\n", .{line});
+        return error.ReadersDisagree;
+    }
+}
+
+fn recordEql(a: Record, b: Record) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .coverage => |at_ms| at_ms == b.coverage,
+        .generation => |fact| GenerationFact.eql(fact, b.generation),
+        .pending => |marker| PendingMarker.eql(marker, b.pending),
+        .incident => |incident| incident.occurred_at_ms == b.incident.occurred_at_ms and
+            incident.completeness == b.incident.completeness,
+    };
+}
+
 test "fx vector: generation fact codec round trip" {
     // generation_fact_codec.zig "codec round trips the shared generation fact shape"
     const alloc = testing.allocator;
@@ -626,6 +928,17 @@ test "generation ids are gen_ plus 26 Crockford base32 characters" {
     try testing.expect(!validGenerationId("gen_01ARZ3NDEKTSV4RRFFQ69G5FA"));
     try testing.expect(!validGenerationId("gen_01ARZ3NDEKTSV4RRFFQ69G5FAVV"));
     try testing.expect(!validGenerationId("Gen_01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+    // Every byte value, against the alphabet's ranges.
+    for (0..256) |byte| {
+        const char: u8 = @intCast(byte);
+        const want = switch (char) {
+            '0'...'9', 'A'...'H', 'J'...'K', 'M'...'N', 'P'...'T', 'V'...'Z' => true,
+            else => false,
+        };
+        var id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV".*;
+        id[4] = char;
+        try testing.expectEqual(want, validGenerationId(&id));
+    }
 }
 
 test "record parser releases every partial allocation" {

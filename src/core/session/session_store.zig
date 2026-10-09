@@ -99,6 +99,21 @@ pub fn readUsageForRecovery(alloc: Allocator, home_path: []const u8, session_id:
         else => return err,
     };
     defer store.deinit(alloc);
+    // A conversation session's usage needs only its metadata and sidecar;
+    // a full load would also replay its whole transcript.
+    const conversation = store.loadConversationUsageOnly(alloc, session_id) catch |err| switch (err) {
+        error.SessionNotFound => return null,
+        else => return err,
+    };
+    if (conversation) |found| {
+        var usage = found.usage;
+        defer usage.deinit(alloc);
+        return .{
+            .bytes = try usage_mod.snapshot.encodeSidecar(alloc, session_id, usage),
+            .updated_at_ms = found.updated_at_ms,
+            .modified_ns = store.usageSidecarModifiedAtNs(session_id) catch null,
+        };
+    }
     var state = store.loadReadOnly(alloc, session_id) catch |err| switch (err) {
         error.SessionNotFound => return null,
         else => return err,
@@ -1874,6 +1889,19 @@ pub const Store = struct {
             try ids.append(alloc, id);
         }
         return ids;
+    }
+
+    /// A conversation session's usage without its history, or null for any
+    /// other format (`session_log.loadConversationUsageOnly`).
+    pub fn loadConversationUsageOnly(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+    ) !?session_log.ConversationUsage {
+        try validateSessionId(session_id);
+        var session_dir = try self.openSessionDir(session_id);
+        defer session_dir.close();
+        return session_log.loadConversationUsageOnly(alloc, &session_dir, session_id);
     }
 
     pub fn usageSidecarModifiedAtNs(
@@ -5226,6 +5254,44 @@ test "fresh session usage survives the initial durable event" {
         usage_mod.snapshot.Billing.complete,
         loaded.usage.?.billing,
     );
+}
+
+test "usage recovery reads a conversation session's usage without its history" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    var state = try testDurableState(alloc, "recovery-usage", ctx.workspace);
+    defer state.deinit(alloc);
+    state.updated_at_ms = 42;
+    {
+        var writable = try ctx.store.startWritableSession(alloc, state);
+        writable.deinit(alloc);
+    }
+    var full = try ctx.store.loadReadOnly(alloc, state.id);
+    defer full.deinit(alloc);
+    const want = try usage_mod.snapshot.encodeSidecar(alloc, state.id, full.usage.?);
+    defer alloc.free(want);
+
+    const recovered = (try readUsageForRecovery(alloc, ctx.home, state.id)).?;
+    defer alloc.free(recovered.bytes);
+    try std.testing.expectEqualStrings(want, recovered.bytes);
+    try std.testing.expectEqual(full.updated_at_ms, recovered.updated_at_ms);
+    try std.testing.expect(recovered.modified_ns != null);
+
+    // Without its transcript a full load fails; the usage read never opens it.
+    try tmp.dir.deleteFile(io_mod.getIo(), "home/.fx/sessions/recovery-usage/events.jsonl");
+    if (ctx.store.loadReadOnly(alloc, state.id)) |loaded| {
+        var unexpected = loaded;
+        unexpected.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    const again = (try readUsageForRecovery(alloc, ctx.home, state.id)).?;
+    defer alloc.free(again.bytes);
+    try std.testing.expectEqualStrings(want, again.bytes);
+
+    try std.testing.expectEqual(@as(?usage_owner.RecoveredV1, null), try readUsageForRecovery(alloc, ctx.home, "no-such-session"));
 }
 
 test "store start does not publish session caches" {

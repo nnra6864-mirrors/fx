@@ -11,7 +11,7 @@ const Scope = usage_mod.Scope;
 pub const State = struct {
     active: bool = false,
     /// The tab being shown or loaded.
-    requested_scope: Scope = .days_30,
+    requested_scope: Scope = .session,
     /// A rolling view, borrowed from the profile's view loader. It stays
     /// valid until the loader's next poll after a newer one is ready.
     borrowed: ?*const View = null,
