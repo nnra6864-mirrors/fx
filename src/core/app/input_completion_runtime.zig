@@ -73,6 +73,10 @@ pub fn CompletionRuntime(comptime App: type) type {
             choice: file_index.SearchResult,
         };
 
+        /// What accepting a folder row does: Tab opens it to list its
+        /// contents, Enter selects the folder itself.
+        const FolderAction = enum { open, select };
+
         pub fn slashCompletionCandidateCount(app: *App) usize {
             const prefix = command_specs.slashCompletionPrefix(
                 app.slashRegistry(),
@@ -885,7 +889,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                 app.shell.render_requests.request(.footer);
                 return .inactive;
             };
-            return applyFilePickerSelection(app, selection, max_input_len);
+            return applyFilePickerSelection(app, selection, max_input_len, .open);
         }
 
         fn resolveFilePickerSelection(app: *App) ?FilePickerSelection {
@@ -899,6 +903,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             app: *App,
             selection: FilePickerSelection,
             max_input_len: usize,
+            folder_action: FolderAction,
         ) !edit_contract.InsertResult {
             if (!file_picker_path.isRepresentable(selection.choice.path)) {
                 debug_trace.logf("input", "file picker rejected unrepresentable selection bytes={d}", .{selection.choice.path.len});
@@ -920,17 +925,26 @@ pub fn CompletionRuntime(comptime App: type) type {
             const tail = items[replace_end..];
             const reuses_terminator = tail.len > 0 and picker_state.isFilePickerTerminator(tail[0]);
             const is_directory = selection.choice.kind == .directory;
-            const adds_terminator = !is_directory and !reuses_terminator;
-            const encoded = try file_picker_path.encode(app.alloc, selection.choice.path, .{
+            const opens_directory = is_directory and folder_action == .open;
+            const adds_terminator = !opens_directory and !reuses_terminator;
+            // An opened folder stays an active query so its contents list next.
+            // A selected folder is finished like a file: its path with the
+            // trailing slash, any quote closed, and a separating space.
+            const selected_folder = if (is_directory and !opens_directory)
+                try std.mem.concat(app.alloc, u8, &.{ selection.choice.path, "/" })
+            else
+                null;
+            defer if (selected_folder) |path| app.alloc.free(path);
+            const encoded = try file_picker_path.encode(app.alloc, selected_folder orelse selection.choice.path, .{
                 .quoted = selection.query.quoted,
-                .directory = is_directory,
+                .directory = opens_directory,
                 .workspace_relative = indexed,
             });
             var replacement = std.ArrayList(u8).fromOwnedSlice(encoded);
             defer replacement.deinit(app.alloc);
             const separator_offset = replace_start + replacement.items.len;
             if (adds_terminator) try replacement.append(app.alloc, ' ');
-            const cursor_after_replacement = replace_start + replacement.items.len + @intFromBool(!is_directory and reuses_terminator);
+            const cursor_after_replacement = replace_start + replacement.items.len + @intFromBool(!opens_directory and reuses_terminator);
 
             const result = try app.input_runtime.replacementState(&app.pending_images).replaceRangeBounded(
                 app.alloc,
@@ -947,7 +961,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                         separator_offset,
                     );
                 }
-                if (is_directory) app.input_runtime.picker.resetFilePickerIndex();
+                if (opens_directory) app.input_runtime.picker.resetFilePickerIndex();
             }
             return result;
         }
@@ -960,7 +974,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                 if (app.input_runtime.picker.file_completion.acceptedEmpty()) return null;
                 return .inactive;
             };
-            const result = try applyFilePickerSelection(app, selection, max_input_len);
+            const result = try applyFilePickerSelection(app, selection, max_input_len, .select);
             debug_trace.logf(
                 "input",
                 "file picker Enter consumed selected={s} limit_exceeded={s}",
@@ -2060,6 +2074,43 @@ test "filesystem file picker pipeline drills into a directory and selects a file
         "@\"./space dir/item.txt\" ",
         app.input_runtime.edit_state.input.items,
     );
+    try std.testing.expect(app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) == null);
+}
+
+test "filesystem file picker lists an opened folder first and Enter selects it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/space dir");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "workspace/space dir/item.txt",
+        .data = "inside",
+    });
+
+    const io_mod = @import("../shared/io.zig");
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+
+    const rt = CompletionRuntime(FilesystemFilePickerTestApp);
+    var app = FilesystemFilePickerTestApp{
+        .alloc = alloc,
+        .workspace_root = workspace_root,
+    };
+    defer app.deinit();
+
+    try app.input_runtime.textReplacementState().replace(alloc, "@./space");
+    presentFilePickerForTest(&app);
+    try std.testing.expectEqual(edit_contract.InsertResult.inserted, try rt.autocompleteFilePickerSelection(&app, 4096));
+    try std.testing.expectEqualStrings("@\"./space dir/", app.input_runtime.edit_state.input.items);
+
+    presentFilePickerForTest(&app);
+    const folder = app.input_runtime.picker.file_completion.selected(0).?;
+    try std.testing.expectEqualStrings("./space dir", folder.path);
+    try std.testing.expectEqual(file_index.CandidateKind.directory, folder.kind);
+    try std.testing.expectEqualStrings("./space dir/item.txt", app.input_runtime.picker.file_completion.selected(1).?.path);
+
+    try std.testing.expectEqual(edit_contract.InsertResult.inserted, (try rt.submitFilePickerOnEnter(&app, 4096)).?);
+    try std.testing.expectEqualStrings("@\"./space dir/\" ", app.input_runtime.edit_state.input.items);
     try std.testing.expect(app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) == null);
 }
 

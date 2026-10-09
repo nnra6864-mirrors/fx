@@ -129,6 +129,16 @@ function processRssKb(pid: number): number {
   return rss;
 }
 
+// The @ menu rows: the lines between the two rules below the composer.
+function pickerRows(grid: string[]): string[] {
+  const composer = grid.findIndex(isComposerLine);
+  const rules = grid.flatMap((line, index) =>
+    index > composer && /^─+$/.test(line.trim()) ? [index] : []
+  );
+  if (composer < 0 || rules.length < 2) return [];
+  return grid.slice(rules[0]! + 1, rules[1]!).map((line) => line.trim()).filter(Boolean);
+}
+
 function composerTextFromPane(pane: string): string {
   return pane.split("\n")
     .filter(isComposerLine)
@@ -428,6 +438,46 @@ async function replayTape(current: Fixture): Promise<void> {
 }
 
 describe("@ file picker", () => {
+  tmuxTest(
+    "Tab opens a folder that lists itself first, and Enter selects a folder",
+    async () => {
+      const current = createFixture("fx-file-picker-folder-");
+      mkdirSync(join(current.workspace, "notes", "drafts"), { recursive: true });
+      writeFileSync(join(current.workspace, "notes", "todo.md"), "todo");
+      writeFileSync(join(current.workspace, "notes", "drafts", "idea.md"), "idea");
+      const active = await startMockFx(current, [], 1000);
+
+      await active.sendLiteral("Review @notes");
+      await active.waitForText("notes/", TIMEOUT);
+      await active.sendKeys("Tab");
+      await active.waitForText("notes/todo.md", TIMEOUT);
+      expect(await composerPlainText(active)).toBe("Review @notes/");
+      expect(pickerRows(await active.capturePaneGrid())).toEqual(["notes/", "notes/drafts/", "notes/todo.md"]);
+
+      // Enter on the first row selects the opened folder itself.
+      await active.sendKeys("Enter");
+      await active.sendLiteral("please");
+      await active.waitForPane((pane) => composerTextFromPane(pane) === "Review @notes/ please", TIMEOUT);
+      expect(pickerRows(await active.capturePaneGrid())).toEqual([]);
+
+      // Enter on a listed child folder selects that folder.
+      await clearComposer(active);
+      await active.sendLiteral("@notes/");
+      await active.waitForText("notes/drafts/", TIMEOUT);
+      await active.sendKeys("Down");
+      await active.sendKeys("Enter");
+      await active.sendLiteral("x");
+      await active.waitForPane((pane) => composerTextFromPane(pane) === "@notes/drafts/ x", TIMEOUT);
+      expect(gateway?.requests ?? []).toHaveLength(0);
+      expectCleanRuntime(current, active);
+      await clearComposer(active);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TIMEOUT,
+  );
+
   tmuxTest(
     "opens and selects a file while a turn is in flight",
     async () => {
@@ -1651,7 +1701,8 @@ describe("@ file picker", () => {
       expect(await composerPlainText(active)).toBe("@./second/");
       expect(starts()).toBe(2);
       expect(gateway.requests).toHaveLength(0);
-      await active.sendKeys("Tab");
+      // The first row is the opened folder itself; its file follows.
+      await active.sendKeys("Down Tab");
       expect(await composerPlainText(active)).toBe("@./second/beta.txt");
       await clearComposer(active);
       const scrollback = await active.captureFullScrollbackEscapes();
@@ -1722,7 +1773,8 @@ describe("@ file picker", () => {
       await active.waitForText("Selection unavailable", TIMEOUT);
       expect(await composerPlainText(active)).toBe("@./retry/");
       expect(gateway?.requests).toHaveLength(0);
-      await active.sendKeys("Down Enter");
+      // The rows are now the folder and b.txt; move from the stale slot to b.txt.
+      await active.sendKeys("Down Down Enter");
       expect(await composerPlainText(active)).toBe("@./retry/b.txt");
 
       await clearComposer(active);
@@ -1736,7 +1788,8 @@ describe("@ file picker", () => {
       await active.sendKeys("Tab");
       await active.waitForText("./missing/recovered.txt", TIMEOUT);
       expect(await composerPlainText(active)).toBe("@./missing/");
-      await active.sendKeys("Tab");
+      // The recovered folder lists itself first; its file follows.
+      await active.sendKeys("Down Tab");
       expect(await composerPlainText(active)).toBe("@./missing/recovered.txt");
       await active.sendLiteral(" Reply with the words PRESENTED, PICKER, and OK joined by underscores.");
       await active.sendKeys("Enter");
@@ -1863,7 +1916,8 @@ describe("@ file picker", () => {
       await clearComposer(active);
       await active.sendLiteral("@~");
       await active.waitForText("~/home-target.txt", TIMEOUT);
-      await active.sendKeys("Down Enter");
+      // Rows: the home folder itself, ~/.fx/, then ~/home-target.txt.
+      await active.sendKeys("Down Down Enter");
       expect(await composerPlainText(active)).toBe("@~/home-target.txt");
       expect(gateway?.requests).toHaveLength(0);
       await active.sendLiteral(" Reply with the words SHORTCUT, FLOW, and OK joined by underscores.");
@@ -1934,6 +1988,9 @@ describe("@ file picker", () => {
       await active.waitForText("empty-workspace/", TIMEOUT);
       await active.sendKeys("Tab");
       expect(await composerPlainText(active)).toBe("@empty-workspace/");
+      // An opened empty folder still lists itself, so it can be selected.
+      await active.waitForPane((pane) => pickerRows(pane.split("\n")).join("|") === "empty-workspace/", TIMEOUT);
+      await active.sendLiteral("zzz");
       await active.waitForText("no matching files", TIMEOUT);
       await active.sendKeys("Escape");
       await active.waitForPane((pane) => !pane.includes("no matching files"), TIMEOUT);
