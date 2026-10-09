@@ -672,7 +672,7 @@ fn trimEntryRetainedBytes(alloc: Allocator, entry: *TranscriptEntry, target: usi
             const start = retainedTextStart(e.segments.text.items, target);
             if (start == 0) return null;
             const remaining = e.segments.text.items.len - start;
-            std.mem.copyForwards(u8, e.segments.text.items[0..remaining], e.segments.text.items[start..]);
+            @memmove(e.segments.text.items[0..remaining], e.segments.text.items[start..]);
             e.segments.text.items.len = remaining;
             return start;
         },
@@ -4119,7 +4119,7 @@ pub fn appendCappedWithinCapacity(
         debug_trace.logf("transcript_cap", "trimmed {d} leading bytes before append (prior_len={d} text.len={d} cap={d})", .{ cut, list.items.len, text.len, cap });
 
         const remaining = list.items.len - cut;
-        std.mem.copyForwards(u8, list.items[0..remaining], list.items[cut..]);
+        @memmove(list.items[0..remaining], list.items[cut..]);
         list.items.len = remaining;
 
         if (replaceable_last_line.*) {

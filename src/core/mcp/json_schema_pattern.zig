@@ -1,4 +1,5 @@
 const std = @import("std");
+const display_width = @import("../shared/display_width.zig");
 const unicode_letter = @import("json_schema_unicode_letter.zig");
 
 const Allocator = std.mem.Allocator;
@@ -416,7 +417,7 @@ const Parser = struct {
         const width = std.unicode.utf8ByteSequenceLength(self.source[self.index]) catch
             return error.InvalidUtf8;
         if (width > self.source.len - self.index) return error.InvalidUtf8;
-        const codepoint = std.unicode.utf8Decode(self.source[self.index..][0..width]) catch
+        const codepoint = display_width.decodeUtf8Sequence(self.source[self.index..][0..width]) catch
             return error.InvalidUtf8;
         self.index += width;
         return codepoint;
@@ -651,7 +652,7 @@ pub fn matches(
         const width = std.unicode.utf8ByteSequenceLength(text[byte_index]) catch
             return error.InvalidUtf8;
         if (width > text.len - byte_index) return error.InvalidUtf8;
-        const codepoint = std.unicode.utf8Decode(text[byte_index..][0..width]) catch
+        const codepoint = display_width.decodeUtf8Sequence(text[byte_index..][0..width]) catch
             return error.InvalidUtf8;
         const next_byte_index = byte_index + width;
         next.unsetAll();

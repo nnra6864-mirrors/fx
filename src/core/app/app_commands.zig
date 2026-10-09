@@ -2246,7 +2246,12 @@ fn buildTraceReport(app: anytype) ![]u8 {
     const build_options = @import("build_options");
     try out.writer.print("version: {s} ({s})\n", .{ App.app_version, build_options.git_commit });
     try out.writer.print("platform: {s}/{s}\n", .{ @tagName(builtin.target.os.tag), @tagName(builtin.target.cpu.arch) });
-    try out.writer.print("build: {s}\n", .{@tagName(builtin.mode)});
+    try out.writer.print("build: {s}\n", .{switch (builtin.optimize) {
+        .debug => "Debug",
+        .safe => "ReleaseSafe",
+        .fast => "ReleaseFast",
+        .small => "ReleaseSmall",
+    }});
     try out.writer.print("model: {s}\n", .{provider_runtime.model(app)});
     if (app.fast_mode) try out.writer.writeAll("fast_mode: on\n");
     const perm_label = permissions.permissionModeLabel(app.permission_engine.mode);
@@ -3179,8 +3184,7 @@ fn projectProviderToolCalls(
                     output[count] = summary;
                     count += 1;
                 } else {
-                    std.mem.copyForwards(
-                        ProviderToolCallSummary,
+                    @memmove(
                         output[0 .. output.len - 1],
                         output[1..],
                     );

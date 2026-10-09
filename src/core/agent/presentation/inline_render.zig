@@ -1,4 +1,5 @@
 const std = @import("std");
+const display_width = @import("../../shared/display_width.zig");
 const Allocator = std.mem.Allocator;
 const ansi = @import("ansi.zig");
 const tu = @import("text_util.zig");
@@ -320,7 +321,7 @@ fn codepointBefore(text: []const u8, index: usize) u21 {
     var start = index - 1;
     var steps: usize = 0;
     while (start > 0 and steps < 3 and text[start] & 0xC0 == 0x80) : (steps += 1) start -= 1;
-    return std.unicode.utf8Decode(text[start..index]) catch text[index - 1];
+    return display_width.decodeUtf8Sequence(text[start..index]) catch text[index - 1];
 }
 
 /// Code point starting at `index`, or a space at the line end.
@@ -328,7 +329,7 @@ fn codepointAt(text: []const u8, index: usize) u21 {
     if (index >= text.len) return ' ';
     const len = std.unicode.utf8ByteSequenceLength(text[index]) catch return text[index];
     if (index + len > text.len) return text[index];
-    return std.unicode.utf8Decode(text[index .. index + len]) catch text[index];
+    return display_width.decodeUtf8Sequence(text[index .. index + len]) catch text[index];
 }
 
 fn isFlankingWhitespace(cp: u21) bool {
@@ -940,4 +941,15 @@ fn isBareUrlTerminator(c: u8) bool {
 
 fn isTrailingBareUrlByte(c: u8) bool {
     return tu.isTrailingUrlPunctuation(c) or c == '*' or c == '_' or c == '~';
+}
+
+test "emphasis after a truncated UTF-8 sequence renders instead of panicking" {
+    const alloc = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    var link_id: u32 = 0;
+    // The delimiter follows a three-byte lead with only one continuation
+    // byte, so the code point before the run has a mismatched length.
+    try writeInline(alloc, "\xe4\x80*bold*", &out, false, null, &link_id);
+    try std.testing.expect(std.mem.find(u8, out.items, "bold") != null);
 }

@@ -1459,8 +1459,7 @@ pub const Grid = struct {
         const base = self.rowBase(self.cursor_row);
         const start = base + self.cursor_col - 1;
         const end = base + self.cols;
-        std.mem.copyBackwards(
-            Cell,
+        @memmove(
             self.cells[start + count .. end],
             self.cells[start .. end - count],
         );
@@ -1477,8 +1476,7 @@ pub const Grid = struct {
         const base = self.rowBase(self.cursor_row);
         const start = base + self.cursor_col - 1;
         const end = base + self.cols;
-        std.mem.copyForwards(
-            Cell,
+        @memmove(
             self.cells[start .. end - count],
             self.cells[start + count .. end],
         );
@@ -3345,7 +3343,7 @@ fn decodeUtf8(bytes: []const u8, start: usize) DecodedRune {
         };
     }
     const slice = bytes[start .. start + seq_len];
-    const cp = std.unicode.utf8Decode(slice) catch
+    const cp = display_width.decodeUtf8Sequence(slice) catch
         return .{ .codepoint = 0xfffd, .len = 1 };
     return .{ .codepoint = cp, .len = seq_len };
 }

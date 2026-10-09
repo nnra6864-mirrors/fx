@@ -604,7 +604,7 @@ pub const Runtime = struct {
         if (self.deferred_session_input.items.len - self.deferred_session_input_index >= limit) return false;
         if (self.deferred_session_input_index > 0) {
             const remaining = self.deferred_session_input.items[self.deferred_session_input_index..];
-            std.mem.copyForwards(DeferredSessionInput, self.deferred_session_input.items[0..remaining.len], remaining);
+            @memmove(self.deferred_session_input.items[0..remaining.len], remaining);
             self.deferred_session_input.items.len = remaining.len;
             self.deferred_session_completed_end -|= self.deferred_session_input_index;
             self.deferred_session_input_index = 0;

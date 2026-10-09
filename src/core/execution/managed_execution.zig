@@ -1028,8 +1028,7 @@ pub const Runtime = struct {
             return error.InvalidOutputRange;
         }
         if (delivered != 0) {
-            std.mem.copyForwards(
-                u8,
+            @memmove(
                 entry.output.items[0 .. entry.output.items.len - delivered],
                 entry.output.items[delivered..],
             );

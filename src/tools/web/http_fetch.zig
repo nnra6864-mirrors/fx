@@ -629,7 +629,7 @@ fn readResponse(
             parsed.deinit(alloc);
 
             const pending_len = received.items.len - head_end;
-            std.mem.copyForwards(u8, received.items[0..pending_len], received.items[head_end..]);
+            @memmove(received.items[0..pending_len], received.items[head_end..]);
             received.items.len = pending_len;
             continue;
         }

@@ -148,7 +148,7 @@ pub const ModelMenu = struct {
 
     pub fn setQuery(self: *ModelMenu, query_text: []const u8) void {
         const len = @min(query_text.len, self.query_buf.len);
-        if (len > 0) std.mem.copyForwards(u8, self.query_buf[0..len], query_text[0..len]);
+        if (len > 0) @memmove(self.query_buf[0..len], query_text[0..len]);
         self.query_len = len;
         self.selected_index = 0;
         self.window_start = 0;

@@ -161,8 +161,7 @@ pub const IncrementalTerminalSafeEncoder = struct {
         try writer.writeAll(token.bytes);
         const remaining = self.pending_len - token.source_len;
         if (remaining > 0) {
-            std.mem.copyForwards(
-                u8,
+            @memmove(
                 self.pending[0..remaining],
                 self.pending[token.source_len..self.pending_len],
             );
@@ -185,7 +184,7 @@ pub const IncrementalUtf8Validator = struct {
             self.pending_len += copied;
             index += copied;
             if (self.pending_len < sequence_len) return;
-            _ = std.unicode.utf8Decode(self.pending[0..sequence_len]) catch return error.InvalidUtf8;
+            _ = display_width.decodeUtf8Sequence(self.pending[0..sequence_len]) catch return error.InvalidUtf8;
             self.pending_len = 0;
         }
 
@@ -197,7 +196,7 @@ pub const IncrementalUtf8Validator = struct {
                 self.pending_len = remaining.len;
                 return;
             }
-            _ = std.unicode.utf8Decode(bytes[index .. index + sequence_len]) catch return error.InvalidUtf8;
+            _ = display_width.decodeUtf8Sequence(bytes[index .. index + sequence_len]) catch return error.InvalidUtf8;
             index += sequence_len;
         }
     }
@@ -585,7 +584,7 @@ fn terminalSafeToken(raw: []const u8, index: usize, buf: *[12]u8) TerminalSafeTo
     }
 
     const sequence = raw[index .. index + sequence_len];
-    const codepoint = std.unicode.utf8Decode(sequence) catch {
+    const codepoint = display_width.decodeUtf8Sequence(sequence) catch {
         return .{ .source_len = 1, .bytes = writeByteEscape(buf, byte) };
     };
     if (isNonPrintingCodepoint(codepoint)) {

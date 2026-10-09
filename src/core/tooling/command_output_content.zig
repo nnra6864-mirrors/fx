@@ -1,4 +1,5 @@
 const std = @import("std");
+const display_width = @import("../shared/display_width.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -151,7 +152,7 @@ pub const Decoder = struct {
             }
 
             const sequence = self.utf8_pending[0..sequence_len];
-            const scalar = std.unicode.utf8Decode(sequence) catch {
+            const scalar = display_width.decodeUtf8Sequence(sequence) catch {
                 try emitEscapedByte(sink, .byte_escape, self.utf8_pending[0]);
                 self.shiftUtf8Pending(1);
                 continue;
@@ -177,8 +178,7 @@ pub const Decoder = struct {
     fn shiftUtf8Pending(self: *Decoder, count: usize) void {
         const remaining = self.utf8_pending_len - count;
         if (remaining > 0) {
-            std.mem.copyForwards(
-                u8,
+            @memmove(
                 self.utf8_pending[0..remaining],
                 self.utf8_pending[count..self.utf8_pending_len],
             );

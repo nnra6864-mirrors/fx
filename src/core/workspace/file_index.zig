@@ -1129,7 +1129,7 @@ fn foldUtf8Into(bytes: []const u8, out: []u21) ?[]const u21 {
         const sequence_len = std.unicode.utf8ByteSequenceLength(bytes[byte_index]) catch return null;
         const end = byte_index + sequence_len;
         if (end > bytes.len) return null;
-        const codepoint = std.unicode.utf8Decode(bytes[byte_index..end]) catch return null;
+        const codepoint = display_width.decodeUtf8Sequence(bytes[byte_index..end]) catch return null;
         out[scalar_index] = unicode_simple_fold.fold(codepoint);
         scalar_index += 1;
         byte_index = end;
@@ -1179,7 +1179,7 @@ fn decodeFoldedPath(
         const sequence_len = std.unicode.utf8ByteSequenceLength(path[byte_index]) catch return null;
         const end = byte_index + sequence_len;
         if (end > path.len or scalar_index >= scratch.scalars.len) return null;
-        const codepoint = std.unicode.utf8Decode(path[byte_index..end]) catch return null;
+        const codepoint = display_width.decodeUtf8Sequence(path[byte_index..end]) catch return null;
         scratch.byte_offsets[scalar_index] = std.math.cast(u16, byte_index) orelse return null;
         scratch.scalars[scalar_index] = unicode_simple_fold.fold(codepoint);
         scalar_index += 1;

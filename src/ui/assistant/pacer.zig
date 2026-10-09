@@ -416,7 +416,7 @@ pub const AssistantPacer = struct {
     fn consume(self: *AssistantPacer, byte_count: usize) void {
         const remaining = self.pending.items.len - byte_count;
         if (remaining > 0) {
-            std.mem.copyForwards(u8, self.pending.items[0..remaining], self.pending.items[byte_count..]);
+            @memmove(self.pending.items[0..remaining], self.pending.items[byte_count..]);
         }
         self.pending.items.len = remaining;
     }

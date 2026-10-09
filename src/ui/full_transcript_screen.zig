@@ -4378,7 +4378,7 @@ const PagedLiteralCommandRecord = struct {
             suffix_start - break_index,
         );
         const suffix_len = self.row.items.len - suffix_start;
-        std.mem.copyForwards(u8, self.row.items[0..suffix_len], self.row.items[suffix_start..]);
+        @memmove(self.row.items[0..suffix_len], self.row.items[suffix_start..]);
         self.row.items.len = suffix_len;
         self.remeasureRow();
     }

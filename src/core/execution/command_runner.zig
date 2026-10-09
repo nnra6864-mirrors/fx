@@ -979,7 +979,7 @@ const StreamPreview = struct {
         if (self.tail.items.len + bytes.len > self.tail_limit) {
             const drop = self.tail.items.len + bytes.len - self.tail_limit;
             const keep = self.tail.items.len - drop;
-            std.mem.copyForwards(u8, self.tail.items[0..keep], self.tail.items[drop..]);
+            @memmove(self.tail.items[0..keep], self.tail.items[drop..]);
             self.tail.items.len = keep;
         }
         try self.tail.appendSlice(alloc, bytes);
@@ -2553,7 +2553,7 @@ const OutputChunkEmitter = struct {
         }
         if (line_start > 0) {
             const remaining = pending.items.len - line_start;
-            std.mem.copyForwards(u8, pending.items[0..remaining], pending.items[line_start..]);
+            @memmove(pending.items[0..remaining], pending.items[line_start..]);
             pending.items.len = remaining;
         }
         // The final flush always delivers the last partial line. It is one

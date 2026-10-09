@@ -509,7 +509,7 @@ pub fn retentionSourceMap(alloc: Allocator, text: []const u8, cols: u16) !Retent
     var leading: usize = 0;
     while (leading < wrapped.len and wrapped[leading] == '\n') : (leading += 1) {}
     const skip = @min(leading, map.rows.items.len);
-    std.mem.copyForwards(usize, map.rows.items, map.rows.items[skip..]);
+    @memmove(map.rows.items[0 .. map.rows.items.len - skip], map.rows.items[skip..]);
     map.rows.items.len -= skip;
     for (map.points.items) |*point| point.rendered -|= leading;
     return map;

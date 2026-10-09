@@ -68,7 +68,7 @@ fn stripPastedImageSlashPrefix(stage: *ImagePasteStage) bool {
     if (stage.tokens.items.len == 0 or stage.tokens.items[0].span.raw_start != prefix_len) return false;
 
     const remaining = stage.replacement.items.len - prefix_len;
-    std.mem.copyForwards(u8, stage.replacement.items[0..remaining], stage.replacement.items[prefix_len..]);
+    @memmove(stage.replacement.items[0..remaining], stage.replacement.items[prefix_len..]);
     stage.replacement.items.len = remaining;
     for (stage.tokens.items) |*token| {
         token.span.raw_start -= prefix_len;

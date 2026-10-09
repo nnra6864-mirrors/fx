@@ -15221,7 +15221,7 @@ test "late successful settlement preserves its result and one turn cancellation"
         );
         try std.testing.expectEqual(
             RawEntryClass.turn_cancellation,
-            runtime.entries.getLast().raw_bytes.class,
+            runtime.entries.last().?.raw_bytes.class,
         );
         const detail = runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?;
         try std.testing.expectEqualStrings("late result", detail.result.?);

@@ -50,7 +50,7 @@ pub const StderrCapture = struct {
         }
         const overflow = (self.tail_len + rest.len) -| stderr_tail_capacity;
         if (overflow > 0) {
-            std.mem.copyForwards(u8, self.tail[0 .. self.tail_len - overflow], self.tail[overflow..self.tail_len]);
+            @memmove(self.tail[0 .. self.tail_len - overflow], self.tail[overflow..self.tail_len]);
             self.tail_len -= overflow;
             self.omitted = true;
         }

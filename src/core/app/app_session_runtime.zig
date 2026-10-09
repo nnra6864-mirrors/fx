@@ -514,7 +514,7 @@ pub const SessionPicker = struct {
 
     pub fn setQuery(self: *SessionPicker, query_text: []const u8) void {
         const len = @min(query_text.len, self.query_buf.len);
-        if (len > 0) std.mem.copyForwards(u8, self.query_buf[0..len], query_text[0..len]);
+        if (len > 0) @memmove(self.query_buf[0..len], query_text[0..len]);
         self.query_len = len;
         self.selected = 0;
         self.window_start = 0;
@@ -9961,7 +9961,7 @@ test "resumeRequestedSession replays persisted model Markdown without parsing ge
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Cancelling") == null);
     try std.testing.expectEqual(
         transcript_runtime.RawEntryClass.turn_cancellation,
-        app.raw_transcript_classes.getLast(),
+        app.raw_transcript_classes.last().?,
     );
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
 }

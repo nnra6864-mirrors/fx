@@ -323,8 +323,7 @@ pub const Parser = struct {
 
         if (suffix_start) |start| {
             const retained_len = bytes.len - start;
-            std.mem.copyForwards(
-                u8,
+            @memmove(
                 self.candidate[0..retained_len],
                 bytes[start..],
             );

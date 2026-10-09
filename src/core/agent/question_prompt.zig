@@ -598,7 +598,7 @@ pub const QuestionPrompt = struct {
         if (entry.freeform_cursor == 0) return;
         const start = text_boundaries.previousCharacterStart(entry.freeform_buffer.items, entry.freeform_cursor);
         const count = entry.freeform_cursor - start;
-        std.mem.copyForwards(u8, entry.freeform_buffer.items[start..], entry.freeform_buffer.items[entry.freeform_cursor..]);
+        @memmove(entry.freeform_buffer.items[start .. entry.freeform_buffer.items.len - count], entry.freeform_buffer.items[entry.freeform_cursor..]);
         entry.freeform_buffer.items.len -= count;
         entry.freeform_cursor = start;
     }

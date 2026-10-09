@@ -62,7 +62,7 @@ pub const State = struct {
         if (slot.cursor.* == 0) return;
         const start = text_boundaries.previousCharacterStart(slot.draft.items, slot.cursor.*);
         const count = slot.cursor.* - start;
-        std.mem.copyForwards(u8, slot.draft.items[start..], slot.draft.items[slot.cursor.*..]);
+        @memmove(slot.draft.items[start .. slot.draft.items.len - count], slot.draft.items[slot.cursor.*..]);
         slot.draft.items.len -= count;
         slot.cursor.* = start;
     }

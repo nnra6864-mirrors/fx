@@ -701,7 +701,7 @@ fn sanitizedTerminalTitleLabel(raw: []const u8, buffer: *[terminal_title_max_lab
         };
         if (raw.len - source_index < sequence_len) break;
         const sequence = raw[source_index .. source_index + sequence_len];
-        const codepoint = std.unicode.utf8Decode(sequence) catch {
+        const codepoint = display_width.decodeUtf8Sequence(sequence) catch {
             source_index += 1;
             continue;
         };

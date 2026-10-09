@@ -1,4 +1,5 @@
 const std = @import("std");
+const display_width = @import("../shared/display_width.zig");
 const builtin = @import("builtin");
 const command_effect = @import("../shell_command/command_effect.zig");
 const command_contract = @import("../execution/command_contract.zig");
@@ -60,7 +61,7 @@ const DirectOutputProjector = struct {
             }
 
             const sequence = bytes[index .. index + sequence_len];
-            const scalar = std.unicode.utf8Decode(sequence) catch {
+            const scalar = display_width.decodeUtf8Sequence(sequence) catch {
                 self.escaped_invalid += 1;
                 try appendByteEscape(alloc, projected, byte);
                 index += 1;
@@ -681,7 +682,7 @@ const DirectOutput = struct {
         while (std.mem.findScalar(u8, pending.items, '\n')) |newline| {
             try callback(ctx, self.cfg.output_chunk_lifecycle_id, stream, pending.items[0 .. newline + 1]);
             const remaining = pending.items.len - newline - 1;
-            std.mem.copyForwards(u8, pending.items[0..remaining], pending.items[newline + 1 ..]);
+            @memmove(pending.items[0..remaining], pending.items[newline + 1 ..]);
             pending.items.len = remaining;
         }
         if (!flush and pending.items.len >= direct_output_read_chunk_bytes) {
