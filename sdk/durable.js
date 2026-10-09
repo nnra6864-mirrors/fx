@@ -1458,8 +1458,6 @@ async function uiRankerAt(log, count) {
   return shows;
 }
 
-// The end a turn's worker wrote, among the first `count` lines of the
-// stream, as a reader shows them; null when none did.
 // What a retried `messageId` finds in its session: its turn still waiting or
 // running (`follow`), no trace of it (`fresh`), a turn it already ran,
 // settled from that turn's end on the stream before `from` or from the
@@ -1477,6 +1475,8 @@ async function retryOutcome(log, state, messageId, from, { sent }) {
   return { unsure: true };
 }
 
+// The end a turn's worker wrote, among the first `count` lines of the
+// stream, as a reader shows them; null when none did.
 async function turnEndIn(log, messageId, count) {
   if (count === 0) return null;
   const shows = uiRanker();
