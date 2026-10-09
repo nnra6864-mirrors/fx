@@ -690,7 +690,10 @@ test "lines as fx writes them read in place, and the tree reads whatever that ta
     var taken: usize = 0;
     while (lines.next()) |line| {
         // Every captured line is fx's own writing.
-        try expectAgreement(arena, line, true);
+        expectAgreement(arena, line, true) catch |err| {
+            std.debug.print("{s}: {s}\n", .{ @errorName(err), line });
+            return err;
+        };
         taken += 1;
         // Single-byte edits: whatever still reads in place reads the same.
         for (0..64) |_| {
@@ -714,7 +717,10 @@ test "lines as fx writes them read in place, and the tree reads whatever that ta
                     break :blk line.len + 1;
                 },
             };
-            try expectAgreement(arena, edited[0..len], false);
+            expectAgreement(arena, edited[0..len], false) catch |err| {
+                std.debug.print("{s}: {s}\n", .{ @errorName(err), edited[0..len] });
+                return err;
+            };
         }
         _ = arena_state.reset(.retain_capacity);
     }
@@ -725,7 +731,10 @@ test "lines as fx writes them read in place, and the tree reads whatever that ta
     while (cases.next()) |case_line| {
         if (case_line.len == 0) continue;
         const case = try std.json.parseFromSliceLeaky(CorpusCase, arena, case_line, .{});
-        try expectAgreement(arena, case.input, false);
+        expectAgreement(arena, case.input, false) catch |err| {
+            std.debug.print("{s}: {s}\n", .{ @errorName(err), case.input });
+            return err;
+        };
     }
 }
 
@@ -782,28 +791,25 @@ test "every record the writer emits reads in place back to itself" {
                 return error.NotReadInPlace;
             };
             try testing.expect(recordEql(want, got));
-            try expectAgreement(arena_state.allocator(), line, true);
+            expectAgreement(arena_state.allocator(), line, true) catch |err| {
+                std.debug.print("{s}: {s}\n", .{ @errorName(err), line });
+                return err;
+            };
             _ = arena_state.reset(.retain_capacity);
         }
     }
 }
 
 /// When `parseCanonical` takes `line`, the tree reads the same record;
-/// `taken` also requires that it takes the line.
+/// `taken` also requires that it takes the line. The error names what
+/// differed, and the calling test prints the line.
 fn expectAgreement(arena: Allocator, line: []const u8, taken: bool) !void {
     const fast = parseCanonical(line) orelse {
-        if (!taken) return;
-        std.debug.print("not read in place: {s}\n", .{line});
-        return error.NotReadInPlace;
+        if (taken) return error.NotReadInPlace;
+        return;
     };
-    const tree = parseTree(arena, line) catch |err| {
-        std.debug.print("read in place, but the tree says {s}: {s}\n", .{ @errorName(err), line });
-        return err;
-    };
-    if (!recordEql(fast, tree)) {
-        std.debug.print("read in place differently from the tree: {s}\n", .{line});
-        return error.ReadersDisagree;
-    }
+    const tree = try parseTree(arena, line);
+    if (!recordEql(fast, tree)) return error.ReadersDisagree;
 }
 
 fn recordEql(a: Record, b: Record) bool {
