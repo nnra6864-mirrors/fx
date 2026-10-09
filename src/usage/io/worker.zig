@@ -1121,6 +1121,8 @@ pub const Worker = struct {
         w.counters.lookups += 1;
     }
 
+    const generation_path_prefix = "/v1/generation?id=";
+
     /// Sends one lookup and applies its answer. Returns `error.Canceled`
     /// only when `close` stopped it.
     fn runLookup(w: *Worker) error{Canceled}!void {
@@ -1130,9 +1132,12 @@ pub const Worker = struct {
             w.countLocked(.untrusted);
             return w.answer(.{ .lookup_rejected = o.sequence }, .answer);
         }
+        var path_buf: [generation_path_prefix.len + core.GenerationId.length]u8 = undefined;
+        path_buf[0..generation_path_prefix.len].* = generation_path_prefix.*;
+        path_buf[generation_path_prefix.len..].* = o.id.bytes;
         const request: host.Lookup.Request = .{
             .origin = o.originText(),
-            .generation_id = o.id.slice(),
+            .path = &path_buf,
             .team = o.teamText(),
             .secret = o.secretText(),
             .cancel = &w.cancel,
@@ -1432,6 +1437,9 @@ const TestLookup = struct {
 
     fn fetch(context: *anyopaque, request: *const host.Lookup.Request, body: []u8) host.Lookup.FetchError!host.Lookup.Response {
         const t: *TestLookup = @ptrCast(@alignCast(context));
+        const prefix = "/v1/generation?id=";
+        if (!std.mem.startsWith(u8, request.path, prefix)) return error.Transport;
+        const generation_id = request.path[prefix.len..];
         const answer = blk: {
             t.mutex.lockUncancelable(testing.io);
             defer t.mutex.unlock(testing.io);
@@ -1449,10 +1457,10 @@ const TestLookup = struct {
             .status => |status| return .{ .status = status, .body_len = 0 },
             .transport => return error.Transport,
             .canceled => return error.Canceled,
-            .found => |cost| return .{ .status = 200, .body_len = foundBody(body, request.generation_id, cost).len },
+            .found => |cost| return .{ .status = 200, .body_len = foundBody(body, generation_id, cost).len },
             .slow_found => |cost| {
                 testing.io.sleep(.fromMilliseconds(50), .awake) catch return error.Canceled;
-                return .{ .status = 200, .body_len = foundBody(body, request.generation_id, cost).len };
+                return .{ .status = 200, .body_len = foundBody(body, generation_id, cost).len };
             },
             .hold => {
                 while (!request.cancel.load(.acquire)) {

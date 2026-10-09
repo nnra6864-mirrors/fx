@@ -768,6 +768,52 @@ fn authorityIdentity(source: CredentialSource, account_id: ?[]const u8) ?core.Di
     return hash.finalResult();
 }
 
+/// Length of a `gatewayUser` tag: `fx_` and 32 hex digits.
+pub const gateway_user_len = 35;
+
+/// The `providerOptions.gateway.user` tag for AI Gateway requests made with
+/// this credential, written into `out`, so Gateway's usage reports can be
+/// filtered to fx. It is `fx_` and the first 16 bytes of SHA-256 over a
+/// domain prefix and the API key, in lowercase hex: one-way, the same on
+/// every fx install using the key, and sent only to AI Gateway, which holds
+/// the key already. Null for a credential with no stable key, such as a
+/// sign-in or a deployment token.
+pub fn gatewayUser(source: CredentialSource, secret: []const u8, out: *[gateway_user_len]u8) ?[]const u8 {
+    switch (source) {
+        .ai_gateway_api_key, .stored_key => {},
+        .vercel_oidc_token,
+        .fx_login,
+        .chatgpt_subscription,
+        .grok_subscription,
+        .host_managed,
+        .configured,
+        => return null,
+    }
+    if (secret.len == 0) return null;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("fx-gateway-user-v1\x00");
+    hash.update(secret);
+    const digest = hash.finalResult();
+    out[0..3].* = "fx_".*;
+    out[3..].* = std.fmt.bytesToHex(digest[0..16].*, .lower);
+    return out;
+}
+
+test "an API key's Gateway user tag is a stable one-way hash of the key" {
+    const key = "vck_test_0000000000000000000000000000000000000000";
+    var a: [gateway_user_len]u8 = undefined;
+    var b: [gateway_user_len]u8 = undefined;
+    const tag = gatewayUser(.stored_key, key, &a).?;
+    try std.testing.expectEqualStrings("fx_83db22a6d365044adeb147e9ff055578", tag);
+    // The same key tags the same user wherever fx read it from.
+    try std.testing.expectEqualStrings(tag, gatewayUser(.ai_gateway_api_key, key, &b).?);
+    try std.testing.expect(!std.mem.eql(u8, tag, gatewayUser(.stored_key, key ++ "1", &b).?));
+    try std.testing.expectEqual(null, gatewayUser(.stored_key, "", &b));
+    for ([_]CredentialSource{ .vercel_oidc_token, .fx_login, .chatgpt_subscription, .grok_subscription, .host_managed, .configured }) |source| {
+        try std.testing.expectEqual(null, gatewayUser(source, key, &b));
+    }
+}
+
 /// A short string kept inline.
 fn Text(comptime max: usize) type {
     return struct {

@@ -345,6 +345,15 @@ export type FakeGatewayOptions = {
 // derived title in place for tests that do not opt in.
 export const TITLE_GENERATION_MARKER = "Generate a short title";
 
+/** The AI Gateway user tag fx sends with requests made with this API key. */
+export function gatewayUserTag(apiKey: string): string {
+  const digest = createHash("sha256").update(`fx-gateway-user-v1\0${apiKey}`).digest("hex");
+  return `fx_${digest.slice(0, 32)}`;
+}
+
+/** Matches the AI Gateway user tag fx sends for any API key. */
+export const GATEWAY_USER_TAG = /^fx_[0-9a-f]{32}$/;
+
 export function fakeGatewayTitleDefault() {
   return fakeGatewaySse([{
     type: "finish",

@@ -449,6 +449,22 @@ fn setLedgerCredential(ledger: *usage_mod.Ledger, lease: ?types.CredentialLease)
     );
 }
 
+pub const gateway_user_len = usage_mod.gateway_user_len;
+
+/// The AI Gateway user tag for a request made with `lease`, written into
+/// `out`, or null when the credential has no stable key to tag. A secret
+/// of unknown source is not tagged, since it may be a rotating token.
+pub fn gatewayUser(lease: types.CredentialLease, out: *[gateway_user_len]u8) ?[]const u8 {
+    return switch (lease) {
+        .direct => |direct| usage_mod.gatewayUser(
+            moduleSource(direct.source orelse return null),
+            direct.secret_bytes,
+            out,
+        ),
+        .host_managed => null,
+    };
+}
+
 /// fx's credential source as the usage module names it. Every fx source
 /// must have one: a new one fails the build here.
 fn moduleSource(source: types.CredentialSource) usage_mod.CredentialSource {

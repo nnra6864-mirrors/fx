@@ -30,6 +30,7 @@ import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewaySse,
+  gatewayUserTag,
   startFakeGateway,
 } from "./tmux-helpers";
 
@@ -4264,7 +4265,10 @@ describe("cli: ask success", () => {
           maxOutputTokens: 64_000,
         });
         expect(gateway.modelRequests).toHaveLength(1);
-        expect(request.providerOptions).toEqual({ gateway: { caching: "auto" } });
+        expect(request.providerOptions).toEqual({
+          gateway: { user: gatewayUserTag("fake-portable-ask-key"), caching: "auto" },
+        });
+        expect(gateway.requests[0]!.body).not.toContain("fake-portable-ask-key");
         expect(
           gateway.requests[0]!.headers.get(
             "ai-language-model-specification-version",
