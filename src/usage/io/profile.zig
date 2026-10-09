@@ -58,6 +58,9 @@ pub const compaction_slack_ms: i64 = std.time.ms_per_day;
 pub const max_file_incidents: usize = 4096;
 const tail_sample_bytes: usize = 32;
 const abandon_check_lines: usize = 256;
+/// Bytes a ledger read takes between checks of the abandon flag, so process
+/// exit never waits for a whole large file to be read.
+const abandon_check_bytes: usize = 1024 * 1024;
 
 pub const Mode = enum { read_only, read_write };
 
@@ -387,6 +390,18 @@ fn inspectTail(io: Io, file: File) !Tail {
 
 fn readExact(io: Io, file: File, buffer: []u8, offset: u64) !void {
     if (try file.readPositionalAll(io, buffer, offset) != buffer.len) return error.UsageReadFailed;
+}
+
+/// `readExact` in `abandon_check_bytes` pieces, stopping with
+/// `error.UsageLockAbandoned` once `abandoned` is set.
+fn readExactUnlessAbandoned(io: Io, file: File, buffer: []u8, offset: u64, abandoned: *const std.atomic.Value(bool)) !void {
+    var done: usize = 0;
+    while (done < buffer.len) {
+        if (abandoned.load(.acquire)) return error.UsageLockAbandoned;
+        const end = @min(buffer.len, done + abandon_check_bytes);
+        try readExact(io, file, buffer[done..end], offset + done);
+        done = end;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -797,15 +812,19 @@ pub const Store = struct {
         if (store.index) |*index| {
             if (boundary == index.boundary and store.tailMatches(index, file)) return index;
             if (boundary > index.boundary and store.absorbTail(index, file, boundary)) return index;
+            if (store.abandoned.load(.acquire)) return error.UsageLockAbandoned;
             store.dropIndex();
         }
         if (boundary > max_file_bytes) return error.UsageCapacityExceeded;
+        // An abandoned store is exiting with its process. Freeing a large
+        // ledger's buffer and partial index would take longer than the rest
+        // of exit, so an abandoned read leaves both to the process exit.
         var fresh: Index = .{};
-        errdefer fresh.deinit(store.gpa);
+        errdefer if (!store.abandoned.load(.acquire)) fresh.deinit(store.gpa);
         if (boundary > 0) {
             const bytes = try store.gpa.alloc(u8, @intCast(boundary));
-            defer store.gpa.free(bytes);
-            try readExact(store.io, file, bytes, 0);
+            defer if (!store.abandoned.load(.acquire)) store.gpa.free(bytes);
+            try readExactUnlessAbandoned(store.io, file, bytes, 0, &store.abandoned);
             if (bytes[bytes.len - 1] != '\n') return error.UsageStoreIncomplete;
             try fresh.absorbBytes(store.gpa, bytes, &store.abandoned);
             fresh.boundary = boundary;
@@ -830,7 +849,7 @@ pub const Store = struct {
         if (!store.tailMatches(index, file)) return false;
         const bytes = store.gpa.alloc(u8, @intCast(boundary - index.boundary)) catch return false;
         defer store.gpa.free(bytes);
-        readExact(store.io, file, bytes, index.boundary) catch return false;
+        readExactUnlessAbandoned(store.io, file, bytes, index.boundary, &store.abandoned) catch return false;
         if (bytes.len == 0 or bytes[bytes.len - 1] != '\n') return false;
         index.absorbBytes(store.gpa, bytes, &store.abandoned) catch return false;
         index.boundary = boundary;
@@ -1328,6 +1347,58 @@ test "readers wait for a held lock and report busy after the deadline" {
     var view = try reader.read();
     defer view.release();
     try testing.expectEqual(@as(usize, 1), view.ledger().facts.len);
+}
+
+test "a ledger read checks the abandon flag between pieces" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const bytes = try testing.allocator.alloc(u8, 2 * abandon_check_bytes + 7);
+    defer testing.allocator.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i *% 31);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = usage_file_name, .data = bytes });
+    var file = try tmp.dir.openFile(testing.io, usage_file_name, .{});
+    defer file.close(testing.io);
+    const read = try testing.allocator.alloc(u8, bytes.len);
+    defer testing.allocator.free(read);
+
+    var abandoned: std.atomic.Value(bool) = .init(false);
+    try readExactUnlessAbandoned(testing.io, file, read, 0, &abandoned);
+    try testing.expectEqualSlices(u8, bytes, read);
+
+    abandoned.store(true, .release);
+    try testing.expectError(error.UsageLockAbandoned, readExactUnlessAbandoned(testing.io, file, read, 0, &abandoned));
+}
+
+test "abandoning a first read stops it and leaves the ledger as it was" {
+    const Abandoner = struct {
+        fn hit(ctx: ?*anyopaque, point: Point) void {
+            if (point != .lock_acquired) return;
+            const store: *Store = @ptrCast(@alignCast(ctx.?));
+            store.abandon();
+        }
+    };
+    var home = Home.init();
+    defer home.deinit();
+    {
+        var writer = home.store(.read_write);
+        defer writer.deinit();
+        _ = try writer.append(.{ .generation = testFact(testId(1), 1, 1) }, now_fixed);
+    }
+    const before = try home.ledgerBytes();
+    defer testing.allocator.free(before);
+
+    // An abandoned read leaves its buffer and partial index to the process
+    // exit, so this store allocates from an arena.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var store = Store.init(arena.allocator(), testing.io, .{ .home = home.tmp.dir, .mode = .read_write });
+    defer store.deinit();
+    store.options.probe = .{ .ctx = &store, .hit = Abandoner.hit };
+    try testing.expectError(error.UsageLockAbandoned, store.append(.{ .generation = testFact(testId(2), 1, 1) }, now_fixed));
+
+    const after = try home.ledgerBytes();
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings(before, after);
 }
 
 test "read cache: unchanged file is not re-parsed, any change is" {

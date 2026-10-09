@@ -6118,7 +6118,8 @@ test(
       };
       const settingsPath = join(home, ".fx", "settings.json");
       const routes = [
-        // Session title calls would add usage records these totals don't count.
+        // The fake title replies carry no generation id or cost, which would
+        // leave these totals incomplete.
         { settings: { provider: "gateway", model: FAKE_GATEWAY_MODEL, session_titles: false }, text: "GATEWAY_USAGE_OK" },
         { settings: { provider: "codex", codex_model: "gpt-5.6-sol", session_titles: false }, text: "CODEX_USAGE_OK" },
         { settings: { provider: "grok", grok_model: "grok-4.20", session_titles: false }, text: "GROK_USAGE_OK" },

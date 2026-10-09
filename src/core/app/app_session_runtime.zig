@@ -1119,8 +1119,6 @@ const TitleGenerationLoad = struct {
 
     const Status = enum { none, installed, dropped, failed };
 
-    const title_close_grace_ms: u32 = 1500;
-
     fn deinit(self: *TitleGenerationLoad) void {
         if (self.task) |task| {
             debug_trace.logf("session", "event=title_generation_dropped reason=deinit", .{});
@@ -1134,16 +1132,10 @@ const TitleGenerationLoad = struct {
     }
 
     /// Ends the attempt for a closing session: its call records into that
-    /// session's usage, which settles next. A title usually answers within
-    /// the grace period; cancelling it earlier would leave a possibly billed
-    /// call without a receipt.
+    /// session's usage, which settles next.
     fn dropForClose(self: *TitleGenerationLoad) void {
         const task = self.task orelse return;
-        var waited_ms: u32 = 0;
-        while (!task.isDone() and waited_ms < title_close_grace_ms) : (waited_ms += 10) {
-            io_mod.sleep(10 * std.time.ns_per_ms);
-        }
-        debug_trace.logf("session", "event=title_generation_dropped reason=session_close session={s} done={}", .{ task.session_id, task.isDone() });
+        debug_trace.logf("session", "event=title_generation_dropped reason=session_close session={s}", .{task.session_id});
         task.destroy();
         self.task = null;
     }

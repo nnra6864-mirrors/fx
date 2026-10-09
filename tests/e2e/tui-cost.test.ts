@@ -41,8 +41,8 @@ afterEach(async () => {
   }
 });
 
-// The fake gateway answers every request with the same generation, so a
-// session title call would share the turn's generation id. These tests
+// The fake gateway's default title reply has no generation id or cost, so a
+// recorded title call would leave these sessions incomplete. These tests
 // count exact turn totals, so they run without session titles.
 function disableSessionTitles(home: string) {
   const settings = join(home, ".fx", "settings.json");
