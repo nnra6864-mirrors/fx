@@ -1021,6 +1021,8 @@ if (durabilityKind === "local") {
       await turn.accepted;
       // The first worker waits on a model request that never answers.
       await until(() => requests.length > requestsBefore, "the first worker's model request");
+      // Its model request can go out before its claim lands.
+      await until(async () => (await first[internals].lastLease(session.id)) !== null, "the first worker's claim");
       const holder = (await first[internals].lastLease(session.id)).holder;
       // Its renewals stall until its lease runs out, and another worker
       // takes the session over, as the queue's next delivery would.
