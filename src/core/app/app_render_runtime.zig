@@ -2724,7 +2724,7 @@ test "pending prompt on a full screen is visible before adoption and keeps its r
     var history: std.ArrayList(u8) = .empty;
     defer history.deinit(alloc);
     var offset: u64 = 0;
-    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, "previous answer\n" ** 60, .unknown_raw);
+    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, text_utils.repeat("previous answer\n", 60), .unknown_raw);
     const summary = "  6m 25s (↑14 ↓30k)";
     _ = try app.shell.appendRawTranscriptEntryClassified(alloc, summary, .turn_summary);
     app.shell.render_requests.request(.first_frame);
@@ -2799,7 +2799,7 @@ test "pending steering on a full screen paints below the summary and leaves no f
     var history: std.ArrayList(u8) = .empty;
     defer history.deinit(alloc);
     var offset: u64 = 0;
-    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, "previous answer\n" ** 60, .unknown_raw);
+    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, text_utils.repeat("previous answer\n", 60), .unknown_raw);
     const summary = "  6m 25s (↑14 ↓30k)";
     _ = try app.shell.appendRawTranscriptEntryClassified(alloc, summary, .turn_summary);
     app.shell.render_requests.request(.first_frame);

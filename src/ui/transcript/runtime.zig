@@ -1678,7 +1678,7 @@ test "user prompt card commit caches the same source a frame would rebuild" {
     defer runtime.deinit(alloc);
     var metrics: Metrics = .{};
     _ = try runtime.appendRawTranscriptEntryClassified(alloc, "WELCOME_ROW\n", .welcome);
-    _ = try runtime.appendRawTranscriptEntryClassified(alloc, "previous answer\n" ** 40, .unknown_raw);
+    _ = try runtime.appendRawTranscriptEntryClassified(alloc, text_utils.repeat("previous answer\n", 40), .unknown_raw);
     _ = try runtime.appendRawTranscriptEntryClassified(alloc, "  6m 25s (↑14 ↓30k)", .turn_summary);
     const revision_before = runtime.full_transcript_content_revision;
 

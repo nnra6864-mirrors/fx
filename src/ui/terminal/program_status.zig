@@ -346,7 +346,7 @@ test "program status messages are one bounded line without control characters" {
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, report, "\x1b"));
     try std.testing.expect(std.mem.endsWith(u8, report, terminator));
 
-    const long = "é" ** 200;
+    const long = text_utils.repeat("é", 200);
     const long_report = reporter.update(.{ .blocked = .{ .kind = .permission, .message = long } }).?;
     const message = try decodedMessage(long_report, &decoded);
     try std.testing.expect(message.len <= max_message_bytes);

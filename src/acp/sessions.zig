@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const io_mod = @import("../core/shared/io.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const mem_utils = @import("../core/shared/mem_utils.zig");
+const text_utils = @import("../core/shared/text_utils.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const mcp_servers = @import("mcp_servers.zig");
@@ -3573,6 +3574,6 @@ test "libfx/new rejects a session id that is not header and path safe" {
     for (bad) |params| {
         try std.testing.expectError(error.InvalidSessionId, requestedLibfxSessionId(alloc, params));
     }
-    const long = "{\"sessionId\":\"" ++ "a" ** 256 ++ "\"}";
+    const long = "{\"sessionId\":\"" ++ text_utils.repeat("a", 256) ++ "\"}";
     try std.testing.expectError(error.InvalidSessionId, requestedLibfxSessionId(alloc, long));
 }
