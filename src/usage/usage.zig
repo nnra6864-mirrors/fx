@@ -1,12 +1,11 @@
 //! The usage module's front door.
 //!
-//! - `Profile`: one per process. Opens nothing until first use, and a
-//!   `read_only` profile never creates `~/.fx`. Rolling views, and the
-//!   profile ledger every session publishes to.
 //! - `Ledger`: one per session (TUI, `fx ask`, each ACP session). Restores the
-//!   saved snapshot, records calls, persists checkpoints through the host's
-//!   `SessionSink`, keeps the recovery marker, and publishes to the profile.
+//!   saved snapshot, records calls, and persists checkpoints through the
+//!   host's `SessionSink`.
 //! - `Call`: one model call, from `begin` to `finish`.
+//! - `History`: usage history from AI Gateway's reports, the today, 7-day,
+//!   and 30-day views; `ViewLoader` loads it off the UI thread.
 //! - `snapshot`: the session snapshot formats the session store keeps.
 //! - `render`: the surfaces' text and JSON, byte-identical to today.
 //!
@@ -27,8 +26,6 @@ const core = @import("core/ledger.zig");
 const durable = @import("io/durable.zig");
 const gateway_history = @import("gateway_history.zig");
 const history_store = @import("io/history_store.zig");
-const markers = @import("io/markers.zig");
-const profile_store = @import("io/profile.zig");
 const receipt = @import("receipt.zig");
 pub const snapshot = @import("codec/snapshot.zig");
 /// `snapshot` under a name `Ledger.snapshot` doesn't shadow.
@@ -41,7 +38,6 @@ pub const Scope = report.Scope;
 pub const View = report.View;
 pub const TurnUsage = report.TurnUsage;
 pub const Snapshot = snapshot.Snapshot;
-pub const MarkerKind = markers.Kind;
 pub const Limits = core.Limits;
 pub const Schedule = worker.Schedule;
 pub const Stats = worker.Stats;
@@ -56,7 +52,6 @@ pub const dev = struct {
     pub const receipt = @import("receipt.zig");
     pub const core = struct {
         pub const ledger = @import("core/ledger.zig");
-        pub const publish = @import("core/publish.zig");
     };
     pub const codec = struct {
         pub const record = @import("codec/record.zig");
@@ -64,233 +59,12 @@ pub const dev = struct {
     };
     pub const io = struct {
         pub const durable = @import("io/durable.zig");
-        pub const markers = @import("io/markers.zig");
-        pub const profile = @import("io/profile.zig");
         pub const worker = @import("io/worker.zig");
     };
 };
 
 /// The production Gateway origin.
 pub const default_origin = "https://ai-gateway.vercel.sh";
-
-// ---------------------------------------------------------------------------
-// Profile
-
-pub const Profile = struct {
-    gpa: Allocator,
-    io: Io,
-    home: Io.Dir,
-    mode: Mode,
-    recovery_source: ?host.RecoverySource,
-    probe: durable.Probe,
-    store_lock: Io.Mutex = .init,
-    store: profile_store.Store,
-
-    pub const Mode = profile_store.Mode;
-
-    pub const Options = struct {
-        /// The directory that holds `.fx` (the user's HOME). Borrowed; open
-        /// it with `.iterate = true`.
-        home: Io.Dir,
-        mode: Mode,
-        /// Reads marked sessions for rolling views. Without it every marker
-        /// is an orphan: an incident at its protected time.
-        recovery: ?host.RecoverySource = null,
-        /// Crash points, for tests and the dev lab. Empty in production.
-        probe: durable.Probe = .{},
-    };
-
-    /// Does no I/O. The profile must not move while a ledger is open.
-    pub fn init(gpa: Allocator, io: Io, options: Options) Profile {
-        return .{
-            .gpa = gpa,
-            .io = io,
-            .home = options.home,
-            .mode = options.mode,
-            .recovery_source = options.recovery,
-            .probe = options.probe,
-            .store = .init(gpa, io, .{ .home = options.home, .mode = options.mode, .probe = options.probe }),
-        };
-    }
-
-    /// Every ledger must be closed first.
-    pub fn deinit(p: *Profile) void {
-        p.store.deinit();
-        p.* = undefined;
-    }
-
-    /// A rolling view (24h, 7d, 30d) at `now_ms`: the profile ledger plus
-    /// what marked sessions still owe it. The caller owns the result.
-    pub fn view(p: *Profile, gpa: Allocator, scope: Scope, now_ms: i64) !View {
-        if (scope == .session) return error.SessionScope;
-        var out: [1]View = undefined;
-        try p.rolling(gpa, now_ms, &.{scope}, &out);
-        return out[0];
-    }
-
-    /// The three rolling views, in `Scope.rolling` order, from one read of
-    /// the profile ledger. The caller owns all three.
-    pub fn views(p: *Profile, gpa: Allocator, now_ms: i64) ![Scope.rolling.len]View {
-        var out: [Scope.rolling.len]View = undefined;
-        try p.rolling(gpa, now_ms, &Scope.rolling, &out);
-        return out;
-    }
-
-    /// Builds `out[i]` for `scopes[i]` from one read. On error `out` holds
-    /// nothing owned.
-    fn rolling(p: *Profile, gpa: Allocator, now_ms: i64, scopes: []const Scope, out: []View) !void {
-        var stored = blk: {
-            p.store_lock.lockUncancelable(p.io);
-            defer p.store_lock.unlock(p.io);
-            break :blk try p.store.read();
-        };
-        defer stored.release();
-        var collector: report.RecoveryCollector = .{};
-        defer collector.deinit(gpa);
-        try p.collectRecovery(gpa, &collector);
-        const contents = stored.ledger();
-        const ledger: report.LedgerContents = .{
-            .coverage_started_at_ms = contents.coverage_started_at_ms,
-            .facts = contents.facts,
-            .pending = contents.pending,
-            .incidents = contents.incidents,
-        };
-        var built: usize = 0;
-        errdefer for (out[0..built]) |*view_| view_.deinit(gpa);
-        for (scopes, out) |scope, *dst| {
-            dst.* = try report.rollingView(gpa, ledger, collector.recovery(), scope, now_ms, .{});
-            built += 1;
-        }
-    }
-
-    /// Process exit: stop waiting on `usage.lock` held by another process.
-    /// What is unpublished stays in the session checkpoints and under their
-    /// markers. Safe from any thread.
-    pub fn abandon(p: *Profile) void {
-        p.store.abandon();
-    }
-
-    /// What every marked session still owes the profile ledger. Malformed
-    /// and orphan markers are incidents; a session that can't be
-    /// read or proven current is unknown, as today.
-    fn collectRecovery(p: *Profile, gpa: Allocator, collector: *report.RecoveryCollector) Allocator.Error!void {
-        if (p.recovery_source) |source| if (!source.available()) {
-            collector.markUnknown();
-            return;
-        };
-        for ([_]markers.Kind{ .v1, .v2 }) |kind| {
-            var registry = markers.list(gpa, p.io, p.home, kind) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    collector.markUnknown();
-                    continue;
-                },
-            };
-            defer registry.deinit(gpa);
-            if (registry.omitted > 0) collector.markUnknown();
-            for (registry.entries) |entry| switch (entry.state) {
-                .malformed => {
-                    const modified_ns = entry.modified_at_ns orelse {
-                        collector.markUnknown();
-                        continue;
-                    };
-                    try collector.addIncident(gpa, .{ .occurred_at_ms = msFromNs(modified_ns), .completeness = .incomplete });
-                },
-                .marker => |protected_ms| try p.recoverSession(gpa, collector, kind, entry, protected_ms),
-            };
-        }
-    }
-
-    fn recoverSession(p: *Profile, gpa: Allocator, collector: *report.RecoveryCollector, kind: markers.Kind, entry: markers.Entry, protected_ms: i64) Allocator.Error!void {
-        const orphan: report.Incident = .{ .occurred_at_ms = @max(protected_ms, 0), .completeness = .incomplete };
-        const source = p.recovery_source orelse return collector.addIncident(gpa, orphan);
-        const saved = source.load(switch (kind) {
-            .v1 => .v1,
-            .v2 => .v2,
-        }, entry.name) orelse return collector.addIncident(gpa, orphan);
-        switch (kind) {
-            .v1 => {
-                var sidecar = snapshot.parseSidecar(gpa, saved.bytes) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => return collector.markUnknown(),
-                };
-                defer sidecar.deinit(gpa);
-                const marker_ns = entry.modified_at_ns orelse return collector.markUnknown();
-                if (!std.mem.eql(u8, sidecar.session_id, entry.name)) return collector.markUnknown();
-                const newer = report.v1CheckpointIsNewer(&sidecar.snapshot, saved.updated_at_ms, saved.modified_ns, marker_ns, protected_ms);
-                try collector.addSession(gpa, &sidecar.snapshot, saved.updated_at_ms, newer);
-            },
-            .v2 => {
-                var value = snapshot.parseV2Value(gpa, saved.bytes) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => return collector.markUnknown(),
-                };
-                defer value.deinit(gpa);
-                const newer = report.v2CheckpointIsNewer(&value.snapshot, value.at_ms, protected_ms);
-                try collector.addSession(gpa, &value.snapshot, value.at_ms, newer);
-            },
-        }
-    }
-
-    /// Opens one session's ledger and starts what its saved snapshot owes.
-    pub fn openLedger(p: *Profile, options: Ledger.Options) !*Ledger {
-        if (p.mode == .read_only) return error.ReadOnlyProfile;
-        if (!markers.validSessionId(options.marker, options.session_id)) return error.InvalidSessionId;
-        if (options.origin.len == 0 or options.origin.len > core.max_origin_bytes) return error.InvalidOrigin;
-        const l = try p.gpa.create(Ledger);
-        errdefer p.gpa.destroy(l);
-        const session_id = try p.gpa.dupe(u8, options.session_id);
-        errdefer p.gpa.free(session_id);
-        const origin = try p.gpa.dupe(u8, options.origin);
-        errdefer p.gpa.free(origin);
-        var limits = options.limits;
-        limits.bridge_origin_bytes = @intCast(origin.len);
-        l.* = .{
-            .gpa = p.gpa,
-            .io = p.io,
-            .profile = p,
-            .sink = options.sink,
-            .kind = options.marker,
-            .session_id = session_id,
-            .origin = origin,
-            .limits = limits,
-            .can_look_up = options.lookup != null,
-            .worker = undefined,
-        };
-
-        // Unreadable counts as present: the publication machine then clears
-        // it rather than trusting it gone.
-        const marker = if (markers.read(p.io, p.home, options.marker, session_id)) |found| found != null else |_| true;
-        try l.initWorker(options.saved, marker, .{
-            .limits = limits,
-            .start = options.start,
-            .lookup = options.lookup orelse l.noLookup(),
-            .sink = .{ .context = l, .vtable = &Ledger.sink_vtable },
-            .publisher = .{ .context = l, .vtable = &Ledger.publisher_vtable },
-            .markers = .{ .context = l, .vtable = &Ledger.markers_vtable },
-            .existing_marker = marker,
-            .trace_instance = options.trace_instance,
-            .schedule = options.schedule,
-            .tracer = options.tracer,
-            .wall_start = options.wall_start,
-        });
-        l.worker.start();
-        return l;
-    }
-
-    fn append(p: *Profile, event: profile_store.Event) worker.Publisher.PublishError!profile_store.Outcome {
-        p.store_lock.lockUncancelable(p.io);
-        defer p.store_lock.unlock(p.io);
-        return p.store.append(event, wallMs(p.io)) catch |err| switch (err) {
-            error.UsageLockBusy => error.Busy,
-            else => error.Failed,
-        };
-    }
-};
-
-fn msFromNs(ns: i128) i64 {
-    return @intCast(std.math.clamp(@divFloor(ns, std.time.ns_per_ms), 0, std.math.maxInt(i64)));
-}
 
 fn wallMs(io: Io) i64 {
     return Io.Clock.Timestamp.now(io, .real).raw.toMilliseconds();
@@ -354,11 +128,9 @@ pub const Saved = union(enum) {
 pub const Ledger = struct {
     gpa: Allocator,
     io: Io,
-    /// Null for a detached ledger (`openDetached`).
-    profile: ?*Profile,
+    /// Null for a detached ledger that lives in memory only.
     sink: ?host.SessionSink,
-    kind: markers.Kind,
-    session_id: []u8,
+    /// The Gateway origin lookup entries ask. Owned.
     origin: []u8,
     limits: core.Limits,
     /// The host gave a lookup transport. Without one, credentials only name
@@ -366,16 +138,11 @@ pub const Ledger = struct {
     can_look_up: bool,
     /// Written only under the worker's checkpoint lock.
     buffers: checkpoint.Buffers = .{},
-    /// The error the last marker write gave (`@intFromError`), 0 when it
-    /// succeeded: the cause behind a `CheckpointFailed` from a marker.
-    marker_error: std.atomic.Value(u16) = .init(0),
     context_lock: Io.Mutex = .init,
     context: Context = .{},
     worker: worker.Worker,
 
     pub const Options = struct {
-        session_id: []const u8,
-        marker: MarkerKind = .v1,
         /// Null for a new session.
         saved: ?Saved = null,
         /// A new session's start, when there is no saved snapshot.
@@ -405,47 +172,65 @@ pub const Ledger = struct {
         limits: Limits = .{},
     };
 
-    /// A ledger with no profile: it never touches `~/.fx`, starts no task,
-    /// and looks nothing up. Exact calls settle into its session totals at
-    /// once, as in a session nothing publishes to; lookup entries wait.
-    /// For single-threaded hosts and sessions whose usage is counted
-    /// nowhere else. Rolling views are refused.
-    pub fn openDetached(gpa: Allocator, io: Io, options: DetachedOptions) !*Ledger {
+    /// Opens one session's ledger and starts what its saved snapshot owes.
+    pub fn open(gpa: Allocator, io: Io, options: Options) !*Ledger {
+        if (options.origin.len == 0 or options.origin.len > core.max_origin_bytes) return error.InvalidOrigin;
         const l = try gpa.create(Ledger);
         errdefer gpa.destroy(l);
-        const session_id = try gpa.dupe(u8, "");
-        errdefer gpa.free(session_id);
-        const origin = try gpa.dupe(u8, default_origin);
+        const origin = try gpa.dupe(u8, options.origin);
         errdefer gpa.free(origin);
-        var limits = options.limits;
-        limits.bridge_origin_bytes = @intCast(origin.len);
         l.* = .{
             .gpa = gpa,
             .io = io,
-            .profile = null,
             .sink = options.sink,
-            .kind = .v1,
-            .session_id = session_id,
             .origin = origin,
-            .limits = limits,
-            .can_look_up = false,
+            .limits = options.limits,
+            .can_look_up = options.lookup != null,
             .worker = undefined,
         };
-        try l.initWorker(options.saved, false, .{
-            .limits = limits,
+        try l.initWorker(options.saved, .{
+            .limits = options.limits,
             .start = options.start,
-            .lookup = l.noLookup(),
+            .lookup = options.lookup orelse l.noLookup(),
             .sink = .{ .context = l, .vtable = &Ledger.sink_vtable },
-            .publisher = .{ .context = l, .vtable = &Ledger.detached_publisher_vtable },
-            .inline_only = true,
+            .trace_instance = options.trace_instance,
+            .schedule = options.schedule,
+            .tracer = options.tracer,
             .wall_start = options.wall_start,
         });
-        // A restored backlog settles now.
-        l.worker.publishOwed();
+        l.worker.start();
         return l;
     }
 
-    fn initWorker(l: *Ledger, saved: ?Saved, marker: bool, options: worker.Options) !void {
+    /// A ledger that starts no task and looks nothing up. Exact calls settle
+    /// into its totals at once; lookup entries wait. For single-threaded
+    /// hosts, and for sessions that persist through no sink at all.
+    pub fn openDetached(gpa: Allocator, io: Io, options: DetachedOptions) !*Ledger {
+        const l = try gpa.create(Ledger);
+        errdefer gpa.destroy(l);
+        const origin = try gpa.dupe(u8, default_origin);
+        errdefer gpa.free(origin);
+        l.* = .{
+            .gpa = gpa,
+            .io = io,
+            .sink = options.sink,
+            .origin = origin,
+            .limits = options.limits,
+            .can_look_up = false,
+            .worker = undefined,
+        };
+        try l.initWorker(options.saved, .{
+            .limits = options.limits,
+            .start = options.start,
+            .lookup = l.noLookup(),
+            .sink = .{ .context = l, .vtable = &Ledger.sink_vtable },
+            .inline_only = true,
+            .wall_start = options.wall_start,
+        });
+        return l;
+    }
+
+    fn initWorker(l: *Ledger, saved: ?Saved, options: worker.Options) !void {
         var parsed: ?Saved.Parsed = if (saved) |value| try value.parse(l.gpa) else null;
         defer if (parsed) |*value| value.deinit(l.gpa);
         const restore_buffers = try l.gpa.create(checkpoint.RestoreBuffers);
@@ -453,7 +238,7 @@ pub const Ledger = struct {
         var with_restore = options;
         if (parsed) |*value| {
             const restored = try checkpoint.restoredOf(&value.snapshot, value.at_ms, restore_buffers);
-            with_restore.restore = .{ .saved = restored, .saved_at_ms = value.at_ms, .marker = marker };
+            with_restore.restore = .{ .saved = restored, .saved_at_ms = value.at_ms };
         }
         try l.worker.init(l.gpa, l.io, with_restore);
     }
@@ -480,13 +265,12 @@ pub const Ledger = struct {
         context_used: ?u64 = null,
     };
 
-    /// Joins the worker after a bounded final publish and checkpoint, then
-    /// frees the ledger. The ledger is gone even when this fails.
+    /// Joins the worker after a final checkpoint, then frees the ledger. The
+    /// ledger is gone even when this fails.
     pub fn close(l: *Ledger) worker.CloseError!void {
         const result = l.worker.close();
         l.worker.deinit();
         const gpa = l.gpa;
-        gpa.free(l.session_id);
         gpa.free(l.origin);
         gpa.destroy(l);
         return result;
@@ -555,13 +339,9 @@ pub const Ledger = struct {
         return l.context.context_used;
     }
 
-    /// The session view, or a rolling view through the profile. The caller
-    /// owns the result.
-    pub fn view(l: *Ledger, gpa: Allocator, scope: Scope, now_ms: i64, turn: TurnUsage) !View {
-        if (scope != .session) {
-            const profile = l.profile orelse return error.NoProfile;
-            return profile.view(gpa, scope, now_ms);
-        }
+    /// The session view. Usage history is `History`'s. The caller owns the
+    /// result.
+    pub fn view(l: *Ledger, gpa: Allocator, now_ms: i64, turn: TurnUsage) !View {
         var rows: [Limits.ceiling]core.ModelRow = undefined;
         const live = l.worker.view(&rows);
         var copy: core.Ledger = try .init(gpa, l.limits, .fresh);
@@ -570,16 +350,16 @@ pub const Ledger = struct {
         const buffers = try gpa.create(checkpoint.Buffers);
         defer gpa.destroy(buffers);
         const times: checkpoint.Times = .{ .at_ms = now_ms, .opened_at_ms = l.worker.openedAt() };
-        const snap = checkpoint.snapshotOf(&copy, times, "", buffers);
+        const snap = checkpoint.snapshotOf(&copy, times, buffers);
         var session = try report.sessionViewFromSnapshot(gpa, &snap, now_ms, .fromLedger(live.unpriced), turn);
-        const open = copy.active.items.len;
-        if (open == 0) return session;
+        const in_flight = copy.active.items.len;
+        if (in_flight == 0) return session;
         // `completeness` keeps the checkpoint's reading, so ACP reports no
         // cost mid-call; the dashboard shows what the session settles to.
         var settled_times = times;
         settled_times.live = true;
-        const settled = checkpoint.snapshotOf(&copy, settled_times, "", buffers);
-        session.in_flight = std.math.cast(u32, open) orelse std.math.maxInt(u32);
+        const settled = checkpoint.snapshotOf(&copy, settled_times, buffers);
+        session.in_flight = std.math.cast(u32, in_flight) orelse std.math.maxInt(u32);
         session.settled_completeness = report.billingCompleteness(settled.billing);
         if (session.session_activity) |*activity| activity.api_duration_complete = settled.api_duration_complete;
         return session;
@@ -593,7 +373,7 @@ pub const Ledger = struct {
         l.worker.copyLedger(&copy);
         const buffers = try gpa.create(checkpoint.Buffers);
         defer gpa.destroy(buffers);
-        const snap = checkpoint.snapshotOf(&copy, .{ .at_ms = wallMs(l.io), .opened_at_ms = l.worker.openedAt() }, l.origin, buffers);
+        const snap = checkpoint.snapshotOf(&copy, .{ .at_ms = wallMs(l.io), .opened_at_ms = l.worker.openedAt() }, buffers);
         return snapshot_codec.dupe(gpa, snap);
     }
 
@@ -601,19 +381,8 @@ pub const Ledger = struct {
         return l.worker.stats();
     }
 
-    /// Why the last marker write failed, such as `error.NoSpaceLeft`, or
-    /// null when it succeeded. A host reports this in place of
-    /// `CheckpointFailed`, which says only that the checkpoint isn't durable.
-    pub fn markerFailure(l: *Ledger) ?anyerror {
-        const code = l.marker_error.load(.acquire);
-        if (code == 0) return null;
-        return @errorFromInt(code);
-    }
-
     fn step(l: *Ledger, event: worker.CallEvent) worker.ReportError!core.Transition {
-        const transition = try l.worker.report(event);
-        if (l.profile == null) l.worker.publishOwed();
-        return transition;
+        return l.worker.report(event);
     }
 
     fn observeContext(l: *Ledger, sequence: core.Sequence, used: ?u64) void {
@@ -631,98 +400,9 @@ pub const Ledger = struct {
     fn persist(context: *anyopaque, frozen: *const worker.Checkpoint) worker.Sink.PersistError!void {
         const l: *Ledger = @ptrCast(@alignCast(context));
         const sink = l.sink orelse return;
-        const snap = checkpoint.snapshotOf(frozen.ledger, .{ .at_ms = frozen.at_ms, .opened_at_ms = frozen.opened_at_ms }, l.origin, &l.buffers);
+        const snap = checkpoint.snapshotOf(frozen.ledger, .{ .at_ms = frozen.at_ms, .opened_at_ms = frozen.opened_at_ms }, &l.buffers);
         const saved: host.Checkpoint = .{ .number = frozen.number, .at_ms = frozen.at_ms, .snapshot = &snap };
         return sink.persist(&saved);
-    }
-
-    const publisher_vtable: worker.Publisher.VTable = .{
-        .publish = publishFact,
-        .publish_pending = publishPending,
-        .publish_incident = publishIncident,
-    };
-
-    /// No profile: a fact is accepted in memory, so it settles into the
-    /// session totals; incidents stay in the session's checkpoint.
-    const detached_publisher_vtable: worker.Publisher.VTable = .{
-        .publish = acceptFact,
-        .publish_pending = null,
-        .publish_incident = null,
-    };
-
-    fn acceptFact(_: *anyopaque, _: *const core.Fact) worker.Publisher.PublishError!worker.Publisher.Answer {
-        return .appended;
-    }
-
-    fn publishFact(context: *anyopaque, fact: *const core.Fact) worker.Publisher.PublishError!worker.Publisher.Answer {
-        const l: *Ledger = @ptrCast(@alignCast(context));
-        const outcome = try l.profile.?.append(.{ .generation = .{
-            .id = fact.id.slice(),
-            .created_at_ms = fact.created_at_ms,
-            .model = fact.model,
-            .input_tokens = fact.input_tokens,
-            .output_tokens = fact.output_tokens,
-            .cache_read_tokens = fact.cache_read_tokens,
-            .cache_write_tokens = fact.cache_write_tokens,
-            .reasoning_tokens = fact.reasoning_tokens,
-            .billable_web_search_calls = fact.billable_web_search_calls,
-            .total_cost = fact.total_cost,
-        } });
-        return switch (outcome) {
-            .appended => .appended,
-            .duplicate => .duplicate,
-            .conflict => .conflict,
-        };
-    }
-
-    fn publishPending(context: *anyopaque, record: *const worker.Publisher.PendingRecord) worker.Publisher.PublishError!void {
-        const l: *Ledger = @ptrCast(@alignCast(context));
-        // A second variant of an id is the store's business (an incident);
-        // either way the record is down.
-        _ = try l.profile.?.append(.{ .pending = .{ .id = record.id, .observed_at_ms = record.observed_at_ms } });
-    }
-
-    fn publishIncident(context: *anyopaque, incident: core.Incident) worker.Publisher.PublishError!void {
-        const l: *Ledger = @ptrCast(@alignCast(context));
-        _ = try l.profile.?.append(.{ .incident = .{
-            .occurred_at_ms = incident.occurred_at_ms,
-            .completeness = switch (incident.completeness) {
-                .pending => .pending,
-                .incomplete => .incomplete,
-            },
-        } });
-    }
-
-    const markers_vtable: worker.Markers.VTable = .{ .prepare = prepareMarker, .clear = clearMarker };
-
-    fn prepareMarker(context: *anyopaque, input: worker.Markers.Input) worker.Markers.Error!i64 {
-        const l: *Ledger = @ptrCast(@alignCast(context));
-        const p = l.profile.?;
-        var cause: ?anyerror = null;
-        var probe = p.probe;
-        probe.cause = &cause;
-        const prepared = markers.prepareCheckpoint(p.io, p.home, l.kind, l.session_id, .{
-            .now_ms = input.now_ms,
-            .saved_at_ms = input.saved_at_ms,
-            .saved_owes = input.saved_owes,
-            .next_owes = input.next_owes,
-        }, probe) catch |err| return l.markerFailed(cause orelse err);
-        // Only a marker made durable answers an earlier failure; a checkpoint
-        // that owes nothing writes none.
-        if (input.next_owes) l.marker_error.store(0, .release);
-        return prepared.at_ms;
-    }
-
-    fn clearMarker(context: *anyopaque) worker.Markers.Error!void {
-        const l: *Ledger = @ptrCast(@alignCast(context));
-        const p = l.profile.?;
-        _ = markers.clear(p.io, p.home, l.kind, l.session_id, p.probe) catch |err| return l.markerFailed(err);
-        l.marker_error.store(0, .release);
-    }
-
-    fn markerFailed(l: *Ledger, err: anyerror) error{MarkerFailed} {
-        l.marker_error.store(@intFromError(err), .release);
-        return error.MarkerFailed;
     }
 
     /// For a host with no lookup transport: no origin is trusted. Lookups
@@ -1056,7 +736,9 @@ pub const History = struct {
     };
 
     pub const Options = struct {
-        /// The directory that holds `.fx` (the user's HOME). Borrowed.
+        /// The directory that holds `.fx` (the user's HOME). Borrowed; open
+        /// it with `.iterate = true`, since storing a snapshot syncs it and
+        /// Linux can't sync a directory opened any other way (`O_PATH`).
         home: Io.Dir,
         /// fx's AI Gateway transport. Null shows only the stored snapshot.
         lookup: ?host.Lookup = null,
@@ -1403,12 +1085,9 @@ test {
     _ = @import("codec/snapshot.zig");
     _ = @import("gateway_history.zig");
     _ = @import("core/ledger.zig");
-    _ = @import("core/publish.zig");
     _ = @import("host.zig");
     _ = @import("io/durable.zig");
     _ = @import("io/history_store.zig");
-    _ = @import("io/markers.zig");
-    _ = @import("io/profile.zig");
     _ = @import("io/worker.zig");
     _ = @import("receipt.zig");
     _ = @import("render.zig");
@@ -1440,16 +1119,6 @@ const TestSink = struct {
     fn deinit(s: *TestSink) void {
         if (s.bytes) |bytes| testing.allocator.free(bytes);
     }
-
-    fn source(s: *TestSink) host.RecoverySource {
-        return .{ .context = s, .vtable = &.{ .load = load } };
-    }
-
-    fn load(context: *anyopaque, kind: host.RecoverySource.Kind, session_id: []const u8) ?host.RecoverySource.Saved {
-        const s: *TestSink = @ptrCast(@alignCast(context));
-        if (kind != .v1 or !std.mem.eql(u8, session_id, "sess-1")) return null;
-        return .{ .bytes = s.bytes orelse return null, .updated_at_ms = s.at_ms };
-    }
 };
 
 /// Every lookup answers 404, which retries.
@@ -1478,52 +1147,21 @@ const test_finish =
     \\{"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":130,"cacheRead":20,"cacheWrite":10},"outputTokens":{"total":25,"reasoning":5}},"providerMetadata":{"gateway":{"generationId":"gen_01ARZ3NDEKTSV4RRFFQ69G5FAV","gatewayCost":"0.0123","routing":{"canonicalSlug":"provider/canonical"}}}}
 ;
 
-fn markerExists(io: Io, home: Io.Dir) !bool {
-    return (try markers.read(io, home, .v1, "sess-1")) != null;
-}
-
-test "a read-only profile never creates ~/.fx and can't open a ledger" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var profile = Profile.init(testing.allocator, testing.io, .{ .home = tmp.dir, .mode = .read_only });
-    defer profile.deinit();
-    var view = try profile.view(testing.allocator, .days_30, wallMs(testing.io));
-    defer view.deinit(testing.allocator);
-    try testing.expectEqual(report.Coverage.not_started, view.coverage);
-    try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, ".fx", .{}));
-    var sink: TestSink = .{};
-    defer sink.deinit();
-    var lookup: TestLookup = .{};
-    try testing.expectError(error.ReadOnlyProfile, profile.openLedger(.{ .session_id = "sess-1", .sink = sink.handle(), .lookup = lookup.handle() }));
-    try testing.expectError(error.SessionScope, profile.view(testing.allocator, .session, 0));
-}
-
-test "an exact receipt is published once, its marker clears, and the session restores" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var profile = Profile.init(testing.allocator, testing.io, .{ .home = tmp.dir, .mode = .read_write });
-    defer profile.deinit();
+test "an exact receipt settles once, and the session restores with it" {
     var sink: TestSink = .{};
     defer sink.deinit();
     var lookup: TestLookup = .{};
 
-    const ledger = try profile.openLedger(.{ .session_id = "sess-1", .sink = sink.handle(), .lookup = lookup.handle() });
+    const ledger = try Ledger.open(testing.allocator, testing.io, .{ .sink = sink.handle(), .lookup = lookup.handle() });
     {
         errdefer ledger.close() catch {};
         var call = try ledger.begin(.gateway);
         call.gatewayEvent(test_id_event);
         call.gatewayEvent(test_finish);
         const finished = try call.finish(.completed);
-        try testing.expectEqual(core.State.fact, finished.to);
+        try testing.expectEqual(core.State.settled, finished.to);
     }
     try ledger.close();
-    try testing.expect(!try markerExists(testing.io, tmp.dir));
-
-    const now = wallMs(testing.io);
-    var rolling = try profile.view(testing.allocator, .days_30, now + 1);
-    defer rolling.deinit(testing.allocator);
-    try testing.expectEqual(report.Completeness.complete, rolling.completeness);
-    try testing.expectEqual(@as(f64, 0.0123), rolling.totals.?.total_cost);
 
     // The checkpoint holds the settled totals and owes nothing.
     var saved = try snapshot.parseSidecar(testing.allocator, sink.bytes.?);
@@ -1532,144 +1170,62 @@ test "an exact receipt is published once, its marker clears, and the session res
     try testing.expectEqual(@as(usize, 0), saved.snapshot.publication_backlog.len);
     try testing.expectEqual(@as(usize, 0), saved.snapshot.pending.len);
 
-    // Reopened from the sidecar, the session view shows the same call.
-    const again = try profile.openLedger(.{
-        .session_id = "sess-1",
+    // Reopened from the sidecar, the session view shows the same call, once.
+    const now = wallMs(testing.io);
+    const again = try Ledger.open(testing.allocator, testing.io, .{
         .saved = .{ .sidecar = .{ .bytes = sink.bytes.?, .updated_at_ms = sink.at_ms } },
         .sink = sink.handle(),
         .lookup = lookup.handle(),
     });
     {
         errdefer again.close() catch {};
-        var session = try again.view(testing.allocator, .session, now + 1, .{});
+        var session = try again.view(testing.allocator, now + 1, .{});
         defer session.deinit(testing.allocator);
         try testing.expectEqual(@as(f64, 0.0123), session.totals.?.total_cost);
         try testing.expectEqual(report.Completeness.complete, session.completeness);
     }
     try again.close();
-    // Published once: the restore didn't publish it again.
-    var after = try profile.view(testing.allocator, .days_30, now + 1);
-    defer after.deinit(testing.allocator);
-    try testing.expectEqual(@as(f64, 0.0123), after.totals.?.total_cost);
 }
 
-test "a cancelled call with an id waits for a lookup, keeps its marker, and profile views count it" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
+test "a cancelled call with an id waits for a lookup, and its checkpoint keeps it" {
     var sink: TestSink = .{};
     defer sink.deinit();
-    var profile = Profile.init(testing.allocator, testing.io, .{ .home = tmp.dir, .mode = .read_write, .recovery = sink.source() });
-    defer profile.deinit();
     var lookup: TestLookup = .{};
 
-    const ledger = try profile.openLedger(.{ .session_id = "sess-1", .sink = sink.handle(), .lookup = lookup.handle() });
+    const ledger = try Ledger.open(testing.allocator, testing.io, .{ .sink = sink.handle(), .lookup = lookup.handle() });
     {
         errdefer ledger.close() catch {};
         var call = try ledger.begin(.gateway);
         call.gatewayEvent(test_id_event);
         const finished = try call.finish(.cancelled);
         try testing.expectEqual(core.State.lookup, finished.to);
-        var session = try ledger.view(testing.allocator, .session, wallMs(testing.io), .{});
+        var session = try ledger.view(testing.allocator, wallMs(testing.io), .{});
         defer session.deinit(testing.allocator);
         try testing.expectEqual(report.Completeness.pending, session.completeness);
         // Signed out is waiting, not blocked (only a 401/403 blocks).
         try testing.expectEqual(@as(?core.UnpricedReason, .lookup_pending), session.unpriced.reason);
     }
     try ledger.close();
-    // Signed out, so nothing was looked up, and the session still owes.
+    // Signed out, so nothing was looked up, and the next run still can.
     try testing.expectEqual(@as(u32, 0), lookup.fetches.load(.monotonic));
-    try testing.expect(try markerExists(testing.io, tmp.dir));
-
-    var rolling = try profile.view(testing.allocator, .today, wallMs(testing.io) + 1);
-    defer rolling.deinit(testing.allocator);
-    try testing.expectEqual(report.Completeness.pending, rolling.completeness);
-    // The pending record and the marked session name the same id once.
-    try testing.expectEqual(@as(u64, 1), rolling.unpriced.lookup_pending);
+    var saved = try snapshot.parseSidecar(testing.allocator, sink.bytes.?);
+    defer saved.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), saved.snapshot.pending.len);
 }
 
-test "rolling views are incomplete but keep their totals when session storage is unsafe" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    const Source = struct {
-        readable: bool,
-        fn handle(s: *@This()) host.RecoverySource {
-            return .{ .context = s, .vtable = &.{ .load = load, .available = available } };
-        }
-        fn load(_: *anyopaque, _: host.RecoverySource.Kind, _: []const u8) ?host.RecoverySource.Saved {
-            return null;
-        }
-        fn available(context: *anyopaque) bool {
-            const s: *@This() = @ptrCast(@alignCast(context));
-            return s.readable;
-        }
-    };
-    var source: Source = .{ .readable = true };
-    var profile = Profile.init(testing.allocator, testing.io, .{ .home = tmp.dir, .mode = .read_write, .recovery = source.handle() });
-    defer profile.deinit();
+test "an origin the ledger can't keep is refused" {
     var sink: TestSink = .{};
     defer sink.deinit();
-    const ledger = try profile.openLedger(.{ .session_id = "sess-1", .sink = sink.handle() });
-    {
-        errdefer ledger.close() catch {};
-        var call = try ledger.begin(.gateway);
-        call.gatewayEvent(test_id_event);
-        call.gatewayEvent(test_finish);
-        try testing.expectEqual(core.State.fact, (try call.finish(.completed)).to);
-    }
-    try ledger.close();
-    const now = wallMs(testing.io) + 1;
-
-    var readable = try profile.view(testing.allocator, .days_30, now);
-    defer readable.deinit(testing.allocator);
-    try testing.expectEqual(report.Completeness.complete, readable.completeness);
-
-    source.readable = false;
-    var unsafe = try profile.view(testing.allocator, .days_30, now);
-    defer unsafe.deinit(testing.allocator);
-    try testing.expectEqual(report.Completeness.incomplete, unsafe.completeness);
-    try testing.expectEqual(@as(f64, 0.0123), readable.totals.?.total_cost);
-    try testing.expectEqual(readable.totals.?.total_cost, unsafe.totals.?.total_cost);
-    try testing.expectEqual(@as(?u64, 1), unsafe.totals.?.request_count);
-}
-
-test "a failed marker write keeps its cause for the host, and a later success clears it" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var profile = Profile.init(testing.allocator, testing.io, .{ .home = tmp.dir, .mode = .read_write });
-    defer profile.deinit();
-    var sink: TestSink = .{};
-    defer sink.deinit();
-    const ledger = try profile.openLedger(.{ .session_id = "sess-1", .sink = sink.handle() });
-    defer ledger.close() catch {};
-    try testing.expectEqual(@as(?anyerror, null), ledger.markerFailure());
-    // A file where the marker directory belongs: the marker can't be written.
-    tmp.dir.createDir(testing.io, ".fx", .fromMode(0o700)) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = ".fx/usage-recovery", .data = "" });
-    // An active call may still produce a fact, so its begin needs a marker.
-    try testing.expectError(error.CheckpointFailed, ledger.begin(.gateway));
-    const cause = ledger.markerFailure() orelse return error.TestExpectedCause;
-    try testing.expect(cause != error.MarkerFailed and cause != error.CheckpointFailed);
-
-    try tmp.dir.deleteFile(testing.io, ".fx/usage-recovery");
-    var again = try ledger.begin(.gateway);
-    // Its marker is durable: the earlier cause no longer applies.
-    try testing.expectEqual(@as(?anyerror, null), ledger.markerFailure());
-    try testing.expectEqual(core.State.unbilled, (try again.finish(.failed_unbilled)).to);
-    try testing.expectEqual(@as(?anyerror, null), ledger.markerFailure());
+    try testing.expectError(error.InvalidOrigin, Ledger.open(testing.allocator, testing.io, .{ .sink = sink.handle(), .origin = "" }));
 }
 
 test "a reopened session looks its waiting entries up once a credential arrives" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    var profile = Profile.init(testing.allocator, testing.io, .{ .home = tmp.dir, .mode = .read_write });
-    defer profile.deinit();
     var sink: TestSink = .{};
     defer sink.deinit();
     var lookup: TestLookup = .{};
-    const first = try profile.openLedger(.{ .session_id = "sess-1", .sink = sink.handle(), .lookup = lookup.handle() });
+    const first = try Ledger.open(testing.allocator, testing.io, .{ .sink = sink.handle(), .lookup = lookup.handle() });
     {
         errdefer first.close() catch {};
         var call = try first.begin(.gateway);
@@ -1679,8 +1235,7 @@ test "a reopened session looks its waiting entries up once a credential arrives"
     try first.close();
     try testing.expectEqual(@as(u32, 0), lookup.fetches.load(.monotonic));
 
-    const again = try profile.openLedger(.{
-        .session_id = "sess-1",
+    const again = try Ledger.open(testing.allocator, testing.io, .{
         .saved = .{ .sidecar = .{ .bytes = sink.bytes.?, .updated_at_ms = sink.at_ms } },
         .sink = sink.handle(),
         .lookup = lookup.handle(),
@@ -1741,11 +1296,9 @@ test "wall time counts from first use, from open, or from the session's creation
 test "without a lookup transport a credential only names the entries" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    var profile = Profile.init(testing.allocator, testing.io, .{ .home = tmp.dir, .mode = .read_write });
-    defer profile.deinit();
     var sink: TestSink = .{};
     defer sink.deinit();
-    const ledger = try profile.openLedger(.{ .session_id = "sess-1", .sink = sink.handle() });
+    const ledger = try Ledger.open(testing.allocator, testing.io, .{ .sink = sink.handle() });
     defer ledger.close() catch {};
     try ledger.setCredential(.{ .credential = .{ .bearer = "vck_key" }, .source = .ai_gateway_api_key });
     var call = try ledger.begin(.gateway);
@@ -1753,7 +1306,7 @@ test "without a lookup transport a credential only names the entries" {
     _ = try call.finish(.completed);
     try testing.io.sleep(.fromMilliseconds(20), .awake);
     try testing.expectEqual(@as(u32, 0), ledger.stats().lookups);
-    var session = try ledger.view(testing.allocator, .session, wallMs(testing.io), .{});
+    var session = try ledger.view(testing.allocator, wallMs(testing.io), .{});
     defer session.deinit(testing.allocator);
     // Waiting, as signed out: never refused as untrusted.
     try testing.expectEqual(report.Completeness.pending, session.completeness);
@@ -1776,10 +1329,8 @@ test "a begin whose checkpoint fails ends unbilled instead of staying in flight"
     };
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    var profile = Profile.init(testing.allocator, testing.io, .{ .home = tmp.dir, .mode = .read_write });
-    defer profile.deinit();
     var sink: Failing = .{ .fail_at = 1 };
-    const ledger = try profile.openLedger(.{ .session_id = "sess-1", .sink = sink.handle() });
+    const ledger = try Ledger.open(testing.allocator, testing.io, .{ .sink = sink.handle() });
     defer ledger.close() catch {};
     try testing.expectError(error.CheckpointFailed, ledger.begin(.gateway));
     var saved = try ledger.snapshot(testing.allocator);
@@ -1812,11 +1363,9 @@ test "the persisted credential identity is fx's authority, never the secret" {
     // A lookup entry carries it, whatever the secret.
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    var profile = Profile.init(testing.allocator, testing.io, .{ .home = tmp.dir, .mode = .read_write });
-    defer profile.deinit();
     var sink: TestSink = .{};
     defer sink.deinit();
-    const ledger = try profile.openLedger(.{ .session_id = "sess-1", .sink = sink.handle() });
+    const ledger = try Ledger.open(testing.allocator, testing.io, .{ .sink = sink.handle() });
     {
         errdefer ledger.close() catch {};
         try ledger.setCredential(.{ .credential = .{ .bearer = "vck_secret" }, .source = .fx_login });
@@ -1844,13 +1393,12 @@ test "a detached ledger settles exact calls in memory, starts no task, and write
         call.gatewayEvent(test_finish);
         call.observeContext(130, 25);
         const finished = try call.finish(.completed);
-        try testing.expectEqual(core.State.fact, finished.to);
-        var session = try ledger.view(testing.allocator, .session, wallMs(testing.io), .{});
+        try testing.expectEqual(core.State.settled, finished.to);
+        var session = try ledger.view(testing.allocator, wallMs(testing.io), .{});
         defer session.deinit(testing.allocator);
         try testing.expectEqual(report.Completeness.complete, session.completeness);
         try testing.expectEqual(@as(f64, 0.0123), session.totals.?.total_cost);
         try testing.expectEqual(@as(?u64, 155), ledger.liveContext());
-        try testing.expectError(error.NoProfile, ledger.view(testing.allocator, .days_30, 0, .{}));
         try testing.expectEqual(@as(u32, 0), ledger.stats().spawns);
 
         // A copy restored from its snapshot shows the same totals.
@@ -1859,7 +1407,7 @@ test "a detached ledger settles exact calls in memory, starts no task, and write
         try testing.expectEqual(snapshot.Billing.complete, saved.billing);
         const again = try Ledger.openDetached(testing.allocator, testing.io, .{ .saved = .{ .parsed = .{ .snapshot = &saved, .at_ms = wallMs(testing.io) } } });
         defer again.close() catch {};
-        var restored = try again.view(testing.allocator, .session, wallMs(testing.io), .{});
+        var restored = try again.view(testing.allocator, wallMs(testing.io), .{});
         defer restored.deinit(testing.allocator);
         try testing.expectEqual(@as(f64, 0.0123), restored.totals.?.total_cost);
         try testing.expectEqual(@as(?u64, null), again.liveContext());
@@ -1884,7 +1432,7 @@ test "a call in flight reads incomplete, as a checkpoint does, and says what it 
     _ = try done.finish(.completed);
 
     var open = try ledger.begin(.gateway);
-    var during = try ledger.view(testing.allocator, .session, wallMs(testing.io), .{});
+    var during = try ledger.view(testing.allocator, wallMs(testing.io), .{});
     defer during.deinit(testing.allocator);
     try testing.expectEqual(report.Completeness.incomplete, during.completeness);
     try testing.expectEqual(@as(?f64, null), report.completeCost(&during));
@@ -1894,7 +1442,7 @@ test "a call in flight reads incomplete, as a checkpoint does, and says what it 
     try testing.expectEqual(@as(f64, 0.0123), during.totals.?.total_cost);
 
     _ = try open.finish(.failed_unbilled);
-    var after = try ledger.view(testing.allocator, .session, wallMs(testing.io), .{});
+    var after = try ledger.view(testing.allocator, wallMs(testing.io), .{});
     defer after.deinit(testing.allocator);
     try testing.expectEqual(report.Completeness.complete, after.completeness);
     try testing.expectEqual(@as(u32, 0), after.in_flight);
@@ -1909,7 +1457,7 @@ test "a parsed event observes the same as its text" {
         defer parsed.deinit();
         call.gatewayValue(parsed.value);
     }
-    try testing.expectEqual(core.State.fact, (try call.finish(.completed)).to);
+    try testing.expectEqual(core.State.settled, (try call.finish(.completed)).to);
 }
 
 test "a subscription id the ledger refuses still ends the call" {
@@ -1918,8 +1466,8 @@ test "a subscription id the ledger refuses still ends the call" {
     var call = try ledger.begin(.codex);
     try testing.expectEqual(core.State.unpriced, (try call.finishExact(.{ .external_id = "", .model = "openai/gpt-5" })).to);
     var ok = try ledger.begin(.codex);
-    try testing.expectEqual(core.State.fact, (try ok.finishExact(.{ .external_id = "resp_1", .model = "openai/gpt-5", .input_tokens = 3 })).to);
-    var session = try ledger.view(testing.allocator, .session, wallMs(testing.io), .{});
+    try testing.expectEqual(core.State.settled, (try ok.finishExact(.{ .external_id = "resp_1", .model = "openai/gpt-5", .input_tokens = 3 })).to);
+    var session = try ledger.view(testing.allocator, wallMs(testing.io), .{});
     defer session.deinit(testing.allocator);
     try testing.expectEqual(report.Completeness.incomplete, session.completeness);
     try testing.expectEqual(@as(u64, 3), session.totals.?.input_tokens);
@@ -1928,11 +1476,9 @@ test "a subscription id the ledger refuses still ends the call" {
 test "lines are durable at flushActivity, and code completeness can be lost" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    var profile = Profile.init(testing.allocator, testing.io, .{ .home = tmp.dir, .mode = .read_write });
-    defer profile.deinit();
     var sink: TestSink = .{};
     defer sink.deinit();
-    const ledger = try profile.openLedger(.{ .session_id = "sess-1", .sink = sink.handle() });
+    const ledger = try Ledger.open(testing.allocator, testing.io, .{ .sink = sink.handle() });
     {
         errdefer ledger.close() catch {};
         ledger.recordLines(4, 2);
@@ -1997,7 +1543,7 @@ fn freeHistoryViews(views: *[Scope.rolling.len]View) void {
 }
 
 test "history views say why a credential has none" {
-    var tmp = testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fake: FakeReports = .{ .answers = &.{} };
     var history: History = .init(testing.allocator, testing.io, .{ .home = tmp.dir, .lookup = fake.lookup() });
@@ -2025,7 +1571,7 @@ test "history views say why a credential has none" {
 }
 
 test "history reads its snapshot, refreshes when due, and keeps it when a refresh fails" {
-    var tmp = testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fake: FakeReports = .{ .answers = &.{
         .{ .body = history_report },
@@ -2101,7 +1647,7 @@ test "history reads its snapshot, refreshes when due, and keeps it when a refres
 }
 
 test "the view loader shows the stored snapshot first and cancels a refresh on close" {
-    var tmp = testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fake: FakeReports = .{ .answers = &.{ .{ .body = history_report }, .{ .body = history_report }, .{ .body = history_report }, .hold } };
     var history: History = .init(testing.allocator, testing.io, .{ .home = tmp.dir, .lookup = fake.lookup() });
@@ -2132,30 +1678,12 @@ test "the view loader shows the stored snapshot first and cancels a refresh on c
     }
     try testing.expect(ready);
     try testing.expectEqual(now, loader.view(.days_7).?.history.?.as_of_ms.?);
-    while (fake.used.load(.acquire) < 4) try testing.io.sleep(.fromMilliseconds(1), .awake);
+    for (0..5000) |_| {
+        if (fake.used.load(.acquire) >= 4) break;
+        try testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try testing.expectEqual(@as(usize, 4), fake.used.load(.acquire));
     try testing.expect(loader.isLoading());
     loader.deinit();
     try testing.expectEqual(@as(usize, 4), fake.used.load(.acquire));
-}
-
-test "an orphan marker is one incident at its protected time, not a gap in every window" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    const now = wallMs(testing.io);
-    const day_ms = 24 * 60 * 60 * 1000;
-    {
-        var writer = Profile.init(testing.allocator, testing.io, .{ .home = tmp.dir, .mode = .read_write });
-        defer writer.deinit();
-        _ = try writer.append(.{ .incident = .{ .occurred_at_ms = now - 60 * day_ms, .completeness = .pending } });
-    }
-    _ = try markers.write(testing.io, tmp.dir, .v1, "gone", now - 20 * day_ms, .replace, .{});
-    // No recovery source: the session behind the marker can't be read.
-    var profile = Profile.init(testing.allocator, testing.io, .{ .home = tmp.dir, .mode = .read_only });
-    defer profile.deinit();
-    var day = try profile.view(testing.allocator, .today, now);
-    defer day.deinit(testing.allocator);
-    try testing.expectEqual(report.Completeness.complete, day.completeness);
-    var month = try profile.view(testing.allocator, .days_30, now);
-    defer month.deinit(testing.allocator);
-    try testing.expectEqual(report.Completeness.incomplete, month.completeness);
 }

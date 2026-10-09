@@ -1026,7 +1026,7 @@ pub fn Handlers(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "usage",
                     .tone = .neutral,
-                    .body = "Durable profile usage is unavailable in this host; active session usage remains in memory.",
+                    .body = "Usage history is unavailable in this host; this session's usage stays in memory.",
                 }, true);
                 return;
             }

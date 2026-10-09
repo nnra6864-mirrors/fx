@@ -4051,7 +4051,7 @@ test "the gateway event tap sees every parsed event, so usage prices the call ex
 
     try std.testing.expectEqual(@as(usize, 3), tap.events);
     _ = try call.finish(.completed);
-    var view = try ledger.view(std.testing.allocator, .session, io_mod.milliTimestamp(), .{});
+    var view = try ledger.view(std.testing.allocator, io_mod.milliTimestamp(), .{});
     defer view.deinit(std.testing.allocator);
     try std.testing.expectEqual(usage_mod.report.Completeness.complete, view.completeness);
     try std.testing.expectEqual(@as(f64, 0.0042), view.totals.?.total_cost);

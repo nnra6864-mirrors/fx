@@ -245,7 +245,7 @@ test "a fetch asks for each period once and maps every answer" {
 }
 
 test "the stored snapshot belongs to one identity and survives only whole" {
-    var home = testing.tmpDir(.{});
+    var home = testing.tmpDir(.{ .iterate = true });
     defer home.cleanup();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

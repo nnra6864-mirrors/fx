@@ -567,7 +567,7 @@ test "terminal checkpoint failure releases automatic reviewer stream" {
         calls: usize = 0,
 
         fn current(_: *anyopaque) ?usage_owner.Target {
-            return .{ .session_id = "sess-reviewer", .marker = .v1 };
+            return .{ .session_id = "sess-reviewer" };
         }
 
         fn persist(raw_ctx: *anyopaque, _: []const u8, _: *const usage_mod.host.Checkpoint) anyerror!void {

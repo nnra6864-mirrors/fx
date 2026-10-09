@@ -11,7 +11,6 @@
 //! - `SessionSink` persists a session checkpoint: a snapshot the host
 //!   encodes with the writer for the format it stores. Session files stay
 //!   the session store's.
-//! - `RecoverySource` reads a marked session's saved usage for profile views.
 //! - `Credential` is what the host pushes when its credential changes. The
 //!   module keeps the secret in memory only, compares credentials by their
 //!   SHA-256 digest, and never persists, traces, or logs either.
@@ -134,45 +133,6 @@ pub const Checkpoint = struct {
     /// The sessions-v2 `set usage` value. The caller owns the bytes.
     pub fn encodeV2Value(checkpoint: *const Checkpoint, gpa: std.mem.Allocator) EncodeError![]u8 {
         return snapshot.encodeV2Value(gpa, checkpoint.snapshot.*, checkpoint.at_ms);
-    }
-};
-
-/// Reads one marked session's saved usage, for profile views (design.md,
-/// "Host interface"). The module lists the markers itself.
-pub const RecoverySource = struct {
-    context: *anyopaque,
-    vtable: *const VTable,
-
-    pub const Kind = enum { v1, v2 };
-
-    pub const Saved = struct {
-        /// v1: the sidecar file. v2: the newest `set usage` value. Borrowed
-        /// until the next `load` or the end of the view.
-        bytes: []const u8,
-        /// v1: the session's update time. v2: ignored (`at_ms` is inside).
-        updated_at_ms: i64,
-        /// v1: the sidecar's modification time, when known.
-        modified_ns: ?i128 = null,
-    };
-
-    pub const VTable = struct {
-        /// The session's saved usage, or null when it has none or can't be
-        /// read (an orphan marker).
-        load: *const fn (context: *anyopaque, kind: Kind, session_id: []const u8) ?Saved,
-        /// False when the host's session storage can't be read safely, such
-        /// as a sessions folder that is a symlink. Rolling views are then
-        /// unknown even with no markers, because a session there may owe
-        /// usage. Null means the storage is always readable.
-        available: ?*const fn (context: *anyopaque) bool = null,
-    };
-
-    pub fn load(source: RecoverySource, kind: Kind, session_id: []const u8) ?Saved {
-        return source.vtable.load(source.context, kind, session_id);
-    }
-
-    pub fn available(source: RecoverySource) bool {
-        const check = source.vtable.available orelse return true;
-        return check(source.context);
     }
 };
 

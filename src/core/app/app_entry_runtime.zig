@@ -316,7 +316,6 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
         app.session.bindUsage(app.alloc, .{
             .host = app.usageHost(),
             .home_path = io_mod.getenv("HOME"),
-            .recovery = session_adapter.usage_recovery_readers,
         });
         app.session.usage.startWall();
         // Usage history needs the startup credential before any call.

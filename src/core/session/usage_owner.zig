@@ -1,6 +1,6 @@
 //! A session's usage for the runtime that owns the session (the TUI, `fx
-//! ask`, each ACP session): the profile it publishes to, the session's ledger
-//! in the usage module, and the dashboard's view loader. The host says which
+//! ask`, each ACP session): the session's ledger in the usage module, usage
+//! history from AI Gateway, and the dashboard's view loader. The host says which
 //! session is current and where its checkpoints go; the module decides
 //! everything about usage.
 //!
@@ -27,7 +27,6 @@ pub const Lookup = struct {
 pub const Target = struct {
     /// Borrowed for the call.
     session_id: []const u8,
-    marker: usage_mod.MarkerKind,
 };
 
 /// What the host plugs in. Every function may be called from the module's
@@ -44,32 +43,11 @@ pub const Host = struct {
     persist_fn: *const fn (context: *anyopaque, session_id: []const u8, checkpoint: *const usage_mod.host.Checkpoint) anyerror!void,
 };
 
-/// How marked sessions' saved usage is read for rolling views: the session
-/// store for v1 sessions and the sessions-v2 adapter.
-pub const RecoveryReaders = struct {
-    /// The v1 session's usage as sidecar bytes, its update time, and the
-    /// sidecar's modification time. The caller owns `bytes`.
-    v1: *const fn (alloc: Allocator, home_path: []const u8, session_id: []const u8) anyerror!?RecoveredV1,
-    /// The newest sessions-v2 `set usage` value. The caller owns it.
-    v2: *const fn (alloc: Allocator, home_path: []const u8, session_id: []const u8) anyerror!?[]u8,
-    /// False when the session store can't be opened safely, so rolling
-    /// views are unknown even with no marked session. Null: always readable.
-    storage_readable: ?*const fn (alloc: Allocator, home_path: []const u8) bool = null,
-};
-
-pub const RecoveredV1 = struct {
-    bytes: []u8,
-    updated_at_ms: i64,
-    modified_ns: ?i128,
-};
-
 pub const Owner = struct {
     alloc: Allocator = undefined,
     host: ?Host = null,
     lookup: ?Lookup = null,
     home: ?std.Io.Dir = null,
-    profile: ?usage_mod.Profile = null,
-    recovery: Recovery = .{},
     ledger: ?*usage_mod.Ledger = null,
     /// The session the open ledger belongs to; empty when detached.
     session_id: std.ArrayList(u8) = .empty,
@@ -91,10 +69,9 @@ pub const Owner = struct {
         /// The HOME that holds `.fx`; null keeps usage in memory only.
         home_path: ?[]const u8,
         lookup: ?Lookup,
-        recovery: ?RecoveryReaders = null,
     };
 
-    /// Places the owner: the host, the profile, and the lookup transport.
+    /// Places the owner: the host, usage history, and the lookup transport.
     /// Opens nothing but HOME; the ledger opens on first use.
     pub fn bind(self: *Owner, alloc: Allocator, options: BindOptions) void {
         self.alloc = alloc;
@@ -103,17 +80,13 @@ pub const Owner = struct {
         self.lookup = if (comptime builtin.os.tag == .wasi) null else options.lookup;
         if (comptime builtin.os.tag == .wasi) return;
         const home_path = options.home_path orelse return;
-        if (self.profile != null) return;
+        if (self.home != null) return;
+        // Iterable: storing usage history syncs HOME, and Linux can't sync a
+        // directory opened any other way (`O_PATH`).
         self.home = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home_path, .{ .iterate = true }) catch |err| {
-            debug_trace.logf("usage", "profile unavailable reason={s}", .{@errorName(err)});
+            debug_trace.logf("usage", "usage history unavailable reason={s}", .{@errorName(err)});
             return;
         };
-        self.recovery = .{ .alloc = alloc, .home_path = alloc.dupe(u8, home_path) catch null, .readers = options.recovery };
-        self.profile = usage_mod.Profile.init(alloc, io_mod.getIo(), .{
-            .home = self.home.?,
-            .mode = .read_write,
-            .recovery = self.recovery.source(),
-        });
         self.history = openHistory(alloc, self.home.?, self.lookup);
     }
 
@@ -123,18 +96,15 @@ pub const Owner = struct {
         self.dashboard = null;
         if (self.history) |*history| history.deinit();
         self.history = null;
-        if (self.profile) |*profile| profile.deinit();
-        self.profile = null;
         if (self.home) |dir| dir.close(io_mod.getIo());
         self.home = null;
-        self.recovery.deinit();
         self.dropPendingSaved();
         if (self.bound) self.session_id.deinit(self.alloc);
         self.* = .{};
     }
 
-    /// Closes the open ledger: a bounded final publish and checkpoint. The
-    /// next use opens a ledger for the session current then.
+    /// Closes the open ledger after a final checkpoint. The next use opens a
+    /// ledger for the session current then.
     pub fn close(self: *Owner) void {
         if (!self.bound) return;
         const ledger = blk: {
@@ -167,7 +137,7 @@ pub const Owner = struct {
         ledger.close() catch |err| {
             // The session may stay open: its next ledger restores this one.
             if (kept) |value| self.keepForReopen(value);
-            return self.beginError(err, null);
+            return self.beginError(err);
         };
         if (kept) |value| {
             var owned = value;
@@ -208,7 +178,7 @@ pub const Owner = struct {
     /// A resumed session: the next ledger restores `saved` (borrowed; copied
     /// here), or starts as one that predates usage when null. Wall time
     /// counts from the session's creation. Opens at once when the owner is
-    /// bound, so its waiting lookups and unpublished facts resume.
+    /// bound, so its waiting lookups resume.
     pub fn restore(self: *Owner, saved: ?*const usage_mod.Snapshot, saved_at_ms: i64, created_at_ms: i64) !void {
         self.close();
         self.dropPendingSaved();
@@ -221,11 +191,6 @@ pub const Owner = struct {
         }
         self.wall_start = .{ .at = created_at_ms };
         if (self.bound) _ = self.use();
-    }
-
-    /// Process exit: never wait on `usage.lock` held by another process.
-    pub fn abandon(self: *Owner) void {
-        if (self.profile) |*profile| profile.abandon();
     }
 
     /// The open ledger, opening one for the current session first. Null
@@ -242,11 +207,9 @@ pub const Owner = struct {
         else
             null;
         const target: ?Target = if (self.host) |host| host.current_fn(host.context) else null;
-        const opened = if (target != null and self.profile != null) blk: {
+        const opened = if (target != null) blk: {
             const lookup = self.lookup;
-            break :blk self.profile.?.openLedger(.{
-                .session_id = target.?.session_id,
-                .marker = target.?.marker,
+            break :blk usage_mod.Ledger.open(self.alloc, io_mod.getIo(), .{
                 .saved = saved,
                 .start = self.pending_start,
                 .sink = self.sink(),
@@ -280,7 +243,7 @@ pub const Owner = struct {
     /// wall time keeps counting from when it started. True when the caller
     /// must open the session's ledger. Caller holds `lock`.
     fn promoteLocked(self: *Owner, ledger: *usage_mod.Ledger) bool {
-        if (self.session_id.items.len != 0 or self.profile == null) return false;
+        if (self.session_id.items.len != 0) return false;
         const host = self.host orelse return false;
         if (host.current_fn(host.context) == null) return false;
         const carried = ledger.snapshot(pending_alloc) catch |err| {
@@ -298,7 +261,7 @@ pub const Owner = struct {
     /// for hosts that settle a session's state before closing it.
     pub fn flush(self: *Owner) !void {
         const ledger = self.openLedger() orelse return;
-        ledger.flushActivity() catch |err| return self.beginError(err, ledger);
+        ledger.flushActivity() catch |err| return self.beginError(err);
     }
 
     /// Code lines a committed file change added and removed. Lines that
@@ -333,7 +296,7 @@ pub const Owner = struct {
     /// The session's view now. The caller owns it.
     pub fn sessionView(self: *Owner, alloc: Allocator, turn: usage_mod.TurnUsage) !usage_mod.View {
         const ledger = self.use() orelse return error.UsageUnavailable;
-        return ledger.view(alloc, .session, io_mod.milliTimestamp(), turn);
+        return ledger.view(alloc, io_mod.milliTimestamp(), turn);
     }
 
     /// The session as a checkpoint would persist it now. The caller owns it.
@@ -385,15 +348,11 @@ pub const Owner = struct {
     }
 
     /// A begin's checkpoint failed: the call ended unbilled and must not
-    /// send. The caller gets the host's error, as fx always reported it.
-    /// The cause behind a failed checkpoint, as fx reported it before usage
-    /// moved into the module: the host's write error, else the marker's
-    /// (such as `NoSpaceLeft`). `ledger` is null once it is closed.
-    fn beginError(self: *Owner, err: anyerror, ledger: ?*usage_mod.Ledger) anyerror {
+    /// send. The caller gets the cause, as fx always reported it: the
+    /// host's write error.
+    fn beginError(self: *Owner, err: anyerror) anyerror {
         if (err != error.CheckpointFailed) return err;
-        if (self.takePersistError()) |cause| return cause;
-        if (ledger) |open| if (open.markerFailure()) |cause| return cause;
-        return err;
+        return self.takePersistError() orelse err;
     }
 
     /// A finish took effect but its checkpoint isn't durable yet; the module
@@ -536,7 +495,7 @@ test "a detached ledger's started wall clock keeps running once it moves to the 
     var first = try owner.snapshot(alloc);
     first.deinit(alloc);
     // The session appears; a use that takes no snapshot moves usage to it.
-    state.target = .{ .session_id = "session-1", .marker = .v1 };
+    state.target = .{ .session_id = "session-1" };
     try std.testing.expect(owner.use() != null);
     io_mod.sleep(40 * std.time.ns_per_ms);
     var later = try owner.snapshot(alloc);
@@ -583,7 +542,7 @@ pub const Invocation = struct {
         // Only Gateway entries are looked up, so only a Gateway call's
         // credential is the one lookups run with.
         if (provider == .gateway) self_owner.setCredential(credential);
-        const call = ledger.begin(provider) catch |err| return self_owner.beginError(err, ledger);
+        const call = ledger.begin(provider) catch |err| return self_owner.beginError(err);
         return .{ .owner = self_owner, .call = call };
     }
 
@@ -636,66 +595,7 @@ pub const Invocation = struct {
     }
 };
 
-/// Reads marked sessions' saved usage for rolling views.
-pub const Recovery = struct {
-    alloc: Allocator = undefined,
-    home_path: ?[]u8 = null,
-    readers: ?RecoveryReaders = null,
-    lock: std.Io.Mutex = .init,
-    /// The bytes the last `load` returned.
-    held: ?[]u8 = null,
-
-    pub fn source(self: *Recovery) usage_mod.host.RecoverySource {
-        return .{ .context = self, .vtable = &vtable };
-    }
-
-    fn deinit(self: *Recovery) void {
-        if (self.held) |bytes| self.alloc.free(bytes);
-        if (self.home_path) |path| self.alloc.free(path);
-        self.* = .{};
-    }
-
-    const vtable: usage_mod.host.RecoverySource.VTable = .{ .load = load, .available = available };
-
-    fn available(context: *anyopaque) bool {
-        const self: *Recovery = @ptrCast(@alignCast(context));
-        const home = self.home_path orelse return true;
-        const read = self.readers orelse return true;
-        const check = read.storage_readable orelse return true;
-        return check(self.alloc, home);
-    }
-
-    fn load(context: *anyopaque, kind: usage_mod.host.RecoverySource.Kind, session_id: []const u8) ?usage_mod.host.RecoverySource.Saved {
-        const self: *Recovery = @ptrCast(@alignCast(context));
-        const home = self.home_path orelse return null;
-        const read = self.readers orelse return null;
-        self.lock.lockUncancelable(io_mod.getIo());
-        defer self.lock.unlock(io_mod.getIo());
-        if (self.held) |bytes| self.alloc.free(bytes);
-        self.held = null;
-        switch (kind) {
-            .v1 => {
-                const loaded = (read.v1(self.alloc, home, session_id) catch |err| {
-                    debug_trace.logf("usage", "usage recovery unreadable session={s} reason={s}", .{ session_id, @errorName(err) });
-                    return null;
-                }) orelse return null;
-                self.held = loaded.bytes;
-                return .{ .bytes = loaded.bytes, .updated_at_ms = loaded.updated_at_ms, .modified_ns = loaded.modified_ns };
-            },
-            .v2 => {
-                const bytes = (read.v2(self.alloc, home, session_id) catch |err| {
-                    debug_trace.logf("usage", "usage recovery unreadable session={s} backend=v2 reason={s}", .{ session_id, @errorName(err) });
-                    return null;
-                }) orelse return null;
-                self.held = bytes;
-                return .{ .bytes = bytes, .updated_at_ms = 0 };
-            },
-        }
-    }
-};
-
-/// A read-only profile for `fx usage`: never creates `~/.fx`, needs no
-/// credentials.
+/// Usage history from AI Gateway reports, stored under `home`.
 fn openHistory(alloc: Allocator, home: std.Io.Dir, lookup: ?Lookup) usage_mod.History {
     return usage_mod.History.init(alloc, io_mod.getIo(), .{
         .home = home,
@@ -715,7 +615,8 @@ pub fn historyView(
     scope: usage_mod.Scope,
 ) !usage_mod.View {
     if (scope == .session) return error.SessionScope;
-    var home = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home_path, .{});
+    // Iterable, as in `bind`: storing the answer syncs HOME.
+    var home = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home_path, .{ .iterate = true });
     defer home.close(io_mod.getIo());
     var history = openHistory(alloc, home, lookup);
     defer history.deinit();
