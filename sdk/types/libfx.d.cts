@@ -500,10 +500,14 @@ export type FxAgentOptions = FxSharedOptions<FxAgentEvent> & FxModelChoice & {
   checkpoint?: FxBytes;
 };
 
-/** Options for `agent.session()`. */
+/** Options for `agent.session()`. Each applies to the turns this session object starts. */
 export interface FxSessionOptions {
-  /** JSON every tool call of the turns this session object starts receives as `context`. */
+  /** JSON every tool call of those turns receives as `context`. */
   context?: JsonValue;
+  /** The model for those turns instead of the agent's whole model choice: a model ID, or a model object. */
+  model?: string | FxModelOptions;
+  /** The system context for those turns instead of the agent's. An array is joined with blank lines. */
+  instructions?: string | readonly string[];
 }
 
 /** Options for a durable session's `prompt()`. */

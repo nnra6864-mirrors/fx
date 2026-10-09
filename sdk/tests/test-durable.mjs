@@ -76,6 +76,8 @@ function framesFor(prompt) {
 }
 
 const requests = [];
+// Each chat request's model and prompt, for the tests of a session's settings.
+const chats = [];
 const server = createServer((request, response) => {
   let body = "";
   request.setEncoding("utf8");
@@ -88,6 +90,7 @@ const server = createServer((request, response) => {
     }
     const prompt = JSON.parse(body).prompt;
     requests.push(prompt);
+    chats.push({ model: request.headers["ai-language-model-id"] ?? null, prompt });
     const frames = framesFor(prompt);
     if (frames === null) return;
     // Each answer takes a moment, as a model's does.
@@ -1039,6 +1042,25 @@ test("each agent.session() call carries its own context to the tools", async () 
   assert.equal((await running.result).stopReason, "end_turn");
   assert.equal((await queued.result).stopReason, "end_turn");
   assert.deepEqual(contexts.slice(-2), [{ user: "c" }, { user: "d" }]);
+  await agent.close();
+});
+
+test("a session object's model and instructions reach its model requests, over the agent's", async () => {
+  const systemOf = (prompt) => prompt.filter((message) => message.role === "system").map(textOf).join("\n");
+  const agent = createFxAgent(agentOptions(await durabilityFor(), { instructions: "Agent rules." }));
+  const first = agent.session(undefined, { model: { id: "durable/other" }, instructions: ["Chat rules.", "Chat style."] });
+  const before = chats.length;
+  assert.equal((await first.prompt("hello").result).stopReason, "end_turn");
+  assert.equal((await agent.session(first.id).prompt("plain").result).stopReason, "end_turn");
+  const sent = chats.slice(before);
+  assert.deepEqual(sent.map((chat) => chat.model), ["durable/other", "durable/model"]);
+  assert.match(systemOf(sent[0].prompt), /Chat rules\.\n\nChat style\./);
+  assert.doesNotMatch(systemOf(sent[0].prompt), /Agent rules/);
+  assert.match(systemOf(sent[1].prompt), /Agent rules\./, "a call without settings runs with the agent's");
+  // Settings the engine would refuse are refused when the session object is made.
+  assert.throws(() => agent.session(first.id, { model: { id: "durable/model", speed: 1 } }), /^TypeError: unsupported model option: speed$/);
+  assert.throws(() => agent.session(first.id, { model: 5 }), /^TypeError: session model must be a model id or a model object$/);
+  assert.throws(() => agent.session(first.id, { instructions: 5 }), /^TypeError: instructions must be a string or an array of strings$/);
   await agent.close();
 });
 
