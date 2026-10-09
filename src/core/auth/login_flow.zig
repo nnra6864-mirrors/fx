@@ -2149,7 +2149,7 @@ const WithholdingTokenFixture = struct {
 };
 
 fn makeLoopbackPreparedLogin(alloc: Allocator, token_endpoint: []const u8) !PreparedLogin {
-    const issuer = try alloc.dupe(u8, token_endpoint[0..std.mem.lastIndexOfScalar(u8, token_endpoint, '/').?]);
+    const issuer = try alloc.dupe(u8, token_endpoint[0..std.mem.findScalarLast(u8, token_endpoint, '/').?]);
     errdefer alloc.free(issuer);
     const device_endpoint = try alloc.print("{s}/device", .{issuer});
     errdefer alloc.free(device_endpoint);

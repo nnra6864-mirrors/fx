@@ -13545,7 +13545,7 @@ test "app_input_runtime rejected second image keeps the first pending image and 
     try std.testing.expectEqual(@as(usize, 0), app.queue_accept_count);
     try std.testing.expect(app.last_prompt == null);
 
-    var probe = try std.Io.Dir.openDirAbsolute(std.testing.io, first_snapshot[0..std.mem.lastIndexOfScalar(u8, first_snapshot, '/').?], .{});
+    var probe = try std.Io.Dir.openDirAbsolute(std.testing.io, first_snapshot[0..std.mem.findScalarLast(u8, first_snapshot, '/').?], .{});
     defer probe.close(std.testing.io);
     var snapshot_file = try probe.openFile(std.testing.io, std.Io.Dir.path.basename(first_snapshot), .{});
     snapshot_file.close(std.testing.io);

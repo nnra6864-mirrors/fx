@@ -4282,8 +4282,8 @@ fn publishSessionDirectory(parent: std.Io.Dir, staging: []const u8, target: []co
     }
     // Zig 0.16's Darwin preserve-rename used hard links, which cannot publish
     // directories. Zig 0.17 calls renameatx_np as this does, but treats
-    // ENOTEMPTY as a programmer bug that panics in safe builds, so fx keeps
-    // its own error mapping.
+    // ENOTEMPTY as a programmer bug: a panic in Debug builds and
+    // error.Unexpected otherwise. fx keeps its own error mapping.
     const Darwin = struct {
         extern "c" fn renameatx_np(c_int, [*:0]const u8, c_int, [*:0]const u8, c_uint) c_int;
     };
