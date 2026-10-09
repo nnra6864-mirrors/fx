@@ -3711,7 +3711,7 @@ describe("effect-aware command permissions", () => {
         finalText("large ACP complete"),
       ]);
       activeClient = AcpClient.create(acpRoot.workspace, gatewayEnv(acpRoot, acpGateway));
-      await startAcpSession(activeClient, "code");
+      await startAcpSession(activeClient, "auto");
       const acpMessages = await runAcpPrompt(activeClient, "Run the large ACP fixture.");
       await activeClient.close();
       activeClient = null;
@@ -4076,7 +4076,7 @@ class AcpClient {
   }
 }
 
-async function startAcpSession(client: AcpClient, modeId: "ask" | "code" = "ask") {
+async function startAcpSession(client: AcpClient, modeId: "ask" | "auto" = "ask") {
   await client.request("initialize", { protocolVersion: 1 }, 1);
   await client.request("session/new", { mcpServers: [] }, 2);
   await client.readLine();

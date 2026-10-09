@@ -24,6 +24,7 @@ const ui_render = @import("../../ui/render.zig");
 const transcript_presentation = @import("../output/transcript_presentation.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
 const ui_terminal = @import("../../ui/terminal/terminal.zig");
+const program_status = @import("../../ui/terminal/program_status.zig");
 const terminal_diff = @import("../../ui/render_engine/terminal_diff.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 
@@ -37,11 +38,12 @@ pub const ResizeHandler = shell_runtime.ResizeHandler;
 pub const default_permission_mode = config_runtime.default_permission_mode;
 
 /// Compile-time terminal restoration for one async-signal-safe `write(2)` call.
-/// Resets terminal modes and ends with a newline before the next shell prompt.
-const abnormal_exit_restore_prefix = "\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1004l\x1b[?1006l\x1b[?1l\x1b>\x1b[?1049l\x1b[?7h\x1b[4l\x1b[?6l\x1b[0m\x1b[?25h\x1b[?2031l\x1b[?2004l";
+/// Resets terminal modes, clears fx's program status, and ends with a newline
+/// before the next shell prompt.
+const abnormal_exit_restore_prefix = "\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1004l\x1b[?1006l\x1b[?1l\x1b>\x1b[?1049l\x1b[?7h\x1b[4l\x1b[?6l\x1b[0m\x1b[?25h\x1b[?2031l\x1b[?2004l" ++ program_status.clear_sequence;
 const abnormal_exit_restore = abnormal_exit_restore_prefix ++ "\x1b[<u\x1b[>4;0m\n";
 const tmux_abnormal_exit_restore = abnormal_exit_restore_prefix ++ "\x1b[>4;0m\n";
-const normal_exit_restore_prefix = ui_terminal.theme_notification_disable_sequence ++ "\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1004l\x1b[?1006l\x1b[?1l\x1b>\x1b[4l\x1b[?6l\x1b[?2004l";
+const normal_exit_restore_prefix = ui_terminal.theme_notification_disable_sequence ++ "\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1004l\x1b[?1006l\x1b[?1l\x1b>\x1b[4l\x1b[?6l\x1b[?2004l" ++ program_status.clear_sequence;
 const normal_exit_restore = normal_exit_restore_prefix ++ "\x1b[<u\x1b[>4;0m";
 const tmux_normal_exit_restore = normal_exit_restore_prefix ++ "\x1b[>4;0m";
 const alternate_screen_enter = "\x1b[?1049h";
@@ -340,6 +342,8 @@ pub const StartupStatus = struct {
     selected_model: []const u8,
     owned_selected_model: ?[]u8 = null,
     model_origin: ModelOrigin = .default,
+    /// The reasoning effort a new session starts with, as `StartupState` resolves it.
+    effort: types.ReasoningEffort = .auto,
     ultrafast_mode: bool = false,
     auth: auth_runtime.StatusSnapshot = .{},
     permission_mode: PermissionMode,
@@ -569,6 +573,7 @@ pub fn loadStartupStatusWithAuthMode(
         .selected_model = selected_model.value,
         .owned_selected_model = selected_model.owned,
         .model_origin = ModelOrigin.of(settings, configured_selection.provider, run_model),
+        .effort = settings.effort orelse .auto,
         .ultrafast_mode = detailed.ultrafast_mode_env_override orelse (settings.ultrafast_mode orelse false),
         .auth = auth_status,
         .permission_mode = loadPermissionMode(settings.permission_mode),
@@ -1554,6 +1559,59 @@ fn loadPermissionMode(configured: ?PermissionMode) PermissionMode {
     return config_runtime.parsePermissionMode(mode) orelse fallback;
 }
 
+/// The permission mode startup would load now, including `FX_PERMISSION_MODE`.
+/// Long-running hosts read it when a session starts, so a mode saved by
+/// another fx process since startup applies. `home_dir` defaults to `HOME`.
+pub fn loadSavedPermissionMode(alloc: Allocator, home_dir: ?[]const u8, workspace_root: []const u8) !PermissionMode {
+    var paths = if (home_dir) |home|
+        try config_runtime.discoverPathsFromHome(alloc, home, workspace_root)
+    else
+        try config_runtime.discoverPaths(alloc, workspace_root);
+    defer paths.deinit(alloc);
+    var settings = try config_runtime.loadStartupStatusSettingsFromPaths(alloc, paths);
+    defer settings.deinit(alloc);
+    return loadPermissionMode(settings.permission_mode);
+}
+
+test "loadSavedPermissionMode reads the mode saved after startup" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+
+    var env = try TestEnv.install(alloc, &.{.{ .key = "HOME", .value = home_root }});
+    defer env.deinit();
+    try std.testing.expectEqual(default_permission_mode, try loadSavedPermissionMode(alloc, null, workspace_root));
+
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"permission_mode\":\"ask\"}\n");
+    try std.testing.expectEqual(PermissionMode.ask, try loadSavedPermissionMode(alloc, null, workspace_root));
+
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"permission_mode\":\"yolo\"}\n");
+    try std.testing.expectEqual(PermissionMode.yolo, try loadSavedPermissionMode(alloc, home_root, workspace_root));
+}
+
+test "loadSavedPermissionMode keeps the FX_PERMISSION_MODE override" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"permission_mode\":\"yolo\"}\n");
+
+    var env = try TestEnv.install(alloc, &.{
+        .{ .key = "HOME", .value = home_root },
+        .{ .key = "FX_PERMISSION_MODE", .value = "ask" },
+    });
+    defer env.deinit();
+    try std.testing.expectEqual(PermissionMode.ask, try loadSavedPermissionMode(alloc, null, home_root));
+}
+
 fn loadAgentStepLimit(fallback: usize, configured: ?usize) usize {
     return agent_steps.resolveMaxAgentStepsWithOverride(
         configured,
@@ -2290,6 +2348,17 @@ test "abnormal exit restoration leaves the alternate screen" {
     try std.testing.expect(std.mem.indexOf(u8, abnormal_exit_restore, "\x1b[?1049l") != null);
     try std.testing.expect(std.mem.indexOf(u8, abnormal_exit_restore, "\x1b[?2031l") != null);
     try std.testing.expect(std.mem.indexOf(u8, normal_exit_restore, "\x1b[?2031l") != null);
+}
+
+test "exit and suspend restoration clear the program status record" {
+    for ([_][]const u8{
+        normal_exit_restore,
+        tmux_normal_exit_restore,
+        abnormal_exit_restore,
+        tmux_abnormal_exit_restore,
+    }) |restore| {
+        try std.testing.expect(std.mem.find(u8, restore, program_status.clear_sequence) != null);
+    }
 }
 
 test "terminal keyboard stack restore stays paired with enable policy" {

@@ -58,7 +58,7 @@ function systemText(body) {
 // model answers the turn.
 async function systemTextsWith(workspace, label, { turns = 1, respond = () => null } = {}) {
   const terminal = new Terminal({ cols: 100, rows: 30, allowProposedApi: true, scrollback: 2000 });
-  const config = new Map([["model", "test/agents-model"], ["mode", "code"]]);
+  const config = new Map([["model", "test/agents-model"], ["mode", "auto"]]);
   const requests = [];
   let answered = 0;
   let stderr = "";

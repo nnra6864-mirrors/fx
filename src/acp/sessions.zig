@@ -31,6 +31,7 @@ const project_config = @import("../core/mcp/project_config.zig");
 const builtin_mcp = @import("../builtins/mcp.zig");
 const workspace_config = @import("../core/mcp/workspace_config.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
+const permissions = @import("../core/permissions/permissions.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const provider_set = @import("../core/gateway/provider_set.zig");
@@ -52,13 +53,47 @@ const Allocator = std.mem.Allocator;
 const ErrorCode = jsonrpc.ErrorCode;
 const writeJsonStr = jsonrpc.writeJsonStr;
 
+/// The session id a `libfx/new` request names, or null when it names none.
+/// The id reaches gateway headers, so it must pass the session layout rules.
+/// Caller owns the returned slice.
+fn requestedLibfxSessionId(alloc: Allocator, params_raw: ?[]const u8) error{ InvalidSessionId, OutOfMemory }!?[]u8 {
+    const raw = params_raw orelse return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidSessionId,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSessionId;
+    const value = parsed.value.object.get("sessionId") orelse return null;
+    switch (value) {
+        .null => return null,
+        .string => |id| {
+            session_store_paths.validateSessionId(id) catch return error.InvalidSessionId;
+            return try alloc.dupe(u8, id);
+        },
+        else => return error.InvalidSessionId,
+    }
+}
+
 pub fn handleNewLibfxSession(
     state: *server.ServerState,
     alloc: Allocator,
     msg: *jsonrpc.Message,
 ) !void {
+    // Checked before the active session is released, so a bad request
+    // leaves it in place.
+    const requested = requestedLibfxSessionId(alloc, msg.params_raw) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidSessionId => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Invalid sessionId",
+        }),
+    };
+    var requested_owned = requested != null;
+    defer if (requested_owned) alloc.free(requested.?);
     try server.releaseActiveSession(state);
-    const session_id = try session_store.generateSessionId(alloc);
+    requested_owned = false;
+    const session_id = requested orelse try session_store.generateSessionId(alloc);
     var session_id_owned = true;
     defer if (session_id_owned) alloc.free(session_id);
     const model = try alloc.dupe(u8, state.selected_model);
@@ -71,11 +106,12 @@ pub fn handleNewLibfxSession(
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
 
+    const start = server.loadStartingMode(state, alloc);
     state.active_session = .{
         .session_id = session_id,
         .model = model,
         .provider = state.provider,
-        .mode = state.cfg.mode_registry.default_mode_id,
+        .mode = start.id,
         .workspace_root = state.workspace_root,
         .api_key = state.api_key,
         .credential_source = state.credential_source,
@@ -86,7 +122,7 @@ pub fn handleNewLibfxSession(
         .ultrafast_mode = state.ultrafast_mode,
         .effort = state.effort,
         .first_call_tool_choice = state.first_call_tool_choice,
-        .permission_mode = state.permission_mode,
+        .permission_mode = start.permission_mode,
         .permission_rules = state.permission_rules,
         .session_rt = session_rt,
         .cancel_flag = std.atomic.Value(bool).init(false),
@@ -124,13 +160,14 @@ pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *
     var revision_owned = true;
     defer if (revision_owned) alloc.free(revision);
 
+    const start = server.loadStartingMode(state, alloc);
     state.active_session = .{
         .session_id = session_id,
         .wasm_state = durable,
         .wasm_revision = revision,
         .model = model,
         .provider = durable.preferences.provider,
-        .mode = state.cfg.mode_registry.default_mode_id,
+        .mode = start.id,
         .workspace_root = state.workspace_root,
         .api_key = state.api_key,
         .credential_source = state.credential_source,
@@ -142,7 +179,7 @@ pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *
         .ultrafast_mode = state.ultrafast_mode,
         .effort = state.effort,
         .first_call_tool_choice = state.first_call_tool_choice,
-        .permission_mode = state.permission_mode,
+        .permission_mode = start.permission_mode,
         .permission_rules = state.permission_rules,
         .session_rt = session_rt,
         .cancel_flag = std.atomic.Value(bool).init(false),
@@ -598,7 +635,7 @@ fn writeNewSessionResponse(
     try writeModeConfigOption(
         &out.writer,
         state.cfg.mode_registry,
-        state.cfg.mode_registry.default_mode_id,
+        state.active_session.?.mode,
     );
     if (effortConfigState(state)) |config| {
         try out.writer.writeAll(",");
@@ -613,7 +650,7 @@ fn writeNewSessionResponse(
         try writeUltrafastConfigOption(&out.writer, current);
     }
     try out.writer.writeAll("],\"modes\":{\"currentModeId\":");
-    try writeJsonStr(state.cfg.mode_registry.default_mode_id, &out.writer);
+    try writeJsonStr(state.active_session.?.mode, &out.writer);
     try out.writer.writeAll(",\"availableModes\":");
     try writeModesArray(&out.writer, state.cfg.mode_registry);
     try out.writer.writeAll("}}");
@@ -676,13 +713,14 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     if (loaded.state.usage) |usage| try session_rt.usage.restore(alloc, usage, loaded.state.created_at_ms);
 
     try server.releaseActiveSession(state);
+    const start = server.loadStartingMode(state, alloc);
     state.active_session = .{
         .session_id = sid_copy,
         .wasm_state = loaded.state,
         .wasm_revision = loaded.revision,
         .model = model_copy,
         .provider = loaded.state.preferences.provider,
-        .mode = state.cfg.mode_registry.default_mode_id,
+        .mode = start.id,
         .workspace_root = state.workspace_root,
         .api_key = state.api_key,
         .credential_source = state.credential_source,
@@ -694,7 +732,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
         .ultrafast_mode = restoredUltrafastMode(state, loaded.state.preferences.ultrafast_mode),
         .effort = loaded.state.preferences.effort,
         .first_call_tool_choice = state.first_call_tool_choice,
-        .permission_mode = state.permission_mode,
+        .permission_mode = start.permission_mode,
         .permission_rules = state.permission_rules,
         .session_rt = session_rt,
         .cancel_flag = std.atomic.Value(bool).init(false),
@@ -863,11 +901,9 @@ fn handleRestoreSession(
             const previous_mcp = active.mcp;
             active.mcp = session_mcp;
             session_mcp_owned = false;
-            server.applySessionMode(
-                state.cfg.mode_registry,
-                active,
-                state.cfg.mode_registry.default_mode_id,
-            );
+            const start = server.loadStartingMode(state, alloc);
+            active.mode = start.id;
+            active.permission_mode = start.permission_mode;
             state.subagent_authority_mutex.unlock(io_mod.getIo());
             if (previous_mcp) |runtime| {
                 runtime.retireAndWait();
@@ -1262,7 +1298,7 @@ fn writeLoadSessionResponse(
     try writeModeConfigOption(
         &out.writer,
         state.cfg.mode_registry,
-        state.cfg.mode_registry.default_mode_id,
+        state.active_session.?.mode,
     );
     if (effortConfigState(state)) |config| {
         try out.writer.writeAll(",");
@@ -1277,7 +1313,7 @@ fn writeLoadSessionResponse(
         try writeUltrafastConfigOption(&out.writer, current);
     }
     try out.writer.writeAll("],\"modes\":{\"currentModeId\":");
-    try writeJsonStr(state.cfg.mode_registry.default_mode_id, &out.writer);
+    try writeJsonStr(state.active_session.?.mode, &out.writer);
     try out.writer.writeAll(",\"availableModes\":");
     try writeModesArray(&out.writer, state.cfg.mode_registry);
     try out.writer.writeAll("}}");
@@ -1456,6 +1492,7 @@ fn activateSession(
     const client_system_prompt: []u8 = activation.client_system_prompt orelse &.{};
     if (activation.workspace) |binding| try workspace_binding.commit(state, binding);
     if (activation.credential) |credential| server.adoptServerCredential(state, credential);
+    const start = server.loadStartingMode(state, state.alloc);
     // Nothing after this load can fail before the session takes ownership.
     const files: SavedFiles = if (restored_writable) |*writable| .{ .v1 = writable } else .{ .v2 = activation.v2.? };
     const tool_identities = try restoredToolIdentities(state.alloc, files);
@@ -1468,7 +1505,7 @@ fn activateSession(
         .tool_identities = tool_identities,
         .model = activation.model,
         .provider = activation.provider,
-        .mode = state.cfg.mode_registry.default_mode_id,
+        .mode = start.id,
         .workspace_root = state.workspace_root,
         .api_key = state.api_key,
         .credential_source = state.credential_source,
@@ -1480,7 +1517,7 @@ fn activateSession(
         .ultrafast_mode = activation.ultrafast_mode,
         .effort = activation.effort,
         .first_call_tool_choice = state.first_call_tool_choice,
-        .permission_mode = state.permission_mode,
+        .permission_mode = start.permission_mode,
         .permission_rules = state.permission_rules,
         .session_rt = activation.session_rt,
         .mcp = activation.mcp,
@@ -2332,9 +2369,10 @@ pub fn writeModeConfigOption(
         try writeJsonStr(mode.name, w);
         try w.writeAll(",\"description\":");
         try writeJsonStr(mode.description, w);
-        try w.writeAll(",\"permissionMode\":");
-        try writeJsonStr(@tagName(mode.permission_mode), w);
-        try w.writeAll("}");
+        // ACP leaves extra value fields to `_meta`.
+        try w.writeAll(",\"_meta\":{\"fx\":{\"permissionMode\":");
+        try writeJsonStr(permissions.permissionModeLabel(mode.permission_mode), w);
+        try w.writeAll("}}}");
     }
     try w.writeAll("]}");
 }
@@ -3335,7 +3373,7 @@ test "ACP new and loaded sessions provide a writable subagent host" {
             test_session_mode_registry.default_mode_id,
             new_active.mode,
         );
-        server.applySessionMode(
+        _ = server.applySessionMode(
             state.cfg.mode_registry,
             new_active,
             "review",
@@ -3508,4 +3546,33 @@ test "ACP same-session restore retires the replaced MCP runtime after active use
     if (restore.err) |err| return err;
     try std.testing.expect(retired_before_destroy);
     try std.testing.expect(!completed_while_leased);
+}
+
+test "libfx/new uses a valid host session id and generates one when none is named" {
+    const alloc = std.testing.allocator;
+    const id = (try requestedLibfxSessionId(alloc, "{\"sessionId\":\"wrun_01M3X0485FF9GX5ZA6FWMGR503\"}")).?;
+    defer alloc.free(id);
+    try std.testing.expectEqualStrings("wrun_01M3X0485FF9GX5ZA6FWMGR503", id);
+    try std.testing.expect((try requestedLibfxSessionId(alloc, null)) == null);
+    try std.testing.expect((try requestedLibfxSessionId(alloc, "{}")) == null);
+    try std.testing.expect((try requestedLibfxSessionId(alloc, "{\"sessionId\":null}")) == null);
+}
+
+test "libfx/new rejects a session id that is not header and path safe" {
+    const alloc = std.testing.allocator;
+    const bad = [_][]const u8{
+        "{\"sessionId\":\"\"}",
+        "{\"sessionId\":\"..\"}",
+        "{\"sessionId\":\"a/b\"}",
+        "{\"sessionId\":\"a b\"}",
+        "{\"sessionId\":\"a\\r\\nx-injected: 1\"}",
+        "{\"sessionId\":42}",
+        "[]",
+        "{",
+    };
+    for (bad) |params| {
+        try std.testing.expectError(error.InvalidSessionId, requestedLibfxSessionId(alloc, params));
+    }
+    const long = "{\"sessionId\":\"" ++ "a" ** 256 ++ "\"}";
+    try std.testing.expectError(error.InvalidSessionId, requestedLibfxSessionId(alloc, long));
 }

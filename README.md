@@ -61,6 +61,8 @@ Inside the shell, run `/help` to browse interactive commands.
 In tmux, use your usual prefix bindings to switch sessions or enter copy mode.
 fx preserves those tmux views while resizing, including when the switcher zooms a split pane.
 
+The interactive shell reports its state with the [Program Status Protocol (OSC 7501)](https://www.superlogical.com/rex/docs/build/program-status), so a terminal that supports it can show when fx is working, waiting for your approval or answer, done, or stopped by an error. Approval and question reports include the request or question text. When fx exits or is suspended, it clears the terminal's status records. Terminals without support ignore the reports.
+
 ## Images
 
 Paste an image, attach one with `fx ask --image PATH`, or ask fx to `read_file` a PNG, JPEG, GIF, or WebP. File-backed attachments retain the original image. Before each model request, it checks the complete image count and sends only images that fit: at most 8000 pixels per side with 20 or fewer images, or 2000 pixels per side with more than 20. The encoded per-image limit is 5 MiB.
@@ -118,7 +120,7 @@ Use `/ultrafast on`, `/ultrafast off`, or `/ultrafast status` in the shell. The 
 
 Ultra mode is available only through the Vercel AI Gateway's OpenAI service tier. Gateway metadata currently marks Astra eligible. fx does not select Ultra automatically, and switching models clears an existing Ultra request. Subagents inherit the parent turn's request; an explicit parent disable and capability checks override an existing child preference. Background side calls, including titles, reviews, and compaction, do not use Ultra mode.
 
-ACP clients get the same per-session choice as the shell. The config options from `session/new`, `session/load`, `session/resume`, and `session/set_config_option` include `fast` only for models with a Fast lane and `ultrafast` only for Ultra-eligible models, each with the values `false` and `true`. Turning one on turns the other off, enabling a lane the model lacks returns an error, and switching models turns off a lane the new model lacks. The choice is saved with the session. An unknown config option id returns an error. To show these choices before a session exists, `fx models --json` describes each Gateway model by the same rules: its display `name`, the `efforts` it accepts besides `auto`, and whether it has `fast` and `ultrafast` lanes.
+ACP clients get the same per-session choice as the shell. The config options from `session/new`, `session/load`, `session/resume`, and `session/set_config_option` include `fast` only for models with a Fast lane and `ultrafast` only for Ultra-eligible models, each with the values `false` and `true`. Turning one on turns the other off, enabling a lane the model lacks returns an error, and switching models turns off a lane the new model lacks. The choice is saved with the session. An unknown config option id returns an error. To show these choices before a session exists, `fx models --json` describes each Gateway model by the same rules: its display `name`, the `efforts` it accepts besides `auto`, and whether it has `fast` and `ultrafast` lanes. `fx status --json` run in the workspace reports the `model` and `effort` a new session there starts with.
 
 ## Gateway provider routing
 
@@ -170,6 +172,8 @@ fx builds as a native binary or WebAssembly. Applications embedding fx can provi
 | `createFxTerminal()` | Embed the interactive terminal with `fx-term.wasm`. |
 
 ACP clients can keep their MCP tools loaded on every turn, steer a running turn, supply a session system prompt, serve MCP servers over the ACP connection, and choose each session's workspace. See [ACP embedding](CONTRIBUTING.md#acp-embedding).
+
+ACP sessions offer the CLI's permission modes, `auto` (the default), `ask`, and `full-access`, as the `mode` config option and in `modes`. A session starts in the saved `permission_mode`, and choosing a mode with `session/set_config_option` or `session/set_mode` saves it, like `/permissions` in the shell. Any other mode returns an error. To show the choice before a session exists, `fx status --json` run in the workspace reports the `mode` a new session there starts in and lists the `modes`, each with its `id`, `name`, and `description`.
 
 The SDK is published to npm as [libfx](https://www.npmjs.com/package/libfx). See the [WebAssembly SDK](sdk/README.md) and the runnable Node.js, browser, Next.js, and Nuxt [examples](examples/README.md). The WebAssembly SDK is experimental.
 

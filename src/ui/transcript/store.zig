@@ -2171,12 +2171,37 @@ fn commitAuthoritativeRecordedMutationStateFromEntry(
     rewrite_mode: TranscriptSourceRewriteMode,
     dirty_entry_id: ?u32,
 ) !void {
+    return commitAuthoritativeRecordedMutationStateKeepingSource(
+        self,
+        shadow,
+        alloc,
+        reason,
+        rewrite_mode,
+        dirty_entry_id,
+        null,
+    );
+}
+
+/// Commits like `commitAuthoritativeRecordedMutationStateFromEntry`. When
+/// `kept` is set and the commit neither trimmed nor rebased the published
+/// prefix, the caller receives ownership of the source prepared for the
+/// committed entries instead of it being discarded.
+fn commitAuthoritativeRecordedMutationStateKeepingSource(
+    self: anytype,
+    shadow: anytype,
+    alloc: Allocator,
+    reason: []const u8,
+    rewrite_mode: TranscriptSourceRewriteMode,
+    dirty_entry_id: ?u32,
+    kept: ?*?source_preparation.TranscriptPreparationSource,
+) !void {
     var authoritative_source = try source_preparation.prepareTranscriptSource(
         shadow,
         alloc,
         null,
     );
-    defer authoritative_source.deinit(alloc);
+    var source_kept = false;
+    defer if (!source_kept) authoritative_source.deinit(alloc);
     const prefix_trims = if (comptime @hasField(@TypeOf(shadow.*), "retention_prefix_trims"))
         if (shadow.retention_prefix_trims) |trims| trims.items else &.{}
     else
@@ -2192,6 +2217,12 @@ fn commitAuthoritativeRecordedMutationStateFromEntry(
         authoritative_source.bytes,
         dirty_entry_id,
     );
+    if (kept) |out| {
+        if (!rebased and prefix_trims.len == 0) {
+            out.* = authoritative_source;
+            source_kept = true;
+        }
+    }
 }
 
 fn commitMutationStateWithReconciliationSource(
@@ -2830,14 +2861,29 @@ pub fn writeUserPromptCard(
         skill_tokens,
     );
 
-    try commitAuthoritativeRecordedMutationStateFromEntry(
+    const Runtime = @TypeOf(self.*);
+    const reuses_source = comptime @hasDecl(Runtime, "adoptCommittedTranscriptSource");
+    const revision_before: u64 = if (comptime reuses_source) self.full_transcript_content_revision else 0;
+    var committed_source: ?source_preparation.TranscriptPreparationSource = null;
+    try commitAuthoritativeRecordedMutationStateKeepingSource(
         self,
         &shadow,
         alloc,
         "atomic_user_prompt_append",
         .preserve_same_epoch,
         if (admission.retention_changed) null else admission.entry_id,
+        if (comptime reuses_source) &committed_source else null,
     );
+    if (committed_source) |source| {
+        if (comptime reuses_source) {
+            // The frame that shows the card can reuse this source instead of
+            // rendering every entry again.
+            self.adoptCommittedTranscriptSource(alloc, source, revision_before);
+        } else {
+            var unused = source;
+            unused.deinit(alloc);
+        }
+    }
     self.forgetShimmer();
     return admission.entry_id;
 }

@@ -1129,6 +1129,15 @@ pub fn attemptUserPreferences(
     patch: UserSettingsPatch,
 ) CommitAttempt {
     const home = io_mod.getenv("HOME") orelse return .{ .failure = .{ .err = error.HomeNotSet } };
+    return attemptUserPreferencesInHome(alloc, home, patch);
+}
+
+/// Like attemptUserPreferences, for hosts that run with their own home.
+pub fn attemptUserPreferencesInHome(
+    alloc: Allocator,
+    home: []const u8,
+    patch: UserSettingsPatch,
+) CommitAttempt {
     var store = settings_store.Store.initFromHome(alloc, home, .writable) catch |err| {
         return .{ .failure = .{ .err = err } };
     };

@@ -2,15 +2,20 @@ import { access, readFile } from "node:fs/promises";
 import { closeSync } from "node:fs";
 import { createRequire } from "node:module";
 import { Socket } from "node:net";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { CoreOutput } from "./core-output.js";
 import { loadModule, withModuleFailure } from "./wasm-module.js";
 import { fetchCleanupAction, cleanupTimeoutMs, cleanupByteLimit } from "./fetch-cleanup.js";
+import { createDurableAgentFactory, memory } from "./durable.js";
+import { fxHarness } from "./fx-harness.js";
 import {
-  createFxAgent as createWasmAgent,
+  createFxEngine as createWasmAgent,
   createFxTerminal as createWasmTerminal,
+  createMemoryPersistence,
+  FxFencedError,
+  FxJournalVersionError,
   encodeXtermKeyEvent,
   fxSdkApiVersion,
   listModels,
@@ -19,7 +24,7 @@ import {
   xtermAdapter,
 } from "./fx-sdk.js";
 
-export { encodeXtermKeyEvent, fxSdkApiVersion, listModels, supportsJspi, xtermAdapter };
+export { createMemoryPersistence, encodeXtermKeyEvent, FxFencedError, FxJournalVersionError, fxSdkApiVersion, listModels, memory, supportsJspi, xtermAdapter };
 export const libfxApiVersion = 2;
 const nativeCoreApiVersion = 4;
 
@@ -644,7 +649,12 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
   return wasmFactory({ ...runtimeOptions, wasm: await wasmInput(wasmSource) });
 }
 
-export async function createFxAgent(options = {}) {
+/**
+ * One fx session on the native core, or on WebAssembly when the native
+ * addon is unavailable, with no durability of its own. `createFxAgent`
+ * runs durable sessions on these.
+ */
+export async function createFxEngine(options = {}) {
   return createWithFallback(
     "agent",
     "createCore",
@@ -653,6 +663,38 @@ export async function createFxAgent(options = {}) {
     options,
   );
 }
+
+// The durability a session gets when the caller names none: Vercel's World
+// on Vercel, otherwise files in the temporary directory. Each is its own
+// module, loaded only here: a bundler copies the file the URL names and
+// leaves the import itself to Node.
+async function environmentDurability() {
+  const load = (asset) => import(/* webpackIgnore: true */ /* turbopackIgnore: true */ (asset.protocol === "" ? bundledAssetUrl(asset) : asset).href);
+  if (process.env.VERCEL) {
+    const { vercel } = await load(new URL("./durable/vercel.mjs", import.meta.url));
+    return vercel();
+  }
+  const { local } = await load(new URL("./durable/local.mjs", import.meta.url));
+  return local({ dir: process.env.FX_SESSIONS_DIR || resolve(tmpdir(), "libfx", "sessions") });
+}
+
+/**
+ * An agent whose sessions survive crashes, timeouts and redeployments. It
+ * does no I/O until a session is used.
+ */
+export const createFxAgent = createDurableAgentFactory({
+  name: "createFxAgent",
+  label: "fx agent",
+  defaultDurability: environmentDurability,
+  harness: fxHarness({
+    createEngine: createFxEngine,
+    // An explicit key, then the durability's own credential, such as a
+    // Vercel deployment's OIDC token, then the one in the environment.
+    defaultApiKey: async (durability) => process.env.AI_GATEWAY_API_KEY ||
+      (await Promise.resolve(durability?.gatewayKey?.()).catch(() => undefined)) ||
+      process.env.VERCEL_OIDC_TOKEN || undefined,
+  }),
+});
 
 export function createFxTerminal(options = {}) {
   return createWithFallback("terminal", "createFxTerminal", createWasmTerminal, defaultTermWasm, options);

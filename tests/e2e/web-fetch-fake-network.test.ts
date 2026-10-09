@@ -300,7 +300,7 @@ async function startAcpCodeSession(client: AcpClient) {
   await client.request("initialize", { protocolVersion: 1 }, 1);
   await client.request("session/new", { mcpServers: [] }, 2);
   await client.readLine();
-  await client.request("session/set_mode", { modeId: "code" }, 3);
+  await client.request("session/set_mode", { modeId: "auto" }, 3);
 }
 
 async function runAcpPrompt(client: AcpClient, text: string) {

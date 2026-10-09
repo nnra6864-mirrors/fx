@@ -1660,6 +1660,118 @@ test "clear retains installed full transcript page until window worker terminate
     try std.testing.expect(runtime.full_transcript_installed_page == null);
 }
 
+test "user prompt card commit caches the same source a frame would rebuild" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+        .owned_top_row = 1,
+        .has_committed_frame = true,
+    };
+    defer runtime.deinit(alloc);
+    var metrics: Metrics = .{};
+    _ = try runtime.appendRawTranscriptEntryClassified(alloc, "WELCOME_ROW\n", .welcome);
+    _ = try runtime.appendRawTranscriptEntryClassified(alloc, "previous answer\n" ** 40, .unknown_raw);
+    _ = try runtime.appendRawTranscriptEntryClassified(alloc, "  6m 25s (↑14 ↓30k)", .turn_summary);
+    const revision_before = runtime.full_transcript_content_revision;
+
+    var seeded_text = "SEEDED_PROMPT".*;
+    _ = try runtime.writeUserPromptCard(alloc, &metrics, .{ .text = &seeded_text }, true, &.{});
+    try std.testing.expect(runtime.full_transcript_content_revision != revision_before);
+    const seeded = runtime.compact_transcript_source_cache.find(
+        runtime.full_transcript_content_revision,
+        runtime.layout.cols,
+        runtime.has_committed_frame,
+    ) orelse return error.CommittedSourceNotCached;
+
+    var rebuilt = try source_preparation.prepareTranscriptSource(&runtime, alloc, null);
+    defer rebuilt.deinit(alloc);
+    try rebuilt.ensureLineIndex(alloc);
+    try std.testing.expect(std.mem.find(u8, rebuilt.bytes, "SEEDED_PROMPT") != null);
+    try std.testing.expectEqualDeep(rebuilt, seeded.*);
+
+    // Before the first committed frame the frame-time source keeps the
+    // welcome cut, so the commit's source is not reused.
+    runtime.has_committed_frame = false;
+    const unframed_revision = runtime.full_transcript_content_revision;
+    var unframed_text = "UNFRAMED_PROMPT".*;
+    _ = try runtime.writeUserPromptCard(alloc, &metrics, .{ .text = &unframed_text }, true, &.{});
+    try std.testing.expect(runtime.compact_transcript_source_cache.find(
+        runtime.full_transcript_content_revision,
+        runtime.layout.cols,
+        false,
+    ) == null);
+    try std.testing.expect(runtime.full_transcript_content_revision != unframed_revision);
+
+    // With the full transcript open the commit prepares at full depth, which
+    // the next inline frame must not reuse.
+    runtime.has_committed_frame = true;
+    runtime.full_transcript = .{ .depth = .full };
+    const full_depth_revision = runtime.full_transcript_content_revision;
+    var full_depth_text = "FULL_DEPTH_PROMPT".*;
+    _ = try runtime.writeUserPromptCard(alloc, &metrics, .{ .text = &full_depth_text }, true, &.{});
+    try std.testing.expect(runtime.full_transcript_content_revision != full_depth_revision);
+    try std.testing.expect(runtime.compact_transcript_source_cache.find(
+        runtime.full_transcript_content_revision,
+        runtime.layout.cols,
+        true,
+    ) == null);
+}
+
+test "committed transcript source is not cached while released rows are still published" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{ .cols = 40, .rows = 12, .content_bottom = 8, .divider_top_row = 9, .input_row = 10, .divider_bottom_row = 11, .hint_row = 12 },
+        .has_committed_frame = true,
+        .detached_commit_alloc = alloc,
+        .committed_frame_layout = .{ .terminal_cols = 40, .terminal_rows = 12 },
+    };
+    defer runtime.deinit(alloc);
+    const id = try runtime.appendRawTranscriptEntryClassified(alloc, "RELEASED_ROW", .unknown_raw);
+    var flow = try source_preparation.prepareRetentionSource(&runtime, alloc);
+    defer flow.deinit(alloc);
+    var identity = try source_preparation.RetentionIdentity.capture(&runtime, alloc, &flow);
+    errdefer identity.deinit(alloc);
+    identity.publication_entries = try alloc.dupe(u32, &.{id});
+    identity.publication_release_floor = 1;
+    runtime.transcript_commit_state = .{ .recovering = .{
+        .flow = try alloc.dupe(u8, flow.bytes),
+        .retention_identity = identity,
+        .attempt_cols = 40,
+        .attempt_total_visual_rows = 1,
+        .materialized_visual_rows = 1,
+        .materialized_flow_len = flow.bytes.len,
+        .tracks_semantic_progress = true,
+        .presentation_valid = true,
+    } };
+    identity = .{};
+
+    for ([_]bool{ true, false }) |published| {
+        if (!published) {
+            const retention = &runtime.transcript_commit_state.recovering.retention_identity;
+            alloc.free(retention.publication_entries);
+            retention.publication_entries = &.{};
+        }
+        const previous_revision = runtime.full_transcript_content_revision;
+        runtime.full_transcript_content_revision += 1;
+        const committed = try source_preparation.prepareTranscriptSource(&runtime, alloc, null);
+        runtime.adoptCommittedTranscriptSource(alloc, committed, previous_revision);
+        const cached = runtime.compact_transcript_source_cache.find(
+            runtime.full_transcript_content_revision,
+            runtime.layout.cols,
+            true,
+        );
+        try std.testing.expectEqual(!published, cached != null);
+    }
+}
+
 test "compact transcript cache survives navigation and invalidates on content change" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
@@ -10165,6 +10277,22 @@ pub const TranscriptRuntime = struct {
         }
     }
 
+    /// Writes an OSC 7501 report between frames, like the notification bell.
+    pub fn writeProgramStatus(
+        self: *TranscriptRuntime,
+        metrics: *Metrics,
+        report: []const u8,
+    ) void {
+        switch (transcript_io.writeFrameBytes(self, metrics, report)) {
+            .complete => {},
+            .partial => |partial| debug_trace.logf(
+                "program_status",
+                "report write failed accepted_bytes={d} err={s}",
+                .{ partial.accepted_bytes, @errorName(partial.err) },
+            ),
+        }
+    }
+
     fn writeFrameSink(ctx: *anyopaque, metrics: *Metrics, bytes: []const u8) render_engine.terminal_diff.FrameSinkWriteResult {
         const self: *TranscriptRuntime = @ptrCast(@alignCast(ctx));
         return transcript_io.writeFrameBytes(self, metrics, bytes);
@@ -10286,6 +10414,53 @@ pub const TranscriptRuntime = struct {
             .has_committed_frame = self.has_committed_frame,
         });
         return cached.clone(alloc);
+    }
+
+    /// Takes ownership of the source a recorded mutation commit prepared for
+    /// the committed entries and caches it for the next inline frame, which
+    /// would otherwise render every entry again. Discards it whenever a frame
+    /// would prepare differently from the commit: the content revision did not
+    /// advance, no frame has committed yet, a resume source owns preparation,
+    /// the full transcript is open, or released rows are still published.
+    pub fn adoptCommittedTranscriptSource(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        committed: TranscriptPreparationSource,
+        previous_revision: u64,
+    ) void {
+        var source = committed;
+        const publishes_released_rows = if (self.committedRetentionIdentity()) |identity|
+            identity.publication_entries.len > 0
+        else
+            false;
+        if (self.full_transcript_content_revision == previous_revision or
+            !self.has_committed_frame or
+            self.pending_resume_source != null or
+            self.fullTranscriptActive() or
+            publishes_released_rows or
+            source.cols != self.layout.cols)
+        {
+            source.deinit(alloc);
+            return;
+        }
+        // The commit prepares from a shadow that has not committed a frame;
+        // a frame-time source never carries the welcome cut after the first one.
+        source.welcome_cut_line = null;
+        source.ensureLineIndex(alloc) catch |err| {
+            debug_trace.logf(
+                "render",
+                "committed transcript source dropped before reuse err={s}",
+                .{@errorName(err)},
+            );
+            source.deinit(alloc);
+            return;
+        };
+        _ = self.compact_transcript_source_cache.insert(alloc, .{
+            .source = source,
+            .content_revision = self.full_transcript_content_revision,
+            .cols = self.layout.cols,
+            .has_committed_frame = self.has_committed_frame,
+        });
     }
 
     pub fn prepareTranscriptSourceForFrameInterruptible(

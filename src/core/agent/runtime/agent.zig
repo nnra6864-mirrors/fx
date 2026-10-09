@@ -35,15 +35,20 @@ pub const Agent = struct {
         self.turn_usage = .{};
     }
 
-    pub fn checkpoint(self: *const Agent, alloc: Allocator) checkpoint_codec.Error![]u8 {
-        return checkpoint_codec.encode(alloc, self.history.items, self.turn_usage);
+    /// The history and usage as checkpoint bytes, recording `meta` about the
+    /// agent that saves them. Caller owns the bytes.
+    pub fn checkpoint(self: *const Agent, alloc: Allocator, meta: checkpoint_codec.Meta) checkpoint_codec.Error![]u8 {
+        return checkpoint_codec.encode(alloc, self.history.items, self.turn_usage, meta);
     }
 
+    /// Restores `bytes` into this fresh agent. Returns what the checkpoint
+    /// recorded about the agent that saved it, owned by `alloc`
+    /// (`Meta.free`).
     pub fn restoreCheckpoint(
         self: *Agent,
         alloc: Allocator,
         bytes: []const u8,
-    ) (checkpoint_codec.Error || error{AgentNotFresh})!void {
+    ) (checkpoint_codec.Error || error{AgentNotFresh})!checkpoint_codec.Meta {
         if (!self.fresh or self.history.items.len != 0) {
             return error.AgentNotFresh;
         }
@@ -56,6 +61,9 @@ pub const Agent = struct {
         previous.deinit(alloc);
         self.turn_usage = decoded.usage;
         self.fresh = false;
+        const meta = decoded.meta;
+        decoded.meta = .{};
+        return meta;
     }
 
     pub fn observeUsage(self: *Agent, usage: types.Usage) void {
@@ -254,12 +262,12 @@ test "Agent checkpoint restores only into a fresh owner" {
         .user = .{ .text = @constCast("before") },
         .assistant = @constCast("after"),
     } });
-    const bytes = try source.checkpoint(alloc);
+    const bytes = try source.checkpoint(alloc, .{});
     defer alloc.free(bytes);
 
     var restored: Agent = .{};
     defer restored.deinit(alloc);
-    try restored.restoreCheckpoint(alloc, bytes);
+    (try restored.restoreCheckpoint(alloc, bytes)).free(alloc);
     try std.testing.expectEqualStrings("before", restored.history.items[0].assistant.user.text);
     try std.testing.expectError(error.AgentNotFresh, restored.restoreCheckpoint(alloc, bytes));
 }
@@ -268,11 +276,11 @@ test "Agent checkpoint restore consumes freshness for empty history" {
     const alloc = std.testing.allocator;
     var source: Agent = .{};
     defer source.deinit(alloc);
-    const bytes = try source.checkpoint(alloc);
+    const bytes = try source.checkpoint(alloc, .{});
     defer alloc.free(bytes);
 
     var restored: Agent = .{};
     defer restored.deinit(alloc);
-    try restored.restoreCheckpoint(alloc, bytes);
+    (try restored.restoreCheckpoint(alloc, bytes)).free(alloc);
     try std.testing.expectError(error.AgentNotFresh, restored.restoreCheckpoint(alloc, bytes));
 }
