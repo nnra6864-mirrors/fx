@@ -120,10 +120,12 @@ already aborted is not stored: its `result` resolves with the stop reason
 Give a prompt a `messageId` when the same request can reach your server more
 than once, such as a client retry. A second `prompt()` with an id the session
 already accepted runs nothing: while that turn runs, the view follows it, and
-after it ends, `result` resolves to its outcome with `repeated: true`. When the
-process that ran the turn stopped before writing how it ended, `result`
-resolves with the stop reason `unknown` after 30 seconds. An id follows the
-session id rule.
+after it ends, `result` resolves to its outcome with `repeated: true`. When
+that turn failed and its end never reached the stream, `result` resolves with
+the failure from the session's log, without `repeated` if the failure could be
+this request's own run. When the process that ran the turn stopped before
+writing how it ended, `result` resolves with the stop reason `unknown` after
+30 seconds. An id follows the session id rule.
 
 `session.stream(cursor)` returns every event the session has produced from
 `cursor` on, as NDJSON, and stays open for the events after them. Any process

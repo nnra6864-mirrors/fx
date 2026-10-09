@@ -761,6 +761,51 @@ test("a new session's id can come before its first prompt, and null is no id", a
   await agent.close();
 });
 
+// A memory durability whose stream loses each failed turn's end, as when
+// that write fails after the log recorded the failure.
+function losingFailedEnds(base) {
+  let wrapped = null;
+  const dropped = (line) => {
+    try {
+      const event = JSON.parse(line);
+      return event.type === "turn_end" && event.stopReason === "error";
+    } catch { return false; }
+  };
+  return {
+    ...base,
+    create() {
+      const backend = base.create();
+      wrapped ??= Object.assign(Object.create(backend), {
+        async session(id) {
+          const log = await backend.session(id);
+          const ui = Object.assign(Object.create(log.ui), { write: (lines) => log.ui.write(lines.filter((line) => !dropped(line))) });
+          return Object.assign(Object.create(log), { ui });
+        },
+      });
+      return wrapped;
+    },
+  };
+}
+
+if (durabilityKind === "memory") {
+  test("a retried prompt whose failed turn left no end on the stream answers with its error at once", async () => {
+    const { agent, counts } = agentWhoseEnginesFailAfter(0, losingFailedEnds(memory()));
+    const session = agent.session();
+    // Its view never hears the end it lost; the log still has the failure.
+    await session.prompt("alpha", { messageId: "turn-a" }).accepted;
+    while (counts.opens === 0) await new Promise((wait) => setTimeout(wait, 10));
+    await new Promise((wait) => setTimeout(wait, landMs));
+    let timer;
+    const result = await Promise.race([
+      session.prompt("alpha", { messageId: "turn-a" }).result,
+      new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error("the retry waited for an end that never comes")), 5000); }),
+    ]).finally(() => clearTimeout(timer));
+    assert.equal(result.stopReason, "error");
+    assert.equal(result.error.message, "no engine");
+    await agent.close();
+  });
+}
+
 test("world() checks its options, and an agent names it among the durabilities", async () => {
   assert.throws(() => world(), /world\(\) takes a World or a function that creates one/);
   assert.throws(() => world({}, { pollMs: 0 }), /world\(\) pollMs must be a positive integer/);

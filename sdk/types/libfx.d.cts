@@ -525,7 +525,7 @@ export interface FxTurnResult {
   messageId: string;
   /** `error` when the turn failed, with the reason in `error`; `unknown` when the process that ran it stopped before writing how it ended. */
   stopReason: FxStopReason | "error" | "unknown";
-  /** Absent only from the result of a repeated turn whose failure the session's log recorded. */
+  /** Absent when the result is a failure read from the session's log rather than from the turn's end. */
   usage?: FxUsage;
   error?: FxErrorSummary;
   /** The lease epoch of the worker that wrote the turn's end. */

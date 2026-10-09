@@ -1460,6 +1460,23 @@ async function uiRankerAt(log, count) {
 
 // The end a turn's worker wrote, among the first `count` lines of the
 // stream, as a reader shows them; null when none did.
+// What a retried `messageId` finds in its session: its turn still waiting or
+// running (`follow`), no trace of it (`fresh`), a turn it already ran,
+// settled from that turn's end on the stream before `from` or from the
+// log's record of its failure, or `unsure` when the log says it ran but
+// neither shows how. Once this call has `sent` the message, a recorded
+// failure may be this send's own run, so it is not called a repeat.
+async function retryOutcome(log, state, messageId, from, { sent }) {
+  const waiting = state.inputKeys.has(`prompt:${messageId}`) && !state.consumed.has(messageId);
+  if ((state.openTurn?.id === messageId && !state.failed.has(messageId)) || waiting) return { follow: true };
+  if (!state.consumed.has(messageId)) return { fresh: true };
+  const ended = await turnEndIn(log, messageId, from);
+  if (ended) return { settled: { ...ended, repeated: true } };
+  const error = state.failed.get(messageId);
+  if (error) return { settled: { messageId, stopReason: "error", error, ...(sent ? {} : { repeated: true }) } };
+  return { unsure: true };
+}
+
 async function turnEndIn(log, messageId, count) {
   if (count === 0) return null;
   const shows = uiRanker();
@@ -1778,32 +1795,25 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
                   log.read().then(foldSessionLog),
                   send({ type, messageId, ...(input === undefined ? {} : { input }) }).then(() => accept.resolve({ messageId, sessionId })),
                 ]);
-                // One still waiting or running: follow it. One the log does
-                // not know yet is this send's own.
-                if ((state.openTurn?.id === messageId && !state.failed.has(messageId)) || (state.inputKeys.has(`prompt:${messageId}`) && !state.consumed.has(messageId))) {
-                  return { log, from, attaching: true };
-                }
-                if (!state.consumed.has(messageId)) return { log, from, attaching: false };
-                const ended = await turnEndIn(log, messageId, from);
-                if (ended) return { settled: { ...ended, repeated: true } };
-                // Either this send's own turn already ended, its end after
-                // `from`, or a turn this id ran before never wrote its end.
-                return { log, from, attaching: true, endWithinMs: retryEndWaitMs, unsure: true };
+                // One the log does not know yet is this send's own. When the
+                // log says it ran and nothing shows how, either this send's
+                // own turn already ended, its end after `from`, or a turn
+                // this id ran before never wrote its end.
+                const outcome = await retryOutcome(log, state, messageId, from, { sent: true });
+                if (outcome.settled) return { settled: outcome.settled };
+                if (outcome.unsure) return { log, from, attaching: true, endWithinMs: retryEndWaitMs, unsure: true };
+                return { log, from, attaching: outcome.follow === true };
               }
               if (retried) {
                 // A turn this id already ran answers from the log, without
                 // queueing it again. The viewer's start is read first, so a
                 // turn that ends after it has its end in view.
                 from = await log.ui.length();
-                const state = foldSessionLog(await log.read());
-                // One still waiting or running: follow it.
-                if ((state.openTurn?.id === messageId && !state.failed.has(messageId)) || (state.inputKeys.has(`prompt:${messageId}`) && !state.consumed.has(messageId))) attaching = true;
-                else if (state.consumed.has(messageId)) {
+                const outcome = await retryOutcome(log, foldSessionLog(await log.read()), messageId, from, { sent: false });
+                if (outcome.follow) attaching = true;
+                else if (!outcome.fresh) {
                   accept.resolve({ messageId, sessionId });
-                  const ended = await turnEndIn(log, messageId, from);
-                  if (ended) return { settled: { ...ended, repeated: true } };
-                  const error = state.failed.get(messageId);
-                  if (error) return { settled: { messageId, stopReason: "error", error, repeated: true } };
+                  if (outcome.settled) return { settled: outcome.settled };
                   return { log, from, attaching: true, endWithinMs: retryEndWaitMs };
                 }
               }
