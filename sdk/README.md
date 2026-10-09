@@ -92,6 +92,18 @@ running turn. Pass `context` to hand JSON to the session's tools:
 `session()` call whose prompt or steer started it, and a call without
 `context` gives its turns none.
 
+A conversation can also choose its own model and instructions.
+`agent.session(id, { model, instructions })` runs the turns it starts with
+that model, a model ID or a model object such as `{ id, effort, fast }`, in
+place of the agent's whole model choice, and with those instructions in place
+of the agent's. They follow the rule `context` follows: a turn keeps the
+settings of the `session()` call that started it, also when another process
+continues it, and a call without them runs with the agent's. Pass a
+conversation's settings on each call; a change applies from its next turn.
+When a session's next turn runs under another model than the one its last
+checkpoint was saved under, the session continues and `onEvent` receives a
+`checkpoint.mismatch` event.
+
 ### Turns
 
 `session.prompt(input)` queues `input` as the session's next turn and returns

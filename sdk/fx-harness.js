@@ -1,7 +1,7 @@
 // fx as a harness of the durable core in durable.js: `createFxAgent` is that
 // core running fx engines. Everything the core needs to know about fx is
 // here; the core itself knows only the harness contract.
-import { coreAnswered, engineInternals, journalMarksWanted } from "./fx-sdk.js";
+import { coreAnswered, engineInternals, journalMarksWanted, normalizeInstructions, normalizeModelChoice } from "./fx-sdk.js";
 
 const encoder = new TextEncoder();
 
@@ -21,10 +21,11 @@ export function fxHarness({ createEngine, defaultApiKey = async () => undefined 
     const idempotent = idempotentTools(engineOptions.tools);
     return {
       ...(checkpoint === undefined ? {} : { seed: snapshotOf(checkpointBytesOf(checkpoint)) }),
-      async open({ sessionId, store, context, durability, ready }) {
+      settings: sessionSettings,
+      async open({ sessionId, store, context, settings, durability, ready }) {
         const apiKey = engineOptions.apiKey ?? await defaultApiKey(durability);
         const engine = await createEngine({
-          ...engineOptions,
+          ...withSettings(engineOptions, settings),
           ...(apiKey === undefined ? {} : { apiKey }),
           ...(ready === undefined || engineOptions.tools === undefined ? {} : { tools: claimedTools(engineOptions.tools, ready) }),
           sessionId,
@@ -39,6 +40,33 @@ export function fxHarness({ createEngine, defaultApiKey = async () => undefined 
         return fxSession(engine, idempotent);
       },
     };
+  };
+}
+
+// What `agent.session(id, { model, instructions })` sets for the turns it
+// starts, checked as the engine checks it and copied, since the core stores
+// it with each prompt; undefined when it sets neither.
+function sessionSettings({ model, instructions } = {}) {
+  if (model !== undefined) {
+    if (typeof model !== "string" && (model === null || typeof model !== "object" || Array.isArray(model))) {
+      throw new TypeError("session model must be a model id or a model object");
+    }
+    normalizeModelChoice({ model });
+  }
+  if (instructions !== undefined) normalizeInstructions(instructions);
+  if (model === undefined && instructions === undefined) return undefined;
+  return JSON.parse(JSON.stringify({ model, instructions }));
+}
+
+// The agent's engine options with a session's settings over them. A
+// session's model replaces the agent's whole model choice, its effort and
+// fast options included.
+function withSettings(engineOptions, settings) {
+  if (!settings) return engineOptions;
+  const { model: _model, effort: _effort, fast: _fast, ultrafast: _ultrafast, ...rest } = engineOptions;
+  return {
+    ...(settings.model === undefined ? engineOptions : { ...rest, model: settings.model }),
+    ...(settings.instructions === undefined ? {} : { instructions: settings.instructions }),
   };
 }
 

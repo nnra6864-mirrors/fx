@@ -62,6 +62,12 @@ export async function sessionsAndTurns(agent: FxAgent): Promise<void> {
   assertType<Equal<typeof id, string>>();
   const known: FxSession = agent.session(id, { context: { userId: "user_1", roles: ["admin"], limit: 3 } });
   agent.session(undefined, { context: null });
+  agent.session(id, { model: "openai/gpt-5", instructions: ["Design rules.", "House style."] });
+  agent.session(id, { model: { id: "anthropic/claude-haiku-4.5", effort: "low", fast: true }, context: { userId: "user_1" } });
+  // @ts-expect-error a session's model takes no top-level effort
+  agent.session(id, { model: "openai/gpt-5", effort: "low" });
+  // @ts-expect-error instructions are text
+  agent.session(id, { instructions: 5 });
   assertType<Equal<typeof known.id, string | null>>();
 
   // @ts-expect-error null is not a session id: only a missing id starts a new session

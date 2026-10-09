@@ -738,6 +738,47 @@ test("each prompt's turn runs with its own caller's context, resumed or not", as
   await agent.close();
 });
 
+test("each prompt's turn runs with its session object's settings, resumed or not", async () => {
+  const seen = [];
+  const configurable = createDurableAgentFactory({
+    harness: () => {
+      const base = scriptedHarness()();
+      return {
+        settings: ({ model }) => (model === undefined ? undefined : { model }),
+        open: async (options) => {
+          const session = await base.open(options);
+          const ran = options.settings ?? null;
+          return { ...session, prompt: (input, opts) => { seen.push([input, ran]); return session.prompt(input, opts); }, resume: (opts) => { seen.push(["resume", ran]); return session.resume(opts); }, get openTurn() { return session.openTurn; } };
+        },
+      };
+    },
+    defaultDurability: async () => memory(),
+  });
+  const agent = configurable({ durability: await durabilityFor({ maxDurationMs: 1, reserveMs: 0 }) });
+  const opened = agent.session(undefined, { model: "m1" });
+  assert.equal((await opened.prompt("upsilon").result).stopReason, "end_turn");
+  const id = opened.id;
+  assert.equal((await agent.session(id).prompt("phi").result).stopReason, "end_turn");
+  assert.equal((await agent.session(id, { model: "m2" }).prompt("chi").result).stopReason, "end_turn");
+  assert.deepEqual(seen.filter(([input]) => input === "upsilon").map(([, s]) => s), [{ model: "m1" }]);
+  assert.deepEqual(seen.filter(([input]) => input === "phi").map(([, s]) => s), [null], "a call without settings runs with the agent's");
+  assert.deepEqual(seen.filter(([input]) => input === "chi").map(([, s]) => s), [{ model: "m2" }]);
+  // Every turn yielded at each step; each resume ran with its own turn's settings.
+  const order = seen.map(([input, settings]) => `${input}:${JSON.stringify(settings)}`);
+  for (const [word, settings] of [["upsilon", { model: "m1" }], ["phi", null], ["chi", { model: "m2" }]]) {
+    const at = order.indexOf(`${word}:${JSON.stringify(settings)}`);
+    assert.deepEqual(order.slice(at + 1, at + 3), [`resume:${JSON.stringify(settings)}`, `resume:${JSON.stringify(settings)}`], `${word} resumed with its own settings`);
+  }
+  // A harness's refusal reaches the caller when the session object is made.
+  const strict = createDurableAgentFactory({
+    harness: () => ({ ...scriptedHarness()(), settings: () => { throw new TypeError("no such model"); } }),
+    defaultDurability: async () => memory(),
+  })({ durability: await durabilityFor() });
+  assert.throws(() => strict.session(undefined, { model: "nope" }), /^TypeError: no such model$/);
+  await strict.close();
+  await agent.close();
+});
+
 test("a worker lives only while a delivery runs it", async () => {
   const agent = createAgent({ durability: await durabilityFor() });
   const internals = agent[Symbol.for("libfx.durableInternals")];

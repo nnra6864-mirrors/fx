@@ -107,15 +107,9 @@ function normalizeUltrafast(value) {
   return value;
 }
 
-export function normalizeAgentOptions(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new TypeError("createFxEngine() options must be an object");
-  }
-  const options = { ...value };
-  if (Object.hasOwn(options, "env")) {
-    throw new TypeError("createFxEngine() does not accept env; pass apiKey and model directly");
-  }
-  options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, true);
+// The model choice in `options`, a model object or a model ID with the
+// deprecated top-level options, as `{ model, effort, fast, ultrafast }`.
+export function normalizeModelChoice(options) {
   if (options.model !== null && typeof options.model === "object" && !Array.isArray(options.model)) {
     if (Object.hasOwn(options, "effort") || Object.hasOwn(options, "fast") || Object.hasOwn(options, "ultrafast")) {
       throw new TypeError("model options cannot be mixed with top-level effort, fast, or ultrafast");
@@ -126,16 +120,31 @@ export function normalizeAgentOptions(value) {
         throw new TypeError(`unsupported model option: ${name}`);
       }
     }
-    options.model = boundedString(model.id, "model.id", maxModelBytes, true);
-    options.effort = normalizeEffort(model.effort);
-    options.fast = normalizeFast(model.fast);
-    options.ultrafast = normalizeUltrafast(model.ultrafast);
-  } else {
-    options.model = boundedString(options.model, "model", maxModelBytes, false);
-    options.effort = normalizeEffort(options.effort);
-    options.fast = normalizeFast(options.fast);
-    options.ultrafast = normalizeUltrafast(options.ultrafast);
+    return {
+      model: boundedString(model.id, "model.id", maxModelBytes, true),
+      effort: normalizeEffort(model.effort),
+      fast: normalizeFast(model.fast),
+      ultrafast: normalizeUltrafast(model.ultrafast),
+    };
   }
+  return {
+    model: boundedString(options.model, "model", maxModelBytes, false),
+    effort: normalizeEffort(options.effort),
+    fast: normalizeFast(options.fast),
+    ultrafast: normalizeUltrafast(options.ultrafast),
+  };
+}
+
+export function normalizeAgentOptions(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("createFxEngine() options must be an object");
+  }
+  const options = { ...value };
+  if (Object.hasOwn(options, "env")) {
+    throw new TypeError("createFxEngine() does not accept env; pass apiKey and model directly");
+  }
+  options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, true);
+  Object.assign(options, normalizeModelChoice(options));
   validateGatewayChatUrl(options.gatewayChatUrl);
   if (options.resizeImage !== undefined && typeof options.resizeImage !== "function") {
     throw new TypeError("resizeImage must be a function");
@@ -2074,7 +2083,7 @@ function modelCatalogBody(value) {
   return body;
 }
 
-function normalizeInstructions(value) {
+export function normalizeInstructions(value) {
   let instructions;
   if (value === undefined) instructions = "";
   else if (typeof value === "string") instructions = value;
