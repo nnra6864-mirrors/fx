@@ -43,9 +43,19 @@ const newId = (prefix) => `${prefix}_${crypto.randomUUID().replaceAll("-", "")}`
 
 // How long a worker leaves for a model step it decides not to start.
 const defaultReserveMs = 30_000;
-// A lease with nothing to show whether its holder lives expires after this,
-// and its holder renews it well before.
-const unknownHolderLeaseMs = 60_000;
+// A lease with nothing to show whether its holder lives expires this long
+// after it was taken or last renewed, and its holder renews it every third of
+// that while it runs. So a worker that dies frees its session this soon
+// after its last renewal, not at its function's deadline.
+const defaultLeaseMs = 15_000;
+
+// When a lease taken or renewed now runs out: never past the deadline its
+// worker stops at, and with liveness known, only at that deadline.
+function leaseEnd(backend, deadline) {
+  if (backend.livenessKnown) return deadline;
+  const renewed = Date.now() + backend.leaseMs;
+  return deadline === null ? renewed : Math.min(renewed, deadline);
+}
 // The newest consumed message ids a checkpoint keeps, so a message the queue
 // delivers again after its turn ended is still recognized.
 const recentIdsKept = 256;
@@ -504,7 +514,7 @@ const listenersOf = new WeakMap();
 
 // libfx starts and closes a World it `owned`, having created it; a World the
 // app passed in stays the app's.
-function createWorldBackend(world, { name, reserveMs, pollMs, alive, holderInfo, livenessKnown = false, queueDurable = false, maxDurationMs, owned = true }) {
+function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, holderInfo, livenessKnown = false, queueDurable = false, maxDurationMs, owned = true }) {
   const spec = world.specVersion === undefined ? {} : { specVersion: world.specVersion };
   const created = new Set();
   // Runs being created now: writes that go out together create a run once.
@@ -540,6 +550,7 @@ function createWorldBackend(world, { name, reserveMs, pollMs, alive, holderInfo,
     queueDurable,
     pollMs: pollMs ?? 1000,
     reserveMs: reserveMs ?? defaultReserveMs,
+    leaseMs: leaseMs ?? defaultLeaseMs,
     maxDurationMs: maxDurationMs ?? null,
     world,
     newSessionId: () => `wrun_${typeof world.createRunId === "function" ? world.createRunId({}) : ulid()}`,
@@ -981,7 +992,7 @@ class SessionWorker {
       a: state.head,
       holder: this.holder,
       epoch: state.lastEpoch + 1,
-      expiresAt: deadline ?? (this.backend.livenessKnown ? null : Date.now() + unknownHolderLeaseMs),
+      expiresAt: leaseEnd(this.backend, deadline),
       ...this.backend.holderInfo(),
     };
     this.backend.holding(this.holder, true);
@@ -1102,6 +1113,8 @@ class SessionWorker {
       cut = state.cut;
     }
     const ui = uiWriter(log, (error) => agent.emit("ui.error", { sessionId: this.sessionId, error: error?.name ?? "Error" }), lease.epoch);
+    // When the lease runs out, as this worker last renewed it.
+    let leaseExpiresAt = lease.expiresAt;
     const store = {
       load: async () => ({
         ...(state.checkpoint?.data ? { checkpoint: { through: state.checkpoint.through ?? "0", data: fromBase64(state.checkpoint.data) } } : {}),
@@ -1123,23 +1136,30 @@ class SessionWorker {
           recent: now.recent,
           lastTurnId: now.lastTurnId,
           ...(now.openTurn ? { openTurn: now.openTurn, yielded: now.yielded } : {}),
-          lease: { holder: this.holder, epoch: lease.epoch, expiresAt: lease.expiresAt, pid: lease.pid, host: lease.host },
+          lease: { holder: this.holder, epoch: lease.epoch, expiresAt: leaseExpiresAt, pid: lease.pid, host: lease.host },
         });
       },
     };
+    // The turn running now, which a deadline or a lost lease cancels.
+    let turnNow = null;
     let renew = null;
-    if (lease.expiresAt !== null && deadline === null) {
-      // A lease nothing else shows alive is renewed while its worker runs.
+    if (!this.backend.livenessKnown) {
+      // A lease nothing else shows alive is renewed while its worker runs,
+      // and never after its release, which would take the session back. A
+      // renewal fenced out by another worker's write stops the turn at once,
+      // as a claim that failed does.
       renew = setInterval(() => {
-        void chained({ k: "lease", holder: this.holder, epoch: lease.epoch, expiresAt: Date.now() + unknownHolderLeaseMs, ...this.backend.holderInfo() }).catch(() => {});
-      }, unknownHolderLeaseMs / 3);
+        if (released || failed || this.stopping) return;
+        leaseExpiresAt = leaseEnd(this.backend, deadline);
+        void chained({ k: "lease", holder: this.holder, epoch: lease.epoch, expiresAt: leaseExpiresAt, ...this.backend.holderInfo() })
+          .catch((error) => { if (isFenced(error)) turnNow?.cancel({ reason: "handoff" }); });
+      }, Math.max(1, Math.floor(this.backend.leaseMs / 3)));
     }
     // Shortly before the deadline the worker hands the open turn back to the
     // log, cutting off whatever call is still running, and the same message
     // continues the turn in a new delivery. Half the reserve, at most
     // hardStopMs; a reserve of zero never stops a step.
     const stopMargin = deadline === null ? 0 : Math.min(hardStopMs, Math.floor(this.backend.reserveMs / 2));
-    let turnNow = null;
     this.stopping = false;
     this.stopNow = () => {
       if (this.stopping) return;
@@ -1982,6 +2002,13 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
         lastLease: async (sessionId) => {
           const log = await (await backend()).session(sessionId);
           return foldSessionLog(await log.read()).lastLease;
+        },
+        // Whether a lease stands on the session now, as a worker reading it
+        // would judge: unexpired, and not held by a worker known dead.
+        leaseStands: async (sessionId) => {
+          const held = await backend();
+          const log = await held.session(sessionId);
+          return foldSessionLog(await log.read(), { now: Date.now(), alive: (lease) => held.alive(lease) }).lease !== null;
         },
       },
       /** Opens session `id`, or a new one; no I/O until it is used. */

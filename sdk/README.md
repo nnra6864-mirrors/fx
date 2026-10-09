@@ -217,7 +217,8 @@ one bundles.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `queueDurable` | `false` | The queue keeps a message until a delivery acknowledges it, across crashes. When `false`, `prompt()` stores the prompt in the session before it queues it. |
-| `livenessKnown`, `alive(lease)`, `holderInfo()` | `false` | `alive(lease)` answers whether the holder of a lease still runs, from what `holderInfo()` put in it, so a crashed worker's session frees at once. Without it, a session stays held until its holder's deadline. |
+| `livenessKnown`, `alive(lease)`, `holderInfo()` | `false` | `alive(lease)` answers whether the holder of a lease still runs, from what `holderInfo()` put in it, so a crashed worker's session frees at once. Without it, a worker renews its lease while it runs, and the session of one that died frees `leaseMs` after its last renewal. |
+| `leaseMs` | 15000 | Without liveness, how long a lease lasts after its worker took or last renewed it. The worker renews it every third of that, and never past its deadline. |
 | `maxDurationMs`, `reserveMs` | no limit, 30000 | Each delivery stops `reserveMs` before `maxDurationMs`, or before the World's `getRuntimeDeadline()` when it has one. |
 | `pollMs` | 1000 | How often a waiting worker reads the session again. |
 | `gatewayKey()` | none | The AI Gateway credential when the agent has no `apiKey`. |
@@ -253,7 +254,10 @@ When the process running a turn stops, the next process to receive work for
 the session continues the turn from its last record:
 
 - On `local()`, a session held by a process that died is free at once.
-- On `vercel()`, a turn holds its session until its function's deadline. When
+- On `vercel()`, where libfx cannot tell whether a function still runs, a
+  worker renews a 15 second lease while it runs. When its function dies, its
+  session frees 15 seconds after the last renewal, and the next delivery for
+  it continues the turn. When
   the deadline is near, libfx stops before the next model request and saves
   the turn, and the next invocation continues it. A model request or tool
   call still running shortly before the deadline is cut off: `onEvent`
@@ -264,8 +268,9 @@ the session continues the turn from its last record:
   again: a call is answered as possibly run, so the model decides what to do
   next, and a model request cancels the turn. So a process never runs on
   after the deadline its hold ends at. A
-  process that freezes and wakes after another took its session over stops
-  at its next write, and `onEvent` receives `session.fenced`. Until then it
+  process that freezes, or whose renewals stall for a lease, and wakes after
+  another took its session over stops at its next write, a renewal included,
+  and `onEvent` receives `session.fenced`. Until then it
   can finish a model request or a call to an idempotent tool; it never starts
   a tool with effects, because that waits for its record to be stored. A
   process that started a new turn on an idle session and was taken over
@@ -1133,7 +1138,9 @@ turn 30 seconds before the deadline, at its next model request, and cuts off a
 call still running 2 seconds before it; either way the same queue message runs
 the rest of the turn in a new invocation. Pass
 `durability: vercel({ reserveMs })` from `libfx/durable-vercel` to change that
-margin. libfx authenticates to the AI Gateway with the deployment's OIDC token
+margin. A function that dies mid-turn holds its session for at most
+`leaseMs` after its last renewal, 15 seconds unless you pass
+`vercel({ leaseMs })`. libfx authenticates to the AI Gateway with the deployment's OIDC token
 unless you pass `apiKey` or set `AI_GATEWAY_API_KEY`.
 
 Use the application's normal authentication and request limits around the

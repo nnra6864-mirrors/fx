@@ -28,6 +28,12 @@
 (* that never wakes is a crash. One that wakes carries on until its next   *)
 (* write, so two workers can be active at once (the witness below).        *)
 (*                                                                         *)
+(* With Heartbeat, a holder renews a short lease while it runs, as on a    *)
+(* World that cannot tell whether a holder lives. A freeze is then any     *)
+(* stall long enough for the lease to run out, and a renewal is a write:   *)
+(* one that lands after a worker wakes keeps its lease when it still heads *)
+(* the chain, and stops it when another worker took the session over.      *)
+(*                                                                         *)
 (* Shortly before its deadline a worker's own timer stops it: it cuts off  *)
 (* the call still running, hands the open turn back to the log, and the    *)
 (* same message comes back for a new delivery. So a lease that runs out at *)
@@ -55,13 +61,15 @@ CONSTANTS
     SelfStop,    \* whether a worker stops itself before its deadline
     ClaimFenced, \* whether a claim on a stale read is refused
     MaxCutoffs,  \* cut-offs of one step in a row before it is not run again
-    CutoffBound  \* whether that bound applies
+    CutoffBound, \* whether that bound applies
+    Heartbeat    \* whether a holder renews a short lease while it runs
 
 ASSUME Tool \in {"lookup", "send"}
 ASSUME SelfStop \in BOOLEAN
 ASSUME ClaimFenced \in BOOLEAN
 ASSUME MaxCutoffs \in Nat
 ASSUME CutoffBound \in BOOLEAN
+ASSUME Heartbeat \in BOOLEAN
 
 None == "none"
 Waiting == {"announce", "model1", "tool", "model2"}
@@ -292,11 +300,23 @@ Freeze(w) ==
     /\ UNCHANGED <<pc, epoch, progress, runs, ui, chain, cutoffs, seen>>
     /\ act' = [name |-> "Freeze", w |-> w]
 
-\* w wakes and carries on from where it waited.
+\* w wakes and carries on from where it waited. With Heartbeat its next
+\* renewal may land first: it keeps the lease where w still heads the chain,
+\* and stops w where another worker took the session over.
 Wake(w) ==
     /\ frozen[w]
     /\ frozen' = [frozen EXCEPT ![w] = FALSE]
-    /\ UNCHANGED <<pc, epoch, lease, progress, runs, ui, freezes, froze, chain, cutoffs, seen>>
+    /\ \/ UNCHANGED <<pc, lease, chain>>
+       \/ /\ Heartbeat
+          /\ Heads(w)
+          /\ lease' = [lease EXCEPT !.live = TRUE]
+          /\ chain' = chain + 1
+          /\ UNCHANGED pc
+       \/ /\ Heartbeat
+          /\ ~Heads(w)
+          /\ pc' = [pc EXCEPT ![w] = "stopped"]
+          /\ UNCHANGED <<lease, chain>>
+    /\ UNCHANGED <<epoch, progress, runs, ui, freezes, froze, cutoffs, seen>>
     /\ act' = [name |-> "Wake", w |-> w]
 
 \* Shortly before its deadline, w's own timer stops it and cuts off the call

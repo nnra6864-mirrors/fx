@@ -160,13 +160,14 @@ export async function durabilities(): Promise<void> {
   createFxAgent({ durability: memory({ maxDurationMs: 60_000, reserveMs: 5_000 }) });
   createFxAgent({ durability: local({ maxDurationMs: 300_000, reserveMs: 30_000 }) });
   createFxAgent({ durability: vercel({ reserveMs: 10_000 }) });
+  createFxAgent({ durability: vercel({ reserveMs: 10_000, leaseMs: 5_000 }) });
   createFxAgent({ durability: vercel() });
 
   // @ts-expect-error memory() has no dir
   memory({ dir: ".fx/sessions" });
   // @ts-expect-error local() takes no World options
   local({ queueDurable: true });
-  // @ts-expect-error vercel() takes only reserveMs
+  // @ts-expect-error vercel() takes only reserveMs and leaseMs
   vercel({ maxDurationMs: 60_000 });
   // @ts-expect-error durability must come from memory(), local(), vercel(), or world()
   createFxAgent({ durability: { name: "memory" } });
@@ -204,7 +205,7 @@ export async function worlds(): Promise<void> {
   };
   world(fake);
   world(() => fake);
-  world(async () => fake, { name: "postgres", pollMs: 500, maxDurationMs: 800_000, reserveMs: 30_000 });
+  world(async () => fake, { name: "postgres", pollMs: 500, maxDurationMs: 800_000, reserveMs: 30_000, leaseMs: 10_000 });
   world(fake, {
     livenessKnown: true,
     holderInfo: () => ({ pid: 42, host: "worker-1" }),

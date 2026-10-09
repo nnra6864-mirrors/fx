@@ -6,10 +6,12 @@ import { createWorld } from "@workflow/world-vercel";
 import { world } from "./world.mjs";
 
 /**
- * Each worker holds a session until its function's deadline, and stops
- * `reserveMs` before it so the next invocation continues the turn.
+ * Each worker renews its lease while it runs, so a session whose worker
+ * died frees `leaseMs` after its last renewal. A worker stops `reserveMs`
+ * before its function's deadline, and the next invocation continues the
+ * turn.
  */
-export function vercel({ reserveMs } = {}) {
+export function vercel({ reserveMs, leaseMs } = {}) {
   return world(() => createWorld(), {
     name: "vercel",
     // The deployment's own AI Gateway credential, fresh for each request.
@@ -19,5 +21,6 @@ export function vercel({ reserveMs } = {}) {
     queueDurable: true,
     pollMs: 1000,
     reserveMs,
+    leaseMs,
   });
 }

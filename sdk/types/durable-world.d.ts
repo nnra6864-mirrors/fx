@@ -45,6 +45,8 @@ export type WorldOptions = {
   queueDurable?: boolean;
   /** How often a waiting worker reads the session again. Default 1000. */
   pollMs?: number;
+  /** Without liveness, how long a lease lasts after its worker took or last renewed it; renewed every third of that. At least 1000. Default 15000. */
+  leaseMs?: number;
   /** Each delivery stops `reserveMs` before `maxDurationMs`, or before the World's `getRuntimeDeadline()`. No limit by default. */
   maxDurationMs?: number;
   /** Default 30000. */
@@ -61,7 +63,7 @@ export type WorldOptions = {
     alive(lease: WorldLease): boolean | null;
   }
   | {
-    /** Without liveness, a session stays held until its holder's deadline. */
+    /** Without liveness, a worker renews its lease while it runs, and the session of one that died frees `leaseMs` after its last renewal. */
     livenessKnown?: false;
     alive?(lease: WorldLease): boolean | null;
   }

@@ -39,6 +39,15 @@ const durabilityAt = async (dir, options = {}) => {
   if (durabilityKind === "world") return appWorldAt(dir, options);
   return local({ dir, ...options });
 };
+// A World that cannot tell whether a lease's holder runs, as Vercel's cannot:
+// a worker renews its lease every third of `leaseTestMs`, and its function's
+// deadline is ten minutes away.
+const leaseTestMs = 2000;
+const leasedAt = async (dir) => {
+  const { createWorld } = await import(new URL("../durable/node_modules/@workflow/world-local/dist/index.js", import.meta.url).href);
+  const { world } = await import("../durable/world.mjs");
+  return world(() => createWorld({ dataDir: dir, recoverActiveRuns: false }), { name: "leased", pollMs: 250, leaseMs: leaseTestMs, maxDurationMs: 600_000 });
+};
 const usage = { inputTokens: { total: 1 }, outputTokens: { total: 1 } };
 const resumeNotice = "Resuming from unexpected session interruption.";
 
@@ -359,7 +368,7 @@ if (childMode) {
   const dir = process.argv[5];
   const tool = process.argv[6];
   gate(tool);
-  const agent = createFxAgent(agentOptions(await durabilityAt(dir)));
+  const agent = createFxAgent(agentOptions(process.argv[7] === "leased" ? await leasedAt(dir) : await durabilityAt(dir)));
   const session = agent.session();
   void session.prompt(`use ${tool}`, { messageId: "crash-turn" }).result.catch(() => {});
   await gates.get(tool).started;
@@ -937,6 +946,106 @@ if (durabilityKind !== "memory") {
       await agent.close();
     });
   }
+}
+
+if (durabilityKind === "local") {
+  test("a worker that dies frees its session a lease after its last renewal, not at its deadline", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-durable-leased-"));
+    dirs.push(dir);
+    const child = spawn(process.execPath, [...process.execArgv, fileURLToPath(import.meta.url), durabilityKind, engineBackend, "--child", dir, "send", "leased"], {
+      stdio: ["ignore", "pipe", "inherit"], env: { ...process.env },
+    });
+    let output = "";
+    child.stdout.on("data", (chunk) => { output += chunk; });
+    await until(() => output.includes("\n"), "the child to start its tool", 30_000);
+    const { sessionId } = JSON.parse(output.trim().split("\n")[0]);
+    child.kill("SIGKILL");
+    await new Promise((exited) => child.once("exit", exited));
+    const killedAt = Date.now();
+    const sendsBefore = runs.filter(([name]) => name === "send").length;
+    const agent = createFxAgent(agentOptions(await leasedAt(dir)));
+    const resumed = await agent.session(sessionId).resume().result;
+    const waited = Date.now() - killedAt;
+    assert.equal(resumed.stopReason, "end_turn");
+    assert.equal(runs.filter(([name]) => name === "send").length - sendsBefore, 0, "a call with effects never runs twice on its own");
+    // The dead worker renewed at most a third of a lease before the kill, so
+    // its session frees within a lease of it, plus the backstop's rounding.
+    assert.ok(waited < 5 * leaseTestMs, `the session freed ${waited} ms after the crash, not at the deadline`);
+    await agent.close();
+  });
+
+  test("a worker busy for longer than its lease keeps the session by renewing it", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-durable-renew-"));
+    dirs.push(dir);
+    const events = [];
+    const held = gate("lookup");
+    const first = createFxAgent(agentOptions(await leasedAt(dir), { onEvent: (event) => events.push(event.type) }));
+    const second = createFxAgent(agentOptions(await leasedAt(dir)));
+    try {
+      const session = first.session();
+      const turn = session.prompt("use lookup", { messageId: "long-turn" });
+      await turn.accepted;
+      await held.started;
+      const lookupsBefore = runs.filter(([name]) => name === "lookup").length;
+      // Another server's prompt comes while the call runs for three leases.
+      const next = second.session(session.id).prompt("hello", { messageId: "next-turn" });
+      await new Promise((wait) => setTimeout(wait, 3 * leaseTestMs));
+      held.open();
+      assert.equal((await turn.result).stopReason, "end_turn");
+      assert.equal((await next.result).stopReason, "end_turn");
+      assert.ok(!events.includes("session.fenced"), "no other worker took the session over");
+      assert.equal(runs.filter(([name]) => name === "lookup").length, lookupsBefore, "the call ran once");
+    } finally {
+      gates.delete("lookup");
+      held.open();
+      await first.close();
+      await second.close();
+    }
+  });
+
+  test("a worker whose renewals stall past its lease stops its turn at the renewal another worker fenced", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-durable-lapse-"));
+    dirs.push(dir);
+    const internals = Symbol.for("libfx.durableInternals");
+    const events = [];
+    let stalled = false;
+    const [durability, writes] = holdWrites(await leasedAt(dir), (entry) => stalled && entry.k === "lease");
+    const first = createFxAgent(agentOptions(durability, { onEvent: (event) => events.push(event.type) }));
+    const second = createFxAgent(agentOptions(await leasedAt(dir)));
+    let takeover = null;
+    try {
+      const requestsBefore = requests.length;
+      const session = first.session();
+      const turn = session.prompt("stall", { messageId: "lapsed-turn" });
+      void turn.result.catch(() => {});
+      await turn.accepted;
+      // The first worker waits on a model request that never answers.
+      await until(() => requests.length > requestsBefore, "the first worker's model request");
+      // Its model request can go out before its claim lands.
+      await until(async () => (await first[internals].lastLease(session.id)) !== null, "the first worker's claim");
+      const holder = (await first[internals].lastLease(session.id)).holder;
+      // Its renewals stall until its lease runs out, and another worker
+      // takes the session over, as the queue's next delivery would.
+      stalled = true;
+      await new Promise((wait) => setTimeout(wait, leaseTestMs + 1000));
+      takeover = second.session(session.id).resume();
+      void takeover.result.catch(() => {});
+      await until(async () => (await second[internals].lastLease(session.id))?.holder !== holder, "the takeover");
+      assert.ok(!events.includes("session.fenced"), "the first worker has not written since");
+      // The stalled renewal lands and is fenced out: the first worker stops
+      // its model request at once instead of waiting on it.
+      await writes.releaseHeld();
+      await until(() => events.includes("session.fenced"), "the first worker to stop", 2 * leaseTestMs);
+      await until(() => first[internals].liveWorkers() === 0, "the first worker to let the session go", 2 * leaseTestMs);
+      // The turn goes on with the second worker, where its request stalls too.
+      await second.session(session.id).cancel();
+      assert.equal((await takeover.result).stopReason, "cancelled");
+    } finally {
+      writes.release();
+      await first.close();
+      await second.close();
+    }
+  });
 }
 
 if (durabilityKind !== "memory") {
