@@ -939,6 +939,9 @@ fn candidatesFromTrees(
     trees: []const indexer.Tree,
     stop_requested: *std.atomic.Value(bool),
 ) (Allocator.Error || error{Canceled})![]const Candidate {
+    if (trees.len == 1 and roots.len > 0 and std.mem.eql(u8, trees[0].root, roots[0])) {
+        return primaryTreeCandidates(arena, &trees[0], stop_requested);
+    }
     var candidates: std.ArrayList(Candidate) = .empty;
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     for (trees) |*tree| {
@@ -959,6 +962,44 @@ fn candidatesFromTrees(
         }
     }
     return candidates.toOwnedSlice(arena);
+}
+
+/// The primary root alone: its entries are unique and already relative, so
+/// each one is checked once and kept as is, with no absolute path or
+/// overlap check per entry. This runs on every `@` paint.
+fn primaryTreeCandidates(
+    arena: Allocator,
+    tree: *const indexer.Tree,
+    stop_requested: *std.atomic.Value(bool),
+) (Allocator.Error || error{Canceled})![]const Candidate {
+    var candidates: std.ArrayList(Candidate) = .empty;
+    try candidates.ensureTotalCapacity(arena, @min(tree.entries.len, max_indexed_files));
+    for (tree.entries) |entry| {
+        if (isStopRequested(stop_requested)) return error.Canceled;
+        if (candidates.items.len >= max_indexed_files) break;
+        if (!isPlainRelativePath(entry.path)) continue;
+        if (!text_utils.isTerminalSafe(entry.path)) {
+            debug_trace.logf("core", "file index omitted unsafe candidate bytes={d} kind={s}", .{ entry.path.len, @tagName(entry.kind) });
+            continue;
+        }
+        const kind: CandidateKind = switch (entry.kind) {
+            .file => .file,
+            .directory => .directory,
+        };
+        const accepted = acceptedSafeCandidate(.{ .path = entry.path, .kind = kind }) orelse continue;
+        candidates.appendAssumeCapacity(accepted);
+    }
+    return candidates.toOwnedSlice(arena);
+}
+
+/// A relative `/`-separated path that stays inside its root and avoids
+/// `.git`: no empty, `.`, `..` or `.git` component.
+fn isPlainRelativePath(path: []const u8) bool {
+    var parts = std.mem.splitScalar(u8, path, '/');
+    while (parts.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..") or std.mem.eql(u8, part, ".git")) return false;
+    }
+    return true;
 }
 
 fn hasGitComponent(path: []const u8) bool {
@@ -1073,9 +1114,14 @@ fn acceptedRawPath(sep: u8, raw: []const u8) ?[]const u8 {
 }
 
 fn acceptedCandidate(candidate: Candidate) ?Candidate {
+    if (!text_utils.isTerminalSafe(candidate.path)) return null;
+    return acceptedSafeCandidate(candidate);
+}
+
+/// `acceptedCandidate` for a path already known to be terminal-safe.
+fn acceptedSafeCandidate(candidate: Candidate) ?Candidate {
     if (candidate.path.len == 0) return null;
     if (candidate.path.len > max_path_len) return null;
-    if (!text_utils.isTerminalSafe(candidate.path)) return null;
     if (!file_picker_path.isRepresentable(candidate.path)) return null;
     if (candidate.kind == .directory and std.fs.path.isSep(candidate.path[candidate.path.len - 1])) return null;
     return candidate;
@@ -1864,6 +1910,43 @@ test "tree candidates keep a sorted directory at the exact shared cap" {
     try std.testing.expectEqual(max_indexed_files, candidates.len);
     try std.testing.expectEqual(CandidateKind.directory, candidates[0].kind);
     try std.testing.expectEqualStrings("z-file-099998", candidates[max_indexed_files - 1].path);
+}
+
+test "primary tree candidates keep plain paths and drop git, escaping and unsafe ones" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const entries = [_]indexer.Entry{
+        .{ .path = ".git/config", .kind = .file },
+        .{ .path = "a/../../outside", .kind = .file },
+        .{ .path = "/absolute", .kind = .file },
+        .{ .path = "a//b", .kind = .file },
+        .{ .path = "./a", .kind = .file },
+        .{ .path = "bad-\x1b[2J", .kind = .file },
+        .{ .path = "src", .kind = .directory },
+        .{ .path = "src/.gitignore", .kind = .file },
+        .{ .path = "src/main.zig", .kind = .file },
+    };
+    const tree: indexer.Tree = .{
+        .root = "/workspace",
+        .root_inode = 1,
+        .scan_started_ns = 0,
+        .repository = true,
+        .incomplete = false,
+        .cap_reached = false,
+        .skipped_overlong = 0,
+        .skipped_names = &.{},
+        .entries = &entries,
+        .folders = &.{},
+        .sources = &.{},
+    };
+    var stop_requested = std.atomic.Value(bool).init(false);
+    const candidates = try candidatesFromTrees(arena, &.{"/workspace"}, &.{tree}, &stop_requested);
+    try std.testing.expectEqual(@as(usize, 3), candidates.len);
+    try std.testing.expectEqualStrings("src", candidates[0].path);
+    try std.testing.expectEqual(CandidateKind.directory, candidates[0].kind);
+    try std.testing.expectEqualStrings("src/.gitignore", candidates[1].path);
+    try std.testing.expectEqualStrings("src/main.zig", candidates[2].path);
 }
 
 /// Scans `roots` without a snapshot and keeps the trees alive while the
