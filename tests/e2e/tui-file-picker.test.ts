@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -474,6 +475,70 @@ describe("@ file picker", () => {
       await active.sendText("/quit");
       expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
       session = null;
+    },
+    TIMEOUT,
+  );
+
+  tmuxTest(
+    "paints a folder's rows with the keystroke instead of a loading frame",
+    async () => {
+      const current = createFixture("fx-file-picker-folder-frame-");
+      mkdirSync(join(current.workspace, "tree", "inner"), { recursive: true });
+      writeFileSync(join(current.workspace, "tree", "top.txt"), "top");
+      writeFileSync(join(current.workspace, "tree", "inner", "leaf-a.txt"), "a");
+      writeFileSync(join(current.workspace, "tree", "inner", "leaf-b.txt"), "b");
+      const active = await startMockFx(current, [], 1000);
+
+      await active.sendLiteral("@./tree/");
+      await active.waitForText("./tree/top.txt", TIMEOUT);
+      await active.sendKeys("Down");
+      await active.sendKeys("Tab");
+      await active.waitForText("./tree/inner/leaf-a.txt", TIMEOUT);
+      await active.sendLiteral("leaf-b");
+      await active.waitForPane((pane) => pickerRows(pane.split("\n")).join("|") === "./tree/inner/leaf-b.txt", TIMEOUT);
+      expectCleanRuntime(current, active);
+      await clearComposer(active);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+
+      // Every frame fx wrote, interleaved with the keystrokes that caused them.
+      const framesDir = join(current.root, "frames");
+      const replay = await runFx(["replay", current.tapePath, "--frames-dir", framesDir], {
+        cwd: current.workspace, env: { HOME: current.home }, timeoutMs: TIMEOUT,
+      });
+      expect(replay.code).toBe(0);
+      const frames = readdirSync(join(framesDir, "frames"))
+        .filter((name) => name.endsWith(".json"))
+        .map((name) => JSON.parse(readFileSync(join(framesDir, "frames", name), "utf8")) as {
+          index: number;
+          elapsed_ms: number;
+          kind: string;
+        })
+        .sort((a, b) => a.index - b.index);
+      let lastInputMs = Number.NEGATIVE_INFINITY;
+      let folderRowsPainted = false;
+      for (const frame of frames) {
+        if (frame.kind === "stdin") {
+          lastInputMs = frame.elapsed_ms;
+          continue;
+        }
+        if (frame.kind !== "stdout") continue;
+        // Grid files frame each terminal row as |row|.
+        const grid = readFileSync(
+          join(framesDir, "frames", `${String(frame.index).padStart(4, "0")}.grid.txt`),
+          "utf8",
+        ).split("\n").map((line) => line.replace(/^\|(.*)\|$/, "$1"));
+        if (!composerTextFromPane(grid.join("\n")).startsWith("@./tree/")) continue;
+        if (pickerRows(grid).includes("./tree/inner/leaf-a.txt")) folderRowsPainted = true;
+        // A folder that lists within one 8 ms tick paints together with its
+        // keystroke. A loading frame is allowed only once that wait has run
+        // out; 7 allows for millisecond rounding between the tape and the wait.
+        if (grid.some((line) => line.includes("indexing files..."))) {
+          expect(frame.elapsed_ms - lastInputMs).toBeGreaterThanOrEqual(7);
+        }
+      }
+      expect(folderRowsPainted).toBe(true);
     },
     TIMEOUT,
   );

@@ -837,6 +837,8 @@ pub fn Runtime(comptime App: type) type {
 
         pub const prepareFilePicker = completion_rt.prepareFilePicker;
         pub const collectFilePickerFacts = completion_rt.collectFilePickerFacts;
+        pub const holdFrameForFileListing = completion_rt.holdFrameForFileListing;
+        pub const fileListingHoldPending = completion_rt.fileListingHoldPending;
 
         pub fn handleByte(app: *App, byte: u8, max_input_len: usize, max_prompt_history: usize) !void {
             return handleTerminalByteWithLimits(
