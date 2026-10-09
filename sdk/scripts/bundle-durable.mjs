@@ -24,7 +24,8 @@ const pinWorldVersion = {
   },
 };
 
-for (const name of ["local", "vercel"]) {
+// `world` carries no World; `local` and `vercel` inline it.
+for (const name of ["local", "vercel", "world"]) {
   const result = await Bun.build({
     entrypoints: [fileURLToPath(new URL(`../durable/${name}.mjs`, import.meta.url))],
     outdir: resolve(outputDir, "durable"),

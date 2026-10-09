@@ -109,11 +109,11 @@ function normalizeUltrafast(value) {
 
 export function normalizeAgentOptions(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new TypeError("createFxAgent() options must be an object");
+    throw new TypeError("createFxEngine() options must be an object");
   }
   const options = { ...value };
   if (Object.hasOwn(options, "env")) {
-    throw new TypeError("createFxAgent() does not accept env; pass apiKey and model directly");
+    throw new TypeError("createFxEngine() does not accept env; pass apiKey and model directly");
   }
   options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, true);
   if (options.model !== null && typeof options.model === "object" && !Array.isArray(options.model)) {
@@ -394,13 +394,17 @@ async function loadPersistence(persistence) {
 }
 
 // What a record's events say about turns, in order, for a store that tracks
-// them without reading records: a turn started, ended, or yielded, or an
-// input was accepted.
+// them without reading records: a turn started, ended, or yielded, an input
+// was accepted, or the step the open turn is at, as its tool steps finished
+// and the state of its calls.
 function journalMarks(events) {
   const marks = [];
   for (const event of events) {
-    if (event?.type === "turn_progress" && typeof event.turnId === "string") marks.push({ start: event.turnId });
-    else if (event?.type === "turn_committed" || event?.type === "turn_progress_cleared") marks.push({ end: true });
+    if (event?.type === "turn_progress") {
+      if (typeof event.turnId === "string") marks.push({ start: event.turnId });
+      const steps = event.data?.execution?.tool_steps;
+      if (Array.isArray(steps)) marks.push({ step: `${steps.length}:${String(event.data.tool_state ?? "none")}` });
+    } else if (event?.type === "turn_committed" || event?.type === "turn_progress_cleared") marks.push({ end: true });
     else if (event?.type === "turn_yielded") marks.push({ yield: true });
     else if (event?.type === "input_accepted" && typeof event.data?.id === "string") marks.push({ accepted: event.data.id });
   }
@@ -2459,6 +2463,7 @@ export async function createFxEngine(options = {}) {
         return execute(input, {
           signal: controller.signal,
           executionId: String(toolCallId ?? ""),
+          sessionId,
           ...(options.toolContext === undefined ? {} : { context: options.toolContext }),
         });
       });

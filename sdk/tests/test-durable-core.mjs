@@ -3,15 +3,18 @@
 // `createDurableAgentFactory` documents is all a harness needs, and is the
 // smallest example of one.
 //
-//   node sdk/tests/test-durable-core.mjs [memory|local]
+//   node sdk/tests/test-durable-core.mjs [memory|local|world]
 import { strict as assert } from "node:assert";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDurableAgentFactory, memory } from "../durable.js";
+import { world } from "../durable/world.mjs";
 
 const durabilityKind = process.argv[2] || "memory";
 const { local } = durabilityKind === "local" ? await import("../durable/local.mjs") : {};
+// "world": the app's own World through world(); see app-world.mjs.
+const { appWorldAt, closeAppWorlds } = durabilityKind === "world" ? await import("./app-world.mjs") : {};
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const dirs = [];
@@ -209,7 +212,7 @@ async function durabilityFor(options = {}) {
   if (durabilityKind === "memory") return memory(options);
   const dir = await mkdtemp(join(tmpdir(), "libfx-core-"));
   dirs.push(dir);
-  return local({ dir, ...options });
+  return durabilityKind === "world" ? appWorldAt(dir, options) : local({ dir, ...options });
 }
 
 async function textOf(turn) {
@@ -744,6 +747,60 @@ test("a worker lives only while a delivery runs it", async () => {
   await agent.close();
 });
 
+test("a new session's id can come before its first prompt, and null is no id", async () => {
+  const agent = createAgent({ durability: await durabilityFor() });
+  assert.throws(() => agent.session(null), /session id must be/);
+  const id = await agent.newSessionId();
+  const first = agent.session(id).prompt("alpha", { messageId: "turn-a" });
+  assert.equal((await first.accepted).sessionId, id);
+  assert.equal((await first.result).stopReason, "end_turn");
+  // The same first request sent again reaches the same session and runs once.
+  const again = await agent.session(id).prompt("alpha", { messageId: "turn-a" }).result;
+  assert.equal(again.repeated, true);
+  assert.deepEqual(JSON.parse(decoder.decode(await agent.session(id).checkpoint())), ["alpha-0", "alpha-1", "alpha-2"]);
+  await agent.close();
+});
+
+test("world() checks its options, and an agent names it among the durabilities", async () => {
+  assert.throws(() => world(), /world\(\) takes a World or a function that creates one/);
+  assert.throws(() => world({}, { pollMs: 0 }), /world\(\) pollMs must be a positive integer/);
+  assert.throws(() => world({}, { name: "pg", queueDurable: "yes" }), /pg\(\) queueDurable must be a boolean/);
+  assert.throws(() => world({}, { name: "pg", livenessKnown: true }), /pg\(\) livenessKnown needs alive\(\)/);
+  assert.throws(() => world({}, { alive: true }), /world\(\) alive must be a function/);
+  assert.throws(() => createAgent({ durability: {} }), /durability must come from memory\(\), local\(\), vercel\(\) or world\(\)/);
+});
+
+if (durabilityKind === "world") {
+  test("an app's World stays the app's: libfx neither starts nor closes it", async () => {
+    const durability = await durabilityFor();
+    const instance = await durability.world();
+    const calls = [];
+    for (const key of ["start", "close"]) {
+      const original = instance[key];
+      instance[key] = async (...args) => { calls.push(key); return original.apply(instance, args); };
+    }
+    const agent = createAgent({ durability });
+    assert.equal((await agent.session().prompt("alpha", { messageId: "turn-a" }).result).stopReason, "end_turn");
+    await agent.close();
+    assert.deepEqual(calls, []);
+    const next = createAgent({ durability });
+    assert.equal((await next.session().prompt("beta", { messageId: "turn-b" }).result).stopReason, "end_turn", "the World still serves the next agent");
+    await next.close();
+  });
+
+  test("agents given one World take its deliveries in turn, and one closing leaves the others theirs", async () => {
+    const durability = await durabilityFor();
+    const first = createAgent({ durability });
+    const second = createAgent({ durability });
+    assert.equal((await first.session().prompt("one", { messageId: "turn-1" }).result).stopReason, "end_turn");
+    assert.equal((await second.session().prompt("two", { messageId: "turn-2" }).result).stopReason, "end_turn");
+    // The World's one handler for libfx's queue came last from the second.
+    await second.close();
+    assert.equal((await first.session().prompt("three", { messageId: "turn-3" }).result).stopReason, "end_turn");
+    await first.close();
+  });
+}
+
 let failed = 0;
 for (const [name, fn] of tests) {
   const started = performance.now();
@@ -756,6 +813,7 @@ for (const [name, fn] of tests) {
     console.log(`FAIL ${name}\n  ${error?.stack ?? error}`);
   }
 }
+await closeAppWorlds?.();
 for (const dir of dirs) await rm(dir, { recursive: true, force: true }).catch(() => {});
 console.log(`${tests.length - failed}/${tests.length} core tests passed (${durabilityKind})`);
 process.exit(failed ? 1 : 0);

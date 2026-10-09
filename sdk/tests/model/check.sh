@@ -9,7 +9,7 @@
 #     https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
 #
 # Then drive the code along the graphs:
-#   bun drive.mjs send && bun drive.mjs lookup
+#   bun drive.mjs send && bun drive.mjs lookup && bun drive.mjs cutoff
 set -eu
 cd "$(dirname "$0")"
 
@@ -24,7 +24,7 @@ done
 work="${TMPDIR:-/tmp}/libfx-model-tlc"
 mkdir -p "$work" graphs
 status=0
-for tool in send lookup; do
+for tool in send lookup cutoff; do
     echo "== DurableSession ($tool)"
     if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup \
         -metadir "$work/$tool" -dump dot,actionlabels "graphs/$tool" \
@@ -38,9 +38,10 @@ done
 # self-stop, two workers are active at once with no freeze at all.
 # NoClaimFence breaks EffectsAtMostOnce: a claim that counts on a stale read
 # continues the turn from before a call with effects started, and runs it
-# again.
+# again. NoCutoffBound breaks HandoffsBounded: without the bound, a call
+# that outlasts every delivery is cut off and run again forever.
 for pair in UiInOrder:UiInOrder NoStaleShown:NoStaleShown NotTwoActive:NotTwoActive \
-    NoSelfStop:TwoActiveNeedsFreeze NoClaimFence:EffectsAtMostOnce; do
+    NoSelfStop:TwoActiveNeedsFreeze NoClaimFence:EffectsAtMostOnce NoCutoffBound:HandoffsBounded; do
     witness="${pair%%:*}" invariant="${pair#*:}"
     if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/w-$witness" \
         -config "Witness-$witness.cfg" DurableSession.tla 2>&1 | grep -q -E "Invariant $invariant is violated"; then

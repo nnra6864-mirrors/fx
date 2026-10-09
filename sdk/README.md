@@ -14,6 +14,10 @@ Browsers use WebAssembly with JSPI. The default package has no runtime
 dependencies and performs no MCP connection, skill scan, process spawn, or
 filesystem read when imported.
 
+libfx ships TypeScript declarations for every entry point. Under
+`moduleResolution: "bundler"`, TypeScript reads the browser declarations for
+`libfx` unless `customConditions` includes `"node"`.
+
 ## Agent
 
 ```js
@@ -56,8 +60,9 @@ sessions go.
 ### Sessions
 
 `agent.session(id)` opens the session `id`, and `agent.session()` starts a new
-one. Opening a session reads nothing; its first prompt does. A new session's
-`id` is set once that prompt is accepted, so read it from `turn.accepted`:
+one. Any other value, `null` included, throws. Opening a session reads
+nothing; its first prompt does. A new session's `id` is set once that prompt is
+accepted, so read it from `turn.accepted`:
 
 ```js
 const turn = agent.session().prompt("Plan the migration.");
@@ -67,17 +72,23 @@ const { sessionId } = await turn.accepted;
 const followUp = agent.session(sessionId).prompt("Start with the schema.");
 ```
 
-A session id is 1 to 128 letters, digits, `.`, `_`, or `-`. On `local()` and
-`vercel()`, new ids come from the World, and an id you choose must be `wrun_`
-followed by 10 to 64 letters or digits. `agent.prompt()` and
-`agent.checkpoint()` use a session the agent opens for itself, for code that
-holds one conversation.
+To know the id before the first prompt, for example so a retried first
+request with the same `messageId` reaches the same session, get one from
+`await agent.newSessionId()` and open it with `agent.session(id)`.
+
+On `memory()`, a session id is 1 to 128 letters, digits, `.`, `_`, or `-`. A
+World durability, `local()`, `vercel()`, or `world()`, keeps each session as a
+World run, so the id is a run id: `wrun_` followed by 10 to 64 letters or
+digits. Take it from `agent.newSessionId()` or `turn.accepted`. Vercel's World
+only creates a run whose id was minted in the last 24 hours, so send a new
+id's first prompt within a day. `agent.prompt()` and `agent.checkpoint()` use
+a session the agent opens for itself, for code that holds one conversation.
 
 One process runs a session's turns at a time, one turn after another. A
 second process that receives a prompt for a busy session queues it behind the
 running turn. Pass `context` to hand JSON to the session's tools:
 `agent.session(id, { context: { userId } })` gives every tool call
-`context` beside its `executionId`. Each turn runs with the context of the
+`context` beside its `executionId` and `sessionId`. Each turn runs with the context of the
 `session()` call whose prompt or steer started it, and a call without
 `context` gives its turns none.
 
@@ -163,6 +174,54 @@ createFxAgent({ durability: memory() }); // nothing survives the process
 them, and libfx loads one only when a session first needs it, so your app
 installs no other package and an app with no sessions loads neither.
 
+To keep sessions in a World your app creates, such as Workflow's Postgres
+World, pass it to `world()` from `libfx/durable-world`:
+
+```js
+import { createFxAgent } from "libfx";
+import { world } from "libfx/durable-world";
+import { createWorld } from "@workflow/world-postgres";
+
+// libfx's own queue topics and jobs, apart from the app's workflows.
+const sessions = createWorld({ namespace: "libfx", jobPrefix: "libfx_" });
+await sessions.start();
+
+const agent = createFxAgent({ durability: world(sessions, { queueDurable: true }) });
+```
+
+A World you pass in stays yours. libfx never starts or closes it, so start it
+before the agent's first prompt and close it after `agent.close()`. When the
+World delivers in your process, agents given the same World take its
+deliveries in turn, as servers sharing a queue do, and a delivery that arrives
+while no agent is listening fails, so the queue delivers it again. Pass a
+function that returns a World instead, and libfx creates, starts, and closes
+it with the agent. `local()` and `vercel()` are `world()` with the World each
+one bundles.
+
+`world()` takes what libfx can't learn from the World itself:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `queueDurable` | `false` | The queue keeps a message until a delivery acknowledges it, across crashes. When `false`, `prompt()` stores the prompt in the session before it queues it. |
+| `livenessKnown`, `alive(lease)`, `holderInfo()` | `false` | `alive(lease)` answers whether the holder of a lease still runs, from what `holderInfo()` put in it, so a crashed worker's session frees at once. Without it, a session stays held until its holder's deadline. |
+| `maxDurationMs`, `reserveMs` | no limit, 30000 | Each delivery stops `reserveMs` before `maxDurationMs`, or before the World's `getRuntimeDeadline()` when it has one. |
+| `pollMs` | 1000 | How often a waiting worker reads the session again. |
+| `gatewayKey()` | none | The AI Gateway credential when the agent has no `apiKey`. |
+| `name` | `"world"` | The durability's name in errors. |
+
+libfx uses the World's `events.create` and `events.list`, its streams, its
+queue, and `createQueueHandler`. It reads an event's position in its run from
+the event's id, which must be lowercase letters, an underscore, and that
+position as 26 digits, as in Workflow's Worlds; a session whose World returns
+another id fails. It sends every message on the topic
+`__libfx_wkf_workflow_session` and handles the prefix
+`__libfx_wkf_workflow_`, which is what a Workflow World's `namespace: "libfx"`
+gives, so a World serving the app's own workflows on the default namespace
+needs a second instance for libfx. A World with `registerHandler` delivers to
+the agent in its process. Any other World delivers over HTTP, so mount
+`agent.wakeHandler()` where it delivers, as [Next.js and
+Vercel](#nextjs-and-vercel) shows.
+
 libfx records each step of a turn as it happens. A prompt is stored before
 the caller hears it was accepted, and a tool call with effects is stored
 before it runs, so a crash never loses an accepted prompt and never repeats a
@@ -186,7 +245,11 @@ the session continues the turn from its last record:
   call still running shortly before the deadline is cut off: `onEvent`
   receives `session.deadline`, and the next invocation continues the turn,
   running a cut-off idempotent call again and telling the model about any
-  other. So a process never runs on after the deadline its hold ends at. A
+  other. The event's `cutoffs` counts the times in a row the deadline cut
+  off the same step. After 3, the next invocation does not run that step
+  again: a call is answered as possibly run, so the model decides what to do
+  next, and a model request cancels the turn. So a process never runs on
+  after the deadline its hold ends at. A
   process that freezes and wakes after another took its session over stops
   at its next write, and `onEvent` receives `session.fenced`. Until then it
   can finish a model request or a call to an idempotent tool; it never starts
@@ -235,8 +298,8 @@ such as a lookup:
 
 ```js
 const tools = [
-  { name: "get_order", idempotent: true, inputSchema, async execute(input, { executionId }) { /* ... */ } },
-  { name: "refund_order", inputSchema, async execute(input, { executionId }) { /* ... */ } },
+  { name: "get_order", description: "Looks up an order", idempotent: true, inputSchema, async execute(input, { executionId }) { /* ... */ } },
+  { name: "refund_order", description: "Refunds an order", inputSchema, async execute(input, { executionId }) { /* ... */ } },
 ];
 ```
 
@@ -325,6 +388,25 @@ import { createFxEngine } from "libfx";
 
 const agent = await createFxEngine({ apiKey: process.env.AI_GATEWAY_API_KEY, model });
 ```
+
+### Code written for libfx 0.0.12
+
+In libfx 0.0.12, `createFxAgent()` created this engine. It now creates the
+durable agent, so rename those calls to `createFxEngine()`. Code that still
+calls `createFxAgent()` keeps running, with these differences:
+
+- `await createFxAgent(...)` resolves to the durable agent, because awaiting a
+  value that is not a promise returns the value.
+- Breaking out of a turn's events no longer cancels the turn, which runs to
+  its end. Cancel it with the prompt's `signal` or `session.cancel()`.
+- Turns have no `cancel()` or `steer()`, and the agent has no `followUp()` or
+  `resume()`. A session has `steer()`, `cancel()`, and `resume()`.
+- `persistence` and `sessionId` throw, because the durability holds the
+  session.
+
+On the native backend, host tools now run alongside each other unless they
+are marked `writes: true`, in `createFxEngine()` as well. WebAssembly runs
+them one at a time.
 
 ### Prompt input
 
@@ -790,8 +872,8 @@ starts after every earlier call in the response finishes, and later calls
 wait for it. WebAssembly runs calls one at a time. Every call still goes
 through its own permission check before any of them starts.
 
-`execute` receives `{ signal, executionId }`, plus `context` when the turn
-has one. `executionId` is the model's id for the call and stays the same when
+`execute` receives `{ signal, executionId, sessionId }`, plus `context` when
+the turn has one. `executionId` is the model's id for the call and stays the same when
 the call runs again after a crash, so a tool with an external effect can pass
 it on as an idempotency key. [Tools with effects](#tools-with-effects)
 describes which calls run again.
@@ -997,8 +1079,10 @@ export async function POST(request) {
 // Reconnects from any server.
 export async function GET(request) {
   const params = new URL(request.url).searchParams;
+  const sessionId = params.get("sessionId");
+  if (!sessionId) return new Response("sessionId is required", { status: 400 });
   // The same check as POST.
-  const stream = agent.session(params.get("sessionId")).stream(Number(params.get("cursor") ?? 0));
+  const stream = agent.session(sessionId).stream(Number(params.get("cursor") ?? 0));
   return new Response(stream);
 }
 ```

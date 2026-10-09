@@ -253,6 +253,9 @@ jobs:
           node --experimental-wasm-jspi sdk/tests/test-durable.mjs memory wasm
           node --experimental-wasm-jspi sdk/tests/test-durable.mjs local wasm
 
+      - name: Type-check the TypeScript declarations
+        run: node sdk/tests/test-types.mjs
+
   sdk-node-napi:
     name: SDK (Node + N-API)
     needs: sdk-napi
@@ -294,8 +297,10 @@ jobs:
         run: |
           node sdk/tests/test-durable.mjs memory native
           node sdk/tests/test-durable.mjs local native
+          node sdk/tests/test-durable.mjs world native
           node sdk/tests/test-durable-core.mjs memory
           node sdk/tests/test-durable-core.mjs local
+          node sdk/tests/test-durable-core.mjs world
 
   sdk-bun:
     name: SDK (Bun + N-API/WASM)
@@ -365,6 +370,9 @@ jobs:
           TLA2TOOLS_JAR="$jar" sdk/tests/model/check.sh
           bun sdk/tests/model/drive.mjs send --walks 40
           bun sdk/tests/model/drive.mjs lookup --walks 40 --seed 7
+          bun sdk/tests/model/drive.mjs send --walks 20 --seed 3 --durability world
+          bun sdk/tests/model/drive.mjs lookup --walks 20 --seed 9 --durability world
+          bun sdk/tests/model/drive.mjs cutoff --walks 20 --seed 5
 
       - name: Test libfx on a World
         run: |

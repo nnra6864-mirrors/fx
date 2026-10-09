@@ -3,23 +3,21 @@
 // so an app installs nothing more and ignores any copy it has.
 import { getVercelOidcToken } from "@vercel/oidc";
 import { createWorld } from "@workflow/world-vercel";
+import { world } from "./world.mjs";
 
 /**
  * Each worker holds a session until its function's deadline, and stops
  * `reserveMs` before it so the next invocation continues the turn.
  */
 export function vercel({ reserveMs } = {}) {
-  if (reserveMs !== undefined && !(Number.isSafeInteger(reserveMs) && reserveMs >= 0)) throw new TypeError("vercel() reserveMs must be a non-negative integer");
-  return {
-    [Symbol.for("libfx.durability")]: true,
+  return world(() => createWorld(), {
     name: "vercel",
-    world: () => createWorld(),
     // The deployment's own AI Gateway credential, fresh for each request.
     gatewayKey: () => getVercelOidcToken(),
     livenessKnown: false,
     // Vercel Queues keeps a message until a delivery acknowledges it.
     queueDurable: true,
     pollMs: 1000,
-    ...(reserveMs === undefined ? {} : { reserveMs }),
-  };
+    reserveMs,
+  });
 }

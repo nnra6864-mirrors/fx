@@ -3,13 +3,18 @@
 // WebAssembly, along paths of the TLC state graph of DurableSession.tla, and
 // checks after every step that the code is in a state the model allows.
 //
-//   bun sdk/tests/model/drive.mjs [send|lookup] [--walks N] [--seed S] [--backend native|wasm]
-//     [--durability local|vercel]
+//   bun sdk/tests/model/drive.mjs [send|lookup|cutoff] [--walks N] [--seed S] [--backend native|wasm]
+//     [--durability local|world|vercel]
 //
-// With --durability vercel the agents keep the session in Vercel's World
-// (see sdk/tests/vercel-storage.mjs for what it needs) instead of files.
+// With --durability world each agent is given its own app-built World on the
+// directory through world(), as servers with their own instances would (see
+// sdk/tests/app-world.mjs). With --durability vercel the agents keep the
+// session in Vercel's World (see sdk/tests/vercel-storage.mjs for what it
+// needs) instead of files.
 //
-// `./check.sh` model-checks the spec and writes graphs/<tool>.dot. Each walk
+// `./check.sh` model-checks the spec and writes graphs/<graph>.dot; the cutoff
+// graph runs lookup with more claims and no freezes, so a step can be cut off
+// at the deadline until the bound stops running it. Each walk
 // starts two agents, A and B, on one local() World directory. Every model
 // request and tool call waits until the driver releases it, and so does each
 // worker's claim on the session, so the driver decides the interleaving: it
@@ -31,11 +36,12 @@ const option = (name, fallback) => {
   const index = args.indexOf(`--${name}`);
   return index >= 0 ? args[index + 1] : fallback;
 };
-const tool = args.find((arg) => arg === "send" || arg === "lookup") ?? "send";
+const graphName = args.find((arg) => arg === "send" || arg === "lookup" || arg === "cutoff") ?? "send";
+const tool = graphName === "cutoff" ? "lookup" : graphName;
 const walks = Number(option("walks", 40));
 const backend = option("backend", "native");
 const durabilityKind = option("durability", "local");
-if (durabilityKind !== "local" && durabilityKind !== "vercel") throw new Error("--durability is local or vercel");
+if (!["local", "world", "vercel"].includes(durabilityKind)) throw new Error("--durability is local, world or vercel");
 // Vercel's World is a round trip away: settle, wait for streams, and give up
 // on a step later.
 const remote = durabilityKind === "vercel";
@@ -43,6 +49,7 @@ const settleMs = remote ? 1500 : 60;
 const streamQuietMs = remote ? 2500 : 120;
 const stepTimeoutMs = remote ? 30_000 : 5000;
 const { vercelStorage } = remote ? await import("../vercel-storage.mjs") : {};
+const { appWorldAt, closeAppWorlds } = durabilityKind === "world" ? await import("../app-world.mjs") : {};
 const verbose = args.includes("--verbose");
 let seed = Number(option("seed", 1));
 const here = fileURLToPath(new URL(".", import.meta.url));
@@ -230,7 +237,8 @@ async function harness() {
   const agents = {};
   for (const w of Workers) {
     const claims = new Set();
-    const [durability, held] = holdWrites(withoutBackstops(remote ? vercelStorage({ dir }) : local({ dir })), (entry) => {
+    const stored = durabilityKind === "world" ? await appWorldAt(dir) : remote ? vercelStorage({ dir }) : local({ dir });
+    const [durability, held] = holdWrites(withoutBackstops(stored), (entry) => {
       if (entry.k !== "lease" || claims.has(entry.holder)) return false;
       claims.add(entry.holder);
       return true;
@@ -401,12 +409,21 @@ async function harness() {
       const fencedBefore = fenced[w];
       agents[w][durableInternals].stopAtDeadline(sessionId);
       const reclaimed = () => [...liveHolders].some((holder) => !before.has(holder));
-      // The same message comes back to w, and its claim lands at once.
-      await until(() => {
+      // The same message comes back to w, and its claim lands at once. Past
+      // the bound, the step is not run again: a model request ends the turn.
+      // A turn that ends lets the session go at once, so its claim is noted
+      // when seen, and its end at the new epoch shows it too.
+      const ended = async () => (await streamLines()).some((line) => line.type === "turn_end" && line.epoch === expectedEpoch);
+      let took = false;
+      await until(async () => {
         if (writes[w].held.length > 0) writes[w].releaseHeld();
-        return (reclaimed() && waiting(w) && writes[w].held.length === 0) || fenced[w] > fencedBefore;
+        if (reclaimed()) took = true;
+        if (writes[w].held.length > 0) return false;
+        if (took && waiting(w)) return true;
+        if (await ended()) return (took = true);
+        return fenced[w] > fencedBefore;
       });
-      if (reclaimed()) {
+      if (took) {
         claimed[w] = { fenced: fenced[w], epoch: expectedEpoch };
         holders[w] = [...liveHolders].filter((holder) => !before.has(holder));
       }
@@ -420,6 +437,7 @@ async function harness() {
     for (const entry of [...requests]) entry.answer([{ type: "error", errorText: "walk over" }]);
     for (const entry of [...calls]) entry.end();
     await Promise.race([Promise.all(Workers.map((w) => agents[w].close().catch(() => {}))), sleep(3000)]);
+    await closeAppWorlds?.();
     await rm(dir, { recursive: true, force: true });
   }
 
@@ -434,7 +452,7 @@ const random = () => {
   return seed / 2147483648;
 };
 
-const graph = await loadGraph(resolve(here, "graphs", `${tool}.dot`));
+const graph = await loadGraph(resolve(here, "graphs", `${graphName}.dot`));
 const covered = new Set();
 const totalEdges = [...graph.next.values()].reduce((sum, targets) => sum + targets.size, 0);
 let steps = 0;
@@ -512,6 +530,6 @@ for (let walk = 1; walk <= walks; walk += 1) {
   if (process.exitCode) break;
   if (walk % 25 === 0 || walk === walks) console.log(`${walk} walks, ${steps} steps, ${covered.size} of ${totalEdges} edges`);
 }
-if (!process.exitCode) console.log(`ok ${tool}: ${walks} walks, ${steps} steps matched the model; ${covered.size} of ${totalEdges} edges covered (${backend})`);
+if (!process.exitCode) console.log(`ok ${graphName}: ${walks} walks, ${steps} steps matched the model; ${covered.size} of ${totalEdges} edges covered (${backend})`);
 // An agent a failed walk left mid-turn keeps timers alive; nothing more runs.
 process.exit(process.exitCode ?? 0);

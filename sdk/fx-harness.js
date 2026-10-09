@@ -13,7 +13,9 @@ const encoder = new TextEncoder();
 export function fxHarness({ createEngine, defaultApiKey = async () => undefined }) {
   return (options) => {
     const { checkpoint, ...engineOptions } = options;
-    for (const name of ["persistence", "checkpointAfterBytes", "sessionId", "inputsDurable", "toolContext"]) {
+    // `env` is refused here as well as by the engine, so the error names
+    // createFxAgent() when the agent is created, not when a session opens.
+    for (const name of ["env", "persistence", "checkpointAfterBytes", "sessionId", "inputsDurable", "toolContext"]) {
       if (Object.hasOwn(engineOptions, name)) throw new TypeError(`createFxAgent() does not accept ${name}`);
     }
     const idempotent = idempotentTools(engineOptions.tools);
@@ -103,10 +105,10 @@ function fxSession(engine, idempotent) {
         throw error;
       }
     },
-    // A call left running reruns only when running it twice is safe. Any
-    // other call is never run again: the model is told it may have partly
-    // run, and the turn goes on.
-    resume: (options) => fxTurn(engine.resume({ ...options, onAmbiguous: (call) => (idempotent.has(call.name) ? "rerun" : undefined) }), internals.exited),
+    // A call left running reruns only when running it twice is safe, and
+    // with `rerun: false` not even then. Any other call is never run again:
+    // the model is told it may have partly run, and the turn goes on.
+    resume: ({ rerun = true, ...options } = {}) => fxTurn(engine.resume({ ...options, onAmbiguous: (call) => (rerun && idempotent.has(call.name) ? "rerun" : undefined) }), internals.exited),
     get openTurn() {
       return internals.openTurn;
     },

@@ -10,7 +10,8 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent, memory } from "../node.js";
+import { createFxAgent, createFxEngine, memory } from "../node.js";
+import { createFxEngine as createWasmEngine } from "../fx-sdk.js";
 import { foldSessionLog } from "../durable.js";
 import { holdWrites } from "./hold-writes.mjs";
 
@@ -23,6 +24,8 @@ const wasm = engineBackend === "wasm" ? await readFile(resolve(scriptDir, "../..
 const { local } = durabilityKind === "memory" ? {} : await import("../durable/local.mjs");
 // "vercel": Vercel's World holds the sessions; see vercel-storage.mjs.
 const { vercelStorage } = durabilityKind === "vercel" ? await import("./vercel-storage.mjs") : {};
+// "world": the app's own World through world(); see app-world.mjs.
+const { appWorldAt, closeAppWorlds } = durabilityKind === "world" ? await import("./app-world.mjs") : {};
 // Vercel's World is a round trip away, so its tests wait longer for a
 // stream's next chunk, give a function more time, and run longer.
 const remote = durabilityKind === "vercel";
@@ -31,7 +34,11 @@ const streamQuietMs = remote ? 3000 : 300;
 const streamFirstMs = remote ? 15_000 : streamQuietMs;
 const timeScale = remote ? 6 : 1;
 const testTimeoutMs = remote ? 120_000 : 30_000;
-const durabilityAt = (dir, options = {}) => (durabilityKind === "vercel" ? vercelStorage({ dir, ...options }) : local({ dir, ...options }));
+const durabilityAt = async (dir, options = {}) => {
+  if (durabilityKind === "vercel") return vercelStorage({ dir, ...options });
+  if (durabilityKind === "world") return appWorldAt(dir, options);
+  return local({ dir, ...options });
+};
 const usage = { inputTokens: { total: 1 }, outputTokens: { total: 1 } };
 const resumeNotice = "Resuming from unexpected session interruption.";
 
@@ -48,7 +55,8 @@ const answer = (text) => [{ type: "text-delta", id: "answer", delta: text }, fin
 
 // The model, by the newest user message of the request, past any resume
 // notice: "use <tool>" calls the tool once, then answers with its result;
-// "loop" calls lookup three times; anything else is echoed.
+// "loop" calls lookup three times; "stall" never answers; anything else is
+// echoed.
 function framesFor(prompt) {
   const users = userTexts(prompt).filter((text) => text !== resumeNotice);
   const text = users.at(-1) ?? "";
@@ -59,6 +67,7 @@ function framesFor(prompt) {
     if (turnResults.length === 0) return toolCall(`call-${users.length}-0`, tool, { key: "alpha" });
     return answer(`done: ${JSON.stringify(turnResults.at(-1).output)}`);
   }
+  if (text === "stall") return null;
   if (text === "loop") {
     if (turnResults.length < 3) return toolCall(`call-${users.length}-${turnResults.length}`, "lookup", { key: `k${turnResults.length}` });
     return answer(`looped ${turnResults.length}`);
@@ -79,10 +88,12 @@ const server = createServer((request, response) => {
     }
     const prompt = JSON.parse(body).prompt;
     requests.push(prompt);
+    const frames = framesFor(prompt);
+    if (frames === null) return;
     // Each answer takes a moment, as a model's does.
     setTimeout(() => {
       response.writeHead(200, { "content-type": "text/event-stream" });
-      response.end(framesFor(prompt).map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join("") + "data: [DONE]\n\n");
+      response.end(frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join("") + "data: [DONE]\n\n");
     }, 15);
   });
 });
@@ -96,8 +107,9 @@ const loopbackFetch = (input, init) => {
 
 // Tools. A gate holds a call until the test opens it.
 const runs = [];
-// The `context` each lookup call received.
+// The `context` and `sessionId` each lookup call received.
 const contexts = [];
+const sessionsSeen = [];
 const gates = new Map();
 const gate = (name) => {
   let open;
@@ -112,9 +124,10 @@ const lookup = {
   description: "Looks up a key",
   idempotent: true,
   inputSchema: { type: "object", properties: { key: { type: "string" } } },
-  execute: async ({ key }, { executionId, context }) => {
+  execute: async ({ key }, { executionId, context, sessionId }) => {
     runs.push(["lookup", executionId]);
     contexts.push(context ?? null);
+    sessionsSeen.push(sessionId);
     const held = gates.get("lookup");
     if (held) {
       held.markStarted();
@@ -333,7 +346,7 @@ const until = async (check, what, ms = 10_000) => {
 // tool never finishes and prints the session id once the tool runs. With
 // `accepted`, it dies the moment its prompt is accepted.
 if (childMode && process.argv[6] === "accepted") {
-  const agent = createFxAgent(agentOptions(durabilityAt(process.argv[5])));
+  const agent = createFxAgent(agentOptions(await durabilityAt(process.argv[5])));
   const session = agent.session();
   const { sessionId } = await session.prompt("hello").accepted;
   process.stdout.write(`${JSON.stringify({ sessionId })}\n`, () => process.kill(process.pid, "SIGKILL"));
@@ -343,7 +356,7 @@ if (childMode) {
   const dir = process.argv[5];
   const tool = process.argv[6];
   gate(tool);
-  const agent = createFxAgent(agentOptions(durabilityAt(dir)));
+  const agent = createFxAgent(agentOptions(await durabilityAt(dir)));
   const session = agent.session();
   void session.prompt(`use ${tool}`, { messageId: "crash-turn" }).result.catch(() => {});
   await gates.get(tool).started;
@@ -804,6 +817,39 @@ for (const tool of ["lookup", "send"]) {
   });
 }
 
+test("a call the deadline cuts off 3 times in a row is not run again, and the model hears it may have partly run", async () => {
+  const deadlines = [];
+  const agent = createFxAgent(agentOptions(await durabilityFor({ maxDurationMs: 1500 * timeScale, reserveMs: 1000 * timeScale }), {
+    onEvent: (event) => { if (event.type === "session.deadline") deadlines.push(event.cutoffs); },
+  }));
+  // The call never returns within a delivery.
+  const held = gate("lookup");
+  const before = runs.filter(([name]) => name === "lookup").length;
+  const { result } = await collect(agent.prompt("use lookup"));
+  gates.delete("lookup");
+  held.open();
+  assert.equal(result.stopReason, "end_turn");
+  assert.deepEqual(deadlines, [1, 2, 3], "each deadline cut off the same step once more");
+  assert.equal(runs.filter(([name]) => name === "lookup").length - before, 3, "the call ran once and was rerun twice");
+  assert.ok(JSON.stringify(requests.at(-1)).includes("may have partly run"), "the model hears the call may have run");
+  await agent.close();
+});
+
+test("a model request the deadline cuts off 3 times in a row cancels its turn", async () => {
+  const deadlines = [];
+  const agent = createFxAgent(agentOptions(await durabilityFor({ maxDurationMs: 1500 * timeScale, reserveMs: 1000 * timeScale }), {
+    onEvent: (event) => { if (event.type === "session.deadline") deadlines.push(event.cutoffs); },
+  }));
+  const before = requests.length;
+  const { result } = await collect(agent.prompt("stall"));
+  assert.equal(result.stopReason, "cancelled");
+  assert.deepEqual(deadlines, [1, 2, 3]);
+  assert.ok(requests.length - before <= 4, "the request is not sent on for good");
+  // The session goes on with the next prompt.
+  assert.equal((await agent.prompt("after the stall").result).stopReason, "end_turn");
+  await agent.close();
+});
+
 test("a worker that froze is replaced, and its next write is refused", async () => {
   const durability = await durabilityFor();
   const slow = createFxAgent(agentOptions(durability));
@@ -871,7 +917,7 @@ if (durabilityKind !== "memory") {
       child.kill("SIGKILL");
       await new Promise((exited) => child.once("exit", exited));
       const runsBefore = runs.filter(([name]) => name === tool).length;
-      const agent = createFxAgent(agentOptions(durabilityAt(dir)));
+      const agent = createFxAgent(agentOptions(await durabilityAt(dir)));
       const session = agent.session(sessionId);
       const resumed = await session.resume().result;
       assert.equal(resumed.stopReason, "end_turn");
@@ -901,7 +947,7 @@ if (durabilityKind !== "memory") {
     child.stdout.on("data", (chunk) => { output += chunk; });
     await new Promise((exited) => child.once("exit", exited));
     const { sessionId } = JSON.parse(output.trim().split("\n")[0]);
-    const agent = createFxAgent(agentOptions(durabilityAt(dir)));
+    const agent = createFxAgent(agentOptions(await durabilityAt(dir)));
     const { text, result } = await collect(agent.session(sessionId).resume());
     assert.equal(result.stopReason, "end_turn", "the accepted prompt was in the log");
     assert.equal(text, "echo: hello");
@@ -964,6 +1010,13 @@ test("the fx harness tells a refused turn from one whose core exited under it", 
   assert.notEqual(answered.code, "FX_HARNESS_STOPPED", "the core answered, so it refused the turn");
 });
 
+test("each factory names itself in its option errors", async () => {
+  await assert.rejects(createWasmEngine(5), /^TypeError: createFxEngine\(\) options must be an object$/);
+  await assert.rejects(createFxEngine({ env: {} }), /^TypeError: createFxEngine\(\) does not accept env/);
+  // The durable agent refuses it when created, before any session opens.
+  assert.throws(() => createFxAgent({ env: {} }), /^TypeError: createFxAgent\(\) does not accept env$/);
+});
+
 test("each agent.session() call carries its own context to the tools", async () => {
   const agent = createFxAgent(agentOptions(await durabilityFor()));
   const first = agent.session();
@@ -973,6 +1026,7 @@ test("each agent.session() call carries its own context to the tools", async () 
     assert.equal((await agent.session(first.id, { context: { user } }).prompt("use lookup").result).stopReason, "end_turn");
   }
   assert.deepEqual(contexts.slice(before), [{ user: "a" }, { user: "b" }]);
+  assert.deepEqual(sessionsSeen.slice(before), [first.id, first.id], "every call hears its session's id");
   // A prompt queued behind another caller's running turn still runs with
   // its own caller's context.
   const held = gate("lookup");
@@ -1056,6 +1110,7 @@ for (const [name, fn] of selected) {
   }
 }
 server.close();
+await closeAppWorlds?.();
 for (const dir of dirs) await rm(dir, { recursive: true, force: true }).catch(() => {});
 console.log(`${selected.length - failed}/${selected.length} durable tests passed (${durabilityKind}, ${engineBackend})`);
 process.exit(failed ? 1 : 0);

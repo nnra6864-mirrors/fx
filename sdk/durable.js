@@ -79,8 +79,9 @@ function checkDurations(name, { maxDurationMs, reserveMs }) {
   }
 }
 
-// A durability is `memory()`, or a World one from `libfx/durable-local` or
-// `libfx/durable-vercel`: `{ world() }` and how its workers hold sessions.
+// A durability is `memory()`, or a World one from `libfx/durable-world` (and
+// `libfx/durable-local` and `libfx/durable-vercel`, built on it): `{ world() }`
+// and how its workers hold sessions.
 function isDurability(value) {
   return Boolean(value && typeof value === "object" && value[durabilityTag] === true &&
     (typeof value.create === "function" || typeof value.world === "function"));
@@ -101,9 +102,31 @@ const liveHolders = (globalThis[Symbol.for("libfx.liveHolders")] ??= new Set());
 // while that cancel runs before the session can run no more turns.
 const maxHarnessStops = 3;
 const maxCancelStops = 2;
+// Times in a row the deadline may cut off the same step of a turn, with no
+// record between, before the next delivery stops running it again.
+const maxCutoffs = 3;
 
 // ---------------------------------------------------------------------------
 // The session log, folded. Pure: the same entries always fold the same way.
+
+// How many times in a row the deadline cut off an open turn's step. A
+// harness that marks its records with the step a turn is at counts the
+// cut-offs while that step stays the same, since continuing a cut-off step
+// can write a record with no progress in it. For one that marks no steps,
+// any record is progress.
+const noCutoffs = { cutoffs: 0, cutStep: null, step: null, named: false };
+function afterRecord(cut, marks) {
+  let next = cut;
+  for (const mark of marks ?? []) {
+    if (typeof mark.start === "string") next = noCutoffs;
+    else if (typeof mark.step === "string") next = { ...next, step: mark.step, named: true };
+  }
+  return next.named ? next : { ...next, cutoffs: 0 };
+}
+function afterCutoff(cut) {
+  const same = !cut.named || cut.step === cut.cutStep;
+  return { ...cut, cutoffs: same ? cut.cutoffs + 1 : 1, cutStep: cut.step };
+}
 
 /**
  * Folds a session's log into what a worker acts on. `entries` are
@@ -137,6 +160,8 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
   // How many times each turn's engine stopped under it.
   const stops = new Map();
   const failed = new Map();
+  // Deadline cut-offs in a row of the open turn's step.
+  let cut = noCutoffs;
   let maxCursor = 0;
   const consume = (id) => {
     if (consumed.has(id)) return;
@@ -170,7 +195,9 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
           if (Number.isSafeInteger(entry.epoch) && entry.epoch > epoch) epoch = entry.epoch;
         } else if (entry.k === "release") {
           if (lease?.holder === entry.holder) lease = null;
+          if (typeof entry.cutoff === "string" && entry.cutoff === openTurn?.id) cut = afterCutoff(cut);
         } else {
+          cut = afterRecord(cut, entry.marks);
           records.push({ cursor, data: entry.data });
           for (const mark of entry.marks ?? []) {
             if (typeof mark.start === "string") {
@@ -262,6 +289,8 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
     checkpoint: base ? { through: base.through ?? null, data: base.data } : null,
     records,
     openTurn,
+    cut: openTurn === null ? noCutoffs : cut,
+    cutoffs: openTurn === null ? 0 : cut.cutoffs,
     openFailed,
     lastTurnId,
     yielded,
@@ -462,7 +491,14 @@ const missingStreamFastMs = 2000;
 const firstPageEvents = 10;
 const laterPageEvents = 100;
 
-function createWorldBackend(world, { name, reserveMs, pollMs, alive, holderInfo, livenessKnown = false, queueDurable = false, maxDurationMs }) {
+// The agents listening on each World in this process. A World holds one
+// handler for libfx's queue, so the agents given one World take its
+// deliveries in turn, as servers sharing a queue do.
+const listenersOf = new WeakMap();
+
+// libfx starts and closes a World it `owned`, having created it; a World the
+// app passed in stays the app's.
+function createWorldBackend(world, { name, reserveMs, pollMs, alive, holderInfo, livenessKnown = false, queueDurable = false, maxDurationMs, owned = true }) {
   const spec = world.specVersion === undefined ? {} : { specVersion: world.specVersion };
   const created = new Set();
   // Runs being created now: writes that go out together create a run once.
@@ -472,19 +508,26 @@ function createWorldBackend(world, { name, reserveMs, pollMs, alive, holderInfo,
   const watchers = new Map();
   const changed = (runId) => { for (const watcher of watchers.get(runId) ?? []) watcher(); };
   let handler = null;
-  let removeHandler = null;
   const route = typeof world.registerHandler !== "function";
   const listEvents = (runId, cursor, limit) => world.events.list({
     runId,
     pagination: { sortOrder: "desc", limit, ...(cursor ? { cursor } : {}) },
     resolveData: "all",
   });
-  const queueHandler = world.createQueueHandler(queuePrefix, async (message) => {
+  const deliverTo = async (handle, message) => {
     const input = message?.input;
-    if (!handler || !input || typeof input !== "object") return undefined;
-    const result = await handler(input);
+    if (!input || typeof input !== "object") return undefined;
+    if (!handle) {
+      // A World libfx created closes with its agent. The app's own World
+      // outlives it, so its queue keeps the message for the next agent.
+      if (owned) return undefined;
+      throw new Error("no libfx agent is listening; the queue delivers this again");
+    }
+    const result = await handle(input);
     return Number.isFinite(result?.timeoutSeconds) ? { timeoutSeconds: result.timeoutSeconds } : undefined;
-  });
+  };
+  // The route a deployment mounts delivers to this agent.
+  const queueHandler = world.createQueueHandler(queuePrefix, (message) => deliverTo(handler, message));
   const backend = {
     name,
     livenessKnown,
@@ -507,7 +550,7 @@ function createWorldBackend(world, { name, reserveMs, pollMs, alive, holderInfo,
       else liveHolders.delete(holder);
     },
     async start() {
-      await world.start?.();
+      if (owned) await world.start?.();
       if (typeof world.getRuntimeDeadline === "function") {
         backend.deadline = () => backend.runtimeDeadline ?? null;
       }
@@ -696,15 +739,27 @@ function createWorldBackend(world, { name, reserveMs, pollMs, alive, holderInfo,
     queueHandler,
     listen(fn) {
       handler = fn;
-      if (!route && !removeHandler) {
-        world.registerHandler(queuePrefix, queueHandler);
-        removeHandler = () => {};
+      if (route) return () => { if (handler === fn) handler = null; };
+      let listeners = listenersOf.get(world);
+      if (!listeners) {
+        listeners = { handlers: [], turn: 0 };
+        listenersOf.set(world, listeners);
+        world.registerHandler(queuePrefix, world.createQueueHandler(queuePrefix, (message) => {
+          const { handlers } = listeners;
+          return deliverTo(handlers.length === 0 ? null : handlers[listeners.turn++ % handlers.length], message);
+        }));
       }
-      return () => { if (handler === fn) handler = null; };
+      listeners.handlers.push(fn);
+      return () => {
+        if (handler === fn) handler = null;
+        const index = listeners.handlers.indexOf(fn);
+        if (index >= 0) listeners.handlers.splice(index, 1);
+      };
     },
     // Closing is best effort: a runtime whose HTTP agent cannot close, as
     // under Bun, still lets the agent go.
     async close() {
+      if (!owned) return;
       try {
         await world.close?.();
       } catch {}
@@ -991,11 +1046,14 @@ class SessionWorker {
     });
     const log = gatedLog(raw, ready, () => failed);
     let chain = ready;
-    // The turns a record this worker stored started.
+    // The turns a record this worker stored started, and the open turn's
+    // cut-offs as this worker's own records leave them.
     const started = new Set();
+    let cut = early?.cut ?? noCutoffs;
     // Every chained entry, the harness's records included, continues the
     // newest one this worker wrote.
     const chained = (entry) => {
+      if (entry.k === "record") cut = afterRecord(cut, entry.marks);
       const appended = chain.then(async () => {
         if (failed) throw failed;
         try {
@@ -1010,11 +1068,12 @@ class SessionWorker {
       chain = appended.catch(() => {});
       return appended;
     };
-    const release = async () => {
+    // A release after the deadline cut off a turn's step names that turn.
+    const release = async (cutoff = null) => {
       await chain;
       if (failed || released) return;
       released = true;
-      await chained({ k: "release", holder: this.holder }).catch(() => {});
+      await chained({ k: "release", holder: this.holder, ...(cutoff ? { cutoff } : {}) }).catch(() => {});
     };
     // Why the chain broke: another worker's write fenced this one out, or a
     // write failed for another reason, which the same message retries.
@@ -1028,6 +1087,7 @@ class SessionWorker {
       if (!(await ready)) return broken();
       state = this.fold(await log.read());
       if (state.lastLease?.holder !== this.holder) return "fenced";
+      cut = state.cut;
     }
     const ui = uiWriter(log, (error) => agent.emit("ui.error", { sessionId: this.sessionId, error: error?.name ?? "Error" }), lease.epoch);
     const store = {
@@ -1072,7 +1132,8 @@ class SessionWorker {
     this.stopNow = () => {
       if (this.stopping) return;
       this.stopping = true;
-      agent.emit("session.deadline", { sessionId: this.sessionId, epoch: lease.epoch });
+      // Which cut-off in a row of the same step this is.
+      agent.emit("session.deadline", { sessionId: this.sessionId, epoch: lease.epoch, cutoffs: afterCutoff(cut).cutoffs });
       turnNow?.cancel({ reason: "handoff" });
     };
     // A turn that started under a claim that then failed stops at once and
@@ -1139,6 +1200,7 @@ class SessionWorker {
         let turn = null;
         let messageId = null;
         let fresh = false;
+        let spent = false;
         if (open?.id) {
           // A call left running reruns only when running it twice is safe.
           // Any other call is never run again: the model is told it may have
@@ -1148,8 +1210,13 @@ class SessionWorker {
           // It lands before the turn goes on, so any line the replaced
           // worker writes after it ranks below it and stays hidden.
           await ui.settle();
+          // A step the deadline cut off maxCutoffs times in a row would be
+          // cut off forever. A cut-off call is not run again, so the model
+          // hears it may have partly run; a model request ends the turn,
+          // cancelled, as a turn whose engine keeps stopping does.
+          spent = state.openTurn?.id === messageId && state.cutoffs >= maxCutoffs;
           try {
-            turn = harness.resume({ yieldAt });
+            turn = harness.resume({ yieldAt, ...(spent ? { rerun: false } : {}) });
           } catch (error) {
             await log.append({ k: "stopped", messageId });
             return unusable(error);
@@ -1195,6 +1262,7 @@ class SessionWorker {
         }
         turnNow = turn;
         if (this.stopping || claimFailed) turn.cancel({ reason: "handoff" });
+        else if (spent && !(open.calls?.length > 0)) turn.cancel();
         const outcome = await this.drive(log, harness, turn, messageId, state, ui);
         turnNow = null;
         if (outcome === "fenced") return "fenced";
@@ -1205,7 +1273,7 @@ class SessionWorker {
           await harness.saveCheckpoint();
           await harness.close();
           harness = null;
-          await release();
+          await release(this.stopping ? messageId : null);
           return failed ? broken() : "yielded";
         }
         if (outcome.stopped) {
@@ -1577,8 +1645,10 @@ function turnView({ messageId, resumeRequest = null, start }) {
  * - `seed` (optional): the bytes of a checkpoint a new session starts from.
  *
  * A harness session has `prompt(input, { turnId, yieldAt })` and
- * `resume({ yieldAt })`, each returning a turn; `openTurn`, the turn its
- * records left open as `{ id }`, or null; `settled()`, which resolves once
+ * `resume({ yieldAt, rerun })`, each returning a turn, where `rerun: false`
+ * runs no call left running again; `openTurn`, the turn its records left
+ * open as `{ id, calls? }`, with the calls it left running, or null;
+ * `settled()`, which resolves once
  * every record it started is stored; `saveCheckpoint()`;
  * `exportCheckpoint()`, the conversation as bytes; and `close()`. A turn is
  * an async iterable of the events its viewers see, with `result` resolving
@@ -1605,7 +1675,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
     }
     const { durability, ...harnessOptions } = options;
     if (durability !== undefined && !isDurability(durability)) {
-      throw new TypeError("durability must come from memory(), local() or vercel()");
+      throw new TypeError("durability must come from memory(), local(), vercel() or world()");
     }
     const plugged = harness(harnessOptions);
     const seed = plugged.seed === undefined ? undefined : toBase64(plugged.seed);
@@ -1881,8 +1951,13 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
       session(id, sessionOptions) {
         if (closed) throw new Error(`${label} is closed`);
         // A session object holds nothing a later call needs, so each call
-        // gets its own, with its own context.
-        return openSession(id ?? undefined, sessionOptions);
+        // gets its own, with its own context. Only a missing id starts a
+        // new session; `null` is as invalid as any other non-id.
+        return openSession(id, sessionOptions);
+      },
+      /** An id for a new session, before its first prompt. */
+      async newSessionId() {
+        return (await backend()).newSessionId();
       },
       /** The agent's own session, for code that holds one conversation. */
       get sessionId() {

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -71,6 +71,10 @@ if (cjsBuild.status !== 0) process.exit(cjsBuild.status ?? 1);
 for (const [source, destination] of files) {
   await cp(resolve(repoRoot, source), resolve(outputDir, destination));
 }
+// The TypeScript declarations the manifest's `types` conditions name.
+const declarations = (await readdir(resolve(repoRoot, "sdk/types"))).filter((name) => /\.d\.c?ts$/.test(name)).sort();
+await mkdir(resolve(outputDir, "types"), { recursive: true });
+for (const name of declarations) await cp(resolve(repoRoot, "sdk/types", name), resolve(outputDir, "types", name));
 for (const addon of nativeAddons) {
   if (!addon.endsWith(".node")) throw new Error(`native addon must end in .node: ${addon}`);
   const destination = requestedNativeAddons.length ? basename(addon) : localNativeName;
@@ -94,6 +98,8 @@ console.log("  node.cjs");
 for (const [, destination] of files) console.log(`  ${destination}`);
 console.log("  durable/local.mjs");
 console.log("  durable/vercel.mjs");
+console.log("  durable/world.mjs");
+for (const name of declarations) console.log(`  types/${name}`);
 for (const addon of nativeAddons) {
   console.log(`  ${requestedNativeAddons.length ? basename(addon) : localNativeName}`);
 }

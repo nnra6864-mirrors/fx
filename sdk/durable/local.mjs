@@ -3,6 +3,7 @@
 // installs nothing more.
 import { hostname } from "node:os";
 import { createWorld } from "@workflow/world-local";
+import { world } from "./world.mjs";
 
 const host = hostname();
 
@@ -14,19 +15,14 @@ const host = hostname();
  */
 export function local({ dir, maxDurationMs, reserveMs } = {}) {
   if (dir !== undefined && (typeof dir !== "string" || dir.length === 0)) throw new TypeError("local() dir must be a path");
-  for (const [key, value] of Object.entries({ maxDurationMs, reserveMs })) {
-    if (value !== undefined && !(Number.isSafeInteger(value) && value >= 0)) throw new TypeError(`local() ${key} must be a non-negative integer`);
-  }
-  return {
-    [Symbol.for("libfx.durability")]: true,
+  return world(() => createWorld({ ...(dir === undefined ? {} : { dataDir: dir }), recoverActiveRuns: false }), {
     name: "local",
-    world: () => createWorld({ ...(dir === undefined ? {} : { dataDir: dir }), recoverActiveRuns: false }),
     livenessKnown: true,
     // world-local keeps its queue in memory, so a message dies with the process.
     queueDurable: false,
     pollMs: 250,
-    ...(maxDurationMs === undefined ? {} : { maxDurationMs }),
-    ...(reserveMs === undefined ? {} : { reserveMs }),
+    maxDurationMs,
+    reserveMs,
     holderInfo: () => ({ pid: process.pid, host }),
     alive(lease) {
       if (lease.host !== host || !Number.isSafeInteger(lease.pid)) return null;
@@ -37,5 +33,5 @@ export function local({ dir, maxDurationMs, reserveMs } = {}) {
         return error?.code === "EPERM";
       }
     },
-  };
+  });
 }

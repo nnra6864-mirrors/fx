@@ -1256,12 +1256,12 @@ test("a retried prompt with the id of a turn that ended does not run it again", 
   assertContiguous(journal.events);
 });
 
-test("a tool receives the model's call id as its execution id", async () => {
+test("a tool receives the model's call id as its execution id, and its session's id", async () => {
   const seen = [];
   const recording = {
     ...lookup,
     execute: async (input, context) => {
-      seen.push({ keys: Object.keys(context).sort(), executionId: context.executionId, signal: context.signal instanceof AbortSignal });
+      seen.push({ keys: Object.keys(context).sort(), executionId: context.executionId, sessionId: context.sessionId, signal: context.signal instanceof AbortSignal });
       return lookup.execute(input);
     },
   };
@@ -1269,8 +1269,9 @@ test("a tool receives the model's call id as its execution id", async () => {
   const turn = agent.prompt("use the tool", { turnId: "turn-tools" });
   for await (const _ of turn) {}
   await turn.result;
+  const { sessionId } = agent;
   await agent.close();
-  assert.deepEqual(seen, [{ keys: ["executionId", "signal"], executionId: "call-1", signal: true }]);
+  assert.deepEqual(seen, [{ keys: ["executionId", "sessionId", "signal"], executionId: "call-1", sessionId, signal: true }]);
 });
 try {
   for (const { name, body } of cases) {
