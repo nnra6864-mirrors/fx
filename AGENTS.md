@@ -186,15 +186,15 @@ Do not bypass the permission system for new tools.
 
 * For JSON string escaping (writing raw JSON), use the project's `writeJsonStr` helper in `src/acp/jsonrpc.zig` rather than assuming `std.json.encodeJsonString` exists.
 
-* Zig 0.16 uses `std.Io.File.stdin()` / `.stdout()` / `.stderr()`, not `std.io.getStdIn()`.
+* Zig 0.17 uses `std.Io.File.stdin()` / `.stdout()` / `.stderr()`, not `std.io.getStdIn()`.
 
-### I/O (Zig 0.16 "Juicy Main")
+### I/O ("Juicy Main")
 
 * `main` uses `pub fn main(init: std.process.Init) !void` signature.
 
 * All I/O goes through `std.Io`, passed explicitly or via the project's `src/core/shared/io.zig` helper (`io_mod.getIo()`).
 
-* File operations use `std.Io.Dir` and `std.Io.File` (not `std.fs`). Most methods require an `io` parameter.
+* File operations use `std.Io.Dir` and `std.Io.File`. Most methods require an `io` parameter. Everything left in `std.fs` is deprecated: use `std.Io.Dir.path` for path manipulation and `std.Io.Dir.max_path_bytes` for path buffers.
 
 * Environment variables: use `io_mod.getenv(key)` (returns `?[]const u8`), not `std.process.getEnvVarOwned`.
 
@@ -210,9 +210,29 @@ Do not bypass the permission system for new tools.
 
 * HTTP: `std.http.Client` requires `.io = io_mod.getIo()` in its initializer.
 
-* `std.mem` renames: `trimLeft` is `trimStart`, `trimRight` is `trimEnd`, `indexOf` is `find`, `indexOfScalar` is `findScalar`.
-
 * `ArrayList(T)` initializes with `.empty` (not `.{}`).
+
+### Zig 0.17 Standard Library
+
+fx does not use declarations that Zig 0.17 deprecates. They still compile, so check new code against this list:
+
+* Format with `alloc.print(fmt, args)` and `std.mem.print(buf, fmt, args)`, not `std.fmt.allocPrint` or `std.fmt.bufPrint`.
+
+* Search with the `std.mem.find` family (`find`, `findScalar`, `findAny`, `findLast`, `findScalarLast`, and their `Pos` variants), not `indexOf` or `lastIndexOf`. Trim with `trimStart` and `trimEnd`.
+
+* Copy overlapping slices with `@memmove(dest, src)`, not `std.mem.copyForwards` or `copyBackwards`. Both slices must have the same length.
+
+* Resolve paths with `std.Io.Dir.path.resolveAlloc` and `relativeAlloc`.
+
+* Read the target from `builtin.target.os`, `builtin.target.cpu`, and `builtin.target.abi`, and the optimization mode from `builtin.optimize` (`.debug`, `.safe`, `.fast`, `.small`). Gate safety-only work on `builtin.optimize.runtimeSafety()`. Language types live in `std.lang`, not `std.builtin`.
+
+* Use `std.ArrayList`, `std.array_hash_map.String` and `.Auto`, and `std.bit_set.Dynamic` and `.Static`, not the `Unmanaged` or `BitSet` aliases. Read the last list item with `last()`.
+
+* Convert enums with `@backingInt` and `@fromBackingInt`. Divide rounding up with `@divCeil`.
+
+* `@hasDecl` only finds `pub` declarations, so a declaration that a duck-typed caller probes for must be `pub`.
+
+* Decode one UTF-8 sequence with `display_width.decodeUtf8Sequence` from `src/core/shared/display_width.zig`, not `std.unicode.utf8Decode`.
 
 ### Testing
 

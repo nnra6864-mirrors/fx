@@ -379,7 +379,7 @@ pub fn closingFor(open: []const u8) []const u8 {
 fn slotEscapeChecked(alloc: std.mem.Allocator, spec: SlotSpec, truecolor: bool) ParseError![]u8 {
     return slotEscape(alloc, spec, truecolor) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        // Writer.Allocating reports allocation failure as WriteFailed in 0.16.
+        // Writer.Allocating reports allocation failure as WriteFailed in 0.17.
         error.WriteFailed => error.OutOfMemory,
     };
 }
