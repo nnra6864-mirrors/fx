@@ -636,7 +636,7 @@ fn readNotificationStream(
         }
         const chunk = reader.buffered();
         if (chunk.len == 0) continue;
-        const chunk_len = if (std.mem.indexOfAny(u8, chunk, "\r\n")) |index|
+        const chunk_len = if (std.mem.findAny(u8, chunk, "\r\n")) |index|
             index + 1
         else
             chunk.len;
@@ -905,7 +905,7 @@ fn appendHeaders(
 const MediaType = enum { json, sse };
 
 fn parseMediaType(value: []const u8) ?MediaType {
-    const separator = std.mem.indexOfScalar(u8, value, ';') orelse value.len;
+    const separator = std.mem.findScalar(u8, value, ';') orelse value.len;
     const media_type = std.mem.trim(u8, value[0..separator], " \t");
     if (std.ascii.eqlIgnoreCase(media_type, "application/json")) return .json;
     if (std.ascii.eqlIgnoreCase(media_type, "text/event-stream")) return .sse;
@@ -1040,7 +1040,7 @@ fn readSseStream(
         }
         const chunk = reader.buffered();
         if (chunk.len == 0) continue;
-        const chunk_len = if (std.mem.indexOfAny(u8, chunk, "\r\n")) |index|
+        const chunk_len = if (std.mem.findAny(u8, chunk, "\r\n")) |index|
             index + 1
         else
             chunk.len;
@@ -1534,14 +1534,13 @@ fn listenerHasPendingConnection(listener: *const std.Io.net.Server) !bool {
 }
 
 test "process-exit teardown skips the session DELETE that discard teardown sends" {
-    const os_tag = @import("builtin").os.tag;
+    const os_tag = @import("builtin").target.os.tag;
     if (os_tag == .windows or os_tag == .wasi) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = try address.listen(std.testing.io, .{ .reuse_address = true });
     defer listener.deinit(std.testing.io);
-    const url = try std.fmt.allocPrint(
-        alloc,
+    const url = try alloc.print(
         "http://127.0.0.1:{d}/mcp",
         .{listener.socket.address.getPort()},
     );

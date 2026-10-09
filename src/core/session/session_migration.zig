@@ -175,7 +175,7 @@ pub fn loadSchemaV3ReadOnly(
     var events = try openSessionFile(session_dir, "events.jsonl", .read_only);
     defer events.close(io_mod.getIo());
     const generation = try session_replay.readFirstGeneration(alloc, events);
-    const watermark_name = try std.fmt.allocPrint(alloc, "commit.{s}.json", .{
+    const watermark_name = try alloc.print("commit.{s}.json", .{
         std.fmt.bytesToHex(generation, .lower),
     });
     defer alloc.free(watermark_name);
@@ -275,7 +275,7 @@ fn repairLegacyImages(
 ) !void {
     const session_dir = try paths.sessionDirPath(alloc, ctx.sessions_dir, session_id);
     defer alloc.free(session_dir);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ session_dir, "images" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ session_dir, "images" });
     defer alloc.free(snapshot_dir);
     _ = try session.repair_legacy_images_transactionally(
         alloc,
@@ -387,7 +387,7 @@ test "schema v3 import archives legacy recovery with allocation failure cleanup"
     const events = try std.mem.concat(alloc, u8, &.{ started, recovery });
     defer alloc.free(events);
     try dir.dir.writeFile(std.testing.io, .{ .sub_path = "events.jsonl", .data = events });
-    const watermark = try std.fmt.allocPrint(alloc, "{{\"schema_version\":1,\"session_id\":\"legacy-recovery\",\"log_generation\":\"01010101010101010101010101010101\",\"through_seq\":2,\"through_event_id\":\"02020202020202020202020202020202\",\"through_event_log_bytes\":{d}}}", .{events.len});
+    const watermark = try alloc.print("{{\"schema_version\":1,\"session_id\":\"legacy-recovery\",\"log_generation\":\"01010101010101010101010101010101\",\"through_seq\":2,\"through_event_id\":\"02020202020202020202020202020202\",\"through_event_log_bytes\":{d}}}", .{events.len});
     defer alloc.free(watermark);
     try dir.dir.writeFile(std.testing.io, .{ .sub_path = "commit.01010101010101010101010101010101.json", .data = watermark });
     try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
@@ -479,8 +479,7 @@ test "schema v3 import follows the committed watermark beyond a stale manifest" 
     defer alloc.free(manifest);
     try dir.dir.writeFile(std.testing.io, .{ .sub_path = "session.json", .data = manifest });
     const watermark_name = "commit.01010101010101010101010101010101.json";
-    const watermark = try std.fmt.allocPrint(
-        alloc,
+    const watermark = try alloc.print(
         "{{\"schema_version\":1,\"session_id\":\"{s}\",\"log_generation\":\"{s}\",\"through_seq\":2,\"through_event_id\":\"{s}\",\"through_event_log_bytes\":{d}}}\n",
         .{ id, std.fmt.bytesToHex(generation, .lower), std.fmt.bytesToHex(event_id, .lower), started.len + committed.len },
     );

@@ -733,7 +733,7 @@ fn write_tool_result_part(scratch_alloc: std.mem.Allocator, writer: *std.Io.Writ
         // ignored by several gateway provider routes, so only the text
         // acknowledgment stays here.
         try writer.writeAll(",\"output\":{\"type\":\"content\",\"value\":[");
-        const text = if (failed) try std.fmt.allocPrint(scratch_alloc, "Tool error: {s}", .{content}) else content;
+        const text = if (failed) try scratch_alloc.print("Tool error: {s}", .{content}) else content;
         defer if (failed) scratch_alloc.free(text);
         try writer.writeAll("{\"type\":\"text\",\"text\":");
         try std.json.Stringify.value(text, .{}, writer);
@@ -1315,7 +1315,7 @@ test "writeChatMessageJson serializes user text plus image file parts through co
     defer types.freeImageAttachmentSlice(alloc, images);
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
     try image_attachments.captureImageSnapshot(alloc, &images[0], snapshot_dir);
 

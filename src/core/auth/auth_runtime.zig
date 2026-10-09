@@ -413,8 +413,8 @@ pub fn preparationFailureNotice(err: anyerror) ?[]const u8 {
 pub fn preparationFailureText(alloc: Allocator, provider: model_provider.ProviderId, err: anyerror) ![]u8 {
     const label = provider_catalog.label(provider);
     const failure = classifyCredentialFailure(provider_catalog.find(provider).login_source, err);
-    const normalized = preparationError(failure) orelse return std.fmt.allocPrint(alloc, "{s} requires a new sign-in.", .{label});
-    return std.fmt.allocPrint(alloc, "{s}: {s}", .{ label, preparationFailureNotice(normalized).? });
+    const normalized = preparationError(failure) orelse return alloc.print("{s} requires a new sign-in.", .{label});
+    return alloc.print("{s}: {s}", .{ label, preparationFailureNotice(normalized).? });
 }
 
 test "credential preparation blocks an unavailable explicit source" {
@@ -3353,7 +3353,7 @@ fn expectApiKeyAllocationCleared(
 ) !void {
     try std.testing.expectEqual(@as(usize, 0), runtime.api_key_input.items.len);
     try std.testing.expectEqual(@as(usize, 0), runtime.api_key_input.capacity);
-    try std.testing.expect(std.mem.indexOf(u8, backing, sentinel) == null);
+    try std.testing.expect(std.mem.find(u8, backing, sentinel) == null);
 }
 
 test "auth runtime complete credential refresher ignores non-refreshable sources" {

@@ -302,8 +302,8 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
         .host => |host_files| .{ .host = host_files.reader },
         .host_unreadable => blk: {
             if (options.initial) {
-                const source = if (std.fs.path.isAbsolute(options.workspace_root))
-                    try std.fs.path.join(arena, &.{ options.workspace_root, "AGENTS.md" })
+                const source = if (std.Io.Dir.path.isAbsolute(options.workspace_root))
+                    try std.Io.Dir.path.join(arena, &.{ options.workspace_root, "AGENTS.md" })
                 else
                     options.workspace_root;
                 try scratch.addOmission(source, .host_unreadable);
@@ -328,7 +328,7 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
                     .host => home,
                 };
                 if (canonical_home) |home_root| {
-                    global_source_path = try std.fs.path.join(arena, &.{ home_root, ".fx", "AGENTS.md" });
+                    global_source_path = try std.Io.Dir.path.join(arena, &.{ home_root, ".fx", "AGENTS.md" });
                     global_rule = try loadRuleForSelection(arena, &scratch, files, global_source_path.?, options.context_limits.project_instruction_file_bytes);
                     if (pathing.pathInside(home_root, options.workspace_root)) {
                         if (options.bounded_reconstruction) {
@@ -344,8 +344,8 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
                 try scratch.addOmission("HOME", .home_unavailable);
             }
 
-            if (std.fs.path.isAbsolute(options.workspace_root)) {
-                const project_source = try std.fs.path.join(arena, &.{ options.workspace_root, "AGENTS.md" });
+            if (std.Io.Dir.path.isAbsolute(options.workspace_root)) {
+                const project_source = try std.Io.Dir.path.join(arena, &.{ options.workspace_root, "AGENTS.md" });
                 if (global_source_path == null or
                     !std.mem.eql(u8, global_source_path.?, project_source))
                 {
@@ -501,8 +501,8 @@ fn collectLaunchAncestorCandidates(
     workspace_root: []const u8,
     prior_delivered: []const []const u8,
 ) !void {
-    var current = std.fs.path.dirname(workspace_root);
-    while (current) |scope| : (current = std.fs.path.dirname(scope)) {
+    var current = std.Io.Dir.path.dirname(workspace_root);
+    while (current) |scope| : (current = std.Io.Dir.path.dirname(scope)) {
         if (std.mem.eql(u8, scope, home)) break;
         if (!pathing.pathInside(home, scope)) break;
         if (!try appendRuleCandidate(arena, scratch, scope, .ancestor, prior_delivered)) break;
@@ -516,7 +516,7 @@ fn collectTargetCandidates(
     target: context_contract.ApplicableTarget,
 ) !void {
     const raw_endpoint = switch (target.kind) {
-        .file => std.fs.path.dirname(target.path) orelse target.path,
+        .file => std.Io.Dir.path.dirname(target.path) orelse target.path,
         .directory => target.path,
     };
     const endpoint = if (raw_endpoint.len > 0) raw_endpoint else target.path;
@@ -524,7 +524,7 @@ fn collectTargetCandidates(
         containsString(scratch.evaluated_endpoints.items, endpoint)) return;
 
     try scratch.addEvaluated(endpoint);
-    if (!std.fs.path.isAbsolute(endpoint)) {
+    if (!std.Io.Dir.path.isAbsolute(endpoint)) {
         try scratch.addOmission(if (target.path.len > 0) target.path else "(empty target)", .unsafe_target);
         return;
     }
@@ -532,7 +532,7 @@ fn collectTargetCandidates(
 
     try scratch.addRankingEndpoint(endpoint);
     var current: ?[]const u8 = endpoint;
-    while (current) |scope| : (current = std.fs.path.dirname(scope)) {
+    while (current) |scope| : (current = std.Io.Dir.path.dirname(scope)) {
         if (std.mem.eql(u8, scope, options.workspace_root)) break;
         if (!pathing.pathInside(options.workspace_root, scope)) break;
         if (!try appendRuleCandidate(arena, scratch, scope, .target, options.delivered_sources)) break;
@@ -546,7 +546,7 @@ fn appendRuleCandidate(
     class: CandidateClass,
     prior_delivered: []const []const u8,
 ) !bool {
-    const source = try std.fs.path.join(arena, &.{ scope, "AGENTS.md" });
+    const source = try std.Io.Dir.path.join(arena, &.{ scope, "AGENTS.md" });
     if (containsString(prior_delivered, source) or containsString(scratch.delivered_sources.items, source)) return true;
     for (scratch.candidates.items) |candidate| {
         // A previous walk already covered these ancestors, or stopped at the work cap.
@@ -661,7 +661,7 @@ fn loadFilesystemRule(
     if (stat.kind != .file and stat.kind != .sym_link) return .{ .omitted = .non_regular };
 
     var file = if (stat.kind == .sym_link) blk: {
-        const logical_parent = std.fs.path.dirname(path) orelse return .{ .omitted = .symlink };
+        const logical_parent = std.Io.Dir.path.dirname(path) orelse return .{ .omitted = .symlink };
         const authority = io_mod.realpathAlloc(arena, logical_parent) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return .{ .omitted = .symlink };
@@ -672,8 +672,8 @@ fn loadFilesystemRule(
         };
         if (!pathing.pathInside(authority, canonical_target)) return .{ .omitted = .symlink };
 
-        const target_parent = std.fs.path.dirname(canonical_target) orelse return .{ .omitted = .symlink };
-        const target_name = std.fs.path.basename(canonical_target);
+        const target_parent = std.Io.Dir.path.dirname(canonical_target) orelse return .{ .omitted = .symlink };
+        const target_name = std.Io.Dir.path.basename(canonical_target);
         if (target_name.len == 0) return .{ .omitted = .symlink };
         var parent_dir = io_mod.openDirAbsoluteNoFollow(target_parent, .{}) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -751,7 +751,7 @@ fn pathDepth(path: []const u8) usize {
     var count: usize = 0;
     var in_component = false;
     for (path) |byte| {
-        if (byte == std.fs.path.sep) {
+        if (byte == std.Io.Dir.path.sep) {
             in_component = false;
         } else if (!in_component) {
             count += 1;
@@ -1073,8 +1073,7 @@ fn capProjectInstructionsTotal(
     if (capped.written().len > 0) try capped.writer.writeAll("\n\n");
     try capped.writer.writeAll(marker);
 
-    try scratch.addNotice(try std.fmt.allocPrint(
-        arena,
+    try scratch.addNotice(try arena.print(
         "[context] project instructions omitted {d} source(s) ({s}): observed={d} bytes effective={d} bytes source={s}; override with --context-limit project_instructions_total_bytes=BYTES|off",
         .{ omitted_count, omitted_names.written(), observed_bytes, effective_limit, limit.source.label() },
     ));
@@ -1097,15 +1096,14 @@ fn projectInstructionsLimitMarker(
     source: []const u8,
     omitted_count: usize,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "<context_limit name=\"project_instructions_total_bytes\" action=\"omitted\" omitted_count=\"{d}\" observed_bytes=\"{d}\" effective_bytes=\"{d}\" source=\"{s}\" override=\"--context-limit project_instructions_total_bytes=BYTES|off\" />",
         .{ omitted_count, observed_bytes, effective_bytes, source },
     );
 }
 
 fn writeTestFile(dir: std.Io.Dir, name: []const u8, content: []const u8) !void {
-    if (std.fs.path.dirname(name)) |parent| {
+    if (std.Io.Dir.path.dirname(name)) |parent| {
         try dir.createDirPath(io_mod.getIo(), parent);
     }
     var file = try dir.createFile(io_mod.getIo(), name, .{ .truncate = true });
@@ -1114,8 +1112,8 @@ fn writeTestFile(dir: std.Io.Dir, name: []const u8, content: []const u8) !void {
 }
 
 fn createSymlinkOrSkip(dir: std.Io.Dir, target_path: []const u8, link_path: []const u8) !void {
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
-    if (std.fs.path.dirname(link_path)) |parent| {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
+    if (std.Io.Dir.path.dirname(link_path)) |parent| {
         try dir.createDirPath(io_mod.getIo(), parent);
     }
     dir.symLink(std.testing.io, target_path, link_path, .{ .is_directory = false }) catch |err| {
@@ -1128,7 +1126,7 @@ test "reconstruction budget bounds distinct candidates and both file reads" {
     var budget = ReconstructionBudget{};
     var names: [129][8]u8 = undefined;
     for (&names, 0..) |*name, index| {
-        const source = try std.fmt.bufPrint(name, "r{d}", .{index});
+        const source = try std.mem.print(name, "r{d}", .{index});
         try std.testing.expectEqual(if (index < 128) ReconstructionBudget.Admission.admitted else .exhausted, budget.admit_candidate(source));
     }
     try std.testing.expectEqual(ReconstructionBudget.Admission.duplicate, budget.admit_candidate("r0"));
@@ -1287,11 +1285,11 @@ test "project instruction file cap bounds retained memory across large candidate
     for (0..8) |index| {
         if (index > 0) try relative.writer.writeByte('/');
         try relative.writer.print("level-{d}", .{index});
-        const rule_path = try std.fmt.allocPrint(alloc, "work/{s}/AGENTS.md", .{relative.written()});
+        const rule_path = try alloc.print("work/{s}/AGENTS.md", .{relative.written()});
         defer alloc.free(rule_path);
         try writeTestFile(tmp.dir, rule_path, large_rule);
     }
-    const target_path = try std.fmt.allocPrint(alloc, "work/{s}/target.zig", .{relative.written()});
+    const target_path = try alloc.print("work/{s}/target.zig", .{relative.written()});
     defer alloc.free(target_path);
     try writeTestFile(tmp.dir, target_path, "");
 
@@ -1465,7 +1463,7 @@ test "rule loader classifies bodies blanks oversized non-regular and symlink fil
     const secret_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "secret.md");
     defer alloc.free(secret_path);
     try createSymlinkOrSkip(tmp.dir, secret_path, "linked.md");
-    const linked_path = try std.fs.path.join(alloc, &.{ std.fs.path.dirname(secret_path).?, "linked.md" });
+    const linked_path = try std.Io.Dir.path.join(alloc, &.{ std.Io.Dir.path.dirname(secret_path).?, "linked.md" });
     defer alloc.free(linked_path);
     switch (try loadRule(arena, linked_path, rule_limit)) {
         .body => |body| try std.testing.expectEqualStrings("contained linked instructions", body.text),
@@ -1485,7 +1483,7 @@ test "initial gather loads a contained AGENTS symlink with logical provenance" {
     defer alloc.free(home);
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/work");
     defer alloc.free(workspace);
-    const logical_source = try std.fs.path.join(alloc, &.{ workspace, "AGENTS.md" });
+    const logical_source = try std.Io.Dir.path.join(alloc, &.{ workspace, "AGENTS.md" });
     defer alloc.free(logical_source);
 
     var context = try gatherProjectContextWithHome(alloc, .{
@@ -1588,19 +1586,19 @@ test "scoped selection keeps the nearest readable cap and reports unusable and c
     for (0..36) |index| {
         if (index > 0) try relative.writer.writeByte('/');
         try relative.writer.print("level-{d:0>2}", .{index});
-        const rule_path = try std.fmt.allocPrint(alloc, "home/work/{s}/AGENTS.md", .{relative.written()});
+        const rule_path = try alloc.print("home/work/{s}/AGENTS.md", .{relative.written()});
         defer alloc.free(rule_path);
         if (index == 2) {
             try writeTestFile(tmp.dir, rule_path, " \n ");
         } else if (index == 3) {
             try writeTestFile(tmp.dir, rule_path, oversized);
         } else {
-            const body = try std.fmt.allocPrint(alloc, "RULE_LEVEL_{d:0>2}", .{index});
+            const body = try alloc.print("RULE_LEVEL_{d:0>2}", .{index});
             defer alloc.free(body);
             try writeTestFile(tmp.dir, rule_path, body);
         }
     }
-    const target_path = try std.fmt.allocPrint(alloc, "home/work/{s}/target.zig", .{relative.written()});
+    const target_path = try alloc.print("home/work/{s}/target.zig", .{relative.written()});
     defer alloc.free(target_path);
     try writeTestFile(tmp.dir, target_path, "");
 
@@ -2341,7 +2339,7 @@ test "project omission consequences stay bounded across many sources" {
     const omissions = try arena.alloc(context_contract.ContextOmissionInput, 128);
     for (omissions, 0..) |*omission, index| {
         omission.* = .{
-            .source = try std.fmt.allocPrint(arena, "https://example.test/resource/{d}", .{index}),
+            .source = try arena.print("https://example.test/resource/{d}", .{index}),
             .reason = .unsafe_target,
         };
     }
@@ -2570,7 +2568,7 @@ fn currentWorkingDirectory(arena: Allocator) ![]const u8 {
 /// Reports the shell the shell tool runs for the user profile, falling back to
 /// the environment when no login shell resolves (for example on Windows).
 fn shellPath(arena: Allocator) ?[]const u8 {
-    var login_shell_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var login_shell_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const login_shell = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
     if (shell_resolver.environment(arena, login_shell, .user)) |resolved| {
         switch (resolved) {
@@ -2592,7 +2590,7 @@ fn todayUtcText(arena: Allocator) ![]const u8 {
 fn formatUtcDateFromMillis(arena: Allocator, epoch_ms: i64) ![]const u8 {
     const days = @divFloor(epoch_ms, std.time.ms_per_day);
     const date = civilFromUnixDays(days);
-    return std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2}", .{
+    return arena.print("{d:0>4}-{d:0>2}-{d:0>2}", .{
         @as(u64, @intCast(date.year)),
         @as(u64, @intCast(date.month)),
         @as(u64, @intCast(date.day)),
@@ -2620,7 +2618,7 @@ fn collectGitInfo(arena: Allocator, workspace_root: []const u8) !GitInfo {
     const git_dir = try resolveGitDir(arena, workspace_root);
     if (git_dir == null or gitReadExpired(started_ns)) return .{};
 
-    const head_path = try std.fs.path.join(arena, &.{ git_dir.?, "HEAD" });
+    const head_path = try std.Io.Dir.path.join(arena, &.{ git_dir.?, "HEAD" });
     const head = readSmallFile(arena, head_path, context_contract.Limits.git_metadata_file_bytes) catch return .{};
     if (gitReadExpired(started_ns)) return .{};
 
@@ -2638,7 +2636,7 @@ fn collectGitInfo(arena: Allocator, workspace_root: []const u8) !GitInfo {
 }
 
 fn resolveGitDir(arena: Allocator, workspace_root: []const u8) !?[]const u8 {
-    const dot_git = try std.fs.path.join(arena, &.{ workspace_root, ".git" });
+    const dot_git = try std.Io.Dir.path.join(arena, &.{ workspace_root, ".git" });
     const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), dot_git, .{ .follow_symlinks = false }) catch return null;
 
     if (stat.kind == .directory) return dot_git;
@@ -2651,22 +2649,22 @@ fn resolveGitDir(arena: Allocator, workspace_root: []const u8) !?[]const u8 {
 
     const raw = std.mem.trim(u8, trimmed[prefix.len..], " \t\r\n");
     if (raw.len == 0) return null;
-    if (std.fs.path.isAbsolute(raw)) return try arena.dupe(u8, raw);
-    return try std.fs.path.join(arena, &.{ workspace_root, raw });
+    if (std.Io.Dir.path.isAbsolute(raw)) return try arena.dupe(u8, raw);
+    return try std.Io.Dir.path.join(arena, &.{ workspace_root, raw });
 }
 
 fn resolveCommonGitDir(arena: Allocator, git_dir: []const u8) ![]const u8 {
-    const common_path = try std.fs.path.join(arena, &.{ git_dir, "commondir" });
+    const common_path = try std.Io.Dir.path.join(arena, &.{ git_dir, "commondir" });
     const content = readSmallFile(arena, common_path, context_contract.Limits.git_metadata_file_bytes) catch return git_dir;
     const raw = std.mem.trim(u8, content, " \t\r\n");
     if (raw.len == 0) return git_dir;
-    if (std.fs.path.isAbsolute(raw)) return try arena.dupe(u8, raw);
-    return try std.fs.path.join(arena, &.{ git_dir, raw });
+    if (std.Io.Dir.path.isAbsolute(raw)) return try arena.dupe(u8, raw);
+    return try std.Io.Dir.path.join(arena, &.{ git_dir, raw });
 }
 
 fn collectGitHubRepoIdentity(arena: Allocator, git_dir: []const u8, started_ns: i128) !?GitHubRepoIdentity {
     if (gitReadExpired(started_ns)) return null;
-    const config_path = try std.fs.path.join(arena, &.{ git_dir, "config" });
+    const config_path = try std.Io.Dir.path.join(arena, &.{ git_dir, "config" });
     const config = readSmallFile(arena, config_path, context_contract.Limits.git_config_file_bytes) catch return null;
     if (gitReadExpired(started_ns)) return null;
     return try parseGitHubRepoIdentityFromConfig(arena, config);
@@ -2696,7 +2694,7 @@ fn detectGitWorktreeState(arena: Allocator, workspace_root: []const u8, git_dir:
     }
     if (gitReadExpired(started_ns)) return .unknown;
 
-    const index_path = std.fs.path.join(arena, &.{ git_dir, "index" }) catch return .unknown;
+    const index_path = std.Io.Dir.path.join(arena, &.{ git_dir, "index" }) catch return .unknown;
     const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), index_path, .{ .follow_symlinks = false }) catch return .unknown;
     if (stat.kind != .file or stat.size > context_contract.Limits.git_index_file_bytes) return .unknown;
 
@@ -2779,7 +2777,7 @@ fn indexEntryMatchesWorktree(arena: Allocator, workspace_root: []const u8, entry
     const index_mtime_nsec = std.mem.readInt(u32, entry[12..16], .big);
     const index_size = std.mem.readInt(u32, entry[36..40], .big);
 
-    const abs_path = try std.fs.path.join(arena, &.{ workspace_root, path });
+    const abs_path = try std.Io.Dir.path.join(arena, &.{ workspace_root, path });
     const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), abs_path, .{ .follow_symlinks = false }) catch |err| {
         return switch (err) {
             error.FileNotFound => .dirty,
@@ -2801,7 +2799,7 @@ fn indexEntryMatchesWorktree(arena: Allocator, workspace_root: []const u8, entry
 }
 
 fn isSafeIndexPath(path: []const u8) bool {
-    if (path.len == 0 or std.fs.path.isAbsolute(path)) return false;
+    if (path.len == 0 or std.Io.Dir.path.isAbsolute(path)) return false;
 
     var parts = std.mem.splitScalar(u8, path, '/');
     while (parts.next()) |part| {
@@ -2892,7 +2890,7 @@ fn parseGitHubRepoPath(arena: Allocator, raw_path: []const u8) !?GitHubRepoIdent
     if (!isSafeGitHubPathComponent(owner) or !isSafeGitHubPathComponent(repo_name)) return null;
 
     return .{
-        .repo = try std.fmt.allocPrint(arena, "{s}/{s}", .{ owner, repo_name }),
+        .repo = try arena.print("{s}/{s}", .{ owner, repo_name }),
         .repo_name = try arena.dupe(u8, repo_name),
     };
 }
@@ -2924,7 +2922,7 @@ fn branchFromHead(arena: Allocator, head: []const u8) !?[]const u8 {
     }
 
     const short_len = @min(trimmed.len, 12);
-    return try std.fmt.allocPrint(arena, "detached:{s}", .{trimmed[0..short_len]});
+    return try arena.print("detached:{s}", .{trimmed[0..short_len]});
 }
 
 fn gitReadExpired(started_ns: i128) bool {
@@ -3110,7 +3108,7 @@ test "turn context reports the shell tool's login shell" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const login_shell = shell_resolver.configuredLoginShellInto(&buffer) orelse
         return error.SkipZigTest;
     const expected = switch (try shell_resolver.environment(arena, login_shell, .user)) {
@@ -3118,8 +3116,8 @@ test "turn context reports the shell tool's login shell" {
         else => return error.TestUnexpectedResult,
     };
     const fragment = try buildTurnContextFragment(arena, "/tmp");
-    const line = try std.fmt.allocPrint(arena, "shell_path: {s}\n", .{expected});
-    try std.testing.expect(std.mem.indexOf(u8, fragment, line) != null);
+    const line = try arena.print("shell_path: {s}\n", .{expected});
+    try std.testing.expect(std.mem.find(u8, fragment, line) != null);
 }
 
 test "turn context keeps branch metadata inside its field" {
@@ -3429,8 +3427,7 @@ fn appendTransient(input: TransientContextInput, arena: Allocator, messages: *st
     const content = if (input.interactive)
         turn_context
     else
-        try std.fmt.allocPrint(
-            arena,
+        try arena.print(
             "{s}\nRuntime context: this is a noninteractive run without live question UI; when a user-owned decision remains after inspection, stop and surface a concrete blocker in freeform text with the available options. Do not recommend or label one option as preferred.",
             .{turn_context},
         );

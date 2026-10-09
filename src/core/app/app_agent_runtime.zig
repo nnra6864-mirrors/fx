@@ -1400,14 +1400,14 @@ fn formatMissingSpecToolAction(arena: Allocator, state: ToolActionState, denied_
 
 fn formatInvalidArgsToolAction(arena: Allocator, state: ToolActionState, denied_label: ?[]const u8) ![]const u8 {
     return switch (state) {
-        .active => std.fmt.allocPrint(arena, "● Working…\x1b[0m", .{}),
+        .active => arena.print("● Working…\x1b[0m", .{}),
         .completed => formatToolActionValue(arena, "Completed", "tool call"),
         .denied => formatToolActionValue(arena, denied_label.?, "tool call"),
     };
 }
 
 fn formatToolActionValue(arena: Allocator, label: []const u8, value: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(arena, "● {s}\x1b[0m {s}{s}\x1b[0m", .{ label, shared_theme.current().tool_stdout_style, value });
+    return arena.print("● {s}\x1b[0m {s}{s}\x1b[0m", .{ label, shared_theme.current().tool_stdout_style, value });
 }
 
 /// Command rows keep the muted tool-text base and add shell syntax colors for
@@ -1423,7 +1423,7 @@ fn formatCommandActionValue(arena: Allocator, label: []const u8, command: []cons
         if (theme.light) .light else .dark,
         theme.tool_stdout_style,
     );
-    return std.fmt.allocPrint(arena, "● {s}\x1b[0m {s}\x1b[0m", .{ label, highlighted });
+    return arena.print("● {s}\x1b[0m {s}\x1b[0m", .{ label, highlighted });
 }
 
 fn specLabel(spec: *const tool_dispatch.Tool, state: ToolActionState, denied_label: ?[]const u8) []const u8 {
@@ -1499,13 +1499,12 @@ fn gatherTestProjectContext(_: Allocator, _: context_contract.InitialContextInpu
 }
 
 fn appendTestStaticContext(input: context_contract.StaticContextInput, alloc: Allocator, messages: *std.ArrayList(ChatMessage)) context_contract.ProviderError!void {
-    const content = try std.fmt.allocPrint(alloc, "provider static:{s}", .{input.project_context});
+    const content = try alloc.print("provider static:{s}", .{input.project_context});
     try messages.append(alloc, .{ .role = .system, .content = content });
 }
 
 fn appendTestTransientContext(input: context_contract.TransientContextInput, alloc: Allocator, messages: *std.ArrayList(ChatMessage)) context_contract.ProviderError!void {
-    const content = try std.fmt.allocPrint(
-        alloc,
+    const content = try alloc.print(
         "provider transient:{s}:{s}",
         .{ input.workspace_root, @tagName(input.permission_mode) },
     );
@@ -1538,7 +1537,7 @@ fn gatherFreshProjectContext(alloc: Allocator, input: context_contract.InitialCo
     refresh_targets_match = input.targets.len == 1 and
         input.targets[0].kind == .file and
         std.mem.eql(u8, input.targets[0].path, "/tmp/workspace/images/example.png");
-    const content = try std.fmt.allocPrint(alloc, "fresh:{s}", .{input.workspace_root});
+    const content = try alloc.print("fresh:{s}", .{input.workspace_root});
     errdefer alloc.free(content);
     const notices = try alloc.alloc([]u8, 1);
     errdefer alloc.free(notices);
@@ -1882,7 +1881,7 @@ const FakeApp = struct {
 
     pub fn formatToolExecutionErrorForAgent(self: *FakeApp, arena: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {
         _ = self;
-        return std.fmt.allocPrint(arena, "Tool {s} failed: {s}", .{ tool_name, @errorName(err) });
+        return arena.print("Tool {s} failed: {s}", .{ tool_name, @errorName(err) });
     }
 };
 
@@ -3520,12 +3519,12 @@ test "app agent runtime highlights shell command rows over the tool text base" {
     // while the command verb and quoted string pick up syntax palette colors
     // and return to the base after their closes.
     try std.testing.expect(std.mem.startsWith(u8, completed, "● Ran\x1b[0m \x1b[38;5;245m"));
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         completed,
         "\x1b[38;5;252mprintf\x1b[39m\x1b[38;5;245m",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         completed,
         "\x1b[38;5;250m'hello world'\x1b[39m\x1b[38;5;245m",
@@ -3533,7 +3532,7 @@ test "app agent runtime highlights shell command rows over the tool text base" {
     try std.testing.expect(std.mem.endsWith(u8, completed, "\x1b[0m"));
     // The pipe and the command after it take the keyword color, the flag the
     // number color; plain bytes are intact beneath the styling.
-    try std.testing.expect(std.mem.indexOf(u8, completed, "\x1b[38;5;252m|\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, completed, "\x1b[38;5;252mwc\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, completed, "\x1b[38;5;250m-c\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, completed, "\x1b[38;5;252m|\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, completed, "\x1b[38;5;252mwc\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, completed, "\x1b[38;5;250m-c\x1b[39m") != null);
 }

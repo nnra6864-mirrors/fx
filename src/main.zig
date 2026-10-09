@@ -3627,12 +3627,12 @@ fn topLevelHelpStyleForValues(is_terminal: bool, no_color: bool, dumb_terminal: 
 }
 
 fn stdoutIsTerminal() bool {
-    if (comptime builtin.os.tag == .windows or !builtin.link_libc) return false;
+    if (comptime builtin.target.os.tag == .windows or !builtin.link_libc) return false;
     return std.c.isatty(std.posix.STDOUT_FILENO) != 0;
 }
 
 fn stdoutTerminalColumns() ?usize {
-    if (comptime builtin.os.tag == .windows or !builtin.link_libc) return null;
+    if (comptime builtin.target.os.tag == .windows or !builtin.link_libc) return null;
 
     var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
     const req: c_int = @intCast(std.c.T.IOCGWINSZ);
@@ -3677,7 +3677,7 @@ fn processAllocator() Allocator {
 
 fn writeStdoutFast(text: []const u8) !void {
     @setRuntimeSafety(false);
-    if (comptime builtin.os.tag != .windows) {
+    if (comptime builtin.target.os.tag != .windows) {
         var remaining = text;
         while (remaining.len > 0) {
             const written = std.c.write(std.posix.STDOUT_FILENO, remaining.ptr, remaining.len);
@@ -3691,7 +3691,7 @@ fn writeStdoutFast(text: []const u8) !void {
 
 fn writeStderrFast(text: []const u8) !void {
     @setRuntimeSafety(false);
-    if (comptime builtin.os.tag != .windows) {
+    if (comptime builtin.target.os.tag != .windows) {
         var remaining = text;
         while (remaining.len > 0) {
             const written = std.c.write(std.posix.STDERR_FILENO, remaining.ptr, remaining.len);
@@ -3704,14 +3704,14 @@ fn writeStderrFast(text: []const u8) !void {
 }
 
 fn exitFast(code: u8) noreturn {
-    if (comptime builtin.link_libc and builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+    if (comptime builtin.link_libc and builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) {
         std.c._exit(@intCast(code));
     }
     std.process.exit(code);
 }
 
 fn hasPosixArgVector() bool {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .windows, .freestanding, .other => false,
         .wasi => builtin.link_libc,
         else => true,
@@ -4035,7 +4035,7 @@ test "session reset traces and clears active paste state" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "session-reset-paste.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "session-reset-paste.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();

@@ -135,7 +135,7 @@ pub const Parser = struct {
         }
         if (line[0] == ':') return;
 
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse line.len;
+        const colon = std.mem.findScalar(u8, line, ':') orelse line.len;
         const field = line[0..colon];
         var value = if (colon < line.len) line[colon + 1 ..] else "";
         if (value.len > 0 and value[0] == ' ') value = value[1..];
@@ -159,7 +159,7 @@ pub const Parser = struct {
             return;
         }
         if (std.mem.eql(u8, field, "id")) {
-            if (std.mem.indexOfScalar(u8, value, 0) != null) return;
+            if (std.mem.findScalar(u8, value, 0) != null) return;
             try self.replaceField(&self.id, value);
             self.saw_id = true;
             return;

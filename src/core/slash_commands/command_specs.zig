@@ -569,7 +569,7 @@ pub fn slashCompletionPrefix(registry: SlashRegistry, input: []const u8) ?[]cons
     const prefix = std.mem.trimStart(u8, input, " \t\r\n");
     if (prefix.len == 0 or prefix[0] != '/') return null;
 
-    const command_end = std.mem.indexOfAny(u8, prefix, " \t\r\n") orelse return prefix;
+    const command_end = std.mem.findAny(u8, prefix, " \t\r\n") orelse return prefix;
     const spec = registry.lookup(prefix[0..command_end]) orelse return prefix;
     if (!spec.has_args) return null;
     return prefix;
@@ -1320,8 +1320,8 @@ fn writeTopLevelHelpEntry(writer: *std.Io.Writer, registry: TopLevelRegistry, en
     const padding = usage_width - entry.usage.len + 2;
     var prefix_buf: [128]u8 = undefined;
     var continuation_buf: [96]u8 = undefined;
-    const prefix = try std.fmt.bufPrint(&prefix_buf, "  {s}{s}{s}{s}", .{ styleStart(style, .syntax), entry.usage, styleEnd(style), spaces[0..padding] });
-    const continuation = try std.fmt.bufPrint(&continuation_buf, "  {s}", .{spaces[0 .. usage_width + 2]});
+    const prefix = try std.mem.print(&prefix_buf, "  {s}{s}{s}{s}", .{ styleStart(style, .syntax), entry.usage, styleEnd(style), spaces[0..padding] });
+    const continuation = try std.mem.print(&continuation_buf, "  {s}", .{spaces[0 .. usage_width + 2]});
     try writeWrappedLine(writer, prefix, continuation, summary, columns);
 }
 
@@ -1330,8 +1330,8 @@ fn writeTopLevelFlag(writer: *std.Io.Writer, flag: TopLevelFlag, usage_width: us
     const padding = usage_width - flag.usage.len + 2;
     var prefix_buf: [160]u8 = undefined;
     var continuation_buf: [96]u8 = undefined;
-    const prefix = try std.fmt.bufPrint(&prefix_buf, "  {s}{s}{s}{s}", .{ styleStart(style, .syntax), flag.usage, styleEnd(style), spaces[0..padding] });
-    const continuation = try std.fmt.bufPrint(&continuation_buf, "  {s}", .{spaces[0 .. usage_width + 2]});
+    const prefix = try std.mem.print(&prefix_buf, "  {s}{s}{s}{s}", .{ styleStart(style, .syntax), flag.usage, styleEnd(style), spaces[0..padding] });
+    const continuation = try std.mem.print(&continuation_buf, "  {s}", .{spaces[0 .. usage_width + 2]});
     try writeWrappedLine(writer, prefix, continuation, flag.description, columns);
 }
 
@@ -1345,7 +1345,7 @@ fn writeTopLevelResource(writer: *std.Io.Writer, resource: TopLevelResource, lab
     const spaces = "                                                                ";
     const padding = label_width - display_width.visibleWidth(resource.label) + 2;
     var prefix_buf: [128]u8 = undefined;
-    const prefix = try std.fmt.bufPrint(&prefix_buf, "{s}{s}{s}{s}", .{ styleStart(style, .label), resource.label, styleEnd(style), spaces[0..padding] });
+    const prefix = try std.mem.print(&prefix_buf, "{s}{s}{s}{s}", .{ styleStart(style, .label), resource.label, styleEnd(style), spaces[0..padding] });
     const value_role: HelpRole = if (resource.link) .link else .syntax;
     try writeWrappedStyledLine(writer, prefix, "  ", resource.value, columns, style, value_role);
 }

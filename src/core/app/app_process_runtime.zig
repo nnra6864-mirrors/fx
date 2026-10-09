@@ -129,10 +129,10 @@ pub fn Runtime(comptime App: type) type {
                 else => {},
             }
             if (detailedErrorSummary(err)) |detail| {
-                return std.fmt.allocPrint(alloc, "{s}: {s} ({s})", .{ context, detail, @errorName(err) });
+                return alloc.print("{s}: {s} ({s})", .{ context, detail, @errorName(err) });
             }
 
-            return std.fmt.allocPrint(alloc, "{s}: {s}", .{ context, @errorName(err) });
+            return alloc.print("{s}: {s}", .{ context, @errorName(err) });
         }
 
         fn workerThreadMain(app: *App) void {

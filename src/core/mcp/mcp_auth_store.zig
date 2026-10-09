@@ -111,13 +111,13 @@ fn storageBackend(
     cancel_flag: ?*const std.atomic.Value(bool),
 ) !StorageBackend {
     const disabled = native_keychain.isDisabled();
-    const available = if (builtin.os.tag == .macos and !disabled) blk: {
+    const available = if (builtin.target.os.tag == .macos and !disabled) blk: {
         break :blk if (cancel_flag) |flag|
             try native_keychain.userDefaultKeychainAvailableCancellable(alloc, flag)
         else
             try native_keychain.userDefaultKeychainAvailable(alloc);
     } else false;
-    return selectStorageBackend(builtin.os.tag, disabled, available);
+    return selectStorageBackend(builtin.target.os.tag, disabled, available);
 }
 
 fn selectReadDecision(

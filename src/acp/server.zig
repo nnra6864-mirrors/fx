@@ -362,7 +362,7 @@ pub const ServerState = struct {
     next_mcp_message_id: std.atomic.Value(u64) = .init(1),
     pending_outbound: std.AutoHashMapUnmanaged(u64, PendingOutbound) = .empty,
     legacy_url_mutex: std.Io.Mutex = .init,
-    pending_legacy_urls: std.ArrayListUnmanaged(PendingLegacyUrl) = .empty,
+    pending_legacy_urls: std.ArrayList(PendingLegacyUrl) = .empty,
 
     pub fn deinit(self: *ServerState) void {
         // Terminals end with this process. Ending them first also releases
@@ -1732,7 +1732,7 @@ fn handleKernelCheckpoint(
         error.AttachmentStoreFull => return state.writer.writeError(alloc, msg.id, unavailable),
     };
     var response: [64]u8 = undefined;
-    const written = std.fmt.bufPrint(&response, "{{\"checkpointAttachment\":{d}}}", .{attachment}) catch unreachable;
+    const written = std.mem.print(&response, "{{\"checkpointAttachment\":{d}}}", .{attachment}) catch unreachable;
     try state.writer.writeResponse(alloc, msg.id, written);
 }
 
@@ -2000,7 +2000,7 @@ fn handleKernelSnapshot(
         error.OutOfMemory => return error.OutOfMemory,
         error.AttachmentStoreFull => return state.writer.writeResponse(alloc, msg.id, none),
     };
-    const written = try std.fmt.allocPrint(alloc, "{{\"snapshotAttachment\":{d},\"atSeq\":{d}}}", .{ attachment, at_seq });
+    const written = try alloc.print("{{\"snapshotAttachment\":{d},\"atSeq\":{d}}}", .{ attachment, at_seq });
     defer alloc.free(written);
     try state.writer.writeResponse(alloc, msg.id, written);
 }
@@ -2010,7 +2010,7 @@ const SnapshotSkip = enum { too_large, too_many_turns, invalid };
 
 fn writeSnapshotSkipped(state: *ServerState, alloc: Allocator, id: ?jsonrpc.RequestId, reason: SnapshotSkip) !void {
     debug_trace.logf("session", "event=libfx_snapshot_skipped reason={s}", .{@tagName(reason)});
-    const body = try std.fmt.allocPrint(alloc, "{{\"snapshotAttachment\":null,\"skipped\":\"{s}\"}}", .{@tagName(reason)});
+    const body = try alloc.print("{{\"snapshotAttachment\":null,\"skipped\":\"{s}\"}}", .{@tagName(reason)});
     defer alloc.free(body);
     try state.writer.writeResponse(alloc, id, body);
 }
@@ -2804,8 +2804,7 @@ fn effortOverrideRejection(
         if (index > 0) try set.appendSlice(alloc, ", ");
         try set.appendSlice(alloc, option.label());
     }
-    return try std.fmt.allocPrint(
-        alloc,
+    return try alloc.print(
         "Reasoning effort \"{s}\" is not available for model \"{s}\" (available: {s})",
         .{ effort.label(), model, set.items },
     );
@@ -2915,7 +2914,7 @@ fn fastOverrideRejection(
     model: []const u8,
 ) Allocator.Error!?[]u8 {
     if (capabilities.supports_fast_mode or capabilities.intrinsic_fast) return null;
-    return try std.fmt.allocPrint(alloc, "Fast mode is not available for model \"{s}\"", .{model});
+    return try alloc.print("Fast mode is not available for model \"{s}\"", .{model});
 }
 
 test "fastOverrideRejection accepts models with a fast path" {
@@ -2993,7 +2992,7 @@ fn ultrafastOverrideRejection(
     model: []const u8,
 ) Allocator.Error!?[]u8 {
     if (provider == .gateway and capabilities.supports_ultrafast_mode) return null;
-    return try std.fmt.allocPrint(alloc, "Ultrafast mode is not available for model \"{s}\"", .{model});
+    return try alloc.print("Ultrafast mode is not available for model \"{s}\"", .{model});
 }
 
 test "ultrafastOverrideRejection accepts only Gateway models with the catalog capability" {
@@ -3629,7 +3628,7 @@ fn applyActiveSessionFast(
 ) !bool {
     if (fast) {
         if (!activeSessionCapabilities(state, session).supports_fast_mode) {
-            const message = try std.fmt.allocPrint(alloc, "Fast mode is not available for model \"{s}\"", .{session.model});
+            const message = try alloc.print("Fast mode is not available for model \"{s}\"", .{session.model});
             defer alloc.free(message);
             try state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_params,

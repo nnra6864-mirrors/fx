@@ -143,7 +143,7 @@ fn saveCacheAtHome(alloc: Allocator, provider: Provider, cached: Cached, home: [
 
 fn writeCached(alloc: Allocator, dir: *io_mod.VerifiedDir, provider: Provider, cached: Cached) !void {
     var bytes: [max_cache_bytes]u8 = undefined;
-    const text = try std.fmt.bufPrint(&bytes, "{{\"version\":\"{s}\",\"checked_at_ms\":{d}}}\n", .{ cached.version.slice(), cached.checked_at_ms });
+    const text = try std.mem.print(&bytes, "{{\"version\":\"{s}\",\"checked_at_ms\":{d}}}\n", .{ cached.version.slice(), cached.checked_at_ms });
     try io_mod.durableReplaceVerified(alloc, dir, cacheFile(provider), text);
 }
 
@@ -186,7 +186,7 @@ test "provider version cache creates its profile from a fresh home" {
 }
 
 test "provider version cache rejects directories symlinks and hardlinks" {
-    if (comptime @import("builtin").os.tag == .windows or host_target.is_wasm) return error.SkipZigTest;
+    if (comptime @import("builtin").target.os.tag == .windows or host_target.is_wasm) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const Kind = enum { directory, symlink, hardlink };
     for ([_]Provider{ .codex, .grok }) |provider| {

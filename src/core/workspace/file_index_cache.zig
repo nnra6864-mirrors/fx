@@ -58,7 +58,7 @@ fn cacheKeyHex(alloc: Allocator, roots: []const []const u8) ![]u8 {
 fn cachePath(alloc: Allocator, home: []const u8, roots: []const []const u8) ![]u8 {
     const key = try cacheKeyHex(alloc, roots);
     defer alloc.free(key);
-    return try std.fmt.allocPrint(alloc, "{s}/.fx/file-index/{s}.idx", .{ home, key });
+    return try alloc.print("{s}/.fx/file-index/{s}.idx", .{ home, key });
 }
 
 /// Loads the persisted index for `roots` under `$HOME`, or null when absent,
@@ -159,7 +159,7 @@ pub fn saveTo(alloc: Allocator, home: []const u8, roots: []const []const u8, can
         return;
     }
     const zio = io_mod.getIo();
-    const dir_path = std.fs.path.dirname(path) orelse return;
+    const dir_path = std.Io.Dir.path.dirname(path) orelse return;
     try io_mod.makeDirRecursive(dir_path);
 
     var payload: std.Io.Writer.Allocating = .init(alloc);
@@ -196,7 +196,7 @@ pub fn saveTo(alloc: Allocator, home: []const u8, roots: []const []const u8, can
     var dir = try std.Io.Dir.openDirAbsolute(zio, dir_path, .{ .follow_symlinks = false, .iterate = true });
     defer dir.close(zio);
     var verified: io_mod.VerifiedDir = .{ .dir = dir };
-    try io_mod.durableReplaceVerified(alloc, &verified, std.fs.path.basename(path), out.written());
+    try io_mod.durableReplaceVerified(alloc, &verified, std.Io.Dir.path.basename(path), out.written());
     try dir.setPermissions(zio, .fromMode(0o700));
 }
 

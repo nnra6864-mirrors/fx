@@ -88,7 +88,7 @@ pub fn streamModelCompletion(
                 completed.completion,
                 completed.usage,
             );
-            if (comptime @import("builtin").os.tag != .wasi) {
+            if (comptime @import("builtin").target.os.tag != .wasi) {
                 if (std.meta.activeTag(completed.usage) == .deferred) if (usage) |ledger| {
                     if (request.credential.secret()) |credential| {
                         ledger.startDeferredReconciliation(

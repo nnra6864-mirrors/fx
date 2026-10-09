@@ -43,7 +43,7 @@ pub fn formatHeader(
     const day = epoch_seconds.getDaySeconds();
     const year_day = epoch_seconds.getEpochDay().calculateYearDay();
     const month_day = year_day.calculateMonthDay();
-    return std.fmt.bufPrint(
+    return std.mem.print(
         buf,
         "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>3} UTC · {s}",
         .{

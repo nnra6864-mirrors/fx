@@ -479,7 +479,7 @@ pub const RouteRecoveryStatus = struct {
     pub fn label(self: RouteRecoveryStatus, buf: []u8) []const u8 {
         return switch (self.kind) {
             .auto_retry => self.recoveryLabel(buf),
-            .auto_recovered => std.fmt.bufPrint(
+            .auto_recovered => std.mem.print(
                 buf,
                 "✓ recovered · succeeded on attempt {d}",
                 .{self.succeeded_attempt},
@@ -503,7 +503,7 @@ pub const RouteRecoveryStatus = struct {
 
     fn manualRetryLabel(self: RouteRecoveryStatus, buf: []u8) []const u8 {
         if (self.diagnostic) |diagnostic| {
-            return std.fmt.bufPrint(
+            return std.mem.print(
                 buf,
                 "⚠ Provider route unavailable · {s} · continuing without Fast",
                 .{diagnostic.view()},
@@ -519,13 +519,13 @@ pub const RouteRecoveryStatus = struct {
         action: []const u8,
     ) []const u8 {
         if (self.diagnostic) |diagnostic| {
-            return std.fmt.bufPrint(
+            return std.mem.print(
                 buf,
                 "⚠ {s} · {s} · {s}",
                 .{ cause, diagnostic.view(), action },
             ) catch "⚠ Model response failed";
         }
-        return std.fmt.bufPrint(buf, "⚠ {s} · {s}", .{ cause, action }) catch "⚠ Model response failed";
+        return std.mem.print(buf, "⚠ {s} · {s}", .{ cause, action }) catch "⚠ Model response failed";
     }
 
     fn recoveryLabel(self: RouteRecoveryStatus, buf: []u8) []const u8 {
@@ -556,13 +556,13 @@ pub const RouteRecoveryStatus = struct {
         // counter and no raw error names, just the honest current state.
         if (action_value == .waiting_for_connectivity or action_value == .checking_liveness) {
             if (self.delay_seconds > 0) {
-                return std.fmt.bufPrint(
+                return std.mem.print(
                     buf,
                     "⚠ {s} · {s} · {d}s",
                     .{ cause, action, self.delay_seconds },
                 ) catch "⚠ Recovering model response";
             }
-            return std.fmt.bufPrint(
+            return std.mem.print(
                 buf,
                 "⚠ {s} · {s}",
                 .{ cause, action },
@@ -570,26 +570,26 @@ pub const RouteRecoveryStatus = struct {
         }
         if (self.delay_seconds > 0) {
             if (self.diagnostic) |diagnostic| {
-                return std.fmt.bufPrint(
+                return std.mem.print(
                     buf,
                     "⚠ {s} · {s} · {s} in {d}s",
                     .{ cause, diagnostic.humanText(), action, self.delay_seconds },
                 ) catch "⚠ Recovering model response";
             }
-            return std.fmt.bufPrint(
+            return std.mem.print(
                 buf,
                 "⚠ {s} · {s} in {d}s",
                 .{ cause, action, self.delay_seconds },
             ) catch "⚠ Recovering model response";
         }
         if (self.diagnostic) |diagnostic| {
-            return std.fmt.bufPrint(
+            return std.mem.print(
                 buf,
                 "⚠ {s} · {s} · {s}",
                 .{ cause, diagnostic.humanText(), action },
             ) catch "⚠ Recovering model response";
         }
-        return std.fmt.bufPrint(
+        return std.mem.print(
             buf,
             "⚠ {s} · {s}",
             .{ cause, action },
@@ -621,13 +621,13 @@ pub const RouteRecoveryStatus = struct {
             else
                 "Response failed";
             if (self.diagnostic) |diagnostic| {
-                return std.fmt.bufPrint(
+                return std.mem.print(
                     buf,
                     "⚠ {s} · {s} · kept failing at the same point · stopped",
                     .{ cause_text, diagnostic.humanText() },
                 ) catch "⚠ Response kept failing at the same point";
             }
-            return std.fmt.bufPrint(
+            return std.mem.print(
                 buf,
                 "⚠ {s} · kept failing at the same point · stopped",
                 .{cause_text},
@@ -636,13 +636,13 @@ pub const RouteRecoveryStatus = struct {
         const cause = self.cause orelse return self.pausedCauseLabel(buf, "Provider unavailable");
         if (cause == .rate_limited) {
             if (self.diagnostic) |diagnostic| {
-                return std.fmt.bufPrint(
+                return std.mem.print(
                     buf,
                     "⚠ Rate limited · {s} · server requested a longer wait · recovery paused · attempt {d}",
                     .{ diagnostic.view(), self.failed_attempt },
                 ) catch "⚠ Rate limited · recovery paused";
             }
-            return std.fmt.bufPrint(
+            return std.mem.print(
                 buf,
                 "⚠ Rate limited · server requested a longer wait · recovery paused · attempt {d}",
                 .{self.failed_attempt},
@@ -650,13 +650,13 @@ pub const RouteRecoveryStatus = struct {
         }
         if (cause == .system_resumed) {
             if (self.diagnostic) |diagnostic| {
-                return std.fmt.bufPrint(
+                return std.mem.print(
                     buf,
                     "⚠ Mac woke from sleep · {s} · connection still unavailable · recovery paused · attempt {d}",
                     .{ diagnostic.view(), self.failed_attempt },
                 ) catch "⚠ Connection unavailable · recovery paused";
             }
-            return std.fmt.bufPrint(
+            return std.mem.print(
                 buf,
                 "⚠ Mac woke from sleep · connection still unavailable · recovery paused · attempt {d}",
                 .{self.failed_attempt},
@@ -664,13 +664,13 @@ pub const RouteRecoveryStatus = struct {
         }
         if (cause == .provider_stream_timeout) {
             if (self.diagnostic) |diagnostic| {
-                return std.fmt.bufPrint(
+                return std.mem.print(
                     buf,
                     "⚠ Gateway stream timed out · {s} · automatic retry paused · attempt {d}",
                     .{ diagnostic.view(), self.failed_attempt },
                 ) catch "⚠ Gateway stream timed out · automatic retry paused";
             }
-            return std.fmt.bufPrint(
+            return std.mem.print(
                 buf,
                 "⚠ Gateway stream timed out · automatic retry paused · attempt {d}",
                 .{self.failed_attempt},
@@ -678,13 +678,13 @@ pub const RouteRecoveryStatus = struct {
         }
         if (cause == .request_limit_reached) {
             if (self.diagnostic) |diagnostic| {
-                return std.fmt.bufPrint(
+                return std.mem.print(
                     buf,
                     "⚠ Response paused · {s} · {d}/{d} provider-request safety limit reached",
                     .{ diagnostic.view(), self.failed_attempt, self.attempt_limit },
                 ) catch "⚠ Response paused · provider-request safety limit reached";
             }
-            return std.fmt.bufPrint(
+            return std.mem.print(
                 buf,
                 "⚠ Response paused · {d}/{d} provider-request safety limit reached",
                 .{ self.failed_attempt, self.attempt_limit },
@@ -706,13 +706,13 @@ pub const RouteRecoveryStatus = struct {
             "stopped";
         const plural: []const u8 = if (self.failed_attempt == 1) "" else "s";
         if (self.diagnostic) |diagnostic| {
-            return std.fmt.bufPrint(
+            return std.mem.print(
                 buf,
                 "⚠ {s} · {s} · {s} after {d} attempt{s}",
                 .{ name, diagnostic.humanText(), state_text, self.failed_attempt, plural },
             ) catch "⚠ Model response recovery ended";
         }
-        return std.fmt.bufPrint(
+        return std.mem.print(
             buf,
             "⚠ {s} · {s} after {d} attempt{s}",
             .{ name, state_text, self.failed_attempt, plural },

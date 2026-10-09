@@ -212,7 +212,7 @@ fn composeBrowseHeader(alloc: Allocator, projection: SettingsMenuProjection, wid
 fn appendHeaderTitle(alloc: Allocator, row: *std.ArrayList(u8), count: usize) !void {
     try row.appendSlice(alloc, ui_render.selected_completion_style);
     var buf: [48]u8 = undefined;
-    const title = std.fmt.bufPrint(&buf, "Settings {d}", .{count}) catch "Settings";
+    const title = std.mem.print(&buf, "Settings {d}", .{count}) catch "Settings";
     try row.appendSlice(alloc, title);
     try row.appendSlice(alloc, ui_render.reset_style);
 }
@@ -479,7 +479,7 @@ test "settings menu renders category tabs and a flat full list through the VT" {
         var row = try composeSettingsMenuRow(alloc, projection, row_index, width, rows);
         defer row.deinit(alloc);
         var cursor_buf: [32]u8 = undefined;
-        const cursor = try std.fmt.bufPrint(&cursor_buf, "\x1b[{d};1H", .{row_index + 1});
+        const cursor = try std.mem.print(&cursor_buf, "\x1b[{d};1H", .{row_index + 1});
         try grid.feed(cursor);
         try grid.feed(row.items);
     }

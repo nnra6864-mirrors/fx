@@ -55,8 +55,7 @@ pub fn prepareModelOutputWithTruncation(
     const capped = try truncateText(scratch, .{
         .text = sanitized,
         .max_bytes = max_bytes,
-        .marker = try std.fmt.allocPrint(
-            scratch,
+        .marker = try scratch.print(
             "\n... [tool result truncated for {s}: original {d} bytes; cap is {d} bytes]\n",
             .{ tool_name, sanitized.len, max_bytes },
         ),

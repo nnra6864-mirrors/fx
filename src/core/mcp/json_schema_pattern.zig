@@ -621,11 +621,11 @@ pub fn matches(
     const start = try compiler.compile(root);
 
     const instructions = compiler.instructions.items;
-    var current = try std.DynamicBitSetUnmanaged.initEmpty(alloc, instructions.len);
+    var current = try std.bit_set.Dynamic.initEmpty(alloc, instructions.len);
     defer current.deinit(alloc);
-    var next = try std.DynamicBitSetUnmanaged.initEmpty(alloc, instructions.len);
+    var next = try std.bit_set.Dynamic.initEmpty(alloc, instructions.len);
     defer next.deinit(alloc);
-    var visited = try std.DynamicBitSetUnmanaged.initEmpty(alloc, instructions.len);
+    var visited = try std.bit_set.Dynamic.initEmpty(alloc, instructions.len);
     defer visited.deinit(alloc);
     var stack: std.ArrayList(usize) = .empty;
     defer stack.deinit(alloc);
@@ -681,7 +681,7 @@ pub fn matches(
                 steps,
             );
         }
-        std.mem.swap(std.DynamicBitSetUnmanaged, &current, &next);
+        std.mem.swap(std.bit_set.Dynamic, &current, &next);
         byte_index = next_byte_index;
     }
 }
@@ -689,8 +689,8 @@ pub fn matches(
 fn addClosure(
     alloc: Allocator,
     instructions: []const Instruction,
-    states: *std.DynamicBitSetUnmanaged,
-    visited: *std.DynamicBitSetUnmanaged,
+    states: *std.bit_set.Dynamic,
+    visited: *std.bit_set.Dynamic,
     stack: *std.ArrayList(usize),
     start: usize,
     byte_index: usize,
@@ -719,7 +719,7 @@ fn addClosure(
     }
 }
 
-fn containsAccept(instructions: []const Instruction, states: *const std.DynamicBitSetUnmanaged) bool {
+fn containsAccept(instructions: []const Instruction, states: *const std.bit_set.Dynamic) bool {
     var iterator = states.iterator(.{});
     while (iterator.next()) |index| if (instructions[index].op == .accept) return true;
     return false;

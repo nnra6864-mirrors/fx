@@ -489,12 +489,12 @@ pub fn canonicalizeForegroundResult(
     for ([_]Stream{ .stdout, .stderr }) |stream| {
         const label = @tagName(stream);
         var open_buf: [16]u8 = undefined;
-        const open = std.fmt.bufPrint(&open_buf, "<{s}>\n", .{label}) catch
+        const open = std.mem.print(&open_buf, "<{s}>\n", .{label}) catch
             unreachable;
         if (!std.mem.startsWith(u8, remaining, open)) continue;
 
         var close_buf: [20]u8 = undefined;
-        const close = std.fmt.bufPrint(&close_buf, "\n</{s}>\n", .{label}) catch
+        const close = std.mem.print(&close_buf, "\n</{s}>\n", .{label}) catch
             unreachable;
         const body_and_tail = remaining[open.len..];
         const close_start = std.mem.find(u8, body_and_tail, close) orelse {

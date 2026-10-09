@@ -468,8 +468,7 @@ fn renderCursor(
     request_hash: u64,
     offset: usize,
 ) Allocator.Error![]u8 {
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "c1:{c}:{x}:{x}:{d}",
         .{
             if (domain == .skill) @as(u8, 's') else @as(u8, 'm'),
@@ -697,7 +696,7 @@ test "inventory cursor partitions twenty eight tools without gaps" {
     var name_storage: [28][24]u8 = undefined;
     var documents: [28]Document = undefined;
     for (&documents, 0..) |*document, index| {
-        const name = try std.fmt.bufPrint(&name_storage[index], "mcp_datadog_tool_{d:0>2}", .{index});
+        const name = try std.mem.print(&name_storage[index], "mcp_datadog_tool_{d:0>2}", .{index});
         document.* = .{
             .identities = .{ name, "" },
             .stable_key = name,

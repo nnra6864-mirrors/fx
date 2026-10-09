@@ -179,7 +179,7 @@ pub fn runSequentialCalls(
         } else completed: {
             const execution = options.execute(options.exec_ctx, alloc, call, index) catch |err| blk: {
                 const output = options.format_error(options.format_ctx, alloc, call.name, err) catch
-                    try std.fmt.allocPrint(alloc, "Tool execution failed: {s}", .{@errorName(err)});
+                    try alloc.print("Tool execution failed: {s}", .{@errorName(err)});
                 defer alloc.free(output);
                 break :blk ToolExecutionResult{
                     .status = .failure,
@@ -327,8 +327,7 @@ fn materializeParallelAttempt(
     const execution: ToolExecutionResult = if (slot.err) |err| .{
         .status = .failure,
         .model_output = blk: {
-            const output = options.format_error(options.format_ctx, alloc, call.name, err) catch |format_err| try std.fmt.allocPrint(
-                alloc,
+            const output = options.format_error(options.format_ctx, alloc, call.name, err) catch |format_err| try alloc.print(
                 "Tool execution failed: {s}; additionally failed to format error: {s}",
                 .{ @errorName(err), @errorName(format_err) },
             );
@@ -579,7 +578,7 @@ fn updateMaxInFlight(max_in_flight: *std.atomic.Value(usize), candidate: usize) 
 }
 
 fn parallelTestFormatError(_: *anyopaque, alloc: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {
-    return std.fmt.allocPrint(alloc, "{s} failed with {s}", .{ tool_name, @errorName(err) });
+    return alloc.print("{s} failed with {s}", .{ tool_name, @errorName(err) });
 }
 
 fn toolCall(id: []const u8, name: []const u8, args: []const u8) ToolCall {

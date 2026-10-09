@@ -398,7 +398,7 @@ fn foldedLineBytes(alloc: Allocator, text: []const u8, stream: command_output_co
 
 fn padAnsiBytesToRows(alloc: Allocator, bytes: []const u8, missing_rows: u16) ![]u8 {
     std.debug.assert(missing_rows > 0);
-    return std.fmt.allocPrint(alloc, "{s}\x1b[{d}B\x1b[2K", .{ bytes, missing_rows });
+    return alloc.print("{s}\x1b[{d}B\x1b[2K", .{ bytes, missing_rows });
 }
 
 fn logRenderedTranscriptRow(row: u16, rows_painted: u16, line_index: usize, kind_name: []const u8, partial_skip_rows: u16, text: []const u8) void {
@@ -3108,8 +3108,8 @@ test "reset replay document preserves folded rows without filler" {
     );
     defer if (replay.len > 0) alloc.free(replay);
 
-    try std.testing.expect(std.mem.indexOf(u8, replay, "│ folded-prefix") != null);
-    try std.testing.expect(std.mem.indexOf(u8, replay, "tail") != null);
+    try std.testing.expect(std.mem.find(u8, replay, "│ folded-prefix") != null);
+    try std.testing.expect(std.mem.find(u8, replay, "tail") != null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, replay, "\r\n"));
 
     var terminal = try vt_emulator.Grid.init(alloc, 24, 1);
@@ -3178,7 +3178,7 @@ test "reset replay document crosses the u16 row chunk boundary" {
     );
     defer if (replay.len > 0) alloc.free(replay);
 
-    try std.testing.expect(std.mem.indexOf(u8, replay, "tail") != null);
+    try std.testing.expect(std.mem.find(u8, replay, "tail") != null);
 }
 
 fn preparedProjectionBoundary(

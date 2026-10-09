@@ -1445,8 +1445,7 @@ fn derivePostimage(
                 break :blk .{ .semantic_failure = "edit_file failed: old_string not found in file. Re-read the file to see its current contents; if the change is already applied, do not retry this edit." };
             }
             if (occurrence_count > 1) {
-                break :blk .{ .semantic_failure = try std.fmt.allocPrint(
-                    alloc,
+                break :blk .{ .semantic_failure = try alloc.print(
                     "edit_file failed: old_string is not unique (found {d} occurrences), provide more context",
                     .{occurrence_count},
                 ) };
@@ -1799,7 +1798,7 @@ test "prepare derives a missing write without creating the target" {
 }
 
 test "prepare shows the canonical external target when a symlink redirects outside the workspace" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -1815,7 +1814,7 @@ test "prepare shows the canonical external target when a symlink redirects outsi
     };
 
     const workspace = try io_mod.dirRealpathAlloc(arena, tmp.dir, "workspace");
-    const misleading_path = try std.fs.path.join(arena, &.{ workspace, "link/new.txt" });
+    const misleading_path = try std.Io.Dir.path.join(arena, &.{ workspace, "link/new.txt" });
     const call: types.ToolCall = .{
         .id = "write-symlink-redirect",
         .name = "write_file",
@@ -1843,7 +1842,7 @@ test "prepare retains full review separately from the bounded approval preview" 
         var line: [32]u8 = undefined;
         try content.appendSlice(
             std.testing.allocator,
-            try std.fmt.bufPrint(&line, "line {d}\n", .{line_number}),
+            try std.mem.print(&line, "line {d}\n", .{line_number}),
         );
     }
 
@@ -2175,7 +2174,7 @@ test "prepare rejects call target and authority identity mismatches" {
 }
 
 test "prepare rejects an intermediate-directory retarget" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2388,7 +2387,7 @@ test "apply installs reviewed bytes beneath an authorized external anchor" {
         tmp.dir,
         "external",
     );
-    const target_path = try std.fs.path.join(
+    const target_path = try std.Io.Dir.path.join(
         call_alloc,
         &.{ external, "nested/new.txt" },
     );
@@ -3276,7 +3275,7 @@ test "apply returns deepest-first bounded residue when created parents are not e
 }
 
 test "apply preserves the existing destination mode" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

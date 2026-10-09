@@ -104,7 +104,7 @@ pub const Locations = struct {
         const leaf = std.Uri.percentDecodeInPlace(decoded);
         if (leaf.len == 0 or std.mem.eql(u8, leaf, ".") or std.mem.eql(u8, leaf, "..") or
             std.mem.findAny(u8, leaf, "/\\\x00") != null or !std.unicode.utf8ValidateSlice(leaf)) return error.InvalidSkillLocation;
-        return std.fs.path.join(alloc, &.{ self.roots[index], leaf });
+        return std.Io.Dir.path.join(alloc, &.{ self.roots[index], leaf });
     }
 };
 
@@ -657,7 +657,7 @@ pub fn invalidSkillNameCause(name: []const u8) ?InvalidMetadataCause {
 pub fn validateManagedSkillName(name: []const u8) !void {
     if (name.len == 0 or name.len > max_name_bytes) return error.InvalidSkillName;
     if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return error.InvalidSkillName;
-    if (std.fs.path.isAbsolute(name)) return error.InvalidSkillName;
+    if (std.Io.Dir.path.isAbsolute(name)) return error.InvalidSkillName;
     if (std.mem.findScalar(u8, name, '/') != null) return error.InvalidSkillName;
     if (std.mem.findScalar(u8, name, '\\') != null) return error.InvalidSkillName;
 }

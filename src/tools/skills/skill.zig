@@ -124,7 +124,7 @@ pub fn prepare(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_d
     return prepareInput(ctx, input.as(Input)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Cancelled => return error.Cancelled,
-        else => return .{ .failure = .{ .model_output = try std.fmt.allocPrint(ctx.allocator, "skill failed: {s}. Refresh available skills and retry with an exact advertised location.", .{@errorName(err)}) } },
+        else => return .{ .failure = .{ .model_output = try ctx.allocator.print("skill failed: {s}. Refresh available skills and retry with an exact advertised location.", .{@errorName(err)}) } },
     };
 }
 
@@ -153,7 +153,7 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
     const result = loadInput(ctx, input) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Cancelled => return error.Cancelled,
-        else => return .{ .failure = try std.fmt.allocPrint(ctx.allocator, "skill failed: {s}", .{@errorName(err)}) },
+        else => return .{ .failure = try ctx.allocator.print("skill failed: {s}", .{@errorName(err)}) },
     };
     errdefer skill_invocation.freeExecuteResult(ctx.allocator, result);
     if (result.contextNotice()) |notice| try tool_dispatch.reportContextNotice(ctx, notice);

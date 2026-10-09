@@ -64,8 +64,8 @@ pub const Finished = struct {
 /// Owns bounded steering text shared by the ACP reader and prompt worker.
 pub const Runtime = struct {
     mutex: std.Io.Mutex = .init,
-    messages: std.ArrayListUnmanaged(Entry) = .empty,
-    absorbed: std.ArrayListUnmanaged(RequestId) = .empty,
+    messages: std.ArrayList(Entry) = .empty,
+    absorbed: std.ArrayList(RequestId) = .empty,
     queued_bytes: usize = 0,
     accepting: bool = false,
 

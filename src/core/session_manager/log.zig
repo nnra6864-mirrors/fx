@@ -1158,7 +1158,7 @@ const log_model_tests = struct {
 
     fn tracedSchedule(seed: u64) !void {
         var case_buffer: [64]u8 = undefined;
-        const case = try std.fmt.bufPrint(&case_buffer, "fault-schedule-seed-{d}", .{seed});
+        const case = try std.mem.print(&case_buffer, "fault-schedule-seed-{d}", .{seed});
         try runTraced(seed, case, .none);
     }
 

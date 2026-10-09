@@ -58,8 +58,8 @@ pub const interrupted_turn_context =
     "</turn_aborted>";
 
 pub fn projectSnapshotLocator(buffer: []u8, path: []const u8) ![]const u8 {
-    if (!std.fs.path.isAbsolute(path)) return path;
-    return std.fmt.bufPrint(buffer, "images/{s}", .{std.fs.path.basename(path)});
+    if (!std.Io.Dir.path.isAbsolute(path)) return path;
+    return std.mem.print(buffer, "images/{s}", .{std.Io.Dir.path.basename(path)});
 }
 
 pub const interrupted_before_completion_output = "The previous response ended before completion.";
@@ -132,7 +132,7 @@ pub const WorkIdError = error{
 pub fn validateWorkId(work_id: []const u8) WorkIdError!void {
     if (work_id.len == 0 or work_id.len > max_work_id_bytes or
         !std.unicode.utf8ValidateSlice(work_id) or
-        std.mem.indexOfScalar(u8, work_id, 0) != null)
+        std.mem.findScalar(u8, work_id, 0) != null)
     {
         return error.InvalidWorkId;
     }
@@ -381,7 +381,7 @@ const LegacyImagePlaceholderIterator = struct {
     };
 
     fn next(self: *@This()) ?Slot {
-        const relative_start = std.mem.indexOf(u8, self.text[self.offset..], prefix) orelse
+        const relative_start = std.mem.find(u8, self.text[self.offset..], prefix) orelse
             return null;
         const start = self.offset + relative_start;
         if (image_attachments.matchImagePlaceholder(self.text, start)) |match| {
@@ -390,7 +390,7 @@ const LegacyImagePlaceholderIterator = struct {
         }
 
         const body_start = start + prefix.len;
-        self.offset = if (std.mem.indexOfScalar(u8, self.text[body_start..], ']')) |relative_end|
+        self.offset = if (std.mem.findScalar(u8, self.text[body_start..], ']')) |relative_end|
             body_start + relative_end + 1
         else
             body_start;
@@ -733,7 +733,7 @@ fn make_owned_legacy_image_turn(
 fn sessionTestSnapshotDir(alloc: Allocator, tmp: *std.testing.TmpDir) ![]u8 {
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    return std.fs.path.join(alloc, &.{ root, "snapshots" });
+    return std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
 }
 
 fn writeSessionTestImage(
@@ -791,7 +791,7 @@ test "legacy image snapshot repair drops unavailable path-only images" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const missing_path = try std.fs.path.join(alloc, &.{ root, "missing.png" });
+    const missing_path = try std.Io.Dir.path.join(alloc, &.{ root, "missing.png" });
     defer alloc.free(missing_path);
     const snapshot_dir = try sessionTestSnapshotDir(alloc, &tmp);
     defer alloc.free(snapshot_dir);
@@ -817,14 +817,14 @@ test "legacy image snapshot repair propagates OOM without changing memory or dis
     var reached_success = false;
     for (0..256) |fail_index| {
         var name_buf: [64]u8 = undefined;
-        const snapshot_name = try std.fmt.bufPrint(
+        const snapshot_name = try std.mem.print(
             &name_buf,
             "snapshots-{d}",
             .{fail_index},
         );
         const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
         defer alloc.free(root);
-        const snapshot_dir = try std.fs.path.join(alloc, &.{ root, snapshot_name });
+        const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, snapshot_name });
         defer alloc.free(snapshot_dir);
         const turn = try make_owned_legacy_image_turn(
             alloc,
@@ -2986,8 +2986,7 @@ pub fn inferConversationLanguage(text: []const u8, fallback: ConversationLanguag
 
 pub fn formatCompactedContinuationMessage(alloc: Allocator, summary: []const u8) ![]u8 {
     if (try compactor.modelText(alloc, summary)) |text| return text;
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "{s}{s}\n\n{s}\n{s}",
         .{ compact_continuation_preamble, summary, compact_recent_messages_note, compact_direct_resume_instruction },
     );
@@ -3068,7 +3067,7 @@ fn formatInterruptedAssistantClosedContent(alloc: Allocator, entry: InterruptedH
 }
 
 fn formatInterruptedPartialAssistantClosedContent(alloc: Allocator, assistant: []const u8) Allocator.Error![]u8 {
-    return std.fmt.allocPrint(alloc, "{s}\n\n{s}", .{ assistant, interrupted_before_completion_output });
+    return alloc.print("{s}\n\n{s}", .{ assistant, interrupted_before_completion_output });
 }
 
 test "resume-history-to-request conversion preserves user assistant ordering" {
@@ -4677,9 +4676,9 @@ test "SessionRuntime context projection preserves nine typed canonical turns" {
         .execution = .{ .tool_steps = steps[0..] },
     } });
     for (1..9) |index| {
-        const user = try std.fmt.allocPrint(alloc, "prompt {d}", .{index});
+        const user = try alloc.print("prompt {d}", .{index});
         defer alloc.free(user);
-        const assistant = try std.fmt.allocPrint(alloc, "reply {d}", .{index});
+        const assistant = try alloc.print("reply {d}", .{index});
         defer alloc.free(assistant);
         try runtime.appendAssistantHistoryTurn(alloc, user, assistant);
     }

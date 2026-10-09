@@ -173,8 +173,7 @@ fn executionFailure(
     domain: []const u8,
     err: anyerror,
 ) Allocator.Error!tool_dispatch.ToolResult {
-    return .{ .failure = try std.fmt.allocPrint(
-        alloc,
+    return .{ .failure = try alloc.print(
         "capability_search {s} search failed: {s}",
         .{ domain, @errorName(err) },
     ) };
@@ -204,7 +203,7 @@ fn searchMcp(
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Cancelled => return error.Cancelled,
-        else => return .{ .model_output = try std.fmt.allocPrint(ctx.allocator, "{{\"tools\":[],\"count\":0,\"error\":\"{s}\"}}", .{@errorName(err)}) },
+        else => return .{ .model_output = try ctx.allocator.print("{{\"tools\":[],\"count\":0,\"error\":\"{s}\"}}", .{@errorName(err)}) },
     };
 }
 

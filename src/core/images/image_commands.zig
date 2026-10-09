@@ -36,7 +36,7 @@ pub fn Commands(comptime App: type) type {
                     error.UnsupportedImageType => try app.alloc.dupe(u8, "unsupported image type"),
                     error.FileNotFound => try app.alloc.dupe(u8, "image file not found"),
                     error.ImageTooLarge => try app.alloc.dupe(u8, image_attachments.image_too_large_notice),
-                    else => try std.fmt.allocPrint(app.alloc, "failed to attach image: {s}", .{@errorName(err)}),
+                    else => try app.alloc.print("failed to attach image: {s}", .{@errorName(err)}),
                 };
                 defer app.alloc.free(line);
                 try app.writeDomainNotice(.{ .topic = "images", .tone = .@"error", .body = line }, true);
@@ -51,7 +51,7 @@ pub fn Commands(comptime App: type) type {
                 },
             }
 
-            const line = try std.fmt.allocPrint(app.alloc, "attached image: {s}", .{std.fs.path.basename(image.path)});
+            const line = try app.alloc.print("attached image: {s}", .{std.Io.Dir.path.basename(image.path)});
             defer app.alloc.free(line);
             try app.writeDomainNotice(.{ .topic = "images", .tone = .neutral, .body = line }, true);
         }
@@ -73,7 +73,7 @@ pub fn Commands(comptime App: type) type {
             defer out.deinit();
             try out.writer.print("{d} pending\n", .{app.pending_images.items.len});
             for (app.pending_images.items) |image| {
-                try out.writer.print(" - {s} ({s})\n", .{ std.fs.path.basename(image.path), image.media_type });
+                try out.writer.print(" - {s} ({s})\n", .{ std.Io.Dir.path.basename(image.path), image.media_type });
             }
             const text = try out.toOwnedSlice();
             defer app.alloc.free(text);
@@ -89,7 +89,7 @@ pub fn Commands(comptime App: type) type {
                 if (err == error.NoClipboardImage) {
                     try app.writeDomainNotice(.{ .topic = "images", .tone = .neutral, .body = "no image found on clipboard" }, true);
                 } else if (err != error.Unsupported) {
-                    const line = try std.fmt.allocPrint(app.alloc, "failed to paste clipboard image: {s}", .{@errorName(err)});
+                    const line = try app.alloc.print("failed to paste clipboard image: {s}", .{@errorName(err)});
                     defer app.alloc.free(line);
                     try app.writeDomainNotice(.{ .topic = "images", .tone = .@"error", .body = line }, true);
                 }
@@ -315,7 +315,7 @@ fn testClipboardImage(
     source_dir_name: []const u8,
 ) !image_attachments.ClipboardImageAttachment {
     try tmp.dir.createDir(std.testing.io, source_dir_name, .default_dir);
-    const source_sub_path = try std.fs.path.join(alloc, &.{ source_dir_name, "clipboard.png" });
+    const source_sub_path = try std.Io.Dir.path.join(alloc, &.{ source_dir_name, "clipboard.png" });
     defer alloc.free(source_sub_path);
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = source_sub_path,
@@ -494,7 +494,7 @@ test "path and clipboard insertion recover from provider size rejection without 
     defer alloc.free(next_path);
     const root = try realTmpPath(alloc, &tmp, ".");
     defer alloc.free(root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
 
     var app = FakeApp{
@@ -742,7 +742,7 @@ test "temporary image source is removed after insertion and remapped to its snap
     defer tmp.cleanup();
     const root = try realTmpPath(alloc, &tmp, ".");
     defer alloc.free(root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
     var loaded = try testClipboardImage(alloc, &tmp, "clipboard-source");
     const source_dir = try alloc.dupe(u8, loaded.source_dir);
@@ -783,7 +783,7 @@ test "temporary image source is removed on input full rejection and capture fail
     defer tmp.cleanup();
     const root = try realTmpPath(alloc, &tmp, ".");
     defer alloc.free(root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
 
     {
@@ -975,7 +975,7 @@ test "managePending reports empty lists populated lists and clear" {
 }
 
 test "attachClipboard is silent on unsupported platforms" {
-    if (@import("builtin").os.tag == .macos) return;
+    if (@import("builtin").target.os.tag == .macos) return;
 
     const alloc = std.testing.allocator;
     var app = FakeApp{ .alloc = alloc };

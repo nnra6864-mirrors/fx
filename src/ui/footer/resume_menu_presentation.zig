@@ -290,7 +290,7 @@ fn composeHeaderRow(alloc: Allocator, projection: SessionMenuProjection, width: 
 fn appendHeaderTitle(alloc: Allocator, row: *std.ArrayList(u8), count: usize) !void {
     try row.appendSlice(alloc, ui_render.selected_completion_style);
     var buf: [48]u8 = undefined;
-    const title = std.fmt.bufPrint(&buf, "Sessions {d}", .{count}) catch "Sessions";
+    const title = std.mem.print(&buf, "Sessions {d}", .{count}) catch "Sessions";
     try row.appendSlice(alloc, title);
     try row.appendSlice(alloc, ui_render.reset_style);
 }
@@ -317,11 +317,11 @@ const MetadataColumns = struct {
 };
 
 fn sessionWorkspaceLabel(summary: session_store.SessionSummary) []const u8 {
-    return std.fs.path.basename(session_catalog.workspacePath(summary));
+    return std.Io.Dir.path.basename(session_catalog.workspacePath(summary));
 }
 
 fn sessionTurnsText(buf: []u8, history_len: usize) []const u8 {
-    return std.fmt.bufPrint(
+    return std.mem.print(
         buf,
         "{d} {s}",
         .{ history_len, if (history_len == 1) "turn" else "turns" },

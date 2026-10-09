@@ -100,8 +100,8 @@ fn construct_start_persistence(
     input: AuthorityPreparation,
     proof: contracts.HolderProof,
 ) !PreparedAuthority {
-    if (!std.fs.path.isAbsolute(input.workspace_root) or
-        !std.fs.path.isAbsolute(input.cwd))
+    if (!std.Io.Dir.path.isAbsolute(input.workspace_root) or
+        !std.Io.Dir.path.isAbsolute(input.cwd))
     {
         return error.InvalidPrincipal;
     }

@@ -50,12 +50,12 @@ const default_dimensions: contracts.Dimensions = .{
     .rows = 24,
     .columns = 80,
 };
-const ioctl_set_controlling_terminal: c_int = switch (builtin.os.tag) {
+const ioctl_set_controlling_terminal: c_int = switch (builtin.target.os.tag) {
     .macos => 0x20007461,
     .linux => @intCast(std.os.linux.T.IOCSCTTY),
     else => 0,
 };
-const ioctl_set_window_size: c_int = switch (builtin.os.tag) {
+const ioctl_set_window_size: c_int = switch (builtin.target.os.tag) {
     .macos => @bitCast(@as(u32, 0x80087467)),
     .linux => @intCast(std.os.linux.T.IOCSWINSZ),
     else => 0,
@@ -258,7 +258,7 @@ pub const WorkTracker = struct {
 };
 
 pub fn isSupported() bool {
-    return isSupportedForOs(builtin.os.tag);
+    return isSupportedForOs(builtin.target.os.tag);
 }
 
 fn isSupportedForOs(os_tag: std.Target.Os.Tag) bool {
@@ -280,9 +280,9 @@ test "native terminal backend selection follows canonical platform support" {
             isSupportedForOs(os_tag),
         );
     }
-    try std.testing.expectEqual(isSupportedForOs(builtin.os.tag), isSupported());
+    try std.testing.expectEqual(isSupportedForOs(builtin.target.os.tag), isSupported());
     const ExpectedRegistry = if (comptime host_capabilities
-        .terminalSupportForOs(builtin.os.tag)
+        .terminalSupportForOs(builtin.target.os.tag)
         .isSupported())
         SupportedRegistry
     else
@@ -364,16 +364,16 @@ pub fn runLauncher(alloc: Allocator) !void {
     );
     defer parsed.deinit();
     if (parsed.value.argv.len == 0) return error.InvalidLauncherConfig;
-    if (!std.fs.path.isAbsolute(parsed.value.cwd) or
-        !std.fs.path.isAbsolute(parsed.value.control_path) or
-        !std.fs.path.isAbsolute(parsed.value.bootstrap_path) or
+    if (!std.Io.Dir.path.isAbsolute(parsed.value.cwd) or
+        !std.Io.Dir.path.isAbsolute(parsed.value.control_path) or
+        !std.Io.Dir.path.isAbsolute(parsed.value.bootstrap_path) or
         parsed.value.control_nonce.len != control_nonce_len or
         (parsed.value.command == null) != (parsed.value.command_path == null))
     {
         return error.InvalidLauncherConfig;
     }
     if (parsed.value.command_path) |path| {
-        if (!std.fs.path.isAbsolute(path)) return error.InvalidLauncherConfig;
+        if (!std.Io.Dir.path.isAbsolute(path)) return error.InvalidLauncherConfig;
     }
     try parsed.value.dimensions.validate();
 
@@ -1659,21 +1659,18 @@ const Session = struct {
         var path_bytes: [16]u8 = undefined;
         io_mod.getIo().random(&path_bytes);
         const path_suffix = std.fmt.bytesToHex(path_bytes, .lower);
-        const control_path = try std.fmt.allocPrint(
-            self.alloc,
+        const control_path = try self.alloc.print(
             "/tmp/fx-terminal-{s}.sock",
             .{path_suffix},
         );
         defer self.alloc.free(control_path);
-        const bootstrap_path = try std.fmt.allocPrint(
-            self.alloc,
+        const bootstrap_path = try self.alloc.print(
             "/tmp/fx-terminal-{s}.bootstrap",
             .{path_suffix},
         );
         defer self.alloc.free(bootstrap_path);
         const command_path = if (request.command != null)
-            try std.fmt.allocPrint(
-                self.alloc,
+            try self.alloc.print(
                 "/tmp/fx-terminal-{s}.command",
                 .{path_suffix},
             )
@@ -2092,7 +2089,7 @@ const Session = struct {
 
     fn matchesSignalTarget(self: *Session, target: SignalTarget) bool {
         var pid_buffer: [32]u8 = undefined;
-        const pid_text = std.fmt.bufPrint(
+        const pid_text = std.mem.print(
             &pid_buffer,
             "{d}",
             .{target.pid},
@@ -2172,7 +2169,7 @@ const Session = struct {
         self.mutex.unlock(zio);
         if (!running or pid == null or token == null) return false;
         var pid_buffer: [32]u8 = undefined;
-        const pid_text = std.fmt.bufPrint(&pid_buffer, "{d}", .{pid.?}) catch
+        const pid_text = std.mem.print(&pid_buffer, "{d}", .{pid.?}) catch
             return false;
         if (self.durable.profile.process_provider.matchToken(
             self.alloc,
@@ -2419,7 +2416,7 @@ const Session = struct {
             return;
         };
         var pid_buffer: [32]u8 = undefined;
-        const pid_text = std.fmt.bufPrint(&pid_buffer, "{d}", .{pid}) catch {
+        const pid_text = std.mem.print(&pid_buffer, "{d}", .{pid}) catch {
             self.failClosed(.session_lost);
             return;
         };

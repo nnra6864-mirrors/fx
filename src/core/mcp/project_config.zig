@@ -166,8 +166,7 @@ pub fn renderWorkspaceDiagnostic(
             @tagName(value)
         else
             "value";
-        return std.fmt.allocPrint(
-            alloc,
+        return alloc.print(
             ".mcp.json server '{s}' field {s} requires environment variable '{s}'; set it or use ${{{s}:-default}}.",
             .{
                 encoded_server.bytes,
@@ -177,8 +176,7 @@ pub fn renderWorkspaceDiagnostic(
             },
         );
     }
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         ".mcp.json server '{s}' was skipped: {s}.",
         .{ encoded_server.bytes, @tagName(diagnostic.cause) },
     );
@@ -1567,7 +1565,7 @@ test "workspace template expansion is explicit bounded and deterministic" {
     long_name[0] = 'A';
     @memset(long_name[1..], 'B');
     try environment.put(&long_name, "long-name-value");
-    const long_template = try std.fmt.allocPrint(alloc, "${{{s}}}", .{long_name});
+    const long_template = try alloc.print("${{{s}}}", .{long_name});
     defer alloc.free(long_template);
     var long_budget = WorkspaceExpansionBudget.init();
     var long_expansion = try expandWorkspaceTemplate(

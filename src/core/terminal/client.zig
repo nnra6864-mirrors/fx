@@ -597,7 +597,7 @@ pub const Runtime = struct {
 
         const pid = std.c.getpid();
         var pid_buffer: [32]u8 = undefined;
-        const pid_text = try std.fmt.bufPrint(&pid_buffer, "{d}", .{pid});
+        const pid_text = try std.mem.print(&pid_buffer, "{d}", .{pid});
         const token = try self.process_provider.captureToken(alloc, pid_text);
         var instance_bytes: [16]u8 = undefined;
         zio.random(&instance_bytes);
@@ -801,7 +801,7 @@ var file_descriptor_budget_checked: std.atomic.Value(bool) = .init(false);
 /// terminal start, so the PTY and pipe descriptors of a full session budget
 /// fit under limits as low as 256.
 fn ensureFileDescriptorBudget() void {
-    if (comptime builtin.os.tag != .macos and builtin.os.tag != .linux) return;
+    if (comptime builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return;
     if (file_descriptor_budget_checked.swap(true, .acq_rel)) return;
     var limits = std.posix.getrlimit(.NOFILE) catch |err| {
         debug_trace.logf(
@@ -1092,7 +1092,7 @@ const LiveTerminalFixture = struct {
 
     fn init(fixture: *LiveTerminalFixture) !void {
         const host_capabilities = @import("../hosts/host.zig");
-        if (comptime !host_capabilities.terminalSupportForOs(builtin.os.tag).isSupported()) {
+        if (comptime !host_capabilities.terminalSupportForOs(builtin.target.os.tag).isSupported()) {
             return error.SkipZigTest;
         }
         const alloc = std.testing.allocator;
@@ -1245,9 +1245,9 @@ const LiveTerminalFixture = struct {
     /// The pid recorded for a terminal's shell, read from its durable record.
     fn shellPid(fixture: *LiveTerminalFixture, session_id: []const u8) !std.posix.pid_t {
         const alloc = std.testing.allocator;
-        const name = try std.fmt.allocPrint(alloc, "record-{s}.json", .{session_id});
+        const name = try alloc.print("record-{s}.json", .{session_id});
         defer alloc.free(name);
-        const path = try std.fs.path.join(alloc, &.{
+        const path = try std.Io.Dir.path.join(alloc, &.{
             ".fx", "sessions", owner_session_id, "terminal", "state", name,
         });
         defer alloc.free(path);
@@ -1272,9 +1272,9 @@ const LiveTerminalFixture = struct {
         session_id: []const u8,
     ) !contracts.Lifecycle {
         const alloc = std.testing.allocator;
-        const name = try std.fmt.allocPrint(alloc, "record-{s}.json", .{session_id});
+        const name = try alloc.print("record-{s}.json", .{session_id});
         defer alloc.free(name);
-        const path = try std.fs.path.join(alloc, &.{
+        const path = try std.Io.Dir.path.join(alloc, &.{
             ".fx", "sessions", owner_session_id, "terminal", "state", name,
         });
         defer alloc.free(path);

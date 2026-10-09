@@ -1379,8 +1379,7 @@ test "model cache warmup publishes a snapshot and filtered completion" {
     try fixture.start();
     try std.testing.expect(fixture.waitForAcceptStart(5000));
 
-    const models_url = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const models_url = try std.testing.allocator.print(
         "http://127.0.0.1:{d}/v1/models",
         .{fixture.port()},
     );
@@ -1571,8 +1570,7 @@ test "model cache completion hydrates an open menu and reports once" {
     try fixture.start();
     try std.testing.expect(fixture.waitForAcceptStart(5000));
 
-    const models_url = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const models_url = try std.testing.allocator.print(
         "http://127.0.0.1:{d}/v1/models",
         .{fixture.port()},
     );
@@ -1642,8 +1640,7 @@ test "model cache reset replaces ready public catalog with team catalog" {
         try fixture.start();
         try std.testing.expect(fixture.waitForAcceptStart(5000));
 
-        const models_url = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const models_url = try std.testing.allocator.print(
             "http://127.0.0.1:{d}/v1/models",
             .{fixture.port()},
         );
@@ -1670,8 +1667,7 @@ test "model cache reset replaces ready public catalog with team catalog" {
         try fixture.start();
         try std.testing.expect(fixture.waitForAcceptStart(5000));
 
-        const models_url = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const models_url = try std.testing.allocator.print(
             "http://127.0.0.1:{d}/v1/models",
             .{fixture.port()},
         );

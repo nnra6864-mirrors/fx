@@ -249,8 +249,7 @@ fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: boo
     var scratch: ActionFieldCorrectionScratch = .{};
     if (try actionFieldCorrection(arena, action, object, &scratch)) |correction| {
         for (correction.invalid_fields) |name| {
-            try problems.append(arena, try std.fmt.allocPrint(
-                arena,
+            try problems.append(arena, try arena.print(
                 "request.{s} is not accepted for {s}.",
                 .{ text_utils.utf8PrefixByBytes(name, 64), @tagName(action) },
             ));
@@ -259,11 +258,11 @@ fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: boo
             _ = object.orderedRemove(name);
         }
         for (correction.missing_fields) |name| {
-            try problems.append(arena, try std.fmt.allocPrint(arena, "request.{s} is required.", .{name}));
+            try problems.append(arena, try arena.print("request.{s} is required.", .{name}));
             repairable = false;
         }
         for (correction.conflicts) |conflict| {
-            try problems.append(arena, try std.fmt.allocPrint(arena, "Choose either request.{s} or request.{s}.", .{ conflict[0], conflict[1] }));
+            try problems.append(arena, try arena.print("Choose either request.{s} or request.{s}.", .{ conflict[0], conflict[1] }));
             repairable = false;
         }
     }
@@ -290,7 +289,7 @@ fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: boo
                         value = if (std.math.cast(i64, number)) |integer|
                             .{ .integer = integer }
                         else
-                            .{ .number_string = try std.fmt.allocPrint(arena, "{d}", .{number}) };
+                            .{ .number_string = try arena.print("{d}", .{number}) };
                     } else |_| {
                         repairable = false;
                     }
@@ -494,16 +493,14 @@ fn validateRun(
 ) tool_dispatch.DispatchError!?[]u8 {
     if (argument_problem(input)) |problem| return try ctx.allocator.dupe(u8, problem);
     _ = resolveCwd(arena, ctx, input.cwd) catch |err| {
-        return try std.fmt.allocPrint(
-            ctx.allocator,
+        return try ctx.allocator.print(
             "shell run cwd is invalid: {s}",
             .{@errorName(err)},
         );
     };
     if (!input.tty) {
         _ = commandEnvironment(arena, ctx, input.profile) catch |err| {
-            return try std.fmt.allocPrint(
-                ctx.allocator,
+            return try ctx.allocator.print(
                 "shell run profile is invalid: {s}",
                 .{@errorName(err)},
             );
@@ -546,8 +543,7 @@ fn callRun(
     const request_arena = request_arena_state.allocator();
     const cwd = resolveCwd(request_arena, ctx, input.cwd) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        return .{ .failure = try std.fmt.allocPrint(
-            ctx.allocator,
+        return .{ .failure = try ctx.allocator.print(
             "shell run cwd is invalid: {s}",
             .{@errorName(err)},
         ) };
@@ -557,8 +553,7 @@ fn callRun(
         ctx,
         input.profile,
     ) catch |err| {
-        return .{ .failure = try std.fmt.allocPrint(
-            ctx.allocator,
+        return .{ .failure = try ctx.allocator.print(
             "shell run profile is invalid: {s}",
             .{@errorName(err)},
         ) };
@@ -746,7 +741,7 @@ fn callTtyRun(
     requireTtyShellAuthority(ctx, .{
         .command = command,
         .resolved_cwd = cwd,
-        .target_os = builtin.os.tag,
+        .target_os = builtin.target.os.tag,
         .environment = environment,
         .execution_mode = .tty,
     }) catch |err| return runtimeFailure(ctx, err);
@@ -1779,8 +1774,7 @@ fn runtimeFailure(
     err: anyerror,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     if (err == error.OutOfMemory) return error.OutOfMemory;
-    return .{ .failure = try std.fmt.allocPrint(
-        ctx.allocator,
+    return .{ .failure = try ctx.allocator.print(
         "{{\"error\":{{\"tool\":\"shell\",\"code\":\"{s}\",\"retryable\":false}}}}",
         .{@errorName(err)},
     ) };
@@ -2049,7 +2043,7 @@ test "shell request correction bounds feedback and preserves input bytes" {
     const request = parsed.value.object.get("error").?.object.get("retry_with").?.object.get("request").?.object;
     try std.testing.expectEqualStrings(command, request.get("command").?.string);
 
-    const long_key = try std.fmt.allocPrint(alloc, "{{\"command\":\"true\",\"{s}\":null}}", .{key});
+    const long_key = try alloc.print("{{\"command\":\"true\",\"{s}\":null}}", .{key});
     defer alloc.free(long_key);
     const bounded = try request_correction(alloc, long_key, true);
     defer alloc.free(bounded);
@@ -2121,7 +2115,7 @@ test "TTY execution requires matching shell authority" {
     const command_ctx = command_admission.CommandContext{
         .command = "pwd",
         .resolved_cwd = "/workspace",
-        .target_os = builtin.os.tag,
+        .target_os = builtin.target.os.tag,
         .environment = .{ .clean = "/bin/bash" },
         .execution_mode = .tty,
     };
@@ -2657,7 +2651,7 @@ test "running shell snapshot leaves continuation intent to the caller" {
 }
 
 test "registered shell empty observation waits through one managed execution" {
-    if (comptime @import("builtin").os.tag == .wasi) return;
+    if (comptime @import("builtin").target.os.tag == .wasi) return;
     const alloc = std.testing.allocator;
     var runtime = managed_execution.Runtime.init(alloc);
     defer runtime.deinit();
@@ -2700,7 +2694,7 @@ test "registered shell empty observation waits through one managed execution" {
     const command_ctx = command_admission.CommandContext{
         .command = "sleep 2; printf done",
         .resolved_cwd = "/tmp",
-        .target_os = @import("builtin").os.tag,
+        .target_os = @import("builtin").target.os.tag,
         .environment = environment,
     };
     const authority = command_admission.CommandExecutionAuthority{
@@ -2738,8 +2732,7 @@ test "registered shell empty observation waits through one managed execution" {
     defer started_json.deinit();
     const execution_id = started_json.value.object.get("session_id") orelse
         return error.TestExpectedEqual;
-    const interact_arguments = try std.fmt.allocPrint(
-        alloc,
+    const interact_arguments = try alloc.print(
         "{{\"action\":\"interact\",\"session_id\":\"{s}\",\"yield_time_ms\":1000}}",
         .{execution_id.string},
     );
@@ -2787,14 +2780,14 @@ test "registered shell empty observation waits through one managed execution" {
 }
 
 test "shell delivery advances only after result commit" {
-    if (comptime @import("builtin").os.tag == .wasi) return;
+    if (comptime @import("builtin").target.os.tag == .wasi) return;
     const alloc = std.testing.allocator;
     var runtime = managed_execution.Runtime.init(alloc);
     defer runtime.deinit();
     const command_ctx = command_admission.CommandContext{
         .command = "printf commit-token",
         .resolved_cwd = "/tmp",
-        .target_os = @import("builtin").os.tag,
+        .target_os = @import("builtin").target.os.tag,
         .environment = .legacy,
     };
     var prepared = try runtime.startCaptured(alloc, .{

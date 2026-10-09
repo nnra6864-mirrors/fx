@@ -11,9 +11,9 @@ pub fn provider(transport: *host_stream.Transport) model_catalog.Provider {
 
 fn fetch(raw: ?*anyopaque, alloc: Allocator, input: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
     const transport: *host_stream.Transport = @ptrCast(@alignCast(raw.?));
-    const url = try std.fmt.allocPrint(alloc, "{s}{s}", .{ builtin_gateway.default_model_catalog_base_url, input.endpoint });
+    const url = try alloc.print("{s}{s}", .{ builtin_gateway.default_model_catalog_base_url, input.endpoint });
     defer alloc.free(url);
-    const auth = if (input.access.authorizationCredential()) |credential| try std.fmt.allocPrint(alloc, "Bearer {s}", .{credential}) else null;
+    const auth = if (input.access.authorizationCredential()) |credential| try alloc.print("Bearer {s}", .{credential}) else null;
     defer if (auth) |value| alloc.free(value);
     const Header = struct { name: []const u8, value: []const u8 };
     var headers: std.ArrayList(Header) = .empty;

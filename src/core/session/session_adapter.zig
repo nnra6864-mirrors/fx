@@ -124,7 +124,7 @@ fn traceWiring(comptime action: []const u8, session_id: []const u8, comptime det
 }
 
 fn processId() i64 {
-    if (comptime builtin.os.tag == .wasi) return 0;
+    if (comptime builtin.target.os.tag == .wasi) return 0;
     return std.c.getpid();
 }
 
@@ -147,7 +147,7 @@ pub const Store = struct {
             break :blk try alloc.dupe(u8, home);
         };
         errdefer alloc.free(owned_home);
-        const root = try std.fs.path.join(alloc, &.{
+        const root = try std.Io.Dir.path.join(alloc, &.{
             home,
             profile_paths.root_dir_name,
             profile_paths.sessions_dir_name,
@@ -606,7 +606,7 @@ const BlobHost = struct {
     moved: std.StringHashMapUnmanaged(Hash) = .empty,
     /// The compactor's records by name (D50), loaded on open and kept
     /// since; `mutex` guards them.
-    records: std.StringArrayHashMapUnmanaged(Hash) = .empty,
+    records: std.array_hash_map.String(Hash) = .empty,
     /// Records kept since the last `compaction_records` line, which the
     /// next one lists.
     records_added: std.ArrayList(Hash) = .empty,
@@ -730,7 +730,7 @@ const BlobHost = struct {
         host.mutex.lockUncancelable(io);
         defer host.mutex.unlock(io);
         if (host.records_generation == host.records_written) return null;
-        var map: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+        var map: std.array_hash_map.String([]const u8) = .empty;
         try map.ensureTotalCapacity(a, host.records.count());
         for (host.records.keys(), host.records.values()) |name, *hash| map.putAssumeCapacity(name, try a.dupe(u8, hash));
         var json: std.Io.Writer.Allocating = .init(a);
@@ -806,7 +806,7 @@ const BlobHost = struct {
         }
         const folder = movedFolder(kind) orelse return error.BlobNotFound;
         var key_buffer: [movedKeyMax]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buffer, "{s}/{s}", .{ folder, name }) catch return error.BlobNotFound;
+        const key = std.mem.print(&key_buffer, "{s}/{s}", .{ folder, name }) catch return error.BlobNotFound;
         return host.moved.get(key) orelse error.BlobNotFound;
     }
 
@@ -1049,7 +1049,7 @@ pub const Session = struct {
     }
 
     fn init(alloc: Allocator, store: *Store, handle: sm.Session, fresh: bool) !*Session {
-        const files_path = try std.fs.path.join(alloc, &.{ store.home, profile_paths.root_dir_name, files_dir_name, handle.id() });
+        const files_path = try std.Io.Dir.path.join(alloc, &.{ store.home, profile_paths.root_dir_name, files_dir_name, handle.id() });
         errdefer alloc.free(files_path);
         const host = try BlobHost.create(alloc, store, handle);
         errdefer BlobHost.release(host);
@@ -1094,7 +1094,7 @@ pub const Session = struct {
     /// listed with the records it adds, in chunks as the move's are (D50).
     fn recordLines(self: *Session, a: Allocator, due: BlobHost.RecordsDue) sm.AppendError![]const sm.Event {
         const map_hash = try a.dupe(u8, &(try self.handle.putBlob(due.map_json)));
-        const value = try std.fmt.allocPrint(a, "{{\"map\":\"{s}\"}}", .{map_hash});
+        const value = try a.print("{{\"map\":\"{s}\"}}", .{map_hash});
         var refs: std.ArrayList([]const u8) = .empty;
         try refs.ensureTotalCapacity(a, due.added.len + 1);
         for (due.added) |*hash| refs.appendAssumeCapacity(hash);
@@ -1116,7 +1116,7 @@ pub const Session = struct {
 
     /// The session's folder under `~/.fx/sessions/v2`, for display. Caller owns it.
     pub fn folderPath(self: *const Session, alloc: Allocator) ![]u8 {
-        return std.fs.path.join(alloc, &.{
+        return std.Io.Dir.path.join(alloc, &.{
             self.store.home,
             profile_paths.root_dir_name,
             profile_paths.sessions_dir_name,
@@ -1201,7 +1201,7 @@ pub const Session = struct {
 
     fn capabilityLocked(self: *Session) !*session_child_store.SessionChildCapability {
         if (self.capability) |*capability| return capability;
-        const terminal_path = try std.fs.path.join(self.alloc, &.{ self.store.home, profile_paths.root_dir_name, terminal_dir_name, self.id() });
+        const terminal_path = try std.Io.Dir.path.join(self.alloc, &.{ self.store.home, profile_paths.root_dir_name, terminal_dir_name, self.id() });
         defer self.alloc.free(terminal_path);
         self.capability = try session_child_store.SessionChildCapability.initBlobs(self.alloc, self.host.blobs(), terminal_path, .writable);
         return &self.capability.?;
@@ -1489,7 +1489,7 @@ pub const Session = struct {
         refs[0] = hash_copy;
         return .{
             .type = item_type,
-            .data = try std.fmt.allocPrint(a, "{{\"{s}\":\"{s}\"}}", .{ blob_ref_key, hash_copy }),
+            .data = try a.print("{{\"{s}\":\"{s}\"}}", .{ blob_ref_key, hash_copy }),
             .blobs = refs,
         };
     }
@@ -1729,7 +1729,7 @@ pub const Session = struct {
         var dir = try self.openUsageMarkers();
         defer dir.close();
         var buffer: [48]u8 = undefined;
-        const content = try std.fmt.bufPrint(&buffer, "v1 {d}\n", .{now_ms});
+        const content = try std.mem.print(&buffer, "v1 {d}\n", .{now_ms});
         // A full disk stops the turn here, before the model is asked, so it
         // must read as one (D29) and not as a failed replace.
         var cause: ?anyerror = null;
@@ -1886,14 +1886,14 @@ pub const Session = struct {
         defer scratch.deinit();
         const a = scratch.allocator();
 
-        var moved: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+        var moved: std.array_hash_map.String([]const u8) = .empty;
         for (moved_body_folders) |folder| try self.moveFolder(a, side, folder, &moved);
         var map_json: std.Io.Writer.Allocating = .init(a);
         try std.json.Stringify.value(std.json.ArrayHashMap([]const u8){ .map = moved }, .{}, &map_json.writer);
         const map_hash = try a.dupe(u8, &(try self.handle.putBlob(map_json.written())));
 
         var events: std.ArrayList(sm.Event) = .empty;
-        const value = try std.fmt.allocPrint(a, "{{\"map\":\"{s}\"}}", .{map_hash});
+        const value = try a.print("{{\"map\":\"{s}\"}}", .{map_hash});
         // One line per chunk of blobs keeps each line well under the limit;
         // the last one names the map, so the value is the same on each.
         var refs: std.ArrayList([]const u8) = .empty;
@@ -1928,7 +1928,7 @@ pub const Session = struct {
     /// Puts each regular file of `side/{folder}` as a blob and records it
     /// under `{folder}/{name}`. Anything else there is not fx's and is left
     /// for the side folder's removal, with a trace.
-    fn moveFolder(self: *Session, a: Allocator, side: *io_mod.VerifiedDir, folder: []const u8, moved: *std.StringArrayHashMapUnmanaged([]const u8)) !void {
+    fn moveFolder(self: *Session, a: Allocator, side: *io_mod.VerifiedDir, folder: []const u8, moved: *std.array_hash_map.String([]const u8)) !void {
         const io = io_mod.getIo();
         var dir = side.dir.openDir(io, folder, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
             error.FileNotFound => return,
@@ -1945,7 +1945,7 @@ pub const Session = struct {
             defer file.close(io);
             const stat = try file.stat(io);
             const hash = try self.handle.putBlobFile(file, stat.size);
-            const key = try std.fmt.allocPrint(a, "{s}/{s}", .{ folder, entry.name });
+            const key = try a.print("{s}/{s}", .{ folder, entry.name });
             try moved.put(a, key, try a.dupe(u8, &hash));
         }
     }
@@ -2714,7 +2714,7 @@ pub fn collectMarkedUsage(alloc: Allocator, home: []const u8) !std.ArrayList(Mar
         for (list.items) |*entry| entry.deinit(alloc);
         list.deinit(alloc);
     }
-    const path = try std.fs.path.join(alloc, &.{ home, profile_paths.root_dir_name, usage_markers_dir_name });
+    const path = try std.Io.Dir.path.join(alloc, &.{ home, profile_paths.root_dir_name, usage_markers_dir_name });
     defer alloc.free(path);
     var markers = io_mod.VerifiedDir{ .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), path, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => return list,
@@ -3959,7 +3959,7 @@ test "resume refuses a session whose compaction line is damaged" {
     // One byte of the summary changes, so its line fails its check. Open
     // reads past it: a snapshot follows every compaction.
     const io = io_mod.getIo();
-    const log_path = try std.fs.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
     defer testing.allocator.free(log_path);
     const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
     defer testing.allocator.free(bytes);
@@ -4184,7 +4184,7 @@ test "-c resumes the session this host last opened" {
 }
 
 fn pathExists(t: *TestHome, parts: []const []const u8) bool {
-    const path = std.fs.path.join(testing.allocator, parts) catch return false;
+    const path = std.Io.Dir.path.join(testing.allocator, parts) catch return false;
     defer testing.allocator.free(path);
     t.tmp.dir.access(io_mod.getIo(), path, .{ .follow_symlinks = false }) catch return false;
     return true;
@@ -4367,7 +4367,7 @@ test "recover copies the folders outside the manager, never a link, and says whe
     defer recovered.deinit(testing.allocator);
     try testing.expect(!recovered.files_complete);
     try testing.expectEqual(@as(usize, 1), recovered.history_len);
-    const copy = try std.fs.path.join(testing.allocator, &.{ ".fx", terminal_dir_name, recovered.id });
+    const copy = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", terminal_dir_name, recovered.id });
     defer testing.allocator.free(copy);
     var dir = try t.tmp.dir.openDir(io, copy, .{});
     defer dir.close(io);
@@ -4423,7 +4423,7 @@ const OldSideFolder = struct {
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(&png, &digest, .{});
         var digest_hex = std.fmt.bytesToHex(digest, .lower);
-        const snapshot_path = try std.fs.path.join(testing.allocator, &.{ t.home, ".fx", files_dir_name, s.id(), "images", image_name });
+        const snapshot_path = try std.Io.Dir.path.join(testing.allocator, &.{ t.home, ".fx", files_dir_name, s.id(), "images", image_name });
         defer testing.allocator.free(snapshot_path);
         var images = [_]types.ImageAttachment{.{
             .id = 1,

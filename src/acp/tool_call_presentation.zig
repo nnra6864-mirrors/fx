@@ -48,9 +48,9 @@ pub fn describeToolTitle(registry: tool_dispatch.Registry, arena: Allocator, cal
         });
     }
     if (tool_dispatch.toolCallPresentation(arena, registry, call)) |presentation| {
-        return std.fmt.allocPrint(arena, "{s}", .{presentation.action_label});
+        return arena.print("{s}", .{presentation.action_label});
     }
-    return std.fmt.allocPrint(arena, "{s}", .{call.name});
+    return arena.print("{s}", .{call.name});
 }
 
 pub const ToolCallPresentation = struct {

@@ -999,7 +999,7 @@ fn heading(alloc: Allocator, turn: Prepared, findable: bool) Allocator.Error!led
     const lines = try alloc.alloc([]const u8, turn.tools.len);
     for (lines, turn.tools) |*line, tool| {
         const index = if (tool.call) |call| try indexLine(alloc, call.arguments) else "";
-        line.* = try std.fmt.allocPrint(alloc, "T{d} {s}: {s}", .{ tool.number, tool.name, try shortLine(alloc, index, max_findable_tool_bytes) });
+        line.* = try alloc.print("T{d} {s}: {s}", .{ tool.number, tool.name, try shortLine(alloc, index, max_findable_tool_bytes) });
     }
     result.tools = lines;
     return result;
@@ -1016,7 +1016,7 @@ fn shortLine(alloc: Allocator, text: []const u8, max: usize) Allocator.Error![]c
     try appendFlat(alloc, &line, text);
     const flat = std.mem.trim(u8, line.items, " ");
     if (flat.len <= max) return flat;
-    return std.fmt.allocPrint(alloc, "{s}\u{2026}", .{std.mem.trimEnd(u8, flat[0..text_utils.utf8BackwardBoundary(flat, max)], " ")});
+    return alloc.print("{s}\u{2026}", .{std.mem.trimEnd(u8, flat[0..text_utils.utf8BackwardBoundary(flat, max)], " ")});
 }
 
 /// The saved file for one tool call: an index line, then its arguments and
@@ -1096,7 +1096,7 @@ fn appendFlat(alloc: Allocator, line: *std.ArrayList(u8), text: []const u8) Allo
 }
 
 fn savedOutputNote(alloc: Allocator, handle: []const u8) Allocator.Error![]const u8 {
-    return std.fmt.allocPrint(alloc, "The whole result is saved as {s}; open it with read_tool_result.", .{handle});
+    return alloc.print("The whole result is saved as {s}; open it with read_tool_result.", .{handle});
 }
 
 /// Texts are clipped no shorter than this, or else only their note stays.
@@ -1171,9 +1171,9 @@ fn clipped(alloc: Allocator, text: []const u8, limit: usize, saved_in: []const u
     const head = text_utils.utf8BackwardBoundary(text, limit / 2);
     const tail = text_utils.utf8ForwardBoundary(text, text.len - limit / 2);
     const note = if (saved_in.len == 0)
-        try std.fmt.allocPrint(alloc, "[{d} bytes left out here]", .{tail - head})
+        try alloc.print("[{d} bytes left out here]", .{tail - head})
     else
-        try std.fmt.allocPrint(alloc, "[{d} bytes left out here; the whole text is saved in {s}]", .{ tail - head, saved_in });
+        try alloc.print("[{d} bytes left out here; the whole text is saved in {s}]", .{ tail - head, saved_in });
     if (note.len + 2 >= tail - head) return text;
     return std.mem.concat(alloc, u8, &.{ text[0..head], "\n", note, "\n", text[tail..] });
 }
@@ -1222,7 +1222,7 @@ fn longestExact(turns: []const checkpoint.Turn) usize {
 fn clippedTurns(alloc: Allocator, compacted: Compacted, clip: usize) Allocator.Error![]const checkpoint.Turn {
     const turns = try alloc.alloc(checkpoint.Turn, compacted.turns.len);
     for (turns, compacted.turns) |*slot, turn| {
-        const saved_in = if (compacted.saved and turn.number > 0) try std.fmt.allocPrint(alloc, "M{d}", .{turn.number}) else "";
+        const saved_in = if (compacted.saved and turn.number > 0) try alloc.print("M{d}", .{turn.number}) else "";
         const users = try alloc.alloc([]const u8, turn.users.len);
         for (users, turn.users) |*user, text| user.* = try clipped(alloc, text, clip, saved_in);
         slot.* = turn;
@@ -1252,7 +1252,7 @@ fn renderTranscript(alloc: Allocator, plan: Plan, clip: usize, earlier_clip: usi
         if (earlier.earlier.len > 0) try text.print(alloc, "[Earlier summary]\n{s}\n\n", .{try clipped(alloc, earlier.earlier, earlier_clip, "")});
     }
     for (plan.turns) |turn| {
-        const turn_id = if (plan.saved and turn.number > 0) try std.fmt.allocPrint(alloc, "M{d}", .{turn.number}) else "";
+        const turn_id = if (plan.saved and turn.number > 0) try alloc.print("M{d}", .{turn.number}) else "";
         const first_user = try clipped(alloc, turn.source.user, clip, turn_id);
         if (turn.number > 0) {
             try text.print(alloc, "[Turn {d}]\n[User]\n{s}\n\n", .{ turn.number, first_user });
@@ -1265,7 +1265,7 @@ fn renderTranscript(alloc: Allocator, plan: Plan, clip: usize, earlier_clip: usi
             if (part.first_tool > 0) try text.print(alloc, "[Its tools so far: T{d} to T{d}]\n\n", .{ part.first_tool, part.last_tool });
         }
         for (turn.source.items, turn.tool_numbers) |item, number| {
-            const tool_id = if (plan.saved and number > 0) try std.fmt.allocPrint(alloc, "T{d}", .{number}) else "";
+            const tool_id = if (plan.saved and number > 0) try alloc.print("T{d}", .{number}) else "";
             switch (item) {
                 .user => |added| try text.print(alloc, "[User, added while the assistant worked]\n{s}\n\n", .{try clipped(alloc, added, clip, turn_id)}),
                 .assistant => |assistant| if (assistant.len > 0) try text.print(alloc, "[Assistant]\n{s}\n\n", .{try clipped(alloc, assistant, clip, turn_id)}),
@@ -2494,7 +2494,7 @@ test "a request fits even when a turn has many texts too short to clip" {
     const output = text_utils.repeat("one short line of build output ", 48);
     var items: std.ArrayList(Item) = .empty;
     for (0..300) |index| {
-        const id = try std.fmt.allocPrint(arena, "call-{d}", .{index});
+        const id = try arena.print("call-{d}", .{index});
         try items.append(arena, .{ .tool_call = .{ .id = id, .name = "shell", .arguments = "{\"command\":\"make\"}" } });
         try items.append(arena, .{ .tool_result = .{ .call_id = id, .name = "shell", .output = output } });
     }

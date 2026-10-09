@@ -842,7 +842,7 @@ pub const Grid = struct {
             try self.appendReply("\x1bP1$r0m\x1b\\");
         } else if (std.mem.eql(u8, query, "r")) {
             var buffer: [64]u8 = undefined;
-            const reply = try std.fmt.bufPrint(
+            const reply = try std.mem.print(
                 &buffer,
                 "\x1bP1$r{d};{d}r\x1b\\",
                 .{ self.scroll_top, self.scroll_bottom },
@@ -1555,9 +1555,9 @@ pub const Grid = struct {
             self.cursor_row;
         var buffer: [64]u8 = undefined;
         const reply = if (self.csi_private == '?')
-            try std.fmt.bufPrint(&buffer, "\x1b[?{d};{d}R", .{ row, self.cursor_col })
+            try std.mem.print(&buffer, "\x1b[?{d};{d}R", .{ row, self.cursor_col })
         else
-            try std.fmt.bufPrint(&buffer, "\x1b[{d};{d}R", .{ row, self.cursor_col });
+            try std.mem.print(&buffer, "\x1b[{d};{d}R", .{ row, self.cursor_col });
         try self.appendReply(reply);
     }
 
@@ -1574,12 +1574,12 @@ pub const Grid = struct {
         const reply = switch (self.paramRaw(0, 0)) {
             14 => "\x1b[4;0;0t",
             16 => "\x1b[6;0;0t",
-            18 => try std.fmt.bufPrint(
+            18 => try std.mem.print(
                 &buffer,
                 "\x1b[8;{d};{d}t",
                 .{ self.rows, self.cols },
             ),
-            19 => try std.fmt.bufPrint(
+            19 => try std.mem.print(
                 &buffer,
                 "\x1b[9;{d};{d}t",
                 .{ self.rows, self.cols },
@@ -3806,7 +3806,7 @@ test "writes clear any complete wide glyph overlapping the destination" {
         defer g.deinit();
         try g.feed(case.initial);
         var cursor: [16]u8 = undefined;
-        const move = try std.fmt.bufPrint(&cursor, "\x1b[1;{d}H", .{case.col});
+        const move = try std.mem.print(&cursor, "\x1b[1;{d}H", .{case.col});
         try g.feed(move);
         try g.feed(case.replacement);
         try expectWideCellInvariant(g);
@@ -4105,7 +4105,7 @@ test "scrolled repeated link IDs do not exhaust the hyperlink pool" {
     @memset(uri[prefix.len..], 'x');
     var line_buf: [2200]u8 = undefined;
     for (0..2300) |idx| {
-        const line = try std.fmt.bufPrint(&line_buf, "\x1b]8;id=fx-{d};{s}\x1b\\x\x1b]8;;\x1b\\\r\n", .{ idx, uri[0..] });
+        const line = try std.mem.print(&line_buf, "\x1b]8;id=fx-{d};{s}\x1b\\x\x1b]8;;\x1b\\\r\n", .{ idx, uri[0..] });
         try grid.feed(line);
     }
     try testing.expect(grid.hyperlink_pool.items.len <= 256);
@@ -4119,7 +4119,7 @@ test "hyperlink compaction cadence does not rescan each near-full frame" {
     const uri = "https://example.com/x";
     var line_buf: [128]u8 = undefined;
     for (0..255) |idx| {
-        const line = try std.fmt.bufPrint(&line_buf, "\x1b]8;id=fx-{d};{s}\x1b\\x\x1b]8;;\x1b\\", .{ idx, uri });
+        const line = try std.mem.print(&line_buf, "\x1b]8;id=fx-{d};{s}\x1b\\x\x1b]8;;\x1b\\", .{ idx, uri });
         try grid.feed(line);
     }
     try grid.feed("\x1b]8;id=fx-dead;https://example.com/x\x1b\\\x1b]8;;\x1b\\");
@@ -4142,7 +4142,7 @@ test "hyperlink compaction allocation failure keeps cell links intact" {
     defer grid.deinit();
     var line_buf: [128]u8 = undefined;
     for (0..256) |idx| {
-        const line = try std.fmt.bufPrint(&line_buf, "\x1b]8;id=fx-{d};https://example.com/x\x1b\\x\x1b]8;;\x1b\\", .{idx});
+        const line = try std.mem.print(&line_buf, "\x1b]8;id=fx-{d};https://example.com/x\x1b\\x\x1b]8;;\x1b\\", .{idx});
         try grid.feed(line);
     }
     try grid.osc_buffer.ensureTotalCapacity(alloc, 128);
@@ -4168,7 +4168,7 @@ test "hyperlink compaction retains saved screen and cursor identities" {
 
     var line_buf: [128]u8 = undefined;
     for (0..300) |idx| {
-        const line = try std.fmt.bufPrint(&line_buf, "\x1b]8;id=fx-temp-{d};https://example.com/tmp\x1b\\x\x1b]8;;\x1b\\\r\n", .{idx});
+        const line = try std.mem.print(&line_buf, "\x1b]8;id=fx-temp-{d};https://example.com/tmp\x1b\\x\x1b]8;;\x1b\\\r\n", .{idx});
         try grid.feed(line);
     }
     try testing.expect(grid.hyperlink_pool.items.len <= 256);
@@ -4482,7 +4482,7 @@ test "diffBand reopens an OSC 8 hyperlink for each emitted row" {
     const marker = "\x1b]8;;https://example.com\x1b\\";
     var opens: usize = 0;
     var start: usize = 0;
-    while (std.mem.indexOf(u8, buf.items[start..], marker)) |offset| {
+    while (std.mem.find(u8, buf.items[start..], marker)) |offset| {
         opens += 1;
         start += offset + marker.len;
     }

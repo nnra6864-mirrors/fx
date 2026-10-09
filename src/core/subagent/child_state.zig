@@ -557,7 +557,7 @@ pub const V2Children = struct {
     registry: ?Registry = null,
     /// Settings for children with no log yet, from their admission; taken
     /// when their work first opens them (D34). Keys and models owned.
-    seeds: std.StringArrayHashMapUnmanaged(ChildSeed) = .empty,
+    seeds: std.array_hash_map.String(ChildSeed) = .empty,
 
     pub const ChildSeed = struct {
         preferences: session_codec.DurableSessionPreferences,

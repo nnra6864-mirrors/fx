@@ -819,7 +819,7 @@ fn durableIdentifier(alloc: Allocator, value: []const u8) ![]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
     const hex = std.fmt.bytesToHex(digest[0..12].*, .lower);
-    return std.fmt.allocPrint(alloc, "redacted-{s}", .{&hex});
+    return alloc.print("redacted-{s}", .{&hex});
 }
 
 test "execution memory persists secret-bearing arguments results and provider output verbatim" {

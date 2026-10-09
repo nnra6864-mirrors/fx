@@ -151,7 +151,7 @@ pub const Entry = struct {
 /// Owns everything through its arena.
 pub const Index = struct {
     arena: std.heap.ArenaAllocator,
-    entries: std.StringArrayHashMapUnmanaged(Entry) = .empty,
+    entries: std.array_hash_map.String(Entry) = .empty,
     /// Lines that failed their checksum or did not parse.
     damaged_lines: u64 = 0,
 
@@ -824,7 +824,7 @@ const catalog_model_tests = struct {
             const id = t.ids[i] orelse return "none";
             var path: [300]u8 = undefined;
             if (exists(t.root, id)) return "live";
-            if (exists(t.root, std.fmt.bufPrint(&path, ".trash/{s}", .{id}) catch return "none")) return "trash";
+            if (exists(t.root, std.mem.print(&path, ".trash/{s}", .{id}) catch return "none")) return "trash";
             return if (t.published[i]) "gone" else "none";
         }
 
@@ -895,7 +895,7 @@ const catalog_model_tests = struct {
         defer tmp.cleanup();
         const base = try tmp.dir.realPathFileAlloc(io, ".", gpa);
         defer gpa.free(base);
-        const root_path = try std.fs.path.join(gpa, &.{ base, "sessions", "v2" });
+        const root_path = try std.Io.Dir.path.join(gpa, &.{ base, "sessions", "v2" });
         defer gpa.free(root_path);
         var fault = Fault.init(gpa, io, 1);
         defer fault.deinit();

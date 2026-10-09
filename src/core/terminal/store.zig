@@ -232,7 +232,7 @@ pub const Record = struct {
             return error.InvalidTerminalRecord;
         if (self.host_identity.len == 0 or self.backend_identity.len == 0 or
             self.shell.len == 0 or self.cwd.len == 0 or
-            !std.fs.path.isAbsolute(self.cwd))
+            !std.Io.Dir.path.isAbsolute(self.cwd))
         {
             return error.InvalidTerminalRecord;
         }
@@ -524,7 +524,7 @@ pub const ProfileStore = struct {
         var joined: usize = 0;
         errdefer for (display_outside_paths[0..joined]) |path| alloc.free(path);
         for (outside_roots, &display_outside_paths) |root_name, *path| {
-            path.* = try std.fs.path.join(alloc, &.{ home, profile_paths.root_dir_name, root_name });
+            path.* = try std.Io.Dir.path.join(alloc, &.{ home, profile_paths.root_dir_name, root_name });
             joined += 1;
         }
         return .{
@@ -1341,7 +1341,7 @@ pub fn formatOwnerIdentity(
     token: process_identity.ProcessInstanceToken,
 ) error{ NoSpaceLeft, InvalidOwnerIdentity }![]const u8 {
     if (instance_hex.len != owner_instance_hex_len) return error.InvalidOwnerIdentity;
-    return std.fmt.bufPrint(buffer, "{s}{s}/{d}/{s}", .{
+    return std.mem.print(buffer, "{s}{s}/{d}/{s}", .{
         owner_identity_prefix,
         instance_hex,
         pid,
@@ -1425,7 +1425,7 @@ fn takeover_owner_matches(
     const pid = record.takeover_owner_pid orelse return false;
     const process_token = record.takeover_owner_process_token orelse return false;
     var pid_buffer: [32]u8 = undefined;
-    const owner_pid = std.fmt.bufPrint(&pid_buffer, "{d}", .{owner.pid}) catch
+    const owner_pid = std.mem.print(&pid_buffer, "{d}", .{owner.pid}) catch
         return false;
     return std.mem.eql(u8, pid, owner_pid) and
         std.mem.eql(u8, process_token, owner.token());
@@ -1623,7 +1623,7 @@ fn terminal_id_from_artifact_name(name: []const u8) ?[]const u8 {
             continue;
         }
         const body = name[shape.prefix.len .. name.len - shape.suffix.len];
-        const separator = std.mem.lastIndexOfScalar(u8, body, '-') orelse continue;
+        const separator = std.mem.findScalarLast(u8, body, '-') orelse continue;
         if (separator == 0 or separator + 1 == body.len) continue;
         _ = std.fmt.parseInt(u64, body[separator + 1 ..], 10) catch continue;
         const id = body[0..separator];
@@ -1883,7 +1883,7 @@ fn make_name(
     session_id: []const u8,
     suffix: []const u8,
 ) Allocator.Error![]u8 {
-    return std.fmt.allocPrint(alloc, "{s}-{s}{s}", .{
+    return alloc.print("{s}-{s}{s}", .{
         prefix,
         session_id,
         suffix,
@@ -1907,8 +1907,7 @@ fn checkpoint_name(
     session_id: []const u8,
     generation: u64,
 ) Allocator.Error![]u8 {
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "checkpoint-{s}-{d}.bin",
         .{ session_id, generation },
     );
@@ -1926,8 +1925,7 @@ fn journal_name(
     session_id: []const u8,
     segment: u64,
 ) Allocator.Error![]u8 {
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "journal-{s}-{d}.bin",
         .{ session_id, segment },
     );
@@ -1959,8 +1957,7 @@ fn event_name(
     session_id: []const u8,
     event_id: u64,
 ) Allocator.Error![]u8 {
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "event-{s}-{d}.json",
         .{ session_id, event_id },
     );
@@ -2126,7 +2123,7 @@ fn verify_owner_catalog_claim(
     defer capability.deinit();
     const key = owner_catalog_key(claim.principal, claim.actor);
     var name_buffer: [96]u8 = undefined;
-    const name = try std.fmt.bufPrint(
+    const name = try std.mem.print(
         &name_buffer,
         "catalog-authority-{s}.json",
         .{&key},
@@ -2290,19 +2287,19 @@ pub fn loadOrCreateOwnerCatalogClaim(
     try principal.validate();
     const key = owner_catalog_key(principal, input.actor);
     var authority_name_buffer: [96]u8 = undefined;
-    const catalog_authority_name = try std.fmt.bufPrint(
+    const catalog_authority_name = try std.mem.print(
         &authority_name_buffer,
         "catalog-authority-{s}.json",
         .{&key},
     );
     var proof_name_buffer: [96]u8 = undefined;
-    const catalog_proof_name = try std.fmt.bufPrint(
+    const catalog_proof_name = try std.mem.print(
         &proof_name_buffer,
         "catalog-proof-{s}",
         .{&key},
     );
     var lock_name_buffer: [96]u8 = undefined;
-    const lock_name = try std.fmt.bufPrint(
+    const lock_name = try std.mem.print(
         &lock_name_buffer,
         "catalog-{s}.lock",
         .{&key},
@@ -4607,7 +4604,7 @@ pub const DurableSession = struct {
         now_ms: i64,
     ) !void {
         var pid_buffer: [32]u8 = undefined;
-        const pid = try std.fmt.bufPrint(&pid_buffer, "{d}", .{owner.pid});
+        const pid = try std.mem.print(&pid_buffer, "{d}", .{owner.pid});
         return self.persist_attention_state_locked(
             attention,
             pid,
@@ -5652,7 +5649,7 @@ fn validate_recovery_principal(
         !std.mem.eql(u8, record.cwd, principal.cwd) or
         record.backend != principal.backend or
         principal.lifetime != .session or
-        !std.fs.path.isAbsolute(principal.workspace_root))
+        !std.Io.Dir.path.isAbsolute(principal.workspace_root))
     {
         return error.InvalidAuthorityRecord;
     }
@@ -6303,7 +6300,7 @@ fn test_process_owner(
 ) !contracts.ProcessOwner {
     var pid_buffer: [32]u8 = undefined;
     const pid = std.c.getpid();
-    const pid_text = try std.fmt.bufPrint(&pid_buffer, "{d}", .{pid});
+    const pid_text = try std.mem.print(&pid_buffer, "{d}", .{pid});
     const token = try process_provider.captureToken(
         alloc,
         pid_text,
@@ -7726,7 +7723,7 @@ test "terminal records require takeover attention lease and owner as one state" 
         fixture.profile.process_provider,
     );
     var pid_buffer: [32]u8 = undefined;
-    const pid = try std.fmt.bufPrint(&pid_buffer, "{d}", .{process_owner.pid});
+    const pid = try std.mem.print(&pid_buffer, "{d}", .{process_owner.pid});
     malformed = session.record;
     malformed.takeover_owner_pid = @constCast(pid);
     malformed.takeover_owner_process_token = @constCast(process_owner.token());
@@ -8058,8 +8055,7 @@ test "close intent converges every durable boundary without reviving authority" 
     for (points, 0..) |point, index| {
         var fixture = try TestStoreFixture.init(alloc, test_options());
         defer fixture.deinit();
-        const session_id = try std.fmt.allocPrint(
-            alloc,
+        const session_id = try alloc.print(
             "terminal-close-boundary-{d}",
             .{index},
         );
@@ -8275,7 +8271,7 @@ test "recovery leaves partial start artifacts to the process writing them" {
         .after_authority_write,
     };
     for (points, 0..) |point, index| {
-        const id = try std.fmt.allocPrint(alloc, "terminal-partial-{d}", .{index});
+        const id = try alloc.print("terminal-partial-{d}", .{index});
         defer alloc.free(id);
         fixture.profile.options.fail_at = point;
         try std.testing.expectError(error.InjectedCrash, fixture.create(id));

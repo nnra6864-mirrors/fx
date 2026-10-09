@@ -479,7 +479,7 @@ test "child feedback deduplicates operations and bounds queued receipts" {
     try std.testing.expect((try owner.steer("child", "work", "first", @as([32]u8, @splat(2)), "different")) == .conflict);
     try std.testing.expectEqual(@as(usize, 1), worker.queuedPromptCount());
     for (1..64) |index| {
-        const id = try std.fmt.allocPrint(alloc, "feedback-{d}", .{index});
+        const id = try alloc.print("feedback-{d}", .{index});
         defer alloc.free(id);
         try std.testing.expectEqual(types.SteeringDelivery.queued, (try owner.steer("child", "work", id, fingerprint, "same text")).receipt);
     }

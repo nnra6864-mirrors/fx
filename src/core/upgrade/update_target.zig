@@ -84,7 +84,7 @@ pub const Target = union(Channel) {
         errdefer alloc.free(owned_version);
         const owned_revision = try alloc.dupe(u8, manifest_revision);
         errdefer alloc.free(owned_revision);
-        const artifact_ref = try std.fmt.allocPrint(alloc, "dev/{s}", .{manifest_revision});
+        const artifact_ref = try alloc.print("dev/{s}", .{manifest_revision});
         return .{ .dev = .{
             .version = owned_version,
             .revision = owned_revision,
@@ -142,8 +142,8 @@ pub const Target = union(Channel) {
 
     pub fn writeDisplayLabel(self: Target, out: []u8) ![]const u8 {
         return switch (self) {
-            .stable => |stable| std.fmt.bufPrint(out, "{s}", .{stable.version}),
-            .dev => |dev| std.fmt.bufPrint(out, "dev {s}", .{shortRevision(dev.revision)}),
+            .stable => |stable| std.mem.print(out, "{s}", .{stable.version}),
+            .dev => |dev| std.mem.print(out, "dev {s}", .{shortRevision(dev.revision)}),
         };
     }
 };

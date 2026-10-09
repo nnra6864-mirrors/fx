@@ -617,14 +617,12 @@ fn legacyToolSummary(
     const body = content orelse "";
     const bounded = text_utils.utf8PrefixByBytes(body, 4096);
     return if (bounded.len == 0)
-        std.fmt.allocPrint(
-            alloc,
+        alloc.print(
             "[Prior terminal {s} action completed.]",
             .{action},
         )
     else
-        std.fmt.allocPrint(
-            alloc,
+        alloc.print(
             "[Prior terminal {s} action completed. Stored result follows.]\n{s}",
             .{ action, bounded },
         );
@@ -958,10 +956,9 @@ fn subagent_history_summary(
 ) Allocator.Error![]u8 {
     const bounded = text_utils.utf8PrefixByBytes(content orelse "", 4096);
     return if (bounded.len == 0)
-        std.fmt.allocPrint(alloc, "[Prior subagent {s} action completed.]", .{action})
+        alloc.print("[Prior subagent {s} action completed.]", .{action})
     else
-        std.fmt.allocPrint(
-            alloc,
+        alloc.print(
             "[Prior subagent {s} action completed. Stored result follows.]\n{s}",
             .{ action, bounded },
         );
@@ -2567,7 +2564,7 @@ fn prepareSkillCall(deps: *const AgentRuntimeDeps, arena: Allocator, call: ToolC
     const prepare = deps.prepare_skill_call orelse return null;
     return prepare(deps.ctx, arena, call, locations) catch |err| switch (err) {
         error.OutOfMemory, error.Cancelled => return err,
-        else => .{ .failure = .{ .model_output = try std.fmt.allocPrint(arena, "skill failed: {s}", .{@errorName(err)}) } },
+        else => .{ .failure = .{ .model_output = try arena.print("skill failed: {s}", .{@errorName(err)}) } },
     };
 }
 
@@ -2704,8 +2701,7 @@ fn preparedTerminalModelOutput(
 ) Allocator.Error![]const u8 {
     if (terminal.model_output) |model_output| return model_output;
     return switch (terminal.kind) {
-        .unsupported => try std.fmt.allocPrint(
-            alloc,
+        .unsupported => try alloc.print(
             "Unsupported tool: {s}",
             .{call.name},
         ),
@@ -4103,7 +4099,7 @@ test "recovery checkpoints do not accumulate temporary history copies in the tur
     const alloc = turn.allocator();
     var messages: std.ArrayList(ChatMessage) = .empty;
     for (0..1000) |step_index| {
-        const id = try std.fmt.allocPrint(alloc, "read_{d}", .{step_index});
+        const id = try alloc.print("read_{d}", .{step_index});
         const calls = try alloc.alloc(ToolCall, 1);
         calls[0] = .{ .id = id, .name = "read_file", .arguments_json = "{\"path\":\"evidence.txt\"}" };
         try messages.appendSlice(alloc, &.{
@@ -5224,7 +5220,7 @@ fn prepareExternalFailureDiagnostic(
 ) !types.ModelFailureDiagnostic {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     const owned_source = if (trimmed.len > 0 and !hasDiagnosticIdentifier(trimmed))
-        try std.fmt.allocPrint(alloc, "{s}: {s}", .{ fallback, trimmed })
+        try alloc.print("{s}: {s}", .{ fallback, trimmed })
     else
         null;
     defer if (owned_source) |source| alloc.free(source);
@@ -5243,9 +5239,9 @@ fn prepareExternalFailureDiagnostic(
 }
 
 fn hasDiagnosticIdentifier(text: []const u8) bool {
-    if (std.mem.indexOf(u8, text, ": ")) |separator| {
+    if (std.mem.find(u8, text, ": ")) |separator| {
         if (separator == 0) return false;
-        return std.mem.indexOfAny(u8, text[0..separator], " \t\r\n") == null;
+        return std.mem.findAny(u8, text[0..separator], " \t\r\n") == null;
     }
     for (text) |byte| {
         if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-' and byte != '.') return false;

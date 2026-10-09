@@ -19,7 +19,7 @@ fn openUrlForHost(_: ?*anyopaque, alloc: Allocator, url: []const u8) host.UrlOpe
 }
 
 fn openUrl(alloc: Allocator, url: []const u8) Allocator.Error!bool {
-    return launchUrl(alloc, url, builtin.os.tag, .{}) == .opened;
+    return launchUrl(alloc, url, builtin.target.os.tag, .{}) == .opened;
 }
 
 const LaunchResult = struct {

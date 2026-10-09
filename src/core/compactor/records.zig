@@ -628,7 +628,7 @@ const testing = std.testing;
 /// Files kept in memory, standing in for a session's folder in tests.
 pub const MemoryStore = struct {
     alloc: Allocator,
-    files: std.StringArrayHashMapUnmanaged([]u8) = .empty,
+    files: std.array_hash_map.String([]u8) = .empty,
     /// Every write fails, like a store that cannot be written.
     fail: bool = false,
 
@@ -833,7 +833,7 @@ test "earlier conversation archives are searched one message at a time" {
     // another.
     const start = std.mem.find(u8, archive_text, "### Original assistant\nNothing").?;
     const end = std.mem.find(u8, archive_text, "### Tool result").?;
-    const expected = try std.fmt.allocPrint(alloc, "[1] Earlier conversation archive result-source-aaaa-bbbb.txt, bytes {d}–{d}\n### Original assistant\nNothing special happens at 2 GB.", .{ start + 1, end });
+    const expected = try alloc.print("[1] Earlier conversation archive result-source-aaaa-bbbb.txt, bytes {d}–{d}\n### Original assistant\nNothing special happens at 2 GB.", .{ start + 1, end });
     defer alloc.free(expected);
     try testing.expect(std.mem.find(u8, found, expected) != null);
     try testing.expect(std.mem.find(u8, found, "argument_excerpt=df -h") != null);

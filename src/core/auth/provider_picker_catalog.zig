@@ -149,7 +149,7 @@ test "provider options expose the catalog slugs the composer accepts" {
     try std.testing.expectEqualStrings("vercel", buf[0]);
     for (buf[0..count]) |slug| {
         try std.testing.expect(provider_catalog.parse(slug) != null);
-        try std.testing.expect(std.mem.indexOfScalar(u8, slug, ' ') == null);
+        try std.testing.expect(std.mem.findScalar(u8, slug, ' ') == null);
     }
 }
 
@@ -163,7 +163,7 @@ test "method slugs round trip and stay single tokens" {
     for ([_]Method{ .oauth, .api_key }) |method| {
         const slug = methodSlug(method);
         try std.testing.expectEqual(method, parseMethod(slug).?);
-        try std.testing.expect(std.mem.indexOfScalar(u8, slug, ' ') == null);
+        try std.testing.expect(std.mem.findScalar(u8, slug, ' ') == null);
     }
     try std.testing.expect(parseMethod("nope") == null);
 }

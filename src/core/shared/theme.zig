@@ -779,7 +779,7 @@ pub fn siblingName(alloc: std.mem.Allocator, name: []const u8, want_light: bool)
             (if (want_light) "Light" else "Dark")
         else
             (if (want_light) "light" else "dark");
-        return try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ base, suffix[0..1], replacement });
+        return try alloc.print("{s}{s}{s}", .{ base, suffix[0..1], replacement });
     }
     return null;
 }
@@ -823,12 +823,12 @@ pub fn loadNamed(alloc: std.mem.Allocator, name: []const u8, options: ParseOptio
     if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return error.InvalidName;
 
     const home = io_mod.getenv("HOME") orelse return error.ThemeNotFound;
-    const dir_path = try std.fmt.allocPrint(alloc, "{s}/.fx/themes", .{home});
+    const dir_path = try alloc.print("{s}/.fx/themes", .{home});
     defer alloc.free(dir_path);
     var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), dir_path, .{}) catch return error.ThemeNotFound;
     defer dir.close(io_mod.getIo());
 
-    const file_name = try std.fmt.allocPrint(alloc, "{s}.json", .{name});
+    const file_name = try alloc.print("{s}.json", .{name});
     defer alloc.free(file_name);
     var file = io_mod.openExistingRegularFile(dir, file_name, .read_only) catch return error.ThemeNotFound;
     defer file.close(io_mod.getIo());
@@ -1011,7 +1011,7 @@ test "parse quantizes native themes for 256-color terminals" {
     try std.testing.expectEqualStrings("\x1b[38;5;196m", theme.divider_style);
     try std.testing.expectEqualStrings("\x1b[38;2;48;164;108m", theme.diff_added_marker_truecolor);
     const fallback_n = rgbToAnsi256(0x30, 0xa4, 0x6c);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(alloc, "\x1b[38;5;{d}m", .{fallback_n}), theme.diff_added_marker_fallback);
+    try std.testing.expectEqualStrings(try alloc.print("\x1b[38;5;{d}m", .{fallback_n}), theme.diff_added_marker_fallback);
 }
 
 test "parse resolves a VS Code theme through the adapter" {
@@ -1048,7 +1048,7 @@ test "parse resolves a VS Code theme through the adapter" {
     try std.testing.expectEqualStrings("\x1b[38;2;240;240;240m", theme.hint_style);
     // Alpha colors blend over editor.background before resolution.
     const status_expected = blendOver(.{ .r = 0xf0, .g = 0xf0, .b = 0xf0 }, 0x99, .{ .r = 0x18, .g = 0x18, .b = 0x18 });
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(alloc, "\x1b[38;2;{d};{d};{d}m", .{ status_expected.r, status_expected.g, status_expected.b }), theme.statusline_style);
+    try std.testing.expectEqualStrings(try alloc.print("\x1b[38;2;{d};{d};{d}m", .{ status_expected.r, status_expected.g, status_expected.b }), theme.statusline_style);
     try std.testing.expectEqualStrings("\x1b[38;2;241;180;103m", theme.warning_style);
     try std.testing.expectEqualStrings("\x1b[38;2;63;162;102m", theme.green_style);
     try std.testing.expectEqualStrings("\x1b[38;2;252;107;131m", theme.red_style);

@@ -33,7 +33,7 @@ pub fn spawn_inheriting_fd(
     options: std.process.SpawnOptions,
     inherited_fd: std.posix.fd_t,
 ) std.process.SpawnError!std.process.Child {
-    if (comptime builtin.os.tag != .macos) return error.OperationUnsupported;
+    if (comptime builtin.target.os.tag != .macos) return error.OperationUnsupported;
     return process_spawn_inheriting_fd(io.userdata, options, inherited_fd);
 }
 
@@ -42,7 +42,7 @@ fn process_spawn_inheriting_fd(
     options: std.process.SpawnOptions,
     inherited_fd: ?std.posix.fd_t,
 ) std.process.SpawnError!std.process.Child {
-    if (comptime builtin.os.tag != .macos) return error.OperationUnsupported;
+    if (comptime builtin.target.os.tag != .macos) return error.OperationUnsupported;
     if (options.uid != null or options.gid != null) return error.OperationUnsupported;
     if (options.exe != .detect) return error.OperationUnsupported;
     if (options.inherit_dirs.len != 0 or options.inherit_files.len != 0) return error.OperationUnsupported;
@@ -332,7 +332,7 @@ fn close_fd(fd: std.posix.fd_t) void {
 }
 
 fn darwin_io() !std.Io {
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos) return error.SkipZigTest;
     return wrap(std.testing.io);
 }
 
@@ -372,7 +372,7 @@ extern "c" fn proc_listchildpids(
 ) c_int;
 
 fn child_pid_snapshot() !ChildPidSnapshot {
-    if (comptime builtin.os.tag != .macos) return error.OperationUnsupported;
+    if (comptime builtin.target.os.tag != .macos) return error.OperationUnsupported;
     var snapshot: ChildPidSnapshot = .{ .len = 0 };
     const result = proc_listchildpids(
         std.c.getpid(),
@@ -428,7 +428,7 @@ fn reap_child(io: std.Io, pid: std.posix.pid_t) void {
     }
 }
 
-const max_tracked_fd = if (builtin.os.tag == .macos) std.c.OPEN_MAX else 256;
+const max_tracked_fd = if (builtin.target.os.tag == .macos) std.c.OPEN_MAX else 256;
 
 fn open_fd_snapshot() [max_tracked_fd]bool {
     var result: [max_tracked_fd]bool = @splat(false);
@@ -484,9 +484,9 @@ test "Darwin explicit inherited descriptor avoids low user descriptors" {
     try std.testing.expect(pipe[1] != target_fd);
     try std.testing.expect(target_fd >= preferred_inherited_fd_target);
     var source_buffer: [32]u8 = undefined;
-    const source = try std.fmt.bufPrint(&source_buffer, "{d}", .{pipe[1]});
+    const source = try std.mem.print(&source_buffer, "{d}", .{pipe[1]});
     var target_buffer: [32]u8 = undefined;
-    const target = try std.fmt.bufPrint(
+    const target = try std.mem.print(
         &target_buffer,
         "{d}",
         .{target_fd},
@@ -526,7 +526,7 @@ test "Darwin inherited descriptor survives Bash script execution" {
         );
     }
     var fd_buffer: [32]u8 = undefined;
-    const fd_text = try std.fmt.bufPrint(
+    const fd_text = try std.mem.print(
         &fd_buffer,
         "{d}",
         .{target_fd},
@@ -546,7 +546,7 @@ test "Darwin spawn accepts path and directory working directories" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path_len = try tmp.dir.realPath(io, &path_buffer);
     const expected = path_buffer[0..path_len];
 

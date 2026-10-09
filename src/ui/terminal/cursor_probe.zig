@@ -688,7 +688,7 @@ test "tagged ANSI cursor probe forwards every legacy F3 modifier parameter" {
         try probe.begin(.ansi_tagged, 100);
 
         var sequence_buf: [16]u8 = undefined;
-        const sequence = try std.fmt.bufPrint(&sequence_buf, "\x1b[1;{d}R", .{modifier});
+        const sequence = try std.mem.print(&sequence_buf, "\x1b[1;{d}R", .{modifier});
         var forwarded: std.ArrayList(u8) = .empty;
         defer forwarded.deinit(std.testing.allocator);
 

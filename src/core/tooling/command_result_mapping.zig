@@ -102,8 +102,7 @@ pub const Command = struct {
             "cleanup_guarantee=best_effort\n" ++
             "message=command timed out; cleanup was attempted for the process group and tracked descendants, but fully detached descendants may remain\n";
         const output = if (timeout_ms) |ms|
-            try std.fmt.allocPrint(
-                arena,
+            try arena.print(
                 "timeout=true\ntimeout_ms={d}\n" ++ cleanup,
                 .{ms},
             )

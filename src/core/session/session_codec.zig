@@ -1461,7 +1461,7 @@ test "legacy route checkpoints retain history without resumable authority" {
     const fields = "\"turn_id\":1,\"user\":{\"text\":\"saved request\",\"images\":[]},\"assistant_source\":\"saved partial\",\"execution\":{\"schema_version\":3,\"tool_steps\":[],\"files\":[]},\"cause\":\"response_interrupted\",\"action\":\"continuing_response\",\"tool_state\":\"uncertain\",\"route_model\":\"test/model\",\"requested_fast_mode\":false,\"fast_mode\":false,\"max_provider_attempts\":3,\"consumed_provider_attempts\":0,\"outstanding_reservation\":false}";
     for (routes, 2..) |route, version| {
         for ([_][]const u8{ "possibly_sent", "definitely_unsent" }) |delivery| {
-            const bytes = try std.fmt.allocPrint(alloc, "{{\"version\":{d},\"route_identity\":{s},\"delivery\":\"{s}\",{s}", .{ version, route, delivery, fields });
+            const bytes = try alloc.print("{{\"version\":{d},\"route_identity\":{s},\"delivery\":\"{s}\",{s}", .{ version, route, delivery, fields });
             defer alloc.free(bytes);
             var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
             defer parsed.deinit();
@@ -2766,8 +2766,7 @@ fn parseToolResultImages(
         const parsed = parsePersistedToolImages(alloc, images.array.items) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             if (err == error.InvalidSourceRef) return error.InvalidSessionFormat;
-            const notice = try std.fmt.allocPrint(
-                alloc,
+            const notice = try alloc.print(
                 "{s}\n[Saved tool image unavailable: {s}]",
                 .{ output.*, @errorName(err) },
             );
@@ -2777,8 +2776,7 @@ fn parseToolResultImages(
         };
         if (parsed.len != images.array.items.len) {
             types.freeToolImages(alloc, parsed);
-            const notice = try std.fmt.allocPrint(
-                alloc,
+            const notice = try alloc.print(
                 "{s}\n[Saved tool image unavailable: unsupported content]",
                 .{output.*},
             );
@@ -4466,7 +4464,7 @@ test "durable cancellation provenance accepts explicit turn and rejects invalid 
     const alloc = std.testing.allocator;
     const prefix = "{\"kind\":\"interrupted\",\"user\":{\"text\":\"request\",\"images\":[]},\"assistant\":\"partial\",\"tool_call\":null,\"completed_tool_names\":[\"read_file\"],\"cancellation_origin\":";
     for ([_][]const u8{ "\"turn\"", "\"compaction\"", "\"unknown\"", "null", "0", "true", "{}", "[]", "\"compaction\",\"unknown_field\":true" }, 0..) |value, i| {
-        const bytes = try std.fmt.allocPrint(alloc, "{s}{s}}}", .{ prefix, value });
+        const bytes = try alloc.print("{s}{s}}}", .{ prefix, value });
         defer alloc.free(bytes);
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
         defer parsed.deinit();

@@ -569,10 +569,10 @@ fn failParentSync(_: ?*anyopaque, _: std.Io.Dir) anyerror!void {
 }
 
 fn validateWorkspaceRoot(workspace_root: []const u8) !void {
-    if (workspace_root.len == 0 or workspace_root.len > std.fs.max_path_bytes) {
+    if (workspace_root.len == 0 or workspace_root.len > std.Io.Dir.max_path_bytes) {
         return error.InvalidDurableField;
     }
-    if (!std.fs.path.isAbsolute(workspace_root) or
+    if (!std.Io.Dir.path.isAbsolute(workspace_root) or
         !std.unicode.utf8ValidateSlice(workspace_root))
     {
         return error.InvalidDurableField;
@@ -700,7 +700,7 @@ fn repairIncompleteTail(file: std.Io.File) !void {
             start,
         );
         if (read_count != read_len) return error.PromptHistoryWriteFailed;
-        if (std.mem.lastIndexOfScalar(u8, buffer[0..read_count], '\n')) |newline| {
+        if (std.mem.findScalarLast(u8, buffer[0..read_count], '\n')) |newline| {
             try file.setLength(io_mod.getIo(), start + newline + 1);
             try file.sync(io_mod.getIo());
             return;
@@ -900,8 +900,7 @@ fn fixtureLine(
     workspace_root: []const u8,
     text: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "{{\"schema_version\":1,\"timestamp_ms\":{d},\"workspace_root\":\"{s}\",\"text\":\"{s}\"}}\n",
         .{ timestamp_ms, workspace_root, text },
     );
@@ -925,7 +924,7 @@ test "reverse load filters workspace bounds results and preserves chronology" {
     defer store.deinit(alloc);
 
     for (0..105) |index| {
-        const text = try std.fmt.allocPrint(alloc, "a-{d}", .{index});
+        const text = try alloc.print("a-{d}", .{index});
         defer alloc.free(text);
         try std.testing.expectEqual(
             AppendOutcome.appended,
@@ -962,7 +961,7 @@ test "reverse load scans beyond one mebibyte of newer interleaved workspace reco
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(alloc);
     for (0..100) |index| {
-        const text = try std.fmt.allocPrint(alloc, "kept-{d}", .{index});
+        const text = try alloc.print("kept-{d}", .{index});
         defer alloc.free(text);
         const line = try fixtureLine(alloc, @intCast(index), "/tmp/workspace-a", text);
         defer alloc.free(line);
@@ -1104,8 +1103,7 @@ test "compaction retains newest one thousand valid records within one mebibyte" 
     var fixture: std.ArrayList(u8) = .empty;
     defer fixture.deinit(alloc);
     for (0..1005) |index| {
-        const text = try std.fmt.allocPrint(
-            alloc,
+        const text = try alloc.print(
             "{d:0>4}-{s}",
             .{ index, text_utils.repeat("x", 1024) },
         );

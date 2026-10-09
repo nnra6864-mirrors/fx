@@ -165,7 +165,7 @@ pub const Overrides = struct {
 };
 
 pub fn parseOverride(raw: []const u8) !Override {
-    const separator = std.mem.indexOfScalar(u8, raw, '=') orelse return error.InvalidContextLimitOverride;
+    const separator = std.mem.findScalar(u8, raw, '=') orelse return error.InvalidContextLimitOverride;
     const raw_name = std.mem.trim(u8, raw[0..separator], " \t\r\n");
     const raw_value = std.mem.trim(u8, raw[separator + 1 ..], " \t\r\n");
     if (raw_name.len == 0 or raw_value.len == 0) return error.InvalidContextLimitOverride;
@@ -219,7 +219,7 @@ pub fn utf8PrefixLength(bytes: []const u8, max_bytes: usize) usize {
 pub fn lineSafePrefixLength(bytes: []const u8, max_bytes: usize) usize {
     const utf8_end = utf8PrefixLength(bytes, max_bytes);
     if (utf8_end == bytes.len) return utf8_end;
-    if (std.mem.lastIndexOfScalar(u8, bytes[0..utf8_end], '\n')) |newline| return newline + 1;
+    if (std.mem.findScalarLast(u8, bytes[0..utf8_end], '\n')) |newline| return newline + 1;
     return utf8_end;
 }
 

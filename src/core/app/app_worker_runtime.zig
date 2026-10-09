@@ -1427,13 +1427,11 @@ pub fn Runtime(comptime App: type) type {
 fn formatWebSearchProgress(alloc: std.mem.Allocator, progress: types.WebSearchProgress) ![]u8 {
     var query_buf: [160]u8 = undefined;
     return switch (progress) {
-        .query_started => |query| std.fmt.allocPrint(
-            alloc,
+        .query_started => |query| alloc.print(
             "● Searching\x1b[0m {s}{s}\x1b[0m",
             .{ shared_theme.current().tool_stdout_style, text_utils.clippedLabel(&query_buf, query, 120) },
         ),
-        .results_received => |entry| std.fmt.allocPrint(
-            alloc,
+        .results_received => |entry| alloc.print(
             "● Found {d} result{s}\x1b[0m {s}{s}\x1b[0m",
             .{ entry.result_count, if (entry.result_count == 1) "" else "s", shared_theme.current().tool_stdout_style, text_utils.clippedLabel(&query_buf, entry.query, 120) },
         ),
@@ -1443,13 +1441,11 @@ fn formatWebSearchProgress(alloc: std.mem.Allocator, progress: types.WebSearchPr
 fn formatWebFetchProgress(alloc: std.mem.Allocator, progress: types.WebFetchProgress) ![]u8 {
     var url_buf: [types.WebFetchCompletion.max_url_len]u8 = undefined;
     return switch (progress) {
-        .fetching => |url| std.fmt.allocPrint(
-            alloc,
+        .fetching => |url| alloc.print(
             "● Fetching\x1b[0m {s}{s}\x1b[0m",
             .{ shared_theme.current().tool_stdout_style, text_utils.clippedLabel(&url_buf, url, 120) },
         ),
-        .converting => |url| std.fmt.allocPrint(
-            alloc,
+        .converting => |url| alloc.print(
             "● Converting\x1b[0m {s}{s}\x1b[0m",
             .{ shared_theme.current().tool_stdout_style, text_utils.clippedLabel(&url_buf, url, 120) },
         ),
@@ -2533,7 +2529,7 @@ test "core.app_worker_runtime assistant chunk trace is metadata only" {
         ".",
     );
     defer alloc.free(trace_path);
-    const trace_file_path = try std.fs.path.join(
+    const trace_file_path = try std.Io.Dir.path.join(
         alloc,
         &.{ trace_path, "worker-trace.log" },
     );
@@ -4585,7 +4581,7 @@ test "core.app_worker_runtime failed turn terminalizes tool lifecycle before err
     try std.testing.expectEqual(@as(usize, 0), app.shell.lifecyclePinCount());
     var failed_status_expected: [64]u8 = undefined;
     try std.testing.expectEqualStrings(
-        try std.fmt.bufPrint(
+        try std.mem.print(
             &failed_status_expected,
             "{s}●{s} Tool failed",
             .{ ui_render.red_style, reset_style },

@@ -170,7 +170,7 @@ fn runWithOutput(alloc: Allocator, args: []const [:0]const u8, output: anytype) 
         }
 
         if (opts.frames and frame.kind != .marker) {
-            const header_text = try std.fmt.allocPrint(alloc, "\n--- frame {d} ({s}, +{d}ms) ---\n", .{ frame_count, frameKindName(frame.kind), frame.delta_ms });
+            const header_text = try alloc.print("\n--- frame {d} ({s}, +{d}ms) ---\n", .{ frame_count, frameKindName(frame.kind), frame.delta_ms });
             defer alloc.free(header_text);
             try output.writeStdout(header_text);
             var snapshot: std.ArrayList(u8) = .empty;
@@ -238,7 +238,7 @@ fn frameKindName(kind: record_tape.Kind) []const u8 {
 
 fn prepareFramesDir(alloc: Allocator, root: []const u8) !void {
     try io_mod.makeDirRecursive(root);
-    const frames_path = try std.fs.path.join(alloc, &.{ root, "frames" });
+    const frames_path = try std.Io.Dir.path.join(alloc, &.{ root, "frames" });
     defer alloc.free(frames_path);
     try io_mod.makeDirRecursive(frames_path);
 }
@@ -256,15 +256,15 @@ fn writeFrameArtifacts(
     defer snapshot.deinit(alloc);
     try grid.snapshot(&snapshot);
 
-    const stem = try std.fmt.allocPrint(alloc, "{d:0>4}", .{index});
+    const stem = try alloc.print("{d:0>4}", .{index});
     defer alloc.free(stem);
-    const json_name = try std.fmt.allocPrint(alloc, "{s}.json", .{stem});
+    const json_name = try alloc.print("{s}.json", .{stem});
     defer alloc.free(json_name);
-    const grid_name = try std.fmt.allocPrint(alloc, "{s}.grid.txt", .{stem});
+    const grid_name = try alloc.print("{s}.grid.txt", .{stem});
     defer alloc.free(grid_name);
-    const json_path = try std.fs.path.join(alloc, &.{ root, "frames", json_name });
+    const json_path = try std.Io.Dir.path.join(alloc, &.{ root, "frames", json_name });
     defer alloc.free(json_path);
-    const grid_path = try std.fs.path.join(alloc, &.{ root, "frames", grid_name });
+    const grid_path = try std.Io.Dir.path.join(alloc, &.{ root, "frames", grid_name });
     defer alloc.free(grid_path);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -314,7 +314,7 @@ fn writeFramesManifest(
         .{ frame_count, resize_count, stdout_bytes },
     );
 
-    const manifest_path = try std.fs.path.join(alloc, &.{ root, "manifest.json" });
+    const manifest_path = try std.Io.Dir.path.join(alloc, &.{ root, "manifest.json" });
     defer alloc.free(manifest_path);
     try writeFile(manifest_path, out.written());
 }
@@ -382,7 +382,7 @@ fn trimSnapshotFrame(line: []const u8) []const u8 {
 
 fn writeFile(path: []const u8, bytes: []const u8) !void {
     const zio = io_mod.getIo();
-    var file = if (std.fs.path.isAbsolute(path))
+    var file = if (std.Io.Dir.path.isAbsolute(path))
         try std.Io.Dir.createFileAbsolute(zio, path, .{ .truncate = true })
     else
         try std.Io.Dir.cwd().createFile(zio, path, .{ .truncate = true });
@@ -401,7 +401,7 @@ fn replyFormattedError(
     fallback: []const u8,
 ) !u8 {
     var buf: [buffer_len]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, fmt, args) catch fallback;
+    const msg = std.mem.print(&buf, fmt, args) catch fallback;
     return replyError(alloc, output, json, code, msg);
 }
 
@@ -543,7 +543,7 @@ fn readTestFile(alloc: Allocator, path: []const u8) ![]u8 {
 fn testPath(alloc: Allocator, dir: std.Io.Dir, name: []const u8) ![]u8 {
     const root = try io_mod.dirRealpathAlloc(alloc, dir, ".");
     defer alloc.free(root);
-    return std.fs.path.join(alloc, &.{ root, name });
+    return std.Io.Dir.path.join(alloc, &.{ root, name });
 }
 
 fn runCaptured(alloc: Allocator, args: []const [:0]const u8, capture: *CaptureOutput) !u8 {
@@ -829,11 +829,11 @@ test "frames-dir writes manifest and per-frame grid artifacts" {
     const exit_code = try runCaptured(alloc, &.{ tape_arg, "--frames-dir", frames_dir_arg }, &capture);
     try testing.expectEqual(@as(u8, 0), exit_code);
 
-    const manifest_path = try std.fs.path.join(alloc, &.{ frames_dir, "manifest.json" });
+    const manifest_path = try std.Io.Dir.path.join(alloc, &.{ frames_dir, "manifest.json" });
     defer alloc.free(manifest_path);
-    const frame_json_path = try std.fs.path.join(alloc, &.{ frames_dir, "frames", "0001.json" });
+    const frame_json_path = try std.Io.Dir.path.join(alloc, &.{ frames_dir, "frames", "0001.json" });
     defer alloc.free(frame_json_path);
-    const frame_grid_path = try std.fs.path.join(alloc, &.{ frames_dir, "frames", "0001.grid.txt" });
+    const frame_grid_path = try std.Io.Dir.path.join(alloc, &.{ frames_dir, "frames", "0001.grid.txt" });
     defer alloc.free(frame_grid_path);
 
     const manifest = try readTestFile(alloc, manifest_path);

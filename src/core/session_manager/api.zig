@@ -421,7 +421,7 @@ pub const Manager = struct {
         if (!schema.validBlobHash(hash)) return error.InvalidArgument;
         if (!try readyToRead(m)) return error.NotFound;
         try session_mod.blobExists(&m.env, id, hash);
-        return std.fs.path.join(gpa, &.{ m.root_path, id, "blobs", hash });
+        return std.Io.Dir.path.join(gpa, &.{ m.root_path, id, "blobs", hash });
     }
 
     /// Root sessions, newest first, from the index alone.
@@ -841,7 +841,7 @@ const api_tests = struct {
             f.tmp = testing.tmpDir(.{ .iterate = true });
             const base = try f.tmp.dir.realPathFileAlloc(io, ".", gpa);
             defer gpa.free(base);
-            f.root = try std.fs.path.join(gpa, &.{ base, "sessions", "v2" });
+            f.root = try std.Io.Dir.path.join(gpa, &.{ base, "sessions", "v2" });
             f.recorder = .{};
             f.manager = try api.Manager.init(gpa, io, .{
                 .root = f.root,
@@ -1224,7 +1224,7 @@ const api_tests = struct {
         // A torn tail is read around and left in place.
         var root = try f.dir();
         defer root.close(io);
-        const log_path = try std.fs.path.join(gpa, &.{ p_id, "log.jsonl" });
+        const log_path = try std.Io.Dir.path.join(gpa, &.{ p_id, "log.jsonl" });
         defer gpa.free(log_path);
         var torn_len: u64 = 0;
         {
@@ -1528,7 +1528,7 @@ const api_tests = struct {
         var dir = try f.dir();
         defer dir.close(io);
         var path: [300]u8 = undefined;
-        const bytes = try dir.readFileAlloc(io, try std.fmt.bufPrint(&path, "{s}/log.jsonl", .{id}), gpa, .limited(1 << 20));
+        const bytes = try dir.readFileAlloc(io, try std.mem.print(&path, "{s}/log.jsonl", .{id}), gpa, .limited(1 << 20));
         defer gpa.free(bytes);
         try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\"kind\":\"item\",\"turn\":1,\"type\":\"steering\""));
     }
@@ -1688,7 +1688,7 @@ const api_tests = struct {
 
             var root = try f.dir();
             defer root.close(io);
-            const path = try std.fmt.allocPrint(gpa, "{s}/blobs/{s}", .{ id, &hash });
+            const path = try gpa.print("{s}/blobs/{s}", .{ id, &hash });
             defer gpa.free(path);
             if (overwrite) {
                 // A blob is read-only (D49), so damage replaces the file, as
@@ -1734,7 +1734,7 @@ const api_tests = struct {
         try testing.expectError(error.InvalidTransition, s.append(&.{.{ .set = .{ .key = .moved_files, .value = "{}", .blobs = &absent } }}));
         const hash = try s.putBlob("a body from the side folder");
         const refs = [_][]const u8{&hash};
-        const value = try std.fmt.allocPrint(gpa, "{{\"map\":\"{s}\"}}", .{&hash});
+        const value = try gpa.print("{{\"map\":\"{s}\"}}", .{&hash});
         defer gpa.free(value);
         _ = try s.append(&.{.{ .set = .{ .key = .moved_files, .value = value, .blobs = &refs } }});
         _ = try s.append(&.{ .turn_started, piece, .turn_committed });
@@ -1759,7 +1759,7 @@ const api_tests = struct {
         // A lost blob that only the setting names damages the session there.
         var root = try f.dir();
         defer root.close(io);
-        const path = try std.fmt.allocPrint(gpa, "{s}/blobs/{s}", .{ id, &hash });
+        const path = try gpa.print("{s}/blobs/{s}", .{ id, &hash });
         defer gpa.free(path);
         try root.deleteFile(io, path);
         try testing.expectEqual(@as(u64, 1), (try m.verify(id)).bad_blobs);
@@ -1781,14 +1781,14 @@ const api_tests = struct {
         // Mid-turn, as auto compaction runs: the records and their map.
         const record = try s.putBlob("T1 shell: ls\nResult:\nfirst\n");
         const first_map = try s.putBlob("{\"compacted-T1.txt\":\"r\"}");
-        const first = try std.fmt.allocPrint(gpa, "{{\"map\":\"{s}\"}}", .{&first_map});
+        const first = try gpa.print("{{\"map\":\"{s}\"}}", .{&first_map});
         defer gpa.free(first);
         _ = try s.append(&.{.{ .set = .{ .key = .compaction_records, .value = first, .blobs = &.{ &record, &first_map } } }});
         _ = try s.append(&.{ piece, .turn_committed });
         // A later compaction rewrites the map; the newest value wins.
         _ = try s.append(&.{.turn_started});
         const second_map = try s.putBlob("{\"compacted-T1.txt\":\"r\",\"compacted-M1.txt\":\"m\"}");
-        const second = try std.fmt.allocPrint(gpa, "{{\"map\":\"{s}\"}}", .{&second_map});
+        const second = try gpa.print("{{\"map\":\"{s}\"}}", .{&second_map});
         defer gpa.free(second);
         _ = try s.append(&.{.{ .set = .{ .key = .compaction_records, .value = second, .blobs = &.{&second_map} } }});
         _ = try s.append(&.{ piece, .turn_committed });
@@ -1895,7 +1895,7 @@ const api_tests = struct {
         try testing.expectEqualSlices(u8, body, stored);
         var root = try f.dir();
         defer root.close(io);
-        const blobs_path = try std.fmt.allocPrint(gpa, "{s}/blobs", .{s.id()});
+        const blobs_path = try gpa.print("{s}/blobs", .{s.id()});
         defer gpa.free(blobs_path);
         var blobs = try root.openDir(io, blobs_path, .{ .iterate = true });
         defer blobs.close(io);

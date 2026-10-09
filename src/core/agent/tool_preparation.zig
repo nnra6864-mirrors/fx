@@ -620,7 +620,7 @@ const RetainedTargetCollector = struct {
             debug_trace.logf("context", "retained_target_skipped reason=outside_primary_workspace", .{});
             return;
         }
-        const directory = if (is_directory) resolved else std.fs.path.dirname(resolved) orelse return;
+        const directory = if (is_directory) resolved else std.Io.Dir.path.dirname(resolved) orelse return;
         for (self.targets.items) |target| {
             if (std.mem.eql(u8, target.path, directory)) return;
         }
@@ -883,7 +883,7 @@ test "registered candidates expose only authoritative canonical targets" {
         "workspace/segment::scope",
     );
     defer alloc.free(delimiter_cwd_path);
-    const new_path = try std.fs.path.join(alloc, &.{ workspace, "build/pkg/new.txt" });
+    const new_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "build/pkg/new.txt" });
     defer alloc.free(new_path);
     const tools = [_]tool_dispatch.Tool{
         builtin_tools.read_file,

@@ -268,9 +268,9 @@ pub fn buildExplicitPromptSection(
 
     const failed = binding_plan.len - loaded;
     const summary = if (failed == 0)
-        try std.fmt.allocPrint(alloc, "{d} requested skill{s} loaded{s}", .{ loaded, if (loaded == 1) "" else "s", load_rows.written() })
+        try alloc.print("{d} requested skill{s} loaded{s}", .{ loaded, if (loaded == 1) "" else "s", load_rows.written() })
     else
-        try std.fmt.allocPrint(alloc, "Requested skills · {d} loaded · {d} failed (ctrl+o for details){s}", .{ loaded, failed, load_rows.written() });
+        try alloc.print("Requested skills · {d} loaded · {d} failed (ctrl+o for details){s}", .{ loaded, failed, load_rows.written() });
     errdefer alloc.free(summary);
     const details = if (load_details.written().len > 0) try load_details.toOwnedSlice() else null;
     errdefer if (details) |value| alloc.free(value);
@@ -292,11 +292,11 @@ pub fn buildExplicitPromptSection(
 fn appendExplicitLoadRow(alloc: Allocator, out: *std.Io.Writer, name: []const u8, failure: ?[]const u8) !void {
     const row = if (failure) |detail|
         if (detail.len > 0)
-            try std.fmt.allocPrint(alloc, "Could not load {s}: {s}", .{ name, detail })
+            try alloc.print("Could not load {s}: {s}", .{ name, detail })
         else
-            try std.fmt.allocPrint(alloc, "Could not load {s}", .{name})
+            try alloc.print("Could not load {s}", .{name})
     else
-        try std.fmt.allocPrint(alloc, "Loaded skill {s}", .{name});
+        try alloc.print("Loaded skill {s}", .{name});
     defer alloc.free(row);
     const sanitized = try tool_result_limits.prepareSanitizedOutput(alloc, row);
     defer alloc.free(sanitized);
@@ -872,7 +872,7 @@ fn loadByIdentityWithOptions(
             )), &discovery_notice, max_tool_result_bytes);
         }
         if (skill_runtime.resourceIsSkillFile(resource_path)) {
-            const metadata = switch (skill_contract.resolveMetadata(skill_contract.parseSkillFile(resource_read.bytes), std.fs.path.basename(skill.path))) {
+            const metadata = switch (skill_contract.resolveMetadata(skill_contract.parseSkillFile(resource_read.bytes), std.Io.Dir.path.basename(skill.path))) {
                 .valid => |value| value,
                 .invalid => return error.SkillResourceChanged,
             };
@@ -902,7 +902,7 @@ fn loadByIdentityWithOptions(
         const output = try tool_result_limits.prepareSanitizedOutput(alloc, full.written());
         if (output.len > primary_budget) {
             defer alloc.free(output);
-            const message = try std.fmt.allocPrint(alloc, "Complete skill content exceeds max_tool_result_bytes ({d} bytes). No complete instructions were loaded.", .{primary_budget});
+            const message = try alloc.print("Complete skill content exceeds max_tool_result_bytes ({d} bytes). No complete instructions were loaded.", .{primary_budget});
             defer alloc.free(message);
             return attachOwnedDiscoveryNotice(alloc, .{ .failure = .{ .model_output = try boundedSkillError(alloc, message, primary_budget) } }, &discovery_notice, max_tool_result_bytes);
         }
@@ -1204,8 +1204,8 @@ fn formatBoundedIdentityPairError(
 
 fn boundedEncodedPrefixLength(encoded: []const u8, max_bytes: usize) usize {
     var prefix_len = context_limits.utf8PrefixLength(encoded, max_bytes);
-    if (std.mem.lastIndexOfScalar(u8, encoded[0..prefix_len], '&')) |amp_index| {
-        if (std.mem.indexOfScalar(u8, encoded[amp_index..prefix_len], ';') == null) prefix_len = amp_index;
+    if (std.mem.findScalarLast(u8, encoded[0..prefix_len], '&')) |amp_index| {
+        if (std.mem.findScalar(u8, encoded[amp_index..prefix_len], ';') == null) prefix_len = amp_index;
     }
     return prefix_len;
 }
@@ -1322,7 +1322,7 @@ fn revalidatePrimaryIdentity(alloc: Allocator, file: *std.Io.File, skill: skill_
     if (try file.readPositionalAll(io_mod.getIo(), bytes, 0) != length) return error.SkillResourceChanged;
     const after = try file.stat(io_mod.getIo());
     if (before.size != after.size or !std.meta.eql(before.mtime, after.mtime)) return error.SkillResourceChanged;
-    const metadata = switch (skill_contract.resolveMetadata(skill_contract.parseSkillFile(bytes), std.fs.path.basename(skill.path))) {
+    const metadata = switch (skill_contract.resolveMetadata(skill_contract.parseSkillFile(bytes), std.Io.Dir.path.basename(skill.path))) {
         .valid => |value| value,
         .invalid => return error.SkillResourceChanged,
     };
@@ -1539,7 +1539,7 @@ fn openTestSkillCandidate(
     alloc: Allocator,
     root: []const u8,
 ) !skill_runtime.OpenedSkillCandidate {
-    const name = std.fs.path.basename(root);
+    const name = std.Io.Dir.path.basename(root);
     return switch (try skill_runtime.openValidatedSkillCandidate(alloc, .{
         .name = name,
         .description = "",
@@ -1607,7 +1607,7 @@ fn createSkillSymlinkOrSkip(
     link_path: []const u8,
     is_directory: bool,
 ) !void {
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     dir.symLink(std.testing.io, target_path, link_path, .{ .is_directory = is_directory }) catch |err| {
         if (err == error.AccessDenied or std.mem.eql(u8, @errorName(err), "Permission" ++ "Denied")) {
             return error.SkipZigTest;
@@ -1660,7 +1660,7 @@ test "skill resource loading rejects symlink components and candidate rebinding"
 
     const tmp_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(tmp_root);
-    const ancestor_root = try std.fs.path.join(alloc, &.{ tmp_root, "ancestor-root/.agents/skills/workflow" });
+    const ancestor_root = try std.Io.Dir.path.join(alloc, &.{ tmp_root, "ancestor-root/.agents/skills/workflow" });
     defer alloc.free(ancestor_root);
     try expectSkillResourceRejected(alloc, ancestor_root, "SKILL.md");
 
@@ -2423,7 +2423,7 @@ test "skill invocation preserves strict discovery diagnostics without a profile 
 
     const tmp_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(tmp_root);
-    const trace_path = try std.fs.path.join(alloc, &.{ tmp_root, "skill-tool-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ tmp_root, "skill-tool-trace.log" });
     defer alloc.free(trace_path);
     test_debug_trace.resetForTest();
     defer test_debug_trace.resetForTest();
@@ -2438,7 +2438,7 @@ test "skill invocation preserves strict discovery diagnostics without a profile 
 
     const canonical_tmp = try io_mod.realpathAlloc(alloc, "/tmp");
     defer alloc.free(canonical_tmp);
-    const workspace_root = try std.fs.path.join(alloc, &.{ canonical_tmp, "fx-skill-tool-strict-workspace" });
+    const workspace_root = try std.Io.Dir.path.join(alloc, &.{ canonical_tmp, "fx-skill-tool-strict-workspace" });
     defer alloc.free(workspace_root);
     const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "custom-skills");
     defer alloc.free(skills_dir);

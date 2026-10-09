@@ -84,8 +84,7 @@ pub fn execute(input: Input) Error!ToolExecutionResult {
     if (file_mutation_contract.preparedMutationIsNoop(prepared)) {
         return .{
             .status = .success,
-            .model_output = try std.fmt.allocPrint(
-                input.result_allocator,
+            .model_output = try input.result_allocator.print(
                 "No changes to {s}; it already contains the requested content",
                 .{prepared.display_path},
             ),
@@ -169,8 +168,7 @@ fn prepareFileMutationSuccessResult(
     );
     defer encoded_path.deinit(call_alloc);
 
-    const raw_output = try std.fmt.allocPrint(
-        call_alloc,
+    const raw_output = try call_alloc.print(
         "{s} {s} ({d} bytes)",
         .{
             if (prepared.kind == .write) "wrote" else "edited",

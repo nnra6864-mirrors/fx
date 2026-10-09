@@ -1660,8 +1660,7 @@ test "non-object legacy interrupted repair cleans every allocation failure" {
 test "legacy cancellation provenance reads old sessions and roundtrips optional origin" {
     const Case = struct {
         fn run(alloc: Allocator, origin_field: []const u8, expected: types.CancellationOrigin) !void {
-            const json = try std.fmt.allocPrint(
-                alloc,
+            const json = try alloc.print(
                 "{{\"schema_version\":1,\"id\":\"old\",\"created_at_ms\":1,\"updated_at_ms\":2," ++
                     "\"workspace_root\":\"/tmp/workspace\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[" ++
                     "{{\"kind\":\"interrupted\",\"user\":{{\"text\":\"request\",\"images\":[]}},\"assistant\":\"partial\"{s}}}]}}",
@@ -1691,8 +1690,7 @@ test "legacy cancellation provenance reads old sessions and roundtrips optional 
 test "legacy cancellation provenance rejects invalid values after owned fields" {
     const alloc = std.testing.allocator;
     for ([_][]const u8{ "\"unknown\"", "null", "1", "false", "[]", "{}" }) |origin| {
-        const json = try std.fmt.allocPrint(
-            alloc,
+        const json = try alloc.print(
             "{{\"kind\":\"interrupted\",\"user\":{{\"text\":\"request\",\"images\":[]}},\"assistant\":\"partial\",\"completed_tool_names\":[\"read_file\"],\"cancellation_origin\":{s}}}",
             .{origin},
         );
@@ -1726,7 +1724,7 @@ test "legacy session JSON repairs duplicate-key tool arguments before projection
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "legacy-repair-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "legacy-repair-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -1999,7 +1997,7 @@ test "legacy summary streaming stops before writer-produced history payload" {
         .{},
     );
     defer alloc.free(json);
-    const history_start = std.mem.indexOf(u8, json, "\"history\":[") orelse
+    const history_start = std.mem.find(u8, json, "\"history\":[") orelse
         return error.TestExpectedEqual;
 
     const summary_prefix_end = history_start + "\"history\":".len;

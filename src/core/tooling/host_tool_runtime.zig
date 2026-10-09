@@ -345,7 +345,7 @@ test "host tool runtime bounds descriptions at 64 KiB" {
     defer alloc.free(description);
     @memset(description, 'a');
     for ([_]usize{ 64 * 1024, 64 * 1024 + 1 }) |length| {
-        const json = try std.fmt.allocPrint(alloc, "[{{\"name\":\"lookup\",\"description\":\"{s}\",\"inputSchema\":{{}}}}]", .{description[0..length]});
+        const json = try alloc.print("[{{\"name\":\"lookup\",\"description\":\"{s}\",\"inputSchema\":{{}}}}]", .{description[0..length]});
         defer alloc.free(json);
         const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
         defer parsed.deinit();
@@ -389,7 +389,7 @@ test "host tool runtime rejects duplicate and invalid names" {
         const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
         defer parsed.deinit();
         try std.testing.expectError(
-            if (std.mem.indexOf(u8, json, "bad name") != null)
+            if (std.mem.find(u8, json, "bad name") != null)
                 error.InvalidHostToolName
             else
                 error.DuplicateHostToolName,

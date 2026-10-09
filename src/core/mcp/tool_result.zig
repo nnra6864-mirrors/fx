@@ -37,8 +37,7 @@ pub fn extract(alloc: Allocator, options: ExtractOptions) !tool_mcp_runtime.Call
         .{},
     ) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        const raw = try std.fmt.allocPrint(
-            alloc,
+        const raw = try alloc.print(
             "MCP protocol failure: {s}",
             .{@errorName(err)},
         );
@@ -209,7 +208,7 @@ pub fn restart_failed_result(
     try out.writer.writeAll(",\"tool\":");
     try std.json.Stringify.value(tool_name, .{}, &out.writer);
     try out.writer.writeAll(",\"error\":{\"kind\":\"server_restart_failed\",\"message\":");
-    const message = try std.fmt.allocPrint(alloc, "MCP server stopped and could not be restarted: {s}", .{failure});
+    const message = try alloc.print("MCP server stopped and could not be restarted: {s}", .{failure});
     defer alloc.free(message);
     try std.json.Stringify.value(message, .{}, &out.writer);
     try out.writer.writeAll("}}");
@@ -345,8 +344,7 @@ fn serialize_capped(
     }
 
     const combined = try collect_result_text(arena, result);
-    const marker = try std.fmt.allocPrint(
-        arena,
+    const marker = try arena.print(
         "\n... [mcp tool result truncated for {s}/{s}: original {d} bytes; cap is {d} bytes]\n",
         .{ server_name, tool_name, full_output.len, max_tool_result_bytes },
     );

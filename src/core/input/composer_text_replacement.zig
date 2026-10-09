@@ -292,7 +292,7 @@ test "prepared replacement traces entities cleared by its caller before commit" 
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();

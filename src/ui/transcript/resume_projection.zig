@@ -511,7 +511,7 @@ test "resume projection finalizes complete flow before one retained-tail pass" {
     });
     for (0..12) |index| {
         var text: [64]u8 = undefined;
-        const line = try std.fmt.bufPrint(&text, "historical marker {d}\n", .{index});
+        const line = try std.mem.print(&text, "historical marker {d}\n", .{index});
         _ = try projection.appendRawClassified(line, .unknown_raw);
     }
     try projection.finalize();
@@ -573,7 +573,7 @@ test "resume projection installs complete publication and retained continuation 
     defer projection.deinit();
     for (0..12) |index| {
         var text: [64]u8 = undefined;
-        const line = try std.fmt.bufPrint(&text, "publication marker {d}\n", .{index});
+        const line = try std.mem.print(&text, "publication marker {d}\n", .{index});
         _ = try projection.appendRawClassified(line, .unknown_raw);
     }
     try projection.finalize();

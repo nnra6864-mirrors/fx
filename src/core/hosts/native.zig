@@ -13,7 +13,7 @@ pub const clipboard = host.Clipboard{
 pub const secret_store = native_secret_store.provider;
 
 fn copyToClipboard(_: ?*anyopaque, text: []const u8) host.ClipboardError!bool {
-    const argv = clipboardCommand(builtin.os.tag) orelse return false;
+    const argv = clipboardCommand(builtin.target.os.tag) orelse return false;
     const io = io_mod.getIo();
     var child = std.process.spawn(io, .{
         .argv = argv,
@@ -172,7 +172,7 @@ fn run_clipboard_process(
 // Publish eager file representations so the pasteboard server owns them after
 // this short-lived process exits.
 fn copy_file_to_clipboard(_: ?*anyopaque, alloc: std.mem.Allocator, path: []const u8) host.ClipboardError!bool {
-    if (comptime builtin.os.tag != .macos) return false;
+    if (comptime builtin.target.os.tag != .macos) return false;
 
     const script =
         \\function run(argv) {

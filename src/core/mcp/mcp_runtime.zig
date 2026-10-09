@@ -872,7 +872,7 @@ pub const McpRuntime = struct {
                         .failed => .failed,
                     }, serverAuthenticationState(server), server.config.name, server.last_error);
                     defer if (failure) |message| self.alloc.free(message);
-                    return try std.fmt.allocPrint(self.alloc, "Required MCP server '{s}' failed to start: {s}", .{ safe_name, failure orelse "Check the trusted profile configuration and retry." });
+                    return try self.alloc.print("Required MCP server '{s}' failed to start: {s}", .{ safe_name, failure orelse "Check the trusted profile configuration and retry." });
                 }
             }
         }
@@ -1245,8 +1245,7 @@ pub const McpRuntime = struct {
         if (health.startupDecision(snapshot.servers) != .blocked) return null;
         for (snapshot.servers) |server| {
             if (!server.required or server.connection == .ready) continue;
-            const message = try std.fmt.allocPrint(
-                alloc,
+            const message = try alloc.print(
                 "Required MCP server '{s}' failed to start: {s}",
                 .{
                     server.configured_name,
@@ -1989,8 +1988,7 @@ pub const McpRuntime = struct {
                 }
             }
         }
-        const notice = if (omitted > 0) try std.fmt.allocPrint(
-            alloc,
+        const notice = if (omitted > 0) try alloc.print(
             "[context] {d} always-loaded MCP tool{s} exceeded the mcp_selected_schema_bytes budget and stay available through capability_search",
             .{ omitted, if (omitted == 1) "" else "s" },
         ) else null;
@@ -2309,7 +2307,7 @@ pub const McpRuntime = struct {
             if (self.lookupCallableTool(name) == null) break :result @as(tool_mcp_runtime.ValidationResult, .not_available);
             tools_feature.validateArguments(arena, arguments_json, .{}) catch |err| {
                 break :result @as(tool_mcp_runtime.ValidationResult, .{
-                    .invalid = try std.fmt.allocPrint(arena, "Invalid arguments for MCP tool {s}: {s}", .{ name, @errorName(err) }),
+                    .invalid = try arena.print("Invalid arguments for MCP tool {s}: {s}", .{ name, @errorName(err) }),
                 });
             };
             break :result @as(tool_mcp_runtime.ValidationResult, .{ .valid = self.generation });
@@ -3184,7 +3182,7 @@ test "per-server recovery serialization observes the operation deadline" {
 }
 
 test "guarded stdio subscription startup releases catalog locks before transport commit" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
 
     const child = try std.process.spawn(std.testing.io, .{
         .argv = &.{ "sh", "-c", "while IFS= read -r request; do :; done" },
@@ -3281,7 +3279,7 @@ test "guarded stdio subscription startup releases catalog locks before transport
 }
 
 test "runtime shutdown releases catalog locks before subscription cancellation write" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     var runtime = McpRuntime.init(alloc);
@@ -4102,7 +4100,7 @@ test "legacy URL completions require an established unique candidate before repl
     var id_buffer: [64]u8 = undefined;
     var candidate_index: usize = runtime.completions.legacy_url_completion_candidates.items.len;
     while (candidate_index < max_legacy_url_completion_candidates) : (candidate_index += 1) {
-        const id = try std.fmt.bufPrint(&id_buffer, "candidate-{d}", .{candidate_index});
+        const id = try std.mem.print(&id_buffer, "candidate-{d}", .{candidate_index});
         const candidate_ids = [_][]const u8{id};
         try runtime.registerLegacyUrlCompletionCandidates(
             source,
@@ -4113,7 +4111,7 @@ test "legacy URL completions require an established unique candidate before repl
     }
     var unknown_index: usize = 0;
     while (unknown_index <= max_early_legacy_url_completions_per_window) : (unknown_index += 1) {
-        const id = try std.fmt.bufPrint(&id_buffer, "unknown-{d}", .{unknown_index});
+        const id = try std.mem.print(&id_buffer, "unknown-{d}", .{unknown_index});
         var frame = std.Io.Writer.Allocating.init(alloc);
         defer frame.deinit();
         try frame.writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":");
@@ -4175,7 +4173,7 @@ test "legacy URL provisional completions cannot cross concurrent operation windo
     var provisional_buffer: [64]u8 = undefined;
     var provisional_index: usize = 1;
     while (provisional_index < max_early_legacy_url_completions_per_window) : (provisional_index += 1) {
-        const id = try std.fmt.bufPrint(&provisional_buffer, "first-window-{d}", .{provisional_index});
+        const id = try std.mem.print(&provisional_buffer, "first-window-{d}", .{provisional_index});
         var frame = std.Io.Writer.Allocating.init(alloc);
         defer frame.deinit();
         try frame.writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":");
@@ -5012,7 +5010,7 @@ test "legacy URL waiter publication is allocator-safe and retirement wakes it" {
 }
 
 test "runtime retirement cancels a committed stdio tool call before waiting for its lease" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     const shell_server =
@@ -5486,8 +5484,7 @@ test "legacy initialize advertises elicitation only for negotiated supported mod
 
 test "modern request builders share required request metadata" {
     const alloc = std.testing.allocator;
-    const metadata = try std.fmt.allocPrint(
-        alloc,
+    const metadata = try alloc.print(
         "\"_meta\":{{\"io.modelcontextprotocol/protocolVersion\":\"{s}\",\"io.modelcontextprotocol/clientInfo\":{{\"name\":\"fx\",\"version\":\"{s}\"}},\"io.modelcontextprotocol/clientCapabilities\":{{}}}}",
         .{ modern_protocol_version, build_options.app_version },
     );
@@ -5495,8 +5492,7 @@ test "modern request builders share required request metadata" {
 
     const discover = try buildDiscoverRequest(alloc, 0);
     defer alloc.free(discover);
-    const expected_discover = try std.fmt.allocPrint(
-        alloc,
+    const expected_discover = try alloc.print(
         "{{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"server/discover\",\"params\":{{{s}}}}}",
         .{metadata},
     );
@@ -5505,8 +5501,7 @@ test "modern request builders share required request metadata" {
 
     const list = try buildToolsListRequest(alloc, 1, .modern, null);
     defer alloc.free(list);
-    const expected_list = try std.fmt.allocPrint(
-        alloc,
+    const expected_list = try alloc.print(
         "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{{{s}}}}}",
         .{metadata},
     );
@@ -5515,8 +5510,7 @@ test "modern request builders share required request metadata" {
 
     const call = try buildToolCallRequestForProtocol(alloc, 2, "echo", "{\"text\":\"hi\"}", .modern, null, null, .{});
     defer alloc.free(call);
-    const expected_call = try std.fmt.allocPrint(
-        alloc,
+    const expected_call = try alloc.print(
         "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{{s},\"name\":\"echo\",\"arguments\":{{\"text\":\"hi\"}}}}}}",
         .{metadata},
     );
@@ -5677,7 +5671,7 @@ fn expectTestProcessExited(pid: std.posix.pid_t) !void {
             error.ProcessNotFound => return,
             else => {},
         };
-        if (builtin.os.tag == .linux and testProcessIsZombie(pid)) return;
+        if (builtin.target.os.tag == .linux and testProcessIsZombie(pid)) return;
         io_mod.sleep(10 * std.time.ns_per_ms);
     }
     return error.TestProcessStillRunning;
@@ -5685,7 +5679,7 @@ fn expectTestProcessExited(pid: std.posix.pid_t) !void {
 
 fn testProcessIsZombie(pid: std.posix.pid_t) bool {
     var path_buf: [64]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/status", .{pid}) catch return false;
+    const path = std.mem.print(&path_buf, "/proc/{d}/status", .{pid}) catch return false;
     var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch return false;
     defer file.close(io_mod.getIo());
 

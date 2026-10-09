@@ -77,7 +77,7 @@ test "child compaction preserves work identity and permits final commit" {
     defer alloc.free(bytes);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "child request"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "work-checkpoint"));
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "child done") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "child done") != null);
 }
 
 test "child recovery admission distinguishes work identity from repeated prompt text" {
@@ -729,7 +729,7 @@ pub fn failureDiagnosticValue(code: []const u8, detail: []const u8) types.ModelF
         "";
     if (safe_detail.len == 0) return types.ModelFailureDiagnostic.init(prefix);
     var buffer: [max_bytes]u8 = undefined;
-    const text = std.fmt.bufPrint(&buffer, "{s}: {s}", .{ prefix, safe_detail }) catch unreachable;
+    const text = std.mem.print(&buffer, "{s}: {s}", .{ prefix, safe_detail }) catch unreachable;
     return types.ModelFailureDiagnostic.init(text);
 }
 

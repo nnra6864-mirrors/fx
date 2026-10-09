@@ -1540,7 +1540,7 @@ test "question prompt traces discarded drafts with their reason" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "question-draft.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "question-draft.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -1572,7 +1572,7 @@ test "question prompt traces drafts that differ from accepted submissions" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "question-draft-accepted.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "question-draft-accepted.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();

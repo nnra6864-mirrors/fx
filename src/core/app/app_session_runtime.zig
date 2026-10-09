@@ -2757,8 +2757,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn writeSessionPickerError(app: *App, err: anyerror) !void {
-            const notice = try std.fmt.allocPrint(
-                app.alloc,
+            const notice = try app.alloc.print(
                 "unable to list saved sessions: {s}",
                 .{@errorName(err)},
             );
@@ -3401,14 +3400,12 @@ pub fn Runtime(comptime App: type) type {
                 }
                 if (comptime @hasDecl(App, "writeDomainNotice")) {
                     const body = if (loaded.conversation_writer.turn_open)
-                        try std.fmt.allocPrint(
-                            app.alloc,
+                        try app.alloc.print(
                             "Turn completed, but fx could not save it ({s}). New messages are blocked until you reopen the session. The turn may run again.",
                             .{@errorName(err)},
                         )
                     else
-                        try std.fmt.allocPrint(
-                            app.alloc,
+                        try app.alloc.print(
                             "Turn completed, but fx could not save it ({s}). The session keeps running; this turn may be missing after a resume.",
                             .{@errorName(err)},
                         );
@@ -3454,8 +3451,7 @@ pub fn Runtime(comptime App: type) type {
                 .finished_prompt => {
                     recordShutdownFailure(app, failure);
                     if (comptime @hasDecl(App, "writeDomainNotice")) {
-                        const body = try std.fmt.allocPrint(
-                            app.alloc,
+                        const body = try app.alloc.print(
                             "Turn completed, but fx could not save it ({s}). The session keeps running; this turn may be missing after a resume.",
                             .{@errorName(failure)},
                         );
@@ -3625,13 +3621,13 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             const basename = if (comptime @hasField(App, "workspace_root"))
-                std.fs.path.basename(app.workspace_root)
+                std.Io.Dir.path.basename(app.workspace_root)
             else
                 "";
             const folder = if (basename.len == 0) "workspace" else basename;
             const prefix = "fx v" ++ build_options.app_version ++ " | ";
-            var label_buffer: [prefix.len + std.fs.max_path_bytes]u8 = undefined;
-            const label = std.fmt.bufPrint(&label_buffer, "{s}{s}", .{ prefix, folder }) catch |err| {
+            var label_buffer: [prefix.len + std.Io.Dir.max_path_bytes]u8 = undefined;
+            const label = std.mem.print(&label_buffer, "{s}{s}", .{ prefix, folder }) catch |err| {
                 debug_trace.logf("session", "terminal title workspace omitted err={s}", .{@errorName(err)});
                 provider.set("fx v" ++ build_options.app_version);
                 return;
@@ -5073,8 +5069,7 @@ pub fn Runtime(comptime App: type) type {
             );
             const formatted_action = if (outcome_decision) |decision|
                 if (decision.detail) |detail|
-                    try std.fmt.allocPrint(
-                        action_arena.allocator(),
+                    try action_arena.allocator().print(
                         "{s}: {s}",
                         .{ formatted_action_base, detail },
                     )
@@ -5417,8 +5412,7 @@ pub fn Runtime(comptime App: type) type {
             sink: anytype,
             call: types.ToolCall,
         ) !void {
-            const status = try std.fmt.allocPrint(
-                app.alloc,
+            const status = try app.alloc.print(
                 "● Tool completion was not reported: {s}",
                 .{call.name},
             );
@@ -5432,8 +5426,7 @@ pub fn Runtime(comptime App: type) type {
             sink: anytype,
             result: types.PersistedToolResult,
         ) !void {
-            const status = try std.fmt.allocPrint(
-                app.alloc,
+            const status = try app.alloc.print(
                 "● {s} tool result: {s}",
                 .{ @tagName(result.status), result.tool_name },
             );
@@ -6241,7 +6234,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn reportRememberFailure(app: *App, failure: RememberFailure, comptime from_worker: bool) void {
             const alloc = std.heap.c_allocator;
-            const body = std.fmt.allocPrint(alloc, "Session saved, but could not remember it for -c ({s}). Resume with fx --resume {s}.", .{ @errorName(failure.err), failure.id[0..failure.len] }) catch return;
+            const body = alloc.print("Session saved, but could not remember it for -c ({s}). Resume with fx --resume {s}.", .{ @errorName(failure.err), failure.id[0..failure.len] }) catch return;
             defer alloc.free(body);
             const notice = types.SemanticNotice{ .topic = "session", .tone = .warning, .body = body };
             if (comptime @hasDecl(@TypeOf(app.worker), "pushEvent") and (from_worker or !@hasDecl(App, "writeDomainNotice"))) {
@@ -6260,8 +6253,7 @@ pub fn Runtime(comptime App: type) type {
             label: []const u8,
             err: anyerror,
         ) !void {
-            const notice = try std.fmt.allocPrint(
-                app.alloc,
+            const notice = try app.alloc.print(
                 "{s}: {s}; continuing non-durably",
                 .{ label, @errorName(err) },
             );
@@ -6801,13 +6793,12 @@ const TestApp = struct {
             return error.TestSystemNoticeFailure;
         }
         try self.notices.append(self.alloc, if (notice.topic.len > 0)
-            try std.fmt.allocPrint(
-                self.alloc,
+            try self.alloc.print(
                 "{s} {s}: {s}",
                 .{ types.noticeGlyph(notice.tone), notice.topic, notice.body },
             )
         else
-            try std.fmt.allocPrint(self.alloc, "{s} {s}", .{ types.noticeGlyph(notice.tone), notice.body }));
+            try self.alloc.print("{s} {s}", .{ types.noticeGlyph(notice.tone), notice.body }));
     }
 
     fn commitStartupResumeReplayAnchor(self: *TestApp) !void {
@@ -6862,7 +6853,7 @@ const TestApp = struct {
         const line = if (std.mem.endsWith(u8, text, "\n"))
             try self.alloc.dupe(u8, text)
         else
-            try std.fmt.allocPrint(self.alloc, "{s}\n", .{text});
+            try self.alloc.print("{s}\n", .{text});
         try self.completed_tool_statuses.append(self.alloc, line);
         try self.completed_tool_outcomes.append(self.alloc, kind);
         try self.replay_events.append(self.alloc, .completed_tool_status);
@@ -6947,16 +6938,16 @@ const TestApp = struct {
             return arena.dupe(u8, "● Ran pwd");
         }
         if (display_target) |target| {
-            return std.fmt.allocPrint(arena, "● Completed {s} {s}", .{ call.name, target });
+            return arena.print("● Completed {s} {s}", .{ call.name, target });
         }
-        return std.fmt.allocPrint(arena, "● Completed {s}", .{call.name});
+        return arena.print("● Completed {s}", .{call.name});
     }
 
     fn describeToolActionDeniedWithAdvertised(self: *TestApp, arena: Allocator, call: types.ToolCall, _: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
         if (self.action_description_allocates_scratch) {
             _ = try arena.dupe(u8, "temporary parsed arguments");
         }
-        return std.fmt.allocPrint(arena, "● {s} {s}", .{ label, call.name });
+        return arena.print("● {s} {s}", .{ label, call.name });
     }
 
     fn pacerEmit(ctx: *anyopaque, text: []const u8) anyerror!void {
@@ -7551,7 +7542,7 @@ test "v2 ultrafast resume applies process overrides without persisting them" {
     const home = try TestHome.install(alloc, paths.home);
     defer home.deinit();
     // fx keeps `.fx` private, and resuming a v2 session verifies that.
-    const fx_dir = try std.fs.path.joinZ(alloc, &.{ paths.home, ".fx" });
+    const fx_dir = try std.Io.Dir.path.joinZ(alloc, &.{ paths.home, ".fx" });
     defer alloc.free(fx_dir);
     if (std.c.chmod(fx_dir.ptr, 0o700) != 0) return error.TestChmodFailed;
     for ([_]bool{ false, true }) |baseline| {
@@ -8213,7 +8204,7 @@ test "resume projection stores reflow metadata for session action rows" {
     var run_calls = [_]types.ToolCall{.{
         .id = "call_run",
         .name = "shell",
-        .arguments_json = try std.fmt.allocPrint(alloc, "{{\"action\":\"run\",\"command\":{f}}}", .{std.json.fmt(command, .{})}),
+        .arguments_json = try alloc.print("{{\"action\":\"run\",\"command\":{f}}}", .{std.json.fmt(command, .{})}),
     }};
     defer alloc.free(run_calls[0].arguments_json);
     var run_results = [_]types.PersistedToolResult{.{
@@ -8307,7 +8298,7 @@ test "resume projection restores session action rows with labels seeded from the
     var run_calls = [_]types.ToolCall{.{
         .id = "call_run",
         .name = "shell",
-        .arguments_json = try std.fmt.allocPrint(alloc, "{{\"action\":\"run\",\"command\":{f}}}", .{std.json.fmt(command, .{})}),
+        .arguments_json = try alloc.print("{{\"action\":\"run\",\"command\":{f}}}", .{std.json.fmt(command, .{})}),
     }};
     defer alloc.free(run_calls[0].arguments_json);
     var run_results = [_]types.PersistedToolResult{.{
@@ -8383,7 +8374,7 @@ test "resume projection stores reflow metadata after the session moved workspace
     var run_calls = [_]types.ToolCall{.{
         .id = "call_run",
         .name = "shell",
-        .arguments_json = try std.fmt.allocPrint(alloc, "{{\"action\":\"run\",\"command\":{f}}}", .{std.json.fmt(command, .{})}),
+        .arguments_json = try alloc.print("{{\"action\":\"run\",\"command\":{f}}}", .{std.json.fmt(command, .{})}),
     }};
     defer alloc.free(run_calls[0].arguments_json);
     var run_results = [_]types.PersistedToolResult{.{
@@ -10552,7 +10543,7 @@ test "cancelled command replay rejects unsafe handles without partial output" {
     };
     for (unsafe_handles, 0..) |handle, index| {
         var call_id_buf: [32]u8 = undefined;
-        const call_id = try std.fmt.bufPrint(&call_id_buf, "unsafe-{d}", .{index});
+        const call_id = try std.mem.print(&call_id_buf, "unsafe-{d}", .{index});
         const history = [_]types.HistoryTurn{.{ .interrupted = .{
             .user = .{ .text = @constCast("cancel") },
             .tool_call = .{
@@ -11040,7 +11031,7 @@ test "appendFinishedPrompt keeps the session alive when the turn cannot be saved
     );
     // The user sees a warning instead of a disappearing process.
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, app.notices.items[0], "could not save") != null);
+    try std.testing.expect(std.mem.find(u8, app.notices.items[0], "could not save") != null);
 
     // Nothing of the rejected turn reached the journal.
     {
@@ -11400,7 +11391,7 @@ test "session picker reuses a held catalog after resize and workspace switch" {
         held.catalog = .{};
         for (0..100) |index| {
             var id_buffer: [32]u8 = undefined;
-            const id = try std.fmt.bufPrint(&id_buffer, "saved-{d}", .{index});
+            const id = try std.mem.print(&id_buffer, "saved-{d}", .{index});
             var summary = try session_summary_codec.cloneSessionSummary(catalog_alloc, .{
                 .id = @constCast(id),
                 .workspace_root = if (index % 2 == 0) paths.workspace else @constCast("/foreign-workspace"),
@@ -12766,7 +12757,7 @@ test "terminal title uses the workspace basename and handles unnamed roots" {
         defer app.deinit();
         Runtime(TestApp).syncTerminalTitle(&app);
         var expected_buffer: [128]u8 = undefined;
-        const expected = try std.fmt.bufPrint(&expected_buffer, "fx v{s} | {s}", .{ build_options.app_version, case.folder });
+        const expected = try std.mem.print(&expected_buffer, "fx v{s} | {s}", .{ build_options.app_version, case.folder });
         try std.testing.expectEqualStrings(expected, app.terminalTitleLabelText());
     }
 }
@@ -12981,7 +12972,7 @@ test "remembered selection write failure leaves pending user work durable and wa
 }
 
 fn parseTestRecoveryCheckpoint(alloc: Allocator, cause: []const u8) !session_codec.RecoveryCheckpoint {
-    const json = try std.fmt.allocPrint(alloc, "{{\"version\":2,\"turn_id\":1,\"user\":{{\"text\":\"saved request\",\"images\":[]}},\"assistant_source\":\"partial\",\"execution\":{{\"schema_version\":3,\"tool_steps\":[],\"files\":[]}},\"cause\":\"{s}\",\"action\":\"continuing_response\",\"tool_state\":\"uncertain\",\"authority\":{{\"provider\":\"gateway\",\"model\":\"test/model\",\"credential_source\":null,\"credential_identity\":null}},\"requested_fast_mode\":false,\"fast_mode\":false,\"max_provider_attempts\":3,\"consumed_provider_attempts\":0,\"outstanding_reservation\":false}}", .{cause});
+    const json = try alloc.print("{{\"version\":2,\"turn_id\":1,\"user\":{{\"text\":\"saved request\",\"images\":[]}},\"assistant_source\":\"partial\",\"execution\":{{\"schema_version\":3,\"tool_steps\":[],\"files\":[]}},\"cause\":\"{s}\",\"action\":\"continuing_response\",\"tool_state\":\"uncertain\",\"authority\":{{\"provider\":\"gateway\",\"model\":\"test/model\",\"credential_source\":null,\"credential_identity\":null}},\"requested_fast_mode\":false,\"fast_mode\":false,\"max_provider_attempts\":3,\"consumed_provider_attempts\":0,\"outstanding_reservation\":false}}", .{cause});
     defer alloc.free(json);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
     defer parsed.deinit();

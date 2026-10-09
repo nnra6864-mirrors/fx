@@ -130,7 +130,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
         try context.build_fn(alloc, request.data());
     defer if (request.prepared_request_body == null) alloc.free(payload);
     const auth = if (request.credential.secret()) |credential|
-        try std.fmt.allocPrint(alloc, "Bearer {s}", .{credential})
+        try alloc.print("Bearer {s}", .{credential})
     else
         null;
     defer if (auth) |value| alloc.free(value);

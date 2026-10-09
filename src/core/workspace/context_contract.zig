@@ -809,7 +809,7 @@ test "entrypoint model-visible layout snapshot covers major entrypoints" {
 test "context registry routes the default provider" {
     const Fixture = struct {
         fn gather(alloc: Allocator, input: InitialContextInput) ProviderError!ProviderContext {
-            return .{ .content = try std.fmt.allocPrint(alloc, "project:{s}", .{input.workspace_root}) };
+            return .{ .content = try alloc.print("project:{s}", .{input.workspace_root}) };
         }
 
         fn appendStatic(input: StaticContextInput, alloc: Allocator, messages: *std.ArrayList(types.ChatMessage)) ProviderError!void {
@@ -817,7 +817,7 @@ test "context registry routes the default provider" {
         }
 
         fn appendTransient(input: TransientContextInput, alloc: Allocator, messages: *std.ArrayList(types.ChatMessage)) ProviderError!void {
-            const content = try std.fmt.allocPrint(alloc, "runtime:{s}", .{input.workspace_root});
+            const content = try alloc.print("runtime:{s}", .{input.workspace_root});
             try messages.append(alloc, .{ .role = .system, .content = content });
         }
     };

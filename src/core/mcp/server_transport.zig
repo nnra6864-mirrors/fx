@@ -939,10 +939,10 @@ fn spawnStdioServer(alloc: Allocator, server: *McpServer, argv: []const []const 
         .argv = prepared.argv,
         .stdin = .pipe,
         .stdout = .pipe,
-        .stderr = if (builtin.os.tag == .windows) .ignore else .pipe,
+        .stderr = if (builtin.target.os.tag == .windows) .ignore else .pipe,
         .environ_map = if (server.env_map != null) &server.env_map.? else null,
         .cwd = if (server.config.cwd) |cwd| .{ .path = cwd } else .inherit,
-        .pgid = if (builtin.os.tag == .windows) null else 0,
+        .pgid = if (builtin.target.os.tag == .windows) null else 0,
     });
 
     server.dispatcher = stdio_dispatcher.StdioDispatcher.create(

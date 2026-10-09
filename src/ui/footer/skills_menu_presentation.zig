@@ -344,7 +344,7 @@ fn composeHeaderRow(
 fn appendHeaderTitle(alloc: Allocator, row: *std.ArrayList(u8), count: usize) !void {
     try row.appendSlice(alloc, ui_render.selected_completion_style);
     var buf: [48]u8 = undefined;
-    const title = std.fmt.bufPrint(&buf, "Skills {d}", .{count}) catch "Skills";
+    const title = std.mem.print(&buf, "Skills {d}", .{count}) catch "Skills";
     try row.appendSlice(alloc, title);
     try row.appendSlice(alloc, ui_render.reset_style);
 }
@@ -424,7 +424,7 @@ fn composeEmptyRow(
         "No skills found."
     else blk: {
         var buf: [96]u8 = undefined;
-        break :blk std.fmt.bufPrint(
+        break :blk std.mem.print(
             &buf,
             "No {s} skills found.",
             .{skill_runtime.skillMenuFilterLabel(source_filter)},

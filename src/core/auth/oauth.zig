@@ -190,7 +190,7 @@ pub fn discover(
     transport: oauth_transport.Provider,
     issuer_url: []const u8,
 ) !Metadata {
-    const url = try std.fmt.allocPrint(alloc, "{s}/.well-known/openid-configuration", .{issuer_url});
+    const url = try alloc.print("{s}/.well-known/openid-configuration", .{issuer_url});
     defer alloc.free(url);
     const bytes = try fetchJson(alloc, transport, .get, url, null, .{});
     defer alloc.free(bytes);

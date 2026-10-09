@@ -254,7 +254,7 @@ pub fn parse_vision_request(
         for (value.array.items, 0..) |item, index| {
             if (item != .string or
                 std.mem.trim(u8, item.string, " \t\r\n").len == 0 or
-                item.string.len > std.fs.max_path_bytes)
+                item.string.len > std.Io.Dir.max_path_bytes)
             {
                 return error.InvalidImagePath;
             }
@@ -483,7 +483,7 @@ pub noinline fn project_text_only_messages(
     projected[current_user_message_index].content = if (content.len == 0)
         try alloc.dupe(u8, references)
     else
-        try std.fmt.allocPrint(alloc, "{s}\n\n{s}", .{ content, references });
+        try alloc.print("{s}\n\n{s}", .{ content, references });
     return projected;
 }
 

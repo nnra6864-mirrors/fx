@@ -316,13 +316,13 @@ fn cloneUrl(alloc: Allocator, source: url_policy.ValidatedUrl) !url_policy.Valid
 fn hostHeader(alloc: Allocator, target: url_policy.ValidatedUrl) ![]u8 {
     const host = try hostForHeader(alloc, target.canonical_host);
     defer alloc.free(host);
-    if (target.explicit_port) |port| return std.fmt.allocPrint(alloc, "{s}:{d}", .{ host, port });
+    if (target.explicit_port) |port| return alloc.print("{s}:{d}", .{ host, port });
     return alloc.dupe(u8, host);
 }
 
 fn hostForHeader(alloc: Allocator, canonical_host: []const u8) ![]u8 {
     if (std.mem.findScalar(u8, canonical_host, ':') == null) return alloc.dupe(u8, canonical_host);
-    return std.fmt.allocPrint(alloc, "[{s}]", .{canonical_host});
+    return alloc.print("[{s}]", .{canonical_host});
 }
 
 fn isRedirectStatus(status: std.http.Status) bool {
@@ -1914,8 +1914,7 @@ test "web_fetch response parser consumes informational heads before final respon
         "103 Early Hints",
     };
     for (informational) |status_line| {
-        const payload = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const payload = try std.testing.allocator.print(
             "HTTP/1.1 {s}\r\nX-Interim: yes\r\n\r\n" ++
                 "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
             .{status_line},
@@ -3376,7 +3375,7 @@ test "web_fetch transport traces stable stages and redact sensitive values" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "web-fetch-transport.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "web-fetch-transport.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();

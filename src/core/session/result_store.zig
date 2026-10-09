@@ -273,7 +273,7 @@ pub fn storeToolImages(alloc: Allocator, capability: *session_child_store.Sessio
     if (out.written().len > image_data.max_result_frame_bytes) return error.ResultTooLarge;
     const base = try handleFor(alloc, capability, call_id, tool_name, out.written());
     defer alloc.free(base);
-    const handle = try std.fmt.allocPrint(alloc, "image-{s}", .{base});
+    const handle = try alloc.print("image-{s}", .{base});
     errdefer alloc.free(handle);
     try storeLargeResultAtHandleManaged(alloc, capability, handle, out.written());
     return handle;
@@ -484,8 +484,7 @@ fn makeDiffContentHandle(alloc: Allocator, tool_call_id: []const u8, pack: []con
     var call_digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(tool_call_id, &call_digest, .{});
     const call_hex = std.fmt.bytesToHex(call_digest[0..8].*, .lower);
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "diff-{s}-{s}.json",
         .{ &call_hex, &content_hex },
     );
@@ -513,8 +512,7 @@ fn storeLargeResultAtHandleManaged(
 }
 
 pub fn formatStoredResultOutput(alloc: Allocator, handle: []const u8, preview: []const u8, stored_bytes: usize) ![]u8 {
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "<tool_result_preview handle=\"{s}\" stored_bytes=\"{d}\">\n{s}\n</tool_result_preview>\n" ++
             "<tool_result_handle>{s}</tool_result_handle>\n" ++
             "Full result is stored outside session JSON. Use read_tool_result with this handle to inspect a byte range or literal query.",
@@ -554,8 +552,7 @@ pub fn readByRangeManaged(
     const end = @min(text.len, start + requested);
     const safe_start = text_utils.utf8ForwardBoundary(text, start);
     const safe_end = text_utils.utf8BackwardBoundary(text, end);
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "<tool_result handle=\"{s}\" start_byte=\"{d}\" end_byte=\"{d}\" total_bytes=\"{d}\">\n{s}\n</tool_result>",
         .{ handle, safe_start + 1, safe_end, text.len, text[safe_start..safe_end] },
     );
@@ -680,8 +677,7 @@ pub fn deleteManaged(
 }
 
 fn cappedInlineOutput(alloc: Allocator, tool_name: []const u8, text: []const u8, max_bytes: usize) ![]u8 {
-    const marker = try std.fmt.allocPrint(
-        alloc,
+    const marker = try alloc.print(
         "\n... [tool result truncated for {s}: original {d} bytes; cap is {d} bytes]\n",
         .{ tool_name, text.len, max_bytes },
     );
@@ -708,8 +704,7 @@ pub fn makeHandle(alloc: Allocator, tool_call_id: []const u8, tool_name: []const
     const call_hex = std.fmt.bytesToHex(call_digest[0..8].*, .lower);
     const safe_tool = try safeHandlePart(alloc, tool_name);
     defer alloc.free(safe_tool);
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "result-{s}-{s}-{s}.txt",
         .{ safe_tool, &call_hex, &content_hex },
     );
@@ -1487,7 +1482,7 @@ test "managed result reader reaches head middle and tail through bounded pages" 
     const middle = try reader.readPage(alloc, reader.size / 2, full_read_chunk_bytes);
     defer alloc.free(middle);
     try std.testing.expectEqual(@as(usize, full_read_chunk_bytes), middle.len);
-    try std.testing.expect(std.mem.indexOfScalar(u8, middle, 'x') != null);
+    try std.testing.expect(std.mem.findScalar(u8, middle, 'x') != null);
 
     const tail_offset = reader.size - "\nFULL_READER_TAIL\n".len;
     const tail = try reader.readPage(alloc, tail_offset, full_read_chunk_bytes);
@@ -1600,7 +1595,7 @@ test "managed result create read stat delete remains contained after route swap"
     );
     defer alloc.free(ranged);
     try std.testing.expect(std.mem.find(u8, ranged, "alpha") != null);
-    const outside_path = try std.fs.path.join(
+    const outside_path = try std.Io.Dir.path.join(
         alloc,
         &.{ "outside", handle },
     );

@@ -543,7 +543,7 @@ test "provider request image accounting borrows large payloads and releases scra
     const payload = try alloc.alloc(u8, 4 * 1024 * 1024);
     defer alloc.free(payload);
     @memset(payload, 'A');
-    const body = try std.fmt.allocPrint(alloc, "{{\"input\":[{{\"role\":\"user\",\"content\":[{{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,{s}\"}}]}}]}}", .{payload});
+    const body = try alloc.print("{{\"input\":[{{\"role\":\"user\",\"content\":[{{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,{s}\"}}]}}]}}", .{payload});
     defer alloc.free(body);
     var storage: [8192]u8 = undefined;
     var scratch = std.heap.FixedBufferAllocator.init(&storage);

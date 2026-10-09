@@ -59,7 +59,7 @@ pub fn shouldUsePlaceholder(bytes: []const u8) bool {
 /// Returns the slice of `buf` that was filled.
 pub fn formatPlaceholder(buf: []u8, id: usize, line_count: usize) ![]const u8 {
     const noun = if (line_count == 1) "line" else "lines";
-    return std.fmt.bufPrint(buf, "[Pasted text #{d}, {d} {s}]", .{ id, line_count, noun });
+    return std.mem.print(buf, "[Pasted text #{d}, {d} {s}]", .{ id, line_count, noun });
 }
 
 /// Replace every registered pasted-text span with its matching block content.

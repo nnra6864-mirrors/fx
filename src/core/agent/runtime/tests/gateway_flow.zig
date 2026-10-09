@@ -456,7 +456,7 @@ fn writeTestImagePath(alloc: Allocator, tmp: *std.testing.TmpDir) ![]u8 {
 fn testSnapshotDir(alloc: Allocator, tmp: *std.testing.TmpDir) ![]u8 {
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    return std.fs.path.join(alloc, &.{ root, "snapshots" });
+    return std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
 }
 
 fn testCapturedImage(
@@ -544,8 +544,7 @@ fn oversizedVisionProviderResult(alloc: Allocator, summary_bytes: usize) ![]u8 {
     const summary = try alloc.alloc(u8, summary_bytes);
     defer alloc.free(summary);
     @memset(summary, 'a');
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "{{\"images\":[{{\"image_id\":1,\"status\":\"ok\",\"summary\":\"{s}\",\"visible_text\":[],\"details\":[]}}]}}",
         .{summary},
     );
@@ -736,8 +735,7 @@ test "fake gateway rejects assistant prefill and unexpected tail continuations" 
         error.TestAssistantPrefillRequest,
         check(alloc, "{\"prompt\":[{\"role\":\"user\",\"content\":[]},{\"role\":\"assistant\",\"content\":[]}]}", true),
     );
-    const continued = try std.fmt.allocPrint(
-        alloc,
+    const continued = try alloc.print(
         "{{\"prompt\":[{{\"role\":\"assistant\",\"content\":[]}},{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}]}}",
         .{runtime_orchestrator.assistant_tail_continuation_prompt},
     );
@@ -1492,7 +1490,7 @@ test "processQueuedPrompt keeps corrupt twenty-image members inside their origin
         try std.testing.expectEqual(expected[1], countNeedle(gateway.request_bodies.items[2], "\"type\":\"file\""));
         try std.testing.expectEqual(expected[2], countNeedle(gateway.request_bodies.items[3], "\"type\":\"file\""));
         var invalid_marker: [32]u8 = undefined;
-        const marker = try std.fmt.bufPrint(
+        const marker = try std.mem.print(
             &invalid_marker,
             "image_id={d}",
             .{corrupt_index + 1},
@@ -2233,8 +2231,7 @@ test "vision does not retry a provider response over the output limit" {
 
     try std.testing.expectEqual(@as(usize, 1), script.calls);
     try std.testing.expect(std.mem.find(u8, result.model_output, "output_limit_exceeded") != null);
-    const expected_message = try std.fmt.allocPrint(
-        alloc,
+    const expected_message = try alloc.print(
         "Vision produced {d} bytes; the configured budget is 1024 bytes.",
         .{oversized.len},
     );
@@ -2570,7 +2567,7 @@ test "processQueuedPrompt routes images natively only when vision and file input
         const image = try testCapturedImage(alloc, &tmp, image_path, 1);
         defer types.freeImageAttachment(alloc, image);
         var images = [_]types.ImageAttachment{image};
-        const model = try std.fmt.allocPrint(alloc, "test/{s}", .{entry.label});
+        const model = try alloc.print("test/{s}", .{entry.label});
         defer alloc.free(model);
         const capability_overrides = [_]ModelCapabilityOverride{.{
             .model = model,
@@ -2776,7 +2773,7 @@ test "processQueuedPrompt traces selected live controls without request payloads
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "provider-options-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "provider-options-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -3396,7 +3393,7 @@ test "compaction remeasures its rebuilt continuation after calibrated preflight"
     var completions: [6]FakeCompletion = undefined;
     for (ids, 0..) |id, index| {
         calls[index] = .{toolCall(id, "read_file", "{\"path\":\"fixture.txt\"}")};
-        states[index] = try std.fmt.allocPrint(alloc, "[{{\"type\":\"reasoning\",\"text\":\"\",\"providerOptions\":{{\"openai\":{{\"reasoningEncryptedContent\":\"{s}\"}}}}}},{{\"type\":\"tool-call\",\"toolCallId\":\"{s}\"}}]", .{ text_utils.repeat("r", 200_000), id });
+        states[index] = try alloc.print("[{{\"type\":\"reasoning\",\"text\":\"\",\"providerOptions\":{{\"openai\":{{\"reasoningEncryptedContent\":\"{s}\"}}}}}},{{\"type\":\"tool-call\",\"toolCallId\":\"{s}\"}}]", .{ text_utils.repeat("r", 200_000), id });
         initialized += 1;
         completions[index] = .{ .tool_calls = &calls[index], .provider_state_json = states[index], .usage = .{ .input_tokens = inputs[index] } };
     }
@@ -4178,7 +4175,7 @@ test "processQueuedPrompt resolves catalog capabilities for opaque effort" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "portable-reasoning-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "portable-reasoning-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -4224,7 +4221,7 @@ test "processQueuedPrompt traces why stale controls are omitted" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "stale-controls-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "stale-controls-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -4830,11 +4827,11 @@ test "processQueuedPrompt places transient overlay before history and current pr
 
     try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
     const body = gateway.request_bodies.items[0];
-    const system_idx = std.mem.indexOf(u8, body, "system") orelse return error.TestExpectedEqual;
-    const static_idx = std.mem.indexOf(u8, body, "static project context unique") orelse return error.TestExpectedEqual;
-    const history_idx = std.mem.indexOf(u8, body, "past background prompt") orelse return error.TestExpectedEqual;
-    const current_idx = std.mem.indexOf(u8, body, "is it still running") orelse return error.TestExpectedEqual;
-    const runtime_idx = std.mem.indexOf(u8, body, "runtime tail context unique") orelse return error.TestExpectedEqual;
+    const system_idx = std.mem.find(u8, body, "system") orelse return error.TestExpectedEqual;
+    const static_idx = std.mem.find(u8, body, "static project context unique") orelse return error.TestExpectedEqual;
+    const history_idx = std.mem.find(u8, body, "past background prompt") orelse return error.TestExpectedEqual;
+    const current_idx = std.mem.find(u8, body, "is it still running") orelse return error.TestExpectedEqual;
+    const runtime_idx = std.mem.find(u8, body, "runtime tail context unique") orelse return error.TestExpectedEqual;
     try std.testing.expect(system_idx < static_idx);
     try std.testing.expect(static_idx < runtime_idx);
     try std.testing.expect(runtime_idx < history_idx);
@@ -5139,7 +5136,7 @@ test "processQueuedPrompt prepares each origin skill catalog with its supplied m
             skill.* = .{
                 .name = name,
                 .description = description,
-                .path = try std.fs.path.join(scratch.allocator(), &.{ case.workspace, "skills", name }),
+                .path = try std.Io.Dir.path.join(scratch.allocator(), &.{ case.workspace, "skills", name }),
                 .source = .workspace_shared,
             };
         }
@@ -5168,7 +5165,7 @@ test "processQueuedPrompt prepares each origin skill catalog with its supplied m
         try std.testing.expect(std.mem.find(u8, catalog, "<available_skills>") != null);
         try std.testing.expect(catalog.len <= @as(usize, case.context_window) * 2 / 100 * 4);
         for (names) |name| {
-            const entry = try std.fmt.allocPrint(scratch.allocator(), "- {s}: ", .{name});
+            const entry = try scratch.allocator().print("- {s}: ", .{name});
             try std.testing.expect(std.mem.find(u8, catalog, entry) != null);
         }
         try std.testing.expect(std.mem.find(u8, catalog, case.workspace) != null);
@@ -5522,9 +5519,9 @@ test "processQueuedPrompt keeps completed history before the final current user 
     try expectGatewayPromptTextCount(&gateway, 0, "runtime context structural needle", 1);
     try expectGatewayPromptTextCount(&gateway, 0, "current structural prompt needle", 1);
     const body = gateway.request_bodies.items[0];
-    const history_idx = std.mem.indexOf(u8, body, "prior assistant structural needle") orelse return error.TestExpectedEqual;
-    const runtime_idx = std.mem.indexOf(u8, body, "runtime context structural needle") orelse return error.TestExpectedEqual;
-    const current_idx = std.mem.indexOf(u8, body, "current structural prompt needle") orelse return error.TestExpectedEqual;
+    const history_idx = std.mem.find(u8, body, "prior assistant structural needle") orelse return error.TestExpectedEqual;
+    const runtime_idx = std.mem.find(u8, body, "runtime context structural needle") orelse return error.TestExpectedEqual;
+    const current_idx = std.mem.find(u8, body, "current structural prompt needle") orelse return error.TestExpectedEqual;
     try std.testing.expect(runtime_idx < history_idx);
     try std.testing.expect(history_idx < current_idx);
     try expectGatewayPromptFinalUserText(&gateway, 0, "current structural prompt needle");
@@ -5740,8 +5737,7 @@ test "processQueuedPrompt does not language-retry a tool-bearing response" {
 test "processQueuedPrompt discards prose replay without losing reasoning or tool metadata" {
     const alloc = std.testing.allocator;
     const prose = "我会先检查锁文件和依赖清单。";
-    const state = try std.fmt.allocPrint(
-        alloc,
+    const state = try alloc.print(
         "[{{\"type\":\"reasoning\",\"text\":\"retained_reasoning\"}},{{\"type\":\"text\",\"offset\":0,\"length\":{d},\"providerOptions\":{{\"fixture\":{{\"id\":\"discarded_text\"}}}}}},{{\"type\":\"tool-call\",\"toolCallId\":\"call_read\",\"providerOptions\":{{\"fixture\":{{\"id\":\"retained_tool\"}}}}}}]",
         .{prose.len},
     );
@@ -6615,7 +6611,7 @@ test "processQueuedPrompt retries replay-safe ReadFailed before success" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "read-failed-retry-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "read-failed-retry-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -8823,7 +8819,7 @@ test "processQueuedPrompt trace records history shape returned tool calls and wa
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "agent-loop-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "agent-loop-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -8882,7 +8878,7 @@ test "processQueuedPrompt assigns trace lineage to subagent runs" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "subagent-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "subagent-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -8920,7 +8916,7 @@ test "processQueuedPrompt trace emits one canonical result for tool execution er
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "tool-error-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "tool-error-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();

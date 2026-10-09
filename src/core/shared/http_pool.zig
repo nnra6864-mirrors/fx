@@ -230,7 +230,7 @@ test "drain evicts a real parked connection past the TTL" {
     var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var server = try address.listen(zio, .{ .reuse_address = true });
     defer server.deinit(zio);
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/chat", .{server.socket.address.getPort()});
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/chat", .{server.socket.address.getPort()});
     defer std.testing.allocator.free(url);
 
     var pool = HttpPool.init(std.testing.allocator);

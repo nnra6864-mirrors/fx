@@ -190,7 +190,7 @@ pub fn Runtime(comptime App: type) type {
                     else
                         "Authentication is unavailable. Run /provider to repair this source.";
                     debug_trace.logf("auth", "resumed credential unavailable source={t} err={s}", .{ failure.source, @errorName(failure.err) });
-                    const body = try std.fmt.allocPrint(app.alloc, "{s}: {s}", .{ credentials.sourceLabel(failure.source), message });
+                    const body = try app.alloc.print("{s}: {s}", .{ credentials.sourceLabel(failure.source), message });
                     defer app.alloc.free(body);
                     try app.writeDomainNotice(.{ .topic = "auth", .tone = .@"error", .body = body }, true);
                 },
@@ -581,8 +581,7 @@ pub fn Runtime(comptime App: type) type {
                     }
                     var unavailable = app.auth.pickerView().unavailable_sources.iterator();
                     while (unavailable.next()) |source| {
-                        const body = try std.fmt.allocPrint(
-                            app.alloc,
+                        const body = try app.alloc.print(
                             "{s} is unavailable. Check the saved credential or choose another option.",
                             .{credentials.sourceLabel(source)},
                         );
@@ -880,8 +879,7 @@ pub fn Runtime(comptime App: type) type {
                 .saved => |changed| {
                     applyCredentialChange(app, changed);
                     rememberCredentialSource(app, .stored_key);
-                    const body = try std.fmt.allocPrint(
-                        app.alloc,
+                    const body = try app.alloc.print(
                         "Saved the API key to {s} and made it active.",
                         .{credentials.stored_key_backend_label},
                     );
@@ -914,8 +912,7 @@ pub fn Runtime(comptime App: type) type {
                     .body = "Could not verify that API key with AI Gateway. Nothing was stored.",
                 }, true),
                 .store_failed => {
-                    const body = try std.fmt.allocPrint(
-                        app.alloc,
+                    const body = try app.alloc.print(
                         "Could not save the API key to {s}. Nothing was stored.",
                         .{credentials.stored_key_backend_label},
                     );
@@ -927,8 +924,7 @@ pub fn Runtime(comptime App: type) type {
                     }, true);
                 },
                 .reload_failed => {
-                    const body = try std.fmt.allocPrint(
-                        app.alloc,
+                    const body = try app.alloc.print(
                         "Saved the API key to {s}, but could not make it active.",
                         .{credentials.stored_key_backend_label},
                     );
@@ -977,8 +973,7 @@ pub fn Runtime(comptime App: type) type {
         /// when it did not. Failure is already explained to the user here.
         pub fn applySourceChoice(app: *App, source: credentials.Source) !bool {
             if (try rejectPendingPreparation(app)) return false;
-            const body = try std.fmt.allocPrint(
-                app.alloc,
+            const body = try app.alloc.print(
                 "Switched credential to {s}.",
                 .{credentials.sourceLabel(source)},
             );
@@ -1158,7 +1153,7 @@ pub fn Runtime(comptime App: type) type {
             })) {
                 .prepare => {},
                 .no_change => {
-                    const body = try std.fmt.allocPrint(app.alloc, "Already using {s}.", .{provider_catalog.label(target)});
+                    const body = try app.alloc.print("Already using {s}.", .{provider_catalog.label(target)});
                     defer app.alloc.free(body);
                     try app.writeDomainNotice(.{
                         .topic = "provider",
@@ -1237,7 +1232,7 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             };
-            const body = try std.fmt.allocPrint(app.alloc, "Preparing {s}.", .{provider_catalog.label(input.target())});
+            const body = try app.alloc.print("Preparing {s}.", .{provider_catalog.label(input.target())});
             defer app.alloc.free(body);
             try app.writeDomainNotice(.{
                 .topic = "provider",
@@ -1381,8 +1376,7 @@ pub fn Runtime(comptime App: type) type {
             if (credential) |*value| _ = app.auth.adoptCredential(app.alloc, value);
             reconcileGatewayCredential(app);
 
-            const body = try std.fmt.allocPrint(
-                app.alloc,
+            const body = try app.alloc.print(
                 "Switched to {s} with {s}.",
                 .{ provider_catalog.label(target), provider_runtime.model(app) },
             );
@@ -1600,7 +1594,7 @@ pub fn Runtime(comptime App: type) type {
             const selection = app.auth.loadedTeamSelection() orelse return false;
             if (index >= selection.teams.items.len) return false;
             const team = selection.teams.items[index];
-            const body = try std.fmt.allocPrint(app.alloc, "Changed Vercel team to {s} ({s}).", .{ team.name, team.slug });
+            const body = try app.alloc.print("Changed Vercel team to {s} ({s}).", .{ team.name, team.slug });
             defer app.alloc.free(body);
             if (validation == .rejected) {
                 cancelPromptRetryAfterAuth(app);
@@ -1997,28 +1991,23 @@ pub fn Runtime(comptime App: type) type {
         ) ![]u8 {
             const source_label = credentials.sourceLabel(failure.source);
             return switch (failure.reason) {
-                .invalid_credential => std.fmt.allocPrint(
-                    alloc,
+                .invalid_credential => alloc.print(
                     "{s} sign-in expired.\npress enter to sign in again. Your prompt is saved.",
                     .{source_label},
                 ),
-                .invalid_storage => std.fmt.allocPrint(
-                    alloc,
+                .invalid_storage => alloc.print(
                     "{s}: Saved credential storage is unavailable.\nCheck credential storage, then press enter to retry. Your prompt is saved.",
                     .{source_label},
                 ),
-                .persistence_uncertain => std.fmt.allocPrint(
-                    alloc,
+                .persistence_uncertain => alloc.print(
                     "{s} refresh could not be saved.\npress enter to sign in again. Your prompt is saved.",
                     .{source_label},
                 ),
-                .authority_changed => std.fmt.allocPrint(
-                    alloc,
+                .authority_changed => alloc.print(
                     "{s} account or team changed during refresh.\nReview authentication before retrying. Your prompt is saved.",
                     .{source_label},
                 ),
-                .temporary_unavailable => std.fmt.allocPrint(
-                    alloc,
+                .temporary_unavailable => alloc.print(
                     "{s} credential refresh failed.\npress enter to retry. Your prompt is saved.",
                     .{source_label},
                 ),
@@ -2091,7 +2080,7 @@ pub fn Runtime(comptime App: type) type {
             const failure = auth_runtime.classifyCredentialFailure(source, err);
             if (failure.reason == .invalid_storage or failure.reason == .persistence_uncertain) {
                 const notice = auth_runtime.preparationFailureNotice(auth_runtime.preparationError(failure).?).?;
-                const body = try std.fmt.allocPrint(app.alloc, "{s}: {s}", .{ credentials.sourceLabel(source), notice });
+                const body = try app.alloc.print("{s}: {s}", .{ credentials.sourceLabel(source), notice });
                 defer app.alloc.free(body);
                 try writeAuthNotice(app, .{ .topic = "auth", .tone = .@"error", .body = body });
                 return;
@@ -3180,8 +3169,7 @@ test "completed credential switch emits exactly one transcript line" {
     try std.testing.expectEqual(@as(usize, 1), app.preference_write_count);
     try std.testing.expectEqual(credentials.Source.stored_key, app.last_preference_source.?);
     try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
-    const expected = try std.fmt.allocPrint(
-        app.alloc,
+    const expected = try app.alloc.print(
         "Switched credential to {s}.\n",
         .{credentials.sourceLabel(.stored_key)},
     );

@@ -166,7 +166,7 @@ pub fn writeInput(
                     try std.json.Stringify.value(message.content orelse "", .{}, writer);
                 } else {
                     const failed = message.tool_result_status == .failure;
-                    const text = if (failed) try std.fmt.allocPrint(scratch_alloc, "Tool error: {s}", .{message.content orelse ""}) else message.content orelse "";
+                    const text = if (failed) try scratch_alloc.print("Tool error: {s}", .{message.content orelse ""}) else message.content orelse "";
                     defer if (failed) scratch_alloc.free(text);
                     try writer.writeByte('[');
                     if (text.len > 0) {
@@ -176,7 +176,7 @@ pub fn writeInput(
                     }
                     for (tool_images, 0..) |image, index| {
                         try budget.check();
-                        const url = try std.fmt.allocPrint(scratch_alloc, "data:{s};base64,{s}", .{ image.mime_type, image.data });
+                        const url = try scratch_alloc.print("data:{s};base64,{s}", .{ image.mime_type, image.data });
                         defer scratch_alloc.free(url);
                         if (index > 0 or text.len > 0) try writer.writeByte(',');
                         try writer.writeAll("{\"type\":\"input_image\",\"image_url\":");
@@ -499,7 +499,7 @@ test "Responses images use captured bytes and reject unavailable snapshots" {
     defer out.deinit();
     try ImageInputTest.write(alloc, &out.writer, &messages, null);
     try std.testing.expect(std.mem.find(u8, out.written(), "data:image/png;base64,iVBORw0KGgpB") != null);
-    const snapshot_name = std.fs.path.basename(attachment.snapshot_path.?);
+    const snapshot_name = std.Io.Dir.path.basename(attachment.snapshot_path.?);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = snapshot_name, .data = "\x89PNG\r\n\x1a\nB" });
     try std.testing.expectError(error.ImageSnapshotCorrupt, ImageInputTest.write(alloc, &out.writer, &messages, null));
     try tmp.dir.deleteFile(std.testing.io, snapshot_name);
@@ -1161,7 +1161,7 @@ pub const Reducer = struct {
         const bounded_code = types.ModelFailureDiagnostic.init(code);
         const bounded_message = types.ModelFailureDiagnostic.init(message);
         var buffer: [2 * types.ModelFailureDiagnostic.max_bytes + 2]u8 = undefined;
-        const text = try std.fmt.bufPrint(&buffer, "{s}: {s}", .{ bounded_code.view(), bounded_message.view() });
+        const text = try std.mem.print(&buffer, "{s}: {s}", .{ bounded_code.view(), bounded_message.view() });
         const detail = types.ModelFailureDiagnostic.init(text);
         self.provider_failure_detail = try alloc.dupe(u8, detail.view());
         self.provider_failure_cause = if (std.mem.eql(u8, code, "server_error"))
@@ -1410,7 +1410,7 @@ test "Responses absent final snapshot preserves completed stream evidence" {
         try stream.apply(
             \\{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_done","phase":"final_answer","content":[{"type":"output_text","text":"Completed answer."}]}}
         );
-        const terminal = try std.fmt.allocPrint(stream.alloc, "{{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\"{s}}}}}", .{snapshot});
+        const terminal = try stream.alloc.print("{{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\"{s}}}}}", .{snapshot});
         defer stream.alloc.free(terminal);
         try stream.apply(terminal);
         const completion = try stream.finish();
@@ -1456,13 +1456,13 @@ test "Responses output kinds remain exclusive across item event stages" {
             for ([_][]const u8{ "response.output_item.added", "response.output_item.done", "response.completed" }) |stage| {
                 var stream = ToolRecordTest.init(std.testing.allocator);
                 defer stream.deinit();
-                const start = try std.fmt.allocPrint(stream.alloc, "{{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{s}}}", .{initial});
+                const start = try stream.alloc.print("{{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{s}}}", .{initial});
                 defer stream.alloc.free(start);
                 try stream.apply(start);
                 const event = if (std.mem.eql(u8, stage, "response.completed"))
-                    try std.fmt.allocPrint(stream.alloc, "{{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\",\"output\":[{s}]}}}}", .{replacement})
+                    try stream.alloc.print("{{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\",\"output\":[{s}]}}}}", .{replacement})
                 else
-                    try std.fmt.allocPrint(stream.alloc, "{{\"type\":\"{s}\",\"output_index\":0,\"item\":{s}}}", .{ stage, replacement });
+                    try stream.alloc.print("{{\"type\":\"{s}\",\"output_index\":0,\"item\":{s}}}", .{ stage, replacement });
                 defer stream.alloc.free(event);
                 if (from == to) {
                     try stream.apply(event);
@@ -1499,7 +1499,7 @@ test "Responses non-null snapshot shapes remain invalid" {
     for ([_][]const u8{ "{}", "false", "0", "\"invalid\"" }) |snapshot| {
         var stream = ToolRecordTest.init(std.testing.allocator);
         defer stream.deinit();
-        const event = try std.fmt.allocPrint(stream.alloc, "{{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\",\"output\":{s}}}}}", .{snapshot});
+        const event = try stream.alloc.print("{{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\",\"output\":{s}}}}}", .{snapshot});
         defer stream.alloc.free(event);
         try std.testing.expectError(error.InvalidEvent, stream.apply(event));
         try std.testing.expectError(error.StreamIncomplete, stream.finish());
@@ -1690,7 +1690,7 @@ test "Responses reasoning replay retains terminal enrichment without duplicates"
     for ([_][]const u8{ "", ",\"encrypted_content\":\"opaque\"" }) |encrypted| {
         var stream = ToolRecordTest.init(std.testing.allocator);
         defer stream.deinit();
-        const item = try std.fmt.allocPrint(stream.alloc, "{{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[]{s}}}}}", .{encrypted});
+        const item = try stream.alloc.print("{{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[]{s}}}}}", .{encrypted});
         defer stream.alloc.free(item);
         try stream.apply(item);
         try stream.apply("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":\"opaque\"}]}}");
@@ -1716,7 +1716,7 @@ test "Responses reasoning replay binds supplied identity before ciphertext" {
     for ([_][]const u8{ "response.output_item.added", "response.output_item.done" }) |kind| {
         var stream = ToolRecordTest.init(std.testing.allocator);
         defer stream.deinit();
-        const event = try std.fmt.allocPrint(stream.alloc, "{{\"type\":\"{s}\",\"output_index\":0,\"item\":{{\"type\":\"reasoning\",\"id\":\"rs_original\"}}}}", .{kind});
+        const event = try stream.alloc.print("{{\"type\":\"{s}\",\"output_index\":0,\"item\":{{\"type\":\"reasoning\",\"id\":\"rs_original\"}}}}", .{kind});
         defer stream.alloc.free(event);
         try stream.apply(event);
         try std.testing.expectError(error.ResponsesReasoningConflict, stream.apply("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"reasoning\",\"id\":\"rs_replacement\",\"encrypted_content\":\"opaque\"}]}}"));
@@ -1754,7 +1754,7 @@ test "Responses reasoning replay rejects conflicting final evidence and invalid 
         var stream = ToolRecordTest.init(std.testing.allocator);
         defer stream.deinit();
         try stream.apply("{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}}");
-        const event = try std.fmt.allocPrint(stream.alloc, "{{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\",\"output\":[{s}]}}}}", .{item});
+        const event = try stream.alloc.print("{{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\",\"output\":[{s}]}}}}", .{item});
         defer stream.alloc.free(event);
         try std.testing.expectError(error.ResponsesReasoningConflict, stream.apply(event));
         try std.testing.expectError(error.StreamIncomplete, stream.finish());
@@ -1766,7 +1766,7 @@ test "Responses reasoning replay rejects conflicting final evidence and invalid 
     }) |item| {
         var stream = ToolRecordTest.init(std.testing.allocator);
         defer stream.deinit();
-        const event = try std.fmt.allocPrint(stream.alloc, "{{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\",\"output\":[{s}]}}}}", .{item});
+        const event = try stream.alloc.print("{{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\",\"output\":[{s}]}}}}", .{item});
         defer stream.alloc.free(event);
         try std.testing.expectError(error.InvalidEvent, stream.apply(event));
     }
@@ -2577,8 +2577,7 @@ pub fn buildSubscriptionBilling(
     if (provider == .gateway or created_at_ms < 0) return null;
     const input_tokens = usage.input_tokens orelse return null;
     const output_tokens = usage.output_tokens orelse return null;
-    const qualified_model = try std.fmt.allocPrint(
-        alloc,
+    const qualified_model = try alloc.print(
         "{s}/{s}",
         .{ @tagName(provider), model },
     );

@@ -1309,7 +1309,7 @@ test "prompt history recall restores image snapshots with fresh ids and exact sk
     defer alloc.free(source_path);
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
 
     var runtime = InputRuntime{};
@@ -1671,7 +1671,7 @@ test "prompt history restores the complete saved semantic draft" {
     defer alloc.free(source_path);
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
 
     var runtime = InputRuntime{};
@@ -1862,7 +1862,7 @@ test "prompt history corrupt image rejection preserves the active draft" {
     defer alloc.free(source_path);
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
 
     var runtime = InputRuntime{};
@@ -2054,7 +2054,7 @@ test "backspace image placeholder removal preserves sorted attachment ids" {
     var token_start: usize = 0;
     inline for (.{ 1, 2, 3 }) |id| {
         var token_buf: [32]u8 = undefined;
-        const token = try std.fmt.bufPrint(&token_buf, "[Image #{d}]", .{id});
+        const token = try std.mem.print(&token_buf, "[Image #{d}]", .{id});
         try runtime.entities.image_tokens.append(alloc, .{
             .id = id,
             .span = .{ .raw_start = token_start, .raw_end = token_start + token.len },
@@ -2062,7 +2062,7 @@ test "backspace image placeholder removal preserves sorted attachment ids" {
         token_start += token.len;
         try blocks.append(alloc, .{
             .id = id,
-            .path = try std.fmt.allocPrint(alloc, "/tmp/{d}.png", .{id}),
+            .path = try alloc.print("/tmp/{d}.png", .{id}),
             .media_type = try alloc.dupe(u8, "image/png"),
         });
     }
@@ -3943,11 +3943,11 @@ fn appendPastedBlockForTest(runtime: *InputRuntime, alloc: Allocator, id: usize,
 fn appendImageBlockForTest(runtime: *InputRuntime, blocks: *ImageBlocks, alloc: Allocator, id: usize) !void {
     try blocks.append(alloc, .{
         .id = id,
-        .path = try std.fmt.allocPrint(alloc, "/tmp/{d}.png", .{id}),
+        .path = try alloc.print("/tmp/{d}.png", .{id}),
         .media_type = try alloc.dupe(u8, "image/png"),
     });
     var placeholder_buf: [64]u8 = undefined;
-    const placeholder = try std.fmt.bufPrint(&placeholder_buf, "[Image #{d}]", .{id});
+    const placeholder = try std.mem.print(&placeholder_buf, "[Image #{d}]", .{id});
     if (std.mem.find(u8, runtime.edit_state.input.items, placeholder)) |raw_start| {
         try runtime.entities.image_tokens.ensureUnusedCapacity(alloc, 1);
         runtime.entities.registerImageTokenAssumeCapacity(.{
@@ -3976,7 +3976,7 @@ fn appendCapturedImageBlockForTest(
     attachment_owned = false;
 
     var placeholder_buf: [64]u8 = undefined;
-    const placeholder = try std.fmt.bufPrint(&placeholder_buf, "[Image #{d}]", .{id});
+    const placeholder = try std.mem.print(&placeholder_buf, "[Image #{d}]", .{id});
     if (std.mem.find(u8, runtime.edit_state.input.items, placeholder)) |raw_start| {
         try runtime.entities.image_tokens.ensureUnusedCapacity(alloc, 1);
         runtime.entities.registerImageTokenAssumeCapacity(.{
@@ -4013,7 +4013,7 @@ test "line kill and repeated yank preserve images and exact skill provenance" {
     defer alloc.free(source_path);
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
 
     var runtime = InputRuntime{};
@@ -4133,13 +4133,13 @@ fn checkStructuredKillYankAllocationFailure(
     std.crypto.hash.sha2.Sha256.hash(image_bytes, &digest_bytes, .{});
     const digest_hex = std.fmt.bytesToHex(digest_bytes, .lower);
     var snapshot_name_buf: [96]u8 = undefined;
-    const snapshot_name = try std.fmt.bufPrint(
+    const snapshot_name = try std.mem.print(
         &snapshot_name_buf,
         "image-8-{s}.bin",
         .{digest_hex[0..16]},
     );
     var snapshot_relative_buf: [128]u8 = undefined;
-    const snapshot_relative = try std.fmt.bufPrint(
+    const snapshot_relative = try std.mem.print(
         &snapshot_relative_buf,
         "snapshots/{s}",
         .{snapshot_name},
@@ -4170,7 +4170,7 @@ fn checkStructuredKillYankAllocationFailure(
     const media_type = try alloc.dupe(u8, "image/png");
     var media_type_owned = true;
     errdefer if (media_type_owned) alloc.free(media_type);
-    const snapshot_path = try std.fs.path.join(
+    const snapshot_path = try std.Io.Dir.path.join(
         alloc,
         &.{ root, "snapshots", snapshot_name },
     );
@@ -4683,7 +4683,7 @@ test "known-id pasted scans reject dense different-id prefixes" {
     try runtime.edit_state.input.appendSlice(alloc, "[Pasted text #7, 1 line]");
     for (0..128) |suffix| {
         var buf: [96]u8 = undefined;
-        const lookalike = try std.fmt.bufPrint(&buf, "[Pasted text #7{d}, nested ", .{suffix});
+        const lookalike = try std.mem.print(&buf, "[Pasted text #7{d}, nested ", .{suffix});
         try runtime.edit_state.input.appendSlice(alloc, lookalike);
     }
     try runtime.edit_state.input.append(alloc, ']');
@@ -4700,7 +4700,7 @@ test "atomic line deletion trace logs dropped backing without sensitive contents
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "line-delete-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "line-delete-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -4734,7 +4734,7 @@ test "atomic line deletion trace logs a same-id backing once and skips survivors
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "line-delete-dedup-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "line-delete-dedup-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();

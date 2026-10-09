@@ -690,8 +690,8 @@ const AcpElicitationResponderContext = struct {
     acp: *AcpContext,
     tool_call_id: []const u8,
     operation_cancel_flag: ?*const std.atomic.Value(bool),
-    accepted_url_ids: std.ArrayListUnmanaged([]u8) = .empty,
-    accepted_legacy_urls: std.ArrayListUnmanaged(AcceptedLegacyUrl) = .empty,
+    accepted_url_ids: std.ArrayList([]u8) = .empty,
+    accepted_legacy_urls: std.ArrayList(AcceptedLegacyUrl) = .empty,
 
     fn deinit(self: *AcpElicitationResponderContext) void {
         for (self.accepted_url_ids.items) |id| self.acp.state.alloc.free(id);
@@ -1080,7 +1080,7 @@ pub fn handlePrompt(
         else
             null,
     );
-    if (comptime @import("builtin").os.tag != .wasi) {
+    if (comptime @import("builtin").target.os.tag != .wasi) {
         if (state.cfg.provider_set.select(session.provider).deferred_usage != null) {
             if (session.credential_source == .host_managed) {
                 session.session_rt.usage.replaceHostManagedReconciliationAuthority(
@@ -1526,7 +1526,7 @@ const ParsedPromptInput = struct {
         for (self.pending_images, 0..) |pending, index| {
             var attachment = if (pending.bytes.len == 0) ref: {
                 if (pending.source_ref == null or !image_data.supportedMediaType(pending.media_type)) return error.InvalidPromptImage;
-                const path = try std.fmt.allocPrint(alloc, image_attachments.inline_image_path_prefix ++ "{d}", .{pending.id});
+                const path = try alloc.print(image_attachments.inline_image_path_prefix ++ "{d}", .{pending.id});
                 errdefer alloc.free(path);
                 break :ref types.ImageAttachment{
                     .id = pending.id,
@@ -1855,7 +1855,7 @@ fn localFileTargetPath(alloc: Allocator, uri_text: []const u8) Allocator.Error!?
         write_index += 1;
     }
     const decoded_path = decoded_storage[0..write_index];
-    if (!std.fs.path.isAbsolute(decoded_path)) return null;
+    if (!std.Io.Dir.path.isAbsolute(decoded_path)) return null;
 
     var components = std.mem.splitScalar(u8, decoded_path, '/');
     while (components.next()) |component| {
@@ -2431,7 +2431,7 @@ fn describeToolActionDenied(raw_ctx: *anyopaque, arena: Allocator, call: ToolCal
         .display_target = display_target,
         .is_available_dynamic_mcp_tool = lifecycleDynamicMcpToolAvailable(ctx, call.name, advertised_dynamic_tool_names),
     });
-    return std.fmt.allocPrint(arena, "{s}: {s}", .{ label, action });
+    return arena.print("{s}: {s}", .{ label, action });
 }
 
 fn lifecycleDynamicMcpToolAvailable(ctx: *AcpContext, name: []const u8, advertised_dynamic_tool_names: []const []const u8) bool {
@@ -2536,7 +2536,7 @@ fn completeToolCallTransport(
         var buffer: [512]u8 = undefined;
         const notice = tool_call_presentation.shellResultNotice(result.model_output, &buffer) orelse
             break :blk preview;
-        notice_text = std.fmt.allocPrint(ctx.alloc, "{s}\n{s}", .{ notice, preview }) catch
+        notice_text = ctx.alloc.print("{s}\n{s}", .{ notice, preview }) catch
             break :blk preview;
         break :blk notice_text.?;
     };
@@ -3139,9 +3139,9 @@ fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u
         null;
     defer if (owned_message) |message| ctx.alloc.free(message);
     const msg = owned_message orelse if (detail.len > 0)
-        std.fmt.bufPrint(&buf, "HTTP {d}: {s}", .{ @backingInt(status), detail }) catch "HTTP error"
+        std.mem.print(&buf, "HTTP {d}: {s}", .{ @backingInt(status), detail }) catch "HTTP error"
     else
-        std.fmt.bufPrint(&buf, "HTTP {d}", .{@backingInt(status)}) catch "HTTP error";
+        std.mem.print(&buf, "HTTP {d}", .{@backingInt(status)}) catch "HTTP error";
     ctx.sendAgentText(ctx.operationalMessageId(), msg) catch {};
 }
 
@@ -3259,7 +3259,7 @@ fn requestAcpElicitation(
 
     var id_buffer: [48]u8 = undefined;
     const url_id = if (input_request.mode == .url)
-        try std.fmt.bufPrint(&id_buffer, "fx-{d}", .{outbound_id})
+        try std.mem.print(&id_buffer, "fx-{d}", .{outbound_id})
     else
         null;
     const legacy_source_id = if (origin.wire.isLegacy() and input_request.mode == .url)
@@ -3385,13 +3385,11 @@ fn formatAcpElicitationMessage(
     request: mcp_elicitation.Request,
 ) ![]u8 {
     return switch (request.mode) {
-        .form => std.fmt.allocPrint(
-            alloc,
+        .form => alloc.print(
             "fx received a form request from MCP server {s}. {s}",
             .{ server_name, request.message },
         ),
-        .url => std.fmt.allocPrint(
-            alloc,
+        .url => alloc.print(
             "fx received a URL request from MCP server {s} for host {s}. {s}",
             .{ server_name, request.url_host orelse "unknown", request.message },
         ),
@@ -4220,11 +4218,10 @@ test "parsePromptInput preserves resource text and accepts only local absolute f
     defer alloc.free(root);
     const expected_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "Fx Project/src/main.zig");
     defer alloc.free(expected_path);
-    const local_uri = try std.fmt.allocPrint(alloc, "file://{s}/Fx%20Project/src/main.zig", .{root});
+    const local_uri = try alloc.print("file://{s}/Fx%20Project/src/main.zig", .{root});
     defer alloc.free(local_uri);
     const remote_uri = "https://example.test/reference.txt";
-    const params = try std.fmt.allocPrint(
-        alloc,
+    const params = try alloc.print(
         "{{\"sessionId\":\"s1\",\"prompt\":[" ++
             "{{\"type\":\"resource\",\"resource\":{{\"uri\":\"{s}\",\"text\":\"local body\"}}}}," ++
             "{{\"type\":\"resource\",\"resource\":{{\"uri\":\"{s}\",\"text\":\"remote body\"}}}}]}}",
@@ -4235,8 +4232,7 @@ test "parsePromptInput preserves resource text and accepts only local absolute f
     var parsed = try parsePromptInput(alloc, params);
     defer parsed.deinit(alloc);
 
-    const expected_text = try std.fmt.allocPrint(
-        alloc,
+    const expected_text = try alloc.print(
         "File: {s}\nlocal body\nFile: {s}\nremote body",
         .{ local_uri, remote_uri },
     );
@@ -4265,8 +4261,7 @@ test "parsePromptInput rejects unsafe file URI targeting without losing embedded
     };
 
     for (uris) |uri| {
-        const params = try std.fmt.allocPrint(
-            alloc,
+        const params = try alloc.print(
             "{{\"sessionId\":\"s1\",\"prompt\":[{{\"type\":\"resource\",\"resource\":{{\"uri\":\"{s}\",\"text\":\"embedded text\"}}}}]}}",
             .{uri},
         );
@@ -4320,11 +4315,11 @@ test "localFileTargetPath canonicalizes a local symlink target" {
 
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const alias_path = try std.fs.path.join(alloc, &.{ root, "alias.txt" });
+    const alias_path = try std.Io.Dir.path.join(alloc, &.{ root, "alias.txt" });
     defer alloc.free(alias_path);
     const expected = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "real.txt");
     defer alloc.free(expected);
-    const uri = try std.fmt.allocPrint(alloc, "file://{s}", .{alias_path});
+    const uri = try alloc.print("file://{s}", .{alias_path});
     defer alloc.free(uri);
 
     const actual = (try localFileTargetPath(alloc, uri)) orelse
@@ -4341,8 +4336,7 @@ test "parsePromptInput releases partial resource state across allocation failure
     file.close(std.testing.io);
     const local_path = try io_mod.dirRealpathAlloc(backing, tmp.dir, "local.txt");
     defer backing.free(local_path);
-    const params = try std.fmt.allocPrint(
-        backing,
+    const params = try backing.print(
         "{{\"sessionId\":\"s1\",\"prompt\":[" ++
             "{{\"type\":\"resource\",\"resource\":{{\"uri\":\"file://{s}\",\"text\":\"local body\"}}}}," ++
             "{{\"type\":\"resource\",\"resource\":{{\"uri\":\"https://example.test/reference.txt\",\"text\":\"remote body\"}}}}]}}",
@@ -4723,7 +4717,7 @@ const AcpContextRegistryFixture = struct {
     fn gather(alloc: Allocator, _: context_contract.InitialContextInput) context_contract.ProviderError!context_contract.ProviderContext {
         gather_calls += 1;
         if (gather_error) |err| return err;
-        return .{ .content = try std.fmt.allocPrint(alloc, "ACP registry context {d}", .{gather_calls}) };
+        return .{ .content = try alloc.print("ACP registry context {d}", .{gather_calls}) };
     }
 
     fn appendStatic(input: context_contract.StaticContextInput, alloc: Allocator, messages: *std.ArrayList(ChatMessage)) context_contract.ProviderError!void {
@@ -5229,7 +5223,7 @@ fn testPermissionRuleSet(alloc: Allocator, permission: []const u8, pattern: []co
 }
 
 fn createSymlinkOrSkip(dir: std.Io.Dir, target_path: []const u8, link_path: []const u8) !void {
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     dir.symLink(std.testing.io, target_path, link_path, .{ .is_directory = false }) catch |err| {
         if (err == error.AccessDenied or std.mem.eql(u8, @errorName(err), "Permission" ++ "Denied")) {
             return error.SkipZigTest;
@@ -5594,9 +5588,8 @@ test "ACP auto mode automatic review clears or cautions prepared external file m
         ),
     };
 
-    const target_path = try std.fs.path.join(arena, &.{ external, "desktop-test.txt" });
-    const arguments_json = try std.fmt.allocPrint(
-        arena,
+    const target_path = try std.Io.Dir.path.join(arena, &.{ external, "desktop-test.txt" });
+    const arguments_json = try arena.print(
         "{{\"path\":\"{s}\",\"content\":\"hello\\n\"}}",
         .{target_path},
     );

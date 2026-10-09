@@ -470,8 +470,7 @@ pub const Reviewer = struct {
         const context_message: []const u8 = switch (view) {
             .normal => "review_context_kind: normal\n",
             .contextual => blk: {
-                const message = std.fmt.allocPrint(
-                    alloc,
+                const message = alloc.print(
                     "review_context_kind: contextual\ntrusted_root_context:\n{s}",
                     .{trusted_root_context},
                 ) catch |err| return constructionFailure(err);
@@ -1275,7 +1274,7 @@ pub const function_schema: model_tool_schema.FunctionSchema = .{
 fn toolsJsonAlloc(alloc: std.mem.Allocator) ![]u8 {
     const schema_json = try model_tool_schema.builtinFunctionSchemaJsonAlloc(alloc, function_schema);
     defer alloc.free(schema_json);
-    return std.fmt.allocPrint(alloc, "[{s}]", .{schema_json});
+    return alloc.print("[{s}]", .{schema_json});
 }
 
 test "automatic review model-facing tool contract stays byte exact" {
@@ -1680,8 +1679,8 @@ test "prior tool result selection is entry bounded and keeps the newest window" 
     var contents: [20][16]u8 = undefined;
     var messages: [21]types.ChatMessage = undefined;
     for (messages[0..20], 0..) |*message, index| {
-        const call_id = try std.fmt.bufPrint(&call_ids[index], "call-{d}", .{index});
-        const content = try std.fmt.bufPrint(&contents[index], "result-{d}", .{index});
+        const call_id = try std.mem.print(&call_ids[index], "call-{d}", .{index});
+        const content = try std.mem.print(&contents[index], "result-{d}", .{index});
         message.* = .{
             .role = .tool,
             .content = content,
@@ -1822,7 +1821,7 @@ test "automatic review preserves the exact invalid completion cause" {
 
 test "review response uses the structured decision despite commentary" {
     for ([_][]const u8{ "clear", "caution" }) |decision| {
-        const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"decision\":\"{s}\"}}", .{decision});
+        const args = try std.testing.allocator.print("{{\"decision\":\"{s}\"}}", .{decision});
         defer std.testing.allocator.free(args);
         var result = try parseCompletion(std.testing.allocator, .{
             .content = "Additional text is not decision authority.",
@@ -2031,8 +2030,7 @@ test "automatic review sends exact unmasked secret-like action evidence" {
         .build_fn = buildTestReviewPayload,
     }, null, 1000);
     const command = "python3 -c 'import secrets; print(\"TOOL_DATA_TOKEN=\"+secrets.token_hex(12))'";
-    const arguments_json = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const arguments_json = try std.testing.allocator.print(
         "{{\"action\":\"run\",\"command\":{f}}}",
         .{std.json.fmt(command, .{})},
     );

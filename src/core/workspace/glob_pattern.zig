@@ -55,7 +55,7 @@ pub const Pattern = struct {
     /// Returns true when the pattern matches a path. Patterns without slash match the basename.
     pub fn matchesPath(self: Pattern, candidate_path: []const u8) bool {
         if (!self.has_path_separator) {
-            return matchSegment(self.raw, std.fs.path.basename(candidate_path));
+            return matchSegment(self.raw, std.Io.Dir.path.basename(candidate_path));
         }
         return matchSegmented(self.segments, candidate_path);
     }

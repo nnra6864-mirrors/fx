@@ -811,7 +811,7 @@ pub const Runtime = struct {
                     if (steering_worker) |worker| {
                         if (worker.hasPendingPlainSteering()) {
                             debug_trace.eventf("subagent", "steering_wait_yielded", .{}, "child_id={s} work_id={s} child_cancelled=false", .{ child_id, work_id });
-                            const pending_text = try std.fmt.allocPrint(alloc, "{s}\nchild_id={s} work_id={s}", .{ model_contract.steering_pending_result, child_id, work_id });
+                            const pending_text = try alloc.print("{s}\nchild_id={s} work_id={s}", .{ model_contract.steering_pending_result, child_id, work_id });
                             defer alloc.free(pending_text);
                             var pending = try self.encodeManaged(alloc, .{ .ok = true, .pending = true, .result = pending_text });
                             if (status.sink != null) attachStatusPresentation(alloc, &pending, status.current(observation.metrics));
@@ -1153,7 +1153,7 @@ fn operationIdAlloc(
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(invocation_id, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
-    return std.fmt.allocPrint(alloc, "fxop:2:m:{d}:{s}", .{ epoch, &hex });
+    return alloc.print("fxop:2:m:{d}:{s}", .{ epoch, &hex });
 }
 
 fn checkYieldedOwnership(alloc: Allocator) !void {
@@ -1892,7 +1892,7 @@ test "model override passes through for non-gateway providers" {
 fn formatFailedResult(alloc: Allocator, failure: ?[]const u8, partial: ?[]const u8) ![]u8 {
     const reason = failure orelse "failure reason unavailable";
     const text = partial orelse "";
-    return std.fmt.allocPrint(alloc, "Subagent failed: {s}. Earlier tool calls may have completed; their effects are not rolled back.{s}{s}", .{
+    return alloc.print("Subagent failed: {s}. Earlier tool calls may have completed; their effects are not rolled back.{s}{s}", .{
         reason,
         if (text.len > 0) "\n\nPartial result:\n" else "",
         text,

@@ -196,7 +196,7 @@ fn upgradeWorkerInner(
     var rand_buf: [8]u8 = undefined;
     io_mod.getIo().random(&rand_buf);
     const rand_hex = std.fmt.bytesToHex(rand_buf, .lower);
-    const tmp_dir = try std.fmt.allocPrint(alloc, "{s}/fx-upgrade-{s}", .{ tmp_base, rand_hex });
+    const tmp_dir = try alloc.print("{s}/fx-upgrade-{s}", .{ tmp_base, rand_hex });
     defer alloc.free(tmp_dir);
     defer std.Io.Dir.cwd().deleteTree(io_mod.getIo(), tmp_dir) catch {};
 
@@ -205,10 +205,10 @@ fn upgradeWorkerInner(
         return;
     };
 
-    const archive_path = try std.fmt.allocPrint(alloc, "{s}/fx.tar.gz", .{tmp_dir});
+    const archive_path = try alloc.print("{s}/fx.tar.gz", .{tmp_dir});
     defer alloc.free(archive_path);
 
-    const archive_url = try std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.tar.gz", .{ cdn_base, target.artifactRef(), helpers.platform });
+    const archive_url = try alloc.print("{s}/{s}/fx-{s}.tar.gz", .{ cdn_base, target.artifactRef(), helpers.platform });
     defer alloc.free(archive_url);
 
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
@@ -224,7 +224,7 @@ fn upgradeWorkerInner(
     };
     progress.markFinishing();
 
-    const checksum_url = try std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.tar.gz.sha256", .{ cdn_base, target.artifactRef(), helpers.platform });
+    const checksum_url = try alloc.print("{s}/{s}/fx-{s}.tar.gz.sha256", .{ cdn_base, target.artifactRef(), helpers.platform });
     defer alloc.free(checksum_url);
 
     helpers.verifyChecksum(&client, archive_path, checksum_url, .{}) catch |err| {
@@ -241,10 +241,10 @@ fn upgradeWorkerInner(
         return;
     };
 
-    const extracted_bin = try std.fmt.allocPrint(alloc, "{s}/fx", .{tmp_dir});
+    const extracted_bin = try alloc.print("{s}/fx", .{tmp_dir});
     defer alloc.free(extracted_bin);
 
-    var self_exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var self_exe_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const self_exe = helpers.currentExecutablePath(&self_exe_buf) catch {
         result.err = .self_exe_not_found;
         return;

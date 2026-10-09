@@ -81,7 +81,7 @@ fn formatHttpDiagnostic(
     title: ?[]const u8,
     max_bytes: usize,
 ) ![]u8 {
-    if (detail.len == 0) return std.fmt.allocPrint(alloc, "HTTP {d}", .{@backingInt(status)});
+    if (detail.len == 0) return alloc.print("HTTP {d}", .{@backingInt(status)});
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, detail, .{}) catch
         return formatFallbackBounded(alloc, status, detail, max_bytes);
@@ -187,8 +187,8 @@ fn formatFallbackBounded(
     detail: []const u8,
     max_bytes: usize,
 ) ![]u8 {
-    if (detail.len == 0) return std.fmt.allocPrint(alloc, "HTTP {d}", .{@backingInt(status)});
-    const raw = try std.fmt.allocPrint(alloc, "HTTP {d}: {s}", .{ @backingInt(status), detail });
+    if (detail.len == 0) return alloc.print("HTTP {d}", .{@backingInt(status)});
+    const raw = try alloc.print("HTTP {d}: {s}", .{ @backingInt(status), detail });
     defer alloc.free(raw);
     return sanitizeExternalText(alloc, raw, max_bytes);
 }
@@ -266,7 +266,7 @@ fn writeParamPath(writer: *std.Io.Writer, value: std.json.Value) !bool {
 
 fn schemaKindAfter(message: ?[]const u8, marker: []const u8) ?[]const u8 {
     const text = message orelse return null;
-    const marker_index = std.mem.indexOf(u8, text, marker) orelse return null;
+    const marker_index = std.mem.find(u8, text, marker) orelse return null;
     var start = marker_index + marker.len;
     while (start < text.len and (text[start] == ' ' or text[start] == '\'' or text[start] == '"' or text[start] == '`')) : (start += 1) {}
     var end = start;
@@ -316,7 +316,7 @@ fn jsonKindName(value: std.json.Value) []const u8 {
 fn providerFromGatewayMessage(message: ?[]const u8) ?[]const u8 {
     const text = message orelse return null;
     const marker = "Providers considered: ";
-    const start = std.mem.indexOf(u8, text, marker) orelse return null;
+    const start = std.mem.find(u8, text, marker) orelse return null;
     const provider_text = trimBreakWhitespace(text[start + marker.len ..]);
     var end: usize = 0;
     while (end < provider_text.len) : (end += 1) {

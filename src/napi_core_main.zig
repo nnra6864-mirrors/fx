@@ -50,7 +50,7 @@ const ReadyNotifier = struct {
 
     fn init() error{ReadyChannelFailed}!ReadyNotifier {
         var pair: [2]c_int = undefined;
-        const flags = if (@import("builtin").os.tag == .macos) 0 else std.c.SOCK.CLOEXEC | std.c.SOCK.NONBLOCK;
+        const flags = if (@import("builtin").target.os.tag == .macos) 0 else std.c.SOCK.CLOEXEC | std.c.SOCK.NONBLOCK;
         const socket_type = std.c.SOCK.STREAM | flags;
         if (std.c.socketpair(std.c.AF.UNIX, socket_type, 0, &pair) != 0) return error.ReadyChannelFailed;
         errdefer for (pair) |fd| {

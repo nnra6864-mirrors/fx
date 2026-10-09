@@ -222,7 +222,7 @@ pub fn encodeTerminalSafePathTail(
     raw: []const u8,
     max_encoded_bytes: usize,
 ) error{ OutOfMemory, PathBasenameTooLong }!EncodedPathTail {
-    const basename = std.fs.path.basename(raw);
+    const basename = std.Io.Dir.path.basename(raw);
     if (basename.len == 0) return error.PathBasenameTooLong;
     const basename_source_start = raw.len - basename.len;
 
@@ -462,7 +462,7 @@ pub fn clippedLabel(buf: []u8, text: []const u8, max_len: usize) []const u8 {
 
 pub fn sanitizeModelText(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
     if (isModelSafeText(text)) return text;
-    return std.fmt.allocPrint(arena, "binary or non-utf8 tool output omitted ({d} bytes)", .{text.len});
+    return arena.print("binary or non-utf8 tool output omitted ({d} bytes)", .{text.len});
 }
 
 pub fn maskSecrets(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
@@ -1180,8 +1180,8 @@ test "encodeTerminalSafe visibly escapes controls line breaks and invalid UTF-8"
         "A\\x1b[31m\\x0a\\x0d\\x07\\x7fB\\xff",
         encoded.bytes,
     );
-    try std.testing.expect(std.mem.indexOfScalar(u8, encoded.bytes, 0x1b) == null);
-    try std.testing.expect(std.mem.indexOfScalar(u8, encoded.bytes, '\n') == null);
+    try std.testing.expect(std.mem.findScalar(u8, encoded.bytes, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, encoded.bytes, '\n') == null);
     try std.testing.expect(std.unicode.utf8ValidateSlice(encoded.bytes));
     try std.testing.expect(!encoded.truncated);
 }
@@ -1204,8 +1204,8 @@ test "encodeTerminalSafeInline still escapes dangerous controls and invalid UTF-
     defer encoded.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("a\\x1b[31m b\\x07\\xff", encoded.bytes);
-    try std.testing.expect(std.mem.indexOfScalar(u8, encoded.bytes, 0x1b) == null);
-    try std.testing.expect(std.mem.indexOfScalar(u8, encoded.bytes, '\n') == null);
+    try std.testing.expect(std.mem.findScalar(u8, encoded.bytes, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, encoded.bytes, '\n') == null);
     try std.testing.expect(std.unicode.utf8ValidateSlice(encoded.bytes));
 }
 
@@ -1259,7 +1259,7 @@ test "incremental terminal-safe encoding matches the whole-slice policy at every
         try encoder.append(&out.writer, raw[split..]);
         try encoder.finish(&out.writer);
         try std.testing.expectEqualStrings(expected.bytes, out.written());
-        try std.testing.expect(std.mem.indexOfScalar(u8, out.written(), 0x1b) == null);
+        try std.testing.expect(std.mem.findScalar(u8, out.written(), 0x1b) == null);
     }
 }
 
@@ -1289,7 +1289,7 @@ test "encodeTerminalSafe makes every byte value terminal-safe UTF-8" {
     for (encoded.bytes) |byte| {
         try std.testing.expect(byte >= 0x20 and byte != 0x7f);
     }
-    try std.testing.expect(std.mem.indexOfScalar(u8, encoded.bytes, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, encoded.bytes, 0x1b) == null);
     try std.testing.expect(!encoded.truncated);
 }
 
@@ -1314,8 +1314,7 @@ test "encodeTerminalSafePathTail preserves a complete basename from a long sourc
     const prefix = try std.testing.allocator.alloc(u8, 5 * 1024);
     defer std.testing.allocator.free(prefix);
     @memset(prefix, 'a');
-    const raw = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const raw = try std.testing.allocator.print(
         "/{s}/note.txt",
         .{prefix},
     );
@@ -1409,7 +1408,7 @@ test "encodeTerminalSafePathTail keeps hostile UTF-8 and escape tokens whole" {
     defer encoded.deinit(std.testing.allocator);
 
     try std.testing.expect(std.unicode.utf8ValidateSlice(encoded.bytes));
-    try std.testing.expect(std.mem.indexOfScalar(u8, encoded.bytes, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, encoded.bytes, 0x1b) == null);
     try std.testing.expect(
         std.mem.find(u8, encoded.bytes, "\\x1b") != null,
     );

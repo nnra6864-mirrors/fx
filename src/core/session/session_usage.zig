@@ -1360,7 +1360,7 @@ pub const Usage = struct {
     /// only updates the profile-level usage ledger. Tests keep the legacy
     /// synchronous flush so assertions stay deterministic.
     fn scheduleProfilePublicationDrain(self: *Usage) void {
-        if (builtin.is_test or comptime builtin.os.tag == .wasi) {
+        if (builtin.is_test or comptime builtin.target.os.tag == .wasi) {
             self.flushProfilePublications();
             return;
         }
@@ -1394,7 +1394,7 @@ pub const Usage = struct {
     /// Stops the background profile-publication drain, joining any live worker.
     /// A later schedule starts a fresh worker.
     fn stopPublicationDrain(self: *Usage) void {
-        if (builtin.is_test or comptime builtin.os.tag == .wasi) return;
+        if (builtin.is_test or comptime builtin.target.os.tag == .wasi) return;
         self.publication_drain_cancel.store(true, .seq_cst);
         self.publication_drain_mutex.lockUncancelable(io_mod.getIo());
         defer self.publication_drain_mutex.unlock(io_mod.getIo());
@@ -5434,13 +5434,13 @@ test "usage keeps more than sixteen exact resolved models" {
     const suffixes = "ABCDEFGHJKMNPQRST";
     for (suffixes, 0..) |suffix, index| {
         var id_buf: [30]u8 = undefined;
-        const id = try std.fmt.bufPrint(
+        const id = try std.mem.print(
             &id_buf,
             "gen_01ARZ3NDEKTSV4RRFFQ69G5FA{c}",
             .{suffix},
         );
         var model_buf: [64]u8 = undefined;
-        const model = try std.fmt.bufPrint(&model_buf, "provider/model-{d}", .{index});
+        const model = try std.mem.print(&model_buf, "provider/model-{d}", .{index});
         const sequence = try usage.reserveInvocation();
         try usage.finishObservedInvocation(
             alloc,
@@ -5506,7 +5506,7 @@ test "sixteenth pending generation is the capacity boundary" {
 
     for (suffixes[0..max_pending_generations]) |suffix| {
         var id_buf: [30]u8 = undefined;
-        const id = try std.fmt.bufPrint(
+        const id = try std.mem.print(
             &id_buf,
             "gen_01ARZ3NDEKTSV4RRFFQ69G5FA{c}",
             .{suffix},
@@ -5532,7 +5532,7 @@ test "sixteenth pending generation is the capacity boundary" {
     );
 
     var overflow_id_buf: [30]u8 = undefined;
-    const overflow_id = try std.fmt.bufPrint(
+    const overflow_id = try std.mem.print(
         &overflow_id_buf,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FA{c}",
         .{suffixes[max_pending_generations]},

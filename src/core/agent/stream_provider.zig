@@ -729,8 +729,7 @@ test "stream provider exposes its exact request serializer without streaming" {
         ) anyerror![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.calls += 1;
-            return std.fmt.allocPrint(
-                alloc,
+            return alloc.print(
                 "model={s};instructions={d};messages={d};tools={d}",
                 .{ request.model, request.instructions.len, request.messages.len, request.tools.advertised_names.len },
             );

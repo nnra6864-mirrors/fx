@@ -2960,7 +2960,7 @@ test "active prompt snapshot ownership discards every pre-transfer boundary" {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         var name_buffer: [32]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buffer, "snapshot-{d}.bin", .{index});
+        const name = try std.mem.print(&name_buffer, "snapshot-{d}.bin", .{index});
         {
             var file = try tmp.dir.createFile(std.testing.io, name, .{});
             defer file.close(std.testing.io);
@@ -3565,7 +3565,7 @@ test "multi-queue history propagation is allocation-failure atomic" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const snapshot_path = try std.fs.path.join(alloc, &.{ root, "snapshot.bin" });
+    const snapshot_path = try std.Io.Dir.path.join(alloc, &.{ root, "snapshot.bin" });
     defer alloc.free(snapshot_path);
 
     var fail_index: usize = 0;
@@ -3970,7 +3970,7 @@ test "finish ownership handoff preserves allocator and filesystem ownership" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const snapshot_path = try std.fs.path.join(alloc, &.{ root, "snapshot.bin" });
+    const snapshot_path = try std.Io.Dir.path.join(alloc, &.{ root, "snapshot.bin" });
     defer alloc.free(snapshot_path);
 
     try std.testing.checkAllAllocationFailures(

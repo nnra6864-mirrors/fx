@@ -100,7 +100,7 @@ fn storageBackend() StorageBackend {
     // A temporary HOME does not isolate the host account's macOS Keychain.
     // Keychain-specific tests inject their backend explicitly.
     if (comptime builtin.is_test) return .profile_file;
-    return selectStorageBackend(builtin.os.tag, native_keychain.isDisabled());
+    return selectStorageBackend(builtin.target.os.tag, native_keychain.isDisabled());
 }
 
 pub fn presence() host_contract.SecretStorePresence {
@@ -1402,7 +1402,7 @@ test "oauth session loading propagates allocation failures" {
 }
 
 test "OAuth mutation loads report auth file open failures" {
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.symLink(std.testing.io, "missing-auth-target", auth_file_name, .{ .is_directory = false });

@@ -18,8 +18,7 @@ pub fn contentAddressedHandle(
         return error.InvalidArtifactHandle;
     }
     const digest_hex = std.fmt.bytesToHex(digest[0..8].*, .lower);
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "{s}-{s}{s}",
         .{
             source_handle[0 .. source_handle.len - suffix.len],
@@ -46,7 +45,7 @@ pub fn blobHandle(
 /// The blob a v2 handle names (`blobHandle`), or null for any other handle,
 /// such as a v1 one. Borrows from `handle`.
 pub fn blobHash(handle: []const u8) ?[]const u8 {
-    const separator = std.mem.lastIndexOfScalar(u8, handle, '-') orelse return null;
+    const separator = std.mem.findScalarLast(u8, handle, '-') orelse return null;
     const rest = handle[separator + 1 ..];
     const encoded = rest[0 .. std.mem.findScalar(u8, rest, '.') orelse rest.len];
     if (encoded.len != blob_hex_bytes or !isLowerHex(encoded)) return null;
@@ -75,7 +74,7 @@ pub fn handleMatchesContentDigest(
 fn encodedDigest(handle: []const u8, suffix: []const u8) ?[]const u8 {
     if (suffix.len == 0 or !std.mem.endsWith(u8, handle, suffix)) return null;
     const stem = handle[0 .. handle.len - suffix.len];
-    const separator = std.mem.lastIndexOfScalar(u8, stem, '-') orelse return null;
+    const separator = std.mem.findScalarLast(u8, stem, '-') orelse return null;
     const encoded = stem[separator + 1 ..];
     if (encoded.len != digest_hex_bytes and encoded.len != blob_hex_bytes) return null;
     if (!isLowerHex(encoded)) return null;
