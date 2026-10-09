@@ -850,6 +850,8 @@ if (durabilityKind === "memory") {
 test("world() checks its options, and an agent names it among the durabilities", async () => {
   assert.throws(() => world(), /world\(\) takes a World or a function that creates one/);
   assert.throws(() => world({}, { pollMs: 0 }), /world\(\) pollMs must be a positive integer/);
+  assert.throws(() => world({}, { leaseMs: 999 }), /world\(\) leaseMs must be an integer of at least 1000/);
+  assert.throws(() => world({}, { leaseMs: 1500.5 }), /world\(\) leaseMs must be an integer of at least 1000/);
   assert.throws(() => world({}, { name: "pg", queueDurable: "yes" }), /pg\(\) queueDurable must be a boolean/);
   assert.throws(() => world({}, { name: "pg", livenessKnown: true }), /pg\(\) livenessKnown needs alive\(\)/);
   assert.throws(() => world({}, { alive: true }), /world\(\) alive must be a function/);

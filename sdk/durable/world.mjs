@@ -13,7 +13,10 @@ const durabilityTag = Symbol.for("libfx.durability");
  *
  * - `livenessKnown`: `alive(lease)` answers whether a lease's holder still
  *   runs, from what `holderInfo()` put in it, so a crashed worker's session
- *   frees at once. Otherwise a lease holds until its deadline.
+ *   frees at once. Otherwise its worker renews the lease while it runs, and
+ *   a session frees `leaseMs` after a dead worker's last renewal.
+ * - `leaseMs`: how long a lease lasts after it was taken or last renewed,
+ *   when liveness is unknown. Default 15000.
  * - `queueDurable`: the queue keeps a message until a delivery acknowledges
  *   it, across crashes. Otherwise `prompt()` stores the prompt first.
  * - `pollMs`: how often a waiting worker reads the session again.
@@ -25,12 +28,14 @@ export function world(source, options = {}) {
   const owned = typeof source === "function";
   if (!owned && !(source && typeof source === "object")) throw new TypeError("world() takes a World or a function that creates one");
   if (!options || typeof options !== "object" || Array.isArray(options)) throw new TypeError("world() options must be an object");
-  const { name = "world", livenessKnown = false, queueDurable = false, pollMs, maxDurationMs, reserveMs, alive, holderInfo, gatewayKey } = options;
+  const { name = "world", livenessKnown = false, queueDurable = false, pollMs, leaseMs, maxDurationMs, reserveMs, alive, holderInfo, gatewayKey } = options;
   if (typeof name !== "string" || name.length === 0) throw new TypeError("world() name must be a non-empty string");
   for (const [key, value] of Object.entries({ livenessKnown, queueDurable })) {
     if (typeof value !== "boolean") throw new TypeError(`${name}() ${key} must be a boolean`);
   }
   if (pollMs !== undefined && !(Number.isSafeInteger(pollMs) && pollMs > 0)) throw new TypeError(`${name}() pollMs must be a positive integer`);
+  // Renewed every third of it, so a lease shorter than a second renews faster than a write lands.
+  if (leaseMs !== undefined && !(Number.isSafeInteger(leaseMs) && leaseMs >= 1000)) throw new TypeError(`${name}() leaseMs must be an integer of at least 1000`);
   for (const [key, value] of Object.entries({ maxDurationMs, reserveMs })) {
     if (value !== undefined && !(Number.isSafeInteger(value) && value >= 0)) throw new TypeError(`${name}() ${key} must be a non-negative integer`);
   }
@@ -46,6 +51,7 @@ export function world(source, options = {}) {
     livenessKnown,
     queueDurable,
     ...(pollMs === undefined ? {} : { pollMs }),
+    ...(leaseMs === undefined ? {} : { leaseMs }),
     ...(maxDurationMs === undefined ? {} : { maxDurationMs }),
     ...(reserveMs === undefined ? {} : { reserveMs }),
     ...(alive === undefined ? {} : { alive }),
