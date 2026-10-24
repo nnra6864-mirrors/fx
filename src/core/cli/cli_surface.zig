@@ -1123,6 +1123,10 @@ fn runNonInteractiveWithDeps(
         try writeModelModifierUsage(deps);
         return .handled_failure;
     }
+    if (global_args.modifiers.instances != null) {
+        try writeStderr(deps, "fx: --instances applies to interactive sessions\n");
+        return .handled_failure;
+    }
 
     if (isVersionFlag(effective_args[0])) {
         if (effective_args.len != 1) {
