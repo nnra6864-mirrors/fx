@@ -346,18 +346,65 @@ fn readProfile(arena: Allocator, dir: []const u8, name: []const u8, source: Sour
     const settings = readFile(arena, settings_path, max_settings_bytes) catch |err| switch (err) {
         error.FileNotFound => return null,
         error.OutOfMemory => return error.OutOfMemory,
-        else => return fail(arena, failure, "profile '{s}': cannot read {s}: {s}", .{ name, settings_path, @errorName(err) }),
+        else => return fail(arena, failure, "profile '{s}': cannot read {s}: {s}", .{ name, settings_path, readFailure(err, max_settings_bytes) }),
     };
     const prompt_path = try std.Io.Dir.path.join(arena, &.{ dir, name, prompt_file_name });
     const prompt = readFile(arena, prompt_path, max_prompt_bytes) catch |err| switch (err) {
         error.FileNotFound => "",
         error.OutOfMemory => return error.OutOfMemory,
-        else => return fail(arena, failure, "profile '{s}': cannot read {s}: {s}", .{ name, prompt_path, @errorName(err) }),
+        else => return fail(arena, failure, "profile '{s}': cannot read {s}: {s}", .{ name, prompt_path, readFailure(err, max_prompt_bytes) }),
     };
     return parse(arena, name, source, settings, prompt, failure) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.InvalidProfile => error.InvalidProfile,
     };
+}
+
+/// Why a profile file couldn't be read, in words.
+fn readFailure(err: anyerror, max_bytes: usize) []const u8 {
+    return switch (err) {
+        error.StreamTooLong => if (max_bytes == max_prompt_bytes)
+            "it is larger than the 256 KiB a profile file may hold"
+        else
+            "it is larger than the 64 KiB a profile file may hold",
+        error.AccessDenied, error.PermissionDenied => "fx isn't allowed to read it",
+        error.IsDir => "it is a folder, not a file",
+        else => "the file couldn't be read",
+    };
+}
+
+test "profile read failures name the limit instead of an error" {
+    try std.testing.expect(std.mem.find(u8, readFailure(error.StreamTooLong, max_prompt_bytes), "256 KiB") != null);
+    try std.testing.expect(std.mem.find(u8, readFailure(error.StreamTooLong, max_settings_bytes), "64 KiB") != null);
+    try std.testing.expectEqualStrings("it is a folder, not a file", readFailure(error.IsDir, max_prompt_bytes));
+}
+
+test "profile parsing stays bounded on fuzzed settings and prompts" {
+    try std.testing.fuzz({}, fuzzProfileParse, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "{}",
+            "{\"tools\": [\"read_file\"], \"prompt\": \"replace\"}",
+            "{\"mcp_servers\": [\"*\"], \"model\": \"openai/gpt-5\", \"effort\": \"low\"}",
+            "{\"tools\": 3, \"unknown\": null}",
+            "\xff\x00{",
+        }) ++ @import("fuzz_corpus").profile_parse.*),
+    });
+}
+
+fn fuzzProfileParse(_: void, smith: *std.testing.Smith) anyerror!void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var settings_buffer: [4096]u8 = undefined;
+    const settings = settings_buffer[0..@intCast(smith.slice(&settings_buffer))];
+    var prompt_buffer: [512]u8 = undefined;
+    const prompt = prompt_buffer[0..@intCast(smith.slice(&prompt_buffer))];
+    var failure: ?[]const u8 = null;
+    const profile = parse(arena.allocator(), "fuzz", .project, settings, prompt, &failure) catch |err| switch (err) {
+        // A refused profile always says why.
+        error.InvalidProfile => return std.testing.expect(failure != null),
+        error.OutOfMemory => return err,
+    };
+    try std.testing.expectEqualStrings("fuzz", profile.name);
 }
 
 fn readFile(arena: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
