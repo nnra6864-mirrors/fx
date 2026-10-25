@@ -99,9 +99,7 @@ pub const ChildAgent = struct {
     /// see `turnGoing`.
     fn workGoing(self: *ChildAgent) bool {
         if (self.agent.child_run) |*run| if (run.inFlight()) return true;
-        return self.agent.worker.isProcessing() or
-            self.agent.worker.queuedPromptCount() > 0 or
-            self.agent.worker.hasPendingEvents();
+        return turnInFlight(&self.agent) or self.agent.worker.hasPendingEvents();
     }
 };
 
@@ -123,7 +121,7 @@ pub const AgentsMenu = struct {
 
 /// What an instance is doing, as the instance list shows it, most urgent
 /// first.
-pub const InstanceState = enum {
+const InstanceState = enum {
     needs_approval,
     has_question,
     working,
@@ -141,16 +139,16 @@ pub const InstanceState = enum {
     }
 };
 
-pub fn instanceState(agent: *agents.Agent) InstanceState {
+fn instanceState(agent: *agents.Agent) InstanceState {
     if (agent.approval_prompt.isActive()) return .needs_approval;
     if (agent.question_prompt.isActive()) return .has_question;
-    if (instanceTurnGoing(agent)) return .working;
+    if (turnInFlight(agent)) return .working;
     if (agent.finished_unseen) return .finished;
     return .idle;
 }
 
 /// Whether one of `agent`'s turns is going or queued.
-fn instanceTurnGoing(agent: *agents.Agent) bool {
+fn turnInFlight(agent: *agents.Agent) bool {
     return agent.worker.isProcessing() or agent.worker.queuedPromptCount() > 0;
 }
 
@@ -708,11 +706,62 @@ pub fn Runtime(comptime App: type) type {
         pub fn homeOfScreen(app: *App, name_buf: []u8) ?Home {
             const child = app.agent_on_screen orelse return null;
             if (child.agent.role != .subagent) return null;
-            const root = rootInstance(app, child);
-            const hosted: ?*ChildAgent = if (root == &app.main_agent) null else for (app.child_agents.items) |entry| {
-                if (&entry.agent == root) break entry;
-            } else null;
+            const hosted = screenInstance(app);
             return .{ .name = noteName(app, hosted, name_buf), .key = keyToward(app, hosted) };
+        }
+
+        /// The instance on screen, or the one whose tree holds the subagent
+        /// on screen; null for the first instance.
+        fn screenInstance(app: *App) ?*ChildAgent {
+            const child = app.agent_on_screen orelse return null;
+            if (child.agent.role != .subagent) return child;
+            const root = rootInstance(app, child);
+            if (root == &app.main_agent) return null;
+            for (app.child_agents.items) |entry| if (&entry.agent == root) return entry;
+            return null;
+        }
+
+        /// The footer note for a hidden agent waiting on an answer, such as
+        /// "reviewer needs approval · Alt+→", or the finished note, or empty.
+        /// fx never switches on its own. `buf` backs the returned text.
+        pub fn waitingNote(app: *App, buf: []u8) []const u8 {
+            // The first waiting agent the note names, null for the first
+            // instance, which `main_agent` holds.
+            var first: ?*ChildAgent = null;
+            var found = false;
+            var state: InstanceState = .needs_approval;
+            var count: usize = 0;
+            if (app.agent_on_screen != null and firstOpen(app)) {
+                // Main's own request, not a subagent's that main also shows.
+                const main_waiting = if (app.main_agent.approval_prompt.request) |request|
+                    request.origin == .active_session
+                else
+                    false;
+                if (main_waiting or app.main_agent.question_prompt.isActive()) {
+                    found = true;
+                    state = if (main_waiting) .needs_approval else .has_question;
+                    count += 1;
+                }
+            }
+            for (app.child_agents.items) |child| {
+                if (child == app.agent_on_screen) continue;
+                const approval = child.agent.approval_prompt.isActive();
+                if (!approval and !child.agent.question_prompt.isActive()) continue;
+                if (!found) {
+                    first = child;
+                    found = true;
+                    state = if (approval) .needs_approval else .has_question;
+                }
+                count += 1;
+            }
+            if (!found) return finishedNote(app, buf);
+            var name_buf: [32]u8 = undefined;
+            const name = noteName(app, first, &name_buf);
+            const key = keyToward(app, first);
+            return if (count > 1)
+                std.mem.print(buf, "{s} and {d} more need you · {s}", .{ name, count - 1, key }) catch ""
+            else
+                std.mem.print(buf, "{s} {s} · {s}", .{ name, state.label(), key }) catch "";
         }
 
         /// The key that reaches agent `target`, null for the first instance,
@@ -762,7 +811,7 @@ pub fn Runtime(comptime App: type) type {
 
         /// Updates `agent`'s marks; whether either changed.
         fn noteFinished(agent: *AppAgent, on_screen: bool) bool {
-            const going = instanceTurnGoing(agent);
+            const going = turnInFlight(agent);
             const finished = if (on_screen) false else agent.finished_unseen or (agent.was_working and !going);
             const changed = going != agent.was_working or finished != agent.finished_unseen;
             agent.was_working = going;
@@ -871,6 +920,8 @@ pub fn Runtime(comptime App: type) type {
             instanceTargets(app, &targets) catch return .{};
             menu.rows.clearRetainingCapacity();
             menu.rows.ensureTotalCapacity(app.alloc, targets.items.len) catch return .{};
+            // A subagent's screen marks the instance whose tree holds it.
+            const on_screen = screenInstance(app);
             for (targets.items, 1..) |target, number| {
                 const agent = targetAgent(app, target);
                 menu.rows.appendAssumeCapacity(.{
@@ -878,7 +929,7 @@ pub fn Runtime(comptime App: type) type {
                     .title = agent.session_title.items,
                     .profile = agent.profile.profile.name,
                     .state = instanceState(agent).label(),
-                    .on_screen = target == app.agent_on_screen,
+                    .on_screen = target == on_screen,
                 });
             }
             if (menu.selected >= menu.rows.items.len) menu.selected = menu.rows.items.len -| 1;

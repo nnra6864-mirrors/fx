@@ -3340,49 +3340,9 @@ const App = struct {
         return child.displayName();
     }
 
-    /// The footer note for a hidden agent waiting on an answer, such as
-    /// "reviewer needs approval · Alt+→", or empty. fx never switches
-    /// on its own. `buf` backs the returned text.
+    /// The footer note for a hidden agent waiting on an answer.
     pub fn hiddenAgentWaitingNote(self: *App, buf: []u8) []const u8 {
-        // The first waiting agent the note names, null for the first
-        // instance, which `main_agent` holds.
-        var first: ?*app_agents_runtime.ChildAgent = null;
-        var found = false;
-        var asks = false;
-        var count: usize = 0;
-        if (self.agent_on_screen != null and AgentsAppRuntime.firstOpen(self)) {
-            // Main's own request, not a subagent's that main also shows.
-            const main_waiting = if (self.main_agent.approval_prompt.request) |request|
-                request.origin == .active_session
-            else
-                false;
-            if (main_waiting or self.main_agent.question_prompt.isActive()) {
-                found = true;
-                asks = !main_waiting;
-                count += 1;
-            }
-        }
-        for (self.child_agents.items) |child| {
-            if (child == self.agent_on_screen) continue;
-            const approval = child.agent.approval_prompt.isActive();
-            if (!approval and !child.agent.question_prompt.isActive()) continue;
-            if (!found) {
-                first = child;
-                found = true;
-                asks = !approval;
-            }
-            count += 1;
-        }
-        if (!found) return AgentsAppRuntime.finishedNote(self, buf);
-        var name_buf: [32]u8 = undefined;
-        const name = AgentsAppRuntime.noteName(self, first, &name_buf);
-        const key = AgentsAppRuntime.keyToward(self, first);
-        return if (count > 1)
-            std.mem.print(buf, "{s} and {d} more need you · {s}", .{ name, count - 1, key }) catch ""
-        else if (asks)
-            std.mem.print(buf, "{s} has a question · {s}", .{ name, key }) catch ""
-        else
-            std.mem.print(buf, "{s} needs approval · {s}", .{ name, key }) catch "";
+        return AgentsAppRuntime.waitingNote(self, buf);
     }
 
     /// Handles the events and paced text of the agent in context.
