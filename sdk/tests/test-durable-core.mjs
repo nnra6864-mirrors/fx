@@ -2745,6 +2745,44 @@ if (durabilityKind !== "memory") {
     for (const closing of [agent, other]) await closing.close();
   });
 
+  test("a run_created that lands past the first slot does not count as creating the run", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-fresh-late-"));
+    dirs.push(dir);
+    const calls = [];
+    const counted = countingWorld(await durabilityAt(dir), calls);
+    let id = null;
+    // A World that answers run_created on an existing run with success, at a
+    // later slot, instead of refusing it.
+    const durability = {
+      ...counted,
+      world: async () => {
+        const world = await counted.world();
+        const create = world.events.create.bind(world.events);
+        const events = Object.assign(Object.create(world.events), {
+          async create(runId, event, ...rest) {
+            if (runId === id && event?.eventType === "run_created") {
+              await create(runId, event, ...rest).catch(() => {});
+              return { event: { eventId: `evnt_${String(7).padStart(26, "0")}` } };
+            }
+            return create(runId, event, ...rest);
+          },
+        });
+        return Object.assign(Object.create(world), { events });
+      },
+    };
+    const agent = createAgent({ durability });
+    const other = createAgent({ durability: await durabilityAt(dir) });
+    id = await agent.newSessionId();
+    const ranBefore = ran.length;
+    assert.equal((await other.session(id).prompt("zeta", { messageId: "turn-z" }).result).stopReason, "end_turn");
+    await untilIdle(other);
+    const mine = await agent.session(id).prompt("zeta", { messageId: "turn-z" }).result;
+    assert.equal(mine.repeated, true, "the run existed, so the turn is answered from it");
+    assert.ok(reads(admission(calls, id)) > 0, "the session was read");
+    assert.deepEqual(ran.slice(ranBefore).filter((step) => step.startsWith("turn-z:")), ["turn-z:0", "turn-z:1", "turn-z:2"], "the turn ran once");
+    for (const closing of [agent, other]) await closing.close();
+  });
+
   test("a new chat's first prompt whose write fails is stored by its retry once, and queued", async () => {
     for (const fault of ["create:run_started", "create:input", "queue"]) {
       const dir = await mkdtemp(join(tmpdir(), "libfx-fresh-fail-"));

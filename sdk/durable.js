@@ -747,6 +747,11 @@ function slotOf(event) {
   return Number(match[1]);
 }
 
+// The slot of the event a write returned, or NaN when the World returned none.
+function slotWritten(result) {
+  return Number(eventIdPattern.exec(String(result?.event?.eventId ?? ""))?.[1]);
+}
+
 function logEntryOf(event) {
   if (event?.eventType !== "step_created" || event.eventData?.stepName !== logStep) return null;
   const input = event.eventData.input;
@@ -1104,8 +1109,7 @@ function createWorldBackend(world, durability) {
       let covered = null;
       // The run's creation events hold no entry, so a read that showed every
       // entry through the slot before one still does through it.
-      const passOver = (result) => {
-        const slot = Number(eventIdPattern.exec(String(result?.event?.eventId ?? ""))?.[1]);
+      const passOver = (slot) => {
         if (covered !== null && slot === covered + 1) covered = slot;
       };
       // Resolves true when this call's own `run_created` made the run: the
@@ -1116,19 +1120,19 @@ function createWorldBackend(world, durability) {
         let made = false;
         try {
           const deploymentId = typeof world.getDeploymentId === "function" ? await world.getDeploymentId() : "libfx";
-          const result = await world.events.create(runId, {
+          const slot = slotWritten(await world.events.create(runId, {
             eventType: "run_created",
             ...spec,
             eventData: { deploymentId, workflowName: "libfx/session", input: encoder.encode("{}") },
-          });
-          made = Number(eventIdPattern.exec(String(result?.event?.eventId ?? ""))?.[1]) === firstEventSlot;
-          passOver(result);
+          }));
+          made = slot === firstEventSlot;
+          passOver(slot);
         } catch (error) {
           // Another worker created it first.
           if (!/exist|conflict|409|already/i.test(String(error?.message ?? "")) && error?.status !== 409) throw error;
         }
         try {
-          passOver(await world.events.create(runId, { eventType: "run_started", ...spec }));
+          passOver(slotWritten(await world.events.create(runId, { eventType: "run_started", ...spec })));
         } catch (error) {
           if (!/exist|conflict|409|already|started|status/i.test(String(error?.message ?? "")) && error?.status !== 409) throw error;
         }
@@ -1224,9 +1228,7 @@ function createWorldBackend(world, durability) {
           // this write lands pass it over. Of a run it did not make, this
           // object knows nothing; the caller then reads it.
           covered = 0;
-          const pending = createRun().finally(() => creating.delete(runId));
-          creating.set(runId, pending);
-          const made = await pending;
+          const made = await ensureRun();
           if (!made) covered = null;
           // As a read that found no run notes it.
           if (made) noteSnapshot({ seq: 0, seqInBand: inBandAtRunCreation }, "null");
