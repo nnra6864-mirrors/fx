@@ -1219,9 +1219,10 @@ function createWorldBackend(world, durability) {
         // Creates the run, as its first append would, and resolves true only
         // when this call's own write made it: the log was then empty and its
         // stream had no line, as a read just before the write would have
-        // shown, so the sender need not read either. False, after the same
-        // writes, when the run existed, this process already created it, or
-        // the World cannot show which: the caller then reads as before.
+        // shown, so the sender need not read either. False, without writing,
+        // when this process already created the run or is creating it; false,
+        // after the same writes, when the run existed or the World cannot show
+        // which. The caller then reads as before.
         async fresh() {
           if (created.has(runId) || creating.has(runId)) return false;
           // As a read that found no run leaves it, so the creation events
