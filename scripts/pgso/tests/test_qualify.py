@@ -10,7 +10,7 @@ import types
 import unittest
 from unittest import mock
 
-from scripts.pgso import macos
+from scripts.pgso import linux, macos
 from scripts.pgso.model import PgsoError
 from scripts.pgso.pipeline import PipelinePaths
 from scripts.pgso.profile_supplement import MappedProfile, ProfileSupplement
@@ -674,7 +674,9 @@ class PgsoQualificationTests(unittest.TestCase):
                 prebuilt_pairs={"ui_activity": pair},
             )
 
-    def test_external_control_is_optimized_linked_and_stripped_with_platform_tools(self) -> None:
+    def build_fake_external_control(
+        self, platform: object, target: str, tool_names: tuple[str, ...]
+    ) -> tuple[pathlib.Path, list[str]]:
         tools = self.root / "tools"
         tools.mkdir()
         actions = self.root / "actions.log"
@@ -697,17 +699,31 @@ class PgsoQualificationTests(unittest.TestCase):
             opt=fake("opt"),
             llc=fake("llc"),
             zig=fake("zig"),
-            target="aarch64-macos",
-            tools=types.SimpleNamespace(strip=fake("strip")),
+            target=target,
+            platform=platform,
+            tools=types.SimpleNamespace(**{name: fake(name) for name in tool_names}),
         )
         paths = PipelinePaths.create(self.root / "run", selector="ui_activity")
 
         binary = build_external_o2_control(toolchain, paths)
 
         self.assertEqual(paths.root / "external-control" / paths.binary_name, binary)
-        lines = actions.read_text(encoding="utf-8").splitlines()
+        return binary, actions.read_text(encoding="utf-8").splitlines()
+
+    def test_external_control_is_optimized_linked_and_stripped_with_platform_tools(self) -> None:
+        binary, lines = self.build_fake_external_control(macos, "aarch64-macos", ("strip",))
+
         self.assertEqual(["opt", "llc", "zig", "strip"], [line.split()[0] for line in lines])
+        self.assertIn("-Wl,-dead_strip", lines[2].split())
         self.assertEqual(f"strip -S -x {binary}", lines[3])
+
+    def test_linux_external_control_is_stripped_by_its_link(self) -> None:
+        _, lines = self.build_fake_external_control(linux, "aarch64-linux", ())
+
+        self.assertEqual(["opt", "llc", "zig"], [line.split()[0] for line in lines])
+        link = lines[2].split()
+        self.assertIn("-Wl,--gc-sections", link)
+        self.assertIn("-s", link)
 
     def test_benchmark_pair_uses_the_external_control_for_minimum_macos(self) -> None:
         plan = BENCHMARK_PLANS[0]
@@ -744,7 +760,7 @@ class PgsoQualificationTests(unittest.TestCase):
             mock.patch("scripts.pgso.qualify.link_candidate", return_value=candidate),
         ):
             pair = build_benchmark_pair(
-                types.SimpleNamespace(platform=macos), self.root, output, plan,
+                types.SimpleNamespace(platform=macos, target=macos.TARGET), self.root, output, plan,
             )
 
         self.assertEqual(external, pair.control_binary)

@@ -502,7 +502,8 @@ def _prepare_runtime_home(
         "set-option -g history-limit 100000\n",
         encoding="utf-8",
     )
-    if allow_keychain:
+    # Only macOS has a Keychain; on Linux fx keeps keys in its profile file.
+    if allow_keychain and sys.platform == "darwin":
         source = pathlib.Path.home() / "Library" / "Keychains"
         if not source.is_dir():
             raise PgsoError(f"host Keychains directory does not exist: {source}")

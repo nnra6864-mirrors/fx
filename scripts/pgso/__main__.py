@@ -35,6 +35,7 @@ from scripts.pgso.qualify import (
     require_measurements_passed,
 )
 from scripts.pgso.runner import cancellation_guard, run_checked
+from scripts.pgso import platforms
 from scripts.pgso.toolchain import DEFAULT_TARGET
 from scripts.pgso.toolchain import Toolchain
 
@@ -100,7 +101,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python3 -m scripts.pgso",
-        description="Build and qualify macOS arm64 fx PGSO candidates",
+        description="Build and qualify fx PGSO candidates",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     descriptions = {
@@ -244,14 +245,7 @@ def _runtime_versions(
         log_path=paths.logs / "tmux-version.json",
         require_empty_stderr=True,
     )
-    macos_result = run_checked(
-        ("sw_vers", "-productVersion"),
-        cwd=REPO_ROOT,
-        env=os.environ.copy(),
-        timeout_s=30,
-        log_path=paths.logs / "macos-version.json",
-        require_empty_stderr=True,
-    )
+    os_versions = platforms.for_target(arguments.target).os_versions(paths)
     return bun, hyperfine, {
         "bun_path": str(bun),
         "bun_version": bun_version,
@@ -259,7 +253,7 @@ def _runtime_versions(
         "hyperfine_version": hyperfine_version,
         "tmux_path": str(tmux),
         "tmux_version": tmux_result.stdout.strip(),
-        "macos_version": macos_result.stdout.strip(),
+        **os_versions,
     }
 
 

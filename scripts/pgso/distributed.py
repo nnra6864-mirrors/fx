@@ -1215,7 +1215,7 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run distributed macOS arm64 PGSO qualification")
+    parser = argparse.ArgumentParser(description="Run distributed PGSO qualification")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     plan = subparsers.add_parser("plan")

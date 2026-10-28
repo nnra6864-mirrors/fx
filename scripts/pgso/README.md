@@ -19,7 +19,9 @@ The driver requires:
 
 The pipeline does not use the host CPU as the release target. The final candidate must match the control's architecture, minimum macOS version, SDK compatibility stamp, main-stack request, and dynamic-library dependency versions. It must contain a valid code signature, contain no profile sections or profile-runtime dependency, and produce no profile output when executed.
 
-The target-specific steps live in a platform module, which [`platforms.py`](platforms.py) selects for the requested target: the host check, native tools, the instrumented and candidate links, the control properties the candidate must match, and the candidate's layout checks. [`macos.py`](macos.py) is the only platform. The profile, outlining, corpus, and measurement stages are shared.
+The target-specific steps live in a platform module, which [`platforms.py`](platforms.py) selects for the requested target: the host check, native tools, the instrumented and candidate links, the control properties the candidate must match, and the candidate's layout checks. [`macos.py`](macos.py) builds `aarch64-macos`, and [`linux.py`](linux.py) builds `aarch64-linux`. The profile, outlining, corpus, and measurement stages are shared.
+
+The Linux platform runs on an arm64 Linux host and needs `ld.lld`, `llvm-readelf`, the `aarch64-unknown-linux-gnu` profile runtime, and `lib/libLLVM.so` from the same LLVM root. Zig links the static musl control with its own `ld.lld`, so the control build records that exact link (`--verbose-link`), and the instrumented and candidate links rerun it with only the Zig object replaced. The candidate must match the control's ELF class, type, machine, OS ABI, segment types, first load address, stack segment, and whether it has interpreter, dynamic, TLS, and note segments. It must contain no profile sections. No workflow builds Linux candidates yet.
 
 Training records execution counts and first-use function timestamps in the same
 continuous profiles. Counter supplements preserve the temporal traces. The

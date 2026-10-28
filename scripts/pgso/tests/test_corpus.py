@@ -840,7 +840,9 @@ class PgsoCorpusTests(unittest.TestCase):
             self.make_scenario("keychain")
         )
 
-        with mock.patch.object(pathlib.Path, "home", return_value=host_home):
+        with mock.patch.object(pathlib.Path, "home", return_value=host_home), mock.patch(
+            "scripts.pgso.corpus.sys.platform", "darwin"
+        ):
             self.run_fixture(self.make_corpus(scenario))
 
         link = (
@@ -854,6 +856,22 @@ class PgsoCorpusTests(unittest.TestCase):
         )
         self.assertTrue(link.is_symlink())
         self.assertEqual(host_keychains.resolve(), link.resolve())
+
+    def test_keychain_scenarios_run_without_a_keychain_on_linux(self) -> None:
+        host_home = self.root / "host-home"
+        host_home.mkdir()
+        scenario = dataclasses_replace_allow_keychain(
+            self.make_scenario("keychain")
+        )
+
+        with mock.patch.object(pathlib.Path, "home", return_value=host_home), mock.patch(
+            "scripts.pgso.corpus.sys.platform", "linux"
+        ):
+            self.run_fixture(self.make_corpus(scenario))
+
+        scenario_home = self.root / "output" / "profiles" / "home" / "keychain"
+        self.assertTrue(scenario_home.is_dir())
+        self.assertFalse((scenario_home / "Library").exists())
 
     def test_run_stops_and_records_a_failed_scenario(self) -> None:
         corpus = self.make_corpus(
