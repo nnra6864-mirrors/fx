@@ -14,10 +14,12 @@
 (* and then heals, which is what lets Heals be checked.                    *)
 (*                                                                         *)
 (* The turn loop routes each request's network, gateway, and rate-limit    *)
-(* failures through the module. fx does not save the module's record yet,  *)
-(* so resuming after a closed window and the crash-loop guard are          *)
-(* model-checked only. fx adds no stop of its own, so NeverGivesUp holds   *)
-(* for every transient failure fx reports, unclear ones included.          *)
+(* failures through the module, and fx saves the module's record with the  *)
+(* session, so a closed window or a crash resumes on the next launch       *)
+(* (Resume.tla models that side). fx adds no stop of its own, so           *)
+(* NeverGivesUp holds for every transient failure fx reports, unclear ones *)
+(* included. tests/tla/drivers/recovery/driver.ts walks recovery.zig along *)
+(* this model.                                                             *)
 (*                                                                         *)
 (* Bug selects one planted defect. Each is a bug fx has had or a promise   *)
 (* the API makes; check.sh names the rule that must catch it.              *)
@@ -30,7 +32,9 @@ CONSTANTS
     Bug          \* "none", or the name of one planted defect
 
 Bugs == {"none", "stall_stop", "no_wake", "stale_socket", "frozen_status",
-         "no_closing", "never_ask", "hot_retry", "send_without_save"}
+         "no_closing", "never_ask", "hot_retry", "send_without_save",
+         \* Planted in RecoveryTimed.tla.
+         "unbounded_wait", "frozen_countdown"}
 
 ASSUME /\ MaxFaults \in Nat /\ Ladder \in 1..4 /\ Bug \in Bugs
 
@@ -300,9 +304,15 @@ UserCancels ==
                    deaths, cleanExit, net, gateway, needUser, faults, alive>>
 
 \* `user_continue`: Enter or a successful /login after fixing what was asked.
+\* Only answering the crash-loop question starts the death count over
+\* (recovery.zig onUserContinue): a sign-in says nothing about crashes. Two
+\* counted deaths while waiting for the user mean the crash-loop question.
 UserActs ==
+    LET loop == seenDeaths >= 2 IN
     /\ alive /\ phase = "need_user"
-    /\ needUser' = FALSE /\ seenDeaths' = 0 /\ deaths' = 0
+    /\ needUser' = FALSE
+    /\ seenDeaths' = IF loop THEN 0 ELSE seenDeaths
+    /\ deaths' = IF loop THEN 0 ELSE deaths
     /\ SendNow(TRUE)
     /\ UNCHANGED <<sameFail, savedClean, cleanExit, net, gateway, faults,
                    alive, cancelled>>
