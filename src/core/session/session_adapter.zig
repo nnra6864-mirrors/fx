@@ -1201,6 +1201,22 @@ fn movedFolder(kind: session_child_store.ManagedChildKind) ?[]const u8 {
 /// A moved name's key: a folder of a few bytes and a handle of at most 160.
 const movedKeyMax = 256;
 
+/// Whether the session `fx -c` opens in `workspace` left its newest turn
+/// unfinished: still open, or ended by a crash or a closed window. A session
+/// another fx has open is working, not interrupted. Reads the index, the
+/// session's lock, and its log tail, and writes nothing.
+pub fn hasInterruptedTurn(store: *Store, alloc: Allocator, workspace: []const u8) bool {
+    const id = (store.manager.lastOpened(alloc, workspace, .app) catch return false) orelse return false;
+    defer alloc.free(id);
+    if (store.manager.isBusy(id) catch true) return false;
+    var peeked = store.manager.peek(alloc, id) catch return false;
+    defer peeked.deinit(alloc);
+    const state = peeked.state;
+    if (state.open_turn != null) return true;
+    const last = state.last_interrupted orelse return false;
+    return last.turn == state.last_turn and (last.reason == .crash or last.reason == .closed);
+}
+
 pub const Session = struct {
     alloc: Allocator,
     store: *Store,
@@ -5532,6 +5548,33 @@ test "a send's record rides with the turn's first write, and a reopen finds the 
     defer restored.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), restored.history.len);
     try testing.expectEqualStrings("go", restored.history[0].interrupted.user.text);
+}
+
+test "an unfinished newest turn is interrupted unless another fx has the session open" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try s.appendProgress(.{ .text = @constCast("go") }, .{}, .{});
+    // Open here, so it is working, not interrupted.
+    try testing.expect(!hasInterruptedTurn(&t.store, testing.allocator, "/w"));
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    try testing.expect(hasInterruptedTurn(&t.store, testing.allocator, "/w"));
+    try testing.expect(!hasInterruptedTurn(&t.store, testing.allocator, "/elsewhere"));
+
+    // A reopen marks it, and it stays interrupted until a turn ends it.
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    r.close();
+    try testing.expect(hasInterruptedTurn(&t.store, testing.allocator, "/w"));
+
+    // A turn the user cancelled is finished.
+    const c = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    try c.commitTurn(.{ .interrupted = .{ .user = .{ .text = @constCast("next") }, .terminal_reason = .cancelled } }, types.ConversationLanguage.default());
+    c.close();
+    try testing.expect(!hasInterruptedTurn(&t.store, testing.allocator, "/w"));
 }
 
 test "a cleared record leaves the turn resumable without one" {
