@@ -1098,24 +1098,42 @@ function createWorldBackend(world, durability) {
         }
         return pending;
       };
+      // The newest slot the last read() returned every entry through, or
+      // null when that read could not show it had them all: 0 when it listed
+      // nothing, as for a run not created yet.
+      let covered = null;
+      // The run's creation events hold no entry, so a read that showed every
+      // entry through the slot before one still does through it.
+      const passOver = (result) => {
+        const slot = Number(eventIdPattern.exec(String(result?.event?.eventId ?? ""))?.[1]);
+        if (covered !== null && slot === covered + 1) covered = slot;
+      };
+      // Resolves true when this call's own `run_created` made the run: the
+      // World creates a run only when none exists (a second one is refused,
+      // 409), and its first event takes the first slot. A run that did not
+      // exist held no event and no stream.
       const createRun = async () => {
+        let made = false;
         try {
           const deploymentId = typeof world.getDeploymentId === "function" ? await world.getDeploymentId() : "libfx";
-          await world.events.create(runId, {
+          const result = await world.events.create(runId, {
             eventType: "run_created",
             ...spec,
             eventData: { deploymentId, workflowName: "libfx/session", input: encoder.encode("{}") },
           });
+          made = Number(eventIdPattern.exec(String(result?.event?.eventId ?? ""))?.[1]) === firstEventSlot;
+          passOver(result);
         } catch (error) {
           // Another worker created it first.
           if (!/exist|conflict|409|already/i.test(String(error?.message ?? "")) && error?.status !== 409) throw error;
         }
         try {
-          await world.events.create(runId, { eventType: "run_started", ...spec });
+          passOver(await world.events.create(runId, { eventType: "run_started", ...spec }));
         } catch (error) {
           if (!/exist|conflict|409|already|started|status/i.test(String(error?.message ?? "")) && error?.status !== 409) throw error;
         }
         created.add(runId);
+        return made;
       };
       // Events newest first, down to and excluding slot `stopBelow`.
       const newestFirst = async (stopBelow, stopAtCheckpoint) => {
@@ -1175,9 +1193,6 @@ function createWorldBackend(world, durability) {
           cursor = page.cursor;
         }
       };
-      // The newest slot the last read() returned every entry through, or
-      // null when that read could not show it had them all.
-      let covered = null;
       const fullRead = async () => {
         const read = await newestFirst(0, true);
         const entries = read.events.reverse();
@@ -1191,12 +1206,32 @@ function createWorldBackend(world, durability) {
           covered = read.newest;
         } else {
           forgetView(runId);
-          covered = null;
+          covered = read.missing || read.listed === 0 ? 0 : null;
         }
         return entries;
       };
       return {
         newest: () => covered,
+        // Creates the run, as its first append would, and resolves true only
+        // when this call's own write made it: the log was then empty and its
+        // stream had no line, as a read just before the write would have
+        // shown, so the sender need not read either. False, after the same
+        // writes, when the run existed, this process already created it, or
+        // the World cannot show which: the caller then reads as before.
+        async fresh() {
+          if (created.has(runId) || creating.has(runId)) return false;
+          // As a read that found no run leaves it, so the creation events
+          // this write lands pass it over. Of a run it did not make, this
+          // object knows nothing; the caller then reads it.
+          covered = 0;
+          const pending = createRun().finally(() => creating.delete(runId));
+          creating.set(runId, pending);
+          const made = await pending;
+          if (!made) covered = null;
+          // As a read that found no run notes it.
+          if (made) noteSnapshot({ seq: 0, seqInBand: inBandAtRunCreation }, "null");
+          return made;
+        },
         async read() {
           const view = viewOf(runId);
           if (!view) return fullRead();
@@ -1596,7 +1631,9 @@ async function recordMessage(log, state, message) {
  * The log a sender read and then extended with its own entries, as the
  * worker it starts in the same request may use it instead of reading the
  * log again. Only when the sender's read showed every entry through slot
- * `newestSeen`, and every entry the sender then wrote took the next slot:
+ * `newestSeen` (for a run it found missing, the run's creation events it
+ * then saw land hold none), and every entry the sender then wrote took the
+ * next slot:
  * then nothing landed in between, so the view holds every input that comes
  * before this message's. The sender's entries go on as the JSON the World
  * stored, not as the objects it wrote. Null otherwise. Pure.
@@ -2645,6 +2682,15 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
     let closed = false;
     const workers = new Map();
     const active = new Set();
+    // Session ids this process minted whose first prompt has not yet tried
+    // to create their run, newest kept. Only a hint that the run may not
+    // exist: whether it did is what that prompt's own write shows.
+    const minted = new Set();
+    const mint = (id) => {
+      minted.add(id);
+      if (minted.size > 1024) minted.delete(minted.values().next().value);
+      return id;
+    };
     const backend = () => {
       if (closed) return Promise.reject(new Error(`${label} is closed`));
       backendPromise ??= (async () => {
@@ -2741,14 +2787,17 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
       let id = requestedId ?? null;
       let seeded = seed === undefined || requestedId !== undefined;
       const resolved = backend().then((created) => {
-        id ??= created.newSessionId();
+        id ??= mint(created.newSessionId());
         if (!created.validSessionId(id)) throw new TypeError(`${created.name} durability cannot hold session id ${JSON.stringify(id)}`);
         return { created, id };
       });
       void resolved.catch(() => {});
       // With `inRequest`, a prompt runs here, in the request that took it,
       // where the durability allows (see `runInRequest`).
-      const send = async (message, { inRequest = false } = {}) => {
+      // `fresh` is the log whose own write just created the session's run, so
+      // the log is empty without reading it. That object, not a new one, goes
+      // on: it holds what the creation showed of the log.
+      const send = async (message, { inRequest = false, fresh = null } = {}) => {
         const { created, id: sessionId } = await resolved;
         const extra = {
           ...(seeded ? {} : { seed }),
@@ -2762,10 +2811,13 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
         // a turn runs or as whom (`tests/tla/sdk/TenantIsolation.tla`
         // OnlySentRuns), and a queue that ends with the process loses no
         // input.
-        const log = await created.session(sessionId);
-        const read = await log.read();
-        const newestSeen = log.newest?.();
+        const log = fresh ?? await created.session(sessionId);
+        // Fresh: the caller's own write just created the run, so its log
+        // held no entry, as a read before that write would have shown.
+        const read = fresh ? [] : await log.read();
         const appended = await recordMessage(log, foldSessionLog(read), full);
+        // Taken after the writes, which pass it over a run they created.
+        const newestSeen = log.newest?.();
         const queued = queuedMessage(full, created.store);
         const idempotencyKey = `${sessionId}:${message.type}:${message.messageId}`;
         if (inRequest && created.runInRequest) {
@@ -2812,20 +2864,26 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
             try {
               const read = input === undefined || ready === null || aborted() ? input : await ready();
               const message = { type, messageId, ...(input === undefined ? {} : { input: read }) };
-              const queue = () => {
-                if (progress) progress.sent = true;
-                return send(message, { inRequest: type === "prompt" });
-              };
               const { created, id: sessionId } = await resolved;
               const log = await created.session(sessionId);
+              // The first prompt to a session id this process minted creates
+              // its run before anything reads it. When that write made the
+              // run, the log held no entry and the stream no line: what this
+              // turn would read is known, retried or not, as reads just before
+              // the write would have returned it.
+              const fresh = type === "prompt" && !aborted() && minted.delete(sessionId) && typeof log.fresh === "function" && await log.fresh();
+              const queue = () => {
+                if (progress) progress.sent = true;
+                return send(message, { inRequest: type === "prompt", fresh: fresh ? log : null });
+              };
               let attaching = type === "resume";
-              let from = null;
+              let from = fresh ? 0 : null;
               // The viewer's start is read before the message is queued, so
               // every line this message's own turn writes comes after it, and
               // an end for this id before it can only be from a turn this id
               // already ran.
-              if (retried) from = await log.ui.length();
-              if (retried && !aborted()) {
+              if (retried && !fresh) from = await log.ui.length();
+              if (retried && !fresh && !aborted()) {
                 // The log, for that answer, is read alongside the one queue
                 // send.
                 const [state] = await Promise.all([
@@ -2841,7 +2899,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
                 if (outcome.unsure) return { log, from, attaching: true, endWithinMs: retryEndWaitMs, unsure: true };
                 return { log, from, attaching: outcome.follow === true };
               }
-              if (retried) {
+              if (retried && !fresh) {
                 // A turn this id already ran answers from the log, without
                 // queueing it again. The viewer's start was read first, so a
                 // turn that ends after it has its end in view.
@@ -3145,7 +3203,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
       },
       /** An id for a new session, before its first prompt. */
       async newSessionId() {
-        return (await backend()).newSessionId();
+        return mint((await backend()).newSessionId());
       },
       /** The agent's name: its sessions' turns run only on agents with this name. */
       get name() {

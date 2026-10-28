@@ -2430,6 +2430,159 @@ if (durabilityKind === "queue") {
     await agent.close();
   });
 
+  test("a new session's first prompt the request runs itself starts its worker from the sender's read", async () => {
+    for (const inBandFence of [false, true]) {
+      const dir = await mkdtemp(join(tmpdir(), "libfx-handoff-new-"));
+      dirs.push(dir);
+      const ops = [];
+      const { durability: base } = await queueWorldAt(dir, { queueLeases: true, runInRequest: true, maxDurationMs: 60_000, inBandFence });
+      const agent = createAgent({ durability: watchingLog(base, { onList: () => ops.push("list"), onCreate: (kind) => ops.push(kind) }) });
+      const session = agent.session();
+      assert.equal((await textOf(session.prompt("chi"))).result.stopReason, "end_turn");
+      const input = ops.indexOf("input");
+      const lease = ops.indexOf("lease", input);
+      assert.ok(input >= 0 && lease > input, JSON.stringify(ops));
+      assert.deepEqual(ops.slice(input + 1, lease), [], `nothing read or written between the input and the worker's lease (inBandFence ${inBandFence})`);
+      await untilIdle(agent);
+      // The session goes on from the log the first turn left.
+      assert.equal((await textOf(session.prompt("psi"))).result.stopReason, "end_turn");
+      await agent.close();
+    }
+  });
+
+  test("a worker reads the log itself when another writer creates the new session's run first", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-handoff-race-"));
+    dirs.push(dir);
+    const ops = [];
+    // Runs once, just before this agent creates the run.
+    let before = null;
+    const { durability: base } = await queueWorldAt(dir, { queueLeases: true, runInRequest: true, maxDurationMs: 60_000 });
+    const watched = watchingLog(base, { onList: () => ops.push("list"), onCreate: (kind) => ops.push(kind) });
+    const durability = {
+      ...watched,
+      world: async () => {
+        const world = await watched.world();
+        const create = world.events.create.bind(world.events);
+        const events = Object.assign(Object.create(world.events), {
+          async create(runId, event, ...rest) {
+            if (before && event?.eventType === "run_created") {
+              const write = before;
+              before = null;
+              await write(runId);
+            }
+            return create(runId, event, ...rest);
+          },
+        });
+        return Object.assign(Object.create(world), { events });
+      },
+    };
+    const internals = (agent) => agent[Symbol.for("libfx.durableInternals")];
+    const agent = createAgent({ durability });
+    const other = createAgent({ durability: await durabilityAt(dir) });
+    before = async (runId) => (await internals(other).openLog(runId)).append({ k: "note", n: 1 });
+    // An id this agent did not mint, so its sender reads the log before it
+    // tries to create the run, as a first prompt from another server does.
+    const session = agent.session(await other.newSessionId());
+    assert.equal((await textOf(session.prompt("tau"))).result.stopReason, "end_turn");
+    assert.equal(before, null, "the other writer created the run");
+    const input = ops.indexOf("input");
+    const lease = ops.indexOf("lease", input);
+    assert.ok(input >= 0 && lease > input, JSON.stringify(ops));
+    assert.ok(ops.slice(input + 1, lease).includes("list"), "the worker read the log before its lease");
+    for (const closing of [agent, other]) await closing.close();
+  });
+
+  test("a first prompt on an id another server minted starts its worker from the sender's read once its sender creates the run", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-handoff-unminted-"));
+    dirs.push(dir);
+    const ops = [];
+    const { durability: base } = await queueWorldAt(dir, { queueLeases: true, runInRequest: true, maxDurationMs: 60_000 });
+    const agent = createAgent({ durability: watchingLog(base, { onList: () => ops.push("list"), onCreate: (kind) => ops.push(kind) }) });
+    const other = createAgent({ durability: await durabilityAt(dir) });
+    // Not minted here: the sender reads the missing run first, then creates it.
+    const session = agent.session(await other.newSessionId());
+    assert.equal((await textOf(session.prompt("upsilon"))).result.stopReason, "end_turn");
+    const input = ops.indexOf("input");
+    const lease = ops.indexOf("lease", input);
+    assert.ok(input >= 0 && ops.indexOf("list") < input && lease > input, JSON.stringify(ops));
+    assert.deepEqual(ops.slice(input + 1, lease), [], "the worker took the sender's read of the run it created");
+    for (const closing of [agent, other]) await closing.close();
+  });
+
+  test("a new chat's first lease is written in-band where the World fences in-band writes", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-fresh-inband-"));
+    dirs.push(dir);
+    const leases = [];
+    const { durability: base } = await queueWorldAt(dir, { queueLeases: true, runInRequest: true, maxDurationMs: 60_000, inBandFence: true });
+    const durability = {
+      ...base,
+      world: async () => {
+        const world = await base.world();
+        const create = world.events.create.bind(world.events);
+        const events = Object.assign(Object.create(world.events), {
+          create(runId, event, params, ...rest) {
+            if (event?.eventType === "step_created") {
+              try { if (JSON.parse(decoder.decode(event.eventData.input)).k === "lease") leases.push(params?.inBand === true); } catch {}
+            }
+            return create(runId, event, params, ...rest);
+          },
+        });
+        return Object.assign(Object.create(world), { events });
+      },
+    };
+    const agent = createAgent({ durability });
+    assert.equal((await textOf(agent.session().prompt("phi"))).result.stopReason, "end_turn");
+    assert.ok(leases.length > 0, "the turn took a lease");
+    assert.equal(leases[0], true, "the first lease was written in-band");
+    await agent.close();
+  });
+
+  test("a creation event that does not land at the very next slot leaves the worker to read the log itself", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-handoff-skip-"));
+    dirs.push(dir);
+    const ops = [];
+    let raced = false;
+    const { durability: base } = await queueWorldAt(dir, { queueLeases: true, runInRequest: true, maxDurationMs: 60_000 });
+    const internals = (agent) => agent[Symbol.for("libfx.durableInternals")];
+    const other = createAgent({ durability: await durabilityAt(dir) });
+    const id = await other.newSessionId();
+    const otherLog = await internals(other).openLog(id);
+    const watched = watchingLog(base, { onList: () => ops.push("list"), onCreate: (kind) => ops.push(kind) });
+    const durability = {
+      ...watched,
+      world: async () => {
+        const world = await watched.world();
+        const create = world.events.create.bind(world.events);
+        const events = Object.assign(Object.create(world.events), {
+          async create(runId, event, ...rest) {
+            if (!raced && runId === id && event?.eventType === "run_started") {
+              raced = true;
+              // Another server's entries land after the run is created, then
+              // the World answers this run_started with an event two slots on,
+              // past them.
+              await create(runId, event, ...rest).catch(() => {});
+              await otherLog.append({ k: "note", n: 1 });
+              await otherLog.append({ k: "note", n: 2 });
+              const listed = (await world.events.list({ runId, pagination: { limit: 100 } })).data;
+              const newest = Math.max(...listed.map((event) => Number(/(\d{26})$/.exec(event.eventId)[1])));
+              return { event: { eventId: `evnt_${String(newest).padStart(26, "0")}` } };
+            }
+            return create(runId, event, ...rest);
+          },
+        });
+        return Object.assign(Object.create(world), { events });
+      },
+    };
+    const agent = createAgent({ durability });
+    assert.equal((await textOf(agent.session(id).prompt("omega"))).result.stopReason, "end_turn");
+    assert.ok(raced, "the run_started answer was replaced");
+    const input = ops.indexOf("input");
+    const lease = ops.indexOf("lease", input);
+    assert.ok(input >= 0 && lease > input, JSON.stringify(ops));
+    assert.ok(ops.slice(input + 1, lease).includes("list"), "the worker read the log before its lease");
+    for (const closing of [agent, other]) await closing.close();
+  });
+
   test("a worker reads the log itself when another write lands between its sender's read and the input", async () => {
     const dir = await mkdtemp(join(tmpdir(), "libfx-handoff-gap-"));
     dirs.push(dir);
@@ -2474,6 +2627,153 @@ if (durabilityKind === "queue") {
     assert.ok(input >= 0 && lease > input, JSON.stringify(ops));
     assert.ok(ops.slice(input + 1, lease).includes("list"), "the worker read the log before its lease");
     for (const closing of [agent, other]) await closing.close();
+  });
+}
+
+// A durability whose World records each call it takes, as `[name, runId]`
+// with `name` `list`, `getInfo`, `create:<eventType>`, `create:<entry
+// kind>` or `queue`, and fails a call once where `faults` names it:
+// `faults.add("create:input")`.
+function countingWorld(base, calls, faults = new Set()) {
+  const failOnce = (name, runId) => {
+    calls.push([name, runId]);
+    if (!faults.delete(name)) return;
+    throw Object.assign(new Error("injected failure"), { status: 503, call: name });
+  };
+  return {
+    ...base,
+    world: async () => {
+      const world = await base.world();
+      const list = world.events.list.bind(world.events);
+      const create = world.events.create.bind(world.events);
+      const getInfo = world.streams.getInfo.bind(world.streams);
+      const queue = world.queue.bind(world);
+      const events = Object.assign(Object.create(world.events), {
+        list(...args) {
+          calls.push(["list", args[0]?.runId]);
+          return list(...args);
+        },
+        async create(runId, event, ...rest) {
+          let name = `create:${event?.eventType}`;
+          if (event?.eventType === "step_created") {
+            try { name = `create:${JSON.parse(decoder.decode(event.eventData.input)).k}`; } catch {}
+          }
+          failOnce(name, runId);
+          return create(runId, event, ...rest);
+        },
+      });
+      const streams = Object.assign(Object.create(world.streams), {
+        getInfo(...args) {
+          calls.push(["getInfo", args[0]]);
+          return getInfo(...args);
+        },
+      });
+      return Object.assign(Object.create(world), {
+        events,
+        streams,
+        async queue(...args) {
+          failOnce("queue", args[1]?.runId);
+          return queue(...args);
+        },
+      });
+    },
+  };
+}
+
+// The calls for session `id`, and those up to its first queue send.
+const callsOf = (calls, id) => calls.filter(([, runId]) => runId === id).map(([name]) => name);
+const admission = (calls, id) => {
+  const mine = callsOf(calls, id);
+  return mine.slice(0, mine.indexOf("queue") + 1);
+};
+const reads = (names) => names.filter((name) => name === "list" || name === "getInfo").length;
+
+if (durabilityKind !== "memory") {
+  test("a new chat's first prompt, on an id this process minted, reads nothing before it is stored, retried or not", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-fresh-"));
+    dirs.push(dir);
+    const calls = [];
+    const agent = createAgent({ durability: countingWorld(await durabilityAt(dir), calls) });
+    const id = await agent.newSessionId();
+    const first = agent.session(id).prompt("alpha", { messageId: "turn-fresh" });
+    assert.equal((await first.accepted).sessionId, id);
+    assert.deepEqual(admission(calls, id), ["create:run_created", "create:run_started", "create:input", "queue"]);
+    assert.equal((await first.result).stopReason, "end_turn");
+    await untilIdle(agent);
+    // A retry of it reads the session as before, and runs nothing again.
+    const ranBefore = ran.length;
+    calls.length = 0;
+    const again = await agent.session(id).prompt("alpha", { messageId: "turn-fresh" }).result;
+    assert.equal(again.repeated, true);
+    assert.deepEqual(ran.slice(ranBefore).filter((step) => step.startsWith("turn-fresh:")), [], "the retry ran nothing");
+    assert.ok(reads(callsOf(calls, id)) > 0, "the retry read the session");
+    // A session the agent names itself is new as well.
+    calls.length = 0;
+    const own = agent.session();
+    const turn = own.prompt("beta");
+    await turn.accepted;
+    assert.deepEqual(admission(calls, own.id), ["create:run_created", "create:run_started", "create:input", "queue"]);
+    assert.equal((await turn.result).stopReason, "end_turn");
+    assert.deepEqual(JSON.parse(decoder.decode(await agent.session(id).checkpoint())), ["alpha-0", "alpha-1", "alpha-2"]);
+    await agent.close();
+  });
+
+  test("a minted id another server prompted first is read as before, and its turn runs once", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-fresh-other-"));
+    dirs.push(dir);
+    const calls = [];
+    const agent = createAgent({ durability: countingWorld(await durabilityAt(dir), calls) });
+    const other = createAgent({ durability: await durabilityAt(dir) });
+    // Sequential: the other server ran the turn before this one's first prompt.
+    const id = await agent.newSessionId();
+    const ranBefore = ran.length;
+    assert.equal((await other.session(id).prompt("gamma", { messageId: "turn-g" }).result).stopReason, "end_turn");
+    await untilIdle(other);
+    const mine = await agent.session(id).prompt("gamma", { messageId: "turn-g" }).result;
+    assert.equal(mine.repeated, true, "the run existed, so the turn is answered from it");
+    assert.ok(reads(admission(calls, id)) > 0, "the run existed, so the session was read");
+    assert.deepEqual(ran.slice(ranBefore).filter((step) => step.startsWith("turn-g:")), ["turn-g:0", "turn-g:1", "turn-g:2"]);
+    // Concurrent: both servers send one first prompt together.
+    const both = await agent.newSessionId();
+    const ranThen = ran.length;
+    const results = await Promise.all([agent, other].map((each) => each.session(both).prompt("delta", { messageId: "turn-d" }).result));
+    for (const result of results) assert.equal(result.stopReason, "end_turn");
+    await untilIdle(agent);
+    await untilIdle(other);
+    assert.deepEqual(ran.slice(ranThen).filter((step) => step.startsWith("turn-d:")).sort(), ["turn-d:0", "turn-d:1", "turn-d:2"], "the turn ran once");
+    assert.deepEqual(JSON.parse(decoder.decode(await agent.session(both).checkpoint())), ["delta-0", "delta-1", "delta-2"]);
+    for (const closing of [agent, other]) await closing.close();
+  });
+
+  test("a new chat's first prompt whose write fails is stored by its retry once, and queued", async () => {
+    for (const fault of ["create:run_started", "create:input", "queue"]) {
+      const dir = await mkdtemp(join(tmpdir(), "libfx-fresh-fail-"));
+      dirs.push(dir);
+      const calls = [];
+      const faults = new Set([fault]);
+      const base = durabilityKind === "queue"
+        ? (await queueWorldAt(dir, { queueLeases: true, runInRequest: true, maxDurationMs: 60_000, reserveMs: 100 })).durability
+        : await durabilityAt(dir);
+      const agent = createAgent({ durability: countingWorld(base, calls, faults) });
+      const id = await agent.newSessionId();
+      const messageId = `turn-${fault.replace(/[^a-z]/g, "")}`;
+      await assert.rejects(agent.session(id).prompt("eps", { messageId }).accepted, /injected failure/, fault);
+      assert.equal(callsOf(calls, id).filter((name) => name === "queue").length, fault === "queue" ? 1 : 0, `${fault}: nothing was queued before the failure`);
+      const ranBefore = ran.length;
+      calls.length = 0;
+      const retry = agent.session(id).prompt("eps", { messageId });
+      await retry.accepted;
+      assert.ok(reads(admission(calls, id)) > 0, `${fault}: the retry read the session`);
+      assert.equal(callsOf(calls, id).filter((name) => name === "queue").length >= 1, true, `${fault}: the retry queued its message`);
+      const result = await retry.result;
+      assert.equal(result.stopReason, "end_turn", fault);
+      assert.notEqual(result.repeated, true, `${fault}: no earlier attempt ran it`);
+      await untilIdle(agent);
+      assert.deepEqual(ran.slice(ranBefore).filter((step) => step.startsWith(`${messageId}:`)), [0, 1, 2].map((step) => `${messageId}:${step}`), `${fault}: it ran once`);
+      const inputs = callsOf(calls, id).filter((name) => name === "create:input").length;
+      assert.equal(inputs, fault === "queue" ? 0 : 1, `${fault}: the input is stored once`);
+      await agent.close();
+    }
   });
 }
 
