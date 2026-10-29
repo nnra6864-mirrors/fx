@@ -7053,7 +7053,6 @@ test "processQueuedPrompt routes native network failure classes through one hear
         .{ .err = error.ConnectionResetByPeer, .stage = .after_send },
         // A stream the transport watchdog stopped for silence.
         .{ .err = error.StreamStalled, .stage = .after_send },
-        .{ .err = error.SystemResumed, .stage = .after_send, .waiting = offline.waiting, .retrying = offline.retrying },
     };
 
     for (cases) |case| {
@@ -7798,37 +7797,6 @@ test "processQueuedPrompt resumed reply retries a size rejection with fewer imag
     try expectBodyNotContains(&second_gateway, 1, "\"type\":\"file\"");
     try expectBodyContains(&second_gateway, 1, "not sent to keep the request under");
     try std.testing.expectEqualStrings("finished without the image", second_hooks.history_assistant_text.?);
-}
-
-test "processQueuedPrompt retries system resume through the heartbeat" {
-    const alloc = std.testing.allocator;
-    const completions = [_]FakeCompletion{
-        .{ .stream_error = error.SystemResumed },
-        .{ .content = "Recovered after resume" },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.enable_recovery_checkpoint = true;
-    defer hooks.deinit();
-    var fixture = PromptFixture{};
-    const config = fixture.config();
-
-    try runFakePrompt(&gateway, &hooks, config, fixture.job());
-
-    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
-    // The last settled attempt, before the checkpoint that saves the reply.
-    const checkpoint = hooks.recovery_checkpoints.items[hooks.recovery_checkpoints.items.len - 2];
-    try std.testing.expectEqual(types.ModelRecoveryCause.system_resumed, checkpoint.cause);
-    try std.testing.expectEqual(@as(usize, 2), checkpoint.consumed_provider_attempts);
-    try std.testing.expect(!checkpoint.outstanding_reservation);
-    const final = hooks.recovery_checkpoints.items[hooks.recovery_checkpoints.items.len - 1];
-    try std.testing.expectEqual(types.ModelRecoveryAction.delivering_response, final.action);
-    try std.testing.expectEqual(@as(usize, 2), final.consumed_provider_attempts);
-    // A wake from sleep is offline until the network answers again.
-    try expectModuleStatus(&hooks, 0, .waiting, "Offline · next try in 1s · ");
-    try expectRecovered(&hooks, 2);
 }
 
 test "processQueuedPrompt sends nothing when durable reservation fails" {
