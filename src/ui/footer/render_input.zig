@@ -729,7 +729,8 @@ fn appendConnectedToolLabel(
     var connected: std.ArrayList(u8) = .empty;
     defer connected.deinit(alloc);
     try connected.appendSlice(alloc, ui_render.statusline_style);
-    if (std.mem.eql(u8, marker_bytes, "●") or std.mem.eql(u8, marker_bytes, "■")) {
+    // `■` is the cancelled marker older sessions recorded before `▪`.
+    if (std.mem.eql(u8, marker_bytes, "●") or std.mem.eql(u8, marker_bytes, "▪") or std.mem.eql(u8, marker_bytes, "■")) {
         try connected.appendSlice(alloc, "└");
         try appendWithoutAnsi(alloc, &connected, label[marker_end .. marker_end + line_end]);
     } else {

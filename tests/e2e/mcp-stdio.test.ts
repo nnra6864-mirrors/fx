@@ -3507,7 +3507,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
 
       await tui.sendInterruptEscapePair(10_000);
       await tui.waitForText("Cancelled mcp_fixture_echo", 10_000);
-      await tui.waitForText("■ Cancelled", 5_000);
+      await tui.waitForText("▪ Cancelled", 5_000);
       const cancel_deadline = Date.now() + 5_000;
       while (Date.now() < cancel_deadline) {
         if (

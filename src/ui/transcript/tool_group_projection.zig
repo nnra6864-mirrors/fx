@@ -320,7 +320,8 @@ fn normalizeCanonicalStatus(
 ) !?[]const u8 {
     var index: usize = 0;
     while (skipSgrSequence(text, &index)) {}
-    const markers = [_][]const u8{ "●", "■", "⊘", "↻" };
+    // `■` is the cancelled marker older sessions recorded before `▪`.
+    const markers = [_][]const u8{ "●", "▪", "■", "⊘", "↻" };
     const marker = for (markers) |candidate| {
         if (std.mem.startsWith(u8, text[index..], candidate)) break candidate;
     } else return null;
@@ -2386,7 +2387,7 @@ test "tool-heavy groups render every canonical action" {
 test "minimal tool group keeps cancellation in the header and child row" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "■ Cancelled sleep 30 · What can fx do differently?", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "▪ Cancelled sleep 30 · What can fx do differently?", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .cancelled },
@@ -2398,7 +2399,7 @@ test "minimal tool group keeps cancellation in the header and child row" {
     try std.testing.expectEqualStrings(
         "● 1 tool call · 1 command · 1 cancelled\n" ++
             "└ Cancelled \x1b[38;5;252msleep\x1b[39m 30\n\n" ++
-            "■ Cancelled sleep 30 · What can fx do differently?",
+            "▪ Cancelled sleep 30 · What can fx do differently?",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -2408,7 +2409,7 @@ test "minimal tool group clips cancellation to one child row" {
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{
             .id = 1,
-            .bytes = "■ Cancelled sleep waiting command words extend past line two",
+            .bytes = "▪ Cancelled sleep waiting command words extend past line two",
             .class = .tool_status,
         } },
     };
@@ -2458,8 +2459,8 @@ test "minimal tool group keeps later cancelled rows and hides other details" {
 test "cancelled actions remain inside the message-delimited block" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "■ Cancelled first", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "■ Cancelled second", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "▪ Cancelled first", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "▪ Cancelled second", .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 3, .bytes = "output", .class = .command_output } },
         .{ .raw_bytes = .{ .id = 4, .bytes = "read", .class = .tool_status } },
     };

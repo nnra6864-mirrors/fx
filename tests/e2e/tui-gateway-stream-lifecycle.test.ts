@@ -4957,7 +4957,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         TIMEOUT,
       );
       await waitForCondition(() => hold.cancelled, "stream cancellation");
-      expect(afterFirst).toContain("■ Cancelled");
+      expect(afterFirst).toContain("▪ Cancelled");
       expect(afterFirst).not.toContain("system: cancelled");
       expect(afterFirst).not.toContain("Cancelling");
       expect(session.isPaneAlive()).toBe(true);
@@ -5833,6 +5833,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       let executedBeforeRetry: boolean | undefined;
       let executionAtFinal: string | undefined;
+      let executionBeforeNextRetry: string | undefined;
       const refreshGateway = startFakeGateway([
         fakeShellRun("before_instruction_refresh", command, { cwd: nested }),
         () => {
@@ -5846,6 +5847,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           return fakeGatewayFinalText(finalText);
         },
         fakeShellRun("retained_scope_next_turn", command, { cwd: nested }),
+        () => {
+          executionBeforeNextRetry = readFileSync(markerPath, "utf8");
+          return fakeShellRun("changed_scope_after_refresh", command, { cwd: nested });
+        },
         fakeGatewayFinalText(nextFinalText),
       ]);
       gateway = refreshGateway;
@@ -5892,19 +5897,34 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         expect(output).not.toMatch(/command not run|project instructions changed|\bfailed\b/i);
       }
 
+      // The rules file changes before the next turn. The instructions stay as the
+      // session started them; the call that reaches the folder again gets the
+      // current rules on its tool result, replacing the earlier copy, and runs
+      // only when the model issues it again (D93).
       writeFileSync(join(nested, "AGENTS.md"), `${currentInstruction}\n`);
       await session.sendText("Run that same command once more.");
       await session.waitForText(nextFinalText, TIMEOUT);
       await session.waitForComposer(TIMEOUT);
-      expect(refreshGateway.requests).toHaveLength(5);
-      const nextInstructions = (parseGatewayRequest(refreshGateway.requests[3]!.body).prompt ?? [])
-        .filter((message) => message.role === "system")
-        .map((message) => contentText(message.content)).join("\n");
-      expect(nextInstructions).toContain(currentInstruction);
-      expect(nextInstructions).not.toContain(instruction);
+      expect(refreshGateway.requests).toHaveLength(6);
+      for (const request of refreshGateway.requests.slice(3)) {
+        const instructions = (parseGatewayRequest(request.body).prompt ?? [])
+          .filter((message) => message.role === "system")
+          .map((message) => contentText(message.content)).join("\n");
+        expect(instructions).not.toContain(currentInstruction);
+        expect(instructions).not.toContain(instruction);
+      }
+      expect(refreshGateway.requests[3]!.body).not.toContain(currentInstruction);
+      const refreshedPrompt = parseGatewayRequest(refreshGateway.requests[4]!.body).prompt ?? [];
+      const refreshedResult = refreshedPrompt[refreshedPrompt.length - 1]!;
+      expect(refreshedResult.role).toBe("tool");
+      const refreshedOutput = JSON.stringify(refreshedResult.content);
+      expect(refreshedOutput).toContain("Scoped project instructions were added before execution.");
+      expect(refreshedOutput).toContain("The rules below replace the earlier copy from the same file.");
+      expect(refreshedOutput).toContain(currentInstruction);
+      expect(executionBeforeNextRetry).toBe("executed\n");
       expect(readFileSync(markerPath, "utf8")).toBe("executed\nexecuted\n");
       expect(countOccurrences(await session.captureFullScrollback(), refreshLabel))
-        .toBe(countOccurrences(compact, refreshLabel));
+        .toBe(countOccurrences(compact, refreshLabel) + 1);
       expect(hasEmptyComposer(await session.capturePane())).toBe(true);
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);

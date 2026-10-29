@@ -8,10 +8,10 @@ import unittest
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-SCRIPT_PATH = REPO_ROOT / "scripts" / "detect-libfx-need.sh"
+SCRIPT_PATH = REPO_ROOT / "scripts" / "detect-ci-need.sh"
 
 
-class DetectLibfxNeedTests(unittest.TestCase):
+class DetectCiNeedTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self.temp.name)
@@ -27,6 +27,7 @@ class DetectLibfxNeedTests(unittest.TestCase):
         }
         self.git("init", "-q")
         self.write("src/acp/server.zig", "pub fn serve() void {}\n")
+        self.write("src/mcp/engine.zig", "pub fn run() void {}\n")
         self.write("README.md", "fx\n")
         self.base = self.commit("base")
 
@@ -69,30 +70,36 @@ class DetectLibfxNeedTests(unittest.TestCase):
         output_path.unlink()
         return result.returncode, outputs, result.stdout + result.stderr
 
-    def assert_needed(self, **env: str) -> str:
+    def assert_needs(self, *, libfx: bool, mcp: bool, **env: str) -> str:
         code, outputs, text = self.detect(**env)
         self.assertEqual(0, code, text)
-        self.assertEqual({"needed": "true"}, outputs, text)
+        self.assertEqual(
+            {"libfx": str(libfx).lower(), "mcp": str(mcp).lower()}, outputs, text,
+        )
         return text
 
-    def assert_not_needed(self) -> None:
-        code, outputs, text = self.detect()
-        self.assertEqual(0, code, text)
-        self.assertEqual({"needed": "false"}, outputs, text)
+    def commit_each(self, paths: tuple[str, ...], *, libfx: bool, mcp: bool) -> None:
+        for path in paths:
+            with self.subTest(path=path):
+                self.write(path, f"// {path}\n")
+                self.commit(path)
+                self.assertIn(path, self.assert_needs(libfx=libfx, mcp=mcp))
+                self.base = self.git("rev-parse", "HEAD")
 
-    def test_change_outside_libfx_skips_the_check(self) -> None:
+    def test_change_outside_both_checks_skips_them(self) -> None:
         self.write("README.md", "fx docs\n")
         self.write("src/ui/composer.zig", "pub fn draw() void {}\n")
         self.write("src/core/agent/loop.zig", "pub fn run() void {}\n")
         self.write("src/wasm_term_main.zig", "pub fn main() void {}\n")
         self.write("tests/e2e/composer.test.ts", "test\n")
+        self.write("tests/e2e/fixtures/fake-gateway.ts", "export {};\n")
         self.write(".github/workflows/macos.yml", "name: macOS\n")
         self.commit("head")
 
-        self.assert_not_needed()
+        self.assert_needs(libfx=False, mcp=False)
 
-    def test_libfx_paths_need_the_check(self) -> None:
-        for path in (
+    def test_libfx_paths_need_only_the_libfx_check(self) -> None:
+        self.commit_each((
             "sdk/durable.js",
             "sdk/tests/test-durable.mjs",
             "tests/tla/sdk/DurableSession.tla",
@@ -104,38 +111,50 @@ class DetectLibfxNeedTests(unittest.TestCase):
             "src/acp/libfx_steering.zig",
             "src/core/hosts/host.zig",
             "src/core/session_manager/api.zig",
+        ), libfx=True, mcp=False)
+
+    def test_mcp_paths_need_only_the_mcp_check(self) -> None:
+        self.commit_each((
+            "src/mcp/engine.zig",
+            "src/core/mcp_host/host.zig",
+            "src/core/mcp/config.zig",
+            "tests/tla/mcp/Engine.tla",
+            "tests/tla/mcp_host/Host.tla",
+            "tests/tla/drivers/mcp/driver.ts",
+            "tests/tla/drivers/mcp_host/sign-in.test.ts",
+            "tests/tla/drivers/lib/context.ts",
+            "tests/e2e/fixtures/mcp-legacy-stdio.mjs",
+            "tests/e2e/tmux-helpers.ts",
+            "tests/evals/eval-helpers.ts",
+            "tests/e2e/render-lab/tape.ts",
+        ), libfx=False, mcp=True)
+
+    def test_build_and_check_inputs_need_both_checks(self) -> None:
+        self.commit_each((
             "build.zig",
             "build.zig.zon",
-        ):
-            with self.subTest(path=path):
-                self.write(path, f"// {path}\n")
-                self.commit(path)
-                self.assertIn(path, self.assert_needed())
-                self.base = self.git("rev-parse", "HEAD")
+            ".github/workflows/ci.yml",
+            "scripts/detect-ci-need.sh",
+        ), libfx=True, mcp=True)
 
-    def test_check_inputs_need_the_check(self) -> None:
-        for path in (".github/workflows/ci.yml", "scripts/detect-libfx-need.sh"):
-            with self.subTest(path=path):
-                self.write(path, f"# {path}\n")
-                self.commit(path)
-                self.assertIn(path, self.assert_needed())
-                self.base = self.git("rev-parse", "HEAD")
+    def test_mcp_driver_folders_do_not_need_the_libfx_check(self) -> None:
+        self.write("tests/tla/drivers/mcp/scenarios/u01-wire.mjs", "export {};\n")
+        self.commit("nested driver")
 
-    def test_other_drivers_folders_skip_the_check(self) -> None:
-        self.write("tests/tla/drivers/mcp/driver.ts", "export {};\n")
-        self.write("tests/tla/drivers/usage/lean/drive.mjs", "export {};\n")
-        self.commit("other drivers")
+        self.assert_needs(libfx=False, mcp=True)
 
-        self.assert_not_needed()
-
-    def test_deleted_and_renamed_libfx_files_need_the_check(self) -> None:
+    def test_deleted_and_renamed_files_need_their_checks(self) -> None:
         self.git("mv", "src/acp/server.zig", "src/server.zig")
+        self.git("rm", "-q", "src/mcp/engine.zig")
         self.commit("head")
 
-        self.assertIn("src/acp/server.zig", self.assert_needed())
+        text = self.assert_needs(libfx=True, mcp=True)
+        self.assertIn("src/acp/server.zig", text)
+        self.assertIn("src/mcp/engine.zig", text)
 
-    def test_request_forces_the_check(self) -> None:
-        self.assertIn("push to main", self.assert_needed(LIBFX_REQUESTED="push to main"))
+    def test_request_forces_both_checks(self) -> None:
+        text = self.assert_needs(libfx=True, mcp=True, CI_NEED_REQUESTED="push to main")
+        self.assertIn("push to main", text)
 
     def test_unreadable_revision_fails_instead_of_skipping(self) -> None:
         code, outputs, text = self.detect(base="does-not-exist")

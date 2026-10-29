@@ -615,7 +615,7 @@ fn lifecycleMarker(kind: types.ToolOutcomeKind) LifecycleMarker {
         .completed => .{ .style = ui_render.system_notice_text_style, .glyph = "●" },
         .failed => .{ .style = ui_render.red_style, .glyph = "●" },
         .denied => .{ .style = ui_render.red_style, .glyph = "⊘" },
-        .cancelled => .{ .style = ui_render.warning_style, .glyph = "■" },
+        .cancelled => .{ .style = ui_render.warning_style, .glyph = "▪" },
         .deferred => .{ .style = ui_render.warning_style, .glyph = "↻" },
     };
 }
@@ -4247,7 +4247,7 @@ test "retintEntriesForTheme rewrites owned presentation without touching externa
 
     const owned_id = try runtime.appendRawTranscriptEntryClassified(
         alloc,
-        "\x1b[38;5;252m■\x1b[38;5;255m cancelled\x1b[39m\n",
+        "\x1b[38;5;252m▪\x1b[38;5;255m cancelled\x1b[39m\n",
         .tool_status,
     );
     const command_id = try runtime.appendRawTranscriptEntryClassified(
@@ -4271,7 +4271,7 @@ test "retintEntriesForTheme rewrites owned presentation without touching externa
     try std.testing.expectEqual(unknown_id, runtime.entries.items[2].id());
     try std.testing.expectEqual(assistant_id, runtime.entries.items[3].id());
     try std.testing.expectEqualStrings(
-        "\x1b[38;5;238m■\x1b[38;5;235m cancelled\x1b[39m\n",
+        "\x1b[38;5;238m▪\x1b[38;5;235m cancelled\x1b[39m\n",
         runtime.entries.items[0].raw_bytes.bytes,
     );
     try std.testing.expectEqualStrings(

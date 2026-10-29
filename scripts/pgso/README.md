@@ -19,6 +19,8 @@ The driver requires:
 
 The pipeline does not use the host CPU as the release target. The final candidate must match the control's architecture, minimum macOS version, SDK compatibility stamp, main-stack request, and dynamic-library dependency versions. It must contain a valid code signature, contain no profile sections or profile-runtime dependency, and produce no profile output when executed.
 
+The target-specific steps live in a platform module, which [`platforms.py`](platforms.py) selects for the requested target: the host check, native tools, the instrumented and candidate links, the control properties the candidate must match, and the candidate's layout checks. [`macos.py`](macos.py) is the only platform. The profile, outlining, corpus, and measurement stages are shared.
+
 Training records execution counts and first-use function timestamps in the same
 continuous profiles. Counter supplements preserve the temporal traces. The
 main PGSO executable uses LLVM's temporal function order through the native
@@ -79,11 +81,21 @@ Generated IR helpers are kept in one dense linker cluster ordered by their
 hottest profiled caller so outlining does not scatter startup code across cold
 pages.
 
+LLVM's IR outliner does not compare constants nested inside a constant
+expression. Two regions that differ only in an instruction's constant can share
+one parameter that also replaces a nested constant, so one of them reads the
+wrong address. Before each outliner run, `ir_size.py expand-constant-exprs`
+rebuilds the constant expressions that instructions use as instructions, so the
+outliner compares every constant. Afterwards, `ir_size.py check-outlined` fails
+the run if an outlined function still holds a constant expression the outliner
+rebuilt from a parameter. Benchmark candidates take the same two steps.
+
 Two size passes in [`ir_size.py`](ir_size.py) run through the pinned LLVM C
 library. Right after Zig emits bitcode, `outline-helpers` marks small shared
 std helpers `noinline`: the allocator's slice `free`, `remap`, and aligned
-allocation, the writer's `write`, `writeAll`, and allocating-writer setup and
-teardown, and the byte list's `appendSlice` and `deinit`. Zig otherwise copies
+allocation, the writer's `write`, `writeAll`, `writeByte`, and
+allocating-writer setup and teardown, the byte list's `appendSlice`, every
+list's `deinit`, `mem.eql`, and the `Io.Mutex` lock and unlock. Zig otherwise copies
 them into thousands of call sites (`free` alone into about 11,000). The pass
 runs before instrumentation, so training, profile use, and the recorded
 bitcode identity all include it. It reports matches per pattern and fails if

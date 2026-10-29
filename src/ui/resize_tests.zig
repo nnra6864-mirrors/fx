@@ -3584,7 +3584,7 @@ test "resized question cancellation keeps the idle footer bottom anchored" {
     _ = try h.shell.appendReplaceableTranscriptLineClassified(
         alloc,
         &h.metrics,
-        "\x1b[2m■ Cancelled\x1b[0m\n",
+        "\x1b[2m▪ Cancelled\x1b[0m\n",
         .question_resolution,
     );
     question.discard(alloc, "test_cleanup");
@@ -3602,7 +3602,7 @@ test "resized question cancellation keeps the idle footer bottom anchored" {
     try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
     try h.flush();
 
-    const cancelled_row = try findRowContaining(&h, "■ Cancelled");
+    const cancelled_row = try findRowContaining(&h, "▪ Cancelled");
     const footer_row = try findFirstDividerRowAfter(&h, cancelled_row);
     try expectExactlyOneBlankRowBetween(&h, cancelled_row, footer_row);
     try std.testing.expectEqual(

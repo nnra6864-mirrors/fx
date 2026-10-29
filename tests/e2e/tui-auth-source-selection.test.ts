@@ -2634,7 +2634,7 @@ tmuxTest(
     );
     await session.waitForComposer(TIMEOUT);
     expect(Date.now() - cancelStarted).toBeLessThan(500);
-    expect(cancelledPane).toContain("■ Cancelled");
+    expect(cancelledPane).toContain("▪ Cancelled");
     expect(cancelledPane).not.toContain("system: cancelled");
     expect(cancelledPane).not.toContain("Cancelling");
     expect(session.isAlive()).toBe(true);

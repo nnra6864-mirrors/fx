@@ -337,6 +337,10 @@ pub fn Bindings(comptime App: type) type {
                     if (app.session_persistence.v2 != null) agentAppendTurnPiece else null
                 else
                     null,
+                .record_usage = if (comptime @hasField(App, "session_persistence"))
+                    if (app.session_persistence.v2 != null) agentRecordUsage else null
+                else
+                    null,
                 .save_prompt_images = if (comptime @hasField(App, "session_persistence"))
                     if (app.session_persistence.v2 != null) agentSavePromptImages else null
                 else
@@ -872,10 +876,10 @@ pub fn Bindings(comptime App: type) type {
             return result;
         }
 
-        fn agentAppendStaticContext(ctx: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) !void {
+        fn agentAppendStaticContext(ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime @hasDecl(App, "appendStaticContextMessage")) {
-                try app.appendStaticContextMessage(arena, project_context, messages);
+                try app.appendStaticContextMessage(arena, messages);
             }
         }
 
@@ -1197,6 +1201,11 @@ pub fn Bindings(comptime App: type) type {
         fn agentAppendTurnPiece(ctx: *anyopaque, progress: agent_runtime.TurnProgress) anyerror!void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app_session_runtime.Runtime(App).appendTurnPiece(app, progress);
+        }
+
+        fn agentRecordUsage(ctx: *anyopaque, usage: types.Usage) anyerror!void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try app_session_runtime.Runtime(App).recordUsage(app, usage);
         }
 
         fn agentSavePromptImages(ctx: *anyopaque, alloc: std.mem.Allocator, images: []types.ImageAttachment) anyerror!void {
