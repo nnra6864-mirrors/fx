@@ -1673,9 +1673,19 @@ class SessionWorker {
     this.sessionId = sessionId;
     // Set while this process runs the session; each run holds its own lease.
     this.running = false;
-    // Deliveries in progress for the session in this process.
+    // How many claims this worker has started. A read taken at a lower count
+    // may predate a turn that took the inputs it shows pending.
+    this.turns = 0;
+    // Deliveries in progress for the session in this process, and senders
+    // about to hand one a read (see consume).
     this.deliveries = 0;
     this.holder = null;
+  }
+
+  // Taken just before a read of the log, for consume to tell whether a turn
+  // ran here since: the claims started, or null while one runs.
+  mark() {
+    return this.running ? null : this.turns;
   }
 
   // The log folded as `delivery` judges whether a lease's holder lives.
@@ -1693,9 +1703,13 @@ class SessionWorker {
   // have the same message delivered again later.
   // `handoff` is the sender's own session object and the log it read and
   // extended, when the request that took the prompt runs it (see
-  // handoffEntries); the worker starts from them instead of reading again.
+  // handoffEntries), with `seen`, what mark() said before that read; the
+  // worker starts from them instead of reading again.
   async consume(message, delivery = null, handoff = null) {
     const log = handoff?.log ?? await this.backend.session(this.sessionId);
+    // The claims this worker had started when the read began, or null when
+    // one was running then, whose writes it may not show.
+    let seen = handoff ? handoff.seen : this.mark();
     let entries = handoff?.entries ?? await log.read();
     let state = this.fold(entries, delivery);
     if (!knownMessage(state, message)) {
@@ -1717,6 +1731,14 @@ class SessionWorker {
       return undefined;
     }
     for (let claims = 0; claims < 8; claims += 1) {
+      // A turn this worker ran since the read may have run this message,
+      // which the read still shows pending; starting from it would send the
+      // turn's model request twice. A turn still running answers below.
+      while (!this.running && seen !== this.turns) {
+        seen = this.turns;
+        entries = await log.read();
+        state = this.fold(entries, delivery);
+      }
       // A session with no open turn starts its next prompt at once: the
       // first model request goes out while the lease is written, and
       // nothing else is written until it lands.
@@ -1752,6 +1774,7 @@ class SessionWorker {
       }
       // The turns ran, or another worker's write came before this claim:
       // read the log again.
+      seen = this.mark();
       entries = await log.read();
       state = this.fold(entries, delivery);
     }
@@ -1768,6 +1791,7 @@ class SessionWorker {
     // Claimed before the first await, so a delivery that arrives meanwhile
     // sees the session running here.
     this.running = true;
+    this.turns += 1;
     this.holder = newId("wkr");
     const lease = {
       k: "lease",
@@ -2690,13 +2714,23 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
     // One delivery of `message` to the session's worker here: from the
     // queue, with `delivery` naming the queue's message and attempt, or with
     // `inRequest` from the request that took the prompt.
-    const receive = (created, message, delivery, { inRequest = false, handoff = null } = {}) => {
-      let worker = workers.get(message.sessionId);
+    // The session's worker here, kept until as many letGo() calls.
+    const hold = (created, sessionId) => {
+      let worker = workers.get(sessionId);
       if (!worker) {
-        worker = new SessionWorker(agent, created, message.sessionId);
-        workers.set(message.sessionId, worker);
+        worker = new SessionWorker(agent, created, sessionId);
+        workers.set(sessionId, worker);
       }
       worker.deliveries += 1;
+      return worker;
+    };
+    const letGo = (worker, sessionId) => {
+      worker.deliveries -= 1;
+      // A worker lives while a delivery runs it.
+      if (worker.deliveries === 0 && !worker.running && workers.get(sessionId) === worker) workers.delete(sessionId);
+    };
+    const receive = (created, message, delivery, { inRequest = false, handoff = null } = {}) => {
+      const worker = hold(created, message.sessionId);
       let work = worker.consume(message, delivery, handoff);
       if (inRequest) {
         // No queue delivered this message, so none delivers it again: a turn
@@ -2718,9 +2752,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
         emit("session.error", { sessionId: message.sessionId, error: errorSummary(error) });
       }).finally(() => {
         active.delete(work);
-        worker.deliveries -= 1;
-        // A worker lives while a delivery runs it.
-        if (worker.deliveries === 0 && !worker.running && workers.get(message.sessionId) === worker) workers.delete(message.sessionId);
+        letGo(worker, message.sessionId);
       });
       return work;
     };
@@ -2763,34 +2795,44 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
         // OnlySentRuns), and a queue that ends with the process loses no
         // input.
         const log = await created.session(sessionId);
-        const read = await log.read();
-        const newestSeen = log.newest?.();
-        const appended = await recordMessage(log, foldSessionLog(read), full);
-        const queued = queuedMessage(full, created.store);
-        const idempotencyKey = `${sessionId}:${message.type}:${message.messageId}`;
-        if (inRequest && created.runInRequest) {
-          await created.refreshDeadline?.();
-          const deadline = deliveryDeadline(created);
-          if (deadline !== null) {
-            // This request runs the turn, and the queue keeps the message as
-            // a backstop it delivers only after the request's deadline, by
-            // when the request has stopped. The lease names the backstop, so
-            // if the request died, the backstop takes the session over and
-            // continues the turn.
-            const delaySeconds = Math.ceil(Math.max(0, deadline - Date.now()) / 1000) + inlineBackstopMarginSeconds;
-            const { messageId: backstop } = await created.queue.send(queued, { idempotencyKey, delaySeconds }) ?? {};
-            seeded = true;
-            const delivery = backstop ? { messageId: backstop, attempt: 0 } : null;
-            // receive() reports a failure to the host; the backstop retries it.
-            const entries = handoffEntries(read, newestSeen, appended);
-            const handoff = entries ? { log, entries } : null;
-            const work = receive(created, queued, delivery, { inRequest: true, handoff }).then(() => {}, () => {});
-            created.waitUntil?.(work);
-            return;
+        const inline = inRequest && created.runInRequest;
+        // Held from before the read until receive() takes over, so a turn
+        // run here meanwhile is counted on the worker the handoff goes to,
+        // not on one dropped in between (see consume).
+        const worker = inline ? hold(created, sessionId) : null;
+        try {
+          const seen = worker?.mark() ?? null;
+          const read = await log.read();
+          const newestSeen = log.newest?.();
+          const appended = await recordMessage(log, foldSessionLog(read), full);
+          const queued = queuedMessage(full, created.store);
+          const idempotencyKey = `${sessionId}:${message.type}:${message.messageId}`;
+          if (inline) {
+            await created.refreshDeadline?.();
+            const deadline = deliveryDeadline(created);
+            if (deadline !== null) {
+              // This request runs the turn, and the queue keeps the message as
+              // a backstop it delivers only after the request's deadline, by
+              // when the request has stopped. The lease names the backstop, so
+              // if the request died, the backstop takes the session over and
+              // continues the turn.
+              const delaySeconds = Math.ceil(Math.max(0, deadline - Date.now()) / 1000) + inlineBackstopMarginSeconds;
+              const { messageId: backstop } = await created.queue.send(queued, { idempotencyKey, delaySeconds }) ?? {};
+              seeded = true;
+              const delivery = backstop ? { messageId: backstop, attempt: 0 } : null;
+              // receive() reports a failure to the host; the backstop retries it.
+              const entries = handoffEntries(read, newestSeen, appended);
+              const handoff = entries ? { log, entries, seen } : null;
+              const work = receive(created, queued, delivery, { inRequest: true, handoff }).then(() => {}, () => {});
+              created.waitUntil?.(work);
+              return;
+            }
           }
+          await created.queue.send(queued, { idempotencyKey });
+          seeded = true;
+        } finally {
+          if (worker) letGo(worker, sessionId);
         }
-        await created.queue.send(queued, { idempotencyKey });
-        seeded = true;
       };
       // Settles once the latest prompt from this session object with images
       // to store is stored or has failed; null while none has. Each later

@@ -2475,6 +2475,230 @@ if (durabilityKind === "queue") {
     assert.ok(ops.slice(input + 1, lease).includes("list"), "the worker read the log before its lease");
     for (const closing of [agent, other]) await closing.close();
   });
+
+  test("a prompt's worker reads the log again when a turn ran here after its sender's read, so the prompt starts once", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-handoff-stale-"));
+    dirs.push(dir);
+    const kindOf = (event) => {
+      try { return JSON.parse(decoder.decode(event.eventData.input)).k; } catch { return null; }
+    };
+    // Runs once, at the first listing after a's release: a's worker reading
+    // the log again, once it stopped running. Then the next release, b's,
+    // resolves `bReleased`.
+    let onRelease = null;
+    let beforeList = null;
+    let ranB;
+    const bReleased = new Promise((resolve) => { ranB = resolve; });
+    let bStored;
+    const stored = new Promise((resolve) => { bStored = resolve; });
+    // Resolves at the next listing, once armed.
+    let listed = null;
+    const { durability: base } = await queueWorldAt(dir, { queueLeases: true, runInRequest: true, maxDurationMs: 60_000 });
+    const durability = {
+      ...base,
+      world: async () => {
+        const world = await base.world();
+        const list = world.events.list.bind(world.events);
+        const create = world.events.create.bind(world.events);
+        const queue = world.queue.bind(world);
+        const events = Object.assign(Object.create(world.events), {
+          async list(...args) {
+            const wake = listed;
+            listed = null;
+            wake?.();
+            const run = beforeList;
+            beforeList = null;
+            await run?.();
+            return list(...args);
+          },
+          async create(runId, event, ...rest) {
+            const result = await create(runId, event, ...rest);
+            const kind = event?.eventType === "step_created" ? kindOf(event) : null;
+            if (kind === "input" && JSON.parse(decoder.decode(event.eventData.input)).messageId === "stale-b") bStored();
+            if (kind === "release") {
+              if (onRelease) [beforeList, onRelease] = [onRelease, null];
+              else ranB();
+            }
+            return result;
+          },
+        });
+        return Object.assign(Object.create(world), {
+          events,
+          async queue(name, payload, options = {}) {
+            // b's backstop is sent once the turn before b ran b here and
+            // its worker read the log again, with nothing running.
+            if (payload?.input?.messageId === "stale-b" && options.delaySeconds > 0) {
+              await bReleased;
+              await new Promise((resolve) => { listed = resolve; });
+            }
+            return queue(name, payload, options);
+          },
+        });
+      },
+    };
+    const agent = createAgent({ durability });
+    const session = agent.session();
+    // a's turn ends before its release lands.
+    let sent;
+    const second = new Promise((resolve) => { sent = resolve; });
+    // b's sender reads the log after a's worker stopped and stores b before
+    // that worker reads the log again, so a's worker runs b first.
+    onRelease = async () => {
+      sent(textOf(session.prompt("nu", { messageId: "stale-b" })));
+      await stored;
+    };
+    assert.equal((await textOf(session.prompt("xi", { messageId: "stale-a" }))).result.stopReason, "end_turn");
+    const { text, result } = await second;
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(text, "nu-0 nu-1 nu-2");
+    await untilIdle(agent);
+    assert.deepEqual(prompted.filter((id) => id === "stale-b"), ["stale-b"], "b's turn started once");
+    await agent.close();
+  });
+
+  const entryOfEvent = (event) => {
+    try { return event?.eventType === "step_created" ? JSON.parse(decoder.decode(event.eventData.input)) : null; } catch { return null; }
+  };
+  // A World with hooks: before(entry) runs before a write, after(entry) once
+  // it landed, onList() at each listing, onQueue(payload, options) before a send.
+  const hookedWorld = (base, hooks) => ({
+    ...base,
+    world: async () => {
+      const world = await base.world();
+      const list = world.events.list.bind(world.events);
+      const create = world.events.create.bind(world.events);
+      const queue = world.queue.bind(world);
+      const events = Object.assign(Object.create(world.events), {
+        async list(...args) {
+          await hooks.onList?.(args[0]);
+          return list(...args);
+        },
+        async create(runId, event, ...rest) {
+          const entry = entryOfEvent(event);
+          if (entry) await hooks.before?.(entry);
+          const result = await create(runId, event, ...rest);
+          if (entry) await hooks.after?.(entry);
+          return result;
+        },
+      });
+      return Object.assign(Object.create(world), {
+        events,
+        async queue(name, payload, options = {}) {
+          await hooks.onQueue?.(payload, options);
+          return queue(name, payload, options);
+        },
+      });
+    },
+  });
+  const internalsOf = (agent) => agent[Symbol.for("libfx.durableInternals")];
+
+  test("a sender that reads while a claim's lease is still landing does not start a turn twice", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-lease-landing-"));
+    dirs.push(dir);
+    let onLease = null;
+    let bStored;
+    const stored = new Promise((resolve) => { bStored = resolve; });
+    let armedRelease = false;
+    let ranB;
+    const bReleased = new Promise((resolve) => { ranB = resolve; });
+    let listed = null;
+    const { durability: base } = await queueWorldAt(dir, { queueLeases: true, runInRequest: true, maxDurationMs: 60_000 });
+    const durability = hookedWorld(base, {
+      onList: () => { const wake = listed; listed = null; wake?.(); },
+      before: async (entry) => {
+        if (entry.k === "lease" && onLease) { const run = onLease; onLease = null; await run(); }
+      },
+      after: (entry) => {
+        if (entry.k === "input" && entry.messageId === "m2-b") bStored();
+        if (entry.k === "release" && armedRelease) { armedRelease = false; ranB(); }
+      },
+      onQueue: async (payload, options) => {
+        if (payload?.input?.messageId === "m2-b" && options.delaySeconds > 0) {
+          await bReleased;
+          await new Promise((resolve) => { listed = resolve; });
+        }
+      },
+    });
+    const agent = createAgent({ durability });
+    const session = agent.session();
+    assert.equal((await textOf(session.prompt("warm", { messageId: "m2-w" }))).result.stopReason, "end_turn");
+    await untilIdle(agent);
+    let sent;
+    const second = new Promise((resolve) => { sent = resolve; });
+    // a's claim is running, its lease not yet in the log, when b's sender
+    // marks and reads; b lands before the lease does.
+    onLease = async () => {
+      armedRelease = true;
+      sent(textOf(session.prompt("nu", { messageId: "m2-b" })));
+      await stored;
+    };
+    const first = await textOf(session.prompt("xi", { messageId: "m2-a" }));
+    assert.equal(first.result.stopReason, "end_turn");
+    const { text, result } = await second;
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(text, "nu-0 nu-1 nu-2");
+    await untilIdle(agent);
+    assert.deepEqual(prompted.filter((id) => id.startsWith("m2-")), ["m2-w", "m2-a", "m2-b"], "each turn started once");
+    await agent.close();
+  });
+
+  test("a prompt whose turn another sender's worker ran while its backstop was sent starts once", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-other-sender-"));
+    dirs.push(dir);
+    let onBStored = null;
+    let armed = false;
+    let ranRelease;
+    const released = new Promise((resolve) => { ranRelease = resolve; });
+    let listed = null;
+    const { durability: base } = await queueWorldAt(dir, { queueLeases: true, runInRequest: true, maxDurationMs: 60_000 });
+    const durability = hookedWorld(base, {
+      onList: () => { const wake = listed; listed = null; wake?.(); },
+      after: (entry) => {
+        if (entry.k === "input" && entry.messageId === "bc-b" && onBStored) { const run = onBStored; onBStored = null; run(); }
+        if (entry.k === "release" && armed) { armed = false; ranRelease(); }
+      },
+      onQueue: async (payload, options) => {
+        if (payload?.input?.messageId === "bc-b" && options.delaySeconds > 0) {
+          await released;
+          await new Promise((resolve) => { listed = resolve; });
+          await sleep(30);
+        }
+      },
+    });
+    const agent = createAgent({ durability });
+    const session = agent.session();
+    assert.equal((await textOf(session.prompt("warm", { messageId: "bc-w" }))).result.stopReason, "end_turn");
+    await untilIdle(agent);
+    armed = true;
+    let cTurn;
+    onBStored = () => { cTurn = textOf(session.prompt("chi", { messageId: "bc-c" })); };
+    const b = await textOf(session.prompt("nu", { messageId: "bc-b" }));
+    const c = await cTurn;
+    assert.equal(b.text, "nu-0 nu-1 nu-2");
+    assert.equal(c.text, "chi-0 chi-1 chi-2");
+    await untilIdle(agent);
+    assert.deepEqual(prompted.filter((id) => id.startsWith("bc-")), ["bc-w", "bc-b", "bc-c"], "each turn started once");
+    await agent.close();
+  });
+
+  for (const how of ["backstop", "input"]) {
+    test(`a ${how} write that fails leaves no worker held`, async () => {
+      const dir = await mkdtemp(join(tmpdir(), "libfx-held-fail-"));
+      dirs.push(dir);
+      const { durability: base } = await queueWorldAt(dir, { queueLeases: true, runInRequest: true, maxDurationMs: 60_000 });
+      const durability = hookedWorld(base, {
+        before: (entry) => { if (how === "input" && entry.k === "input" && entry.messageId === "f-b") throw new Error("input write failed"); },
+        onQueue: (payload, options) => { if (how === "backstop" && payload?.input?.messageId === "f-b" && options.delaySeconds > 0) throw new Error("backstop failed"); },
+      });
+      const agent = createAgent({ durability });
+      const session = agent.session();
+      assert.equal((await textOf(session.prompt("warm", { messageId: "f-w" }))).result.stopReason, "end_turn");
+      await untilIdle(agent);
+      await assert.rejects(textOf(session.prompt("nu", { messageId: "f-b" })));
+      assert.equal(internalsOf(agent).liveWorkers(), 0, "no worker is left held");
+      await agent.close();
+    });
+  }
 }
 
 let failed = 0;
