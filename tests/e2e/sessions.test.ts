@@ -277,10 +277,13 @@ test("fx ask saves to v2, resumes by id and by last, and never writes v1", async
     expect(first.output).toBe("V2_FIRST_ANSWER");
     const id: string = first.session_id;
     expect(id.length).toBeGreaterThan(0);
+    // The first turn saves the runtime context it captured right after its
+    // user message (D94).
     expect(shape(logLines(fixture.home, id))).toEqual([
       "session_created",
       "turn_started",
       "item:user",
+      "item:runtime_context",
       "item:assistant",
       "item:turn_end",
       "turn_committed",
@@ -305,6 +308,8 @@ test("fx ask saves to v2, resumes by id and by last, and never writes v1", async
 
     const kinds = logLines(fixture.home, id).map((line) => line.kind);
     expect(kinds.filter((kind) => kind === "turn_committed").length).toBe(3);
+    // The resumed turns send the saved copy and save none of their own.
+    expect(shape(logLines(fixture.home, id)).filter((kind) => kind === "item:runtime_context").length).toBe(1);
     expectNoV1Sessions(fixture);
   } finally {
     gateway.stop();
@@ -525,7 +530,7 @@ test("a long command output is kept as one read-only blob, and the model pages i
   const gateway = startDynamicFakeGateway(async (body) => {
     if (body.includes("Page the output again.")) {
       if (body.includes("replay-read-1")) return fakeGatewayFinalText("REPLAY_PAGED_DONE");
-      const handle = /fx-command-replay-[a-f0-9]{64}\.bin/.exec(body)?.[0] ?? "missing-handle";
+      const handle = /fx-command-replay-[a-f0-9]{12}-[a-f0-9]{64}\.bin/.exec(body)?.[0] ?? "missing-handle";
       return fakeGatewayToolCall("replay-read-1", "read_tool_result", {
         request: { handle, query: "150001" },
       });
@@ -539,8 +544,9 @@ test("a long command output is kept as one read-only blob, and the model pages i
     expect(JSON.parse(created.stdout).output).toBe("LONG_RUN_DONE");
     const id = JSON.parse(created.stdout).session_id;
 
-    const handle = /fx-command-replay-[a-f0-9]{64}\.bin/.exec(JSON.stringify(logLines(fixture.home, id)))?.[0] ?? "";
-    expect(handle).toMatch(/^fx-command-replay-[a-f0-9]{64}\.bin$/);
+    const handle = /fx-command-replay-[a-f0-9]{12}-[a-f0-9]{64}\.bin/.exec(JSON.stringify(logLines(fixture.home, id)))?.[0] ?? "";
+    // A run id, then the hash that names the blob (D44, D91).
+    expect(handle).toMatch(/^fx-command-replay-[a-f0-9]{12}-[a-f0-9]{64}\.bin$/);
     const hash = /-([a-f0-9]{64})\./.exec(handle)![1]!;
     expect(blobNames(fixture, id)).toContain(hash);
     expect(blobNames(fixture, id).every((name) => /^[a-f0-9]{64}$/.test(name))).toBe(true);
@@ -3341,7 +3347,7 @@ test.skipIf(!tmuxAvailable())("an app whose disk fills keeps running, and the se
     await app2.sendText("The disk fills in this turn.");
     // It names the write that failed first, even when an earlier streamed
     // write took the log down (D40).
-    await app2.waitForText("Turn completed, but fx could not save it (FileTooBig)", TIMEOUT);
+    await app2.waitForText("Couldn't save this turn: a file-size limit was reached", TIMEOUT);
     await app2.waitForComposer(TIMEOUT);
     await quit();
     expect(gateway.requests.length).toBe(asked + 1);
@@ -3975,7 +3981,7 @@ async function gridEnter(entry: GridEntry, c: GridCase, gateway: any, token: str
         const deadline = Date.now() + TIMEOUT;
         while (Date.now() < deadline) {
           screen = await session.captureFullScrollback();
-          if (screen.includes(answer) || /✗ .*|could not save/.test(screen.slice(screen.lastIndexOf(prompt)))) break;
+          if (screen.includes(answer) || /✗ .*|[Cc]ouldn't save/.test(screen.slice(screen.lastIndexOf(prompt)))) break;
           await Bun.sleep(100);
         }
         // The reply shows even when saving it fails, so read the turn's end.
@@ -3984,7 +3990,7 @@ async function gridEnter(entry: GridEntry, c: GridCase, gateway: any, token: str
         const turn = screen.slice(screen.lastIndexOf(prompt));
         await session.sendText("/quit");
         await exit("after /quit");
-        return { entered: turn.includes(answer) && !/✗ |could not save/.test(turn), said: `${turn}\n${readFileSync(stderrPath, "utf8")}` };
+        return { entered: turn.includes(answer) && !/✗ |[Cc]ouldn't save/.test(turn), said: `${turn}\n${readFileSync(stderrPath, "utf8")}` };
       } finally {
         await session.kill();
       }

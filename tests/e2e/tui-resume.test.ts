@@ -1369,6 +1369,215 @@ printf '${trailingMarker}   '
   60_000,
 );
 
+function treeBytes(path: string): number {
+  let total = 0;
+  for (const entry of readdirSync(path, { withFileTypes: true })) {
+    const child = join(path, entry.name);
+    if (entry.isDirectory()) total += treeBytes(child);
+    else if (entry.isFile()) total += statSync(child).size;
+  }
+  return total;
+}
+
+test.skipIf(!tmuxAvailable())(
+  "resumed session restores a large-file edit's full diff from its saved rows",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-resume-large-edit-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.txt");
+    const resumedStderrPath = join(root, "resumed-stderr.txt");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+    );
+
+    // A file past the former 4 MiB edit limit, with the edited block near
+    // its end. The trailing lines are context only the full diff shows: the
+    // tool arguments never contain them and the inline preview cuts off first.
+    const oldBlock = Array.from({ length: 10 }, (_, i) => `old-line-${String(i + 1).padStart(2, "0")}`).join("\n");
+    const newBlock = Array.from({ length: 10 }, (_, i) => `new-line-${String(i + 1).padStart(2, "0")}`).join("\n");
+    const filler = Array.from(
+      { length: 100_000 },
+      (_, i) => `filler-${String(i).padStart(8, "0")} lorem ipsum dolor sit amet`,
+    ).join("\n");
+    const original = `${filler}\n${oldBlock}\ntrailing-context-1\ntrailing-context-2\n`;
+    expect(original.length).toBeGreaterThan(4 * 1024 * 1024);
+    const target = join(workspace, "big.txt");
+    writeFileSync(target, original);
+
+    const doneMarker = "LARGE_EDIT_DONE";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("edit_large_1", "edit_file", {
+        path: "big.txt",
+        old_string: oldBlock,
+        new_string: newBlock,
+      }),
+      fakeGatewayFinalText(doneMarker),
+    ]);
+    let active: TmuxSession | null = null;
+    let resumedGateway: ReturnType<typeof startFakeGateway> | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: realpathSync(workspace),
+        env: gatewayEnv(home, gateway),
+        stderrPath,
+        width: 100,
+        height: 60,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Apply the block edit.");
+      await waitForScrollback(active, doneMarker);
+      expect(readFileSync(target, "utf8")).toBe(original.replace(oldBlock, newBlock));
+
+      await active.sendKeys("C-o");
+      const liveFull = await active.waitForText("trailing-context-2", TIMEOUT);
+      expect(liveFull).toContain("new-line-10");
+      expect(liveFull).toContain("unchanged lines ⋯");
+      await active.sendKeys("C-o");
+      await active.waitForText(doneMarker, TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await active.kill();
+      active = null;
+
+      // The session keeps the diff's rows, not copies of the 5 MiB file.
+      expect(treeBytes(storeRoot(home))).toBeLessThan(512 * 1024);
+
+      resumedGateway = startFakeGateway([]);
+      active = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume-last`,
+        cwd: realpathSync(workspace),
+        env: gatewayEnv(home, resumedGateway),
+        stderrPath: resumedStderrPath,
+        width: 100,
+        height: 60,
+      });
+      await active.waitForText(doneMarker, TIMEOUT);
+      await active.sendKeys("C-o");
+      const resumedFull = await active.waitForText("trailing-context-2", TIMEOUT);
+      expect(resumedFull).toContain("new-line-10");
+      expect(resumedFull).toContain("unchanged lines ⋯");
+      expect(resumedGateway.requests).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
+    } finally {
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      gateway.stop();
+      resumedGateway?.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  60_000,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a file's own terminal sequences and invalid bytes show as text in a resumed full diff",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-resume-hostile-edit-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.txt");
+    const resumedStderrPath = join(root, "resumed-stderr.txt");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+    );
+
+    // The edited line sits next to a screen clear, a C1 control, and bytes
+    // that are not UTF-8. Drawn raw, the first ended fx and the second
+    // reached the terminal; saved raw, the third failed the session save.
+    const original = Buffer.concat([
+      Buffer.from("keep\n\x1b[2J\x1b[Hclear-row\n\u009b31mcsi-row\n"),
+      Buffer.from([0xff, 0xfe]),
+      Buffer.from("-bytes-row\nedit-me\ntrailing-context\n"),
+    ]);
+    const target = join(workspace, "hostile.txt");
+    writeFileSync(target, original);
+    const edited = Buffer.from(original.toString("latin1").replace("edit-me", "edited-row"), "latin1");
+
+    const doneMarker = "HOSTILE_EDIT_DONE";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("edit_hostile_1", "edit_file", {
+        path: "hostile.txt",
+        old_string: "edit-me",
+        new_string: "edited-row",
+      }),
+      fakeGatewayFinalText(doneMarker),
+    ]);
+    const expectEscapedRows = (screen: string) => {
+      expect(screen).toContain("\\x1b[2J\\x1b[Hclear-row");
+      expect(screen).toContain("\\u{009b}31mcsi-row");
+      expect(screen).toContain("\\xff\\xfe-bytes-row");
+      expect(screen).toContain("edited-row");
+    };
+    let active: TmuxSession | null = null;
+    let resumedGateway: ReturnType<typeof startFakeGateway> | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: realpathSync(workspace),
+        env: gatewayEnv(home, gateway),
+        stderrPath,
+        width: 100,
+        height: 40,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Apply the edit.");
+      await waitForScrollback(active, doneMarker);
+      expect(readFileSync(target).equals(edited)).toBe(true);
+
+      await active.sendKeys("C-o");
+      expectEscapedRows(await active.waitForText("trailing-context", TIMEOUT));
+      expect(active.isPaneAlive()).toBe(true);
+      await active.sendKeys("C-o");
+      await active.waitForText(doneMarker, TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await active.kill();
+      active = null;
+
+      resumedGateway = startFakeGateway([]);
+      active = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume-last`,
+        cwd: realpathSync(workspace),
+        env: gatewayEnv(home, resumedGateway),
+        stderrPath: resumedStderrPath,
+        width: 100,
+        height: 40,
+      });
+      await active.waitForText(doneMarker, TIMEOUT);
+      await active.sendKeys("C-o");
+      expectEscapedRows(await active.waitForText("trailing-context", TIMEOUT));
+      expect(active.isPaneAlive()).toBe(true);
+      expect(resumedGateway.requests).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
+    } finally {
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      gateway.stop();
+      resumedGateway?.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  60_000,
+);
+
 test.skipIf(!tmuxAvailable())(
   "resumed session labels shell interactions with their launch command",
   async () => {
@@ -1451,6 +1660,14 @@ function gatewaySawNote(gateway: ReturnType<typeof startFakeGateway>): boolean {
   );
 }
 
+/** Where the stale-handle note sits in a request: the role of each message that carries it. */
+function noteRoles(body: unknown): string[] {
+  const parsed = typeof body === "string" ? JSON.parse(body) : body;
+  return ((parsed as { prompt?: { role: string; content: unknown }[] }).prompt ?? [])
+    .filter((message) => JSON.stringify(message.content).includes(STALE_HANDLE_NOTE))
+    .map((message) => message.role);
+}
+
 test.skipIf(!tmuxAvailable())(
   "resume after process restart warns the model about stale shell handles",
   async () => {
@@ -1489,7 +1706,10 @@ test.skipIf(!tmuxAvailable())(
       await active.kill();
       active = null;
 
-      resumedGateway = startFakeGateway([fakeGatewayFinalText("STALE_NOTE_PHASE2_DONE")]);
+      resumedGateway = startFakeGateway([
+        fakeGatewayFinalText("STALE_NOTE_PHASE2_DONE"),
+        fakeGatewayFinalText("STALE_NOTE_PHASE3_DONE"),
+      ]);
       active = await TmuxSession.create({
         cmd: `${FX_BIN} --resume-last`,
         cwd: workspace,
@@ -1502,6 +1722,15 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("Is the watcher still running?");
       await waitForScrollback(active, "STALE_NOTE_PHASE2_DONE");
       expect(gatewaySawNote(resumedGateway)).toBe(true);
+      // The note rides on the resumed turn's own message, so the instructions
+      // stay as they were cached; the next turn of this process keeps that one
+      // copy and adds no other (D93).
+      await active.sendText("And now?");
+      await waitForScrollback(active, "STALE_NOTE_PHASE3_DONE");
+      expect(resumedGateway.requests).toHaveLength(2);
+      for (const request of resumedGateway.requests) {
+        expect(noteRoles(request.body)).toEqual(["user"]);
+      }
 
       await active.sendText("/quit");
       expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -5632,6 +5861,34 @@ test("manual upgrade output links stable notes and dev changes", async () => {
   }
 }, UPGRADE_TIMEOUT);
 
+test("update runs the manual upgrade", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-update-alias-")));
+  const argvLogPath = join(root, "upgrade-argv.log");
+  const installedFx = join(root, "fx");
+  const home = join(root, "home");
+  mkdirSync(home);
+  const release = startUpgradeServer(root, argvLogPath);
+  copyFileSync(FX_BIN, installedFx);
+  chmodSync(installedFx, 0o755);
+
+  try {
+    const update = Bun.spawn([installedFx, "update", "--channel", "stable"], {
+      env: { ...process.env, HOME: home, FX_E2E_UPGRADE_BASE_URL: release.baseUrl },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const exitCode = await update.exited;
+    expect(exitCode).toBe(0);
+    expect(await new Response(update.stdout).text()).toContain(
+      "notes: https://fx.sh/changelog#v9.9.9",
+    );
+    expect(readFileSync(installedFx, "utf8")).toStartWith("#!/bin/sh");
+  } finally {
+    release.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, UPGRADE_TIMEOUT);
+
 test.skipIf(!tmuxAvailable())(
   "upgrade ctrl-g reloads the background-installed binary and resumes",
   async () => {
@@ -7102,7 +7359,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("What can fx do differently?", TIMEOUT);
       const resumedGrid = await active.capturePaneGrid();
       const footer = findFooterBlocks(resumedGrid).at(-1);
-      const cancelledRow = resumedGrid.findIndex((row) => row.includes("■ Cancelled"));
+      const cancelledRow = resumedGrid.findIndex((row) => row.includes("▪ Cancelled"));
       expect(footer).toBeDefined();
       expect(cancelledRow).toBeGreaterThanOrEqual(0);
       expect(cancelledRow).toBeLessThan(footer!.topDivider);
@@ -7381,7 +7638,7 @@ test.skipIf(!tmuxAvailable())(
       ));
       const cancelledIndex = resumed.indexOf("Cancelled");
       expect(cancelledIndex).toBeGreaterThanOrEqual(0);
-      expect(resumed).toContain("■ Cancelled");
+      expect(resumed).toContain("▪ Cancelled");
       expect(countOccurrences(resumed, "What can fx do differently?")).toBe(1);
       expect(resumed).not.toContain("system: cancelled");
       expect(resumed).not.toContain("Cancelling");
@@ -7721,8 +7978,12 @@ for (const inspectDetails of [false, true]) {
         expect(paneExitMatches(active.paneStatus(), 0)).toBe(true);
         const events = savedItems(home, sessionId);
         expect(events.filter(event => event.tool_result?.call_id === "write-second")).toHaveLength(1);
-        expect(events.find(event => event.tool_result?.call_id === "write-receipt").tool_result.committed_file_presentation.lifecycle_id)
+        // The write's full diff is saved beside its result, with its lifecycle
+        // id, and the result keeps the preview-only shape older fx versions read.
+        expect(events.find(event => event.file_review?.call_id === "write-receipt").file_review.lifecycle_id)
           .toEqual({ turn_id: 2, call_id: "write-receipt" });
+        expect(events.find(event => event.tool_result?.call_id === "write-receipt").tool_result.committed_file_presentation.lifecycle_id)
+          .toBeNull();
         expect(events.some(event => event.assistant?.text === savedReply)).toBe(true);
       } finally {
         if (active) await active.kill();
@@ -8068,6 +8329,9 @@ test.skipIf(!tmuxAvailable())(
       active = second.session;
       const pane = await active.waitForText("RESUMED_ANSWER_7310", TIMEOUT);
       expect(pane).toContain("Resuming the interrupted request");
+      // The killed turn reads as stopped, not as a failure.
+      expect(pane).toContain("system: fx stopped before this turn finished");
+      expect(pane).not.toContain("system: failed");
       // The note is for the model; the transcript never shows it.
       expect(pane).not.toContain(RESUME_NOTE);
       const resumed = gateway.requests.slice(before).find((request) => request.body.includes(RESUME_NOTE));
@@ -8216,7 +8480,11 @@ test.skipIf(!tmuxAvailable())(
       const third = await launchFx(fixture, gateway, "-c", "third");
       active = third.session;
       await heldAtLeast(3);
-      expect(await active.capturePane()).not.toContain("crashed fx twice");
+      const pane = await active.capturePane();
+      expect(pane).not.toContain("crashed fx twice");
+      // A closed window reads as stopped, not as cancelled.
+      expect(pane).toContain("system: fx stopped before this turn finished");
+      expect(pane).not.toContain("system: cancelled");
       expect(readFileSync(third.stderrPath, "utf8")).toBe("");
     } finally {
       await active?.kill();
@@ -8259,6 +8527,185 @@ test.skipIf(!tmuxAvailable())(
       // decides whether running it again is safe.
       expect(resumed!.body).toContain("fx stopped while this tool was running");
       expect(readFileSync(second.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
+// A save cut short. A crash in the middle of writing a log line leaves part
+// of the line and no newline, and the next launch cuts it, so fx reads the
+// save before it. A save's send starts only after its write returns, so a
+// cut save never hides a send that went out, and an answered turn's
+// `turn_end` item keeps it from going out again.
+
+/// A 503 that asks for a wait of `seconds`.
+function retryAfterUnavailable(seconds: number): Response {
+  return new Response(JSON.stringify({ error: { message: "provider temporarily unavailable" } }), {
+    status: 503,
+    headers: { "content-type": "application/json", "retry-after": String(seconds) },
+  });
+}
+
+type SavedRecord = { phase: number; clean: boolean; attempt: number; deaths: number };
+
+/// The records session `id` saved, oldest first, read from the layout
+/// `src/core/recovery/recovery.zig` documents: byte 1 the phase (1 sending,
+/// 2 waiting), byte 2 bit 0 a clean exit, bytes 4 and 5 the attempt, byte 7
+/// the abrupt deaths. A cleared record reads as null.
+function savedRecords(home: string, id: string): (SavedRecord | null)[] {
+  return savedItems(home, id)
+    .filter((item) => "recovery" in item)
+    .map((item) => {
+      const hex = item.recovery?.record;
+      if (typeof hex !== "string") return null;
+      const bytes = Buffer.from(hex, "hex");
+      return { phase: bytes[1]!, clean: (bytes[2]! & 1) !== 0, attempt: bytes.readUInt16LE(4), deaths: bytes[7]! };
+    });
+}
+
+/// Cuts session `id`'s log inside line `index`, as a crash while writing it
+/// would: the lines before it stay, half of it remains without its newline,
+/// and nothing after it was written. Returns that line, parsed.
+function tearLogAt(home: string, id: string, index: number): any {
+  const path = logOf(home, id);
+  const lines = readFileSync(path, "utf8").split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  const line = lines[index]!;
+  writeFileSync(path, `${lines.slice(0, index).map((kept) => `${kept}\n`).join("")}${line.slice(0, Math.floor(line.length / 2))}`);
+  return JSON.parse(line);
+}
+
+function logLineCount(home: string, id: string): number {
+  return readFileSync(logOf(home, id), "utf8").split("\n").filter(Boolean).length;
+}
+
+test.skipIf(!tmuxAvailable())(
+  "a crash that cuts a retry's save short resumes the request without counting a crash",
+  async () => {
+    const fixture = resumeFixture("fx-auto-resume-torn-send-");
+    let sends = 0;
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (body.includes(RESUME_NOTE)) return fakeGatewayFinalText("TORN_SEND_RESUMED_4417");
+      if (!body.includes("Retry me.")) return fakeGatewayFinalText("UNRELATED");
+      sends += 1;
+      // The first send fails; the retry stays on the wire.
+      return sends === 1 ? retryAfterUnavailable(1) : new Promise<Response>(() => {});
+    });
+    let active: TmuxSession | null = null;
+    try {
+      active = (await launchFx(fixture, gateway, "", "first")).session;
+      await active.sendText("Retry me.");
+      await waitForCondition(() => sends >= 2, "the retry");
+      const id = sessionIdFromHome(fixture.home);
+      await waitForCondition(() => savedRecords(fixture.home, id).at(-1)?.attempt === 2, "the retry's save");
+      await endFx(active, "SIGKILL");
+      active = null;
+
+      // The retry's save is the last line: the crash cuts it in half.
+      const records = savedRecords(fixture.home, id);
+      expect(records.at(-2)?.phase).toBe(2);
+      expect(records.at(-1)).toMatchObject({ phase: 1, attempt: 2 });
+      const torn = tearLogAt(fixture.home, id, logLineCount(fixture.home, id) - 1);
+      expect(torn).toMatchObject({ kind: "item", type: "recovery" });
+
+      active = (await launchFx(fixture, gateway, "-c", "second")).session;
+      await active.waitForText("TORN_SEND_RESUMED_4417", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      // fx read the wait's save, which no send followed, so the resumed
+      // send counts no crash.
+      const resumed = savedRecords(fixture.home, id).filter((record) => record !== null).at(-1);
+      expect(resumed).toMatchObject({ phase: 1, deaths: 0 });
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a crash that cuts a wait's save short counts the crash, so the crash-loop guard never counts late",
+  async () => {
+    const fixture = resumeFixture("fx-auto-resume-torn-wait-");
+    let sends = 0;
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (body.includes(RESUME_NOTE)) return fakeGatewayFinalText("TORN_WAIT_RESUMED_6203");
+      if (!body.includes("Wait for me.")) return fakeGatewayFinalText("UNRELATED");
+      sends += 1;
+      // A long wait, so fx is killed while it waits.
+      return retryAfterUnavailable(20);
+    });
+    let active: TmuxSession | null = null;
+    try {
+      active = (await launchFx(fixture, gateway, "", "first")).session;
+      await active.sendText("Wait for me.");
+      const id = await (async () => {
+        await waitForCondition(() => sends >= 1, "the first send");
+        return sessionIdFromHome(fixture.home);
+      })();
+      await waitForCondition(() => savedRecords(fixture.home, id).at(-1)?.phase === 2, "the wait's save");
+      await endFx(active, "SIGKILL");
+      active = null;
+
+      // The wait's save is the last line: the crash cuts it in half, so the
+      // save before it, the first send's, is what the next launch reads.
+      expect(savedRecords(fixture.home, id).at(-2)).toMatchObject({ phase: 1, attempt: 1, deaths: 0 });
+      const torn = tearLogAt(fixture.home, id, logLineCount(fixture.home, id) - 1);
+      expect(torn).toMatchObject({ kind: "item", type: "recovery" });
+
+      active = (await launchFx(fixture, gateway, "-c", "second")).session;
+      await active.waitForText("TORN_WAIT_RESUMED_6203", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      // fx can no longer tell the failed send from one in flight, so it
+      // counts the crash: one too many at worst, never one too few.
+      const resumed = savedRecords(fixture.home, id).filter((record) => record !== null).at(-1);
+      expect(resumed).toMatchObject({ phase: 1, deaths: 1 });
+      expect(sends).toBe(1);
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a crash that cuts an answered turn's commit short never sends the request again",
+  async () => {
+    const fixture = resumeFixture("fx-auto-resume-torn-commit-");
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (body.includes(RESUME_NOTE)) return fakeGatewayFinalText("RESENT_BY_MISTAKE");
+      return fakeGatewayFinalText("ANSWERED_ONCE_5521");
+    });
+    let active: TmuxSession | null = null;
+    try {
+      active = (await launchFx(fixture, gateway, "", "first")).session;
+      await active.sendText("Answer once.");
+      await active.waitForText("ANSWERED_ONCE_5521", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      const id = sessionIdFromHome(fixture.home);
+      await waitForCondition(() => logLines(fixture.home, id).some((line: any) => line.kind === "turn_committed"), "the commit");
+      await endFx(active, "SIGKILL");
+      active = null;
+
+      // The crash cuts the commit line in half; nothing after it was written.
+      const commit = logLines(fixture.home, id).findIndex((line: any) => line.kind === "turn_committed");
+      expect(savedItems(fixture.home, id).some((item) => "turn_end" in item)).toBe(true);
+      expect(tearLogAt(fixture.home, id, commit)).toMatchObject({ kind: "turn_committed" });
+
+      const before = gateway.requests.length;
+      active = (await launchFx(fixture, gateway, "-c", "second")).session;
+      await active.waitForText("ANSWERED_ONCE_5521", TIMEOUT);
+      await Bun.sleep(1_500);
+      const pane = await active.capturePane();
+      expect(pane).not.toContain("Resuming the interrupted request");
+      expect(gateway.requests.slice(before).some((request) => request.body.includes(RESUME_NOTE))).toBe(false);
     } finally {
       await active?.kill();
       gateway.stop();

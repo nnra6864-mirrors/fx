@@ -113,7 +113,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
         expect(readFileSync(receipt, "utf8")).toContain(`target=${eventPath}`);
         expect(readFileSync(tracePath, "utf8")).toContain("shutdown finished prompt persistence failed");
         expect(session.paneStatus().status).toBe(1);
-        expect(output + stderr).toMatch(/save.*fail|fail.*sav|could not.*sav|unable to.*sav/i);
+        expect(output + stderr).toMatch(/save.*fail|fail.*sav|could not.*sav|couldn.t.*sav|unable to.*sav/i);
       } else { expect(session.paneStatus().status).toBe(0); expect(stderr).toBe(""); }
       expect(readFileSync(eventPath).subarray(0, saved.length).equals(saved)).toBe(true);
       const resumed = await runFx(["ask", "--json", "--resume-id", id, "Continue without repeating work."], {
@@ -532,7 +532,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       await session.waitForText("What can fx do differently?", TIMEOUT);
       const cancelledGrid = await session.capturePaneGrid();
       const footer = findFooterBlocks(cancelledGrid).at(-1);
-      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("■ Cancelled"));
+      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("▪ Cancelled"));
       expect(footer).toBeDefined();
       expect(cancelledRow).toBeGreaterThanOrEqual(0);
       expect(cancelledRow).toBeLessThan(footer!.topDivider);
@@ -725,7 +725,7 @@ while :; do sleep 1; done
         TIMEOUT,
       );
       expect(Date.now() - cancelStartedAt).toBeLessThan(500);
-      expect(immediateCancellation).toContain("■ Cancelled");
+      expect(immediateCancellation).toContain("▪ Cancelled");
       expect(immediateCancellation).not.toContain("system: cancelled");
       expect(immediateCancellation).not.toContain("Cancelling");
       await waitForTrace(

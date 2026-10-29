@@ -36,7 +36,16 @@ pub const failed_turn_notice: core_types.SemanticNotice = .{
     .body = "failed",
 };
 
+/// A turn fx itself stopped, by crashing or closing, which the next launch
+/// sends again.
+pub const stopped_turn_notice: core_types.SemanticNotice = .{
+    .topic = "system",
+    .tone = .warning,
+    .body = "fx stopped before this turn finished",
+};
+
 pub fn interruptedTurnNotice(entry: InterruptedHistoryTurn) core_types.SemanticNotice {
+    if (entry.stopped_by_exit) return stopped_turn_notice;
     return switch (entry.terminal_reason) {
         .cancelled => interrupted_turn_notice,
         .failed => failed_turn_notice,
@@ -577,6 +586,17 @@ fn make_owned_legacy_image_turn(
         .media_type = @constCast("image/png"),
     }});
     return turn;
+}
+
+test "a turn fx stopped by crashing or closing reads as stopped, not failed or cancelled" {
+    const stopped: InterruptedHistoryTurn = .{ .user = .{ .text = @constCast("go") }, .terminal_reason = .failed, .stopped_by_exit = true };
+    try std.testing.expectEqualStrings("fx stopped before this turn finished", interruptedTurnNotice(stopped).body);
+    try std.testing.expectEqual(core_types.NoticeTone.warning, interruptedTurnNotice(stopped).tone);
+    // Esc and a turn that failed keep their own notices.
+    const cancelled: InterruptedHistoryTurn = .{ .user = .{ .text = @constCast("go") }, .terminal_reason = .cancelled };
+    try std.testing.expectEqualStrings("cancelled", interruptedTurnNotice(cancelled).body);
+    const failed: InterruptedHistoryTurn = .{ .user = .{ .text = @constCast("go") }, .terminal_reason = .failed };
+    try std.testing.expectEqualStrings("failed", interruptedTurnNotice(failed).body);
 }
 
 test "legacy image repair rewrites repeated per-turn ordinals to stable session ids" {
@@ -1342,6 +1362,12 @@ fn collectShellIdsFromExecution(
 /// does not own. Registry membership, not the resume event, decides staleness:
 /// in-process resumes share the registry with executions started by this
 /// process, so those handles stay valid and stay quiet.
+/// What the first turn after such a resume tells the model, as a context
+/// note at the start of that turn (D93): the instructions stay as they were
+/// cached.
+pub const stale_shell_handles_note =
+    "Runtime context: fx restarted since this session was last active, so earlier shell session_id handles no longer exist; stopping or interacting with them fails with ExecutionNotFound. Their processes are normally terminated when fx exits but can survive an unclean exit, so check for a survivor before starting a duplicate. Otherwise start fresh shell sessions instead of reusing earlier handles.";
+
 pub fn detectStaleShellHandles(
     alloc: Allocator,
     history: []const HistoryTurn,
@@ -1399,7 +1425,8 @@ pub const SessionRuntime = struct {
     unversioned_history_len: usize = 0,
     /// True when restored history references shell execution handles that this
     /// process does not own. Resume seams set it once after restore, before the
-    /// first agent turn of the resumed session, so no lock is required.
+    /// first agent turn of the resumed session, so no lock is required. The
+    /// next prompt takes it with `takeStaleShellHandles`.
     has_stale_shell_handles: bool = false,
 
     pub fn init(max_history_turns: usize) SessionRuntime {
@@ -1421,6 +1448,22 @@ pub const SessionRuntime = struct {
         self.permission_state.deinit(alloc);
         self.agent.deinit(alloc);
         self.context_notice_hashes.deinit(alloc);
+    }
+
+    /// Whether the prompt being queued should tell the model that earlier shell
+    /// handles are gone. True once per resume: the turn that carries the note
+    /// keeps it in the conversation, so later turns need no copy.
+    pub fn takeStaleShellHandles(self: *SessionRuntime) bool {
+        defer self.has_stale_shell_handles = false;
+        return self.has_stale_shell_handles;
+    }
+
+    /// Gives the stale shell handles note back when the prompt that took it
+    /// is dropped before its turn runs: removed from the queue, or refused
+    /// at admission. The next prompt carries it instead.
+    pub fn returnStaleShellHandles(self: *SessionRuntime, turn_id: u64) void {
+        self.has_stale_shell_handles = true;
+        debug_trace.logf("session", "stale shell handles note returned from dropped prompt turn_id={d}", .{turn_id});
     }
 
     pub fn reset(self: *SessionRuntime, alloc: Allocator) void {
@@ -2296,7 +2339,9 @@ pub fn appendExecutionMemoryChatMessages(
     execution: core_types.ExecutionMemory,
 ) !void {
     var steering_index: usize = 0;
+    var note_index: usize = 0;
     for (execution.tool_steps, 0..) |step, step_index| {
+        try appendContextNoteChatMessages(alloc, messages, execution.context_notes, &note_index, step_index);
         while (steering_index < execution.steering.len and
             execution.steering[steering_index].after_tool_step_count == step_index)
         {
@@ -2337,6 +2382,9 @@ pub fn appendExecutionMemoryChatMessages(
             }
         }
     }
+    // Notes after the last step follow its results, as the turn sent them,
+    // and come before the file context a saved turn adds.
+    try appendContextNoteChatMessages(alloc, messages, execution.context_notes, &note_index, null);
     if (execution.files.len > 0) {
         const text = try formatExecutionFileContext(alloc, execution.files);
         errdefer alloc.free(text);
@@ -2350,6 +2398,22 @@ pub fn appendExecutionMemoryChatMessages(
             }
         }
         try messages.append(alloc, restoredSteeringChatMessage(steering.text));
+    }
+}
+
+/// Appends, as flagged system messages, the notes saved after `step_index`
+/// steps, or every remaining note when null (D93). Borrows their text.
+fn appendContextNoteChatMessages(
+    alloc: Allocator,
+    messages: *std.ArrayList(core_types.ChatMessage),
+    notes: []const core_types.PersistedContextNote,
+    index: *usize,
+    step_index: ?usize,
+) !void {
+    while (index.* < notes.len) : (index.* += 1) {
+        const note = notes[index.*];
+        if (step_index) |count| if (note.after_tool_step_count != count) break;
+        try messages.append(alloc, .{ .role = .system, .content = note.text, .context_note = true, .context_note_sources = note.sources });
     }
 }
 
@@ -2734,6 +2798,84 @@ test "resume history preserves steering between tool episodes" {
     }
     try std.testing.expectEqualStrings("after first", messages.items[3].content.?.asText());
     try std.testing.expectEqualStrings("after second", messages.items[6].content.?.asText());
+}
+
+test "resume history keeps context notes between tool episodes, before steering and the file context (D93)" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var first_calls = [_]ToolCall{.{ .id = "call_first", .name = "read_file", .arguments_json = "{\"path\":\"first\"}" }};
+    var first_results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("call_first"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("first result"),
+        .output_bytes = "first result".len,
+        .stored_output_bytes = "first result".len,
+    }};
+    var second_calls = [_]ToolCall{.{ .id = "call_second", .name = "read_file", .arguments_json = "{\"path\":\"second\"}" }};
+    var second_results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("call_second"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("second result"),
+        .output_bytes = "second result".len,
+        .stored_output_bytes = "second result".len,
+    }};
+    var steps = [_]ToolExecutionStep{
+        .{ .tool_calls = &first_calls, .tool_results = &first_results },
+        .{ .tool_calls = &second_calls, .tool_results = &second_results },
+    };
+    var steering = [_]core_types.PersistedSteering{
+        .{ .text = @constCast("after first"), .after_tool_step_count = 1 },
+        .{ .text = @constCast("after second"), .after_tool_step_count = 2 },
+    };
+    var notes = [_]core_types.PersistedContextNote{
+        .{ .text = @constCast("note after first"), .after_tool_step_count = 1 },
+        .{ .text = @constCast("note after second"), .after_tool_step_count = 2 },
+    };
+    var files = [_]core_types.FileEvidence{.{
+        .path = @constCast("first"),
+        .tool_call_id = @constCast("call_first"),
+        .tool_name = @constCast("read_file"),
+        .action = .read,
+    }};
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("run both") },
+        .assistant = @constCast("finished"),
+        .execution = .{
+            .tool_steps = &steps,
+            .files = &files,
+            .steering = &steering,
+            .context_notes = &notes,
+        },
+    } }};
+
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    try appendHistoryChatMessages(arena, &messages, &history);
+    const expected = [_]struct { core_types.ChatRole, ?[]const u8 }{
+        .{ .user, "run both" },
+        .{ .assistant, null },
+        .{ .tool, "first result" },
+        .{ .system, "note after first" },
+        .{ .user, "after first" },
+        .{ .assistant, null },
+        .{ .tool, "second result" },
+        .{ .system, "note after second" },
+        .{ .user, null },
+        .{ .user, "after second" },
+        .{ .assistant, "finished" },
+    };
+    try std.testing.expectEqual(expected.len, messages.items.len);
+    for (expected, messages.items) |want, got| {
+        try std.testing.expectEqual(want[0], got.role);
+        try std.testing.expectEqual(want[0] == .system, got.context_note);
+        if (want[1]) |text| try std.testing.expectEqualStrings(text, got.content.?);
+    }
+    // The file context a saved turn adds follows the last step's note, which
+    // rides on that step's result, and comes before the last steering.
+    try std.testing.expect(std.mem.find(u8, messages.items[8].content.?, "first") != null);
 }
 
 test "resume projection replays assistant tool execution memory before final answer" {
@@ -3472,6 +3614,17 @@ test "SessionRuntime restore and reset clear stale shell handle state" {
 
     runtime.has_stale_shell_handles = true;
     runtime.reset(alloc);
+    try std.testing.expect(!runtime.has_stale_shell_handles);
+
+    // The first prompt after a resume takes the flag; later prompts do not.
+    runtime.has_stale_shell_handles = true;
+    try std.testing.expect(runtime.takeStaleShellHandles());
+    try std.testing.expect(!runtime.takeStaleShellHandles());
+    try std.testing.expect(!runtime.has_stale_shell_handles);
+
+    // A prompt dropped before its turn ran gives the note to the next one.
+    runtime.returnStaleShellHandles(7);
+    try std.testing.expect(runtime.takeStaleShellHandles());
     try std.testing.expect(!runtime.has_stale_shell_handles);
 }
 

@@ -285,6 +285,9 @@ fn legacyEarlier(arena: Allocator, store: ?Store, summary: []const u8) !?summari
 fn appendItems(arena: Allocator, items: *std.ArrayList(summarize.Item), message: types.ChatMessage) !void {
     const content = message.content orelse "";
     switch (message.role) {
+        // A saved turn's context notes come back as system messages, which
+        // are fx's context, not the conversation, and never reach the
+        // summarizer's messages (D93).
         .system => {},
         .user => if (message.context_origin == .user_turn) {
             try items.append(arena, .{ .user = content });
