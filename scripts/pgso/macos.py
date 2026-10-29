@@ -36,6 +36,7 @@ LIBLLVM_NAME = "libLLVM.dylib"
 CONTROL_BUILD_FLAGS: tuple[str, ...] = ()
 # Apple ld's dead-code stripping for `zig cc` links.
 ZIG_CC_LINK_FLAGS = ("-Wl,-dead_strip",)
+STARTUP_SCENARIOS: tuple[str, ...] = ()
 
 
 def external_control_strip_argv(

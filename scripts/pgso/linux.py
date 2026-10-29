@@ -39,6 +39,15 @@ HOST_ARCH = "aarch64"
 LIBLLVM_NAME = "libLLVM.so"
 # Record Zig's own link of the control, which the other links reuse.
 CONTROL_BUILD_FLAGS = ("--verbose-link",)
+# Profile use compiles the cold functions for size, which on Linux slows these
+# short commands past the startup gate, so their cold functions are exempt.
+STARTUP_SCENARIOS = (
+    "direct-help",
+    "direct-version",
+    "direct-status",
+    "direct-doctor",
+    "direct-sessions",
+)
 ZIG_CC_LINK_FLAGS = ("-Wl,--gc-sections",)
 
 
@@ -489,6 +498,16 @@ def check_applied_order(
     return missing
 
 
+def link_order_text(paths: PipelinePaths, profile_order: pathlib.Path) -> str:
+    """The startup functions in first-use order, then the profile order.
+
+    The startup exemption removed the cold startup functions' records, so the
+    profile order leaves them out.
+    """
+    _require_nonempty_file(paths.startup_order, "startup function order")
+    return paths.startup_order.read_text(encoding="utf-8") + profile_order.read_text(encoding="utf-8")
+
+
 def _link_ordered_candidate(toolchain: Toolchain, paths: PipelinePaths) -> None:
     order_path = paths.logs / "candidate-profile.order"
     run_checked(
@@ -511,7 +530,7 @@ def _link_ordered_candidate(toolchain: Toolchain, paths: PipelinePaths) -> None:
     if symbols.stdout_truncated:
         raise PgsoError("candidate object symbols exceeded the capture limit")
     functions = parse_function_symbols(symbols.stdout)
-    ordered, mapping, seen = order_symbols(order_path.read_text(encoding="utf-8"), functions)
+    ordered, mapping, seen = order_symbols(link_order_text(paths, order_path), functions)
     ordered, helpers = append_outlined_helpers(ordered, functions, paths.profile_use_ir, seen)
     order_file = paths.logs / "candidate-order.txt"
     order_file.write_text("".join(f"{name}\n" for name in ordered), encoding="utf-8")
