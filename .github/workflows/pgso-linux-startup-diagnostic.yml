@@ -51,60 +51,51 @@ jobs:
           echo "perf_event_paranoid: $(cat /proc/sys/kernel/perf_event_paranoid)"
           ls -l "$RUNNER_TEMP/control/bin/fx" "$RUNNER_TEMP/candidate-artifact/candidate/fx"
 
-      - name: Time and count page faults
+      - name: Time each page-cache state
         run: |
           d="$RUNNER_TEMP/diag"
           mkdir -p "$d/home"
-          cp "$RUNNER_TEMP/control/bin/fx" "$d/control"
-          cp "$RUNNER_TEMP/candidate-artifact/candidate/fx" "$d/candidate"
-          chmod +x "$d/control" "$d/candidate"
+          control="$RUNNER_TEMP/control/bin/fx"
+          candidate="$RUNNER_TEMP/candidate-artifact/candidate/fx"
+          chmod +x "$candidate"
           cat > "$d/measure.py" <<'PY'
-          import os, resource, statistics, subprocess, sys, time
-          d = sys.argv[1]
-          label = sys.argv[2]
-          env = {"HOME": f"{d}/home", "PATH": "/usr/bin:/bin", "FX_SOUND": "0", "FX_AUTO_UPGRADE": "0"}
-          for args in (["help"], ["--version"], ["status", "--json"]):
-              rows = {"control": ([], []), "candidate": ([], [])}
-              for i in range(400):
-                  order = ("control", "candidate") if i % 2 == 0 else ("candidate", "control")
-                  for name in order:
+          import resource, statistics, subprocess, sys, time
+          label, control, candidate, home = sys.argv[1:5]
+          env = {"HOME": home, "PATH": "/usr/bin:/bin", "FX_SOUND": "0", "FX_AUTO_UPGRADE": "0"}
+          for args in (["help"], ["--version"]):
+              rows = {control: ([], []), candidate: ([], [])}
+              for i in range(320):
+                  for path in ((control, candidate) if i % 2 == 0 else (candidate, control)):
                       before = resource.getrusage(resource.RUSAGE_CHILDREN)
                       start = time.perf_counter_ns()
-                      subprocess.run([f"{d}/{name}", *args], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                      subprocess.run([path, *args], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
                       elapsed = (time.perf_counter_ns() - start) / 1000
                       after = resource.getrusage(resource.RUSAGE_CHILDREN)
                       if i >= 20:
-                          rows[name][0].append(elapsed)
-                          rows[name][1].append(after.ru_minflt - before.ru_minflt)
-              c, k = rows["control"], rows["candidate"]
-              p50 = lambda xs: statistics.median(xs)
-              print(f"[{label}] {' '.join(args):14s} wall p50 control {p50(c[0]):7.1f}us candidate {p50(k[0]):7.1f}us ({p50(k[0]) / p50(c[0]) - 1:+.1%})"
-                    f"  minor faults control {p50(c[1]):.0f} candidate {p50(k[1]):.0f}", flush=True)
+                          rows[path][0].append(elapsed)
+                          rows[path][1].append(after.ru_minflt - before.ru_minflt)
+              c, k = rows[control], rows[candidate]
+              m = statistics.median
+              print(f"[{label}] {' '.join(args):10s} wall p50 control {m(c[0]):6.1f}us candidate {m(k[0]):6.1f}us ({m(k[0]) / m(c[0]) - 1:+.1%})"
+                    f"  minor faults control {m(c[1]):.0f} candidate {m(k[1]):.0f}", flush=True)
           PY
-          python3 "$d/measure.py" "$d" "default"
-          if sudo test -w /sys/kernel/debug/fault_around_bytes; then
-            original="$(sudo cat /sys/kernel/debug/fault_around_bytes)"
-            for bytes in 4096 65536; do
-              echo "$bytes" | sudo tee /sys/kernel/debug/fault_around_bytes >/dev/null
-              python3 "$d/measure.py" "$d" "fault_around=$bytes"
-            done
-            echo "$original" | sudo tee /sys/kernel/debug/fault_around_bytes >/dev/null
-          fi
+          drop() { sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null; }
+          state() { rm -rf "${d:?}/$1"; mkdir -p "$d/$1"; }
 
-      - name: Count with perf
-        continue-on-error: true
-        run: |
-          d="$RUNNER_TEMP/diag"
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq "linux-tools-$(uname -r)" linux-tools-common >/dev/null 2>&1 \
-            || sudo apt-get install -y -qq linux-tools-azure linux-tools-common >/dev/null
-          sudo sysctl -w kernel.perf_event_paranoid=-1
-          perf list hw 2>&1 | head -20
-          for args in "help" "--version"; do
-            for name in control candidate; do
-              echo "== $name $args"
-              HOME="$d/home" perf stat -r 200 \
-                -e task-clock,page-faults,cycles,instructions,branch-misses,L1-icache-load-misses,iTLB-load-misses \
-                -- "$d/$name" $args 2>&1 >/dev/null | grep -v -E '^\s*$'
-            done
-          done
+          # Both binaries freshly written.
+          state fresh; cp "$control" "$d/fresh/control"; cp "$candidate" "$d/fresh/candidate"
+          python3 "$d/measure.py" both-written "$d/fresh/control" "$d/fresh/candidate" "$d/home"
+
+          # Both binaries read back from disk.
+          state disk; cp "$control" "$d/disk/control"; cp "$candidate" "$d/disk/candidate"; drop
+          python3 "$d/measure.py" both-read "$d/disk/control" "$d/disk/candidate" "$d/home"
+
+          # The gate's state: the control was built hours earlier, the candidate just linked.
+          state gate; cp "$control" "$d/gate/control"; drop; "$d/gate/control" --version >/dev/null
+          cp "$candidate" "$d/gate/candidate"
+          python3 "$d/measure.py" control-read-candidate-written "$d/gate/control" "$d/gate/candidate" "$d/home"
+
+          # The reverse.
+          state reverse; cp "$candidate" "$d/reverse/candidate"; drop; "$d/reverse/candidate" --version >/dev/null
+          cp "$control" "$d/reverse/control"
+          python3 "$d/measure.py" control-written-candidate-read "$d/reverse/control" "$d/reverse/candidate" "$d/home"
