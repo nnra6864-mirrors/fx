@@ -3925,6 +3925,8 @@ describe("fx mcp call", () => {
     const saved = readFileSync(join(root.workspace, "out.txt"), "utf8");
     expect(saved.length).toBeGreaterThan(1536 * 1024);
     expect(saved.trimEnd().endsWith("BRIDGE_TAIL:hello")).toBe(true);
+    // Its stderr line tells the model what the file holds.
+    expect(seen).toContain(`fx mcp call: wrote ${Buffer.byteLength(saved)} bytes of text`);
     expect(toolCalls(root)).toHaveLength(1);
   }, 60_000);
 

@@ -32,6 +32,7 @@ The bridge is built. An item stays open until its own done criterion has evidenc
 
 - [ ] **C1** `fx mcp call <tool> '<json>'`, `list`, `search`, and `help <tool>` in `src/core/mcp_host/verbs.zig` and `src/builtins/commands.zig`. It writes to standard output only after the whole reply arrives, never retries, and exits with a distinct code per refusal and outcome. Done when `tests/e2e/cli.test.ts` covers each exit code and a cut-short reply leaves no file content. Status: `call` is built; `list`, `search`, and `help` come later, by design. Exits 0, 2, 3, and 5 are covered by tests or a binary run. Missing: the CLI E2E test of each code, and the cut-short reply.
 - [ ] **C2** Version and availability: a client against an fx without the bridge, or speaking another version, prints a reason naming the fix. Done when the E2E test in C1 covers both. Status: built (the reply header's version, and `UnsupportedReply`). Missing: the E2E test.
+- [x] **C3** Result summary: after a successful call with standard output not a terminal, the client writes one line to standard error with the result's size and shape, listing the values of short text fields that repeat across a list's items and never unique values. Done when the unit tests in `src/core/mcp_host/mcp_call_client.zig` cover shapes, hidden unique values, escaped control bytes, and bounded deep and wide input, and the file test in `tests/e2e/mcp-stdio.test.ts` sees the line. Status: done.
 
 ## D. Proof through the binary, CI, and docs
 

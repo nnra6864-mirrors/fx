@@ -2,7 +2,9 @@
 //! a command that fx's shell tool runs, through the session's bridge
 //! (`mcp_call_bridge.zig`). It prints just the tool's data on stdout, so
 //! the command can write it to a file or pipe it into `jq`, and only what
-//! the command prints reaches the model.
+//! the command prints reaches the model. When stdout is not a terminal, one
+//! stderr line describes the data (`shapeSummary`), so the agent can filter
+//! it without first inspecting it.
 //!
 //! The call meets the same permission rules, prompt, and review as a direct
 //! call of the tool by the agent that ran the command. It works only while
@@ -111,6 +113,9 @@ pub fn run(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, tool: []con
     switch (reply.header.status) {
         .ok => {
             try out.writeAll(reply.bytes);
+            if (!(std.Io.File.stdout().isTty(io) catch false)) {
+                try err.print("fx mcp call: {s}\n", .{try shapeSummary(arena, reply.bytes)});
+            }
             return exit.ok;
         },
         .tool_error => {
@@ -134,6 +139,114 @@ pub fn run(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, tool: []con
             return if (reply.header.reason == .busy) exit.busy else if (reply.header.reason == .malformed or reply.header.reason == .too_large) exit.usage else exit.unavailable;
         },
     }
+}
+
+/// The most a shape summary prints.
+const max_summary_chars = 1500;
+/// How deep a shape summary follows nested lists and objects.
+const max_shape_depth = 8;
+/// A text field repeated across a list's items shows its values when it has
+/// at most this many distinct ones, each no longer than `max_hint_value_bytes`.
+const max_hint_values = 8;
+const max_hint_value_bytes = 32;
+
+/// One line saying how big a result is and how it is shaped: types, keys,
+/// and counts. The only values it shows are those of short text fields that
+/// repeat across a list's items, such as a status. Allocates in `arena`.
+pub fn shapeSummary(arena: Allocator, bytes: []const u8) Allocator.Error![]const u8 {
+    if (bytes.len == 0) return "wrote 0 bytes";
+    const value = std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{}) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            const lines = std.mem.countScalar(u8, bytes, '\n') + @intFromBool(bytes[bytes.len - 1] != '\n');
+            return arena.print("wrote {d} bytes of text in {d} lines", .{ bytes.len, lines });
+        },
+    };
+    // A full buffer stops the walk, so a huge result costs no more than the line.
+    var buffer: [max_summary_chars]u8 = undefined;
+    var shape: Writer = .fixed(&buffer);
+    const whole = if (describeShape(&shape, value, 0, &.{})) |_| true else |_| false;
+    var text = shape.buffered();
+    while (!std.unicode.utf8ValidateSlice(text)) text = text[0 .. text.len - 1];
+    return arena.print("wrote {d} bytes of JSON: {s}{s}", .{ bytes.len, text, if (whole) "" else "…" });
+}
+
+/// `siblings` holds the list `value` is the first item of, if any.
+fn describeShape(w: *Writer, value: std.json.Value, depth: u8, siblings: []const std.json.Value) Writer.Error!void {
+    if (depth >= max_shape_depth) return w.writeAll("…");
+    switch (value) {
+        .null => try w.writeAll("null"),
+        .bool => try w.writeAll("boolean"),
+        .integer, .float, .number_string => try w.writeAll("number"),
+        .string => try w.writeAll("string"),
+        .array => |items| {
+            if (items.items.len == 0) return w.writeAll("[]");
+            try w.print("[{d} × ", .{items.items.len});
+            try describeShape(w, items.items[0], depth + 1, items.items);
+            try w.writeAll("]");
+        },
+        .object => |object| {
+            try w.writeAll("{");
+            var it = object.iterator();
+            var index: usize = 0;
+            while (it.next()) |entry| : (index += 1) {
+                if (index > 0) try w.writeAll(", ");
+                try writeKey(w, entry.key_ptr.*);
+                var hint_buffer: [max_hint_values][]const u8 = undefined;
+                if (repeatedValues(siblings, entry.key_ptr.*, &hint_buffer)) |values| {
+                    try w.writeAll(": ");
+                    for (values, 0..) |hint, hint_index| {
+                        if (hint_index > 0) try w.writeAll("|");
+                        try std.json.Stringify.value(hint, .{}, w);
+                    }
+                } else if (depth < 2) {
+                    // Two levels of fields, then names only, keeps the line short.
+                    try w.writeAll(": ");
+                    try describeShape(w, entry.value_ptr.*, depth + 1, &.{});
+                }
+            }
+            try w.writeAll("}");
+        },
+    }
+}
+
+/// Writes a field name as it is when it reads plainly, or as a JSON string
+/// when it holds control bytes or the summary's own punctuation.
+fn writeKey(w: *Writer, key: []const u8) Writer.Error!void {
+    const plain = key.len > 0 and for (key) |byte| {
+        if (byte < 0x20 or byte == 0x7f or std.mem.findScalar(u8, "\"\\,:{}[]|", byte) != null) break false;
+    } else true;
+    if (plain) return w.writeAll(key);
+    return std.json.Stringify.value(key, .{}, w);
+}
+
+/// The distinct values of `key` across `items` when every value is short text,
+/// there are few of them, and at least one repeats. Values that never repeat
+/// could be identifiers or free text, so they stay hidden.
+fn repeatedValues(items: []const std.json.Value, key: []const u8, out: *[max_hint_values][]const u8) ?[]const []const u8 {
+    var distinct: usize = 0;
+    var seen: usize = 0;
+    for (items) |item| {
+        if (item != .object) continue;
+        const field = item.object.get(key) orelse continue;
+        switch (field) {
+            .null => continue,
+            .string => |text| {
+                if (text.len > max_hint_value_bytes) return null;
+                seen += 1;
+                for (out[0..distinct]) |known| {
+                    if (std.mem.eql(u8, known, text)) break;
+                } else {
+                    if (distinct == max_hint_values) return null;
+                    out[distinct] = text;
+                    distinct += 1;
+                }
+            },
+            else => return null,
+        }
+    }
+    if (distinct == 0 or distinct >= seen) return null;
+    return out[0..distinct];
 }
 
 fn unavailable(err: *Writer) !u8 {
@@ -161,4 +274,61 @@ test "fx mcp call outside a shell call reports it is unavailable" {
     try std.testing.expectEqual(@as(usize, 0), out.written().len);
     try std.testing.expect(std.mem.find(u8, err.written(), "no running fx shell call") != null);
     try std.testing.expectEqual(exit.usage, try run(arena_state.allocator(), std.testing.io, &out.writer, &err.writer, "mcp_s_t", "[1]"));
+}
+
+test "a shape summary of one item names sizes, keys, and types, not values" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const summary = try shapeSummary(arena,
+        \\{"issues":[{"id":"LABS-1202","title":"ZQX secret","labels":["bug"],"priority":{"value":1,"name":"Urgent"}}],"hasNextPage":false}
+    );
+    try std.testing.expectEqualStrings("wrote 128 bytes of JSON: {issues: [1 × {id, title, labels, priority}], hasNextPage: boolean}", summary);
+    for ([_][]const u8{ "LABS-1202", "ZQX", "bug", "Urgent" }) |value| try std.testing.expect(std.mem.find(u8, summary, value) == null);
+    try std.testing.expectEqualStrings("wrote 12 bytes of text in 2 lines", try shapeSummary(arena, "first\nsecond"));
+    try std.testing.expectEqualStrings("wrote 0 bytes", try shapeSummary(arena, ""));
+}
+
+test "a shape summary shows the values of repeated short text fields only" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const summary = try shapeSummary(arena,
+        \\[{"id":"A-1","state":"open","title":"ZQX one","tag":"\u001b[31m"},{"id":"A-2","state":"done","title":"ZQX two","tag":"\u001b[31m"},{"id":"A-3","state":"open","title":"ZQX three","tag":null}]
+    );
+    try std.testing.expectEqualStrings(
+        \\wrote 190 bytes of JSON: [3 × {id: string, state: "open"|"done", title: string, tag: "\u001b[31m"}]
+    , summary);
+    try std.testing.expect(std.mem.findScalar(u8, summary, 0x1b) == null);
+    for ([_][]const u8{ "A-1", "ZQX" }) |value| try std.testing.expect(std.mem.find(u8, summary, value) == null);
+}
+
+test "a shape summary stays bounded on deep, wide, and odd input" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const depth = 100_000;
+    const deep = try arena.alloc(u8, depth * 2);
+    @memset(deep[0..depth], '[');
+    @memset(deep[depth..], ']');
+    const deep_summary = try shapeSummary(arena, deep);
+    try std.testing.expect(std.mem.endsWith(u8, deep_summary, "[1 × …]]]]]]]]"));
+
+    var wide: std.Io.Writer.Allocating = .init(arena);
+    try wide.writer.writeAll("{");
+    for (0..400) |index| try wide.writer.print("{s}\"field_é_{d}\":{d}", .{ if (index > 0) "," else "", index, index });
+    try wide.writer.writeAll("}");
+    const wide_summary = try shapeSummary(arena, wide.written());
+    try std.testing.expect(std.mem.endsWith(u8, wide_summary, "…"));
+    try std.testing.expect(wide_summary.len < max_summary_chars + 64);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(wide_summary));
+
+    const odd_summary = try shapeSummary(arena,
+        \\[{"a\u001bb":"x","c,d":"y"},{"a\u001bb":"x","c,d":"y"}]
+    );
+    try std.testing.expectEqualStrings(
+        \\wrote 55 bytes of JSON: [2 × {"a\u001bb": "x", "c,d": "y"}]
+    , odd_summary);
+    try std.testing.expect(std.mem.findScalar(u8, odd_summary, 0x1b) == null);
 }

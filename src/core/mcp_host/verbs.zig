@@ -240,6 +240,8 @@ pub fn writeUsage(w: *Writer, surface: Surface, verb: ?Verb) Writer.Error!void {
             \\  Runs the MCP tool TOOL, such as mcp_linear_list_issues, with the JSON
             \\  object of arguments, or with the object on stdin for -. Prints just
             \\  the tool's data, so a command can save it to a file or filter it.
+            \\  When stdout is not a terminal, one line on stderr gives the data's
+            \\  size and shape, with the values of short fields that repeat.
             \\  Works only in a command that fx's shell tool runs, while it runs, and
             \\  asks permission as a direct call of TOOL would.
             \\  Exits 0 on success, 1 when the call fails, 2 for a usage mistake,
