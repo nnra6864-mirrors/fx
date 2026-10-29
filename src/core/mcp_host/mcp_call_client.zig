@@ -113,7 +113,7 @@ pub fn run(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, tool: []con
     switch (reply.header.status) {
         .ok => {
             try out.writeAll(reply.bytes);
-            if (!(std.Io.File.stdout().isTty(io) catch false)) {
+            if (!stdoutIsTerminal(io)) {
                 try err.print("fx mcp call: {s}\n", .{try shapeSummary(arena, reply.bytes)});
             }
             return exit.ok;
@@ -139,6 +139,12 @@ pub fn run(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, tool: []con
             return if (reply.header.reason == .busy) exit.busy else if (reply.header.reason == .malformed or reply.header.reason == .too_large) exit.usage else exit.unavailable;
         },
     }
+}
+
+/// Whether this process's stdout is a terminal, where the data is already in
+/// view and needs no summary.
+fn stdoutIsTerminal(io: std.Io) bool {
+    return std.Io.File.stdout().isTty(io) catch false;
 }
 
 /// The most a shape summary prints.
