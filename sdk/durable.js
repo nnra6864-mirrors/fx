@@ -1848,7 +1848,8 @@ class SessionWorker {
       // message runs the session again shortly, once a lease that landed is
       // let go.
       if (isFenced(settled.error)) return "refused";
-      // The caller hears a backstop that was never sent.
+      // A backstop that was never sent fails the delivery, which reports
+      // it once; nothing was written, so there is no lease to release.
       if (unsent) return "failed";
       this.agent.emit("session.error", { sessionId: this.sessionId, error: errorSummary(settled.error) });
       if (settled.head !== null) await log.append({ k: "release", a: settled.head, holder: this.holder }).catch(() => {});

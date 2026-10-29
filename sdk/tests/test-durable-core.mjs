@@ -2417,20 +2417,22 @@ if (durabilityKind === "queue") {
     dirs.push(dir);
     const ops = [];
     const { durability: base } = await queueWorldAt(dir, { queueLeases: true, runInRequest: true, maxDurationMs: 60_000 });
-    const agent = createAgent({ durability: watchingLog(base, { onList: () => ops.push("list"), onCreate: (kind) => ops.push(kind) }) });
+    // A read once the turn's model request has gone out is the turn's own
+    // poll for steers; one before it is the worker reading the log again.
+    const agent = createAgent({ durability: watchingLog(base, { onList: () => ops.push(prompted.includes("turn-phi") ? "poll" : "list"), onCreate: (kind) => ops.push(kind) }) });
     const session = agent.session();
     assert.equal((await textOf(session.prompt("upsilon"))).result.stopReason, "end_turn");
     await untilIdle(agent);
     ops.length = 0;
-    assert.equal((await textOf(session.prompt("phi"))).result.stopReason, "end_turn");
+    assert.equal((await textOf(session.prompt("phi", { messageId: "turn-phi" }))).result.stopReason, "end_turn");
     const input = ops.indexOf("input");
     const lease = ops.indexOf("lease", input);
     assert.ok(input >= 0 && lease > input, JSON.stringify(ops));
     // The lease waits for the backstop, so the turn's own poll for steers
-    // may read once before it lands; nothing else reads the log again, and
-    // nothing is written.
+    // may read once before it lands; the worker does not read the log again,
+    // and nothing is written.
     const between = ops.slice(input + 1, lease);
-    assert.ok(between.every((op) => op === "list") && between.length <= 1, `nothing read or written between the input and the worker's lease: ${JSON.stringify(between)}`);
+    assert.ok(between.every((op) => op === "poll") && between.length <= 1, `nothing read or written between the input and the worker's lease: ${JSON.stringify(between)}`);
     await agent.close();
   });
 
