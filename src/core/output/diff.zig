@@ -1119,15 +1119,18 @@ const ReviewCapture = struct {
             reviewElisionText(&elision_text, line.elision_count)
         else
             line.text;
-        const charge = text.len +| 1;
-        if (self.text_bytes +| charge > self.max_text_bytes) {
-            self.budget_reached = true;
-            return;
-        }
-        const owned_text = self.alloc.dupe(u8, text) catch {
+        // Saved text must be valid UTF-8, so invalid bytes are kept as the
+        // escapes the renderer shows for them.
+        const owned_text = text_utils.dupeValidUtf8(self.alloc, text) catch {
             self.failed = true;
             return;
         };
+        const charge = owned_text.len +| 1;
+        if (self.text_bytes +| charge > self.max_text_bytes) {
+            self.alloc.free(owned_text);
+            self.budget_reached = true;
+            return;
+        }
         self.rows.append(self.alloc, .{
             .kind = presentationLineKind(line.op),
             .old_line = line.old_line,
@@ -1264,7 +1267,10 @@ fn appendDiffRenderLine(
     try out.append(alloc, previewLineSign(line.op));
     if (accent) try out.appendSlice(alloc, line_style);
     try out.append(alloc, ' ');
-    try out.appendSlice(alloc, line.text);
+    // A row's text comes from a file and can hold escape sequences, C1
+    // controls, or invalid UTF-8, which the frame's emulator or the user's
+    // terminal would act on if written raw.
+    try text_utils.appendTerminalSafeLine(alloc, out, line.text);
     try out.appendSlice(alloc, styles.reset);
     try out.append(alloc, '\n');
 }
@@ -2367,6 +2373,105 @@ test "captured review rows render the same full diff as the live review" {
     try expectCapturedReviewMatchesLive("a\nb", "a\nb\n");
     try expectCapturedReviewMatchesLive(null, "new\nfile\n");
     try expectCapturedReviewMatchesLive("same\n", "same\n");
+    try expectCapturedReviewMatchesLive(hostile_before, hostile_after);
+}
+
+/// A file with its own terminal sequences, a C1 control, a tab, CRLF line
+/// endings, and invalid UTF-8 around a one-line edit.
+const hostile_before = "keep\tx\r\n\x1b[2J\x1b[Hclear\r\n\u{9b}31mcsi\n\xff\xfe\x00\xc3(\nold\ntail\n";
+const hostile_after = "keep\tx\r\n\x1b[2J\x1b[Hclear\r\n\u{9b}31mcsi\n\xff\xfe\x00\xc3(\nnew \x1b]0;title\x07\ntail\n";
+
+const plain_styles: FormatStyles = .{ .added_fg = "", .removed_fg = "", .context_fg = "", .reset = "" };
+
+/// Every line of `content` is printable terminal text, apart from tabs,
+/// which only move along the row.
+fn expectTerminalSafeLines(content: []const u8) !void {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        var parts = std.mem.splitScalar(u8, line, '\t');
+        while (parts.next()) |part| try std.testing.expect(text_utils.isTerminalSafe(part));
+    }
+}
+
+test "diff rows show a file's control bytes as text, never as terminal sequences" {
+    const alloc = std.testing.allocator;
+    const live = (try formatFileChangeFullDiff(
+        alloc,
+        hostile_before,
+        .{ .after_content = hostile_after, .lifecycle_id = .{ .turn_id = 1, .call_id = "edit_1" } },
+        plain_styles,
+    )).?;
+    defer live.deinit(alloc);
+    try expectTerminalSafeLines(live.content);
+    try std.testing.expect(std.mem.find(u8, live.content, "keep\tx") != null);
+    try std.testing.expect(std.mem.find(u8, live.content, "\\x1b[2J\\x1b[Hclear") != null);
+    try std.testing.expect(std.mem.find(u8, live.content, "\\u{009b}31mcsi") != null);
+    try std.testing.expect(std.mem.find(u8, live.content, "\\xff\\xfe\\x00\\xc3(") != null);
+    try std.testing.expect(std.mem.find(u8, live.content, "new \\x1b]0;title\\x07") != null);
+
+    // The inline preview draws its rows through the same renderer.
+    const preview_lines = [_]PreviewLine{
+        .{ .op = .context, .old_line = 2, .new_line = 2, .text = "\x1b[2J\x1b[Hclear" },
+        .{ .op = .addition, .new_line = 5, .text = "new \u{9b}31m" },
+    };
+    const preview = try formatFileChangePreview(alloc, .{
+        .path = "a.txt",
+        .lines = &preview_lines,
+        .additions = 1,
+        .deletions = 0,
+        .truncated = false,
+    }, plain_styles);
+    defer alloc.free(preview);
+    try expectTerminalSafeLines(preview);
+
+    // Saved rows are text the session store accepts.
+    const captured = try captureReviewLines(alloc, hostile_before, hostile_after, std.math.maxInt(usize));
+    defer types.freeCommittedFilePresentationLines(alloc, captured.rows);
+    for (captured.rows) |row| try std.testing.expect(std.unicode.utf8ValidateSlice(row.text));
+}
+
+test "diff rows stay terminal-safe and saveable on fuzzed file text" {
+    try std.testing.fuzz({}, fuzzDiffRows, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "keep\nold\n" ++ "keep\nnew\n",
+            "\x1b[2J\x1b[Hold\n\u{9b}31m\xff\tx\r\n" ++ "\x1b[2J\x1b[Hnew\n\u{9b}31m\xff\tx\r\n",
+            "a\xed\xa0\x80\r\rb\x00\n" ++ "a\xc3(\x1b]52;c;eA==\x07\n",
+        }) ++ @import("fuzz_corpus").diff_rows.*),
+    });
+}
+
+/// The input's first half is a file before an edit and its second half the
+/// file after it. Whatever the bytes, the saved rows must be valid UTF-8,
+/// both renderings must be terminal-safe, and the resumed full diff must
+/// match the live one.
+fn fuzzDiffRows(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [4096]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&buffer));
+    const previous = buffer[0 .. len / 2];
+    const after = buffer[len / 2 .. len];
+    const alloc = std.testing.allocator;
+    const lifecycle_id: types.ToolLifecycleId = .{ .turn_id = 1, .call_id = "fuzz" };
+
+    const captured = captureReviewLines(alloc, previous, after, std.math.maxInt(usize)) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
+    defer types.freeCommittedFilePresentationLines(alloc, captured.rows);
+    for (captured.rows) |row| try std.testing.expect(std.unicode.utf8ValidateSlice(row.text));
+
+    const restored = try formatCapturedFullDiff(alloc, captured.rows, lifecycle_id, plain_styles);
+    defer restored.deinit(alloc);
+    try expectTerminalSafeLines(restored.content);
+
+    const live = (try formatFileChangeFullDiff(
+        alloc,
+        previous,
+        .{ .after_content = after, .lifecycle_id = lifecycle_id },
+        plain_styles,
+    )) orelse return;
+    defer live.deinit(alloc);
+    try std.testing.expectEqualStrings(live.content, restored.content);
 }
 
 test "captured review rows stop at the text budget with one notice row" {

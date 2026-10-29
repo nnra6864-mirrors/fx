@@ -4337,6 +4337,8 @@ noinline fn replay(
                             try represented.append(ta, try ta.dupe(u8, value.call_id));
                         },
                         .steering => |value| try builder.appendSteering(value.text),
+                        .context_note => |value| try builder.appendContextNote(value.text, value.sources),
+                        .runtime_context => |value| try builder.setRuntimeContext(value.messages),
                         .turn_completed => |value| try sink.turn(try presentStoredResults(src, alloc, try builder.finishAssistant(value)), lastStarted(entry)),
                         .interrupted => |value| {
                             interrupted_item = true;
@@ -4769,6 +4771,9 @@ fn itemType(kind: PieceKind) ?[]const u8 {
         .turn_completed => "turn_end",
         .interrupted => "interruption",
         .context_checkpoint => null,
+        // An older fx leaves out an item type it does not know (D17, D93, D94).
+        .context_note => "context_note",
+        .runtime_context => "runtime_context",
     };
 }
 
@@ -4850,6 +4855,32 @@ fn decodePiece(arena: Allocator, kind: PieceKind, data: []const u8, allocate: st
     };
     try session_event.validateConversationEventShape(event, session_event.conversation_schema_version);
     return event;
+}
+
+test "v2 conversation pieces stay bounded under fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzConversationPiece, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "{}",
+            "{\"text\":\"ok\"}",
+            // A context note (D93) and a saved runtime context (D94), as v2 writes them.
+            "{\"text\":\"<scoped-rules from=\\\"sub/AGENTS.md\\\" scope=\\\"sub\\\">\\nR\\n</scoped-rules>\",\"sources\":[{\"path\":\"/w/sub/AGENTS.md\",\"stamp\":7}]}",
+            "{\"text\":\"n\",\"sources\":[{\"path\":\"\",\"stamp\":0}]}",
+            "{\"messages\":[\"<fx-turn-context>\\ngit_branch: main\\n</fx-turn-context>\",\"Runtime context: permission mode is auto.\"]}",
+            "{\"messages\":[]}",
+        }) ++ @import("fuzz_corpus").session_conversation_piece.*),
+    });
+}
+
+/// Reads the bytes as a piece of every kind, as replay does for a v2 item.
+fn fuzzConversationPiece(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [4096]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&buffer));
+    inline for (@typeInfo(PieceKind).@"enum".field_names) |name| {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        _ = decodePiece(arena_state.allocator(), @field(PieceKind, name), buffer[0..len], .alloc_always) catch {};
+    }
 }
 
 /// A user piece as v2 writes it: `session_event.ConversationUser` field for
@@ -6193,6 +6224,199 @@ test "a compaction inside a turn leaves the steps it covers out of that turn on 
     try testing.expectEqualStrings("three steps", kept.user.text);
     try testing.expectEqual(@as(usize, 0), kept.execution.tool_steps.len);
     try testing.expectEqual(@as(usize, 0), kept.execution.steering.len);
+}
+
+/// Two shell steps whose results name their stored bodies.
+const NoteTestSteps = struct {
+    calls: [3]types.ToolCall = .{
+        .{ .id = "call-1", .name = "shell", .arguments_json = "{}" },
+        .{ .id = "call-2", .name = "shell", .arguments_json = "{}" },
+        .{ .id = "call-3", .name = "shell", .arguments_json = "{}" },
+    },
+    results: [3]types.PersistedToolResult = .{
+        ok("call-1", "result-shell-1.txt"),
+        ok("call-2", "result-shell-2.txt"),
+        ok("call-3", "result-shell-3.txt"),
+    },
+    steps: [3]types.ToolExecutionStep = undefined,
+
+    fn ok(id: []const u8, handle: []const u8) types.PersistedToolResult {
+        return .{ .tool_call_id = @constCast(id), .tool_name = @constCast("shell"), .status = .success, .output = @constCast("ok"), .output_bytes = 2, .output_handle = @constCast(handle), .stored_output_bytes = 2 };
+    }
+
+    fn init(self: *NoteTestSteps) void {
+        for (&self.steps, 0..) |*step, i| step.* = .{ .tool_calls = self.calls[i .. i + 1], .tool_results = self.results[i .. i + 1] };
+    }
+};
+
+test "a turn's context notes come back on resume at their boundaries, before that boundary's steering (D93)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var fixture: NoteTestSteps = .{};
+    fixture.init();
+    var delivered = [_]types.ContextNoteSource{
+        .{ .path = "/w/sub/AGENTS.md", .stamp = 0x1F_FFFF_FFFF_FFFF },
+        .{ .path = "/w/sub/deep/CLAUDE.md", .stamp = 0 },
+    };
+    var notes = [_]types.PersistedContextNote{
+        .{ .text = @constCast("note at start"), .after_tool_step_count = 0 },
+        .{ .text = @constCast("note after one"), .after_tool_step_count = 1, .sources = &delivered },
+        .{ .text = @constCast("note at the end"), .after_tool_step_count = 2 },
+    };
+    var steering = [_]types.PersistedSteering{.{ .text = @constCast("steer after one"), .after_tool_step_count = 1 }};
+    try s.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("two steps") },
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = fixture.steps[0..2], .steering = &steering, .context_notes = &notes },
+    } }, types.ConversationLanguage.default());
+    try s.commitTurn(assistantTurn("plain", "turn"), types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    // Each note is its own `context_note` item, written before the steering
+    // at its boundary.
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, bytes, "\"context_note\""));
+    try testing.expect(std.mem.find(u8, bytes, "note after one").? < std.mem.find(u8, bytes, "steer after one").?);
+    try testing.expect(std.mem.find(u8, bytes, "call-2").? < std.mem.find(u8, bytes, "note at the end").?);
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), restored.history.len);
+    const execution = restored.history[0].assistant.execution;
+    try testing.expectEqual(@as(usize, 2), execution.tool_steps.len);
+    try testing.expectEqual(notes.len, execution.context_notes.len);
+    for (notes, execution.context_notes) |want, got| {
+        try testing.expectEqualStrings(want.text, got.text);
+        try testing.expectEqual(want.after_tool_step_count, got.after_tool_step_count);
+        // Each delivered file comes back with its stamp, including the
+        // largest stamp and an unknown one.
+        try testing.expectEqual(want.sources.len, got.sources.len);
+        for (want.sources, got.sources) |want_source, got_source| {
+            try testing.expectEqualStrings(want_source.path, got_source.path);
+            try testing.expectEqual(want_source.stamp, got_source.stamp);
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), execution.steering.len);
+    try testing.expectEqual(@as(usize, 1), execution.steering[0].after_tool_step_count);
+    // A turn without notes comes back without any.
+    try testing.expectEqual(@as(usize, 0), restored.history[1].assistant.execution.context_notes.len);
+}
+
+test "a turn's runtime context comes back on resume, saved once right after its user message (D94)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var fixture: NoteTestSteps = .{};
+    fixture.init();
+    var captured = [_][]u8{ @constCast("<fx-turn-context>\ngit_branch: main\n</fx-turn-context>"), @constCast("Runtime context: permission mode is ask.") };
+    var notes = [_]types.PersistedContextNote{.{ .text = @constCast("note at start"), .after_tool_step_count = 0 }};
+    const user: types.UserTurn = .{ .text = @constCast("two steps") };
+    // Every save of the turn carries it, so the streamed pieces stay a prefix
+    // of the committed turn.
+    try s.appendProgress(user, .{ .tool_steps = fixture.steps[0..1], .context_notes = &notes, .runtime_context = &captured }, .{});
+    try s.commitTurn(.{ .assistant = .{
+        .user = user,
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = fixture.steps[0..2], .context_notes = &notes, .runtime_context = &captured },
+    } }, types.ConversationLanguage.default());
+    try s.commitTurn(assistantTurn("plain", "turn"), types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.find(u8, bytes, superseded_type) == null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "git_branch: main"));
+    try testing.expect(std.mem.find(u8, bytes, "two steps").? < std.mem.find(u8, bytes, "git_branch: main").?);
+    try testing.expect(std.mem.find(u8, bytes, "git_branch: main").? < std.mem.find(u8, bytes, "note at start").?);
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), restored.history.len);
+    const execution = restored.history[0].assistant.execution;
+    try testing.expectEqual(@as(usize, 2), execution.tool_steps.len);
+    try testing.expectEqual(@as(usize, 1), execution.context_notes.len);
+    try testing.expectEqual(captured.len, execution.runtime_context.?.len);
+    for (captured, execution.runtime_context.?) |want, got| try testing.expectEqualStrings(want, got);
+    // A later turn that used the saved copy saves none.
+    try testing.expect(restored.history[1].assistant.execution.runtime_context == null);
+}
+
+test "a compaction inside a turn drops the context notes it covers and keeps the later ones on resume (D93)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var fixture: NoteTestSteps = .{};
+    fixture.init();
+    var notes = [_]types.PersistedContextNote{
+        .{ .text = @constCast("note after one"), .after_tool_step_count = 1 },
+        .{ .text = @constCast("note after two"), .after_tool_step_count = 2 },
+        .{ .text = @constCast("note after three"), .after_tool_step_count = 3 },
+    };
+    var steering = [_]types.PersistedSteering{
+        .{ .text = @constCast("after one"), .after_tool_step_count = 1 },
+        .{ .text = @constCast("after two"), .after_tool_step_count = 2 },
+    };
+    try s.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("three steps") },
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = &fixture.steps, .steering = &steering, .context_notes = &notes },
+    } }, types.ConversationLanguage.default());
+    var first = "steps one and two".*;
+    try s.commitCompaction(.{ .summary = &first, .removed_turn_count = 0, .compaction_count = 1 }, false, .{ .tool_steps = 2, .steering = 1 });
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    {
+        const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+        defer r.close();
+        var restored = try r.restore(testing.allocator);
+        defer restored.deinit(testing.allocator);
+        const kept = restored.history[1].assistant;
+        try testing.expectEqual(@as(usize, 1), kept.execution.tool_steps.len);
+        // The note before the cut is gone; the one at the cut and the one
+        // after the last step stay, counted from the cut.
+        try testing.expectEqual(@as(usize, 2), kept.execution.context_notes.len);
+        try testing.expectEqualStrings("note after two", kept.execution.context_notes[0].text);
+        try testing.expectEqual(@as(usize, 0), kept.execution.context_notes[0].after_tool_step_count);
+        try testing.expectEqualStrings("note after three", kept.execution.context_notes[1].text);
+        try testing.expectEqual(@as(usize, 1), kept.execution.context_notes[1].after_tool_step_count);
+        var second = "all three steps".*;
+        try r.commitCompaction(.{ .summary = &second, .removed_turn_count = 0, .compaction_count = 2 }, false, .{ .tool_steps = 1, .steering = 1 });
+    }
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    const kept = restored.history[1].assistant;
+    try testing.expectEqual(@as(usize, 0), kept.execution.tool_steps.len);
+    // The second cut covers the note before the step it covers and keeps the
+    // note after the last step, which nothing follows.
+    try testing.expectEqual(@as(usize, 1), kept.execution.context_notes.len);
+    try testing.expectEqualStrings("note after three", kept.execution.context_notes[0].text);
+    try testing.expectEqual(@as(usize, 0), kept.execution.context_notes[0].after_tool_step_count);
 }
 
 test "resume refuses a session whose compaction line is damaged" {

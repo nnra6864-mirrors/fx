@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation_contract = @import("file_mutation_contract.zig");
 const io_mod = @import("../shared/io.zig");
+const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const pathing = @import("../workspace/pathing.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
@@ -1453,7 +1454,28 @@ fn derivePostimage(
                 .absent => break :blk .{ .semantic_failure = identity_changed_message },
                 .present => |present| present.content,
             };
-            const occurrence_count = countOccurrences(before, edit.old_string);
+            var old_string = edit.old_string;
+            var new_string = edit.new_string;
+            var occurrence_count = countOccurrences(before, old_string);
+            // Tool output shows a file's carried tags starting `&lt;` (D93), so an
+            // edit copied from it that matches only as the file has them
+            // means the file's `<`, in the old and the new text alike.
+            var shown_old: ?[]u8 = null;
+            defer if (shown_old) |text| alloc.free(text);
+            var shown_new: ?[]u8 = null;
+            defer if (shown_new) |text| alloc.free(text);
+            if (occurrence_count == 0) {
+                shown_old = try model_context_encoding.unescapeCarried(alloc, old_string);
+                if (shown_old) |shown| {
+                    const shown_count = countOccurrences(before, shown);
+                    if (shown_count > 0) {
+                        shown_new = try model_context_encoding.unescapeCarried(alloc, new_string);
+                        old_string = shown;
+                        new_string = shown_new orelse new_string;
+                        occurrence_count = shown_count;
+                    }
+                }
+            }
             if (occurrence_count == 0) {
                 break :blk .{ .semantic_failure = "edit_file failed: old_string not found in file. Re-read the file to see its current contents; if the change is already applied, do not retry this edit." };
             }
@@ -1467,14 +1489,14 @@ fn derivePostimage(
             const match_start = std.mem.find(
                 u8,
                 before,
-                edit.old_string,
+                old_string,
             ).?;
             const prefix_len = match_start;
-            const suffix_start = match_start + edit.old_string.len;
+            const suffix_start = match_start + old_string.len;
             var after_len = std.math.add(
                 usize,
                 prefix_len,
-                edit.new_string.len,
+                new_string.len,
             ) catch break :blk .{ .semantic_failure = edited_file_too_large_message };
             after_len = std.math.add(
                 usize,
@@ -1487,8 +1509,8 @@ fn derivePostimage(
 
             const after = try alloc.alloc(u8, after_len);
             @memcpy(after[0..prefix_len], before[0..prefix_len]);
-            const replacement_end = prefix_len + edit.new_string.len;
-            @memcpy(after[prefix_len..replacement_end], edit.new_string);
+            const replacement_end = prefix_len + new_string.len;
+            @memcpy(after[prefix_len..replacement_end], new_string);
             @memcpy(after[replacement_end..], before[suffix_start..]);
             break :blk .{ .content = after };
         },
@@ -2010,6 +2032,49 @@ test "zero-occurrence edit failure explains recovery and leaves the file untouch
     defer file.close(std.testing.io);
     const unchanged = try io_mod.readFileToEnd(arena, &file, 4096);
     try std.testing.expectEqualStrings("export interface RacePlan {\n  laps: number;\n}\n", unchanged);
+}
+
+test "an edit copied from tool output that escaped a carried tag edits the file's tag (D93)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createFile(&tmp, "doc.md", "intro\n<scoped-rules from=\"a\">old rule</scoped-rules>\nend\n");
+    try createFile(&tmp, "html.md", "&lt;scoped-rules> as text\n<scoped-rules> as tag\n");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try workspaceRoot(arena, tmp);
+
+    // What read_file showed, copied into both strings.
+    const copied_call: types.ToolCall = .{
+        .id = "edit-copied",
+        .name = "edit_file",
+        .arguments_json = try editArgumentsJson(
+            arena,
+            "doc.md",
+            "&lt;scoped-rules from=\"a\">old rule&lt;/scoped-rules>",
+            "&lt;scoped-rules from=\"a\">new rule&lt;/scoped-rules>",
+        ),
+    };
+    const copied = try expectPrepared(arena, copied_call, try evaluatePolicy(arena, root, copied_call));
+    try std.testing.expectEqualStrings("intro\n<scoped-rules from=\"a\">new rule</scoped-rules>\nend\n", copied.after_content);
+
+    // Text the file really holds escaped is matched as it is first.
+    const literal_call: types.ToolCall = .{
+        .id = "edit-literal",
+        .name = "edit_file",
+        .arguments_json = try editArgumentsJson(arena, "html.md", "&lt;scoped-rules> as text", "&lt;scoped-rules> kept as text"),
+    };
+    const literal = try expectPrepared(arena, literal_call, try evaluatePolicy(arena, root, literal_call));
+    try std.testing.expectEqualStrings("&lt;scoped-rules> kept as text\n<scoped-rules> as tag\n", literal.after_content);
+
+    // Neither form matching still fails as before.
+    const missing_call: types.ToolCall = .{
+        .id = "edit-missing-tag",
+        .name = "edit_file",
+        .arguments_json = try editArgumentsJson(arena, "doc.md", "&lt;scoped-rules from=\"b\">", "x"),
+    };
+    const failure = try expectSemanticFailure(arena, missing_call, try evaluatePolicy(arena, root, missing_call));
+    try std.testing.expect(std.mem.find(u8, failure, "old_string not found in file") != null);
 }
 
 test "prepare emits explicit empty and no-change notices" {

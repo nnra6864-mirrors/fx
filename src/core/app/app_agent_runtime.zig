@@ -814,7 +814,6 @@ pub fn Runtime(comptime App: type) type {
         pub fn appendStaticContextMessage(
             app: *App,
             arena: Allocator,
-            project_context: ?[]const u8,
             messages: *std.ArrayList(ChatMessage),
             ignored_list_entries: []const []const u8,
             max_list_entries: usize,
@@ -834,7 +833,7 @@ pub fn Runtime(comptime App: type) type {
             _ = gateway_retry_count;
             _ = gateway_chat_url;
             try app.contextRegistry().appendDefaultStatic(.{
-                .project_context = project_context orelse modelVisibleProjectContext(app),
+                .project_context = modelVisibleProjectContext(app),
             }, arena, messages);
             var report = if (comptime @hasDecl(App, "snapshotMcpModelCatalog"))
                 try app.snapshotMcpModelCatalog(arena)
@@ -901,7 +900,6 @@ pub fn Runtime(comptime App: type) type {
                 .access_scope = workspace.access_scope,
                 .interactive = true,
                 .permission_mode = permission_snapshot.mode,
-                .stale_shell_handles = app.session.has_stale_shell_handles,
             }, arena, messages);
         }
 
@@ -2050,7 +2048,7 @@ test "app prompt projection configures web search then blocks native execution" 
     const arena = arena_state.allocator();
     var messages: std.ArrayList(ChatMessage) = .empty;
     defer messages.deinit(arena);
-    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, null, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     try app.appendRuntimeContextMessage(arena, &messages);
 
     try std.testing.expectEqualStrings("stale-key", app.web_search_runtime.api_key);
@@ -2582,7 +2580,7 @@ test "app agent runtime appends static and transient context through configured 
     defer messages.deinit(arena);
     app.permission_engine.mode = .auto;
 
-    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, null, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     try Runtime(FakeApp).appendTransientRuntimeContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
 
     try std.testing.expectEqual(@as(usize, 3), messages.items.len);
@@ -2607,7 +2605,7 @@ test "app agent runtime prefers active queued project context snapshot" {
     var messages: std.ArrayList(ChatMessage) = .empty;
     defer messages.deinit(arena);
 
-    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, null, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
 
     try std.testing.expectEqual(@as(usize, 2), messages.items.len);
     try std.testing.expectEqualStrings("provider static:queued project context", messages.items[0].content.?);
@@ -2628,7 +2626,7 @@ test "app agent runtime shows MCP availability changes to the model" {
     var messages: std.ArrayList(ChatMessage) = .empty;
     defer messages.deinit(arena);
 
-    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, null, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
 
     try std.testing.expectEqual(@as(usize, 3), messages.items.len);
     try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);

@@ -195,6 +195,9 @@ pub fn buildAgentRequest(
     defer alloc.free(prompt);
     @memcpy(prompt[0..request.instructions.len], request.instructions);
     @memcpy(prompt[request.instructions.len..], projected orelse request.messages);
+    var provider_options = request.provider_options;
+    provider_options.cache_markers = vercel_model_policy.cacheMarkers(request.model);
+    provider_options.single_system_message = vercel_model_policy.singleSystemMessage(request.model);
 
     if (request.verified_images) |images| {
         const response_format = request.response_format orelse
@@ -204,7 +207,7 @@ pub fn buildAgentRequest(
             tools_json,
             prompt,
             images,
-            request.provider_options,
+            provider_options,
             request.tool_choice,
             .{
                 .name = response_format.name,
@@ -223,7 +226,7 @@ pub fn buildAgentRequest(
                 alloc,
                 tools_json,
                 prompt,
-                request.provider_options,
+                provider_options,
                 request.tool_choice,
                 request.max_output_tokens,
                 active,
@@ -233,7 +236,7 @@ pub fn buildAgentRequest(
                 alloc,
                 tools_json,
                 prompt,
-                request.provider_options,
+                provider_options,
                 request.tool_choice,
                 request.max_output_tokens,
             );
@@ -246,7 +249,7 @@ pub fn buildAgentRequest(
                 alloc,
                 tools_json,
                 prompt,
-                request.provider_options,
+                provider_options,
                 request.max_output_tokens,
                 active,
             )
@@ -255,7 +258,7 @@ pub fn buildAgentRequest(
                 alloc,
                 tools_json,
                 prompt,
-                request.provider_options,
+                provider_options,
                 request.max_output_tokens,
             );
         return finalizeAgentRequestBody(alloc, request.model, try body);
@@ -419,6 +422,105 @@ test "agent request builder keeps default reasoning silent and emits output limi
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value.object.get("providerOptions") == null);
+}
+
+test "agent request builder sends stable cache markers in each family's syntax" {
+    const alloc = std.testing.allocator;
+    const instructions = [_]shared_types.ChatMessage{
+        .{ .role = .system, .content = "stable base", .cache_breakpoint = true },
+        .{ .role = .system, .content = "turn context" },
+    };
+    const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
+    for ([_]struct { model: []const u8, anthropic: usize, openai: usize }{
+        .{ .model = "anthropic/claude-sonnet-5.5", .anthropic = 1, .openai = 0 },
+        .{ .model = "openai/gpt-6.1-sol", .anthropic = 0, .openai = 1 },
+        .{ .model = "openai/gpt-5.6-luna", .anthropic = 0, .openai = 1 },
+        .{ .model = "openai/gpt-5", .anthropic = 0, .openai = 0 },
+        .{ .model = "google/gemini-3-flash", .anthropic = 0, .openai = 0 },
+    }) |case| {
+        var options = resolveGatewayProviderOptions(case.model, .auto, false);
+        options.prompt_caching = true;
+        const body = try buildAgentRequest(alloc, .{
+            .model = case.model,
+            .instructions = &instructions,
+            .messages = &messages,
+            .tool_choice = .auto,
+            .provider_options = options,
+        });
+        defer alloc.free(body);
+        try std.testing.expectEqual(case.anthropic, std.mem.count(u8, body, "\"cacheControl\""));
+        try std.testing.expectEqual(case.openai, std.mem.count(u8, body, "\"promptCacheBreakpoint\""));
+        // The caller's instructions are not modified.
+        try std.testing.expect(instructions[0].cache_breakpoint);
+    }
+}
+
+test "agent requests carry delivered rules in the tool result for every family, without cache markers (D93)" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const instructions = [_]shared_types.ChatMessage{.{ .role = .system, .content = "stable base", .cache_breakpoint = true }};
+    const calls = [_]shared_types.ToolCall{.{ .id = "call_1", .name = "read_file", .arguments_json = "{\"path\":\"sub/notes.md\"}" }};
+    const messages = [_]shared_types.ChatMessage{
+        .{ .role = .user, .content = "question" },
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .content = "notes", .tool_call_id = "call_1", .tool_name = "read_file" },
+        .{ .role = .system, .content = "<scoped-rules from=\"sub/AGENTS.md\" scope=\"sub\">tabs</scoped-rules>", .context_note = true },
+    };
+    const sent = try agent_stream_provider_contract.carryContextNotes(arena, &messages);
+    const carried = "\"value\":\"notes\\n\\n<scoped-rules from=\\\"sub/AGENTS.md\\\" scope=\\\"sub\\\">tabs</scoped-rules>\"";
+    for ([_][]const u8{
+        "anthropic/claude-sonnet-5.5",
+        "openai/gpt-6.1-sol",
+        "openai/gpt-5",
+        "spacexai/grok-4.7",
+        "moonshotai/kimi-k3",
+        "alibaba/qwen3.8-max",
+        "meta/llama-4-maverick",
+    }) |model| {
+        var options = resolveGatewayProviderOptions(model, .auto, false);
+        options.prompt_caching = true;
+        const body = try buildAgentRequest(arena, .{
+            .model = model,
+            .instructions = &instructions,
+            .messages = sent,
+            .tool_choice = .auto,
+            .provider_options = options,
+        });
+        // The rules end the tool result's text, and the instructions are the
+        // request's only system message.
+        try std.testing.expect(std.mem.find(u8, body, carried) != null);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "\"role\":\"system\""));
+        // Only the stable instructions carry a marker, for the families fx marks.
+        const markers: usize = @intFromBool(vercel_model_policy.cacheMarkers(model) != .none);
+        try std.testing.expectEqual(markers, std.mem.count(u8, body, "\"cacheControl\"") + std.mem.count(u8, body, "\"promptCacheBreakpoint\""));
+    }
+}
+
+test "agent requests to Qwen send the instructions as one system message" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const instructions = [_]shared_types.ChatMessage{
+        .{ .role = .system, .content = "stable base" },
+        .{ .role = .system, .content = "turn context" },
+    };
+    const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
+    for ([_]struct { model: []const u8, systems: usize }{
+        .{ .model = "alibaba/qwen3.8-max", .systems = 1 },
+        .{ .model = "zai/glm-5.3", .systems = 2 },
+    }) |case| {
+        const body = try buildAgentRequest(arena, .{
+            .model = case.model,
+            .instructions = &instructions,
+            .messages = &messages,
+            .tool_choice = .auto,
+            .provider_options = resolveGatewayProviderOptions(case.model, .auto, false),
+        });
+        try std.testing.expectEqual(case.systems, std.mem.count(u8, body, "{\"role\":\"system\""));
+    }
 }
 
 test "agent request builder scopes the product user agent to GLM 5.2" {

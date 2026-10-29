@@ -239,6 +239,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .upgrade,
         .token = "upgrade",
+        .aliases = &.{"update"},
         .usage = "upgrade [--channel <stable|dev>] [--json]",
         .summary = "Upgrade 𝒇x on the selected release channel",
         .options = &.{
@@ -316,7 +317,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .slack, .usage = "slack <install|status|refresh>" },
         .{ .kind = .permissions, .usage = "permissions" },
         .{ .kind = .workspace, .usage = "workspace" },
-        .{ .kind = .upgrade, .usage = "upgrade", .summary = "Upgrade fx on the selected release channel" },
+        .{ .kind = .upgrade, .usage = "upgrade|update", .summary = "Upgrade fx on the selected release channel" },
         .{ .kind = .acp, .usage = "acp" },
         .{ .kind = .help, .usage = "help" },
     } },
