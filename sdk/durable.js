@@ -1694,7 +1694,21 @@ class SessionWorker {
   // `handoff` is the sender's own session object and the log it read and
   // extended, when the request that took the prompt runs it (see
   // handoffEntries); the worker starts from them instead of reading again.
+  // `delivery` may be a promise of it, the backstop of a prompt the request
+  // runs itself while the queue still takes it: until it resolves, the log
+  // is folded without it, which can only find a lease alive that it would
+  // find dead, and only a claim that starts early goes ahead, its lease
+  // waiting for it. Anything else waits for it first. One that rejects
+  // fails the delivery, which then writes and sends nothing.
   async consume(message, delivery = null, handoff = null) {
+    let backstop = typeof delivery?.then === "function" ? delivery : null;
+    if (backstop) delivery = null;
+    const settle = async () => {
+      if (!backstop) return;
+      const pending = backstop;
+      backstop = null;
+      delivery = await pending;
+    };
     const log = handoff?.log ?? await this.backend.session(this.sessionId);
     let entries = handoff?.entries ?? await log.read();
     let state = this.fold(entries, delivery);
@@ -1710,6 +1724,7 @@ class SessionWorker {
     // to another agent's session does, goes on to it.
     const owner = state.agent ?? agentOf(message);
     if (owner !== this.agent.name) {
+      await settle();
       await this.backend.queue.send(queuedMessage({ ...message, agent: owner }, this.backend.store), {
         idempotencyKey: `${message.sessionId}:${message.type}:${message.messageId}:to:${owner}`,
       });
@@ -1720,10 +1735,18 @@ class SessionWorker {
       // A session with no open turn starts its next prompt at once: the
       // first model request goes out while the lease is written, and
       // nothing else is written until it lands.
-      const early = this.running || state.lease ? null : earlyStart(entries, state, message, (items) => this.fold(items, delivery));
+      let early = this.running || state.lease ? null : earlyStart(entries, state, message, (items) => this.fold(items, delivery));
+      if (!early && backstop) {
+        await settle();
+        state = this.fold(entries, delivery);
+        early = this.running || state.lease ? null : earlyStart(entries, state, message, (items) => this.fold(items, delivery));
+      }
       let outcome;
       if (early) {
-        outcome = await this.claim(log, state, deadline, early, delivery);
+        outcome = await this.claim(log, state, deadline, early, backstop ?? delivery);
+        // A backstop that failed fails the delivery here, so nothing is
+        // queued again for it.
+        await settle();
       } else {
         if (this.running) return { timeoutSeconds: runningBackstopSeconds };
         if (!state.hasWork) {
@@ -1764,11 +1787,15 @@ class SessionWorker {
   // before either lands. The lease names `delivery`, so a later delivery of
   // the same message can tell it lost its holder. Returns what run()
   // returns, or "refused" when another worker's write came before the claim.
+  // `delivery` may be a promise of it, a backstop still being sent: every
+  // write of the claim waits for it, and one that rejects fails the claim
+  // with nothing written.
   async claim(log, state, deadline, early, delivery = null) {
     // Claimed before the first await, so a delivery that arrives meanwhile
     // sees the session running here.
     this.running = true;
     this.holder = newId("wkr");
+    const backstop = typeof delivery?.then === "function" ? delivery : null;
     const lease = {
       k: "lease",
       a: state.head,
@@ -1776,14 +1803,21 @@ class SessionWorker {
       epoch: state.lastEpoch + 1,
       expiresAt: leaseEnd(this.backend, deadline),
       ...this.backend.holderInfo(),
-      ...(delivery ? { delivery } : {}),
+      ...(delivery && !backstop ? { delivery } : {}),
     };
     this.backend.holding(this.holder, true);
+    let unsent = false;
     try {
+      // The lease names the backstop, so nothing goes out before it is sent.
+      // Its holder's later leases and checkpoints name it too.
+      const sent = backstop
+        ? backstop.then((named) => { if (named) lease.delivery = named; }, (error) => { unsent = true; throw error; })
+        : null;
+      const write = (entry) => (sent ? sent.then(() => log.append(entry)) : log.append(entry));
       // Both writes go out at once and neither waits for the other; the
       // claim settles once both have, with the lease's cursor if it landed
       // and the first failure.
-      const writes = [log.append(lease), ...(early?.writes ?? []).map((entry) => log.append(entry))];
+      const writes = [write(lease), ...(early?.writes ?? []).map((entry) => write(entry))];
       const claimed = Promise.allSettled(writes).then(async ([leased, ...rest]) => {
         const head = leased.status === "fulfilled" ? leased.value : null;
         const error = leased.status === "rejected" ? leased.reason : rest.find((item) => item.status === "rejected")?.reason ?? null;
@@ -1814,6 +1848,8 @@ class SessionWorker {
       // message runs the session again shortly, once a lease that landed is
       // let go.
       if (isFenced(settled.error)) return "refused";
+      // The caller hears a backstop that was never sent.
+      if (unsent) return "failed";
       this.agent.emit("session.error", { sessionId: this.sessionId, error: errorSummary(settled.error) });
       if (settled.head !== null) await log.append({ k: "release", a: settled.head, holder: this.holder }).catch(() => {});
       return "failed";
@@ -2778,14 +2814,21 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
             // if the request died, the backstop takes the session over and
             // continues the turn.
             const delaySeconds = Math.ceil(Math.max(0, deadline - Date.now()) / 1000) + inlineBackstopMarginSeconds;
-            const { messageId: backstop } = await created.queue.send(queued, { idempotencyKey, delaySeconds }) ?? {};
-            seeded = true;
-            const delivery = backstop ? { messageId: backstop, attempt: 0 } : null;
+            // The worker starts while the backstop is sent: its first model
+            // request goes out at once, and it writes and shows nothing, and
+            // runs no tool, until its lease, which names the backstop, lands
+            // after the send. A send that fails fails the claim, so the turn
+            // stops having stored nothing, and the caller hears the failure.
+            const sending = Promise.resolve().then(() => created.queue.send(queued, { idempotencyKey, delaySeconds }));
+            const backstop = sending.then((sent) => (sent?.messageId ? { messageId: sent.messageId, attempt: 0 } : null));
+            void backstop.catch(() => {});
             // receive() reports a failure to the host; the backstop retries it.
             const entries = handoffEntries(read, newestSeen, appended);
             const handoff = entries ? { log, entries } : null;
-            const work = receive(created, queued, delivery, { inRequest: true, handoff }).then(() => {}, () => {});
+            const work = receive(created, queued, backstop, { inRequest: true, handoff }).then(() => {}, () => {});
             created.waitUntil?.(work);
+            await sending;
+            seeded = true;
             return;
           }
         }

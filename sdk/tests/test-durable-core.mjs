@@ -2426,7 +2426,240 @@ if (durabilityKind === "queue") {
     const input = ops.indexOf("input");
     const lease = ops.indexOf("lease", input);
     assert.ok(input >= 0 && lease > input, JSON.stringify(ops));
-    assert.deepEqual(ops.slice(input + 1, lease), [], "nothing read or written between the input and the worker's lease");
+    // The lease waits for the backstop, so the turn's own poll for steers
+    // may read once before it lands; nothing else reads the log again, and
+    // nothing is written.
+    const between = ops.slice(input + 1, lease);
+    assert.ok(between.every((op) => op === "list") && between.length <= 1, `nothing read or written between the input and the worker's lease: ${JSON.stringify(between)}`);
+    await agent.close();
+  });
+
+  // A durability whose queue holds the backstop of the prompt `hold(id)`
+  // names until the test passes or fails it, and the events of what the
+  // World is asked to write.
+  const backstopGate = (base) => {
+    const holds = new Map();
+    const ops = [];
+    const durability = {
+      ...base,
+      world: async () => {
+        const world = await base.world();
+        const create = world.events.create.bind(world.events);
+        const queue = world.queue.bind(world);
+        const events = Object.assign(Object.create(world.events), {
+          create(runId, event, ...rest) {
+            if (event?.eventType === "step_created") {
+              try { ops.push(JSON.parse(decoder.decode(event.eventData.input)).k); } catch {}
+            }
+            return create(runId, event, ...rest);
+          },
+        });
+        return Object.assign(Object.create(world), {
+          events,
+          async queue(name, payload, options = {}) {
+            const hold = payload?.input?.type === "prompt" && options.delaySeconds !== undefined ? holds.get(payload.input.messageId) : undefined;
+            if (hold) {
+              holds.delete(payload.input.messageId);
+              hold.called();
+              await hold.gate;
+            }
+            return queue(name, payload, options);
+          },
+        });
+      },
+    };
+    const hold = (messageId) => {
+      let called;
+      let pass;
+      let fail;
+      const calling = new Promise((resolve) => { called = resolve; });
+      const gate = new Promise((resolve, reject) => { pass = resolve; fail = reject; });
+      void gate.catch(() => {});
+      holds.set(messageId, { called, gate });
+      return { calling, pass: () => pass(), fail: (error) => fail(error) };
+    };
+    return { durability, hold, ops };
+  };
+  const until = async (check, what) => {
+    for (let tries = 0; !check(); tries += 1) {
+      assert.ok(tries < 300, what);
+      await sleep(10);
+    }
+  };
+  const inRequestAt = async (prefix, harnessAgent = createAgent, options = {}) => {
+    const dir = await mkdtemp(join(tmpdir(), prefix));
+    dirs.push(dir);
+    const { durability: base, broker } = await queueWorldAt(dir, { queueLeases: true, runInRequest: true, maxDurationMs: 60_000, reserveMs: 100, ...options });
+    const gated = backstopGate(base);
+    return { ...gated, broker, agent: harnessAgent === createAgent ? createAgent({ durability: gated.durability }) : harnessAgent(gated.durability) };
+  };
+  const internalsOf = (agent) => agent[Symbol.for("libfx.durableInternals")];
+
+  test("a prompt the request runs itself starts its turn while its backstop is sent, and writes and shows nothing until it is", async () => {
+    const { agent, hold, ops, broker } = await inRequestAt("libfx-backstop-overlap-");
+    const session = agent.session();
+    assert.equal((await textOf(session.prompt("warm"))).result.stopReason, "end_turn");
+    await untilIdle(agent);
+    const ui = await (await internalsOf(agent).openLog(session.id)).ui.length();
+    const gate = hold("turn-overlap");
+    ops.length = 0;
+    const turn = session.prompt("overlap", { messageId: "turn-overlap" });
+    let accepted = false;
+    void turn.accepted.then(() => { accepted = true; });
+    await gate.calling;
+    // The model request goes out while the queue still takes the backstop.
+    await until(() => prompted.includes("turn-overlap"), "the turn waited for its backstop to start");
+    await sleep(100);
+    assert.deepEqual(ops, ["input"], "nothing but the input is written before the backstop is sent");
+    assert.equal(await (await internalsOf(agent).openLog(session.id)).ui.length(), ui, "nothing is shown before the backstop is sent");
+    assert.ok(!ran.some((step) => step.startsWith("turn-overlap:")), "no step ran before the backstop was sent");
+    assert.equal(accepted, false, "the prompt is accepted only once its backstop is sent");
+    gate.pass();
+    const { text, result } = await textOf(turn);
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(text, "overlap-0 overlap-1 overlap-2");
+    assert.ok(accepted);
+    const [backstop] = broker.sent.filter((message) => message.payload?.input?.messageId === "turn-overlap");
+    await untilIdle(agent);
+    // The lease names the real backstop, as when it waited for it.
+    const leases = (await (await internalsOf(agent).openLog(session.id)).read()).map(({ entry }) => entry).filter((entry) => entry.k === "lease");
+    assert.deepEqual(leases.at(-1).delivery, { messageId: backstop.id, attempt: 0 });
+    await agent.close();
+  });
+
+  test("a backstop that fails after the turn started fails the prompt with nothing written, shown or queued, and its retry runs the turn once", async () => {
+    // Also where the World knows whether a holder lives, so a failed claim
+    // would otherwise come back as a fresh message.
+    for (const options of [{}, { livenessKnown: true, alive: () => false }]) {
+    const { agent, hold, ops, broker } = await inRequestAt("libfx-backstop-fails-", createAgent, options);
+    const id = options.livenessKnown ? "turn-unsent-known" : "turn-unsent";
+    const session = agent.session();
+    assert.equal((await textOf(session.prompt("warm"))).result.stopReason, "end_turn");
+    await untilIdle(agent);
+    const ui = await (await internalsOf(agent).openLog(session.id)).ui.length();
+    const gate = hold(id);
+    ops.length = 0;
+    const turn = session.prompt("unsent", { messageId: id });
+    await gate.calling;
+    await until(() => prompted.includes(id), "the turn waited for its backstop to start");
+    gate.fail(Object.assign(new Error("the queue is down"), { code: "QUEUE_DOWN" }));
+    await assert.rejects(turn.accepted, (error) => error.code === "QUEUE_DOWN");
+    await assert.rejects(turn.result, (error) => error.code === "QUEUE_DOWN");
+    await untilIdle(agent);
+    await sleep(100);
+    assert.deepEqual(ops, ["input"], "the stopped turn wrote no lease, record or end");
+    assert.equal(await (await internalsOf(agent).openLog(session.id)).ui.length(), ui, "the stopped turn showed nothing");
+    assert.ok(!ran.some((step) => step.startsWith(`${id}:`)), "no step ran");
+    assert.deepEqual(broker.sent.filter((message) => message.payload?.input?.messageId === id), [], "nothing was queued for it, not even again");
+    // The caller retries, and the turn runs once.
+    const { text, result } = await textOf(session.prompt("unsent", { messageId: id }));
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(text, "unsent-0 unsent-1 unsent-2");
+    await untilIdle(agent);
+    assert.deepEqual(ran.filter((step) => step.startsWith(`${id}:`)), [0, 1, 2].map((n) => `${id}:${n}`), "each step ran once");
+    const [backstop] = broker.sent.filter((message) => message.payload?.input?.messageId === id);
+    const leases = (await (await internalsOf(agent).openLog(session.id)).read()).map(({ entry }) => entry).filter((entry) => entry.k === "lease");
+    assert.deepEqual(leases.at(-1).delivery, { messageId: backstop.id, attempt: 0 });
+    // The backstop, delivered at last, runs nothing.
+    const before = ran.length;
+    broker.lapse(backstop);
+    await until(() => !broker.held(() => true).some((message) => message.id === backstop.id), "the backstop was never acknowledged");
+    assert.equal(ran.length, before);
+    await agent.close();
+    }
+  });
+
+  test("a prompt whose signal aborts while its backstop is sent ends cancelled", async () => {
+    const { agent, hold } = await inRequestAt("libfx-backstop-abort-");
+    const session = agent.session();
+    const gate = hold("turn-abort");
+    const step = holdStep("aborted-0");
+    const controller = new AbortController();
+    const turn = session.prompt("aborted", { messageId: "turn-abort", signal: controller.signal });
+    await gate.calling;
+    await until(() => prompted.includes("turn-abort"), "the turn waited for its backstop to start");
+    controller.abort();
+    gate.pass();
+    const result = await turn.result;
+    step.release();
+    assert.equal(result.stopReason, "cancelled");
+    assert.ok(!ran.includes("turn-abort:0"), "the held step never finished");
+    await untilIdle(agent);
+    await agent.close();
+  });
+
+  test("an image prompt the request runs itself reads its image while its backstop is sent", async () => {
+    let gated;
+    const { agent, hold } = await inRequestAt("libfx-backstop-image-", (durability) => {
+      gated = recordingAgent(durability);
+      return gated.agent;
+    });
+    const session = agent.session();
+    const gate = hold("turn-image-overlap");
+    const turn = session.prompt([{ type: "text", text: "look" }, image], { messageId: "turn-image-overlap" });
+    await gate.calling;
+    await until(() => gated.seen.length === 1, "the image turn waited for its backstop to start");
+    assert.deepEqual(gated.seen, [[{ type: "text", text: "look" }, image]], "with its image, read from the store");
+    gate.pass();
+    assert.equal((await turn.result).stopReason, "end_turn");
+    assert.equal(gated.seen.length, 1, "read once");
+    await untilIdle(agent);
+    await agent.close();
+  });
+
+  test("a prompt that finds its session running queues nothing for itself before its backstop is sent, and nothing once that failed", async () => {
+    const { agent, hold, broker } = await inRequestAt("libfx-backstop-busy-");
+    const session = agent.session();
+    const step = holdStep("busy-0");
+    const first = session.prompt("busy", { messageId: "turn-busy" });
+    await step.holding;
+    const gate = hold("turn-queued");
+    const second = session.prompt("queued", { messageId: "turn-queued" });
+    await gate.calling;
+    await sleep(100);
+    assert.deepEqual(broker.sent.filter((message) => message.payload?.input?.messageId === "turn-queued"), [], "nothing was queued before the backstop");
+    gate.fail(Object.assign(new Error("the queue is down"), { code: "QUEUE_DOWN" }));
+    await assert.rejects(second.accepted, (error) => error.code === "QUEUE_DOWN");
+    await sleep(100);
+    assert.deepEqual(broker.sent.filter((message) => message.payload?.input?.messageId === "turn-queued"), [], "nothing was queued after it failed");
+    step.release();
+    assert.equal((await first.result).stopReason, "end_turn");
+    await untilIdle(agent);
+    await agent.close();
+  });
+
+  test("a steer sent while a prompt's backstop is in flight joins the turn it started", async () => {
+    const steered = [];
+    const { agent, hold } = await inRequestAt("libfx-backstop-steer-", (durability) => createDurableAgentFactory({
+      harness: () => {
+        const base = scriptedHarness()();
+        return {
+          open: async (options) => {
+            const session = await base.open(options);
+            return {
+              ...session,
+              prompt: (input, opts) => ({ ...session.prompt(input, opts), steer: async (text, id) => { steered.push([opts.turnId, text, id]); } }),
+              get openTurn() { return session.openTurn; },
+            };
+          },
+        };
+      },
+      defaultDurability: async () => memory(),
+    })({ durability }));
+    const session = agent.session();
+    const gate = hold("turn-steered");
+    const step = holdStep("steered-0");
+    const turn = session.prompt("steered", { messageId: "turn-steered" });
+    await gate.calling;
+    await until(() => prompted.includes("turn-steered"), "the turn waited for its backstop to start");
+    const steering = session.steer("more", { messageId: "steer-in-flight" });
+    gate.pass();
+    await steering;
+    await until(() => steered.length > 0, "the steer never reached the turn");
+    assert.deepEqual(steered, [["turn-steered", "more", "steer-in-flight"]]);
+    step.release();
+    assert.equal((await turn.result).stopReason, "end_turn");
+    await untilIdle(agent);
     await agent.close();
   });
 
