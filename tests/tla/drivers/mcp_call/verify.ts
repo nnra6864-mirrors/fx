@@ -15,7 +15,7 @@
 //      and rejects designs that drop one.
 //
 // The shell around the core has not landed, so nothing here runs the fx
-// binary yet; design/TODO.md tracks the binary stage.
+// binary yet; design/FINISH.md tracks the binary stage.
 //
 // Settings: FX_MCP_CALL_SEED (default 20261029), FX_MCP_CALL_TRACES (random
 // traces, default 300), FX_TLA_OUT (where the report goes).

@@ -10,7 +10,7 @@
 //   mutation:ID     a planted bug in mutations.json
 //   zig:path#name   a `test "name"` block in that Zig file
 //   driver:name     a driver stage: spec-to-code or code-to-spec
-//   todo:ID         an open item in design/TODO.md that will enforce it
+//   finish:ID       an open item in design/FINISH.md that will enforce it
 //   review:text     how a check that cannot be automated is enforced instead
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -39,7 +39,7 @@ export function checkTraceability(designPath = join(MODEL_DIR, "design", "DESIGN
   const design = readFileSync(designPath, "utf8");
   const spec = readFileSync(join(SPEC_DIR, "McpCall.tla"), "utf8");
   const traceSpec = readFileSync(join(SPEC_DIR, "TraceMcpCall.tla"), "utf8");
-  const todo = readFileSync(join(MODEL_DIR, "design", "TODO.md"), "utf8");
+  const finish = readFileSync(join(MODEL_DIR, "design", "FINISH.md"), "utf8");
   const model = configNames();
   const trace = configNames(readFileSync(join(SPEC_DIR, "TraceMcpCall.cfg"), "utf8"));
   const mutationIds = new Set([...mutations.spec, ...mutations.code].map((m) => m.id));
@@ -80,8 +80,8 @@ export function checkTraceability(designPath = join(MODEL_DIR, "design", "DESIGN
       case "driver":
         if (!["spec-to-code", "code-to-spec"].includes(value)) problems.push(`${owner}: ${token} is not a driver stage`);
         break;
-      case "todo":
-        if (!new RegExp(`^- \\[ \\] \\*\\*${value}\\*\\*`, "m").test(todo)) problems.push(`${owner}: ${token} is not an open item in TODO.md`);
+      case "finish":
+        if (!new RegExp(`^- \\[ \\] \\*\\*${value}\\*\\*`, "m").test(finish)) problems.push(`${owner}: ${token} is not an open item in FINISH.md`);
         break;
       case "review":
         if (value.length < 20) problems.push(`${owner}: ${token} must say how it is enforced`);

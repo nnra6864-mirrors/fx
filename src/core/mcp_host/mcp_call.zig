@@ -30,8 +30,8 @@ pub const max_slots = 16;
 /// fewer.
 pub const default_capacity: u8 = 8;
 
-/// The session's own owner and every subagent it can run at once
-/// (`max_children` in src/core/subagent/child_state.zig).
+/// The bridge's own registration and the shell calls it serves at once. The
+/// bridge refuses a shell call past it (`mcp_call_bridge.zig` `register`).
 pub const max_owners = 1 + 256;
 
 /// A bearer secret the shell makes for one owner: 32 random bytes.
@@ -222,9 +222,9 @@ fn onOwnerAdded(state: State, owner: OwnerId, token: Token) Output {
             return quiet(next);
         }
     }
-    // The shell runs at most `max_children` subagents, so a full table is a
-    // programmer error, not a runtime condition.
-    @panic("mcp_call: owner table full");
+    // The bridge refuses a shell call before the table fills. If it ever is
+    // full, the owner is not added, so its requests are refused.
+    return quiet(state);
 }
 
 fn onOwnerRemoved(state: State, owner: OwnerId) Output {
@@ -475,6 +475,22 @@ test "a request is admitted only with a token in force and the supported version
     // A new session's token replaces the old one.
     const restarted = run(admitted.state, &.{ .stopped, .{ .started = child_token } });
     try testing.expectEqual(Effect{ .refuse = .unauthorized }, single(step(restarted, .{ .request = .{ .token = main_token, .version = 1 } })));
+}
+
+test "a full owner table leaves a new owner out, and its requests are refused" {
+    var state = run(State.init(2), &.{.{ .started = main_token }});
+    var n: u32 = 1;
+    while (n < max_owners) : (n += 1) {
+        var token: Token = @splat(0);
+        std.mem.writeInt(u32, token[0..4], n, .little);
+        token[31] = 0xee;
+        state = step(state, .{ .owner_added = .{ .owner = @fromBackingInt(n), .token = token } }).state;
+    }
+    const late_token: Token = @splat(0xab);
+    const full = step(state, .{ .owner_added = .{ .owner = @fromBackingInt(max_owners), .token = late_token } });
+    try testing.expectEqual(@as(usize, 0), full.effects().len);
+    try testing.expectEqualDeep(state, full.state);
+    try testing.expectEqual(Effect{ .refuse = .unauthorized }, single(step(full.state, .{ .request = .{ .token = late_token, .version = 1 } })));
 }
 
 test "a call starts only after the permission check allows it, once per request" {

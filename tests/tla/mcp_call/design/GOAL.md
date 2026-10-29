@@ -10,7 +10,7 @@ The request, from a user of fx: let a tool call's output go to a file instead of
 
 The bridge that lets a command run by the agent's shell tool, inside a running fx session, call that session's MCP tools: `fx mcp call <tool> '<json>'`. The result goes to the command's standard output, so the command decides whether it goes to a file, a pipe, or the screen. Only what the agent prints reaches its context.
 
-This workspace designs and verifies the bridge's pure core, `src/core/mcp_host/mcp_call.zig`: which requests are admitted, the order of the permission check and the call, at most one call and one reply per request, what happens when a client, a subagent, or the session goes away, and what is logged when data is dropped. The shell around it (socket, client, permission and catalog adapters, environment, UI) is specified here and tracked in `TODO.md`.
+This workspace designs and verifies the bridge's pure core, `src/core/mcp_host/mcp_call.zig`: which requests are admitted, the order of the permission check and the call, at most one call and one reply per request, what happens when a client, a subagent, or the session goes away, and what is logged when data is dropped. The shell around it (socket, client, permission and catalog adapters, environment, UI) is specified here and tracked in `FINISH.md`.
 
 ## Decisions
 
@@ -47,10 +47,10 @@ This workspace designs and verifies the bridge's pure core, `src/core/mcp_host/m
 
 ## What 100% done means
 
-Each item is a check that passes. `TODO.md` lists each one.
+Each item is a check that passes. `FINISH.md` lists each one.
 
 1. `bun run verify` in `tests/tla/mcp_call/` exits 0: model check, core tests, harness, spec to code, code to spec, spec mutations, code mutations, and traceability all pass.
 2. `zig build test` passes with the `fx mcp call` tests included (`src/main.zig` lists them in its test block).
-3. The shell items in `TODO.md` (B1 to B8) and the client items (C1, C2) each have their named test passing.
+3. The shell items in `FINISH.md` (B1 to B8) and the client items (C1, C2) each have their named test passing.
 4. A binary stage in `verify` drives the built `zig-out/bin/fx` with a fake MCP server and checks each recorded bridge run against `McpCall.tla` (D1).
 5. CI passes for the exact commit, including `macOS arm64`, and the startup latency budget holds.

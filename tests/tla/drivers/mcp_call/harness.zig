@@ -60,7 +60,8 @@ fn token(name: []const u8) error{InvalidToken}!mcp_call.Token {
 
 fn tokenName(value: mcp_call.Token) []const u8 {
     for (token_names) |name| {
-        if (std.mem.eql(u8, &(token(name) catch unreachable), &value)) return name;
+        const known = token(name) catch continue;
+        if (std.mem.eql(u8, &known, &value)) return name;
     }
     return "unknown";
 }

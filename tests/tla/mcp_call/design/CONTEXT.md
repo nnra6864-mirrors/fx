@@ -29,7 +29,7 @@ This describes the code on `6bb36a928` (`origin/main` when this workspace was ma
 | MCP connections, logins, catalog | The MCP host runtime's owner thread (`runtime.zig:708-735`) | Shared by every caller through `Catalog` |
 | A subagent's MCP access | `Access.scoped` (`tool_mcp_runtime.zig:44-61`), checked by `Catalog.allowsLocked` (`model.zig:562-573`) | Modeled in `tests/tla/mcp_host/SubagentAccess.tla` |
 | Permission rules and grants | `tool_admission` with the session's permission state (`tool_admission.zig:1278-1292`) | The bridge must ask here, not copy rules |
-| Subagent lifecycle | `src/core/subagent/child_state.zig`, at most `max_children = 256` (`:17`) | Sizes the bridge's owner table (`mcp_call.zig` `max_owners`, this change) |
+| Subagent lifecycle | `src/core/subagent/child_state.zig`, at most `max_children = 256` (`:17`) | A subagent's shell call is its own owner, with that subagent's access (this change) |
 | The bridge's admission state | `mcp_call.State` (this change) | One writer: the bridge's shell thread |
 | Request arguments and results | The bridge shell, by request id | Never in the core, never in session JSON |
 
