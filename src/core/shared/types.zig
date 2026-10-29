@@ -429,6 +429,7 @@ pub fn plainErrorText(raw: []const u8, buf: []u8) []const u8 {
         .{ "ReadOnlyFileSystem", "the disk is read-only" },
         .{ "NoSpaceLeft", "the disk is full" },
         .{ "FileTooBig", "a file-size limit was reached" },
+        .{ "InputOutput", "a disk read or write failed" },
     };
     inline for (pairs) |pair| {
         if (std.mem.eql(u8, raw, pair[0])) return pair[1];

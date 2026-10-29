@@ -2819,9 +2819,10 @@ pub fn Runtime(comptime App: type) type {
                 .finished_prompt => {
                     recordShutdownFailure(app, failure);
                     if (comptime @hasDecl(App, "writeDomainNotice")) {
+                        var plain_buf: [96]u8 = undefined;
                         const body = try app.alloc.print(
-                            "Turn completed, but fx could not save it ({s}). The session keeps running; this turn may be missing after a resume.",
-                            .{@errorName(failure)},
+                            "Couldn't save this turn: {s}. It may be missing when you reopen this session.",
+                            .{types.plainErrorText(@errorName(failure), &plain_buf)},
                         );
                         defer app.alloc.free(body);
                         app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = body }, true) catch {};
@@ -9586,7 +9587,7 @@ test "appendFinishedPrompt keeps the session alive when the turn cannot be saved
     );
     // The user sees a warning instead of a disappearing process.
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
-    try std.testing.expect(std.mem.find(u8, app.notices.items[0], "could not save") != null);
+    try std.testing.expect(std.mem.find(u8, app.notices.items[0], "Couldn't save this turn") != null);
 
     // A later clean turn still persists; the writer is not latched shut.
     const clean = try session_runtime.makeAssistantTurn(alloc, "next", "fine");
