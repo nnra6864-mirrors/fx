@@ -1167,7 +1167,7 @@ describe("gateway stream lifecycle", () => {
       expectOnlyLeadingSystemMessages(gateway.requests[0]!.body);
       expect(contentText(request.prompt[1]?.content)).toBe(WEB_SEARCH_GUIDANCE);
       expect(toolByName(oracleRequest, "shell")?.description).toBe(
-        `Run a shell command. Each call starts a new shell with the user's startup files, so cd and export do not carry over. If the command is still running after yield_time_ms, you get a session_id: call again with action=interact to wait for more output, or action=stop to end it. Never rerun it. Owned sessions end when fx exits; & and nohup jobs end with their command. To keep a service running, use \`${DETACH_COMMAND}\` and check it is ready in that call. In zsh, quote globs meant for another program.`,
+        `Run a shell command. Each call starts a new shell with the user's startup files, so cd and export do not carry over. If the command is still running after yield_time_ms, you get a session_id: call again with action=interact to wait for more output, or action=stop to end it. Never rerun it. Owned sessions end when fx exits; & and nohup jobs end with their command. To keep a service running, use \`${DETACH_COMMAND}\` and check it is ready in that call. In zsh, quote globs meant for another program. To list, find, or read files, use glob_files, grep_files, and read_file, not ls, find, grep, or cat.`,
       );
       expect(toolByName(oracleRequest, "skill")?.description).toContain(
         "relative to the skill, not the workspace",
