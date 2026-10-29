@@ -2155,6 +2155,68 @@ tmuxTest(
   60_000,
 );
 
+// The same recovery on the two subscriptions: their sign-in is a browser
+// flow, which the test completes the way the browser would.
+for (const provider of ["codex", "grok"] as const) {
+  const label = provider === "codex" ? "Codex" : "Grok";
+  tmuxTest(
+    `an expired ${label} sign-in during a request opens its sign-in and finishes the request`,
+    async () => {
+      home = mkdtempSync(join(tmpdir(), `fx-tui-recovery-${provider}-sign-in-`));
+      stderrPath = join(home, "stderr.log");
+      writeFileSync(stderrPath, "");
+      gateway = startFakeGateway([]);
+      // The first request is refused and so is the refresh, so only a new
+      // sign-in can help.
+      chatgptOauth = startFakeChatGptOAuth({ unauthorizedResponses: provider === "codex" ? 1 : 0, rejectRefresh: true });
+      const grok = startFakeGrokOAuth({ unauthorizedResponses: provider === "grok" ? 1 : 0, rejectRefresh: true });
+      try {
+        // A token the fake did not issue, for the same account.
+        const stale = provider === "codex"
+          ? chatgptAccessToken().replace("signature", "stale-signature")
+          : "grok-stale-access-token";
+        if (provider === "codex") writeSeededChatGptLogin(home, stale);
+        else writeSeededGrokLogin(home, stale);
+        writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+          provider, models: { codex: "gpt-5.6-sol", grok: "grok-4.6" },
+        }), { mode: 0o600 });
+
+        session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+          ...chatgptOauth.env, ...grok.env, FX_MODEL: undefined,
+        });
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText(`Answer after I sign in to ${label} again.`);
+        // fx opens the subscription's own sign-in while the request waits.
+        const waiting = await session.waitForPane(
+          (pane) => pane.includes(`Authorize with ${label}`),
+          TIMEOUT,
+        );
+        expect(waiting).toContain("Sign-in expired · opening /login");
+        await completeDisplayedSubscriptionLogin(
+          session,
+          `Authorize with ${label}`,
+          provider === "codex" ? `${chatgptOauth.baseUrl}/oauth/authorize?` : `${grok.baseUrl}/oauth2/authorize?`,
+        );
+        await session.waitForText(provider === "codex" ? "CHATGPT_DIRECT_RESPONSE" : "GROK_DIRECT_RESPONSE", TIMEOUT);
+
+        const sent = provider === "codex"
+          ? chatgptOauth.requests.filter((request) => request.path === "/chatgpt/responses")
+          : grok.requests.filter((request) => request.path === "/v1/responses");
+        expect(sent).toHaveLength(2);
+        expect(sent[0]!.authorization).toBe(`Bearer ${stale}`);
+        expect(sent[1]!.authorization).toBe(`Bearer ${provider === "codex" ? chatgptOauth.accessToken : grok.initialAccessToken}`);
+        expect(sent[1]!.body).toContain(`Answer after I sign in to ${label} again.`);
+        // Nothing went to the Gateway.
+        expect(gateway.requests).toHaveLength(0);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        grok.stop();
+      }
+    },
+    60_000,
+  );
+}
+
 tmuxTest(
   "one Esc during the sign-in fx opened closes it and ends the request",
   async () => {
