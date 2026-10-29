@@ -2231,6 +2231,10 @@ pub const InterruptedHistoryTurn = struct {
     cancelled_command: ?CancelledCommandPresentation = null,
     terminal_reason: InterruptedTerminalReason = .cancelled,
     cancellation_origin: CancellationOrigin = .turn,
+    /// fx stopped before the turn ended, by a crash or a closed window,
+    /// rather than the turn failing or being cancelled. Only a session's
+    /// replay sets it, and nothing saves it.
+    stopped_by_exit: bool = false,
 };
 
 pub const CompactedSummaryHistoryTurn = struct {

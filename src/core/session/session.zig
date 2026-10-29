@@ -36,7 +36,16 @@ pub const failed_turn_notice: core_types.SemanticNotice = .{
     .body = "failed",
 };
 
+/// A turn fx itself stopped, by crashing or closing, which the next launch
+/// sends again.
+pub const stopped_turn_notice: core_types.SemanticNotice = .{
+    .topic = "system",
+    .tone = .warning,
+    .body = "fx stopped before this turn finished",
+};
+
 pub fn interruptedTurnNotice(entry: InterruptedHistoryTurn) core_types.SemanticNotice {
+    if (entry.stopped_by_exit) return stopped_turn_notice;
     return switch (entry.terminal_reason) {
         .cancelled => interrupted_turn_notice,
         .failed => failed_turn_notice,
@@ -577,6 +586,17 @@ fn make_owned_legacy_image_turn(
         .media_type = @constCast("image/png"),
     }});
     return turn;
+}
+
+test "a turn fx stopped by crashing or closing reads as stopped, not failed or cancelled" {
+    const stopped: InterruptedHistoryTurn = .{ .user = .{ .text = @constCast("go") }, .terminal_reason = .failed, .stopped_by_exit = true };
+    try std.testing.expectEqualStrings("fx stopped before this turn finished", interruptedTurnNotice(stopped).body);
+    try std.testing.expectEqual(core_types.NoticeTone.warning, interruptedTurnNotice(stopped).tone);
+    // Esc and a turn that failed keep their own notices.
+    const cancelled: InterruptedHistoryTurn = .{ .user = .{ .text = @constCast("go") }, .terminal_reason = .cancelled };
+    try std.testing.expectEqualStrings("cancelled", interruptedTurnNotice(cancelled).body);
+    const failed: InterruptedHistoryTurn = .{ .user = .{ .text = @constCast("go") }, .terminal_reason = .failed };
+    try std.testing.expectEqualStrings("failed", interruptedTurnNotice(failed).body);
 }
 
 test "legacy image repair rewrites repeated per-turn ordinals to stable session ids" {
