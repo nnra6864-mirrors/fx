@@ -1745,7 +1745,11 @@ class SessionWorker {
   // extended, when the request that took the prompt runs it (see
   // handoffEntries), with `seen`, what mark() said before that read; the
   // worker starts from them instead of reading again.
-  async consume(message, delivery = null, handoff = null) {
+  // `backstop`, from that request too, is its backstop's send still in
+  // flight, which settles with `delivery`. Until it does, the worker goes on
+  // only to an early start, which writes nothing before it (see claim). A
+  // send that failed ends the delivery; its sender fails the prompt.
+  async consume(message, delivery = null, handoff = null, backstop = null) {
     const log = handoff?.log ?? await this.backend.session(this.sessionId);
     // The claims this worker had started when the read began, or null when
     // one was running then, whose writes it may not show.
@@ -1756,6 +1760,20 @@ class SessionWorker {
       this.agent.emit("session.refused", { sessionId: this.sessionId, messageId: message.messageId, reason: "unknown message" });
       return undefined;
     }
+    // Folded again with the backstop's delivery, which can only end a lease
+    // that stood without it (see redelivers).
+    const queued = async () => {
+      if (!backstop) return true;
+      try {
+        delivery = await backstop;
+      } catch {
+        return false;
+      } finally {
+        backstop = null;
+      }
+      state = this.fold(entries, delivery);
+      return true;
+    };
     await this.backend.refreshDeadline?.();
     // When this delivery's function stops, if it does.
     const deadline = this.backend.deadline() ?? (this.backend.maxDurationMs === null ? null : Date.now() + this.backend.maxDurationMs);
@@ -1764,28 +1782,40 @@ class SessionWorker {
     // to another agent's session does, goes on to it.
     const owner = state.agent ?? agentOf(message);
     if (owner !== this.agent.name) {
+      if (!(await queued())) return undefined;
       await this.backend.queue.send(queuedMessage({ ...message, agent: owner }, this.backend.store), {
         idempotencyKey: `${message.sessionId}:${message.type}:${message.messageId}:to:${owner}`,
       });
       this.agent.emit("session.forwarded", { sessionId: this.sessionId, agent: owner });
       return undefined;
     }
-    for (let claims = 0; claims < 8; claims += 1) {
-      // A turn this worker ran since the read may have run this message,
-      // which the read still shows pending; starting from it would send the
-      // turn's model request twice. A turn still running answers below.
+    // A turn this worker ran since the read may have run this message,
+    // which the read still shows pending; starting from it would send the
+    // turn's model request twice. A turn still running answers below.
+    const caughtUp = async () => {
       while (!this.running && seen !== this.claimsStarted) {
         seen = this.claimsStarted;
         entries = await log.read();
         state = this.fold(entries, delivery);
       }
+    };
+    for (let claims = 0; claims < 8; claims += 1) {
+      await caughtUp();
       // A session with no open turn starts its next prompt at once: the
       // first model request goes out while the lease is written, and
       // nothing else is written until it lands.
-      const early = this.running || state.lease ? null : earlyStart(entries, state, message, (items) => this.fold(items, delivery));
+      const startable = () => (this.running || state.lease ? null : earlyStart(entries, state, message, (items) => this.fold(items, delivery)));
+      let early = startable();
+      if (!early && backstop) {
+        if (!(await queued())) return undefined;
+        // A turn may have run here while the backstop was sent.
+        await caughtUp();
+        early = startable();
+      }
       let outcome;
       if (early) {
-        outcome = await this.claim(log, state, deadline, early, delivery);
+        outcome = await this.claim(log, state, deadline, early, delivery, backstop);
+        if (!(await queued())) return undefined;
       } else {
         if (this.running) return { timeoutSeconds: runningBackstopSeconds };
         if (!state.hasWork) {
@@ -1825,9 +1855,12 @@ class SessionWorker {
   // the chain there, and runs it. With `early`, what `earlyStart` returned,
   // the message's input is written with the lease and the next turn starts
   // before either lands. The lease names `delivery`, so a later delivery of
-  // the same message can tell it lost its holder. Returns what run()
-  // returns, or "refused" when another worker's write came before the claim.
-  async claim(log, state, deadline, early, delivery = null) {
+  // the same message can tell it lost its holder. With `backstop`, the send
+  // that names that delivery, still in flight: every write waits for it, so
+  // the lease names it, and the engine opens meanwhile. Returns what run()
+  // returns, "refused" when another worker's write came before the claim,
+  // or "unqueued" when the backstop failed.
+  async claim(log, state, deadline, early, delivery = null, backstop = null) {
     // Claimed before the first await, so a delivery that arrives meanwhile
     // sees the session running here.
     this.running = true;
@@ -1843,11 +1876,14 @@ class SessionWorker {
       ...(delivery ? { delivery } : {}),
     };
     this.backend.holding(this.holder, true);
+    let unqueued = false;
+    const sent = backstop?.then((queued) => { if (queued) lease.delivery = queued; });
+    void sent?.catch(() => { unqueued = true; });
     try {
       // Both writes go out at once and neither waits for the other; the
       // claim settles once both have, with the lease's cursor if it landed
-      // and the first failure.
-      const writes = [log.append(lease), ...(early?.writes ?? []).map((entry) => log.append(entry))];
+      // and the first failure. A failed backstop fails both unmade.
+      const writes = [lease, ...(early?.writes ?? [])].map((entry) => (sent ? sent.then(() => log.append(entry)) : log.append(entry)));
       const claimed = Promise.allSettled(writes).then(async ([leased, ...rest]) => {
         const head = leased.status === "fulfilled" ? leased.value : null;
         const error = leased.status === "rejected" ? leased.reason : rest.find((item) => item.status === "rejected")?.reason ?? null;
@@ -1866,7 +1902,7 @@ class SessionWorker {
       });
       let outcome;
       try {
-        outcome = await this.run(log, claimed, lease, deadline, early?.state ?? null);
+        outcome = await this.run(log, claimed, lease, deadline, early?.state ?? null, sent?.then(() => true, () => false));
       } catch (error) {
         if ((await claimed).error === null) throw error;
       }
@@ -1876,8 +1912,9 @@ class SessionWorker {
       // wrote nothing and showed nothing. A fenced one leaves the delivery
       // to read the log and try again; after any other failure the same
       // message runs the session again shortly, once a lease that landed is
-      // let go.
+      // let go. One whose backstop failed is its sender's to report.
       if (isFenced(settled.error)) return "refused";
+      if (unqueued) return "unqueued";
       this.agent.emit("session.error", { sessionId: this.sessionId, error: errorSummary(settled.error) });
       if (settled.head !== null) await log.append({ k: "release", a: settled.head, holder: this.holder }).catch(() => {});
       return "failed";
@@ -1899,8 +1936,9 @@ class SessionWorker {
   // over. With `early`, the state the session was read in, the first turn
   // starts before the claim lands: every write waits for it, and once it
   // failed nothing more is written and the turn stops. The caller answers
-  // for a claim that failed.
-  async run(raw, claimed, lease, deadline, early) {
+  // for a claim that failed. `queued`, when given, resolves whether the
+  // backstop the lease names was sent.
+  async run(raw, claimed, lease, deadline, early, queued = null) {
     const agent = this.agent;
     let head = null;
     let failed = null;
@@ -2073,7 +2111,16 @@ class SessionWorker {
         // What the turn it runs first runs with: the open turn's context and
         // settings, or the next prompt's.
         harnessRun = runOf(state.openTurn ?? state.pending[0]);
-        harness = await agent.openHarness(this.sessionId, store, harnessRun, ready);
+        const opening = agent.openHarness(this.sessionId, store, harnessRun, ready);
+        // A failed backstop does not wait out a slow open: its sender fails
+        // the prompt once this worker stops. The late engine closes in the
+        // background, and the agent's close() waits for it.
+        if (queued && !(await Promise.race([queued, opening.then(() => true, () => true)]))) {
+          agent.track(opening.then((late) => late.close()).catch(() => {}));
+          await ready;
+          return broken();
+        }
+        harness = await opening;
       } catch (error) {
         // The image store failed to answer while the engine read the
         // session's images: as when the log can't be read, the delivery
@@ -2168,6 +2215,12 @@ class SessionWorker {
             await ui.settle();
             state = this.fold(await log.read());
             continue;
+          }
+          // A model request is billed, so none goes out for a prompt whose
+          // backstop failed and whose sender reports it failed.
+          if (queued && !(await queued)) {
+            await ready;
+            return broken();
           }
           try {
             turn = harness.prompt(withImages.input ?? "", { turnId: messageId, yieldAt });
@@ -2778,9 +2831,9 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
     // One delivery of `message` to the session's worker here: from the
     // queue, with `delivery` naming the queue's message and attempt, or with
     // `inRequest` from the request that took the prompt.
-    const receive = (created, message, delivery, { inRequest = false, handoff = null } = {}) => {
+    const receive = (created, message, delivery, { inRequest = false, handoff = null, backstop = null } = {}) => {
       const worker = hold(created, message.sessionId);
-      let work = worker.consume(message, delivery, handoff);
+      let work = worker.consume(message, delivery, handoff, backstop);
       if (inRequest) {
         // No queue delivered this message, so none delivers it again: a turn
         // that must go on later continues in a fresh message. One whose
@@ -2874,14 +2927,28 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
               // if the request died, the backstop takes the session over and
               // continues the turn.
               const delaySeconds = Math.ceil(Math.max(0, deadline - Date.now()) / 1000) + inlineBackstopMarginSeconds;
-              const { messageId: backstop } = await created.queue.send(queued, { idempotencyKey, delaySeconds }) ?? {};
-              seeded = true;
-              const delivery = backstop ? { messageId: backstop, attempt: 0 } : null;
-              // receive() reports a failure to the host; the backstop retries it.
+              const backstop = (async () => {
+                const { messageId } = await created.queue.send(queued, { idempotencyKey, delaySeconds }) ?? {};
+                return messageId ? { messageId, attempt: 0 } : null;
+              })();
+              void backstop.catch(() => {});
+              // The worker opens its engine while the backstop is sent; its
+              // lease, its writes and its first model request wait for the
+              // send (see claim). receive() reports a failure to the host; the
+              // backstop retries it.
               const entries = handoffEntries(read, newestSeen, appended);
               const handoff = entries ? { log, entries, seen } : null;
-              const work = receive(created, queued, delivery, { inRequest: true, handoff }).then(() => {}, () => {});
+              const work = receive(created, queued, null, { inRequest: true, handoff, backstop }).then(() => {}, () => {});
               created.waitUntil?.(work);
+              try {
+                await backstop;
+              } catch (error) {
+                // The worker has stopped, having stored nothing, before the
+                // caller hears: a retry finds no worker here, as if none ran.
+                await work;
+                throw error;
+              }
+              seeded = true;
               return;
             }
           }
