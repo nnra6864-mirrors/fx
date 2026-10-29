@@ -810,9 +810,11 @@ pub fn Runtime(comptime App: type) type {
             provider: model_provider.ProviderId,
         ) !void {
             try app.auth.refreshSourceInventory(app.alloc);
+            // Renewing the waiting request's own provider switches nothing,
+            // so the new credential is taken up at once.
             switch (auth_transition.signInCompletion(
                 provider,
-                comptime provider_runtime.supported(App),
+                (comptime provider_runtime.supported(App)) and !renewsWaitingRequest(app, provider),
             )) {
                 .vercel => unreachable,
                 .switch_provider => |target| {
@@ -1030,21 +1032,23 @@ pub fn Runtime(comptime App: type) type {
 
         fn beginChatGptSignIn(app: *App) !void {
             if (comptime provider_runtime.supported(App)) {
-                const decision = decideProviderSwitch(.{
-                    .current = provider_runtime.provider(app),
-                    .target = .codex,
-                    .target_credential_ready = false,
-                    .intent = .post_oauth,
-                    .stream_active = app.stream.active,
-                    .queued_prompts = app.worker.queuedPromptCount(),
-                });
-                if (decision == .busy) {
-                    try app.writeDomainNotice(.{
-                        .topic = "auth",
-                        .tone = .warning,
-                        .body = "Codex sign-in is unavailable until active and queued work finishes.",
-                    }, true);
-                    return;
+                if (!renewsWaitingRequest(app, .codex)) {
+                    const decision = decideProviderSwitch(.{
+                        .current = provider_runtime.provider(app),
+                        .target = .codex,
+                        .target_credential_ready = false,
+                        .intent = .post_oauth,
+                        .stream_active = app.stream.active,
+                        .queued_prompts = app.worker.queuedPromptCount(),
+                    });
+                    if (decision == .busy) {
+                        try app.writeDomainNotice(.{
+                            .topic = "auth",
+                            .tone = .warning,
+                            .body = "Codex sign-in is unavailable until active and queued work finishes.",
+                        }, true);
+                        return;
+                    }
                 }
             }
             try app.flushBeforeBlockingExternalWork();
@@ -1062,21 +1066,23 @@ pub fn Runtime(comptime App: type) type {
 
         fn beginGrokSignIn(app: *App) !void {
             if (comptime provider_runtime.supported(App)) {
-                const decision = decideProviderSwitch(.{
-                    .current = provider_runtime.provider(app),
-                    .target = .grok,
-                    .target_credential_ready = false,
-                    .intent = .post_oauth,
-                    .stream_active = app.stream.active,
-                    .queued_prompts = app.worker.queuedPromptCount(),
-                });
-                if (decision == .busy) {
-                    try app.writeDomainNotice(.{
-                        .topic = "auth",
-                        .tone = .warning,
-                        .body = "Grok sign-in is unavailable until active and queued work finishes.",
-                    }, true);
-                    return;
+                if (!renewsWaitingRequest(app, .grok)) {
+                    const decision = decideProviderSwitch(.{
+                        .current = provider_runtime.provider(app),
+                        .target = .grok,
+                        .target_credential_ready = false,
+                        .intent = .post_oauth,
+                        .stream_active = app.stream.active,
+                        .queued_prompts = app.worker.queuedPromptCount(),
+                    });
+                    if (decision == .busy) {
+                        try app.writeDomainNotice(.{
+                            .topic = "auth",
+                            .tone = .warning,
+                            .body = "Grok sign-in is unavailable until active and queued work finishes.",
+                        }, true);
+                        return;
+                    }
                 }
             }
             try app.flushBeforeBlockingExternalWork();
@@ -1964,6 +1970,15 @@ pub fn Runtime(comptime App: type) type {
         fn requestWaitsForSignIn(app: *App) bool {
             if (comptime !@hasDecl(@TypeOf(app.shell), "worker_status_state")) return false;
             return app.shell.worker_status_state().waitsForSignIn();
+        }
+
+        /// A request waits for `provider`'s sign-in and `provider` is the
+        /// one in use: signing in again renews the credential the request
+        /// sends with and switches nothing, so the active request does not
+        /// block it.
+        fn renewsWaitingRequest(app: *App, provider: model_provider.ProviderId) bool {
+            if (comptime !provider_runtime.supported(App)) return false;
+            return requestWaitsForSignIn(app) and provider_runtime.provider(app).eql(provider);
         }
 
         /// A request waits for the user to sign in again: opens the sign-in
