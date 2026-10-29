@@ -3884,8 +3884,8 @@ describe("MCP stdio servers", () => {
 // tools, so a big result can go to a file and only what the command prints
 // reaches the model (`src/core/mcp_host/mcp_call_bridge.zig`).
 describe("fx mcp call", () => {
-  const bridgeRoot = (label: string, settings: Record<string, unknown> = {}) => {
-    const root = createRoot(label, MODERN_FIXTURE);
+  const bridgeRoot = (label: string, settings: Record<string, unknown> = {}, options: RootOptions = {}) => {
+    const root = createRoot(label, MODERN_FIXTURE, options);
     const profilePath = join(root.home, ".fx", "mcp.json");
     const profile = JSON.parse(readFileSync(profilePath, "utf8"));
     profile.mcp.fixture.environment.FX_MCP_RESULT_PAD_BYTES = String(1536 * 1024);
@@ -3927,6 +3927,55 @@ describe("fx mcp call", () => {
     expect(saved.trimEnd().endsWith("BRIDGE_TAIL:hello")).toBe(true);
     expect(toolCalls(root)).toHaveLength(1);
   }, 60_000);
+
+  test.skipIf(!tmuxAvailable())(
+    "in the TUI, a command's call waits for the user's approval, then saves the result",
+    async () => {
+      // The TUI can show forms, so it declares elicitation to every server.
+      const root = bridgeRoot("bridge-tui-approval", {}, { expectedElicitation: "both" });
+      const stderrPath = join(root.root, "stderr.log");
+      let seen = "";
+      const activeGateway = startFakeGateway([
+        fakeGatewayToolCall("run_call", "shell", { action: "run", command }),
+        (body: string) => {
+          seen = toolResultText(body, "run_call");
+          return fakeGatewayFinalText("BRIDGE_TUI_DONE");
+        },
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 40,
+        stderrPath,
+        env: { ...fixtureEnv(root, activeGateway), FX_PERMISSION_MODE: "ask" },
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Save the list to a file.");
+      // The shell command asks first, as any command does in ask mode.
+      await tui.waitForText("Would you like to run the following command?", 20_000);
+      await tui.sendKeys("1");
+      // Then its `fx mcp call` asks while the command waits, and nothing
+      // reaches the server before the answer.
+      const approval = await tui.waitForText("Allow this MCP tool call?", 20_000);
+      expect(approval).toContain(TOOL_NAME);
+      expect(toolCalls(root)).toHaveLength(0);
+      await tui.sendKeys("1");
+
+      await tui.waitForText("BRIDGE_TUI_DONE", 20_000);
+      expect(seen).toContain("exit=0");
+      expect(seen).toContain("BRIDGE_TAIL:hello");
+      expect(seen.length).toBeLessThan(4096);
+      expect(readFileSync(join(root.workspace, "out.txt"), "utf8").length).toBeGreaterThan(1536 * 1024);
+      expect(toolCalls(root)).toHaveLength(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    60_000,
+  );
 
   test("a call the permission rules deny runs nothing, and the command learns why", async () => {
     const root = bridgeRoot("bridge-denied", { permission: { bash: { "*": "allow" }, [TOOL_NAME]: "deny" } });
