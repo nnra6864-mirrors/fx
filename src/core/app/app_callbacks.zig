@@ -876,10 +876,10 @@ pub fn Bindings(comptime App: type) type {
             return result;
         }
 
-        fn agentAppendStaticContext(ctx: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) !void {
+        fn agentAppendStaticContext(ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime @hasDecl(App, "appendStaticContextMessage")) {
-                try app.appendStaticContextMessage(arena, project_context, messages);
+                try app.appendStaticContextMessage(arena, messages);
             }
         }
 

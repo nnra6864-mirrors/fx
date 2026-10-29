@@ -3,12 +3,27 @@ const types = @import("../shared/types.zig");
 const model_provider = @import("model_provider.zig");
 const image_route = @import("../images/image_route.zig");
 
+/// The provider syntax for the cache markers on messages flagged with
+/// `ChatMessage.cache_breakpoint`.
+pub const CacheMarkers = enum { none, anthropic, openai };
+
 pub const ResolvedProviderOptions = struct {
     reasoning: ?types.ReasoningEffort = null,
     fast: bool = false,
     ultrafast: bool = false,
     parallel_tool_calls: ?bool = null,
     prompt_caching: bool = false,
+    /// Marker syntax for flagged messages; written only with
+    /// `prompt_caching`. `none` writes no markers.
+    cache_markers: CacheMarkers = .none,
+    /// Asks OpenAI GPT-5.6 and later to write no prompt-cache entries
+    /// (explicit cache mode with no breakpoints), for a request whose prefix
+    /// no later request shares. Such a model otherwise writes the whole
+    /// prompt at the cache-write price on every call.
+    skip_cache_writes: bool = false,
+    /// The model takes one system message, at the start of the conversation,
+    /// so the Gateway request joins the leading system messages into one.
+    single_system_message: bool = false,
     /// Borrowed gateway provider slugs in preference order. Empty leaves
     /// provider selection to the gateway. The backing memory must outlive
     /// request-body serialization.
