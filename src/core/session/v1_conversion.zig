@@ -835,6 +835,9 @@ const FrameReader = struct {
                 try reader.builder.appendSteering(value.text);
                 try reader.keep(event, seq);
             },
+            // v1 logs never hold a context note or runtime context; only a v2
+            // session saves them (D93, D94).
+            .context_note, .runtime_context => return error.InvalidConversationFrame,
             // The builder only checks the turn; its copy lives in the arena.
             .turn_completed => |value| {
                 try reader.requireOpen();

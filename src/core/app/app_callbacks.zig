@@ -310,6 +310,7 @@ pub fn Bindings(comptime App: type) type {
                 .append_static_context = agentAppendStaticContext,
                 .validate_tool_call = agentValidateToolCall,
                 .snapshot_mcp_definition = agentSnapshotMcpDefinition,
+                .resolve_unselected_mcp_tool = if (comptime @hasDecl(App, "resolveUnselectedMcpTool")) agentResolveUnselectedMcpTool else null,
                 .prepare_skill_call = if (comptime @hasField(App, "skills") and @hasDecl(App, "toolRegistry")) agentPrepareSkillCall else null,
                 .check_tool_availability = agentCheckToolAvailability,
                 .request_tool_permission = agentRequestToolPermission,
@@ -334,6 +335,10 @@ pub fn Bindings(comptime App: type) type {
                 } else null,
                 .append_turn_piece = if (comptime @hasField(App, "session_persistence"))
                     if (app.session_persistence.v2 != null) agentAppendTurnPiece else null
+                else
+                    null,
+                .record_usage = if (comptime @hasField(App, "session_persistence"))
+                    if (app.session_persistence.v2 != null) agentRecordUsage else null
                 else
                     null,
                 .save_prompt_images = if (comptime @hasField(App, "session_persistence"))
@@ -871,10 +876,10 @@ pub fn Bindings(comptime App: type) type {
             return result;
         }
 
-        fn agentAppendStaticContext(ctx: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) !void {
+        fn agentAppendStaticContext(ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime @hasDecl(App, "appendStaticContextMessage")) {
-                try app.appendStaticContextMessage(arena, project_context, messages);
+                try app.appendStaticContextMessage(arena, messages);
             }
         }
 
@@ -961,6 +966,11 @@ pub fn Bindings(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime @hasDecl(App, "snapshotMcpDefinition")) return app.snapshotMcpDefinition(arena, name, known);
             return .unavailable;
+        }
+
+        fn agentResolveUnselectedMcpTool(ctx: *anyopaque, arena: Allocator, name: []const u8) !?tool_mcp_runtime.SelectedTool {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            return app.resolveUnselectedMcpTool(arena, name);
         }
 
         fn agentValidateToolCall(ctx: *anyopaque, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {
@@ -1191,6 +1201,11 @@ pub fn Bindings(comptime App: type) type {
         fn agentAppendTurnPiece(ctx: *anyopaque, progress: agent_runtime.TurnProgress) anyerror!void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app_session_runtime.Runtime(App).appendTurnPiece(app, progress);
+        }
+
+        fn agentRecordUsage(ctx: *anyopaque, usage: types.Usage) anyerror!void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try app_session_runtime.Runtime(App).recordUsage(app, usage);
         }
 
         fn agentSavePromptImages(ctx: *anyopaque, alloc: std.mem.Allocator, images: []types.ImageAttachment) anyerror!void {

@@ -13,6 +13,7 @@ const types = @import("../core/shared/types.zig");
 const atomic_value = @import("../core/mcp/atomic_value.zig");
 const json_comparison = @import("../core/shared/json_comparison.zig");
 const sse = @import("sse.zig");
+const host_stream_provider = @import("host_stream_provider.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 
 pub fn isRetryableGatewayError(err: anyerror) bool {
@@ -307,6 +308,89 @@ pub fn fetchUsageGet(
     );
 }
 
+/// The same GET as `fetchUsageGet`, through a host transport instead of
+/// fx's own HTTP client: the JS host in WebAssembly, which cannot open
+/// sockets. Pulses `cooperative_pulse` while the host has nothing ready.
+/// Redirects are the host's: `fetch` follows them and drops `authorization`
+/// when one leaves the origin.
+pub fn fetchUsageGetThroughHost(
+    alloc: std.mem.Allocator,
+    transport: host_stream_provider.Transport,
+    bearer: []const u8,
+    gateway_team: ?[]const u8,
+    account: UsageAccount,
+    url: []const u8,
+    cancel_flag: *std.atomic.Value(bool),
+    cooperative_pulse: ?agent_stream_provider.CooperativePulse,
+) !GetResult {
+    const authorization = try alloc.print("Bearer {s}", .{bearer});
+    defer secret.zeroAndFree(alloc, authorization);
+    var headers_buf: [5]std.http.Header = undefined;
+    headers_buf[0] = .{ .name = "authorization", .value = authorization };
+    const extra = usageExtraHeaders(headers_buf[1..5], gateway_team, account);
+    const response = try host_stream_provider.get(
+        alloc,
+        transport,
+        url,
+        headers_buf[0 .. 1 + extra.len],
+        usage_response_max_bytes,
+        cancel_flag,
+        std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+            .clock = .awake,
+            .raw = .fromMilliseconds(usage_request_timeout_ms),
+        }),
+        cooperative_pulse,
+    );
+    return .{ .status = response.status, .body = response.body };
+}
+
+/// The headers a usage GET sends besides `authorization`: the AI Gateway
+/// team, or the provider account. Borrows from the arguments.
+fn usageExtraHeaders(buf: *[4]std.http.Header, gateway_team: ?[]const u8, account: UsageAccount) []const std.http.Header {
+    var count = gatewayModelCatalogExtraHeaders(buf, gateway_team).len;
+    switch (account) {
+        .none => {},
+        .chatgpt => |id| {
+            buf[count] = .{ .name = "chatgpt-account-id", .value = id };
+            buf[count + 1] = .{ .name = "originator", .value = "fx" };
+            count += 2;
+        },
+        // The proxy reads a subscription token only with the Grok CLI's
+        // token-auth marker, the same one fx's Grok requests send.
+        .grok => |id| {
+            buf[count] = .{ .name = "X-XAI-Token-Auth", .value = "xai-grok-cli" };
+            buf[count + 1] = .{ .name = "x-userid", .value = id };
+            buf[count + 2] = .{ .name = "x-grok-client-identifier", .value = "fx" };
+            count += 3;
+        },
+    }
+    return buf[0..count];
+}
+
+test "usage GETs send the team or provider account headers, whichever transport carries them" {
+    var buf: [4]std.http.Header = undefined;
+    try std.testing.expectEqual(@as(usize, 0), usageExtraHeaders(&buf, null, .none).len);
+    try std.testing.expectEqual(@as(usize, 0), usageExtraHeaders(&buf, "", .none).len);
+
+    const team = usageExtraHeaders(&buf, "team_example", .none);
+    try std.testing.expectEqual(@as(usize, 1), team.len);
+    try std.testing.expectEqualStrings(vercel_ai_gateway_team_header, team[0].name);
+    try std.testing.expectEqualStrings("team_example", team[0].value);
+
+    const chatgpt = usageExtraHeaders(&buf, null, .{ .chatgpt = "account-example" });
+    try std.testing.expectEqual(@as(usize, 2), chatgpt.len);
+    try std.testing.expectEqualStrings("chatgpt-account-id", chatgpt[0].name);
+    try std.testing.expectEqualStrings("account-example", chatgpt[0].value);
+    try std.testing.expectEqualStrings("originator", chatgpt[1].name);
+
+    const grok = usageExtraHeaders(&buf, null, .{ .grok = "user-example" });
+    try std.testing.expectEqual(@as(usize, 3), grok.len);
+    try std.testing.expectEqualStrings("X-XAI-Token-Auth", grok[0].name);
+    try std.testing.expectEqualStrings("x-userid", grok[1].name);
+    try std.testing.expectEqualStrings("user-example", grok[1].value);
+    try std.testing.expectEqualStrings("x-grok-client-identifier", grok[2].name);
+}
+
 const UsageGetOperation = struct {
     alloc: std.mem.Allocator,
     bearer: []const u8,
@@ -323,36 +407,14 @@ const UsageGetOperation = struct {
         defer client.deinit();
         const auth_header = try self.alloc.print("Bearer {s}", .{self.bearer});
         defer secret.zeroAndFree(self.alloc, auth_header);
-        var team_header_buf: [1]std.http.Header = undefined;
         var extra_headers_buf: [4]std.http.Header = undefined;
-        var extra_count: usize = 0;
-        for (gatewayModelCatalogExtraHeaders(&team_header_buf, self.gateway_team)) |header| {
-            extra_headers_buf[extra_count] = header;
-            extra_count += 1;
-        }
-        switch (self.account) {
-            .none => {},
-            .chatgpt => |id| {
-                extra_headers_buf[extra_count] = .{ .name = "chatgpt-account-id", .value = id };
-                extra_headers_buf[extra_count + 1] = .{ .name = "originator", .value = "fx" };
-                extra_count += 2;
-            },
-            // The proxy reads a subscription token only with the Grok CLI's
-            // token-auth marker, the same one fx's Grok requests send.
-            .grok => |id| {
-                extra_headers_buf[extra_count] = .{ .name = "X-XAI-Token-Auth", .value = "xai-grok-cli" };
-                extra_headers_buf[extra_count + 1] = .{ .name = "x-userid", .value = id };
-                extra_headers_buf[extra_count + 2] = .{ .name = "x-grok-client-identifier", .value = "fx" };
-                extra_count += 3;
-            },
-        }
         var req = try client.request(.GET, uri, .{
             .headers = .{
                 .accept_encoding = .omit,
                 .user_agent = .{ .override = user_agent },
                 .authorization = .{ .override = auth_header },
             },
-            .extra_headers = extra_headers_buf[0..extra_count],
+            .extra_headers = usageExtraHeaders(&extra_headers_buf, self.gateway_team, self.account),
             .redirect_behavior = .unhandled,
         });
         defer req.deinit();
@@ -3966,6 +4028,8 @@ fn parseSseUsage(root: std.json.Value) types.Usage {
     return .{
         .input_tokens = parseSseTokenTotal(usage_value, "inputTokens"),
         .output_tokens = parseSseTokenTotal(usage_value, "outputTokens"),
+        .cache_read_tokens = parseSseTokenDetail(usage_value, "inputTokens", "cacheRead"),
+        .cache_write_tokens = parseSseTokenDetail(usage_value, "inputTokens", "cacheWrite"),
         .reasoning_tokens = parseSseTokenDetail(usage_value, "outputTokens", "reasoning"),
     };
 }
@@ -4876,12 +4940,12 @@ test "consumeSseStream leaves missing and unknown service tiers unconfirmed" {
     }
 }
 
-test "consumeSseStream surfaces finish reasoning tokens in turn usage" {
+test "consumeSseStream surfaces finish cache and reasoning tokens in turn usage" {
     const Noop = struct {
         fn chunk(_: *anyopaque, _: []const u8) void {}
     };
     const payload =
-        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"usage\":{\"inputTokens\":{\"total\":10},\"outputTokens\":{\"total\":25,\"reasoning\":5}}}\n\n";
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"usage\":{\"inputTokens\":{\"total\":10,\"noCache\":3,\"cacheRead\":6,\"cacheWrite\":1},\"outputTokens\":{\"total\":25,\"reasoning\":5}}}\n\n";
     var reader = std.Io.Reader.fixed(payload);
     var cancel_flag = std.atomic.Value(bool).init(false);
     var completion = try consumeSseStream(
@@ -4896,6 +4960,8 @@ test "consumeSseStream surfaces finish reasoning tokens in turn usage" {
 
     try std.testing.expectEqual(@as(?u64, 10), completion.usage.input_tokens);
     try std.testing.expectEqual(@as(?u64, 25), completion.usage.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 6), completion.usage.cache_read_tokens);
+    try std.testing.expectEqual(@as(?u64, 1), completion.usage.cache_write_tokens);
     try std.testing.expectEqual(@as(?u64, 5), completion.usage.reasoning_tokens);
 
     const malformed =

@@ -27,8 +27,7 @@ ERROR_UNION = (
 )
 
 
-@unittest.skipUnless(AVAILABLE, "pinned LLVM 21 with libLLVM is not installed")
-class IrSizeTests(unittest.TestCase):
+class LlvmCase(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory(prefix="fx-pgso-ir-size-")
         self.root = pathlib.Path(self.temporary_directory.name)
@@ -65,6 +64,9 @@ class IrSizeTests(unittest.TestCase):
             text=True,
         ).stdout
 
+
+@unittest.skipUnless(AVAILABLE, "pinned LLVM 21 with libLLVM is not installed")
+class IrSizeTests(LlvmCase):
     def test_error_union_return_copy_becomes_one_code_store(self) -> None:
         source = self.assemble(
             "error_union",
@@ -118,22 +120,29 @@ class IrSizeTests(unittest.TestCase):
                 self.assertIn("@error_return", self.cleaned_ir(output))
 
     def test_shared_std_helpers_become_noinline(self) -> None:
-        names = (
-            "mem.Allocator.free__func_12",
-            "mem.Allocator.free",
-            "mem.Allocator.remap__func_7",
-            "Io.Writer.writeAll",
-            '"array_list.Aligned(u8,null).deinit"',
-            "mem.Allocator.dupe",
-            '"array_list.Aligned(u16,null).deinit"',
+        cases = (
+            ("mem.Allocator.free__func_12", True),
+            ("mem.Allocator.free", True),
+            ("mem.Allocator.remap__func_7", True),
+            ("Io.Writer.writeAll", True),
+            ("Io.Writer.writeByte", True),
+            ('"array_list.Aligned(u8,null).deinit"', True),
+            ('"array_list.Aligned(u16,null).deinit"', True),
+            ('"array_list.Aligned(u8,null).append"', False),
+            ("mem.eql__func_4", True),
+            ("mem.eqlBytes", False),
+            ("Io.Mutex.lockUncancelable", True),
+            ("Io.Mutex.unlock", True),
+            ("Io.Mutex.tryLock", False),
+            ("mem.Allocator.dupe", False),
         )
-        body = "".join(f"define internal void @{name}(ptr %p) {{\n  ret void\n}}\n" for name in names)
-        calls = "".join(f"  call void @{name}(ptr %p)\n" for name in names)
+        body = "".join(f"define internal void @{name}(ptr %p) {{\n  ret void\n}}\n" for name, _ in cases)
+        calls = "".join(f"  call void @{name}(ptr %p)\n" for name, _ in cases)
         source = self.assemble("helpers", body + f"define void @use(ptr %p) {{\n{calls}  ret void\n}}\n")
         result, output = self.run_pass("outline-helpers", source)
 
         self.assertEqual(0, result.returncode, result.stderr)
-        self.assertIn('"marked_functions": 5', result.stdout)
+        self.assertIn(f'"marked_functions": {sum(marked for _, marked in cases)}', result.stdout)
         # The pipeline validates this output before it records the identity.
         _require_bitcode_header(output)
         ir = subprocess.run(
@@ -142,15 +151,7 @@ class IrSizeTests(unittest.TestCase):
         attributes = {
             line.split("=", 1)[0].strip(): line for line in ir.splitlines() if line.startswith("attributes #")
         }
-        for name, expected in (
-            ("mem.Allocator.free__func_12", True),
-            ("mem.Allocator.free", True),
-            ("mem.Allocator.remap__func_7", True),
-            ("Io.Writer.writeAll", True),
-            ('"array_list.Aligned(u8,null).deinit"', True),
-            ("mem.Allocator.dupe", False),
-            ('"array_list.Aligned(u16,null).deinit"', False),
-        ):
+        for name, expected in cases:
             definition = next(line for line in ir.splitlines() if line.startswith("define") and f"@{name}(" in line)
             group = definition.rsplit("#", 1)[1].split()[0] if "#" in definition else None
             marked = group is not None and "noinline" in attributes.get(f"attributes #{group}", "")
@@ -171,3 +172,95 @@ class IrSizeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# Two regions that differ only in an instruction's constant, 16 or 8898, next
+# to a constant expression that nests the constant 16.
+NESTED_CONSTANT = """@real_io = internal global { ptr, ptr, i8 } zeroinitializer, align 8
+@sink = global i64 0
+""" + "".join(
+    f"""define i64 @{name}(ptr %app) {{
+  %flag = load i8, ptr getelementptr inbounds (i8, ptr @real_io, i64 16), align 8
+  %field = getelementptr inbounds i8, ptr %app, i64 {offset}
+  %v = load i64, ptr %field, align 8
+  %f = zext i8 %flag to i64
+  %s = add i64 %v, %f
+  store i64 %s, ptr @sink, align 8
+  ret i64 %s
+}}
+"""
+    for name, offset in (("first", 16), ("second", 8898))
+)
+
+
+@unittest.skipUnless(AVAILABLE, "pinned LLVM with libLLVM is not installed")
+class OutlinedConstantTests(LlvmCase):
+    def outline(self, source: pathlib.Path) -> pathlib.Path:
+        output = self.root / f"{source.stem}.outlined.bc"
+        subprocess.run(
+            [str(LLVM_BIN / "opt"), "-passes=iroutliner", "-ir-outlining-no-cost", str(source), "-o", str(output)],
+            check=True,
+        )
+        return output
+
+    def check(self, bitcode: pathlib.Path) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(IR_SIZE_SCRIPT), "--libllvm", str(LIBLLVM), "check-outlined", str(bitcode)],
+            capture_output=True,
+            text=True,
+        )
+
+    def text(self, bitcode: pathlib.Path) -> str:
+        return subprocess.run(
+            [str(LLVM_BIN / "llvm-dis"), str(bitcode), "-o", "-"], check=True, capture_output=True, text=True
+        ).stdout
+
+    def test_check_rejects_a_nested_constant_the_outliner_folded_into_a_parameter(self) -> None:
+        outlined = self.outline(self.assemble("nested", NESTED_CONSTANT))
+
+        result = self.check(outlined)
+
+        self.assertEqual(1, result.returncode, result.stdout)
+        self.assertIn("folded a nested constant into a parameter", result.stderr)
+
+    def test_expanded_expressions_keep_each_region_constant(self) -> None:
+        result, expanded = self.run_pass("expand-constant-exprs", self.assemble("nested", NESTED_CONSTANT))
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn('"rewritten_operands": 2', result.stdout)
+        outlined = self.outline(expanded)
+
+        check = self.check(outlined)
+
+        self.assertEqual(0, check.returncode, check.stderr)
+        self.assertIn('"outlined_functions": 1', check.stdout)
+        ir = self.text(outlined)
+        self.assertEqual(2, ir.count("getelementptr inbounds i8, ptr @real_io, i64 16"))
+        self.assertIn("i64 8898", ir)
+        self.assertNotIn("@real_io, i64 %", ir)
+
+    def test_phi_and_intrinsic_expressions_stay_constant_and_call_arguments_expand(self) -> None:
+        source = self.assemble(
+            "kept",
+            "@g = global [4 x i64] zeroinitializer\n"
+            + MEMCPY
+            + "declare void @use(ptr)\n"
+            "define ptr @f(i1 %c, ptr %out) {\n"
+            "entry:\n"
+            "  call void @llvm.memcpy.p0.p0.i64(ptr %out, ptr getelementptr inbounds (i8, ptr @g, i64 8), i64 8, i1 false)\n"
+            "  call void @use(ptr getelementptr inbounds (i8, ptr @g, i64 16))\n"
+            "  br i1 %c, label %a, label %b\n"
+            "a:\n  br label %b\n"
+            "b:\n"
+            "  %p = phi ptr [ getelementptr inbounds (i8, ptr @g, i64 24), %a ], [ %out, %entry ]\n"
+            "  ret ptr %p\n}\n",
+        )
+
+        result, output = self.run_pass("expand-constant-exprs", source)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn('"rewritten_operands": 1', result.stdout)
+        ir = self.cleaned_ir(output)
+        self.assertIn("ptr getelementptr inbounds (i8, ptr @g, i64 8)", ir)
+        self.assertIn("[ getelementptr inbounds (i8, ptr @g, i64 24), %a ]", ir)
+        self.assertIn("%pgso.expr = getelementptr inbounds i8, ptr @g, i64 16", ir)
+        self.assertIn("call void @use(ptr %pgso.expr)", ir)

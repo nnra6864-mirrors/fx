@@ -16,7 +16,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   AMBIGUOUS_CAPABILITY_CLAUSES,
@@ -49,6 +49,11 @@ import {
 const MODEL = "openai/gpt-5.5";
 const DEFAULT_MODEL = "spacexai/grok-4.7";
 const DELAY_MS = 32_500;
+// What the shell description tells the model to run for a service that
+// outlives fx; macOS has no setsid command (src/builtins/tools.zig).
+const DETACH_COMMAND = process.platform === "darwin"
+  ? "perl -MPOSIX -e 'fork&&exit;setsid;exec@ARGV' <cmd> >log 2>&1 &"
+  : "setsid <cmd> >log 2>&1 &";
 const MALFORMED_ARGUMENTS = '{"depth":1,"depth":2}';
 const MALFORMED_CALL_ID = "malformed_ask_1";
 const MALFORMED_TOOL_NAME = "ask_user_question";
@@ -495,7 +500,7 @@ function parseAskJson(stdout: string): {
   error?: string;
   session_id: string;
   tool_calls: Array<{ name: string; status: string }>;
-  usage: { input_tokens: number | null; output_tokens: number | null };
+  usage: { input_tokens: number | null; output_tokens: number | null; cache_read_tokens?: number; cache_write_tokens?: number };
   // The recovery module's shape (decision 38). `recovered` has no message.
   recovery?: {
     state: string;
@@ -588,7 +593,16 @@ function advertisedSkillPath(body: string, location: string): string {
   const prefix = `Root ${match[1]}: `;
   const root = taggedBlock(body, "available_skills").split("\n").find((line) => line.startsWith(prefix));
   if (!root) throw new Error(`Missing root for ${location}`);
-  return join(root.slice(prefix.length), decodeURIComponent(match[2]!));
+  // A root inside the workspace is shown relative to the turn context's workspace_root.
+  const shown = root.slice(prefix.length);
+  const base = isAbsolute(shown) ? shown : join(turnContextWorkspaceRoot(body), shown);
+  return join(base, decodeURIComponent(match[2]!));
+}
+
+function turnContextWorkspaceRoot(body: string): string {
+  const match = /^workspace_root: (.+)$/m.exec(promptText(body));
+  if (!match) throw new Error("Missing workspace_root in the turn context");
+  return match[1]!;
 }
 
 function toolResultOutput(body: string, callId: string): string {
@@ -1149,7 +1163,7 @@ describe("gateway stream lifecycle", () => {
       expectOnlyLeadingSystemMessages(gateway.requests[0]!.body);
       expect(contentText(request.prompt[1]?.content)).toBe(WEB_SEARCH_GUIDANCE);
       expect(toolByName(oracleRequest, "shell")?.description).toBe(
-        "Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id and remain available across turns. Use shell.interact with that exact session_id: omit chars to observe, or provide chars to send exact input and then observe. Use shell.stop only when termination is requested. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output, so do not run a separate command merely to test output safety or shell usability. Never detach with &, nohup, setsid, or double-forking. Each call starts a new shell with the user's startup files applied: their aliases, functions, and PATH are available, but cd, export, and alias changes do not carry over to the next call. In zsh, quote glob patterns meant for another program (for example '--include=*.zig') because unmatched globs are errors.",
+        `Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id and remain available across turns. Use shell.interact with that exact session_id: omit chars to observe, or provide chars to send exact input and then observe. Use shell.stop only when termination is requested. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output, so do not run a separate command merely to test output safety or shell usability. Owned sessions end when fx exits; & and nohup jobs end with their command. To keep a service running, use \`${DETACH_COMMAND}\` and check it is ready in that call. Each call starts a new shell with the user's startup files: aliases, functions, and PATH work, but cd, export, and alias changes do not carry over. In zsh, quote glob patterns meant for another program (for example '--include=*.zig') because unmatched globs are errors.`,
       );
       expect(toolByName(oracleRequest, "skill")?.description).toContain(
         "the task clearly matches one",
@@ -1774,7 +1788,7 @@ describe("gateway stream lifecycle", () => {
       expect(gateway.requestCount()).toBe(1);
       expect(prompt).toContain("LINKED_INSTRUCTION_SENTINEL");
       expect(prompt).toContain(
-        `<project-rules from="${join(root.workspace, "AGENTS.md")}">`,
+        '<project-rules from="AGENTS.md">',
       );
       expect(prompt).toContain("LINKED_SKILL_SENTINEL");
       expect(prompt).toContain(
@@ -2032,7 +2046,8 @@ describe("gateway stream lifecycle", () => {
       expect(promptText(gateway.requests[0]!.body)).toContain(
         'reason="oversized rule file"',
       );
-      expect(promptText(gateway.requests[1]!.body)).toContain(
+      // Rules and omissions a tool call reaches ride on its result (D93).
+      expect(toolResultOutput(gateway.requests[1]!.body, "project_omission_read")).toContain(
         'reason="selection cap"',
       );
     } finally {
@@ -3517,8 +3532,13 @@ describe("gateway stream lifecycle", () => {
         expect(deferredBody).toContain(buildRule);
         expect(deferredBody).not.toContain(siblingRule);
         expect(deferredBody.indexOf(rootRule)).toBeLessThan(deferredBody.indexOf(buildRule));
-        expect(toolResultOutput(deferredBody, firstCallId)).toBe(
-          "Scoped project instructions were added before execution. Review them and reissue this tool call if it is still appropriate.",
+        // The deferred call's result carries the rules it waited for (D93).
+        const deferredResult = toolResultOutput(deferredBody, firstCallId);
+        expect(deferredResult.startsWith(
+          "Scoped project instructions were added before execution. Review them and reissue this tool call if it is still appropriate.\n\n",
+        )).toBe(true);
+        expect(deferredResult).toContain(
+          `<scoped-rules from="build/AGENTS.md" scope="build">\n${buildRule}\n</scoped-rules>`,
         );
         expect(existsSync(targetPath)).toBe(true);
 
@@ -5480,6 +5500,116 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 30_000);
 
+  test("a service started the way the shell description says keeps serving after fx ask exits", async () => {
+    const root = createFixtureRoot("shell-setsid-service");
+    const tracePath = join(root.root, "trace.log");
+    const pidPath = join(root.workspace, "service.pid");
+    const callId = "shell_setsid_service_start";
+    const probe = createServer();
+    await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+    const address = probe.address();
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+    if (address === null || typeof address === "string") throw new Error("no loopback port");
+    const port = address.port;
+    const serverPath = join(root.root, "service.py");
+    const logPath = join(root.root, "service.log");
+    // A bare socket server. http.server looks up the host name between bind
+    // and listen, which can outlast the call's timeout on macOS runners.
+    writeFileSync(
+      serverPath,
+      [
+        "import os, socket, sys",
+        "with open(sys.argv[2], 'w') as f: f.write(str(os.getpid()))",
+        "server = socket.socket()",
+        "server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)",
+        "server.bind(('127.0.0.1', int(sys.argv[1])))",
+        "server.listen()",
+        "while True:",
+        "    conn, _ = server.accept()",
+        "    try:",
+        "        if conn.recv(65536):",
+        "            conn.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\nConnection: close\\r\\n\\r\\nok')",
+        "    except OSError:",
+        "        pass",
+        "    conn.close()",
+        "",
+      ].join("\n"),
+    );
+    let step = 0;
+    let started: ShellResult | null = null;
+    let servicePid: number | null = null;
+    let gatewayObservationError: unknown;
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0: {
+          // Run exactly the command the description gives the model, so the
+          // test fails when that advice does not work on this platform.
+          const description = toolByName(parseGatewayRequest(body), "shell")?.description ?? "";
+          const advice = /To keep a service running, use `([^`]+)`/.exec(description)?.[1];
+          if (!advice?.includes("<cmd>") || !advice.includes(">log")) {
+            gatewayObservationError = new Error(`the shell description gives no detach command: ${advice}`);
+            return fakeGatewayFinalText("No command to run.");
+          }
+          const command = [
+            advice
+              .replace("<cmd>", `python3 ${JSON.stringify(serverPath)} ${port} ${JSON.stringify(pidPath)}`)
+              .replace(">log", `>${JSON.stringify(logPath)}`),
+            `until python3 -c 'import socket; socket.create_connection(("127.0.0.1", ${port}), 1).close()' 2>/dev/null; do sleep 0.1; done`,
+            "printf SERVICE-READY",
+          ].join("\n");
+          return fakeShellRun(callId, command, { profile: "clean", timeout_ms: 15_000 });
+        }
+        case 1:
+          try {
+            started = shellResult(body, callId);
+          } catch (error) {
+            gatewayObservationError = error;
+          }
+          return fakeGatewayFinalText("The service is running.");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Start the service and leave it running."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 25_000,
+        },
+      );
+      if (gatewayObservationError) throw gatewayObservationError;
+      servicePid = Number.parseInt(readFileSync(pidPath, "utf8"), 10);
+      expect(result.code).toBe(0);
+      expect(gateway.requestCount()).toBe(2);
+      expect(started).toMatchObject({
+        state: "completed",
+        exit_code: 0,
+        error: null,
+        output_delta: "SERVICE-READY",
+      });
+      // Connect only after fx has exited, as a later check of the machine would.
+      await Bun.sleep(500);
+      const response = await fetch(`http://127.0.0.1:${port}/`);
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe("ok");
+    } finally {
+      if (existsSync(logPath)) {
+        const serviceLog = readFileSync(logPath, "utf8");
+        if (serviceLog.length > 0) console.error(`service.log:\n${serviceLog}`);
+      }
+      if (servicePid !== null && Number.isSafeInteger(servicePid) && servicePid > 0) {
+        try {
+          process.kill(servicePid, "SIGKILL");
+        } catch {}
+      }
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("saved shell replay handle remains readable after resume without re-execution", async () => {
     const root = createFixtureRoot("saved-terminal-replay");
     const firstTracePath = join(root.root, "first-trace.log");
@@ -5639,6 +5769,136 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 20_000);
+
+  test("a killed ask keeps each reply's token usage in its log, and a resume keeps counting", async () => {
+    const root = createFixtureRoot("usage-survives-sigkill");
+    let requests = 0;
+    const gateway = startGateway(() => {
+      requests += 1;
+      if (requests === 1) {
+        return fakeGatewaySse([
+          { type: "tool-call", toolCallId: "usage_kill_1", toolName: "shell", input: { request: { action: "run", command: "sleep 3", yield_time_ms: 30_000 } } },
+          {
+            type: "finish",
+            finishReason: { unified: "tool-calls", raw: "tool-calls" },
+            usage: { inputTokens: { total: 100, noCache: 20, cacheRead: 80 }, outputTokens: { total: 7, reasoning: 2 } },
+          },
+        ]);
+      }
+      return fakeGatewaySse([
+        { type: "text-delta", id: "answer_1", delta: "Done." },
+        {
+          type: "finish",
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: { inputTokens: { total: 50, cacheRead: 40 }, outputTokens: { total: 3 } },
+        },
+      ]);
+    });
+    const usageValues = (id: string) =>
+      (logLines(root.home, id) as Array<{ kind: string; key?: string; value?: unknown }>).filter((line) => line.kind === "set" && line.key === "usage").map((line) => line.value);
+    // As Harbor runs fx: the agent phase ends with a kill, not a turn end.
+    const proc = Bun.spawn([FX_BIN, "ask", "--yolo", "--json", "--", "Run the usage fixture."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+
+    try {
+      let id: string | undefined;
+      const deadline = Date.now() + 10_000;
+      while (id === undefined && Date.now() < deadline) {
+        try {
+          const ids = savedSessionIds(root.home);
+          if (ids.length === 1 && usageValues(ids[0]!).length > 0) id = ids[0];
+        } catch {
+          // The store or its log does not exist yet.
+        }
+        if (id === undefined) await Bun.sleep(25);
+      }
+      expect(id).toBeDefined();
+      proc.kill("SIGKILL");
+      await proc.exited;
+
+      const killedLog = logLines(root.home, id!);
+      expect(killedLog.some((line) => line.kind === "turn_committed")).toBe(false);
+      expect(usageValues(id!).at(-1)).toEqual({
+        input_tokens: 100,
+        output_tokens: 7,
+        cache_read_tokens: 80,
+        cache_write_tokens: null,
+        reasoning_tokens: 2,
+      });
+
+      const resumed = await runFx(["ask", "--yolo", "--json", "--resume-id", id!, "--", "Finish up."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, join(root.root, "resume-trace.log")),
+        timeoutMs: 15_000,
+      });
+      expect(resumed.code).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(parseAskJson(resumed.stdout).usage).toEqual({ input_tokens: 50, output_tokens: 3, cache_read_tokens: 40 });
+      expect(usageValues(id!).at(-1)).toEqual({
+        input_tokens: 150,
+        output_tokens: 10,
+        cache_read_tokens: 120,
+        cache_write_tokens: null,
+        reasoning_tokens: 2,
+      });
+    } finally {
+      if (proc.exitCode === null) proc.kill("SIGKILL");
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a subagent saves its replies' token usage in its own log, apart from its parent's", async () => {
+    const root = createFixtureRoot("usage-subagent");
+    const finish = (unified: string, input: number, cacheRead: number, output: number) => ({
+      type: "finish",
+      finishReason: { unified, raw: unified },
+      usage: { inputTokens: { total: input, cacheRead }, outputTokens: { total: output } },
+    });
+    const gateway = startDynamicFakeGateway((body) => {
+      if (!body.includes('"name":"subagent"')) {
+        return fakeGatewaySse([{ type: "text-delta", id: "child_answer", delta: "CHILD_DONE" }, finish("stop", 7000, 700, 70)]);
+      }
+      if (hasCurrentToolResult(body, "usage_child")) {
+        return fakeGatewaySse([{ type: "text-delta", id: "parent_answer", delta: "PARENT_DONE" }, finish("stop", 200, 20, 2)]);
+      }
+      return fakeGatewaySse([
+        { type: "tool-call", toolCallId: "usage_child", toolName: "subagent", input: { request: { action: "run", task: "Reply CHILD_DONE." } } },
+        finish("tool-calls", 100, 10, 1),
+      ]);
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const savedUsage = (id: string) =>
+      (logLines(root.home, id) as Array<{ kind: string; key?: string; value?: unknown }>)
+        .filter((line) => line.kind === "set" && line.key === "usage")
+        .map((line) => line.value)
+        .at(-1);
+
+    try {
+      const result = await runFx(["ask", "--yolo", "--json", "--", "Delegate the usage task."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+        timeoutMs: 30_000,
+      });
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).final_output).toBe("PARENT_DONE");
+      const [parent] = rootSessionIds(root.home);
+      const children = savedSessionIds(root.home).filter((id) => id !== parent);
+      expect(children.length).toBe(1);
+      expect(savedUsage(parent!)).toEqual({ input_tokens: 300, output_tokens: 3, cache_read_tokens: 30, cache_write_tokens: null, reasoning_tokens: null });
+      expect(savedUsage(children[0]!)).toEqual({ input_tokens: 7000, output_tokens: 70, cache_read_tokens: 700, cache_write_tokens: null, reasoning_tokens: null });
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
 
   test.skipIf(process.platform !== "linux")(
     "a second headless shell run survives replacing the running fx binary",
@@ -5925,7 +6185,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(latest.code).toBe(0);
       const sessionId = JSON.parse(latest.stdout).id as string;
       // One command replay, kept as a blob of the session.
-      const replays = new Set(savedText(root.home, sessionId).match(/fx-command-replay-[a-f0-9]{64}\.bin/g) ?? []);
+      const replays = new Set(savedText(root.home, sessionId).match(/fx-command-replay-[a-f0-9]{12}-[a-f0-9]{64}\.bin/g) ?? []);
       expect(replays.size).toBe(1);
       const replayHash = /([a-f0-9]{64})\.bin$/.exec([...replays][0]!)![1]!;
       expect(existsSync(join(sessionDir(root.home, sessionId), "blobs", replayHash))).toBe(true);
@@ -8691,7 +8951,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(gateway.requests[3]!.headers.get("ai-language-model-id")).toBe(smallModel);
       expect(gateway.requests[4]!.headers.get("ai-language-model-id")).toBe(MODEL);
       for (const catalog of [parentCatalog, childCatalog]) {
-        expect(catalog).toContain(resumedWorkspace);
+        // A root inside the workspace is shown relative to it.
+        expect(catalog).toContain("Root 0: .agents/skills\n");
         expect(catalog).not.toContain("original-workspace-only");
         for (const name of skillNames) expect(catalog).toContain(`- ${name}:`);
       }
@@ -9054,6 +9315,170 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     },
     55_000,
   );
+
+  // The provider's own default limit ran out before any text: reasoning only.
+  const emptyLengthLimitedReply = () => fakeGatewaySse([
+    { type: "reasoning-start", id: "spent_reasoning" },
+    { type: "reasoning-delta", id: "spent_reasoning", delta: "thinking until the provider stops" },
+    { type: "reasoning-end", id: "spent_reasoning" },
+    {
+      type: "finish",
+      finishReason: { unified: "length", raw: "length" },
+      usage: { inputTokens: { total: 3 }, outputTokens: { total: 4096 } },
+    },
+  ]);
+
+  async function askWithReplies(
+    label: string,
+    replies: Array<() => Response>,
+    model: Record<string, unknown> = {},
+  ) {
+    const root = createFixtureRoot(label);
+    const tracePath = join(root.root, "trace.log");
+    let index = 0;
+    const gateway = startDynamicFakeGateway(
+      () => (replies[index++] ?? (() => new Response("unexpected request", { status: 500 })))(),
+      { models: [{ id: MODEL, type: "language", tags: ["tool-use"], ...model }] },
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Answer briefly."],
+        { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 30_000 },
+      );
+      return {
+        result,
+        json: parseAskJson(result.stdout),
+        bodies: gateway.requests.map((request) => JSON.parse(request.body) as { maxOutputTokens?: number }),
+        trace: readFileSync(tracePath, "utf8"),
+      };
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }
+
+  test("an empty reply cut short by the provider's default limit is asked again with a limit", async () => {
+    // A window this large bounds the retry at fx's full-window limit.
+    const { result, json, bodies, trace } = await askWithReplies("empty-length-retry", [
+      emptyLengthLimitedReply,
+      () => fakeGatewayFinalText("answered after the limit retry"),
+    ], { context_window: 1_000_000 });
+
+    expect(result.code).toBe(0);
+    expect(json.output).toContain("answered after the limit retry");
+    expect(json.final_output).toContain("answered after the limit retry");
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("Done.");
+    expect(json.final_output).not.toContain("ran out of output tokens");
+    // The catalog names no limit, so only the retry sends one.
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]!.maxOutputTokens).toBeUndefined();
+    expect(bodies[1]!.maxOutputTokens).toBe(32_768);
+    expect(`${result.stdout}\n${result.stderr}`).toContain("Retrying with a higher limit.");
+    expect(trace).toContain("event=empty_length_limited_retry");
+  }, 40_000);
+
+  test("an empty reply's retry limit stays inside the model's known context window", async () => {
+    const { result, bodies } = await askWithReplies("empty-length-window", [
+      emptyLengthLimitedReply,
+      () => fakeGatewayFinalText("answered inside the window"),
+    ], { context_window: 65_536 });
+
+    expect(result.code).toBe(0);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]!.maxOutputTokens).toBeUndefined();
+    expect(bodies[1]!.maxOutputTokens).toBe(8_192);
+  }, 40_000);
+
+  test("an empty reply still cut short after the retry says so instead of Done.", async () => {
+    const { result, json, bodies } = await askWithReplies("empty-length-twice", [
+      emptyLengthLimitedReply,
+      emptyLengthLimitedReply,
+      () => fakeGatewayFinalText("a third request must not be sent"),
+    ]);
+
+    expect(result.code).toBe(0);
+    expect(bodies).toHaveLength(2);
+    expect(json.final_output).toBe("The reply ran out of output tokens before any text.");
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("Done.");
+  }, 40_000);
+
+  test("an empty reply cut short at the catalog's own limit is not asked again", async () => {
+    const { result, json, bodies, trace } = await askWithReplies("empty-length-catalog-limit", [
+      emptyLengthLimitedReply,
+      () => fakeGatewayFinalText("a retry must not be sent"),
+    ], { context_window: 200_000, max_tokens: 8_000 });
+
+    expect(result.code).toBe(0);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]!.maxOutputTokens).toBe(8_000);
+    expect(json.final_output).toBe("The reply ran out of output tokens before any text.");
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("Done.");
+    expect(trace).not.toContain("event=empty_length_limited_retry");
+  }, 40_000);
+
+  test("commands with the same output get their own handles, and each reads back after resume", async () => {
+    const root = createFixtureRoot("distinct-replay-handles");
+    const tracePath = join(root.root, "trace.log");
+    const handles: string[] = [];
+    const run = (id: string, command: string) => fakeGatewayToolCall(id, "shell", {
+      request: { action: "run", command, profile: "clean", yield_time_ms: 30000 },
+    });
+    const read = (id: string, handle: string) => fakeGatewayToolCall(id, "read_tool_result", {
+      request: { handle, query: "SAME_OUTPUT" },
+    });
+    let step = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      switch (step++) {
+        case 0:
+          return run("same-a", "printf 'SAME_OUTPUT\\n'");
+        case 1:
+          handles.push(JSON.parse(toolResultOutput(body, "same-a")).full_output_handle);
+          return run("same-b", "echo SAME_OUTPUT");
+        case 2:
+          handles.push(JSON.parse(toolResultOutput(body, "same-b")).full_output_handle);
+          return fakeGatewayFinalText("DISTINCT_HANDLES_RECORDED");
+        case 3:
+          return read("read-a", handles[0]!);
+        case 4:
+          expect(toolResultOutput(body, "read-a")).toContain("SAME_OUTPUT");
+          return read("read-b", handles[1]!);
+        case 5:
+          expect(toolResultOutput(body, "read-b")).toContain("SAME_OUTPUT");
+          return fakeGatewayFinalText("DISTINCT_HANDLES_READ");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    try {
+      const env = fixtureEnv(root, gateway, tracePath);
+      const first = await runFx(
+        ["ask", "--json", "--auto", "Run both commands."],
+        { cwd: root.workspace, env, timeoutMs: 30_000 },
+      );
+      expect(first.code).toBe(0);
+      const firstJson = parseAskJson(first.stdout);
+      expect(firstJson.output).toContain("DISTINCT_HANDLES_RECORDED");
+      expect(handles).toHaveLength(2);
+      const shape = /^fx-command-replay-([0-9a-f]{12})-([0-9a-f]{64})\.bin$/;
+      const [a, b] = handles.map((handle) => shape.exec(handle));
+      expect(a).not.toBeNull();
+      expect(b).not.toBeNull();
+      // One stored copy of the output, named by two runs of their own.
+      expect(a![2]).toBe(b![2]);
+      expect(handles[0]).not.toBe(handles[1]);
+
+      const resumed = await runFx(
+        ["ask", "--json", "--auto", "--resume", firstJson.session_id, "Read both outputs."],
+        { cwd: root.workspace, env, timeoutMs: 30_000 },
+      );
+      expect(resumed.code).toBe(0);
+      expect(parseAskJson(resumed.stdout).output).toContain("DISTINCT_HANDLES_READ");
+      expect(step).toBe(6);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 70_000);
 
   test("provider error finish reconciles without authorizing local tool execution", async () => {
     const root = createFixtureRoot("provider-error");

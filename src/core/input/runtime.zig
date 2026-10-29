@@ -1,6 +1,7 @@
 const std = @import("std");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const settings_catalog = @import("../config/settings_catalog.zig");
+const effort_menu = @import("effort_menu.zig");
 const info_panel = @import("info_panel.zig");
 const usage_menu = @import("../session/usage_menu.zig");
 const workspace_menu = @import("../workspace/workspace_menu.zig");
@@ -40,6 +41,7 @@ pub const Runtime = struct {
     settings_menu: settings_catalog.Menu = .{},
     statusline_menu: settings_catalog.StatuslineMenu = .{},
     info_panel: info_panel.State = .{},
+    effort_menu: effort_menu.State = .{},
     usage_menu: usage_menu.State = .{},
     workspace_menu: workspace_menu.State = .{},
     composer_history: composer_history.State = .{},
@@ -69,6 +71,7 @@ pub const Runtime = struct {
         input_reset.resetPendingTextScalarWithTrace(&self.text_scalar, "shutdown");
         self.paste.deinit(alloc);
         self.info_panel.close();
+        self.effort_menu.close(alloc);
         self.usage_menu.close();
         self.edit_state.deinit(alloc);
         self.picker.deinit(alloc);
