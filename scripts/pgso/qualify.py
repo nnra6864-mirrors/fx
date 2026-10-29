@@ -20,7 +20,6 @@ from scripts.pgso.pipeline import (
     emit_bitcode,
     link_candidate,
     merge_profile_batch,
-    read_macos_minos,
 )
 from scripts.pgso.profile_supplement import (
     MappedProfile,
@@ -584,7 +583,7 @@ def build_external_o2_control(
         require_empty_stderr=True,
     )
     run_checked(
-        (str(toolchain.strip), "-S", "-x", str(binary)),
+        (str(toolchain.tools.strip), "-S", "-x", str(binary)),
         cwd=paths.root,
         env=os.environ.copy(),
         timeout_s=120,
@@ -606,7 +605,7 @@ def build_benchmark_pair(
     spec = ArtifactSpec(repo_root=repo_root, selector=plan.selector)
     bitcode_sha256 = emit_bitcode(toolchain, spec, paths)
     external_control = build_external_o2_control(toolchain, paths)
-    minimum_macos = read_macos_minos(
+    control = toolchain.platform.read_control_identity(
         toolchain,
         external_control,
         paths.logs / "control-load-commands.json",
@@ -617,7 +616,7 @@ def build_benchmark_pair(
         build_instrumented(
             toolchain,
             paths,
-            minimum_macos,
+            control,
             training_argv=first_training,
             training_name="training-1",
         )

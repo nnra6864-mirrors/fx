@@ -1249,6 +1249,9 @@ pub const Session = struct {
     /// A conversion's import: the original time of the batches it writes
     /// next (D59). Null for every other session.
     import_ts: ?u64 = null,
+    /// The session's token totals as its newest `set usage` holds them
+    /// (D92), read from the log on the first reply this process records.
+    usage: ?types.Usage = null,
 
     pub fn create(alloc: Allocator, store: *Store, workspace: []const u8, host: Host, seed: Seed) !*Session {
         // Every v2 write needs a writable open, and both start here or in
@@ -1802,6 +1805,7 @@ pub const Session = struct {
     fn encodeEvent(self: *Session, a: Allocator, event: Event) ![]u8 {
         const user = switch (event) {
             .user => |value| value,
+            .tool_result => |value| return encodePiece(a, .{ .tool_result = try withoutReviewLines(value) }),
             else => return encodePiece(a, event),
         };
         if (user.images.len == 0) return encodePiece(a, event);
@@ -2016,11 +2020,14 @@ pub const Session = struct {
     /// the turn first if none is open. One durable batch, except that a
     /// blob needs a published session with an open turn before it.
     fn writePieces(self: *Session, a: Allocator, events: []const Event, encoded: []const []u8, tail: []const sm.Event) !void {
+        const reviews = try a.alloc(?[]u8, events.len);
+        for (events, reviews) |event, *review| review.* = try encodeFileReview(a, event);
         var batch: std.ArrayList(sm.Event) = .empty;
         if (!self.turn_open) {
             try batch.append(a, .turn_started);
-            const needs_blob = for (encoded) |bytes| {
+            const needs_blob = for (encoded, reviews) |bytes, review| {
                 if (bytes.len > max_inline_piece_bytes) break true;
+                if (review) |data| if (data.len > max_inline_piece_bytes) break true;
             } else false;
             if (needs_blob) {
                 _ = try self.write(batch.items);
@@ -2028,8 +2035,9 @@ pub const Session = struct {
                 batch.clearRetainingCapacity();
             }
         }
-        for (events, encoded) |event, bytes| {
+        for (events, encoded, reviews) |event, bytes, review| {
             try batch.append(a, .{ .item = try self.item(a, std.meta.activeTag(event), bytes) });
+            if (review) |data| try batch.append(a, .{ .item = try self.itemAs(a, file_review_type, data) });
         }
         try batch.appendSlice(a, tail);
         if (batch.items.len == 0) return;
@@ -2336,6 +2344,37 @@ pub const Session = struct {
         };
         if (current) |stored| if (std.mem.eql(u8, stored, value)) return;
         _ = try self.write(&.{.{ .set = .{ .key = key, .value = value } }});
+    }
+
+    /// Adds one model reply's provider usage to the session's totals and
+    /// writes them as `set usage`, so a run that is killed or times out
+    /// keeps the usage of every reply it received (D92). A reply with no
+    /// counts writes nothing.
+    pub fn recordUsage(self: *Session, reply: types.Usage) !void {
+        if (std.meta.eql(reply, types.Usage{})) return;
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        var total = self.usage orelse try self.savedUsage(sa);
+        total.add(reply);
+        const value = try std.json.Stringify.valueAlloc(sa, total, .{});
+        _ = try self.write(&.{.{ .set = .{ .key = .usage, .value = value } }});
+        self.usage = total;
+    }
+
+    /// The totals the log's newest `set usage` holds. A value written
+    /// before D92, or one fx cannot read, counts from zero.
+    fn savedUsage(self: *Session, sa: Allocator) !types.Usage {
+        const raw = (try self.handle.state(sa)).usage orelse return .{};
+        return std.json.parseFromSliceLeaky(types.Usage, sa, raw, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                debug_trace.logf("session", "event=sessions_v2_usage_reset session={s} reason={s} dropped=saved_usage", .{ self.id(), @errorName(err) });
+                return .{};
+            },
+        };
     }
 
     /// A title the user chose. It differs from the derived one, so a
@@ -4361,6 +4400,10 @@ noinline fn replay(
                         running_text = value.assistant.text;
                         continue;
                     }
+                    if (std.mem.eql(u8, piece.type, file_review_type)) {
+                        try attachFileReview(src, pa, &builder, piece);
+                        continue;
+                    }
                     const kind = pieceKind(piece.type) orelse {
                         debug_trace.logf("session", "event=sessions_v2_unknown_item session={s} type={s} dropped=item", .{ src.id, piece.type });
                         continue;
@@ -4388,6 +4431,8 @@ noinline fn replay(
                             try represented.append(ta, try ta.dupe(u8, value.call_id));
                         },
                         .steering => |value| try builder.appendSteering(value.text),
+                        .context_note => |value| try builder.appendContextNote(value.text, value.sources),
+                        .runtime_context => |value| try builder.setRuntimeContext(value.messages),
                         .turn_completed => |value| try sink.turn(try presentStoredResults(src, alloc, try builder.finishAssistant(value)), lastStarted(entry)),
                         .interrupted => |value| {
                             interrupted_item = true;
@@ -4409,6 +4454,10 @@ noinline fn replay(
                         .cancel, .closed => .cancelled,
                         .failed, .crash => .failed,
                     } });
+                    turn.interrupted.stopped_by_exit = switch (ended.reason) {
+                        .crash, .closed => true,
+                        .cancel, .failed => false,
+                    };
                     const answered = answerRunning(alloc, &turn.interrupted, running.items, represented.items, running_text) catch |err| {
                         types.freeHistoryTurn(alloc, turn);
                         return err;
@@ -4707,6 +4756,75 @@ fn parseRecoveryRecord(data: []const u8) ?[32]u8 {
     return record;
 }
 
+/// An edit's full-diff rows, saved right after its `tool_result` item rather
+/// than inside it. Older fx versions reject unknown fields in a piece but
+/// skip unknown item types, so they still read the result and show the
+/// edit's preview; its data is a `FileReview`.
+const file_review_type = "file_review";
+
+const FileReview = struct {
+    call_id: []const u8,
+    lifecycle_id: types.ToolLifecycleId,
+    rows: []const types.CommittedFilePresentationLine,
+};
+
+/// `result` without its edit's rows and their lifecycle id, which
+/// `encodeFileReview` saves beside it, so the piece has the shape older fx
+/// versions read. Checks the whole result first.
+fn withoutReviewLines(result: session_event.ConversationToolResult) !session_event.ConversationToolResult {
+    var presentation = result.committed_file_presentation orelse return result;
+    if (presentation.review_lines == null) return result;
+    try session_event.validateConversationEventShape(.{ .tool_result = result }, session_event.conversation_schema_version);
+    presentation.review_lines = null;
+    presentation.lifecycle_id = null;
+    var stripped = result;
+    stripped.committed_file_presentation = presentation;
+    return stripped;
+}
+
+/// The `file_review` item data for `event`'s edit rows, or null when it has
+/// none. The data is owned by `a`.
+fn encodeFileReview(a: Allocator, event: Event) !?[]u8 {
+    const result = switch (event) {
+        .tool_result => |value| value,
+        else => return null,
+    };
+    const presentation = result.committed_file_presentation orelse return null;
+    const rows = presentation.review_lines orelse return null;
+    const lifecycle_id = presentation.lifecycle_id orelse return error.InvalidConversationFrame;
+    try session_event.validateCommittedFileReview(result.call_id, lifecycle_id, rows);
+    var out: std.Io.Writer.Allocating = .init(a);
+    errdefer out.deinit();
+    try std.json.Stringify.value(FileReview{ .call_id = result.call_id, .lifecycle_id = lifecycle_id, .rows = rows }, .{}, &out.writer);
+    return try out.toOwnedSlice();
+}
+
+/// Gives a replayed edit the rows its `file_review` item holds. A review
+/// that cannot be read, or matches no edit of the turn, is dropped and the
+/// edit keeps its preview.
+fn attachFileReview(src: Source, a: Allocator, builder: *session_log.ConversationTurnBuilder, piece: sm.Body.Piece) !void {
+    const data = src.pieceData(a, piece) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("session", "event=sessions_v2_file_review_unreadable session={s} err={s} dropped=file_review", .{ src.id, @errorName(err) });
+            return;
+        },
+    };
+    const review = std.json.parseFromSliceLeaky(FileReview, a, data, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("session", "event=sessions_v2_file_review_invalid session={s} err={s} dropped=file_review", .{ src.id, @errorName(err) });
+            return;
+        },
+    };
+    session_event.validateCommittedFileReview(review.call_id, review.lifecycle_id, review.rows) catch |err| {
+        debug_trace.logf("session", "event=sessions_v2_file_review_invalid session={s} err={s} dropped=file_review", .{ src.id, @errorName(err) });
+        return;
+    };
+    if (!try builder.attachReviewLines(review.call_id, review.lifecycle_id, review.rows)) {
+        debug_trace.logf("session", "event=sessions_v2_file_review_unmatched session={s} call_id={s} dropped=file_review", .{ src.id, review.call_id });
+    }
+}
 /// What the model reads for a call that was running when its turn ended.
 pub const unfinished_tool_output = "fx stopped while this tool was running, so it may have partly run. Check its effects before running it again.";
 const blob_ref_key = "$blob";
@@ -4769,6 +4887,9 @@ fn itemType(kind: PieceKind) ?[]const u8 {
         .turn_completed => "turn_end",
         .interrupted => "interruption",
         .context_checkpoint => null,
+        // An older fx leaves out an item type it does not know (D17, D93, D94).
+        .context_note => "context_note",
+        .runtime_context => "runtime_context",
     };
 }
 
@@ -4850,6 +4971,32 @@ fn decodePiece(arena: Allocator, kind: PieceKind, data: []const u8, allocate: st
     };
     try session_event.validateConversationEventShape(event, session_event.conversation_schema_version);
     return event;
+}
+
+test "v2 conversation pieces stay bounded under fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzConversationPiece, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "{}",
+            "{\"text\":\"ok\"}",
+            // A context note (D93) and a saved runtime context (D94), as v2 writes them.
+            "{\"text\":\"<scoped-rules from=\\\"sub/AGENTS.md\\\" scope=\\\"sub\\\">\\nR\\n</scoped-rules>\",\"sources\":[{\"path\":\"/w/sub/AGENTS.md\",\"stamp\":7}]}",
+            "{\"text\":\"n\",\"sources\":[{\"path\":\"\",\"stamp\":0}]}",
+            "{\"messages\":[\"<fx-turn-context>\\ngit_branch: main\\n</fx-turn-context>\",\"Runtime context: permission mode is auto.\"]}",
+            "{\"messages\":[]}",
+        }) ++ @import("fuzz_corpus").session_conversation_piece.*),
+    });
+}
+
+/// Reads the bytes as a piece of every kind, as replay does for a v2 item.
+fn fuzzConversationPiece(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [4096]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&buffer));
+    inline for (@typeInfo(PieceKind).@"enum".field_names) |name| {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        _ = decodePiece(arena_state.allocator(), @field(PieceKind, name), buffer[0..len], .alloc_always) catch {};
+    }
 }
 
 /// A user piece as v2 writes it: `session_event.ConversationUser` field for
@@ -5432,6 +5579,17 @@ fn countItems(manager: *sm.Manager, id: []const u8, item_type: []const u8) !usiz
     return n;
 }
 
+/// The inline data of the first item of `item_type`. Caller owns it.
+fn firstItemData(manager: *sm.Manager, id: []const u8, item_type: []const u8) ![]u8 {
+    var page = try manager.read(testing.allocator, id, .start, .forward, 1000);
+    defer page.deinit();
+    for (page.entries) |entry| {
+        const body = entry.body orelse continue;
+        if (body == .item and std.mem.eql(u8, body.item.type, item_type)) return testing.allocator.dupe(u8, body.item.data);
+    }
+    return error.TestUnexpectedResult;
+}
+
 test "streamed pieces are written once, and the commit adds only the rest" {
     var t: TestHome = undefined;
     try t.init();
@@ -5959,6 +6117,85 @@ test "a tool result backed only by its command replay streams as it commits" {
     try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, "tool_result"));
 }
 
+test "an edit's review rows are saved beside its tool result in the shape older fx reads" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("edit it") };
+    var calls = [_]types.ToolCall{.{ .id = "call-1", .name = "edit_file", .arguments_json = "{}" }};
+    const preview = [_]types.CommittedFilePresentationLine{
+        .{ .kind = .deletion, .old_line = 4, .text = "old" },
+        .{ .kind = .addition, .new_line = 4, .text = "new" },
+    };
+    const rows = [_]types.CommittedFilePresentationLine{
+        .{ .kind = .elision, .text = "3 unchanged lines ⋯" },
+        .{ .kind = .deletion, .old_line = 4, .text = "old" },
+        .{ .kind = .addition, .new_line = 4, .text = "new" },
+    };
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call-1"),
+        .tool_name = @constCast("edit_file"),
+        .status = .success,
+        .output = @constCast("edited a.txt"),
+        .output_bytes = 12,
+        .stored_output_bytes = 12,
+        .committed_file_presentation = .{
+            .path = "a.txt",
+            .kind = .edited,
+            .lines = &preview,
+            .additions = 1,
+            .deletions = 1,
+            .truncated = false,
+            .lifecycle_id = .{ .turn_id = 1, .call_id = "call-1" },
+            .review_lines = &rows,
+        },
+    }};
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    const execution: types.ExecutionMemory = .{ .tool_steps = &steps };
+    try s.appendProgress(user, execution, .{});
+    var turn: types.HistoryTurn = .{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = execution } };
+    try s.prepareTurn(&turn);
+    defer testing.allocator.free(results[0].output_handle.?);
+    defer testing.allocator.free(results[0].preview.?);
+    try s.commitTurn(turn, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    // Streamed, then committed: one result and one review, nothing redone.
+    try testing.expectEqual(@as(usize, 0), try countItems(t.store.manager, id, superseded_type));
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, "tool_result"));
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, file_review_type));
+
+    // The result's presentation has only the fields older fx versions know,
+    // and no lifecycle id: the preview-only shape they write themselves.
+    const data = try firstItemData(t.store.manager, id, "tool_result");
+    defer testing.allocator.free(data);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, data, .{});
+    defer parsed.deinit();
+    const presentation = parsed.value.object.get("committed_file_presentation").?.object;
+    const released_fields = [_][]const u8{ "path", "kind", "lines", "additions", "deletions", "truncated", "previous_content", "after_content", "lifecycle_id", "content_handle" };
+    try testing.expectEqual(released_fields.len, presentation.count());
+    for (released_fields) |field| try testing.expect(presentation.contains(field));
+    try testing.expect(presentation.get("lifecycle_id").? == .null);
+
+    // Resume puts the rows and their lifecycle id back on the edit.
+    const history = try detailHistory(.{ .store = &t.store, .id = id }, testing.allocator);
+    defer types.freeHistoryTurnSlice(testing.allocator, history);
+    const restored = history[0].assistant.execution.tool_steps[0].tool_results[0].committed_file_presentation.?;
+    try testing.expectEqual(@as(u64, 1), restored.lifecycle_id.?.turn_id);
+    try testing.expectEqualStrings("call-1", restored.lifecycle_id.?.call_id);
+    const restored_rows = restored.review_lines.?;
+    try testing.expectEqual(rows.len, restored_rows.len);
+    for (rows, restored_rows) |expected, actual| {
+        try testing.expectEqual(expected.kind, actual.kind);
+        try testing.expectEqual(expected.old_line, actual.old_line);
+        try testing.expectEqualStrings(expected.text, actual.text);
+    }
+}
+
 test "a tool result's rebuild time alone does not supersede its stream" {
     const a = "{\"call_id\":\"c\",\"created_at_ms\":100,\"preview\":\"x\"}";
     const b = "{\"call_id\":\"c\",\"created_at_ms\":142,\"preview\":\"x\"}";
@@ -6163,6 +6400,199 @@ test "a compaction inside a turn leaves the steps it covers out of that turn on 
     try testing.expectEqualStrings("three steps", kept.user.text);
     try testing.expectEqual(@as(usize, 0), kept.execution.tool_steps.len);
     try testing.expectEqual(@as(usize, 0), kept.execution.steering.len);
+}
+
+/// Two shell steps whose results name their stored bodies.
+const NoteTestSteps = struct {
+    calls: [3]types.ToolCall = .{
+        .{ .id = "call-1", .name = "shell", .arguments_json = "{}" },
+        .{ .id = "call-2", .name = "shell", .arguments_json = "{}" },
+        .{ .id = "call-3", .name = "shell", .arguments_json = "{}" },
+    },
+    results: [3]types.PersistedToolResult = .{
+        ok("call-1", "result-shell-1.txt"),
+        ok("call-2", "result-shell-2.txt"),
+        ok("call-3", "result-shell-3.txt"),
+    },
+    steps: [3]types.ToolExecutionStep = undefined,
+
+    fn ok(id: []const u8, handle: []const u8) types.PersistedToolResult {
+        return .{ .tool_call_id = @constCast(id), .tool_name = @constCast("shell"), .status = .success, .output = @constCast("ok"), .output_bytes = 2, .output_handle = @constCast(handle), .stored_output_bytes = 2 };
+    }
+
+    fn init(self: *NoteTestSteps) void {
+        for (&self.steps, 0..) |*step, i| step.* = .{ .tool_calls = self.calls[i .. i + 1], .tool_results = self.results[i .. i + 1] };
+    }
+};
+
+test "a turn's context notes come back on resume at their boundaries, before that boundary's steering (D93)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var fixture: NoteTestSteps = .{};
+    fixture.init();
+    var delivered = [_]types.ContextNoteSource{
+        .{ .path = "/w/sub/AGENTS.md", .stamp = 0x1F_FFFF_FFFF_FFFF },
+        .{ .path = "/w/sub/deep/CLAUDE.md", .stamp = 0 },
+    };
+    var notes = [_]types.PersistedContextNote{
+        .{ .text = @constCast("note at start"), .after_tool_step_count = 0 },
+        .{ .text = @constCast("note after one"), .after_tool_step_count = 1, .sources = &delivered },
+        .{ .text = @constCast("note at the end"), .after_tool_step_count = 2 },
+    };
+    var steering = [_]types.PersistedSteering{.{ .text = @constCast("steer after one"), .after_tool_step_count = 1 }};
+    try s.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("two steps") },
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = fixture.steps[0..2], .steering = &steering, .context_notes = &notes },
+    } }, types.ConversationLanguage.default());
+    try s.commitTurn(assistantTurn("plain", "turn"), types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    // Each note is its own `context_note` item, written before the steering
+    // at its boundary.
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, bytes, "\"context_note\""));
+    try testing.expect(std.mem.find(u8, bytes, "note after one").? < std.mem.find(u8, bytes, "steer after one").?);
+    try testing.expect(std.mem.find(u8, bytes, "call-2").? < std.mem.find(u8, bytes, "note at the end").?);
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), restored.history.len);
+    const execution = restored.history[0].assistant.execution;
+    try testing.expectEqual(@as(usize, 2), execution.tool_steps.len);
+    try testing.expectEqual(notes.len, execution.context_notes.len);
+    for (notes, execution.context_notes) |want, got| {
+        try testing.expectEqualStrings(want.text, got.text);
+        try testing.expectEqual(want.after_tool_step_count, got.after_tool_step_count);
+        // Each delivered file comes back with its stamp, including the
+        // largest stamp and an unknown one.
+        try testing.expectEqual(want.sources.len, got.sources.len);
+        for (want.sources, got.sources) |want_source, got_source| {
+            try testing.expectEqualStrings(want_source.path, got_source.path);
+            try testing.expectEqual(want_source.stamp, got_source.stamp);
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), execution.steering.len);
+    try testing.expectEqual(@as(usize, 1), execution.steering[0].after_tool_step_count);
+    // A turn without notes comes back without any.
+    try testing.expectEqual(@as(usize, 0), restored.history[1].assistant.execution.context_notes.len);
+}
+
+test "a turn's runtime context comes back on resume, saved once right after its user message (D94)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var fixture: NoteTestSteps = .{};
+    fixture.init();
+    var captured = [_][]u8{ @constCast("<fx-turn-context>\ngit_branch: main\n</fx-turn-context>"), @constCast("Runtime context: permission mode is ask.") };
+    var notes = [_]types.PersistedContextNote{.{ .text = @constCast("note at start"), .after_tool_step_count = 0 }};
+    const user: types.UserTurn = .{ .text = @constCast("two steps") };
+    // Every save of the turn carries it, so the streamed pieces stay a prefix
+    // of the committed turn.
+    try s.appendProgress(user, .{ .tool_steps = fixture.steps[0..1], .context_notes = &notes, .runtime_context = &captured }, .{});
+    try s.commitTurn(.{ .assistant = .{
+        .user = user,
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = fixture.steps[0..2], .context_notes = &notes, .runtime_context = &captured },
+    } }, types.ConversationLanguage.default());
+    try s.commitTurn(assistantTurn("plain", "turn"), types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.find(u8, bytes, superseded_type) == null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "git_branch: main"));
+    try testing.expect(std.mem.find(u8, bytes, "two steps").? < std.mem.find(u8, bytes, "git_branch: main").?);
+    try testing.expect(std.mem.find(u8, bytes, "git_branch: main").? < std.mem.find(u8, bytes, "note at start").?);
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), restored.history.len);
+    const execution = restored.history[0].assistant.execution;
+    try testing.expectEqual(@as(usize, 2), execution.tool_steps.len);
+    try testing.expectEqual(@as(usize, 1), execution.context_notes.len);
+    try testing.expectEqual(captured.len, execution.runtime_context.?.len);
+    for (captured, execution.runtime_context.?) |want, got| try testing.expectEqualStrings(want, got);
+    // A later turn that used the saved copy saves none.
+    try testing.expect(restored.history[1].assistant.execution.runtime_context == null);
+}
+
+test "a compaction inside a turn drops the context notes it covers and keeps the later ones on resume (D93)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var fixture: NoteTestSteps = .{};
+    fixture.init();
+    var notes = [_]types.PersistedContextNote{
+        .{ .text = @constCast("note after one"), .after_tool_step_count = 1 },
+        .{ .text = @constCast("note after two"), .after_tool_step_count = 2 },
+        .{ .text = @constCast("note after three"), .after_tool_step_count = 3 },
+    };
+    var steering = [_]types.PersistedSteering{
+        .{ .text = @constCast("after one"), .after_tool_step_count = 1 },
+        .{ .text = @constCast("after two"), .after_tool_step_count = 2 },
+    };
+    try s.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("three steps") },
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = &fixture.steps, .steering = &steering, .context_notes = &notes },
+    } }, types.ConversationLanguage.default());
+    var first = "steps one and two".*;
+    try s.commitCompaction(.{ .summary = &first, .removed_turn_count = 0, .compaction_count = 1 }, false, .{ .tool_steps = 2, .steering = 1 });
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    {
+        const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+        defer r.close();
+        var restored = try r.restore(testing.allocator);
+        defer restored.deinit(testing.allocator);
+        const kept = restored.history[1].assistant;
+        try testing.expectEqual(@as(usize, 1), kept.execution.tool_steps.len);
+        // The note before the cut is gone; the one at the cut and the one
+        // after the last step stay, counted from the cut.
+        try testing.expectEqual(@as(usize, 2), kept.execution.context_notes.len);
+        try testing.expectEqualStrings("note after two", kept.execution.context_notes[0].text);
+        try testing.expectEqual(@as(usize, 0), kept.execution.context_notes[0].after_tool_step_count);
+        try testing.expectEqualStrings("note after three", kept.execution.context_notes[1].text);
+        try testing.expectEqual(@as(usize, 1), kept.execution.context_notes[1].after_tool_step_count);
+        var second = "all three steps".*;
+        try r.commitCompaction(.{ .summary = &second, .removed_turn_count = 0, .compaction_count = 2 }, false, .{ .tool_steps = 1, .steering = 1 });
+    }
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    const kept = restored.history[1].assistant;
+    try testing.expectEqual(@as(usize, 0), kept.execution.tool_steps.len);
+    // The second cut covers the note before the step it covers and keeps the
+    // note after the last step, which nothing follows.
+    try testing.expectEqual(@as(usize, 1), kept.execution.context_notes.len);
+    try testing.expectEqualStrings("note after three", kept.execution.context_notes[0].text);
+    try testing.expectEqual(@as(usize, 0), kept.execution.context_notes[0].after_tool_step_count);
 }
 
 test "resume refuses a session whose compaction line is damaged" {

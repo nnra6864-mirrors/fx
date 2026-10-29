@@ -2885,9 +2885,10 @@ pub fn Runtime(comptime App: type) type {
                 .finished_prompt => {
                     recordShutdownFailure(app, failure);
                     if (comptime @hasDecl(App, "writeDomainNotice")) {
+                        var plain_buf: [96]u8 = undefined;
                         const body = try app.alloc.print(
-                            "Turn completed, but fx could not save it ({s}). The session keeps running; this turn may be missing after a resume.",
-                            .{@errorName(failure)},
+                            "Couldn't save this turn: {s}. It may be missing when you reopen this session.",
+                            .{types.plainErrorText(@errorName(failure), &plain_buf)},
                         );
                         defer app.alloc.free(body);
                         app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = body }, true) catch {};
@@ -2904,6 +2905,15 @@ pub fn Runtime(comptime App: type) type {
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             const v2 = app.session_persistence.v2 orelse return;
             try v2.appendProgressWithRecord(progress.user, progress.execution, .{ .calls = progress.running_calls, .assistant = progress.running_assistant }, progress.recovery_record);
+        }
+
+        /// `AgentRuntimeDeps.record_usage` on v2: each reply's usage
+        /// reaches the log as it arrives (D92).
+        pub fn recordUsage(app: *App, usage: types.Usage) !void {
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const v2 = app.session_persistence.v2 orelse return;
+            try v2.recordUsage(usage);
         }
 
         /// `AgentRuntimeDeps.save_prompt_images` on v2: the prompt's images
@@ -9661,7 +9671,7 @@ test "appendFinishedPrompt keeps the session alive when the turn cannot be saved
     );
     // The user sees a warning instead of a disappearing process.
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
-    try std.testing.expect(std.mem.find(u8, app.notices.items[0], "could not save") != null);
+    try std.testing.expect(std.mem.find(u8, app.notices.items[0], "Couldn't save this turn") != null);
 
     // A later clean turn still persists; the writer is not latched shut.
     const clean = try session_runtime.makeAssistantTurn(alloc, "next", "fine");

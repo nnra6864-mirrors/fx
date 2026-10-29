@@ -143,6 +143,9 @@ pub const QueuedPrompt = struct {
     /// Worker begin publishes only its identity so the UI can consume the
     /// pending owner without painting a duplicate card.
     user_prompt_already_presented: bool = false,
+    /// The first turn after a resume whose history names shell handles this
+    /// process does not own. The turn starts with a note saying so (D93).
+    stale_shell_handles: bool = false,
 };
 
 pub const ContextCompactionTask = struct {
@@ -1254,6 +1257,17 @@ pub const WorkerRuntime = struct {
         self.turn_start_held = false;
         debug_trace.logf("worker", "turn start hold released", .{});
         self.worker_cond.broadcast(io_mod.getIo());
+    }
+
+    /// Whether the queued prompt for `turn_id` carries the stale shell
+    /// handles note, so a caller that removes it can give the note back.
+    pub fn queuedPromptCarriesStaleShellHandles(self: *WorkerRuntime, turn_id: u64) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        for (self.queued_prompts.items) |queued| {
+            if (queued.turn_id == turn_id) return queued.stale_shell_handles;
+        }
+        return false;
     }
 
     pub fn removeQueuedPrompt(
@@ -2737,6 +2751,9 @@ fn discardQueuedPrompt(
     prompt: QueuedPrompt,
     retained_images: []const types.ImageAttachment,
 ) void {
+    if (prompt.stale_shell_handles) {
+        debug_trace.logf("worker", "stale shell handles note dropped with queued prompt turn_id={d}", .{prompt.turn_id});
+    }
     if (prompt.recovery_checkpoint == null) {
         image_attachments.deleteUnreferencedImageSnapshots(prompt.images, retained_images);
     }
@@ -5058,6 +5075,27 @@ test "clear queued prompts also clears steering" {
     try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
     const boundary = try runtime.takeSteeringBoundary(alloc, 9, .model);
     try std.testing.expect(boundary == .none);
+}
+
+test "a removed queued prompt reports the stale shell handles note it carried (D93)" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    var noted = try makePrompt(alloc, "after resume", "model");
+    noted.turn_id = 41;
+    noted.stale_shell_handles = true;
+    try runtime.enqueuePrompt(alloc, noted);
+    var plain = try makePrompt(alloc, "next", "model");
+    plain.turn_id = 42;
+    try runtime.enqueuePrompt(alloc, plain);
+
+    try std.testing.expect(runtime.queuedPromptCarriesStaleShellHandles(41));
+    try std.testing.expect(!runtime.queuedPromptCarriesStaleShellHandles(42));
+    try std.testing.expect(!runtime.queuedPromptCarriesStaleShellHandles(43));
+    try std.testing.expect(runtime.removeQueuedPrompt(alloc, 41, &.{}));
+    try std.testing.expect(!runtime.queuedPromptCarriesStaleShellHandles(41));
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
 }
 
 test "idle interactive admission uses ordinary queue" {

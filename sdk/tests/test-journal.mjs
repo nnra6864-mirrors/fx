@@ -871,7 +871,7 @@ test("a journal that does not fold is refused", async () => {
   const invalid = (pattern) => (error) => pattern.test(error.message) && error.code === "FX_JOURNAL_INVALID";
   const duplicated = eventJournal([...journal.events, journal.events.at(-1)]);
   await assert.rejects(createFxEngine(options(targetBackend, duplicated)), invalid(/libfx journal events are out of order/));
-  const newer = eventJournal([{ ...journal.events[0], v: 4 }]);
+  const newer = eventJournal([{ ...journal.events[0], v: 5 }]);
   await assert.rejects(createFxEngine(options(targetBackend, newer)), /libfx journal was written by a newer fx/);
   const garbled = eventJournal([{ v: 1, seq: 1, turn: 1, type: "turn_committed", data: { kind: "nope" } }]);
   await assert.rejects(createFxEngine(options(targetBackend, garbled)), invalid(/Invalid libfx journal/));
@@ -1247,7 +1247,7 @@ test("a turn left open resumes under the tools the new agent has", async () => {
 });
 
 test("a journal from a newer libfx is refused", async () => {
-  const future = eventJournal([{ v: 4, seq: 1, turn: 1, type: "turn_progress", data: {} }]);
+  const future = eventJournal([{ v: 5, seq: 1, turn: 1, type: "turn_progress", data: {} }]);
   const newer = (error) => error instanceof FxJournalVersionError && error.code === "FX_JOURNAL_VERSION";
   await assert.rejects(createFxEngine(options(sourceBackend, future)), newer);
   const record = (format) => ({

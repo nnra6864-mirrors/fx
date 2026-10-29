@@ -85,7 +85,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
     if (opened.status != .ok) {
         const body = try host_stream.readErrorBody(alloc, transport, opened.handle, request);
         return .{ .failed = .{
-            .kind = gateway_client.httpFailureKind(alloc, chat_completions.failure_kind(opened.status), body),
+            .kind = gateway_client.httpFailureKind(alloc, .fromHttpStatus(opened.status), body),
             .detail = body,
             .ownership = .owned,
         } };

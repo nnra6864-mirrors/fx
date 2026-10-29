@@ -6,9 +6,11 @@ import json
 import os
 import pathlib
 import tempfile
+import types
 import unittest
 from unittest import mock
 
+from scripts.pgso import macos
 from scripts.pgso.model import PgsoError
 from scripts.pgso.pipeline import PipelinePaths
 from scripts.pgso.profile_supplement import MappedProfile, ProfileSupplement
@@ -19,6 +21,7 @@ from scripts.pgso.qualify import (
     EvidenceRecorder,
     _read_hyperfine_samples,
     build_benchmark_pair,
+    build_external_o2_control,
     build_profile_linked_benchmarks,
     compare_samples,
     measure_alternating,
@@ -671,6 +674,41 @@ class PgsoQualificationTests(unittest.TestCase):
                 prebuilt_pairs={"ui_activity": pair},
             )
 
+    def test_external_control_is_optimized_linked_and_stripped_with_platform_tools(self) -> None:
+        tools = self.root / "tools"
+        tools.mkdir()
+        actions = self.root / "actions.log"
+
+        def fake(name: str) -> pathlib.Path:
+            path = tools / name
+            path.write_text(
+                "#!/usr/bin/env python3\n"
+                "import pathlib, sys\n"
+                f"with open({str(actions)!r}, 'a') as stream:\n"
+                f"    stream.write({name!r} + ' ' + ' '.join(sys.argv[1:]) + '\\n')\n"
+                "if '-o' in sys.argv:\n"
+                "    pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'artifact')\n",
+                encoding="utf-8",
+            )
+            path.chmod(0o755)
+            return path
+
+        toolchain = types.SimpleNamespace(
+            opt=fake("opt"),
+            llc=fake("llc"),
+            zig=fake("zig"),
+            target="aarch64-macos",
+            tools=types.SimpleNamespace(strip=fake("strip")),
+        )
+        paths = PipelinePaths.create(self.root / "run", selector="ui_activity")
+
+        binary = build_external_o2_control(toolchain, paths)
+
+        self.assertEqual(paths.root / "external-control" / paths.binary_name, binary)
+        lines = actions.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(["opt", "llc", "zig", "strip"], [line.split()[0] for line in lines])
+        self.assertEqual(f"strip -S -x {binary}", lines[3])
+
     def test_benchmark_pair_uses_the_external_control_for_minimum_macos(self) -> None:
         plan = BENCHMARK_PLANS[0]
         output = self.root / "pair"
@@ -692,10 +730,11 @@ class PgsoQualificationTests(unittest.TestCase):
                 "scripts.pgso.qualify.build_external_o2_control",
                 return_value=external,
             ),
-            mock.patch(
-                "scripts.pgso.qualify.read_macos_minos",
-                return_value="15.0",
-            ) as read_minos,
+            mock.patch.object(
+                macos,
+                "read_control_identity",
+                return_value={"minimum_macos": "15.0"},
+            ) as read_identity,
             mock.patch(
                 "scripts.pgso.qualify.build_instrumented",
                 return_value=(raw_profile,),
@@ -704,11 +743,13 @@ class PgsoQualificationTests(unittest.TestCase):
             mock.patch("scripts.pgso.qualify.apply_profile"),
             mock.patch("scripts.pgso.qualify.link_candidate", return_value=candidate),
         ):
-            pair = build_benchmark_pair(object(), self.root, output, plan)
+            pair = build_benchmark_pair(
+                types.SimpleNamespace(platform=macos), self.root, output, plan,
+            )
 
         self.assertEqual(external, pair.control_binary)
-        self.assertEqual(external, read_minos.call_args.args[1])
-        self.assertEqual("15.0", instrument.call_args.args[2])
+        self.assertEqual(external, read_identity.call_args.args[1])
+        self.assertEqual({"minimum_macos": "15.0"}, instrument.call_args.args[2])
 
     def test_builds_all_profile_linked_benchmarks_before_candidate_link(self) -> None:
         paths = PipelinePaths.create(self.root / "run")

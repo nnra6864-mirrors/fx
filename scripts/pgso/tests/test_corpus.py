@@ -64,6 +64,8 @@ VERIFICATION_E2E_TESTS = (
     "tui-compaction-activity.test.ts",
     "compaction-policy.test.ts",
     "tui-composer-edit-contracts.test.ts",
+    "tui-permissions-panel.test.ts",
+    "tui-effort-menu.test.ts",
     "tui-usage.test.ts",
     "tui-decision-prompts.test.ts",
     "poisoned-repository.test.ts",
@@ -75,6 +77,7 @@ VERIFICATION_E2E_TESTS = (
     "tui-slash-commands.test.ts",
     "tui-slash-extra.test.ts",
     "tui-slash-menu.test.ts",
+    "tui-status-session.test.ts",
     "ultrafast-fake-gateway.test.ts",
     "web-fetch-permission-progress.test.ts",
     "web-search-permission-progress.test.ts",
@@ -374,7 +377,7 @@ class PgsoCorpusTests(unittest.TestCase):
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
         self.assertEqual(35, len(corpus.scenarios))
-        self.assertEqual(61, len(corpus.candidate_scenarios))
+        self.assertEqual(64, len(corpus.candidate_scenarios))
         self.assertEqual(
             {
                 "direct-help": 100,

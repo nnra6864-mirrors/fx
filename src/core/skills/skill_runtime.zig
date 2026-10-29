@@ -3017,16 +3017,20 @@ fn buildSkillsSystemPromptSectionWithLimits(
     all_skills: []const Skill,
     limits: context_limits.Values,
 ) !BoundedPromptSection {
-    return buildSkillPrompt(alloc, all_skills, &.{}, limits, null);
+    return buildSkillPrompt(alloc, all_skills, &.{}, limits, null, null);
 }
 
-/// Borrows skill paths until the returned section is released.
+/// Borrows skill paths until the returned section is released. With a
+/// `workspace_root`, skill roots inside it are shown relative to it, so
+/// worktrees of one repository render the same catalog; resolution keeps the
+/// absolute roots.
 pub fn buildSkillPrompt(
     alloc: Allocator,
     skills: []const Skill,
     diagnostics: []const SkillDiagnostic,
     limits: context_limits.Values,
     context_window: ?u32,
+    workspace_root: ?[]const u8,
 ) !BoundedPromptSection {
     var visible: std.ArrayList(Skill) = .empty;
     defer visible.deinit(alloc);
@@ -3037,7 +3041,7 @@ pub fn buildSkillPrompt(
             !try tool_result_limits.modelProjectionPreservesText(identity_scratch.allocator(), skill.path)) continue;
         try visible.append(alloc, skill);
     }
-    var section = renderSkillPrompt(alloc, visible.items, limits, context_window, catalog_namespace(visible.items)) catch |err| {
+    var section = renderSkillPrompt(alloc, visible.items, limits, context_window, catalog_namespace(visible.items, workspace_root), workspace_root) catch |err| {
         if (err == error.WriteFailed) return error.OutOfMemory;
         return err;
     };
@@ -3097,11 +3101,18 @@ const SkillPromptEntry = struct {
     }
 };
 
-fn catalog_namespace(skills: []const Skill) u64 {
+/// The model-visible form of a skill path.
+fn shownPath(workspace_root: ?[]const u8, path: []const u8) []const u8 {
+    return if (workspace_root) |root| pathing.workspaceRelative(root, path) else path;
+}
+
+/// Hashes what the catalog shows, so the namespace changes with the skill set
+/// and layout but not between worktrees of one repository.
+fn catalog_namespace(skills: []const Skill, workspace_root: ?[]const u8) u64 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("fx-skill-locations");
     for (skills) |skill| {
-        for ([_][]const u8{ skill.name, skill.path }) |value| {
+        for ([_][]const u8{ skill.name, shownPath(workspace_root, skill.path) }) |value| {
             var length: [8]u8 = undefined;
             std.mem.writeInt(u64, &length, @intCast(value.len), .little);
             hash.update(&length);
@@ -3119,6 +3130,7 @@ fn renderSkillPrompt(
     limits: context_limits.Values,
     context_window: ?u32,
     namespace: u64,
+    workspace_root: ?[]const u8,
 ) !BoundedPromptSection {
     if (skills.len == 0) return .{ .text = try alloc.dupe(u8, "") };
     const budget = SkillPromptBudget.resolve(limits.skill_catalog_bytes, context_window);
@@ -3150,7 +3162,7 @@ fn renderSkillPrompt(
             var line: std.Io.Writer.Allocating = .init(alloc);
             defer line.deinit();
             try line.writer.print("Root {d}: ", .{index});
-            try model_context_encoding.writeScalar(&line.writer, root);
+            try model_context_encoding.writeScalar(&line.writer, shownPath(workspace_root, root));
             try line.writer.writeByte('\n');
             const owned = try line.toOwnedSlice();
             errdefer alloc.free(owned);
@@ -4485,18 +4497,18 @@ test "skill catalog uses model capacity and preserves explicit byte overrides" {
         const name = try std.mem.print(&storage[index], "entry-{d}", .{index});
         skill.* = .{ .name = name, .description = text_utils.repeat("useful instructions ", 80), .path = name, .source = .global_fx };
     }
-    var unknown = try buildSkillPrompt(alloc, &skills, &.{}, .{}, null);
+    var unknown = try buildSkillPrompt(alloc, &skills, &.{}, .{}, null, null);
     defer unknown.deinit(alloc);
-    var large = try buildSkillPrompt(alloc, &skills, &.{}, .{}, 200_000);
+    var large = try buildSkillPrompt(alloc, &skills, &.{}, .{}, 200_000, null);
     defer large.deinit(alloc);
     try std.testing.expect(unknown.text.len <= 8000);
     try std.testing.expect(large.text.len > unknown.text.len);
     try std.testing.expect(large.text.len <= 16000);
     var limits = context_limits.Values{};
     limits.skill_catalog_bytes = .{ .value = .{ .bytes = 1600 }, .source = .user_global };
-    var small = try buildSkillPrompt(alloc, &skills, &.{}, limits, 200_000);
+    var small = try buildSkillPrompt(alloc, &skills, &.{}, limits, 200_000, null);
     defer small.deinit(alloc);
-    var same = try buildSkillPrompt(alloc, &skills, &.{}, limits, 1_000_000);
+    var same = try buildSkillPrompt(alloc, &skills, &.{}, limits, 1_000_000, null);
     defer same.deinit(alloc);
     try std.testing.expectEqualStrings(small.text, same.text);
     try std.testing.expect(small.text.len <= 1600);
@@ -4506,9 +4518,9 @@ test "skill catalog locations reject a changed identity mapping" {
     const alloc = std.testing.allocator;
     const first = [_]Skill{.{ .name = "review", .description = "Review", .path = "/first/review", .source = .global_fx }};
     const changed = [_]Skill{.{ .name = "review", .description = "Review", .path = "/second/review", .source = .global_fx }};
-    var before = try buildSkillPrompt(alloc, &first, &.{}, .{}, null);
+    var before = try buildSkillPrompt(alloc, &first, &.{}, .{}, null, null);
     defer before.deinit(alloc);
-    var after = try buildSkillPrompt(alloc, &changed, &.{}, .{}, null);
+    var after = try buildSkillPrompt(alloc, &changed, &.{}, .{}, null, null);
     defer after.deinit(alloc);
     const location = try alloc.print("skill:{x:0>16}:0/review", .{before.locations.namespace});
     defer alloc.free(location);
@@ -4518,13 +4530,49 @@ test "skill catalog locations reject a changed identity mapping" {
     try std.testing.expectError(error.StaleSkillLocation, after.locations.resolve(alloc, location));
 }
 
+test "skill catalogs of two worktrees of one repository render the same text" {
+    const alloc = std.testing.allocator;
+    const first = [_]Skill{
+        .{ .name = "local", .description = "Local", .path = "/src/wt1/.fx/skills/local", .source = .workspace_fx },
+        .{ .name = "global", .description = "Global", .path = "/home/u/.fx/skills/global", .source = .global_fx },
+    };
+    const second = [_]Skill{
+        .{ .name = "local", .description = "Local", .path = "/src/wt2/.fx/skills/local", .source = .workspace_fx },
+        .{ .name = "global", .description = "Global", .path = "/home/u/.fx/skills/global", .source = .global_fx },
+    };
+    var a = try buildSkillPrompt(alloc, &first, &.{}, .{}, null, "/src/wt1");
+    defer a.deinit(alloc);
+    var b = try buildSkillPrompt(alloc, &second, &.{}, .{}, null, "/src/wt2");
+    defer b.deinit(alloc);
+    try std.testing.expectEqualStrings(a.text, b.text);
+    try std.testing.expectEqual(a.locations.namespace, b.locations.namespace);
+    try std.testing.expect(std.mem.find(u8, a.text, "Root 0: .fx/skills\n") != null);
+    try std.testing.expect(std.mem.find(u8, a.text, "Root 1: /home/u/.fx/skills\n") != null);
+
+    // One token resolves to each worktree's own skill.
+    const location = try alloc.print("skill:{x:0>16}:0/local", .{a.locations.namespace});
+    defer alloc.free(location);
+    const in_first = try a.locations.resolve(alloc, location);
+    defer alloc.free(in_first);
+    const in_second = try b.locations.resolve(alloc, location);
+    defer alloc.free(in_second);
+    try std.testing.expectEqualStrings("/src/wt1/.fx/skills/local", in_first);
+    try std.testing.expectEqualStrings("/src/wt2/.fx/skills/local", in_second);
+
+    // Without a workspace root the catalog keeps absolute roots.
+    var absolute = try buildSkillPrompt(alloc, &first, &.{}, .{}, null, null);
+    defer absolute.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, absolute.text, "Root 0: /src/wt1/.fx/skills\n") != null);
+    try std.testing.expect(absolute.locations.namespace != a.locations.namespace);
+}
+
 test "skill catalog keeps secret-bearing descriptions and locations verbatim" {
     const alloc = std.testing.allocator;
     const skills = [_]Skill{
         .{ .name = "safe", .description = "Release checks. API_KEY=description-secret-value", .path = "/root/safe", .source = .global_fx },
         .{ .name = "hidden", .description = "Sensitive location", .path = "/root/TOKEN=location-secret-value", .source = .global_fx },
     };
-    var section = try buildSkillPrompt(alloc, &skills, &.{}, .{}, 200_000);
+    var section = try buildSkillPrompt(alloc, &skills, &.{}, .{}, 200_000, null);
     defer section.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, section.text, "- safe:") != null);
     try std.testing.expect(std.mem.find(u8, section.text, "API_KEY=description-secret-value") != null);
@@ -4536,7 +4584,7 @@ fn checkSkillPromptAllocationFailures(alloc: Allocator) !void {
         .{ .name = "first", .description = "first instruction", .path = "/root-a/first", .source = .global_fx },
         .{ .name = "second", .description = "second instruction", .path = "/root-b/second", .source = .global_fx },
     };
-    var result = try buildSkillPrompt(alloc, &skills, &.{}, .{}, null);
+    var result = try buildSkillPrompt(alloc, &skills, &.{}, .{}, null, null);
     defer result.deinit(alloc);
     const location = try alloc.print("skill:{x:0>16}:1/second", .{result.locations.namespace});
     defer alloc.free(location);
@@ -4558,7 +4606,7 @@ test "skill catalog shortens descriptions before omitting identities" {
     };
     var limits = context_limits.Values{};
     limits.skill_catalog_bytes = .{ .value = .{ .bytes = 768 }, .source = .command_line };
-    var result = try buildSkillPrompt(alloc, &skills, &.{}, limits, null);
+    var result = try buildSkillPrompt(alloc, &skills, &.{}, limits, null, null);
     defer result.deinit(alloc);
     for ([_][]const u8{ "alpha", "beta", "gamma" }) |name| {
         try std.testing.expect(std.mem.find(u8, result.text, name) != null);

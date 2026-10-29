@@ -43,6 +43,7 @@ import {
   startFakeGateway,
   TmuxSession,
   type FakeGatewayModel,
+  type FakeGatewayOptions,
   type FakeGatewayResponse,
   tmuxAvailable,
 } from "./tmux-helpers";
@@ -1415,7 +1416,7 @@ async function runCanonicalLifecycleFixture(
     reachedFinal = settled.matched;
     if (reachedFinal) {
       await session.sendText("/help");
-      const help = await waitForPaneOrDone(session, "Commands 37", donePath);
+      const help = await waitForPaneOrDone(session, "Commands 38", donePath);
       helpVisible = help.matched;
       requestCountAfterHelp = queuedGateway.requests.length;
       if (helpVisible) {
@@ -1511,7 +1512,7 @@ async function launchRouteRecoveryTui(
   responses: FakeGatewayResponse[],
   options: {
     model?: string;
-    models?: FakeGatewayModel[];
+    models?: FakeGatewayOptions["models"];
     settings?: Record<string, unknown>;
   } = {},
 ) {
@@ -1935,6 +1936,62 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       expect(queuedGateway.modelRequests).toHaveLength(1);
       expect(queuedGateway.requests).toHaveLength(1);
+      expect(JSON.parse(queuedGateway.requests[0]!.body).maxOutputTokens).toBe(32_768);
+      expect(session!.isAlive()).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await session!.sendText("/quit");
+      expect(await session!.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await session!.kill();
+      session = null;
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "a prompt's request waits for the retry of a model catalog that failed to load",
+    async () => {
+      const model = "zai/glm-5.3";
+      const finalText = "Catalog retry reached the first request.";
+      let catalogUp = false;
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+        "fx-tui-catalog-retry-",
+        [fakeGatewayFinalText(finalText)],
+        {
+          model,
+          models: async () => {
+            if (!catalogUp) return new Response("catalog unavailable", { status: 503 });
+            // Slower than building the request, which goes out first unless it
+            // waits, and well inside the two seconds a request waits.
+            await Bun.sleep(750);
+            return [{
+              id: model,
+              type: "language",
+              tags: ["reasoning", "tool-use"],
+              context_window: 1_000_000,
+              max_tokens: 1_000_000,
+            }];
+          },
+          settings: { model },
+        },
+      );
+      await waitForCondition(
+        () => queuedGateway.modelRequests.length >= 1,
+        "the failed startup catalog load",
+      );
+      // The first retry after a failure waits five seconds; this only paces
+      // the prompt past it, and the request count below proves the retry ran.
+      await Bun.sleep(5_500);
+      const failedLoads = queuedGateway.modelRequests.length;
+      catalogUp = true;
+
+      await session!.sendText("hi");
+      await session!.waitForText(finalText, TIMEOUT);
+      await session!.waitForComposer(TIMEOUT);
+
+      expect(queuedGateway.modelRequests.length).toBe(failedLoads + 1);
+      expect(queuedGateway.requests).toHaveLength(1);
+      // The full-window catalog limit is bounded, as the retried catalog says.
       expect(JSON.parse(queuedGateway.requests[0]!.body).maxOutputTokens).toBe(32_768);
       expect(session!.isAlive()).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -5054,7 +5111,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         TIMEOUT,
       );
       await waitForCondition(() => hold.cancelled, "stream cancellation");
-      expect(afterFirst).toContain("■ Cancelled");
+      expect(afterFirst).toContain("▪ Cancelled");
       expect(afterFirst).not.toContain("system: cancelled");
       expect(afterFirst).not.toContain("Cancelling");
       expect(session.isPaneAlive()).toBe(true);
@@ -5930,6 +5987,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       let executedBeforeRetry: boolean | undefined;
       let executionAtFinal: string | undefined;
+      let executionBeforeNextRetry: string | undefined;
       const refreshGateway = startFakeGateway([
         fakeShellRun("before_instruction_refresh", command, { cwd: nested }),
         () => {
@@ -5943,6 +6001,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           return fakeGatewayFinalText(finalText);
         },
         fakeShellRun("retained_scope_next_turn", command, { cwd: nested }),
+        () => {
+          executionBeforeNextRetry = readFileSync(markerPath, "utf8");
+          return fakeShellRun("changed_scope_after_refresh", command, { cwd: nested });
+        },
         fakeGatewayFinalText(nextFinalText),
       ]);
       gateway = refreshGateway;
@@ -5989,19 +6051,34 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         expect(output).not.toMatch(/command not run|project instructions changed|\bfailed\b/i);
       }
 
+      // The rules file changes before the next turn. The instructions stay as the
+      // session started them; the call that reaches the folder again gets the
+      // current rules on its tool result, replacing the earlier copy, and runs
+      // only when the model issues it again (D93).
       writeFileSync(join(nested, "AGENTS.md"), `${currentInstruction}\n`);
       await session.sendText("Run that same command once more.");
       await session.waitForText(nextFinalText, TIMEOUT);
       await session.waitForComposer(TIMEOUT);
-      expect(refreshGateway.requests).toHaveLength(5);
-      const nextInstructions = (parseGatewayRequest(refreshGateway.requests[3]!.body).prompt ?? [])
-        .filter((message) => message.role === "system")
-        .map((message) => contentText(message.content)).join("\n");
-      expect(nextInstructions).toContain(currentInstruction);
-      expect(nextInstructions).not.toContain(instruction);
+      expect(refreshGateway.requests).toHaveLength(6);
+      for (const request of refreshGateway.requests.slice(3)) {
+        const instructions = (parseGatewayRequest(request.body).prompt ?? [])
+          .filter((message) => message.role === "system")
+          .map((message) => contentText(message.content)).join("\n");
+        expect(instructions).not.toContain(currentInstruction);
+        expect(instructions).not.toContain(instruction);
+      }
+      expect(refreshGateway.requests[3]!.body).not.toContain(currentInstruction);
+      const refreshedPrompt = parseGatewayRequest(refreshGateway.requests[4]!.body).prompt ?? [];
+      const refreshedResult = refreshedPrompt[refreshedPrompt.length - 1]!;
+      expect(refreshedResult.role).toBe("tool");
+      const refreshedOutput = JSON.stringify(refreshedResult.content);
+      expect(refreshedOutput).toContain("Scoped project instructions were added before execution.");
+      expect(refreshedOutput).toContain("The rules below replace the earlier copy from the same file.");
+      expect(refreshedOutput).toContain(currentInstruction);
+      expect(executionBeforeNextRetry).toBe("executed\n");
       expect(readFileSync(markerPath, "utf8")).toBe("executed\nexecuted\n");
       expect(countOccurrences(await session.captureFullScrollback(), refreshLabel))
-        .toBe(countOccurrences(compact, refreshLabel));
+        .toBe(countOccurrences(compact, refreshLabel) + 1);
       expect(hasEmptyComposer(await session.capturePane())).toBe(true);
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);
@@ -6091,7 +6168,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Run the supported call after the unknown call.");
       await session.waitForText(finalText, TIMEOUT);
-      const header = "● 2 tool calls · 2 commands · 1 failed";
+      // The unsupported name has the MCP prefix, so it counts as an MCP call.
+      const header = "● 2 tool calls · 1 command · 1 MCP call · 1 failed";
       const failedRow = `├ Failed ${unsupportedToolName}`;
       const completedRow = `└ Ran ${supportedCommand}`;
       const compact = await session.captureFullScrollback();
@@ -6523,7 +6601,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         }
         await session.waitForText(finalText, TIMEOUT);
         const compact = await session.captureFullScrollback();
-        expect(compact).toContain("● 5 tool calls · 4 subagent · 1 read");
+        expect(compact).toContain("● 5 tool calls · 4 subagents · 1 read");
         expect(compact).toContain("Invalid Agent failed · Check failure visibility");
         expect(compact).not.toContain("Invalid Agent replied");
         for (let index = 0; index < tasks.length; index += 1) {
@@ -6554,7 +6632,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         session = await TmuxSession.create({ cmd: `${FX_BIN} --resume-last`, cwd: workspace, env, width: 110, height: 35, stderrPath: join(root, "resumed-stderr.log") });
         await session.waitForText(finalText, TIMEOUT);
         const resumed = await session.captureFullScrollback();
-        expect(resumed).toContain("● 5 tool calls · 4 subagent · 1 read");
+        expect(resumed).toContain("● 5 tool calls · 4 subagents · 1 read");
         expect(resumed).toContain("Invalid Agent failed · Check failure visibility");
         expect(resumed).toContain("Subagent finished · Check one-off cleanup");
         expect(resumed).toContain("reviewer replied · Check replay again");

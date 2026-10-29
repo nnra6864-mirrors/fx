@@ -49,6 +49,7 @@ pub const SlashKind = enum {
     image,
     images,
     model,
+    effort,
     permissions,
     allowlist,
     stats,
@@ -1613,6 +1614,7 @@ test "rendered top-level help is a complete CLI navigation page" {
     try std.testing.expect(std.mem.find(u8, text, "Run one noninteractive request") != null);
     try std.testing.expect(std.mem.find(u8, text, "Draft or publish a GitHub issue") != null);
     try std.testing.expect(std.mem.find(u8, text, "credits|balance") != null);
+    try std.testing.expect(std.mem.find(u8, text, "upgrade|update") != null);
     try std.testing.expect(std.mem.find(u8, text, "Sign in to a model provider") != null);
     try std.testing.expect(std.mem.find(u8, text, "Sign out of a model provider") != null);
     try std.testing.expect(std.mem.find(u8, text, "Choose the active model provider") != null);
@@ -1823,7 +1825,7 @@ test "slash completion categories follow canonical entries" {
 test "help catalog groups visible commands and searches all command metadata" {
     const registry = testSlashRegistry();
 
-    try std.testing.expectEqual(@as(usize, 37), helpCatalogCount(registry, ""));
+    try std.testing.expectEqual(@as(usize, 38), helpCatalogCount(registry, ""));
     try std.testing.expectEqualStrings("/help", helpCatalogSpecAt(registry, "", 0).?.command);
     try std.testing.expectEqual(@as(usize, 5), helpCatalogCategoryCount(registry, "", .general));
     try std.testing.expectEqual(@as(usize, 3), helpCatalogCount(registry, "appearance"));
