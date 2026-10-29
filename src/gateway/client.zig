@@ -5388,7 +5388,9 @@ test "consumeSseStream names the error a provider's wrapper nests in the notice 
 
 test "consumeSseStream reads a deep chain of provider wrappers only one level down" {
     const alloc = std.testing.allocator;
-    const depth = 20_000;
+    // Past the levels a detail renders, and under the levels an event may
+    // nest before it is refused (`json_depth.max_depth`).
+    const depth = 50;
     var payload: std.Io.Writer.Allocating = .init(alloc);
     defer payload.deinit();
     const writer = &payload.writer;
@@ -5482,14 +5484,13 @@ test "consumeSseStream labels a provider error value too deep to render" {
     };
     const cases = [_]Case{
         // Wrappers whose `type` is the generic "error", with no code or message.
-        .{ .name = "d3", .head = event_head, .open = "{\"type\":\"error\",\"error\":", .leaf = "{\"type\":\"error\"}", .depth = 300, .tail = event_tail, .cause = .uncoded_error },
-        .{ .name = "d3 deep", .head = event_head, .open = "{\"type\":\"error\",\"error\":", .leaf = "{\"type\":\"error\"}", .depth = 20_000, .tail = event_tail, .cause = .uncoded_error },
+        .{ .name = "d3", .head = event_head, .open = "{\"type\":\"error\",\"error\":", .leaf = "{\"type\":\"error\"}", .depth = 50, .tail = event_tail, .cause = .uncoded_error },
         // A chain of `error` objects with no type at all.
-        .{ .name = "d4", .head = event_head, .open = "{\"error\":", .leaf = "{}", .depth = 300, .tail = event_tail, .cause = .uncoded_error },
+        .{ .name = "d4", .head = event_head, .open = "{\"error\":", .leaf = "{}", .depth = 50, .tail = event_tail, .cause = .uncoded_error },
         // Any other nesting under `error`.
-        .{ .name = "d5", .head = event_head, .open = "{\"a\":", .leaf = "{}", .depth = 300, .tail = event_tail, .cause = .uncoded_error },
+        .{ .name = "d5", .head = event_head, .open = "{\"a\":", .leaf = "{}", .depth = 50, .tail = event_tail, .cause = .uncoded_error },
         // An error finish that carries d4's value, with no error event.
-        .{ .name = "f1", .head = "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\"},\"error\":", .open = "{\"error\":", .leaf = "{}", .depth = 300, .tail = "}\n\n", .cause = .unexplained_error_finish },
+        .{ .name = "f1", .head = "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\"},\"error\":", .open = "{\"error\":", .leaf = "{}", .depth = 50, .tail = "}\n\n", .cause = .unexplained_error_finish },
     };
     for (cases) |case| {
         const payload = try testDeepPayload(alloc, case.head, case.open, case.leaf, case.depth, case.tail);
@@ -5501,6 +5502,10 @@ test "consumeSseStream labels a provider error value too deep to render" {
         try std.testing.expectEqualStrings("provider_error", completion.provider_failure_detail.?);
         try std.testing.expectEqual(@as(?types.ProviderFailureCause, case.cause), completion.provider_failure_cause);
     }
+    // An event nested past `json_depth.max_depth` is refused before it is read.
+    const too_deep = try testDeepPayload(alloc, event_head, "{\"type\":\"error\",\"error\":", "{\"type\":\"error\"}", 20_000, event_tail);
+    defer alloc.free(too_deep);
+    try std.testing.expectError(error.InvalidGatewaySseEvent, testStreamOutcome(too_deep));
 }
 
 test "consumeSseStream still renders a shallow provider error value that names nothing" {
