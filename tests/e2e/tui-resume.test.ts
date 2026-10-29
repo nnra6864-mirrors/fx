@@ -1369,6 +1369,215 @@ printf '${trailingMarker}   '
   60_000,
 );
 
+function treeBytes(path: string): number {
+  let total = 0;
+  for (const entry of readdirSync(path, { withFileTypes: true })) {
+    const child = join(path, entry.name);
+    if (entry.isDirectory()) total += treeBytes(child);
+    else if (entry.isFile()) total += statSync(child).size;
+  }
+  return total;
+}
+
+test.skipIf(!tmuxAvailable())(
+  "resumed session restores a large-file edit's full diff from its saved rows",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-resume-large-edit-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.txt");
+    const resumedStderrPath = join(root, "resumed-stderr.txt");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+    );
+
+    // A file past the former 4 MiB edit limit, with the edited block near
+    // its end. The trailing lines are context only the full diff shows: the
+    // tool arguments never contain them and the inline preview cuts off first.
+    const oldBlock = Array.from({ length: 10 }, (_, i) => `old-line-${String(i + 1).padStart(2, "0")}`).join("\n");
+    const newBlock = Array.from({ length: 10 }, (_, i) => `new-line-${String(i + 1).padStart(2, "0")}`).join("\n");
+    const filler = Array.from(
+      { length: 100_000 },
+      (_, i) => `filler-${String(i).padStart(8, "0")} lorem ipsum dolor sit amet`,
+    ).join("\n");
+    const original = `${filler}\n${oldBlock}\ntrailing-context-1\ntrailing-context-2\n`;
+    expect(original.length).toBeGreaterThan(4 * 1024 * 1024);
+    const target = join(workspace, "big.txt");
+    writeFileSync(target, original);
+
+    const doneMarker = "LARGE_EDIT_DONE";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("edit_large_1", "edit_file", {
+        path: "big.txt",
+        old_string: oldBlock,
+        new_string: newBlock,
+      }),
+      fakeGatewayFinalText(doneMarker),
+    ]);
+    let active: TmuxSession | null = null;
+    let resumedGateway: ReturnType<typeof startFakeGateway> | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: realpathSync(workspace),
+        env: gatewayEnv(home, gateway),
+        stderrPath,
+        width: 100,
+        height: 60,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Apply the block edit.");
+      await waitForScrollback(active, doneMarker);
+      expect(readFileSync(target, "utf8")).toBe(original.replace(oldBlock, newBlock));
+
+      await active.sendKeys("C-o");
+      const liveFull = await active.waitForText("trailing-context-2", TIMEOUT);
+      expect(liveFull).toContain("new-line-10");
+      expect(liveFull).toContain("unchanged lines ⋯");
+      await active.sendKeys("C-o");
+      await active.waitForText(doneMarker, TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await active.kill();
+      active = null;
+
+      // The session keeps the diff's rows, not copies of the 5 MiB file.
+      expect(treeBytes(storeRoot(home))).toBeLessThan(512 * 1024);
+
+      resumedGateway = startFakeGateway([]);
+      active = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume-last`,
+        cwd: realpathSync(workspace),
+        env: gatewayEnv(home, resumedGateway),
+        stderrPath: resumedStderrPath,
+        width: 100,
+        height: 60,
+      });
+      await active.waitForText(doneMarker, TIMEOUT);
+      await active.sendKeys("C-o");
+      const resumedFull = await active.waitForText("trailing-context-2", TIMEOUT);
+      expect(resumedFull).toContain("new-line-10");
+      expect(resumedFull).toContain("unchanged lines ⋯");
+      expect(resumedGateway.requests).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
+    } finally {
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      gateway.stop();
+      resumedGateway?.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  60_000,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a file's own terminal sequences and invalid bytes show as text in a resumed full diff",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-resume-hostile-edit-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.txt");
+    const resumedStderrPath = join(root, "resumed-stderr.txt");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+    );
+
+    // The edited line sits next to a screen clear, a C1 control, and bytes
+    // that are not UTF-8. Drawn raw, the first ended fx and the second
+    // reached the terminal; saved raw, the third failed the session save.
+    const original = Buffer.concat([
+      Buffer.from("keep\n\x1b[2J\x1b[Hclear-row\n\u009b31mcsi-row\n"),
+      Buffer.from([0xff, 0xfe]),
+      Buffer.from("-bytes-row\nedit-me\ntrailing-context\n"),
+    ]);
+    const target = join(workspace, "hostile.txt");
+    writeFileSync(target, original);
+    const edited = Buffer.from(original.toString("latin1").replace("edit-me", "edited-row"), "latin1");
+
+    const doneMarker = "HOSTILE_EDIT_DONE";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("edit_hostile_1", "edit_file", {
+        path: "hostile.txt",
+        old_string: "edit-me",
+        new_string: "edited-row",
+      }),
+      fakeGatewayFinalText(doneMarker),
+    ]);
+    const expectEscapedRows = (screen: string) => {
+      expect(screen).toContain("\\x1b[2J\\x1b[Hclear-row");
+      expect(screen).toContain("\\u{009b}31mcsi-row");
+      expect(screen).toContain("\\xff\\xfe-bytes-row");
+      expect(screen).toContain("edited-row");
+    };
+    let active: TmuxSession | null = null;
+    let resumedGateway: ReturnType<typeof startFakeGateway> | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: realpathSync(workspace),
+        env: gatewayEnv(home, gateway),
+        stderrPath,
+        width: 100,
+        height: 40,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Apply the edit.");
+      await waitForScrollback(active, doneMarker);
+      expect(readFileSync(target).equals(edited)).toBe(true);
+
+      await active.sendKeys("C-o");
+      expectEscapedRows(await active.waitForText("trailing-context", TIMEOUT));
+      expect(active.isPaneAlive()).toBe(true);
+      await active.sendKeys("C-o");
+      await active.waitForText(doneMarker, TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await active.kill();
+      active = null;
+
+      resumedGateway = startFakeGateway([]);
+      active = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume-last`,
+        cwd: realpathSync(workspace),
+        env: gatewayEnv(home, resumedGateway),
+        stderrPath: resumedStderrPath,
+        width: 100,
+        height: 40,
+      });
+      await active.waitForText(doneMarker, TIMEOUT);
+      await active.sendKeys("C-o");
+      expectEscapedRows(await active.waitForText("trailing-context", TIMEOUT));
+      expect(active.isPaneAlive()).toBe(true);
+      expect(resumedGateway.requests).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
+    } finally {
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      gateway.stop();
+      resumedGateway?.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  60_000,
+);
+
 test.skipIf(!tmuxAvailable())(
   "resumed session labels shell interactions with their launch command",
   async () => {
@@ -1451,6 +1660,14 @@ function gatewaySawNote(gateway: ReturnType<typeof startFakeGateway>): boolean {
   );
 }
 
+/** Where the stale-handle note sits in a request: the role of each message that carries it. */
+function noteRoles(body: unknown): string[] {
+  const parsed = typeof body === "string" ? JSON.parse(body) : body;
+  return ((parsed as { prompt?: { role: string; content: unknown }[] }).prompt ?? [])
+    .filter((message) => JSON.stringify(message.content).includes(STALE_HANDLE_NOTE))
+    .map((message) => message.role);
+}
+
 test.skipIf(!tmuxAvailable())(
   "resume after process restart warns the model about stale shell handles",
   async () => {
@@ -1489,7 +1706,10 @@ test.skipIf(!tmuxAvailable())(
       await active.kill();
       active = null;
 
-      resumedGateway = startFakeGateway([fakeGatewayFinalText("STALE_NOTE_PHASE2_DONE")]);
+      resumedGateway = startFakeGateway([
+        fakeGatewayFinalText("STALE_NOTE_PHASE2_DONE"),
+        fakeGatewayFinalText("STALE_NOTE_PHASE3_DONE"),
+      ]);
       active = await TmuxSession.create({
         cmd: `${FX_BIN} --resume-last`,
         cwd: workspace,
@@ -1502,6 +1722,15 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("Is the watcher still running?");
       await waitForScrollback(active, "STALE_NOTE_PHASE2_DONE");
       expect(gatewaySawNote(resumedGateway)).toBe(true);
+      // The note rides on the resumed turn's own message, so the instructions
+      // stay as they were cached; the next turn of this process keeps that one
+      // copy and adds no other (D93).
+      await active.sendText("And now?");
+      await waitForScrollback(active, "STALE_NOTE_PHASE3_DONE");
+      expect(resumedGateway.requests).toHaveLength(2);
+      for (const request of resumedGateway.requests) {
+        expect(noteRoles(request.body)).toEqual(["user"]);
+      }
 
       await active.sendText("/quit");
       expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -5632,6 +5861,34 @@ test("manual upgrade output links stable notes and dev changes", async () => {
   }
 }, UPGRADE_TIMEOUT);
 
+test("update runs the manual upgrade", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-update-alias-")));
+  const argvLogPath = join(root, "upgrade-argv.log");
+  const installedFx = join(root, "fx");
+  const home = join(root, "home");
+  mkdirSync(home);
+  const release = startUpgradeServer(root, argvLogPath);
+  copyFileSync(FX_BIN, installedFx);
+  chmodSync(installedFx, 0o755);
+
+  try {
+    const update = Bun.spawn([installedFx, "update", "--channel", "stable"], {
+      env: { ...process.env, HOME: home, FX_E2E_UPGRADE_BASE_URL: release.baseUrl },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const exitCode = await update.exited;
+    expect(exitCode).toBe(0);
+    expect(await new Response(update.stdout).text()).toContain(
+      "notes: https://fx.sh/changelog#v9.9.9",
+    );
+    expect(readFileSync(installedFx, "utf8")).toStartWith("#!/bin/sh");
+  } finally {
+    release.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, UPGRADE_TIMEOUT);
+
 test.skipIf(!tmuxAvailable())(
   "upgrade ctrl-g reloads the background-installed binary and resumes",
   async () => {
@@ -7102,7 +7359,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("What can fx do differently?", TIMEOUT);
       const resumedGrid = await active.capturePaneGrid();
       const footer = findFooterBlocks(resumedGrid).at(-1);
-      const cancelledRow = resumedGrid.findIndex((row) => row.includes("■ Cancelled"));
+      const cancelledRow = resumedGrid.findIndex((row) => row.includes("▪ Cancelled"));
       expect(footer).toBeDefined();
       expect(cancelledRow).toBeGreaterThanOrEqual(0);
       expect(cancelledRow).toBeLessThan(footer!.topDivider);
@@ -7381,7 +7638,7 @@ test.skipIf(!tmuxAvailable())(
       ));
       const cancelledIndex = resumed.indexOf("Cancelled");
       expect(cancelledIndex).toBeGreaterThanOrEqual(0);
-      expect(resumed).toContain("■ Cancelled");
+      expect(resumed).toContain("▪ Cancelled");
       expect(countOccurrences(resumed, "What can fx do differently?")).toBe(1);
       expect(resumed).not.toContain("system: cancelled");
       expect(resumed).not.toContain("Cancelling");
@@ -7721,8 +7978,12 @@ for (const inspectDetails of [false, true]) {
         expect(paneExitMatches(active.paneStatus(), 0)).toBe(true);
         const events = savedItems(home, sessionId);
         expect(events.filter(event => event.tool_result?.call_id === "write-second")).toHaveLength(1);
-        expect(events.find(event => event.tool_result?.call_id === "write-receipt").tool_result.committed_file_presentation.lifecycle_id)
+        // The write's full diff is saved beside its result, with its lifecycle
+        // id, and the result keeps the preview-only shape older fx versions read.
+        expect(events.find(event => event.file_review?.call_id === "write-receipt").file_review.lifecycle_id)
           .toEqual({ turn_id: 2, call_id: "write-receipt" });
+        expect(events.find(event => event.tool_result?.call_id === "write-receipt").tool_result.committed_file_presentation.lifecycle_id)
+          .toBeNull();
         expect(events.some(event => event.assistant?.text === savedReply)).toBe(true);
       } finally {
         if (active) await active.kill();

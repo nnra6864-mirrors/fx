@@ -6,10 +6,12 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { artifacts, binary } from "../lib/context";
+import { artifacts, binary, targetModule } from "../lib/context";
 import { BUN, cliLogin, fixture, probe, redemptions, save, startFake, stdioServer, waitFor, writeProfile } from "./driver";
 import { Shell } from "./shell";
 import { checkTrace, type TraceRecord } from "./trace";
+
+const { stdoutFrames } = await targetModule("render-lab/tape.ts");
 
 async function signInScenario(name: string, tamper: boolean) {
   const f = fixture(artifacts, name);
@@ -155,21 +157,27 @@ test("contract: a login asked for again while one waits is that login: the same 
   writeProfile(f, { web: { type: "http", url: fake.url } });
   const shell = new Shell(f);
   const records: TraceRecord[] = [];
-  // The n-th sign-in address the transcript printed, from 0.
-  const address = async (n: number) => {
+  const tapePath = join(f.base, "shell.fxtape");
+  // Once the transcript has linked a sign-in page n + 1 times, the addresses
+  // those links open, each once: a repaint writes a link again.
+  const addresses = async (n: number) => {
     const deadline = Date.now() + 20_000;
     for (;;) {
-      const found = [...(await shell.tui.captureFullScrollback()).matchAll(/go to:\n\s+(http\S+)/g)].map((m) => m[1]!);
-      if (found.length > n) return found[n]!;
-      if (Date.now() > deadline) throw new Error(`timed out waiting for sign-in address ${n + 1}`);
+      const shown = (await shell.tui.captureFullScrollback()).match(/Didn't open\? Open the sign-in page\./g)?.length ?? 0;
+      if (shown > n) {
+        const written = Buffer.concat(stdoutFrames(tapePath).map((frame: { payload: Uint8Array }) => frame.payload)).toString("utf8");
+        return [...new Set([...written.matchAll(/\x1b\]8;id=fx-mcp-sign-in;([^\x1b]+)\x1b\\/g)].map((m) => m[1]!))];
+      }
+      if (Date.now() > deadline) throw new Error(`timed out waiting for sign-in link ${n + 1}`);
       await Bun.sleep(100);
     }
   };
   try {
-    await shell.start({}, 400);
+    await shell.start({ FX_RECORD: tapePath }, 400);
     records.push({ event: "login", at: Date.now() });
     await shell.tui.sendText("/mcp login web");
-    const first = await address(0);
+    const [first] = await addresses(0);
+    expect(first).toBeTruthy();
     records.push({ event: "authorize", data: { login: 1 }, at: Date.now(), note: first });
     const signing = await shell.status({ k: "signing" }, 10_000);
     expect(signing?.k).toBe("signing");
@@ -180,8 +188,8 @@ test("contract: a login asked for again while one waits is that login: the same 
 
     records.push({ event: "login", at: Date.now() });
     await shell.tui.sendText("/mcp login web");
-    const again = await address(1);
-    expect(again).toBe(first);
+    // The second login links the first one's address, and no other.
+    expect(await addresses(1)).toEqual([first]);
     const still = await probe(port);
     records.push({ event: "probe", data: { login: 1, result: still.result }, at: Date.now() });
 
@@ -215,10 +223,11 @@ test("contract: a login asked for again while one waits is that login: the same 
   }
 }, 150_000);
 
-// Fixed by stopping the sign-in and saying so. Before the fix this
-// case was a finding: the shell kept saying "Signing in" and the trace broke
-// IndicatorImpliesListener. It fails that way on the code before.
-test("contract: a reload during a sign-in closes its listener, and the shell stops saying \"Signing in\" and says why (trace ACCEPTED)", async () => {
+// A reload applies in place, so a change that leaves the server alone leaves
+// its sign-in going; one that removes the server ends it and says so, and the
+// shell never keeps saying "Signing in" without a listener
+// (IndicatorImpliesListener). Before the in-place reload, any change ended it.
+test("contract: a reload that leaves a server alone keeps its sign-in going, and removing the server closes its listener and says why (trace ACCEPTED)", async () => {
   const f = fixture(artifacts, "signin-reload");
   const fake = await startFake(f);
   writeProfile(f, { web: { type: "http", url: fake.url } });
@@ -237,9 +246,19 @@ test("contract: a reload during a sign-in closes its listener, and the shell sto
     const port = Number(new URL(registered).port);
     expect((await probe(port)).result).toBe("open");
     records.push({ event: "probe", data: { login: 1, result: "open" }, at: Date.now() });
-    records.push({ event: "reload", at: Date.now() });
+
+    records.push({ event: "reload", data: { server: "kept" }, at: Date.now() });
     await shell.tui.sendText(`/mcp add other -- ${BUN} ${stdioServer(f, "other").args[0]}`);
     await shell.tui.waitForText("Added other", 10_000);
+    await Bun.sleep(1_000);
+    const kept = await probe(port);
+    records.push({ event: "probe", data: { login: 1, result: kept.result }, at: Date.now() });
+    const going = await shell.status(null, 5_000);
+    records.push({ event: "status", data: { signing: going?.k === "signing" }, at: Date.now(), note: JSON.stringify(going) });
+
+    records.push({ event: "reload", data: { server: "dropped" }, at: Date.now() });
+    await shell.tui.sendText("/mcp remove web");
+    await shell.tui.waitForText("Removed web", 10_000);
     let after = await probe(port);
     // A probe the closing listener drops is no answer either way: probe again.
     for (let k = 0; k < 30 && (after.result === "open" || after.result === "reset"); k++) { await Bun.sleep(100); after = await probe(port); }
@@ -247,12 +266,14 @@ test("contract: a reload during a sign-in closes its listener, and the shell sto
     await Bun.sleep(3_000);
     const still = await shell.status(null, 5_000);
     records.push({ event: "status", data: { signing: still?.k === "signing" }, at: Date.now(), note: JSON.stringify(still) });
-    save(join(f.base, "after-reload.json"), { probe: after, status: still });
+    save(join(f.base, "after-reload.json"), { kept, going, probe: after, status: still });
     const verdict = await checkTrace({ module: "SignIn", records, dir: join(f.base, "trace"), constants: { ObsMaxLogins: 1, ObsMaxHosts: 2, ObsMaxLeases: 1, ObsBridge: false } });
     save(join(f.base, "verdict.json"), verdict);
+    expect(kept.result).toBe("open");
+    expect(going?.k).toBe("signing");
     expect(after.result).toBe("closed");
     expect(still?.k).not.toBe("signing");
-    expect(await shell.tui.captureFullScrollback()).toContain("Couldn't sign in to web: the MCP config changed before the browser came back; run /mcp login web again.");
+    expect(await shell.tui.captureFullScrollback()).toContain("Couldn't sign in to web: the MCP config changed before the browser came back.");
     expect(verdict.verdict).toBe("ACCEPTED");
     await shell.quit();
   } finally {

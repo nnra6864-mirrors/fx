@@ -2289,12 +2289,15 @@ tmuxTest(
       (pane) =>
         pane.includes("Sign in with Vercel") &&
         pane.includes("TEST-CODE") &&
-        pane.includes("/verify") &&
+        pane.includes("Authorize with Vercel") &&
         pane.includes("Waiting for authorization") &&
         pane.includes("enter reopens browser · esc cancels"),
       TIMEOUT,
     );
     expect(signInScreen).not.toContain("Starting Vercel sign-in");
+    // The device page is a link, not its address printed out.
+    expect(signInScreen).toMatch(/^   Open\s+Authorize with Vercel$/m);
+    expect(signInScreen).not.toContain("/verify");
 
     await session.sendKeys("C-c");
     await session.waitForComposer(TIMEOUT);
@@ -2783,7 +2786,7 @@ tmuxTest(
     );
     await session.waitForComposer(TIMEOUT);
     expect(Date.now() - cancelStarted).toBeLessThan(500);
-    expect(cancelledPane).toContain("■ Cancelled");
+    expect(cancelledPane).toContain("▪ Cancelled");
     expect(cancelledPane).not.toContain("system: cancelled");
     expect(cancelledPane).not.toContain("Cancelling");
     expect(session.isAlive()).toBe(true);

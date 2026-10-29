@@ -4025,6 +4025,58 @@ test "compaction summarizes an oversized only recent exchange without repeating 
     try std.testing.expectEqualStrings(original_result, saved.tool_steps[0].tool_results[0].output);
 }
 
+test "a named skill's text stays in the turn once after an in-turn compaction cuts its note (D95)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "requested-workflow");
+    var file = try tmp.dir.createFile(std.testing.io, "requested-workflow/SKILL.md", .{});
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, "---\nname: requested-workflow\ndescription: Requested workflow\n---\nREQUESTED_SKILL_CONTENT\n");
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "requested-workflow");
+    defer alloc.free(path);
+    const skills = [_]@import("../../../skills/skill_runtime.zig").Skill{.{
+        .name = "requested-workflow",
+        .description = "Requested workflow",
+        .path = path,
+        .source = .workspace_shared,
+    }};
+    const original_result = "RECENT_ONLY\n" ++ text_utils.repeat("r", 10_000);
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .tool_calls = &.{toolCall("recent-only", "read_file", "{\"path\":\"large.txt\"}")} },
+        .{ .content = "Turn in progress\nIn between: The read completed with RECENT_ONLY." },
+        .{ .content = "Completed from the observed result." },
+    });
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    const model = "provider/recent-only";
+    const capabilities = [_]ModelCapabilityOverride{.{ .model = model, .capabilities = .{ .context_window = 3_000 } }};
+    hooks.available_capability_overrides = &capabilities;
+    hooks.permission_decisions = &.{.once};
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = original_result } }};
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.skill_catalog = .{ .skills = &skills };
+    var job = fixture.job();
+    job.model = @constCast(model);
+    job.prompt = @constCast("Use $requested-workflow.");
+    try runFakePrompt(&gateway, &hooks, config, job);
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, gateway.request_bodies.items[0], "REQUESTED_SKILL_CONTENT"));
+    try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+    try expectBodyContains(&gateway, 2, "compacted_conversation");
+    // The cut covered the note, so fx adds it again where the kept messages
+    // start: the turn's message carries the skill's text once more.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, gateway.request_bodies.items[2], "REQUESTED_SKILL_CONTENT"));
+    try expectBodyContains(&gateway, 2, "Use $requested-workflow.\\n\\nExplicitly invoked skill content for this query:");
+    try std.testing.expectEqualStrings("Completed from the observed result.", hooks.finish_assistant_text.?);
+    // The turn saves the short note in its place.
+    const saved = hooks.history_turns.items[hooks.history_turns.items.len - 1].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), saved.context_notes.len);
+    try std.testing.expect(std.mem.startsWith(u8, saved.context_notes[0].text, "<fx-skill-used>"));
+}
+
 test "automatic compaction summarizes a newest exchange larger than the input window" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4808,17 +4860,23 @@ test "processQueuedPrompt final summary counts submitted input once across Gatew
 }
 
 test "processQueuedPrompt enables Gateway automatic caching across model families and tool steps" {
+    // Anthropic models and OpenAI GPT-5.6 and later also get fx's two stable
+    // markers, each in its provider's syntax, on the last repo-independent
+    // instruction and on the last stable instruction
+    // (tests/tla/prompt_context/PromptCache.tla). The turn context after
+    // them is never marked. Other families rely on the Gateway alone.
     const alloc = std.testing.allocator;
-    const models = [_][]const u8{
-        "anthropic/claude-sonnet-4.6",
-        "openai/gpt-5.6-luna",
-        "zai/glm-5.2",
-        "moonshotai/kimi-k3",
-        "google/gemini-3-flash",
-        "xai/grok-4.5",
-        "provider/new-model",
+    const cases = [_]struct { model: []const u8, markers: ?[]const u8 }{
+        .{ .model = "anthropic/claude-sonnet-4.6", .markers = "anthropic" },
+        .{ .model = "openai/gpt-5.6-luna", .markers = "openai" },
+        .{ .model = "openai/gpt-5", .markers = null },
+        .{ .model = "zai/glm-5.2", .markers = null },
+        .{ .model = "moonshotai/kimi-k3", .markers = null },
+        .{ .model = "google/gemini-3-flash", .markers = null },
+        .{ .model = "xai/grok-4.5", .markers = null },
+        .{ .model = "provider/new-model", .markers = null },
     };
-    for (models) |model| {
+    for (cases) |case| {
         const calls = [_]ToolCall{toolCall("read", "read_file", "{\"path\":\"a\"}")};
         const completions = [_]FakeCompletion{
             .{ .tool_calls = &calls },
@@ -4829,9 +4887,10 @@ test "processQueuedPrompt enables Gateway automatic caching across model familie
         var hooks = FakeAgentRuntimeDeps.init(alloc);
         defer hooks.deinit();
         hooks.runtime_context_text = "runtime context remains visible";
+        hooks.static_context_text = "static project context";
         var fixture = PromptFixture{};
         var job = fixture.job();
-        job.model = @constCast(model);
+        job.model = @constCast(case.model);
         try runFakePrompt(&gateway, &hooks, fixture.config(), job);
         try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
         for (gateway.request_bodies.items) |body| {
@@ -4839,8 +4898,28 @@ test "processQueuedPrompt enables Gateway automatic caching across model familie
             defer parsed.deinit();
             const options = parsed.value.object.get("providerOptions").?.object;
             try std.testing.expectEqualStrings("auto", options.get("gateway").?.object.get("caching").?.string);
-            try std.testing.expect(std.mem.find(u8, body, "cacheControl") == null);
             try std.testing.expect(std.mem.find(u8, body, "runtime context remains visible") != null);
+            var marked: std.ArrayList([]const u8) = .empty;
+            defer marked.deinit(alloc);
+            for (parsed.value.object.get("prompt").?.array.items) |entry| {
+                const entry_options = entry.object.get("providerOptions") orelse continue;
+                // A marker is always in the model's own syntax, alone, on a
+                // system message.
+                const syntax = case.markers orelse return error.TestUnexpectedCacheMarker;
+                try std.testing.expectEqual(@as(usize, 1), entry_options.object.count());
+                try std.testing.expect(entry_options.object.get(syntax) != null);
+                try std.testing.expectEqualStrings("system", entry.object.get("role").?.string);
+                try marked.append(alloc, entry.object.get("content").?.string);
+            }
+            if (case.markers != null) {
+                try std.testing.expectEqual(@as(usize, 2), marked.items.len);
+                try std.testing.expectEqualStrings("system", marked.items[0]);
+                try std.testing.expect(std.mem.find(u8, marked.items[1], "static project context") != null);
+            } else {
+                try std.testing.expectEqual(@as(usize, 0), marked.items.len);
+                try std.testing.expect(std.mem.find(u8, body, "cacheControl") == null);
+                try std.testing.expect(std.mem.find(u8, body, "promptCacheBreakpoint") == null);
+            }
         }
         try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
     }
@@ -5235,7 +5314,10 @@ test "processQueuedPrompt prepares each origin skill catalog with its supplied m
             const entry = try scratch.allocator().print("- {s}: ", .{name});
             try std.testing.expect(std.mem.find(u8, catalog, entry) != null);
         }
-        try std.testing.expect(std.mem.find(u8, catalog, case.workspace) != null);
+        // Skills under the supplied workspace show relative to it; another
+        // origin's workspace would leave them absolute.
+        try std.testing.expect(std.mem.find(u8, catalog, "Root 0: skills\n") != null);
+        try std.testing.expect(std.mem.find(u8, catalog, case.workspace) == null);
         if (case.child) {
             try std.testing.expect(catalog.len < parent_catalog_bytes);
             try std.testing.expect(std.mem.find(u8, catalog, cases[0].workspace) == null);
@@ -5339,7 +5421,7 @@ test "processQueuedPrompt omits an empty custom tool guidance message" {
     try expectGatewayPromptStringEntry(&gateway, 0, 0, "system");
 }
 
-test "processQueuedPrompt refreshes runtime overlay each step and preserves turn suffix" {
+test "processQueuedPrompt keeps the runtime context ahead of the history and carries a change on the step's tool result (D94)" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
     const completions = [_]FakeCompletion{
@@ -5359,17 +5441,26 @@ test "processQueuedPrompt refreshes runtime overlay each step and preserves turn
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     try expectBodyContains(&gateway, 0, "runtime overlay step one");
     try expectBodyNotContains(&gateway, 0, "runtime overlay step two");
-    try expectBodyContains(&gateway, 1, "runtime overlay step two");
-    try expectBodyNotContains(&gateway, 1, "runtime overlay step one");
     try expectBodyContains(&gateway, 1, "Checking.");
     try expectBodyContains(&gateway, 1, "\"toolName\":\"read_file\"");
-    try expectBodyContains(&gateway, 1, "\"value\":\"ok\"");
+    // The tool result ends with the update.
+    try expectBodyContains(&gateway, 1, "\"value\":\"ok\\n\\n<fx-context-update>\\n");
+    // The first step's copy stays ahead of the history, so the cached prefix
+    // holds; the change rides once on the step's tool result.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, gateway.request_bodies.items[1], "runtime overlay step one"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, gateway.request_bodies.items[1], "runtime overlay step two"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, gateway.request_bodies.items[1], "<fx-context-update>"));
     const first_request_roles = [_]types.ChatRole{ .system, .system, .system, .user };
     const second_request_roles = [_]types.ChatRole{ .system, .system, .system, .user, .assistant, .tool };
     try expectGatewayPromptRoles(&gateway, 0, &first_request_roles);
     try expectGatewayPromptRoles(&gateway, 1, &second_request_roles);
-    const second_request_order = [_][]const u8{ "runtime overlay step two", "user prompt", "Checking.", "\"value\":\"ok\"" };
+    const second_request_order = [_][]const u8{ "runtime overlay step one", "user prompt", "Checking.", "ok", "<fx-context-update>", "runtime overlay step two" };
     try expectBodyContainsInOrder(&gateway, 1, &second_request_order);
+    // The turn saves the copy it captured and the update at its boundary.
+    const saved = hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqualStrings("runtime overlay step one", saved.runtime_context.?[0]);
+    try std.testing.expectEqual(@as(usize, 1), saved.context_notes.len);
+    try std.testing.expectEqual(@as(usize, 1), saved.context_notes[0].after_tool_step_count);
 }
 
 test "processQueuedPrompt refreshes and acknowledges parent deliveries for each tool step" {
@@ -9077,6 +9168,7 @@ test "processQueuedPrompt no-tool length bypasses silent-tool continuation" {
         .{ .tool_calls = &call_one },
         .{ .tool_calls = &call_two },
         .{ .finish_reason = .length },
+        .{ .finish_reason = .length },
         .{ .content = "UNEXPECTED_CONTINUATION" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
@@ -9087,12 +9179,17 @@ test "processQueuedPrompt no-tool length bypasses silent-tool continuation" {
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
-    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    // The empty reply's one retry sends the same request with an output
+    // limit; neither request asks for a summary.
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+    try expectBodyNotContains(&gateway, 2, "\"maxOutputTokens\"");
+    try expectBodyContains(&gateway, 3, "\"maxOutputTokens\":32768");
+    try expectBodyNotContains(&gateway, 3, "Summarize what you just did.");
     try std.testing.expectEqual(@as(usize, 2), hooks.executed_names.items.len);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
     try std.testing.expectEqual(types.ProviderCompletionDisposition.length_limited, hooks.finalized_disposition.?);
     try std.testing.expectEqual(@as(usize, 1), hooks.finalization_count);
-    try std.testing.expectEqualStrings("Done.", hooks.finish_assistant_text.?);
+    try std.testing.expectEqualStrings("The reply ran out of output tokens before any text.", hooks.finish_assistant_text.?);
 }
 
 test "processQueuedPrompt non-ok gateway response trims and clips HTTP detail" {

@@ -435,6 +435,10 @@ fn keepVisible(s: *State, l: Layout) void {
 /// How long news of a sign-in stays on the status line.
 pub const news_ms: i64 = 5000;
 
+/// The link a waiting sign-in offers when the browser didn't open, in the
+/// transcript and on the server's screen alike.
+pub const sign_in_link_label = "Open the sign-in page";
+
 /// The longest the status line waits for servers to finish starting.
 pub const startup_quiet_ms: i64 = 10_000;
 

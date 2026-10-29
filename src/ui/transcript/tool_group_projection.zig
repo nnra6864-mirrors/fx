@@ -149,8 +149,11 @@ const category_labels = [_][]const u8{
     "command",
     "subagent",
     "browser",
+    "MCP call",
 };
 const command_category_index = 5;
+const subagent_category_index = 6;
+const mcp_category_index = 8;
 
 const Summary = struct {
     total: usize = 0,
@@ -182,8 +185,9 @@ fn categoryIndex(kind: types.ToolActivityKind) ?usize {
         .edit => 3,
         .open => 4,
         .command => command_category_index,
-        .subagent => 6,
+        .subagent => subagent_category_index,
         .ask => null,
+        .mcp => mcp_category_index,
     };
 }
 
@@ -316,7 +320,8 @@ fn normalizeCanonicalStatus(
 ) !?[]const u8 {
     var index: usize = 0;
     while (skipSgrSequence(text, &index)) {}
-    const markers = [_][]const u8{ "●", "■", "⊘", "↻" };
+    // `■` is the cancelled marker older sessions recorded before `▪`.
+    const markers = [_][]const u8{ "●", "▪", "■", "⊘", "↻" };
     const marker = for (markers) |candidate| {
         if (std.mem.startsWith(u8, text[index..], candidate)) break candidate;
     } else return null;
@@ -531,10 +536,12 @@ fn formatGroupSummary(alloc: std.mem.Allocator, summary: Summary) ![]u8 {
         const index = next_index orelse break;
         emitted[index] = true;
         const count = summary.categories[index];
-        const label = if (index == command_category_index and count != 1)
-            "commands"
-        else
-            category_labels[index];
+        const label = if (count == 1) category_labels[index] else switch (index) {
+            command_category_index => "commands",
+            subagent_category_index => "subagents",
+            mcp_category_index => "MCP calls",
+            else => category_labels[index],
+        };
         try appendSegment(&out.writer, count, label);
     }
     try appendSegment(&out.writer, summary.completion_unreported, "unreported");
@@ -1490,13 +1497,30 @@ test "grouped subagent status keeps the vertical continuation for middle rows" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 4 tool calls · 4 subagent\n" ++
+        "● 4 tool calls · 4 subagents\n" ++
             "├ Subagent working · inspect auth\n│ glm-5.3-flash · max\n" ++
             "├ Subagent working · inspect auth\n│ glm-5.3-flash · max\n" ++
             "├ Subagent working · inspect auth\n│ glm-5.3-flash · max\n" ++
             "└ Subagent working · inspect auth\n  glm-5.3-flash · max",
         projection.entry_actions.items[0].override.bytes,
     );
+}
+
+test "group summary uses singular and plural subagent labels" {
+    const alloc = std.testing.allocator;
+    var summary: Summary = .{ .total = 2 };
+    summary.categories[command_category_index] = 1;
+    summary.categories[subagent_category_index] = 1;
+    const single = try formatGroupSummary(alloc, summary);
+    defer alloc.free(single);
+    try std.testing.expectEqualStrings("● 2 tool calls · 1 command · 1 subagent", single);
+
+    summary = .{ .total = 5 };
+    summary.categories[command_category_index] = 2;
+    summary.categories[subagent_category_index] = 3;
+    const plural = try formatGroupSummary(alloc, summary);
+    defer alloc.free(plural);
+    try std.testing.expectEqualStrings("● 5 tool calls · 3 subagents · 2 commands", plural);
 }
 
 test "small minimal tool groups surface canonical action targets" {
@@ -2363,7 +2387,7 @@ test "tool-heavy groups render every canonical action" {
 test "minimal tool group keeps cancellation in the header and child row" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "■ Cancelled sleep 30 · What can fx do differently?", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "▪ Cancelled sleep 30 · What can fx do differently?", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .cancelled },
@@ -2375,7 +2399,7 @@ test "minimal tool group keeps cancellation in the header and child row" {
     try std.testing.expectEqualStrings(
         "● 1 tool call · 1 command · 1 cancelled\n" ++
             "└ Cancelled \x1b[38;5;252msleep\x1b[39m 30\n\n" ++
-            "■ Cancelled sleep 30 · What can fx do differently?",
+            "▪ Cancelled sleep 30 · What can fx do differently?",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -2385,7 +2409,7 @@ test "minimal tool group clips cancellation to one child row" {
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{
             .id = 1,
-            .bytes = "■ Cancelled sleep waiting command words extend past line two",
+            .bytes = "▪ Cancelled sleep waiting command words extend past line two",
             .class = .tool_status,
         } },
     };
@@ -2435,8 +2459,8 @@ test "minimal tool group keeps later cancelled rows and hides other details" {
 test "cancelled actions remain inside the message-delimited block" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "■ Cancelled first", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "■ Cancelled second", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "▪ Cancelled first", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "▪ Cancelled second", .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 3, .bytes = "output", .class = .command_output } },
         .{ .raw_bytes = .{ .id = 4, .bytes = "read", .class = .tool_status } },
     };
