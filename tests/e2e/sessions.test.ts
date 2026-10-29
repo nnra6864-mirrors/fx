@@ -3959,7 +3959,7 @@ async function gridEnter(entry: GridEntry, c: GridCase, gateway: any, token: str
         const deadline = Date.now() + TIMEOUT;
         while (Date.now() < deadline) {
           screen = await session.captureFullScrollback();
-          if (screen.includes(answer) || /✗ .*|could not save/.test(screen.slice(screen.lastIndexOf(prompt)))) break;
+          if (screen.includes(answer) || /✗ .*|[Cc]ouldn't save/.test(screen.slice(screen.lastIndexOf(prompt)))) break;
           await Bun.sleep(100);
         }
         // The reply shows even when saving it fails, so read the turn's end.
@@ -3968,7 +3968,7 @@ async function gridEnter(entry: GridEntry, c: GridCase, gateway: any, token: str
         const turn = screen.slice(screen.lastIndexOf(prompt));
         await session.sendText("/quit");
         await exit("after /quit");
-        return { entered: turn.includes(answer) && !/✗ |could not save/.test(turn), said: `${turn}\n${readFileSync(stderrPath, "utf8")}` };
+        return { entered: turn.includes(answer) && !/✗ |[Cc]ouldn't save/.test(turn), said: `${turn}\n${readFileSync(stderrPath, "utf8")}` };
       } finally {
         await session.kill();
       }
