@@ -113,7 +113,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
         expect(readFileSync(receipt, "utf8")).toContain(`target=${eventPath}`);
         expect(readFileSync(tracePath, "utf8")).toContain("shutdown finished prompt persistence failed");
         expect(session.paneStatus().status).toBe(1);
-        expect(output + stderr).toMatch(/save.*fail|fail.*sav|could not.*sav|unable to.*sav/i);
+        expect(output + stderr).toMatch(/save.*fail|fail.*sav|could not.*sav|couldn.t.*sav|unable to.*sav/i);
       } else { expect(session.paneStatus().status).toBe(0); expect(stderr).toBe(""); }
       expect(readFileSync(eventPath).subarray(0, saved.length).equals(saved)).toBe(true);
       const resumed = await runFx(["ask", "--json", "--resume-id", id, "Continue without repeating work."], {
