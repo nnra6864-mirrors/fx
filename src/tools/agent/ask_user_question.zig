@@ -184,7 +184,14 @@ fn parseQuestionBatch(arena: Allocator, args_json: []const u8) QuestionBatchPars
     if (parsed.value != .object) return error.InvalidArguments;
     const args = parsed.value.object;
 
-    const questions_value = args.get("questions") orelse return error.MissingQuestions;
+    var questions_value = args.get("questions") orelse return error.MissingQuestions;
+    // Some models send the array as JSON text. It names the same batch.
+    if (questions_value == .string) {
+        questions_value = std.json.parseFromSliceLeaky(std.json.Value, arena, questions_value.string, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.QuestionsNotArray,
+        };
+    }
     if (questions_value != .array) return error.QuestionsNotArray;
 
     const questions_arr = questions_value.array;
@@ -405,6 +412,26 @@ test "ask_user_question normalizes descriptions and encodes ordered answers" {
     try std.testing.expect(fake.called);
     try std.testing.expect(fake.saw_trimmed);
     try std.testing.expectEqualStrings("[{\"question\":\"Choose?\",\"answer\":\"Yes\"}]", output);
+}
+
+test "ask_user_question accepts the questions array sent as JSON text" {
+    const alloc = std.testing.allocator;
+    var fake = FakeRequester{};
+    const output = try executeWithRequester(
+        alloc,
+        "{\"questions\":\"[{\\\"question\\\":\\\" Choose? \\\",\\\"options\\\":[{\\\"label\\\":\\\" Yes \\\"},{\\\"label\\\":\\\"No\\\"}]}]\"}",
+        .{
+            .ctx = &fake,
+            .response_alloc = alloc,
+            .request = FakeRequester.request,
+        },
+    );
+    defer alloc.free(output);
+
+    try std.testing.expect(fake.called);
+    try std.testing.expectEqualStrings("[{\"question\":\"Choose?\",\"answer\":\"Yes\"}]", output);
+    try expectRequesterOutput("{\"questions\":\"not json\"}", "(ask_user_question: \"questions\" must be an array)");
+    try expectRequesterOutput("{\"questions\":\"{}\"}", "(ask_user_question: \"questions\" must be an array)");
 }
 
 test "ask_user_question flattens model-controlled prompt text for terminal display" {

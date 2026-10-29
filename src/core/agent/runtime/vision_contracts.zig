@@ -225,9 +225,21 @@ pub fn parse_vision_request(
 
     if (parsed.value != .object) return error.InvalidVisionRequest;
     const object = parsed.value.object;
-    const image_ids_value = object.get("image_ids");
-    const paths_value = object.get("paths");
-    if (object.count() != 2 or (image_ids_value == null) == (paths_value == null)) {
+    var image_ids_value = object.get("image_ids");
+    var paths_value = object.get("paths");
+    // Models that fill every schema field send the unused source as null or
+    // []. Next to a real source it names nothing, so it reads as absent.
+    var unused_sources: usize = 0;
+    if (image_ids_value != null and paths_value != null) {
+        if (isUnusedSource(image_ids_value.?)) {
+            image_ids_value = null;
+            unused_sources = 1;
+        } else if (isUnusedSource(paths_value.?)) {
+            paths_value = null;
+            unused_sources = 1;
+        }
+    }
+    if (object.count() - unused_sources != 2 or (image_ids_value == null) == (paths_value == null)) {
         return error.InvalidVisionRequest;
     }
 
@@ -276,6 +288,14 @@ pub fn parse_vision_request(
     return .{
         .source = source,
         .focus = try alloc.dupe(u8, focus_value.string),
+    };
+}
+
+fn isUnusedSource(value: std.json.Value) bool {
+    return switch (value) {
+        .null => true,
+        .array => |items| items.items.len == 0,
+        else => false,
     };
 }
 
@@ -1103,6 +1123,27 @@ test "Vision request parsing requires exactly one nonempty source" {
     try std.testing.expectError(
         error.InvalidVisionRequest,
         parse_vision_request(std.testing.allocator, "{\"image_ids\":[1],\"paths\":[\"a.png\"],\"focus\":\"inspect\"}"),
+    );
+}
+
+test "Vision request parsing reads an empty unused source as absent" {
+    for ([_][]const u8{
+        "{\"image_ids\":[],\"paths\":[\"a.png\"],\"focus\":\"inspect\"}",
+        "{\"image_ids\":null,\"paths\":[\"a.png\"],\"focus\":\"inspect\"}",
+    }) |json| {
+        const request = try parse_vision_request(std.testing.allocator, json);
+        defer request.deinit(std.testing.allocator);
+        const paths = request.paths().?;
+        try std.testing.expectEqual(@as(usize, 1), paths.len);
+        try std.testing.expectEqualStrings("a.png", paths[0]);
+    }
+    const ids = try parse_vision_request(std.testing.allocator, "{\"image_ids\":[2],\"paths\":[],\"focus\":\"inspect\"}");
+    defer ids.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(usize, &.{2}, ids.image_ids().?);
+    // With no real source, the empty one still reports itself.
+    try std.testing.expectError(
+        error.EmptyPaths,
+        parse_vision_request(std.testing.allocator, "{\"image_ids\":[],\"paths\":[],\"focus\":\"inspect\"}"),
     );
 }
 

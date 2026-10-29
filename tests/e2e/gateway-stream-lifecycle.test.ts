@@ -1167,13 +1167,13 @@ describe("gateway stream lifecycle", () => {
       expectOnlyLeadingSystemMessages(gateway.requests[0]!.body);
       expect(contentText(request.prompt[1]?.content)).toBe(WEB_SEARCH_GUIDANCE);
       expect(toolByName(oracleRequest, "shell")?.description).toBe(
-        `Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id and remain available across turns. Use shell.interact with that exact session_id: omit chars to observe, or provide chars to send exact input and then observe. Use shell.stop only when termination is requested. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output, so do not run a separate command merely to test output safety or shell usability. Owned sessions end when fx exits; & and nohup jobs end with their command. To keep a service running, use \`${DETACH_COMMAND}\` and check it is ready in that call. Each call starts a new shell with the user's startup files: aliases, functions, and PATH work, but cd, export, and alias changes do not carry over. In zsh, quote glob patterns meant for another program (for example '--include=*.zig') because unmatched globs are errors.`,
+        `Run a shell command. Each call starts a new shell with the user's startup files, so cd and export do not carry over. If the command is still running after yield_time_ms, you get a session_id: call again with action=interact to wait for more output, or action=stop to end it. Never rerun it. Owned sessions end when fx exits; & and nohup jobs end with their command. To keep a service running, use \`${DETACH_COMMAND}\` and check it is ready in that call. In zsh, quote globs meant for another program.`,
       );
       expect(toolByName(oracleRequest, "skill")?.description).toContain(
-        "the task clearly matches one",
+        "relative to the skill, not the workspace",
       );
       expect(toolByName(oracleRequest, "ask_user_question")?.description).toContain(
-        "precise, mutually exclusive paths",
+        "when a decision blocks you",
       );
       expect(gateway.requests[0]!.body).not.toContain(
         "Treat it as interrupting any previous tool plan.",
@@ -2484,10 +2484,8 @@ describe("gateway stream lifecycle", () => {
       expect(skillSchema?.inputSchema.required).toEqual(["location"]);
       expect(capabilitySearchSchema).toBeDefined();
       expect(capabilitySearchSchema?.inputSchema.required).toEqual(["query"]);
-      expect((capabilitySearchSchema?.inputSchema.properties.query as {
-        minLength?: number;
-        maxLength?: number;
-      })).toMatchObject({ minLength: 1, maxLength: 4096 });
+      // The decoder bounds the query, so the schema carries only its type.
+      expect(capabilitySearchSchema?.inputSchema.properties.query.type).toBe("string");
       expect(capabilitySearchSchema?.inputSchema.properties.kind).toBeUndefined();
       expect(capabilitySearchSchema?.inputSchema.properties.limit).toBeUndefined();
       expect(capabilitySearchSchema?.inputSchema.properties.cursor).toBeUndefined();
