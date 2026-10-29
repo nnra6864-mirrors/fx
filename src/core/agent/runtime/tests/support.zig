@@ -340,7 +340,7 @@ pub const FakeGateway = struct {
             errdefer if (failure_schema) |value| alloc.free(value);
             const failure_request_shape = if (completion.failure_request_shape) |value| try alloc.dupe(u8, value) else null;
             return .{ .failed = .{
-                .kind = gateway_client.httpFailureKind(alloc, failureKind(completion.status), err_body),
+                .kind = gateway_client.httpFailureKind(alloc, .fromHttpStatus(completion.status), err_body),
                 .detail = err_body,
                 .retry_after_seconds = completion.retry_after_seconds,
                 .diagnostics = .{
@@ -380,21 +380,6 @@ pub const FakeGateway = struct {
             err,
             request.delivery.load(),
         );
-    }
-
-    fn failureKind(status: std.http.Status) agent_stream_provider.FailureKind {
-        return switch (status) {
-            .bad_request => .invalid_request,
-            .unauthorized => .unauthorized,
-            .forbidden => .forbidden,
-            .payload_too_large => .request_too_large,
-            .too_many_requests => .rate_limited,
-            .internal_server_error => .server_error,
-            .bad_gateway => .bad_gateway,
-            .service_unavailable => .unavailable,
-            .gateway_timeout => .gateway_timeout,
-            else => .provider_error,
-        };
     }
 };
 
@@ -995,9 +980,9 @@ pub const FakeAgentRuntimeDeps = struct {
         }
     }
 
-    fn appendStaticContext(raw: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) !void {
+    fn appendStaticContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        if (project_context orelse self.static_context_text) |text| {
+        if (self.static_context_text) |text| {
             try messages.append(arena, .{ .role = .system, .content = try arena.dupe(u8, text) });
         }
     }

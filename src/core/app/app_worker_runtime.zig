@@ -1363,6 +1363,7 @@ pub fn Runtime(comptime App: type) type {
                 .open => stream.open_count += 1,
                 .command => stream.command_count += 1,
                 .subagent => stream.subagent_count += 1,
+                .mcp => stream.mcp_count += 1,
                 .ask => {},
             }
         }
