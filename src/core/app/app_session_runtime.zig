@@ -2840,6 +2840,15 @@ pub fn Runtime(comptime App: type) type {
             try v2.appendProgress(progress.user, progress.execution, .{ .calls = progress.running_calls, .assistant = progress.running_assistant });
         }
 
+        /// `AgentRuntimeDeps.record_usage` on v2: each reply's usage
+        /// reaches the log as it arrives (D92).
+        pub fn recordUsage(app: *App, usage: types.Usage) !void {
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const v2 = app.session_persistence.v2 orelse return;
+            try v2.recordUsage(usage);
+        }
+
         /// `AgentRuntimeDeps.save_prompt_images` on v2: the prompt's images
         /// become the session's blobs before its first request (D89).
         pub fn savePromptImages(app: *App, alloc: std.mem.Allocator, images: []types.ImageAttachment) !void {

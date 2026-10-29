@@ -16,7 +16,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { FX_BIN, HAS_API_KEY, REPO_ROOT, runFx, providerVersionTestEnv } from "../evals/eval-helpers";
 import {
@@ -269,7 +269,16 @@ function acpSkillPath(body: string, location: string): string {
   const root = acpTaggedBlock(body, "available_skills").split("\n")
     .find((line) => line.startsWith(prefix));
   if (!root) throw new Error(`Missing root for ${location}`);
-  return join(root.slice(prefix.length), decodeURIComponent(match[2]!));
+  // A root inside the workspace is shown relative to the turn context's workspace_root.
+  const shown = root.slice(prefix.length);
+  const base = isAbsolute(shown) ? shown : join(acpTurnContextWorkspaceRoot(body), shown);
+  return join(base, decodeURIComponent(match[2]!));
+}
+
+function acpTurnContextWorkspaceRoot(body: string): string {
+  const match = /^workspace_root: (.+)$/m.exec(acpPromptText(body));
+  if (!match) throw new Error("Missing workspace_root in the turn context");
+  return match[1]!;
 }
 
 function acpToolResultText(body: string, callId: string): string {
@@ -8833,6 +8842,7 @@ describe("acp: model-independent", () => {
         fakeGatewayToolCall("read_1", "read_file", { path: "a.txt" }),
         fakeGatewayToolCall("read_2", "read_file", { path: "b.txt" }),
         noToolLength(),
+        noToolLength(),
         finalText("UNEXPECTED_CONTINUATION"),
       ]);
       try {
@@ -8848,7 +8858,13 @@ describe("acp: model-independent", () => {
         );
 
         expect(result.promptResult.result.stopReason).toBe("max_output_tokens");
-        expect(gateway.requests).toHaveLength(3);
+        // The empty reply's one retry sends the same request with an output
+        // limit; neither request asks for a summary.
+        expect(gateway.requests).toHaveLength(4);
+        expect(JSON.parse(gateway.requests[2]!.body).maxOutputTokens).toBeUndefined();
+        const retryLimit = JSON.parse(gateway.requests[3]!.body).maxOutputTokens;
+        expect(retryLimit).toBeGreaterThan(0);
+        expect(retryLimit).toBeLessThanOrEqual(32_768);
         expect(gateway.requests.some(({ body }) =>
           body.includes("Summarize what you just did.")
         )).toBe(false);
@@ -9324,9 +9340,12 @@ describe("acp: model-independent", () => {
         expect(deferredBody).not.toContain(siblingRule);
         expect(occurrenceCount(deferredBody, rootRule)).toBe(1);
         expect(occurrenceCount(deferredBody, nestedRule)).toBe(1);
-        expect(acpToolResultText(deferredBody, firstCallId)).toBe(
-          "Scoped project instructions were added before execution. Review them and reissue this tool call if it is still appropriate.",
-        );
+        // The deferred call's result carries the rules it waited for (D93).
+        const deferredResult = acpToolResultText(deferredBody, firstCallId);
+        expect(deferredResult.startsWith(
+          "Scoped project instructions were added before execution. Review them and reissue this tool call if it is still appropriate.\n\n<scoped-rules from=",
+        )).toBe(true);
+        expect(deferredResult).toContain(nestedRule);
 
         const executedBody = gateway.requests[2]!.body;
         expect(executedBody).toContain(rootRule);

@@ -46,6 +46,7 @@ const runtime_finalization = @import("finalization.zig");
 const runtime_deps = @import("deps.zig");
 const runtime_lifecycle = @import("lifecycle.zig");
 const runtime_prompt_context = @import("prompt_context.zig");
+const runtime_context_state = @import("runtime_context.zig");
 const compactor = @import("../../compactor/compactor.zig");
 const runtime_text_completion = @import("text_completion.zig");
 const compaction_activity = @import("../../output/compaction_activity.zig");
@@ -83,6 +84,8 @@ const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const CredentialRefreshMode = runtime_deps.CredentialRefreshMode;
 
 const http_error_detail_max_bytes: usize = 4096;
+const empty_length_retry_notice = "The reply ran out of output tokens before any text. Retrying with a higher limit.";
+const empty_length_limited_reply = "The reply ran out of output tokens before any text.";
 const assistant_prefill_recovery_prompt =
     "Continue from the preceding tool result.";
 pub const assistant_tail_continuation_prompt =
@@ -2508,7 +2511,7 @@ fn advertiseUnselectedMcpCalls(
     const resolve = deps.resolve_unselected_mcp_tool orelse return;
     for (calls) |call| {
         if (deps.tool_registry.lookup(call.name) != null) continue;
-        if (containsToolName(advertised_names.*, call.name)) continue;
+        if (containsString(advertised_names.*, call.name)) continue;
         const resolved = resolve(deps.ctx, arena, call.name) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
@@ -2534,11 +2537,21 @@ fn advertiseUnselectedMcpCalls(
     }
 }
 
-fn containsToolName(names: []const []const u8, name: []const u8) bool {
-    for (names) |candidate| {
-        if (std.mem.eql(u8, candidate, name)) return true;
+fn containsString(items: []const []const u8, item: []const u8) bool {
+    for (items) |candidate| {
+        if (std.mem.eql(u8, candidate, item)) return true;
     }
     return false;
+}
+
+/// Removes the first copy of `item` from `list`, keeping the order.
+fn removeString(list: *std.ArrayList([]const u8), item: []const u8) void {
+    for (list.items, 0..) |candidate, index| {
+        if (std.mem.eql(u8, candidate, item)) {
+            _ = list.orderedRemove(index);
+            return;
+        }
+    }
 }
 
 fn prepareDeferredDynamicCandidate(
@@ -2672,24 +2685,120 @@ pub const TestHooks = if (builtin.is_test) struct {
     pub var context_gate_commit: ?*const fn () Allocator.Error!void = null;
 } else struct {};
 
-fn commitSelectedContext(
+const replaced_rules_preface = "The rules below replace the earlier copy from the same file.\n\n";
+
+/// The notes design's commit (D93): records the delivery and queues the
+/// selected rules as a context note, which joins the turn after this step's
+/// results. Takes `selected.content`. The note keeps each delivered file with
+/// its stamp from `instruction_files`, which read it, so a later turn counts
+/// an unchanged file as delivered. When a file changed since an earlier note,
+/// the note says it replaces that copy. Reminders for rules an earlier turn
+/// delivered follow in a note of their own, without sources, and leave
+/// `remind_sources` for this turn.
+fn commitContextNote(
     arena: Allocator,
-    stable_prefix: *std.ArrayList(ChatMessage),
+    pending_notes: *std.ArrayList(ChatMessage),
     context_delivery_state: *context_contract.DeliveryState,
+    instruction_files: context_contract.InstructionFiles,
     selected: *context_contract.ProviderContext,
+    replaced_sources: []const []const u8,
+    remind_sources: *std.ArrayList([]const u8),
 ) Allocator.Error!void {
     if (comptime builtin.is_test) {
         if (TestHooks.context_gate_commit) |hook| try hook();
     }
-    if (selected.content != null) try stable_prefix.ensureUnusedCapacity(arena, 1);
-    try context_delivery_state.commit(arena, selected);
-    if (selected.content) |content| {
-        stable_prefix.appendAssumeCapacity(.{
-            .role = .system,
-            .content = content,
-        });
-        selected.content = null;
+    if (selected.content != null) {
+        try commitRulesNote(arena, pending_notes, context_delivery_state, instruction_files, selected, replaced_sources);
+    } else {
+        try context_delivery_state.commit(arena, selected);
     }
+    const reminders = selected.reminders orelse return;
+    try pending_notes.append(arena, .{ .role = .system, .content = reminders, .context_note = true });
+    selected.reminders = null;
+    for (selected.reminded_sources) |source| removeString(remind_sources, source);
+    debug_trace.logf("context", "rule reminder queued sources={d} remaining={d}", .{ selected.reminded_sources.len, remind_sources.items.len });
+}
+
+fn commitRulesNote(
+    arena: Allocator,
+    pending_notes: *std.ArrayList(ChatMessage),
+    context_delivery_state: *context_contract.DeliveryState,
+    instruction_files: context_contract.InstructionFiles,
+    selected: *context_contract.ProviderContext,
+    replaced_sources: []const []const u8,
+) Allocator.Error!void {
+    const content = selected.content.?;
+    const sources = try arena.alloc(types.ContextNoteSource, selected.delivered_sources.len);
+    var replaces = false;
+    for (selected.delivered_sources, sources) |source, *dest| {
+        dest.* = .{ .path = try arena.dupe(u8, source), .stamp = instruction_files.sourceStamp(arena, source) };
+        if (containsString(replaced_sources, source)) replaces = true;
+    }
+    const text = if (replaces) try std.mem.concat(arena, u8, &.{ replaced_rules_preface, content }) else content;
+    try pending_notes.ensureUnusedCapacity(arena, 1);
+    try context_delivery_state.commit(arena, selected);
+    pending_notes.appendAssumeCapacity(.{
+        .role = .system,
+        .content = text,
+        .context_note = true,
+        .context_note_sources = sources,
+    });
+    selected.content = null;
+}
+
+/// Counts each instruction file a saved note delivered as delivered when the
+/// file has not changed since, by its stamp from `instruction_files`, so the
+/// gate does not deliver it again (D93). A changed or missing file goes to
+/// `replaced` instead, and the next tool call that reaches it delivers its
+/// current rules in a new note. A note a compaction dropped is not counted
+/// either. Files an earlier turn's note delivered also go to `remindable`;
+/// the recovered turn's own notes do not.
+fn seedNoteDeliveredSources(
+    arena: Allocator,
+    state: *context_contract.DeliveryState,
+    replaced: *std.ArrayList([]const u8),
+    remindable: *std.ArrayList([]const u8),
+    instruction_files: context_contract.InstructionFiles,
+    history: []const types.HistoryTurn,
+    recovery: ?types.ExecutionMemory,
+) Allocator.Error!void {
+    for (history) |turn| {
+        const execution = switch (turn) {
+            .assistant => |entry| entry.execution,
+            .interrupted => |entry| entry.execution,
+            .compacted_summary => continue,
+        };
+        try seedNoteSources(arena, state, replaced, remindable, instruction_files, execution.context_notes);
+    }
+    if (recovery) |execution| try seedNoteSources(arena, state, replaced, null, instruction_files, execution.context_notes);
+}
+
+fn seedNoteSources(
+    arena: Allocator,
+    state: *context_contract.DeliveryState,
+    replaced: *std.ArrayList([]const u8),
+    remindable: ?*std.ArrayList([]const u8),
+    instruction_files: context_contract.InstructionFiles,
+    notes: []const types.PersistedContextNote,
+) Allocator.Error!void {
+    for (notes) |note| for (note.sources) |source| {
+        const current = instruction_files.sourceStamp(arena, source.path);
+        if (source.stamp == 0 or source.stamp != current) {
+            debug_trace.logf("context", "context note source not counted as delivered reason={s} path={s}", .{
+                if (current == 0) "missing" else "changed",
+                source.path,
+            });
+            if (!containsString(replaced.items, source.path)) try replaced.append(arena, try arena.dupe(u8, source.path));
+            continue;
+        }
+        // A later note delivered this file again after it changed.
+        removeString(replaced, source.path);
+        if (!containsString(state.delivered_sources.items, source.path)) {
+            try state.delivered_sources.append(arena, try arena.dupe(u8, source.path));
+        }
+        const list = remindable orelse continue;
+        if (!containsString(list.items, source.path)) try list.append(arena, try arena.dupe(u8, source.path));
+    };
 }
 
 fn candidateHasApplicableContextDelta(
@@ -3801,7 +3910,7 @@ fn appendRunningToolCalls(
     std.debug.assert(issuing.role == .assistant and issuing.tool_calls.len == calls.len);
     try append(deps.ctx, .{
         .user = .{ .text = @constCast(job.prompt), .images = job.images },
-        .execution = try finalization.compacted_execution.project(arena, execution),
+        .execution = try finalization.persistedExecution(arena, execution),
         .running_calls = running,
         .running_assistant = issuing.content,
     });
@@ -3898,7 +4007,7 @@ fn persistRecoveryCheckpointWithAction(
         arena,
         current_turn_messages,
     );
-    const projected = try finalization.compacted_execution.project(arena, execution);
+    const projected = try finalization.persistedExecution(arena, execution);
     const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images };
     // Every completed piece reaches the session before the next request.
     if (deps.append_turn_piece) |append| try append(deps.ctx, .{ .user = user, .execution = projected });
@@ -4024,7 +4133,7 @@ const CompactionSource = struct {
             .turn_id = job.turn_id,
             .user = .{ .text = @constCast(job.prompt), .images = job.images },
             .assistant_source = @constCast(""),
-            .execution = try self.finalization.compacted_execution.project(self.arena, execution),
+            .execution = try self.finalization.persistedExecution(self.arena, execution),
             .cause = .compaction_prepared,
             .action = if (self.tool_evidence == .confirmed) .continuing_after_tool else .retrying_request,
             .tool_state = checkpointToolState(self.tool_evidence),
@@ -5518,7 +5627,64 @@ test "request capabilities resolve before capacity planning and Vision routing" 
 const PreparedSkills = struct {
     catalog: ?*const skill_runtime.BoundedPromptSection = null,
     explicit: ?*const skill_invocation.ExplicitPromptSection = null,
+    /// Where the explicit section's note sits in the turn's messages (D95).
+    explicit_note_index: ?usize = null,
 };
+
+/// Puts a named skill's text on the turn's own message: a context note at the
+/// turn's first boundary, after any note already there, which a save records
+/// as `used_note` (D95). A recovered turn already holds that short note; its
+/// full text goes back in the same place. Returns the note's index.
+fn carryExplicitSkill(
+    arena: Allocator,
+    within_turn_suffix: *std.ArrayList(ChatMessage),
+    text: []const u8,
+    used_note: []const u8,
+) Allocator.Error!usize {
+    var boundary: usize = 0;
+    while (boundary < within_turn_suffix.items.len and within_turn_suffix.items[boundary].role == .system and
+        within_turn_suffix.items[boundary].context_note) : (boundary += 1)
+    {
+        const note = &within_turn_suffix.items[boundary];
+        if (std.mem.startsWith(u8, note.content orelse "", skill_invocation.skill_used_open_tag)) {
+            note.context_note_saved_text = note.content;
+            note.content = text;
+            return boundary;
+        }
+    }
+    try within_turn_suffix.insert(arena, boundary, .{
+        .role = .system,
+        .content = text,
+        .context_note = true,
+        .context_note_saved_text = used_note,
+    });
+    return boundary;
+}
+
+/// After an in-turn compaction keeps the turn's messages from `cut` on, a
+/// cut that covered the named skills' note at `note_index` adds it again
+/// where the kept messages start, so their text still rides on the turn's
+/// message and the instructions stay as they were (D95). Returns the note's
+/// index.
+fn keepExplicitSkillNote(
+    arena: Allocator,
+    within_turn_suffix: *std.ArrayList(ChatMessage),
+    explicit: ?*const skill_invocation.ExplicitPromptSection,
+    note_index: ?usize,
+    cut: usize,
+) Allocator.Error!?usize {
+    const index = note_index orelse return null;
+    if (index >= cut) return index;
+    const section = explicit.?;
+    try within_turn_suffix.insert(arena, cut, .{
+        .role = .system,
+        .content = section.text,
+        .context_note = true,
+        .context_note_saved_text = section.used_note.?,
+    });
+    debug_trace.logf("skills", "explicit skill note added again after compaction index={d}", .{cut});
+    return cut;
+}
 
 fn prepareSkillCatalog(
     alloc: Allocator,
@@ -5533,6 +5699,7 @@ fn prepareSkillCatalog(
         config.skill_catalog.diagnostics,
         config.context_limits,
         context_window,
+        config.workspace_root,
     );
     errdefer section.deinit(alloc);
     if (section.notice) |notice| try deps.pushContextNotice(notice);
@@ -5602,6 +5769,17 @@ fn processQueuedPromptInner(
             &within_turn_suffix,
             checkpoint.execution,
         );
+    }
+    // After a resume whose history names shell handles this process does not
+    // own, the turn says so once, in the conversation, so the instructions
+    // stay as they were cached (D93). It is saved with the turn like any note.
+    if (job.stale_shell_handles) {
+        try within_turn_suffix.append(arena, .{
+            .role = .system,
+            .content = session_runtime.stale_shell_handles_note,
+            .context_note = true,
+        });
+        debug_trace.logf("context", "stale shell handles note queued turn_start=true recovered_messages={d}", .{within_turn_suffix.items.len - 1});
     }
 
     // The overlay arena is reset for every model step so refreshed env,
@@ -5727,34 +5905,17 @@ fn processQueuedPromptInner(
             if (explicit_section.?.load_notice) |notice| try push_notice(deps.ctx, notice);
         }
     }
-    var reconstructed_context = reconstruct: while (true) {
-        const snapshot = reconstructProjectContext(arena, deps, config, job) catch |err| {
-            if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
-            if (try append_immediate_steering_after_cancel(deps, arena, &within_turn_suffix, turn_id, "")) continue :reconstruct;
-            runtime_telemetry.traceCancelObserved(finish_trace.ctx, false);
-            var terminal_materializing = false;
-            try runtime_interruption.persistInterruptedTurnOnce(
-                deps,
-                finalization,
-                job,
-                null,
-                null,
-                completed_tool_names.items,
-                &interrupted_persisted,
-                finish_trace.ctx,
-                within_turn_suffix.items,
-                null,
-                &terminal_materializing,
-            );
-            finish_trace.finish("interrupted");
-            return;
-        };
-        break :reconstruct snapshot;
-    };
-    defer if (reconstructed_context) |*snapshot| snapshot.deinit(arena);
-    var prepared_job = job;
-    if (reconstructed_context) |snapshot| prepared_job.context_snapshot = snapshot;
-    try appendStablePromptContext(arena, deps, config, if (skill_section) |section| section.text else null, if (reconstructed_context) |snapshot| snapshot.modelVisibleBytes() else null, &stable_prefix);
+    // A named skill's text rides on the turn's own message, so the
+    // instructions stay as they were cached; the turn saves a short note in
+    // its place (D95).
+    var explicit_note_index: ?usize = null;
+    if (explicit_section) |section| {
+        if (section.text.len > 0) {
+            explicit_note_index = try carryExplicitSkill(arena, &within_turn_suffix, section.text, section.used_note.?);
+            debug_trace.logf("skills", "explicit skill note queued index={d} bytes={d} saved_bytes={d}", .{ explicit_note_index.?, section.text.len, section.used_note.?.len });
+        }
+    }
+    try appendStablePromptContext(arena, deps, config, if (skill_section) |section| section.text else null, &stable_prefix);
     const active_history = job.history;
     const history_messages_before = stable_prefix.items.len;
     const interrupted_turns = runtime_interruption.countInterruptedHistory(active_history);
@@ -5823,13 +5984,17 @@ fn processQueuedPromptInner(
         semantic_presentation,
         lifecycle,
         config,
-        prepared_job,
-        .{ .catalog = if (skill_section) |*section| section else null, .explicit = if (explicit_section) |*section| section else null },
+        job,
+        .{
+            .catalog = if (skill_section) |*section| section else null,
+            .explicit = if (explicit_section) |*section| section else null,
+            .explicit_note_index = explicit_note_index,
+        },
         request_capabilities,
         finalization,
         arena,
         turn_id,
-        &stable_prefix,
+        stable_prefix.items,
         &history_messages,
         &within_turn_suffix,
         &overlay_arena_state,
@@ -6172,74 +6337,39 @@ fn commitContextCompaction(
     return deps.propagate_history_turn(deps.ctx, .{ .compacted_summary = summary });
 }
 
-fn reconstructProjectContext(
-    alloc: Allocator,
-    deps: *const AgentRuntimeDeps,
-    config: Config,
-    job: QueuedPrompt,
-) !?context_contract.GatheredContextSnapshot {
-    if (!deps.context_enabled) return null;
-    var retained = try tool_preparation.retainedContextTargets(
-        alloc,
-        job.history,
-        if (job.recovery_checkpoint) |checkpoint| checkpoint.execution else null,
-        config.workspace_root,
-        deps.tool_registry,
-        config.cancel_flag,
-    );
-    defer retained.deinit(alloc);
-    if (retained.items.len == 0) return null;
-    const registry = deps.context_registry orelse return error.ContextRegistryUnavailable;
-    var targets: std.ArrayList(context_contract.ApplicableTarget) = .empty;
-    defer targets.deinit(alloc);
-    const prior = job.context_snapshot.evaluated_endpoints;
-    for (prior[0..@min(prior.len, 128)]) |endpoint| {
-        try targets.append(alloc, .{ .path = endpoint, .kind = .directory });
-    }
-    const image_targets = try context_contract.applicableTargetsForImages(alloc, job.images);
-    defer if (image_targets.len > 0) alloc.free(image_targets);
-    try targets.appendSlice(alloc, image_targets[0..@min(image_targets.len, 32)]);
-    try targets.appendSlice(alloc, retained.items);
-    if (config.cancel_flag.load(.seq_cst)) return error.Cancelled;
-    var snapshot = try registry.gatherDefaultSnapshot(alloc, .{
-        .workspace_root = config.workspace_root,
-        .access_scope = config.access_scope,
-        .targets = targets.items,
-        .bounded_reconstruction = true,
-        .context_limits = config.context_limits,
-    });
-    errdefer snapshot.deinit(alloc);
-    if (config.cancel_flag.load(.seq_cst)) return error.Cancelled;
-    for (snapshot.notices) |notice| try deps.pushContextNotice(notice);
-    debug_trace.logf("context", "reconstructed retained_targets={d} delivered_sources={d} bytes={d}", .{ retained.items.len, snapshot.delivered_sources.len, snapshot.modelVisibleBytes().len });
-    return snapshot;
-}
-
 fn appendStablePromptContext(
     alloc: Allocator,
     deps: *const AgentRuntimeDeps,
     config: Config,
     skill_catalog_text: ?[]const u8,
-    project_context: ?[]const u8,
     messages: *std.ArrayList(ChatMessage),
 ) !void {
-    for ([_][]const u8{
-        config.system_prompt,
-        config.custom_tool_guidance,
-        skill_catalog_text orelse "",
-        config.host_instructions,
-    }) |content| {
+    const start = messages.items.len;
+    for ([_][]const u8{ config.system_prompt, config.custom_tool_guidance }) |content| {
+        if (content.len > 0) try messages.append(alloc, .{ .role = .system, .content = content });
+    }
+    // The system prompt and tool guidance are the same in every workspace, so
+    // a session in another worktree or repository can read them from the
+    // cache (tests/tla/prompt_context/PromptCache.tla CrossRepoReuse).
+    markCacheBreakpoint(messages.items[start..]);
+    for ([_][]const u8{ skill_catalog_text orelse "", config.host_instructions }) |content| {
         if (content.len > 0) try messages.append(alloc, .{ .role = .system, .content = content });
     }
     if (config.model_prompt_overlay) |overlay| {
         try messages.append(alloc, .{ .role = .system, .content = overlay });
     }
-    if (deps.append_static_context) |append| {
-        try append(deps.ctx, alloc, project_context, messages);
-    } else if (project_context) |content| {
-        const registry = deps.context_registry orelse return error.ContextRegistryUnavailable;
-        try registry.appendDefaultStatic(.{ .project_context = content }, alloc, messages);
-    }
+    // The session-start project rules; rules a tool call reaches later ride
+    // on its tool result instead (D93).
+    if (deps.append_static_context) |append| try append(deps.ctx, alloc, messages);
+    // The skill catalog and project rules name workspace paths. A breakpoint
+    // at the end of the stable instructions keeps them cached when only the
+    // per-step turn context after them changes (PromptCache.tla
+    // SameWorktreeReuse and ContextChangeKeepsStable).
+    markCacheBreakpoint(messages.items[start..]);
+}
+
+fn markCacheBreakpoint(stable: []ChatMessage) void {
+    if (stable.len > 0) stable[stable.len - 1].cache_breakpoint = true;
 }
 
 pub const ContextCompactionRequest = struct {
@@ -6770,7 +6900,7 @@ fn processQueuedPromptLoop(
     finalization: *TurnFinalizationGuard,
     arena: Allocator,
     turn_id: u64,
-    stable_prefix_ptr: *std.ArrayList(ChatMessage),
+    stable_prefix: []const ChatMessage,
     history_messages_ptr: *std.ArrayList(ChatMessage),
     within_turn_suffix_ptr: *std.ArrayList(ChatMessage),
     overlay_arena_state: *std.heap.ArenaAllocator,
@@ -6787,8 +6917,6 @@ fn processQueuedPromptLoop(
     // The image route core's turn state. This loop is its shell: it runs each
     // effect `image_route.step` returns and feeds the result back.
     var image_route_state = image_route.step(.{}, .{ .turn_started = request_capabilities.image_input_support }).state;
-    var stable_prefix = stable_prefix_ptr.*;
-    defer stable_prefix_ptr.* = stable_prefix;
     const history_messages = history_messages_ptr.*;
     var within_turn_suffix = within_turn_suffix_ptr.*;
     defer within_turn_suffix_ptr.* = within_turn_suffix;
@@ -6812,6 +6940,8 @@ fn processQueuedPromptLoop(
     var trace_count_after_compaction = false;
     var compaction_history = job.history;
     var compacted_suffix_len: usize = 0;
+    // Where the named skills' note sits in `within_turn_suffix` (D95).
+    var explicit_note_index = skills.explicit_note_index;
     // Request-token calibration lives on the agent so the first request of a
     // new turn still calibrates from the previous turn's exact usage.
     var completed_tool_names = completed_tool_names_ptr.*;
@@ -6821,6 +6951,25 @@ fn processQueuedPromptLoop(
     else
         .{};
     defer context_delivery_state.deinit(arena);
+    // Files saved notes delivered that changed since; their current rules
+    // are delivered again when a tool call reaches them.
+    var replaced_note_sources: std.ArrayList([]const u8) = .empty;
+    // Files an earlier turn's notes delivered: the first tool call this turn
+    // that reaches one again gets a reminder line in place of the rules.
+    var remind_sources: std.ArrayList([]const u8) = .empty;
+    // Without a registry the gate never runs, so nothing is seeded.
+    if (deps.context_enabled) if (deps.context_registry) |registry| try seedNoteDeliveredSources(
+        arena,
+        &context_delivery_state,
+        &replaced_note_sources,
+        &remind_sources,
+        registry.instruction_files,
+        job.history,
+        if (job.recovery_checkpoint) |checkpoint| checkpoint.execution else null,
+    );
+    // Notes the gate queued during a step; they join the turn at the next
+    // step boundary.
+    var pending_context_notes: std.ArrayList(ChatMessage) = .empty;
     const root_user_intent_context = switch (config.origin) {
         .subagent => if (config.current_prompt_is_root_authority)
             try auto_classifier_context.buildRootUserContextFromVerifiedRequests(
@@ -6860,11 +7009,14 @@ fn processQueuedPromptLoop(
     defer interrupted_persisted_ptr.* = interrupted_persisted;
     var silent_tool_steps: usize = 0;
     var continuation_injected = false;
+    // The limit the turn's one retry of an empty, cut-short reply set. Later
+    // steps keep it until the catalog names a limit of its own.
+    var length_retry_output_tokens: ?u32 = null;
     var last_step_ctx = finish_trace.ctx;
     var current_step_index: usize = 0;
     var last_tool_call_name: []const u8 = "none";
     var last_tool_call_id: []const u8 = "none";
-    var last_gateway_message_count: usize = stable_prefix.items.len + history_messages.items.len + 1;
+    var last_gateway_message_count: usize = stable_prefix.len + history_messages.items.len + 1;
     var selected_dynamic_tools: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
     try selected_dynamic_tools.ensureTotalCapacity(arena, config.initial_dynamic_tools.len);
     for (config.initial_dynamic_tools) |tool| {
@@ -6959,8 +7111,23 @@ fn processQueuedPromptLoop(
     else
         .none;
     var restore_recovery_source = job.recovery_checkpoint != null;
+    // The session sends one runtime context ahead of the history; a change
+    // joins the conversation instead (D94).
+    var runtime_context = try runtime_context_state.State.init(
+        arena,
+        job.history,
+        if (job.recovery_checkpoint) |checkpoint| checkpoint.execution else null,
+    );
+    finalization.captured_runtime_context = runtime_context.captured;
+    debug_trace.logf("context", "runtime context saved_copy={} known_update={}", .{ runtime_context.frozen != null, runtime_context.known_update != null });
     var step: usize = 0;
     agent_steps_loop: while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
+        // The notes the last step's gate queued follow that step's results and
+        // come before any steering at this boundary (D93).
+        if (pending_context_notes.items.len > 0) {
+            try within_turn_suffix.appendSlice(arena, pending_context_notes.items);
+            pending_context_notes.clearRetainingCapacity();
+        }
         current_step_index = step + 1;
         if (deps.observer) |observer| observer.beginStep(current_step_index);
         defer if (deps.observer) |observer| observer.endStep();
@@ -6987,6 +7154,20 @@ fn processQueuedPromptLoop(
         }
         _ = overlay_arena_state.reset(.retain_capacity);
         const overlay_arena = overlay_arena_state.allocator();
+        // A changed runtime context joins this boundary before its steering,
+        // as the notes above do (D93, D94).
+        var current_runtime_context: std.ArrayList(ChatMessage) = .empty;
+        try deps.append_runtime_context(deps.ctx, overlay_arena, &current_runtime_context);
+        const was_captured = runtime_context.captured != null;
+        const runtime_update = try runtime_context.refresh(arena, overlay_arena, current_runtime_context.items);
+        if (!was_captured and runtime_context.captured != null) {
+            finalization.captured_runtime_context = runtime_context.captured;
+            debug_trace.logf("context", "runtime context captured step={d} messages={d}", .{ current_step_index, runtime_context.messages().len });
+        }
+        if (runtime_update) |note| {
+            try within_turn_suffix.append(arena, .{ .role = .system, .content = note, .context_note = true });
+            debug_trace.logf("context", "runtime context update queued step={d} bytes={d}", .{ current_step_index, note.len });
+        }
         const steering_action = try observe_steering_boundary(
             deps,
             arena,
@@ -7011,10 +7192,7 @@ fn processQueuedPromptLoop(
             return;
         }
         var ephemeral_overlay: std.ArrayList(ChatMessage) = .empty;
-        if (skills.explicit) |section| {
-            if (section.text.len > 0) try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = section.text });
-        }
-        try deps.append_runtime_context(deps.ctx, overlay_arena, &ephemeral_overlay);
+        try ephemeral_overlay.appendSlice(overlay_arena, runtime_context.messages());
         var parent_turn_delivery = try appendPreparedParentTurnContext(
             deps,
             overlay_arena,
@@ -7022,7 +7200,7 @@ fn processQueuedPromptLoop(
         );
         var provider_prompt = try build_provider_prompt_with_response_language_control(
             overlay_arena,
-            stable_prefix.items,
+            stable_prefix,
             ephemeral_overlay.items,
             history_messages.items,
             current_user_effective,
@@ -7041,7 +7219,7 @@ fn processQueuedPromptLoop(
             @intFromBool(initial_decision_pending);
         var current_user_message_index = provider_prompt.current_user_index;
         const response_language_hold_until_completion =
-            response_language_context_conflicts(response_language_expectation, stable_prefix.items) or
+            response_language_context_conflicts(response_language_expectation, stable_prefix) or
             response_language_context_conflicts(response_language_expectation, ephemeral_overlay.items) or
             response_language_context_conflicts(response_language_expectation, history_messages.items) or
             response_language_context_conflicts(response_language_expectation, within_turn_suffix.items);
@@ -7198,7 +7376,7 @@ fn processQueuedPromptLoop(
             }
             provider_prompt = try build_provider_prompt_with_response_language_control(
                 overlay_arena,
-                stable_prefix.items,
+                stable_prefix,
                 ephemeral_overlay.items,
                 history_messages.items,
                 current_user_effective,
@@ -7377,9 +7555,12 @@ fn processQueuedPromptLoop(
             // After the steering rewrap, which recognizes a parent's steering
             // by how its text starts.
             const located_messages = try image_attachments.noteAttachmentLocations(overlay_arena, steering_messages);
-            const request_messages = try with_replyable_conversation_tail(overlay_arena, located_messages);
-            if (request_messages.ptr != located_messages.ptr) {
-                debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{located_messages.len});
+            // The one place context notes join their tool results, before
+            // anything measures, observes, or sends the request (D93).
+            const noted_messages = try agent_stream_provider.carryContextNotes(overlay_arena, located_messages);
+            const request_messages = try with_replyable_conversation_tail(overlay_arena, noted_messages);
+            if (request_messages.ptr != noted_messages.ptr) {
+                debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{noted_messages.len});
             }
             // Images withheld because the catalog could not confirm image
             // input are invisible in the transcript otherwise. The core asks
@@ -7426,7 +7607,7 @@ fn processQueuedPromptLoop(
                 .tool_choice = tool_choice,
                 .vision_mode = vision_mode,
                 .provider_options = provider_opts,
-                .max_output_tokens = model_capabilities.requestOutputTokens(request_capabilities),
+                .max_output_tokens = model_capabilities.requestOutputTokens(request_capabilities) orelse length_retry_output_tokens,
                 .budget = .{ .cancel_flag = config.cancel_flag },
             };
             // The request re-sends every image the session keeps, and
@@ -7608,6 +7789,7 @@ fn processQueuedPromptLoop(
                             .steering = outcome.cut.steering,
                         } else .{};
                         compacted_suffix_len += try runtime_execution_memory.retainedMessageOffset(within_turn_suffix.items[compacted_suffix_len..], active_cut);
+                        explicit_note_index = try keepExplicitSkillNote(arena, &within_turn_suffix, skills.explicit, explicit_note_index, compacted_suffix_len);
                         var retained_messages: std.ArrayList(ChatMessage) = .empty;
                         try session_runtime.appendHistoryChatMessages(arena, &retained_messages, outcome.retained_history);
                         try projectEmptyHistoryReplay(arena, deps.agent_stream_provider, .{ .provider = job.provider, .model = gateway_model }, retained_messages.items);
@@ -8191,6 +8373,9 @@ fn processQueuedPromptLoop(
                     }
                 }
                 agent.observeUsage(completion.usage);
+                if (deps.record_usage) |record| record(deps.ctx, completion.usage) catch |err| {
+                    debug_trace.logf("agent", "event=usage_not_saved err={s}", .{@errorName(err)});
+                };
                 // The completion buffer is step-scoped, so no cross-step
                 // dedupe: each completion reports its serving provider once.
                 // The push_event callback takes ownership of the payload on
@@ -9403,6 +9588,27 @@ fn processQueuedPromptLoop(
             },
         );
         try runtime_telemetry.traceReturnedToolCalls(arena, step_ctx, completion.tool_calls);
+        // A reply the provider cut short before any text or tool call, from a
+        // request that named no output limit, ran out of the provider's own
+        // default. A provider that takes fx's limit gets the request once more
+        // with one.
+        const empty_length_retry: ?u32 = if (disposition == .length_limited and
+            completion.tool_calls.len == 0 and
+            std.mem.trim(u8, partial_assistant, " \t\r\n").len == 0 and
+            length_retry_output_tokens == null and
+            config.provider_capabilities.sends_output_limit and
+            model_capabilities.requestOutputTokens(request_capabilities) == null and
+            agent_steps.allowsStep(config.agent_step_limit, step + 1))
+            model_capabilities.emptyLengthRetryOutputTokens(request_capabilities)
+        else
+            null;
+        if (empty_length_retry) |limit| {
+            length_retry_output_tokens = limit;
+            debug_trace.eventf("agent", "empty_length_limited_retry", step_ctx, "max_output_tokens={d}", .{limit});
+            try deps.push_text(deps.ctx, .{ .operational = empty_length_retry_notice });
+            try deps.push_text(deps.ctx, .{ .operational = "\n" });
+            continue;
+        }
         try runtime_assistant_stream.emitProviderLengthNotice(deps, arena, disposition);
         const terminal_provider_completion = isTerminalProviderExecutedCompletion(completion);
         const final_provider_replay = if (terminal_provider_completion or filtered_provider_calls.removed > 0)
@@ -9459,7 +9665,7 @@ fn processQueuedPromptLoop(
             var turn: HistoryTurn = .{ .assistant = .{
                 .user = .{ .text = job.prompt, .images = job.images },
                 .assistant = @constCast(assistant_text),
-                .execution = try finalization.compacted_execution.project(arena, finish_execution),
+                .execution = try finalization.persistedExecution(arena, finish_execution),
             } };
             types.setHistoryTurnSummary(&turn, completed_summary);
             try deps.propagate_history_turn(deps.ctx, turn);
@@ -9499,9 +9705,10 @@ fn processQueuedPromptLoop(
                 continue;
             }
 
-            const raw_final = if (has_content) partial_assistant else "Done.";
+            const empty_final: []const u8 = if (disposition == .length_limited) empty_length_limited_reply else "Done.";
+            const raw_final = if (has_content) partial_assistant else empty_final;
             const final_text = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, raw_final);
-            const rendered = if (final_text.len > 0) final_text else "Done.";
+            const rendered = if (final_text.len > 0) final_text else empty_final;
             const history_text = try arena.dupe(u8, raw_final);
             const history_replay = if (has_content) final_provider_replay else try deps.agent_stream_provider.projectReplay(arena, final_provider_replay, &.{}, false, true);
 
@@ -9903,6 +10110,7 @@ fn processQueuedPromptLoop(
                 .targets = preparation_batch.applicable_targets.items,
                 .delivered_sources = context_delivery_state.delivered_sources.items,
                 .evaluated_endpoints = context_delivery_state.evaluated_endpoints.items,
+                .remind_sources = remind_sources.items,
                 .context_limits = config.context_limits,
             }) catch |err| {
                 return settleFailedContextGate(
@@ -10006,12 +10214,7 @@ fn processQueuedPromptLoop(
                 return;
             }
 
-            commitSelectedContext(
-                arena,
-                &stable_prefix,
-                &context_delivery_state,
-                &selected,
-            ) catch |err| {
+            commitContextNote(arena, &pending_context_notes, &context_delivery_state, context_registry.instruction_files, &selected, replaced_note_sources.items, &remind_sources) catch |err| {
                 return settleFailedContextGate(
                     deps,
                     &stream_ctx.provisional_statuses,
@@ -12571,7 +12774,7 @@ fn finishFailedTurnWithNotice(
     var turn: HistoryTurn = .{ .assistant = .{
         .user = .{ .text = job.prompt, .images = job.images },
         .assistant = @constCast(notice),
-        .execution = try finalization.compacted_execution.project(arena, execution_memory),
+        .execution = try finalization.persistedExecution(arena, execution_memory),
     } };
     types.setHistoryTurnSummary(&turn, completed_summary);
     try deps.propagate_history_turn(deps.ctx, turn);

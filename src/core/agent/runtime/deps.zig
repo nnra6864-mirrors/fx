@@ -227,7 +227,7 @@ pub const AgentRuntimeDeps = struct {
     prepare_parent_turn_context: ?*const fn (ctx: *anyopaque, arena: Allocator) anyerror!?PreparedParentTurnContext = null,
     acknowledge_parent_turn_context: ?*const fn (ctx: *anyopaque, arena: Allocator, acknowledgements: []const ParentTurnDeliveryAck) void = null,
     append_runtime_context: *const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void,
-    append_static_context: ?*const fn (ctx: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) anyerror!void = null,
+    append_static_context: ?*const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void = null,
     validate_tool_call: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!ToolCallValidationResult = null,
     snapshot_mcp_definition: ?*const fn (*anyopaque, Allocator, []const u8, types.McpToolBinding) anyerror!@import("../../tooling/tool_mcp_runtime.zig").DefinitionSnapshot = null,
     /// Resolves a model call naming a live MCP tool that this step did not
@@ -257,6 +257,10 @@ pub const AgentRuntimeDeps = struct {
     /// Called at every model-request boundary with the turn so far, so each
     /// completed piece is saved as it happens rather than at the turn's end.
     append_turn_piece: ?*const fn (ctx: *anyopaque, progress: TurnProgress) anyerror!void = null,
+    /// Called once with each main-model completion's provider usage, as soon
+    /// as it arrives, so a saved session keeps the usage of every reply even
+    /// when the turn never ends. A failure is traced and never fails the turn.
+    record_usage: ?*const fn (ctx: *anyopaque, usage: types.Usage) anyerror!void = null,
     /// Saves the turn's prompt images in the session before its first
     /// request is built, so the note naming each saved file is true when
     /// that request is sent (D89). It sets `blob_path`, allocated with

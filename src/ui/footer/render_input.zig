@@ -23,6 +23,7 @@ const file_index = @import("../../core/workspace/file_index.zig");
 const workspace_menu = @import("../../core/workspace/workspace_menu.zig");
 const activity_runtime = @import("../../core/output/activity_runtime.zig");
 const transcript_presentation = @import("../../core/output/transcript_presentation.zig");
+const effort_menu = @import("../../core/input/effort_menu.zig");
 const info_panel = @import("../../core/input/info_panel.zig");
 const usage_menu = @import("../../core/session/usage_menu.zig");
 const core_input_runtime = @import("../../core/input/runtime.zig");
@@ -140,6 +141,30 @@ pub const ForkMenuProjection = struct {
         return self.points.len > 0;
     }
 };
+
+/// What the `/effort` menu shows: the current model's reasoning effort
+/// levels, the one in use, and the one highlighted.
+pub const EffortMenuProjection = struct {
+    active: bool = false,
+    model: []const u8 = "",
+    /// `default`, then the model's levels.
+    levels: []const types.ReasoningEffort = &.{},
+    current: usize = 0,
+    selected: usize = 0,
+    window_start: usize = 0,
+};
+
+pub fn effortMenuProjection(menu: *const effort_menu.State) EffortMenuProjection {
+    if (!menu.active) return .{};
+    return .{
+        .active = true,
+        .model = menu.model.items,
+        .levels = menu.levels(),
+        .current = menu.current,
+        .selected = menu.selected,
+        .window_start = menu.window_start,
+    };
+}
 
 pub const HelpMenuProjection = struct {
     active: bool = false,
@@ -380,6 +405,7 @@ pub const RenderContext = struct {
     model_menu: ModelMenuProjection = .{},
     session_menu: SessionMenuProjection = .{},
     fork_menu: ForkMenuProjection = .{},
+    effort_menu: EffortMenuProjection = .{},
     statusline_menu: StatuslineMenuProjection = .{},
     info_panel: InfoPanelProjection = .{},
     usage_menu: UsageMenuProjection = .{},
@@ -703,7 +729,8 @@ fn appendConnectedToolLabel(
     var connected: std.ArrayList(u8) = .empty;
     defer connected.deinit(alloc);
     try connected.appendSlice(alloc, ui_render.statusline_style);
-    if (std.mem.eql(u8, marker_bytes, "●") or std.mem.eql(u8, marker_bytes, "■")) {
+    // `■` is the cancelled marker older sessions recorded before `▪`.
+    if (std.mem.eql(u8, marker_bytes, "●") or std.mem.eql(u8, marker_bytes, "▪") or std.mem.eql(u8, marker_bytes, "■")) {
         try connected.appendSlice(alloc, "└");
         try appendWithoutAnsi(alloc, &connected, label[marker_end .. marker_end + line_end]);
     } else {

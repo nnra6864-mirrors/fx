@@ -21,7 +21,6 @@ from scripts.pgso.pipeline import (
     emit_bitcode,
     link_candidate,
     merge_profile_batch,
-    read_macos_minos,
     verify_candidate,
 )
 from scripts.pgso.qualify import (
@@ -36,7 +35,7 @@ from scripts.pgso.qualify import (
     require_measurements_passed,
 )
 from scripts.pgso.runner import cancellation_guard, run_checked
-from scripts.pgso.toolchain import SUPPORTED_TARGET
+from scripts.pgso.toolchain import DEFAULT_TARGET
 from scripts.pgso.toolchain import Toolchain
 
 
@@ -84,7 +83,7 @@ def load_read_only_manifest(path: pathlib.Path) -> Mapping[str, object]:
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--llvm-bin", required=True)
     parser.add_argument("--output-dir", required=True, type=pathlib.Path)
-    parser.add_argument("--target", default=SUPPORTED_TARGET)
+    parser.add_argument("--target", default=DEFAULT_TARGET)
     parser.add_argument(
         "--update-channel",
         choices=("stable", "dev"),
@@ -321,7 +320,7 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
         stage = "control"
         recorder.stage(stage, "running")
         control = build_control(toolchain, spec, paths)
-        control_minos = read_macos_minos(
+        control_identity = toolchain.platform.read_control_identity(
             toolchain,
             control,
             paths.logs / "control-load-commands.json",
@@ -335,7 +334,7 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
                     "path": str(control),
                     "sha256": control_sha256,
                     "size_bytes": control.stat().st_size,
-                    "minimum_macos": control_minos,
+                    **control_identity,
                 }
             },
         )
@@ -365,7 +364,7 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
         smoke_profiles = build_instrumented(
             toolchain,
             paths,
-            control_minos,
+            control_identity,
         )
         merged_raw_profiles = merge_profile_batch(
             toolchain,
@@ -442,7 +441,7 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
         candidate = verify_candidate(
             toolchain,
             paths,
-            expected_minos=control_minos,
+            control_identity,
         )
         if not candidate.artifact.preferred_headroom_met:
             raise PgsoError(
@@ -454,15 +453,13 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
                 "path": str(control),
                 "sha256": control_sha256,
                 "size_bytes": control.stat().st_size,
-                "minimum_macos": control_minos,
+                **control_identity,
             },
             "candidate": {
                 "path": str(paths.candidate_binary),
                 "sha256": candidate.sha256,
                 "size": dataclasses.asdict(candidate.artifact),
-                "architecture": candidate.metadata.architecture,
-                "minimum_macos": candidate.metadata.min_macos,
-                "signature_valid": candidate.metadata.signature_valid,
+                **toolchain.platform.candidate_evidence(candidate.metadata),
                 "version": candidate.version_output,
             },
             "warnings": 0,

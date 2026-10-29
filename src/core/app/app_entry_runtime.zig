@@ -313,9 +313,9 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
         }
         return initFailure(deps, launch, alloc, first_err);
     };
-    if (comptime !cooperative) {
-        if (@hasDecl(App, "rebindAfterInit")) app.rebindAfterInit();
-    }
+    // `App.init` built the app in a local and copied it here: whatever holds
+    // a pointer to the app needs this address instead.
+    if (@hasDecl(App, "rebindAfterInit")) app.rebindAfterInit();
     var app_needs_deinit = true;
     defer if (app_needs_deinit) {
         if (comptime cooperative) {
@@ -970,6 +970,17 @@ test "app entry runs interactive startup callbacks in active order" {
     try std.testing.expectEqual(RunOutcome.returned, outcome);
     try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
     try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "deinit" });
+}
+
+test "a cooperative launch rebinds the app at its final address before running it" {
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    var launch: cli_surface.InteractiveLaunch = .{};
+    var app: TestApp = undefined;
+    const outcome = try runInteractiveWithDeps(TestApp, true, &app, std.testing.allocator, &launch, .local, capture.deps());
+
+    try std.testing.expectEqual(RunOutcome.returned, outcome);
+    try expectEvents(&.{ "init:none", "rebind-after-init", "run", "terminal-release", "deinit" });
 }
 
 test "app entry reports persistence failure after teardown instead of a successful handoff" {
