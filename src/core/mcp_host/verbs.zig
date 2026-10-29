@@ -15,6 +15,7 @@ const credentials = @import("credentials.zig");
 const secret = @import("../auth/secret.zig");
 const slack = @import("slack.zig");
 const runtime_mod = @import("runtime.zig");
+const mcp_call_client = @import("mcp_call_client.zig");
 const Host = @import("host.zig").Host;
 
 const Allocator = std.mem.Allocator;
@@ -34,7 +35,7 @@ pub const Surface = enum {
     }
 };
 
-pub const Verb = enum { list, show, add, remove, login, logout, approve, reject };
+pub const Verb = enum { list, show, add, remove, login, logout, approve, reject, call };
 
 pub const Command = union(enum) {
     help: ?Verb,
@@ -47,6 +48,8 @@ pub const Command = union(enum) {
     /// Null approves every project server.
     approve: ?[]const u8,
     reject: []const u8,
+    /// `arguments` is JSON, `-` for stdin, or null for none.
+    call: struct { tool: []const u8, arguments: ?[]const u8 },
 };
 
 pub const Parsed = union(enum) {
@@ -90,7 +93,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
     while (i < dash) : (i += 1) {
         const a = rest[i];
         if (isHelp(a)) return .{ .command = .{ .help = verb } };
-        if (a.len == 0 or a[0] != '-') {
+        if (a.len == 0 or a[0] != '-' or (verb == .call and std.mem.eql(u8, a, "-"))) {
             try names.append(arena, a);
             continue;
         }
@@ -100,7 +103,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
             .remove => std.mem.eql(u8, a, "--project") or std.mem.eql(u8, a, "--profile"),
             .login => std.mem.eql(u8, a, "--no-browser"),
             .approve => std.mem.eql(u8, a, "--all"),
-            .logout, .reject => false,
+            .logout, .reject, .call => false,
         };
         if (verb == .list and std.mem.eql(u8, a, "--connect")) return moved(arena, "{s} list --connect is now {s} show NAME.", .{ p, p });
         if (!allowed) return usage(arena, verb, "{s} {s} has no {s} flag.", .{ p, @tagName(verb), a });
@@ -151,6 +154,11 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
             if (pair_flag != null and std.mem.eql(u8, pair_flag.?, "--env")) return usage(arena, verb, "--env is for stdio servers; use --header for HTTP.", .{});
             return .{ .command = .{ .add = .{ .name = name, .file = file, .entry = .{ .http = .{ .url = url, .headers = pairs.items } } } } };
         },
+        .call => {
+            if (surface == .shell) return usage(arena, verb, "/mcp call runs only in a command that fx's shell tool runs: fx mcp call TOOL [JSON].", .{});
+            if (n.len == 0 or n.len > 2) return usage(arena, verb, "{s} call needs a TOOL and at most one JSON argument.", .{p});
+            return .{ .command = .{ .call = .{ .tool = n[0], .arguments = if (n.len == 2) n[1] else null } } };
+        },
         .approve => {
             if (all and n.len > 0) return usage(arena, verb, "{s} approve takes a NAME or --all, not both.", .{p});
             if (all) return .{ .command = .{ .approve = null } };
@@ -169,7 +177,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
         .logout => .{ .logout = name },
         .approve => .{ .approve = name },
         .reject => .{ .reject = name },
-        .list, .add => unreachable,
+        .list, .add, .call => unreachable,
     } };
 }
 
@@ -196,6 +204,7 @@ const overview = [_][2][]const u8{
     .{ "logout NAME", "sign out and delete the login" },
     .{ "approve NAME | --all", "approve project servers from .mcp.json" },
     .{ "reject NAME", "reject a project server" },
+    .{ "call TOOL [JSON | -]", "run an MCP tool from a command fx runs" },
 };
 
 /// The usage of one verb, or of every verb.
@@ -226,6 +235,19 @@ pub fn writeUsage(w: *Writer, surface: Surface, verb: ?Verb) Writer.Error!void {
         .logout => try w.print("usage: {s} logout NAME\n", .{p}),
         .approve => try w.print("usage: {s} approve NAME | --all\n", .{p}),
         .reject => try w.print("usage: {s} reject NAME\n", .{p}),
+        .call => try w.print(
+            \\usage: {s} call TOOL [JSON | -]
+            \\  Runs the MCP tool TOOL, such as mcp_linear_list_issues, with the JSON
+            \\  object of arguments, or with the object on stdin for -. Prints just
+            \\  the tool's data, so a command can save it to a file or filter it.
+            \\  Works only in a command that fx's shell tool runs, while it runs, and
+            \\  asks permission as a direct call of TOOL would.
+            \\  Exits 0 on success, 1 when the call fails, 2 for a usage mistake,
+            \\  3 outside a running fx shell call, 4 when too many calls are
+            \\  running, 5 when permission is not granted, and 6 when the tool
+            \\  returns an error.
+            \\
+        , .{p}),
     }
 }
 
@@ -255,7 +277,8 @@ pub const Context = struct {
 };
 
 /// Runs `fx mcp ARGS` or `/mcp ARGS` and returns the exit code: 0 for
-/// success, 1 for a failure, 2 for a usage mistake.
+/// success, 1 for a failure, 2 for a usage mistake. `call` has more; see
+/// `mcp_call_client.exit`.
 pub fn run(c: Context, args: []const []const u8) u8 {
     var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
     defer arena_state.deinit();
@@ -296,6 +319,7 @@ fn runParsed(c: Context, arena: Allocator, args: []const []const u8) !u8 {
         .logout => |name| logout(c, arena, name),
         .approve => |name| trust(c, arena, if (name) |n| .{ .approve = n } else .approve_all),
         .reject => |name| trust(c, arena, .{ .reject = name }),
+        .call => |cl| mcp_call_client.run(arena, io_mod.getIo(), c.out, c.err, cl.tool, cl.arguments),
     };
 }
 

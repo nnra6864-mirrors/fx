@@ -4649,6 +4649,10 @@ test {
     _ = @import("mcp/mcp.zig");
     _ = @import("core/mcp_host/runtime.zig");
     _ = @import("core/mcp_host/wire_tests.zig");
+    _ = @import("core/mcp_host/mcp_call.zig");
+    _ = @import("core/mcp_host/mcp_call_wire.zig");
+    _ = @import("core/mcp_host/mcp_call_bridge.zig");
+    _ = @import("core/mcp_host/mcp_call_client.zig");
     _ = @import("napi_fetch_state.zig");
     _ = @import("core/config/model_provider.zig");
     _ = @import("core/config/configured_provider.zig");

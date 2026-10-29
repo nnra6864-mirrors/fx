@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runFx } from "../evals/eval-helpers";
+import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { contentText } from "./conditional-guidance-oracle";
 import { pngPixelSize, solidPng } from "./fixtures/image-encoding";
 import {
@@ -3878,4 +3878,76 @@ describe("MCP stdio servers", () => {
     // Nothing needed the configured server, so it never started.
     expect(existsSync(root.wireLogPath)).toBe(false);
   }, 25_000);
+});
+
+// `fx mcp call` lets a command fx's shell tool runs call the session's MCP
+// tools, so a big result can go to a file and only what the command prints
+// reaches the model (`src/core/mcp_host/mcp_call_bridge.zig`).
+describe("fx mcp call", () => {
+  const bridgeRoot = (label: string, settings: Record<string, unknown> = {}) => {
+    const root = createRoot(label, MODERN_FIXTURE);
+    const profilePath = join(root.home, ".fx", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    profile.mcp.fixture.environment.FX_MCP_RESULT_PAD_BYTES = String(1536 * 1024);
+    profile.mcp.fixture.environment.FX_MCP_RESULT_TEXT = "BRIDGE_TAIL";
+    writeFileSync(profilePath, JSON.stringify(profile));
+    writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify(settings));
+    return root;
+  };
+  const command = `"${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"hello"}' > out.txt; echo "exit=$?"; wc -c < out.txt | tr -d ' '; tail -c 18 out.txt`;
+  const toolCalls = (root: FixtureRoot) =>
+    existsSync(root.wireLogPath)
+      ? readWire(root.wireLogPath).filter((entry) => entry.message.method === "tools/call")
+      : [];
+
+  test("a command saves a big MCP result to a file, and only what it prints reaches the model", async () => {
+    const root = bridgeRoot("bridge-file");
+    let seen = "";
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command }),
+      (body: string) => {
+        seen = toolResultText(body, "run_call");
+        return fakeGatewayFinalText("BRIDGE_DONE");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const result = await runFx(["ask", "--json", "--full-access", "--no-save", "Save the list to a file."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway),
+      timeoutMs: 40_000,
+    });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("BRIDGE_DONE");
+    expect(seen).toContain("exit=0");
+    expect(seen).toContain("BRIDGE_TAIL:hello");
+    expect(seen.length).toBeLessThan(4096);
+    const saved = readFileSync(join(root.workspace, "out.txt"), "utf8");
+    expect(saved.length).toBeGreaterThan(1536 * 1024);
+    expect(saved.trimEnd().endsWith("BRIDGE_TAIL:hello")).toBe(true);
+    expect(toolCalls(root)).toHaveLength(1);
+  }, 60_000);
+
+  test("a call the permission rules deny runs nothing, and the command learns why", async () => {
+    const root = bridgeRoot("bridge-denied", { permission: { bash: { "*": "allow" }, [TOOL_NAME]: "deny" } });
+    let seen = "";
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command }),
+      (body: string) => {
+        seen = toolResultText(body, "run_call");
+        return fakeGatewayFinalText("BRIDGE_DENIED");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Save the list to a file."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway),
+      timeoutMs: 40_000,
+    });
+    expect(result.code).toBe(0);
+    expect(seen).toContain("exit=5");
+    expect(seen).toContain("did not run");
+    expect(toolCalls(root)).toHaveLength(0);
+  }, 60_000);
 });

@@ -52,6 +52,9 @@ const compactor = @import("../compactor/compactor.zig");
 const file_mutation_execution = @import("file_mutation_execution.zig");
 const tool_mcp_registry = @import("tool_mcp_registry.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
+const mcp_call_capability = @import("mcp_call_capability.zig");
+const model_tool_schema = @import("model_tool_schema.zig");
+const auto_classifier_context = @import("../permissions/auto_classifier_context.zig");
 const capability_retrieval = @import("capability_retrieval.zig");
 const tool_presentation = @import("tool_presentation.zig");
 const shell_impl = @import("../../tools/shell/shell.zig");
@@ -851,6 +854,7 @@ fn executeRegisteredTool(
         .call = call,
         .completion_sink = &dispatch_metadata.subagent_completion,
     };
+    var mcp_call_bridge = McpCallBridgeState{ .runtime = ctx };
     var dispatch_ctx = typedDispatchContextForCall(ctx, arena, call);
     dispatch_metadata.attach(&dispatch_ctx);
     var result_commit_token: ?result_commit.Token = null;
@@ -870,6 +874,9 @@ fn executeRegisteredTool(
         .access = ctx.mcp_access,
     };
     dispatch_ctx.mcp_call_status_sink = &mcp_call_status;
+    if (ctx.mcp_ctx != null and ctx.mcp_call_tool != null) {
+        dispatch_ctx.mcp_call_capability = mcp_call_bridge.capability();
+    }
     const runtime_provider = if (registry.lookup(call.name)) |tool|
         tool.runtime_provider
     else
@@ -936,6 +943,153 @@ fn executeRegisteredTool(
         }
     }
     return execution;
+}
+
+/// Lends this tool call's permission check and MCP call to the `fx mcp call`
+/// bridge while the call runs (`mcp_call_capability.zig`).
+const McpCallBridgeState = struct {
+    runtime: Context,
+
+    fn capability(self: *McpCallBridgeState) mcp_call_capability.Capability {
+        return .{ .context = @ptrCast(self), .authorize_fn = authorizeBridgeCall, .call_fn = runBridgeCall };
+    }
+};
+
+/// Checks a bridge call as the agent's own call of an MCP tool it never
+/// selected: the tool must resolve for this agent, and the call then meets
+/// the configured and saved rules, the prompt, and automatic review, which
+/// sees exactly this call.
+fn authorizeBridgeCall(
+    raw: *anyopaque,
+    arena: Allocator,
+    request_id: []const u8,
+    tool: []const u8,
+    arguments_json: []const u8,
+) anyerror!mcp_call_capability.Authorization {
+    const state: *McpCallBridgeState = @ptrCast(@alignCast(raw));
+    const ctx = state.runtime;
+    if (ctx.tool_registry.lookup(tool) != null) {
+        return .{ .deny = try arena.print("{s} is a built-in tool; fx mcp call runs MCP tools only.", .{tool}) };
+    }
+    const resolved = (try resolveUnselectedMcpTool(ctx, arena, tool)) orelse {
+        return .{ .deny = try arena.print("No MCP tool named {s} is available to this agent. Find tool names with capability_search.", .{tool}) };
+    };
+    const call: ToolCall = .{ .id = request_id, .name = tool, .arguments_json = arguments_json };
+    var check = ctx;
+    const names = try arena.alloc([]const u8, ctx.advertised_dynamic_tool_names.len + 1);
+    @memcpy(names[0..ctx.advertised_dynamic_tool_names.len], ctx.advertised_dynamic_tool_names);
+    names[names.len - 1] = tool;
+    check.advertised_dynamic_tool_names = names;
+    check.mcp_review_schema_json = try bridgeReviewSchema(arena, resolved);
+    check.expected_mcp_binding = resolved.mcp_binding;
+    check.permission_review_turn = .{
+        .observer = ctx.observer,
+        .model = ctx.model,
+        .pending_assistant = .{ .role = .assistant, .tool_calls = try arena.dupe(ToolCall, &.{call}) },
+        .target_call_id = request_id,
+        .origin = if (ctx.lifecycle_scope.kind == .subagent) .subagent else .root,
+        .trusted_root_context = auto_classifier_context.rootUserRequestContext(ctx.root_user_intent_context) orelse "",
+        .current_turn_untrusted_messages = ctx.current_turn_messages,
+    };
+    const outcome = try tool_admission.requestPermissionOutcome(check.admissionInput(), arena, call, ctx.permission_mode, ctx.session_grants);
+    if (!outcome.decision.isDenied() and outcome.tool_failure == null) {
+        return .{ .allow = .{ .binding = resolved.mcp_binding } };
+    }
+    return .{ .deny = outcome.tool_failure orelse outcome.feedback orelse
+        try arena.print("Permission to run {s} was not granted ({s}).", .{ tool, @tagName(outcome.decision) }) };
+}
+
+/// The review schema a selected MCP tool would carry: its name,
+/// description, and input schema.
+fn bridgeReviewSchema(arena: Allocator, resolved: tool_mcp_runtime.SelectedTool) ![]const u8 {
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, resolved.schema_json, .{});
+    if (schema != .object) return error.InvalidToolSchema;
+    const description = schema.object.get("description") orelse return error.InvalidToolSchema;
+    const input_schema = schema.object.get("inputSchema") orelse return error.InvalidToolSchema;
+    if (description != .string or input_schema != .object) return error.InvalidToolSchema;
+    var input: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(input_schema, .{}, &input.writer);
+    return model_tool_schema.dynamicFunctionSchemaJsonAlloc(arena, resolved.name, description.string, input.written());
+}
+
+fn runBridgeCall(
+    raw: *anyopaque,
+    arena: Allocator,
+    request_id: []const u8,
+    tool: []const u8,
+    arguments_json: []const u8,
+    allowed: @FieldType(mcp_call_capability.Authorization, "allow"),
+    cancel: *std.atomic.Value(bool),
+) anyerror!mcp_call_capability.CallOutcome {
+    const state: *McpCallBridgeState = @ptrCast(@alignCast(raw));
+    const ctx = state.runtime;
+    const runtime = ctx.mcp_ctx orelse return .{ .status = .failed, .bytes = "MCP is not available in this session." };
+    const call_tool = ctx.mcp_call_tool orelse return .{ .status = .failed, .bytes = "MCP is not available in this session." };
+    const result = (call_tool(runtime, arena, tool, arguments_json, mcp_call_capability.max_result_bytes, .{
+        .observer = ctx.observer,
+        .call_id = request_id,
+        .expected_binding = allowed.binding,
+        .cancel_flag = cancel,
+        .input_responder = ctx.mcp_input_responder,
+        .access = ctx.mcp_access,
+    }) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return .{ .status = .failed, .bytes = try arena.print("The MCP call to {s} failed: {s}", .{ tool, @errorName(err) }) };
+    }) orelse return .{ .status = .failed, .bytes = try arena.print("No MCP tool named {s} is available.", .{tool}) };
+    return switch (result.status) {
+        .success => .{ .status = .ok, .bytes = try bridgeResultData(arena, result.model_output) },
+        .tool_failure => .{ .status = .tool_error, .bytes = try bridgeResultData(arena, result.model_output) },
+        .protocol_failure => .{ .status = .failed, .bytes = result.model_output },
+        .input_required => .{ .status = .failed, .bytes = "This tool asked for input that fx mcp call cannot give. Call the tool directly instead." },
+    };
+}
+
+/// Just the data of an MCP result envelope: its structured content as JSON
+/// when it has some, otherwise its text content. A result the envelope cut
+/// short, or any other text that is not an envelope, passes through as is.
+fn bridgeResultData(arena: Allocator, envelope: []const u8) ![]const u8 {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, envelope, .{}) catch return envelope;
+    if (parsed != .object) return envelope;
+    const result = parsed.object.get("result") orelse return envelope;
+    if (result != .object) return envelope;
+    var out: std.Io.Writer.Allocating = .init(arena);
+    if (result.object.get("structuredContent")) |structured| {
+        if (structured != .null) {
+            try std.json.Stringify.value(structured, .{}, &out.writer);
+            try out.writer.writeByte('\n');
+            return out.written();
+        }
+    }
+    if (result.object.get("content")) |content| if (content == .array) {
+        for (content.array.items) |item| {
+            if (item != .object) continue;
+            const text = item.object.get("text") orelse continue;
+            if (text != .string) continue;
+            try out.writer.writeAll(text.string);
+            if (!std.mem.endsWith(u8, text.string, "\n")) try out.writer.writeByte('\n');
+        }
+        if (out.written().len > 0) return out.written();
+    };
+    try std.json.Stringify.value(result, .{}, &out.writer);
+    try out.writer.writeByte('\n');
+    return out.written();
+}
+
+test "bridge result data is the structured content, else the text" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings("{\"issues\":[1,2]}\n", try bridgeResultData(arena,
+        \\{"server":"linear","tool":"list","result":{"content":[{"type":"text","text":"ignored"}],"structuredContent":{"issues":[1,2]},"isError":false}}
+    ));
+    try std.testing.expectEqualStrings("first\nsecond\n", try bridgeResultData(arena,
+        \\{"server":"linear","tool":"list","result":{"content":[{"type":"text","text":"first"},{"type":"image","data":"x"},{"type":"text","text":"second\n"}],"isError":false}}
+    ));
+    try std.testing.expectEqualStrings("{\"content\":[]}\n", try bridgeResultData(arena,
+        \\{"server":"s","tool":"t","result":{"content":[]}}
+    ));
+    const cut = "partial text\n... [mcp tool result truncated for s/t: original 9 bytes; cap is 4 bytes]\n";
+    try std.testing.expectEqualStrings(cut, try bridgeResultData(arena, cut));
 }
 
 const RunCommandBackendState = struct {
