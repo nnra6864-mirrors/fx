@@ -163,6 +163,7 @@ fn postCommitResolutionError(
             .ignored_project_user_only_setting,
             .legacy_workspace_preferences,
             .manual_backup_available,
+            .private_state_permissions_tightened,
             => {},
         }
     }
