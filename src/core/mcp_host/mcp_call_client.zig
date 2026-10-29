@@ -66,7 +66,7 @@ pub fn call(
     const header = try wire.parseHeader(arena, line);
     // A reply carries at most the bridge's result limit and a short message.
     if (header.bytes > capability_mod.max_result_bytes + 64 * 1024) return error.MalformedReply;
-    const bytes = reader.interface.readAlloc(arena, @intCast(header.bytes)) catch |err| switch (err) {
+    const bytes = reader.interface.readAllocAll(arena, @intCast(header.bytes)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.EndOfStream, error.ReadFailed => return error.ConnectionLost,
     };
