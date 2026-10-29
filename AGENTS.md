@@ -328,6 +328,8 @@ The `TLA+ MCP models and drivers` job takes about 20 minutes, so a pull request 
 
 The macOS arm64 PGSO workflow runs on a pull request only when the PGSO pipeline changes: `scripts/pgso/` other than `corpus.json`, the `setup-pgso` action, or `.github/workflows/pgso-macos-arm64.yml`. To qualify any other change, run `gh workflow run pgso-macos-arm64.yml --ref <branch>`. The stable release always runs it.
 
+The Linux arm64 PGSO workflow, `.github/workflows/pgso-linux-arm64.yml`, builds and qualifies a Linux candidate in one job on a GitHub-hosted arm64 runner, which takes several hours. It runs on the same pull request paths, with its own workflow file in place of the macOS one, and `gh workflow run pgso-linux-arm64.yml --ref <branch>` runs it for any other change. Releases don't use it yet.
+
 Live model evals and the live ACP suite need credentials and are not deterministic, so they run only on request. Run the live ACP suite with `gh workflow run ci.yml --ref <branch> -f acp_live=true`.
 
 A CI result is valid only when it belongs to the exact current commit and `Build & Test`, `E2E (deterministic)`, `Shellcheck`, `Startup Latency`, and `macOS arm64` all succeed. Do not mark the draft PR ready or request review from a stale, partial, queued, cancelled, skipped, or failed run. If CI fails, make the smallest repair, rerun the focused local proof, push the new commit to the same draft PR, and wait for CI on the new exact commit. After CI passes, run the final ship gate and mark the PR ready only when it reports `SHIP` for that exact commit.

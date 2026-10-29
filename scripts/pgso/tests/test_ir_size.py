@@ -12,7 +12,7 @@ from scripts.pgso.pipeline import _require_bitcode_header
 from scripts.pgso.toolchain import IR_SIZE_SCRIPT
 
 LLVM_BIN = pathlib.Path(os.environ.get("FX_PGSO_LLVM_BIN", "/opt/homebrew/opt/llvm@22/bin"))
-LIBLLVM = (LLVM_BIN.parent / "lib" / "libLLVM.dylib").resolve()
+LIBLLVM = (LLVM_BIN.parent / "lib" / ("libLLVM.dylib" if sys.platform == "darwin" else "libLLVM.so")).resolve()
 AVAILABLE = (LLVM_BIN / "llvm-as").is_file() and LIBLLVM.is_file()
 
 # The production module layout; alignment decisions depend on it.
