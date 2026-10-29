@@ -2253,10 +2253,10 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
     }, arena, messages);
 }
 
-fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) !void {
+fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     try ctx.state.cfg.context_registry.appendDefaultStatic(.{
-        .project_context = project_context orelse ctx.modelVisibleProjectContext(),
+        .project_context = ctx.modelVisibleProjectContext(),
     }, arena, messages);
     if (ctx.state.cfg.minimal_kernel) return;
     const active_session = if (ctx.state.active_session) |*session| session else null;
@@ -5109,7 +5109,7 @@ test "ACP registry callbacks preserve snapshot bytes before transient context" {
     defer messages.deinit(arena);
     try messages.append(arena, .{ .role = .system, .content = "base system" });
 
-    try deps.append_static_context.?(deps.ctx, arena, null, &messages);
+    try deps.append_static_context.?(deps.ctx, arena, &messages);
     try deps.append_runtime_context(deps.ctx, arena, &messages);
 
     try std.testing.expectEqual(@as(usize, 4), messages.items.len);
@@ -5276,7 +5276,7 @@ test "ACP prompt projection configures web search then blocks native execution" 
     defer messages.deinit(arena);
     const deps = agentRuntimeDeps(&ctx);
     const append_static = deps.append_static_context orelse return error.TestExpectedEqual;
-    try append_static(deps.ctx, arena, null, &messages);
+    try append_static(deps.ctx, arena, &messages);
     try deps.append_runtime_context(deps.ctx, arena, &messages);
 
     try std.testing.expectEqualStrings("stale-key", state.web_search_runtime.api_key);

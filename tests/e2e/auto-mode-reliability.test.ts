@@ -687,6 +687,14 @@ describe("lean auto mode reliability", () => {
       const review = reviewerText(gateway.classifierRequests[0]!.body);
       expect(review).toContain("review_context_kind: contextual");
       expect(review).toContain("Inspect the local site only");
+      // No later request shares a review's prefix, so the default GPT-5.6
+      // reviewer is asked to write nothing to its prompt cache.
+      expect(
+        gateway.classifierRequests[0]!.headers.get("ai-language-model-id"),
+      ).toBe("openai/gpt-5.6-luna");
+      expect(
+        JSON.parse(gateway.classifierRequests[0]!.body).providerOptions,
+      ).toEqual({ openai: { promptCacheOptions: { mode: "explicit" } } });
       expect(existsSync(marker)).toBe(true);
       expect(result.stderr).not.toContain(COMMAND_APPROVAL_PROMPT);
     },

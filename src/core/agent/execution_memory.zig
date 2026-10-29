@@ -288,6 +288,10 @@ const ChatMessageAdapter = struct {
         return value.role == .user and value.permission_feedback;
     }
 
+    fn isContextNote(value: Message) bool {
+        return value.role == .system and value.context_note;
+    }
+
     fn toolCalls(value: Message) []const ToolCall {
         return value.tool_calls;
     }
@@ -337,6 +341,11 @@ const MessageAdapter = struct {
 
     fn isPermissionFeedback(value: Message) bool {
         return value.role == .user and value.permission_feedback;
+    }
+
+    /// This message type carries no context notes.
+    fn isContextNote(_: Message) bool {
+        return false;
     }
 
     fn toolCalls(value: Message) []const ToolCall {
@@ -416,8 +425,11 @@ fn buildNormalExecutionMemory(
 
         var j = i + 1;
         var last_result_index: ?usize = null;
-        while (j < messages.len and Adapter.isTool(messages[j])) : (j += 1) {
+        // A context note sits between steps; it never ends a step's results
+        // or feedback, and `buildExecutionMemory` records it (D93).
+        while (j < messages.len and (Adapter.isTool(messages[j]) or Adapter.isContextNote(messages[j]))) : (j += 1) {
             const result_msg = messages[j];
+            if (Adapter.isContextNote(result_msg)) continue;
             const tool_call_id = Adapter.toolCallId(result_msg) orelse continue;
             const call = findToolCallById(tool_calls, tool_call_id) orelse continue;
             const output = Adapter.content(result_msg) orelse "";
@@ -449,7 +461,7 @@ fn buildNormalExecutionMemory(
             );
         }
 
-        while (j < messages.len and Adapter.isUser(messages[j])) : (j += 1) {
+        while (j < messages.len and (Adapter.isUser(messages[j]) or Adapter.isContextNote(messages[j]))) : (j += 1) {
             const feedback_msg = messages[j];
             if (!Adapter.isPermissionFeedback(feedback_msg)) continue;
             const text = Adapter.content(feedback_msg) orelse

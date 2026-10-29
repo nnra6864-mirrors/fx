@@ -159,6 +159,16 @@ bun install
 bun test
 ```
 
+`prompt-cache-ab.test.ts` compares how two fx builds keep the provider's prompt cache through mid-session changes: a branch switch, a permission change, folder rules, a restart, and a named skill. A recording proxy keeps every request, and for each run it reports the requests that break the cached prefix, the new and cached input tokens, and whether the answers are right. It runs only when the variables name two builds and the models to try:
+
+```bash
+cd tests/evals
+FX_CACHE_AB_BASELINE_BIN=/abs/path/to/base/fx FX_CACHE_AB_CANDIDATE_BIN=/abs/path/to/zig-out/bin/fx \
+  FX_CACHE_AB_MODELS=anthropic/claude-haiku-5.5,openai/gpt-6.1-sol bun test prompt-cache-ab.test.ts
+```
+
+`FX_CACHE_AB_SCENARIOS` picks scenarios by name, and `FX_CACHE_AB_OUTPUT_DIR` keeps each run's requests and summary. One run per scenario varies, so compare several.
+
 ## Open a pull request
 
 1. Sign every commit before you push it. `main` accepts only commits with verified signatures, and squash merging is turned off, so a single unsigned commit blocks the merge. GitHub explains how to set up [commit signature verification](https://docs.github.com/en/authentication/managing-commit-signature-verification/about-commit-signature-verification) with an SSH or GPG key.
