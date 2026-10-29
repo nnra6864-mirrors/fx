@@ -294,8 +294,8 @@ export const FIXTURE_FILES: Record<string, string> = {
     "        print(f'row {i}: value={i * 7 % 1000:04d} status=ok')",
     "",
   ].join("\n"),
-  "vendor/skills/haiku-writer/SKILL.md":
-    "---\nname: haiku-writer\ndescription: Write a haiku about a code change. Use when asked for a haiku.\n---\n\n# Haiku writer\n\nWrite exactly three lines in 5-7-5 syllables. End with the word HAIKU-DONE.\n",
+  "vendor/skills/poem-writer/SKILL.md":
+    "---\nname: poem-writer\ndescription: Write a short poem about a code change. Use when asked for a poem.\n---\n\n# Poem writer\n\nWrite exactly three lines in 5-7-5 syllables. End with the word POEM-DONE.\n",
 };
 
 /** A small PNG that reads "CODE K7-PLUM", for the vision task. */
@@ -812,9 +812,9 @@ export const TASKS: Task[] = [
   {
     id: "install-local",
     tool: "install_skill",
-    prompt: () => "Install the skill in ./vendor/skills/haiku-writer.",
+    prompt: () => "Install the skill in ./vendor/skills/poem-writer.",
     check: (c) => {
-      const found = spawnSync("sh", ["-c", `find "${c.home}/.fx" -path '*haiku-writer*' -name SKILL.md | head -1`], { encoding: "utf8" }).stdout.trim();
+      const found = spawnSync("sh", ["-c", `find "${c.home}/.fx" -path '*poem-writer*' -name SKILL.md | head -1`], { encoding: "utf8" }).stdout.trim();
       return ok(found.length > 0 && used(c, "install_skill").some((s) => !s.error), "skill installed");
     },
   },
