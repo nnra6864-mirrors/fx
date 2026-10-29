@@ -3341,7 +3341,7 @@ test.skipIf(!tmuxAvailable())("an app whose disk fills keeps running, and the se
     await app2.sendText("The disk fills in this turn.");
     // It names the write that failed first, even when an earlier streamed
     // write took the log down (D40).
-    await app2.waitForText("Turn completed, but fx could not save it (FileTooBig)", TIMEOUT);
+    await app2.waitForText("Couldn't save this turn: a file-size limit was reached", TIMEOUT);
     await app2.waitForComposer(TIMEOUT);
     await quit();
     expect(gateway.requests.length).toBe(asked + 1);
