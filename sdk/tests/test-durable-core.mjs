@@ -2627,37 +2627,35 @@ if (durabilityKind === "queue") {
     const dir = await mkdtemp(join(tmpdir(), "libfx-other-sender-"));
     dirs.push(dir);
     let onBStored = null;
-    let armed = false;
-    let ranRelease;
-    const released = new Promise((resolve) => { ranRelease = resolve; });
-    let listed = null;
-    const { durability: base } = await queueWorldAt(dir, { queueLeases: true, runInRequest: true, maxDurationMs: 60_000 });
+    const pending = [];
+    const { durability: base } = await queueWorldAt(dir, {
+      queueLeases: true, runInRequest: true, maxDurationMs: 60_000,
+      waitUntil: (work) => pending.push(work),
+    });
     const durability = hookedWorld(base, {
-      onList: () => { const wake = listed; listed = null; wake?.(); },
       after: (entry) => {
         if (entry.k === "input" && entry.messageId === "bc-b" && onBStored) { const run = onBStored; onBStored = null; run(); }
-        if (entry.k === "release" && armed) { armed = false; ranRelease(); }
       },
       onQueue: async (payload, options) => {
         if (payload?.input?.messageId === "bc-b" && options.delaySeconds > 0) {
-          await released;
-          await new Promise((resolve) => { listed = resolve; });
-          await sleep(30);
+          await cTurn;
+          // The turn can finish before receive()'s finally. Await its
+          // waitUntil work too, so c has relinquished the worker.
+          await Promise.all(pending);
         }
       },
     });
     const agent = createAgent({ durability });
     const session = agent.session();
     assert.equal((await textOf(session.prompt("warm", { messageId: "bc-w" }))).result.stopReason, "end_turn");
-    await untilIdle(agent);
-    armed = true;
+    await Promise.all(pending);
     let cTurn;
     onBStored = () => { cTurn = textOf(session.prompt("chi", { messageId: "bc-c" })); };
     const b = await textOf(session.prompt("nu", { messageId: "bc-b" }));
     const c = await cTurn;
     assert.equal(b.text, "nu-0 nu-1 nu-2");
     assert.equal(c.text, "chi-0 chi-1 chi-2");
-    await untilIdle(agent);
+    await Promise.all(pending);
     assert.deepEqual(prompted.filter((id) => id.startsWith("bc-")), ["bc-w", "bc-b", "bc-c"], "each turn started once");
     await agent.close();
   });
