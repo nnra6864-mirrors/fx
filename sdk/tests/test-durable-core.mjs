@@ -2574,7 +2574,7 @@ if (durabilityKind === "queue") {
       },
     };
     const agent = createAgent({ durability });
-    assert.equal((await textOf(agent.session(id).prompt("omega"))).result.stopReason, "end_turn");
+    assert.equal((await textOf(agent.session(id).prompt("omicron"))).result.stopReason, "end_turn");
     assert.ok(raced, "the run_started answer was replaced");
     const input = ops.indexOf("input");
     const lease = ops.indexOf("lease", input);
@@ -2780,37 +2780,35 @@ if (durabilityKind === "queue") {
     const dir = await mkdtemp(join(tmpdir(), "libfx-other-sender-"));
     dirs.push(dir);
     let onBStored = null;
-    let armed = false;
-    let ranRelease;
-    const released = new Promise((resolve) => { ranRelease = resolve; });
-    let listed = null;
-    const { durability: base } = await queueWorldAt(dir, { queueLeases: true, runInRequest: true, maxDurationMs: 60_000 });
+    const pending = [];
+    const { durability: base } = await queueWorldAt(dir, {
+      queueLeases: true, runInRequest: true, maxDurationMs: 60_000,
+      waitUntil: (work) => pending.push(work),
+    });
     const durability = hookedWorld(base, {
-      onList: () => { const wake = listed; listed = null; wake?.(); },
       after: (entry) => {
         if (entry.k === "input" && entry.messageId === "bc-b" && onBStored) { const run = onBStored; onBStored = null; run(); }
-        if (entry.k === "release" && armed) { armed = false; ranRelease(); }
       },
       onQueue: async (payload, options) => {
         if (payload?.input?.messageId === "bc-b" && options.delaySeconds > 0) {
-          await released;
-          await new Promise((resolve) => { listed = resolve; });
-          await sleep(30);
+          await cTurn;
+          // The turn can finish before receive()'s finally. Await its
+          // waitUntil work too, so c has relinquished the worker.
+          await Promise.all(pending);
         }
       },
     });
     const agent = createAgent({ durability });
     const session = agent.session();
     assert.equal((await textOf(session.prompt("warm", { messageId: "bc-w" }))).result.stopReason, "end_turn");
-    await untilIdle(agent);
-    armed = true;
+    await Promise.all(pending);
     let cTurn;
     onBStored = () => { cTurn = textOf(session.prompt("chi", { messageId: "bc-c" })); };
     const b = await textOf(session.prompt("nu", { messageId: "bc-b" }));
     const c = await cTurn;
     assert.equal(b.text, "nu-0 nu-1 nu-2");
     assert.equal(c.text, "chi-0 chi-1 chi-2");
-    await untilIdle(agent);
+    await Promise.all(pending);
     assert.deepEqual(prompted.filter((id) => id.startsWith("bc-")), ["bc-w", "bc-b", "bc-c"], "each turn started once");
     await agent.close();
   });
@@ -2923,6 +2921,69 @@ if (durabilityKind !== "memory") {
     await agent.close();
   });
 
+  test("a prompt aborted while its run is being created stores and queues nothing, and its same-id retry runs once", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-fresh-abort-"));
+    dirs.push(dir);
+    const calls = [];
+    const counted = countingWorld(await durabilityAt(dir), calls);
+    let started;
+    let release;
+    const holding = new Promise((resolve) => { started = resolve; });
+    const released = new Promise((resolve) => { release = resolve; });
+    let id;
+    const durability = {
+      ...counted,
+      world: async () => {
+        const world = await counted.world();
+        const create = world.events.create.bind(world.events);
+        const events = Object.assign(Object.create(world.events), {
+          async create(runId, event, ...rest) {
+            if (runId === id && event?.eventType === "run_created") {
+              started();
+              await released;
+            }
+            return create(runId, event, ...rest);
+          },
+        });
+        return Object.assign(Object.create(world), { events });
+      },
+    };
+    const agent = createAgent({ durability });
+    try {
+      id = await agent.newSessionId();
+      const messageId = "turn-abort-create";
+      const before = ran.length;
+      const promptedBefore = prompted.length;
+      const controller = new AbortController();
+      const turn = agent.session(id).prompt("omicron", { messageId, signal: controller.signal });
+      await holding;
+      controller.abort();
+      release();
+      assert.equal((await turn.accepted).sessionId, id);
+      assert.equal((await turn.result).stopReason, "cancelled");
+      await untilIdle(agent);
+      assert.deepEqual(callsOf(calls, id), ["create:run_created", "create:run_started"], "the aborted prompt wrote only the run's creation, with no input or queue send");
+      assert.deepEqual(prompted.slice(promptedBefore), [], "the aborted prompt started no turn");
+      assert.deepEqual(ran.slice(before), [], "the aborted prompt ran no steps");
+      calls.length = 0;
+      const retry = agent.session(id).prompt("omicron", { messageId });
+      await retry.accepted;
+      assert.ok(reads(admission(calls, id)) > 0, "the retry read the run the aborted prompt created");
+      const result = await retry.result;
+      assert.equal(result.stopReason, "end_turn");
+      assert.notEqual(result.repeated, true, "the aborted prompt did not run the turn");
+      await untilIdle(agent);
+      assert.equal(callsOf(calls, id).filter((name) => name === "create:input").length, 1, "the retry stored the input once");
+      assert.equal(callsOf(calls, id).filter((name) => name === "queue").length, 1, "the retry queued the input once");
+      assert.deepEqual(prompted.slice(promptedBefore), [messageId], "the retry started the turn once");
+      assert.deepEqual(ran.slice(before), [0, 1, 2].map((step) => `${messageId}:${step}`), "the retry ran each step once");
+      assert.deepEqual(JSON.parse(decoder.decode(await agent.session(id).checkpoint())), ["omicron-0", "omicron-1", "omicron-2"]);
+    } finally {
+      release();
+      await agent.close();
+    }
+  });
+
   test("a minted id another server prompted first is read as before, and its turn runs once", async () => {
     const dir = await mkdtemp(join(tmpdir(), "libfx-fresh-other-"));
     dirs.push(dir);
@@ -3000,14 +3061,15 @@ if (durabilityKind !== "memory") {
       const agent = createAgent({ durability: countingWorld(base, calls, faults) });
       const id = await agent.newSessionId();
       const messageId = `turn-${fault.replace(/[^a-z]/g, "")}`;
-      await assert.rejects(agent.session(id).prompt("eps", { messageId }).accepted, /injected failure/, fault);
-      assert.equal(callsOf(calls, id).filter((name) => name === "queue").length, fault === "queue" ? 1 : 0, `${fault}: nothing was queued before the failure`);
+      await assert.rejects(agent.session(id).prompt("eps", { messageId }).accepted, { message: "injected failure", status: 503, call: fault }, fault);
+      const writes = ["create:run_created", "create:run_started", "create:input", "queue"];
+      assert.deepEqual(callsOf(calls, id), writes.slice(0, writes.indexOf(fault) + 1), `${fault}: only the writes through the failed call were attempted`);
       const ranBefore = ran.length;
       calls.length = 0;
       const retry = agent.session(id).prompt("eps", { messageId });
       await retry.accepted;
       assert.ok(reads(admission(calls, id)) > 0, `${fault}: the retry read the session`);
-      assert.equal(callsOf(calls, id).filter((name) => name === "queue").length >= 1, true, `${fault}: the retry queued its message`);
+      assert.equal(callsOf(calls, id).filter((name) => name === "queue").length, 1, `${fault}: the retry queued its message once`);
       const result = await retry.result;
       assert.equal(result.stopReason, "end_turn", fault);
       assert.notEqual(result.repeated, true, `${fault}: no earlier attempt ran it`);
