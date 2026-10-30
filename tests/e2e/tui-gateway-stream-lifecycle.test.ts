@@ -3252,6 +3252,92 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     TIMEOUT * 2,
   );
 
+  const stallPartial = 'data: {"type":"text-delta","id":"answer_1","delta":"I will trim the rest next."}\n\n';
+  // Each failed response ends without a finish event.
+  const stallShapes = {
+    "after partial text": () => () =>
+      new Response(stallPartial, { headers: { "content-type": "text/event-stream" } }),
+    "before any text": () => () =>
+      new Response("", { headers: { "content-type": "text/event-stream" } }),
+  } as const;
+
+  for (const [shape, stalledResponse] of Object.entries(stallShapes)) {
+    test(
+      `repeated stream failures after tool work keep retrying and keep the work for the next prompt and after resume (${shape})`,
+      async () => {
+        const marker = "STALL_WORK_E2E_PROMPT";
+        const prompt = `Trim the demo to the voice parts. ${marker}`;
+        const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+          "fx-tui-recovery-stall-keeps-work-",
+          [
+            fakeGatewayToolCall("stall_work_write", "write_file", {
+              path: "stall-proof.txt",
+              content: "STALL_WORK_FILE_SENTINEL\n",
+            }),
+            ...Array.from({ length: 3 }, stalledResponse),
+            () => fakeGatewayFinalText("CONTINUE_AFTER_STALL_OK"),
+            () => fakeGatewayFinalText("AFTER_RESUME_OK"),
+          ],
+        );
+
+        await session!.sendText(prompt);
+        // fx never stops on repeated failures: it keeps resending until the
+        // answer arrives, with no "continue" from the user.
+        await session!.waitForText("CONTINUE_AFTER_STALL_OK", TIMEOUT * 2);
+        await session!.waitForStableComposer(TIMEOUT);
+        expect(queuedGateway.requests).toHaveLength(5);
+        // The tool ran once, before the failures; its change is on disk.
+        expect(readFileSync(join(root!, "workspace", "stall-proof.txt"), "utf8")).toBe(
+          "STALL_WORK_FILE_SENTINEL\n",
+        );
+        // The request that finally answered still carries the prompt once and
+        // the completed tool call, and the turn never ended early.
+        const continued = queuedGateway.requests[4]!.body;
+        expect(continued.split(marker).length - 1).toBe(1);
+        expect(continued).toContain("stall_work_write");
+        expect(continued).not.toContain("<turn_aborted>");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+        await session!.sendText("/quit");
+        expect(await session!.waitForSessionEnd(TIMEOUT)).toBe(true);
+        session = null;
+        const resumedStderr = join(root!, "resumed-stderr.log");
+        session = await TmuxSession.create({
+          cmd: `${FX_BIN} --resume-last`,
+          cwd: join(root!, "workspace"),
+          width: 72,
+          height: 24,
+          stderrPath: resumedStderr,
+          env: {
+            HOME: join(root!, "home"),
+            AI_GATEWAY_API_KEY: "fake-route-recovery-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_AUTO_UPGRADE: "0",
+            FX_PERMISSION_MODE: "auto",
+            FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+            FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+            FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+            FX_MODEL: MODEL,
+          },
+        });
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText("What did you change before the connection failed?");
+        await session.waitForText("AFTER_RESUME_OK", TIMEOUT);
+        await session.waitForStableComposer(TIMEOUT);
+        expect(queuedGateway.requests).toHaveLength(6);
+        // The resumed conversation holds the finished turn exactly once.
+        const resumed = queuedGateway.requests[5]!.body;
+        expect(resumed.split(marker).length - 1).toBe(1);
+        expect(resumed).toContain("stall_work_write");
+        expect(resumed).not.toContain("<turn_aborted>");
+        expect(resumed).toContain("CONTINUE_AFTER_STALL_OK");
+        expect(readFileSync(resumedStderr, "utf8")).toBe("");
+      },
+      TIMEOUT * 3,
+    );
+  }
+
   test(
     "Fast route failure automatically falls back without changing transcript history",
     async () => {
