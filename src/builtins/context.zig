@@ -3707,6 +3707,8 @@ test "gateway_system_prompt: source routing" {
     try expectDefaultPromptContains("Use remote sources only for facts that are not available from the current checkout.");
     try expectDefaultPromptContains("including recent commits and changes");
     try expectDefaultPromptContains("To see upstream commits, use git fetch, not gh.");
+    try expectDefaultPromptContains("answer from it even if it looks small; do not clone, fetch, or search for another copy.");
+    try expectDefaultPromptContains("Start exploring a workspace with the file search and read tools, not shell listings such as ls.");
     try expectDefaultPromptContains("For GitHub metadata such as pull requests, issues, and releases, use gh.");
     try expectDefaultPromptContains("If gh is signed out, use the public GitHub API with curl, not web search.");
     try expectDefaultPromptContains("questions about fx");
