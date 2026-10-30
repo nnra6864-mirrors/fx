@@ -771,6 +771,7 @@ const missingStreamFastMs = 2000;
 // may hold together, least recently read dropped first.
 const maxLogViews = 32;
 const maxLogViewChars = 32 * 1024 * 1024;
+const maxMintedIds = 1024;
 
 // Whether a newest-first listing showed every slot from the lowest it
 // listed to the newest. Pure.
@@ -2691,7 +2692,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
     const minted = new Set();
     const mint = (id) => {
       minted.add(id);
-      if (minted.size > 1024) minted.delete(minted.values().next().value);
+      if (minted.size > maxMintedIds) minted.delete(minted.values().next().value);
       return id;
     };
     const backend = () => {
