@@ -724,10 +724,6 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         stderrPath: fixture.stderrPath,
       });
 
-      await session.waitForText(
-        "skills: 1 discovery issue; some skills may be missing (ctrl+o to view)",
-        10_000,
-      );
       await session.waitForComposer(10_000);
       await session.sendKeys("C-o");
       await session.waitForPane(
@@ -743,6 +739,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-o");
       await session.waitForComposer(5_000);
+      // The warning exists (Ctrl+O showed it) but never reaches the inline transcript.
+      const inline = await session.captureFullScrollback();
+      expect(inline).not.toContain("skills:");
+      expect(inline).not.toContain("skill discovery warning:");
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
       session = null;
@@ -3340,13 +3340,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         height: 36,
       });
 
-      const diagnosticSummary =
-        "skills: 1 discovery issue; some skills may be missing (ctrl+o to view)";
-      await session.waitForText(diagnosticSummary, 10_000);
       await session.waitForComposer(10_000);
-      expect(await session.captureFullScrollback()).not.toContain(
-        "skill discovery warning:",
-      );
       await session.sendKeys("C-o");
       await session.waitForText("skill discovery warning:", 5_000);
       const tracePathPattern = tracePath
@@ -3358,6 +3352,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       );
       await session.sendKeys("C-o");
       await session.waitForComposer(5_000);
+      const inline = await session.captureFullScrollback();
+      expect(inline).not.toContain("skills:");
+      expect(inline).not.toContain("skill discovery warning:");
       const startupDiagnosticCount = fileMarkerCount(
         tracePath,
         fixture.malformedMarker,
@@ -3408,12 +3405,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       );
       expect(loadScrollback).not.toContain("1 tool call");
 
-      expect(
-        countOccurrences(
-          await session.captureFullScrollback(),
-          diagnosticSummary,
-        ),
-      ).toBe(1);
+      const finalScrollback = await session.captureFullScrollback();
+      expect(finalScrollback).not.toContain("discovery issue");
+      expect(finalScrollback).not.toContain("skill discovery warning:");
       expect(session.isAlive()).toBe(true);
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
