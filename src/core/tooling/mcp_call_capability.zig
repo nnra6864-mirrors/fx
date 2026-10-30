@@ -38,6 +38,19 @@ pub const CallOutcome = struct {
     bytes: []const u8,
 };
 
+/// A question about the MCP tools themselves: `fx mcp call list`, `search`,
+/// and `help`. It reads tool metadata only, as the agent's own
+/// `capability_search` does, so it needs no permission check; it sees only
+/// the tools the agent may use.
+pub const Lookup = union(enum) {
+    /// Every tool of the named server.
+    list: []const u8,
+    /// The tools that best match a query.
+    search: []const u8,
+    /// One tool's arguments and description.
+    help: []const u8,
+};
+
 pub const Capability = struct {
     context: *anyopaque,
     /// Decides `tool` with `arguments_json` as call `request_id`. May prompt
@@ -60,6 +73,14 @@ pub const Capability = struct {
         allowed: @FieldType(Authorization, "allow"),
         cancel: *std.atomic.Value(bool),
     ) anyerror!CallOutcome,
+    /// Answers a lookup with text for the command: `ok`, or `failed` with
+    /// why. Setting `cancel` ends it early. Allocates in `arena`.
+    lookup_fn: *const fn (
+        context: *anyopaque,
+        arena: Allocator,
+        lookup: Lookup,
+        cancel: *std.atomic.Value(bool),
+    ) anyerror!CallOutcome,
 
     pub fn authorize(self: Capability, arena: Allocator, request_id: []const u8, tool: []const u8, arguments_json: []const u8) anyerror!Authorization {
         return self.authorize_fn(self.context, arena, request_id, tool, arguments_json);
@@ -67,5 +88,9 @@ pub const Capability = struct {
 
     pub fn call(self: Capability, arena: Allocator, request_id: []const u8, tool: []const u8, arguments_json: []const u8, allowed: @FieldType(Authorization, "allow"), cancel: *std.atomic.Value(bool)) anyerror!CallOutcome {
         return self.call_fn(self.context, arena, request_id, tool, arguments_json, allowed, cancel);
+    }
+
+    pub fn lookup(self: Capability, arena: Allocator, question: Lookup, cancel: *std.atomic.Value(bool)) anyerror!CallOutcome {
+        return self.lookup_fn(self.context, arena, question, cancel);
     }
 };

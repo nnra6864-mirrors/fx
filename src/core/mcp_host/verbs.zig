@@ -48,8 +48,7 @@ pub const Command = union(enum) {
     /// Null approves every project server.
     approve: ?[]const u8,
     reject: []const u8,
-    /// `arguments` is JSON, `-` for stdin, or null for none.
-    call: struct { tool: []const u8, arguments: ?[]const u8 },
+    call: mcp_call_client.Command,
 };
 
 pub const Parsed = union(enum) {
@@ -156,8 +155,22 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
         },
         .call => {
             if (surface == .shell) return usage(arena, verb, "/mcp call runs only in a command that fx's shell tool runs: fx mcp call TOOL [JSON].", .{});
-            if (n.len == 0 or n.len > 2) return usage(arena, verb, "{s} call needs a TOOL and at most one JSON argument.", .{p});
-            return .{ .command = .{ .call = .{ .tool = n[0], .arguments = if (n.len == 2) n[1] else null } } };
+            if (n.len == 0) return usage(arena, verb, "{s} call needs a TOOL, or list, search, or help.", .{p});
+            const first = n[0];
+            const rest_names = n[1..];
+            if (std.mem.eql(u8, first, "list") or std.mem.eql(u8, first, "help")) {
+                if (rest_names.len != 1 or rest_names[0].len == 0) {
+                    return usage(arena, verb, "{s} call {s} needs one {s}.", .{ p, first, if (first[0] == 'l') "server NAME" else "TOOL" });
+                }
+                return .{ .command = .{ .call = if (first[0] == 'l') .{ .list = rest_names[0] } else .{ .help = rest_names[0] } } };
+            }
+            if (std.mem.eql(u8, first, "search")) {
+                const query = std.mem.trim(u8, try std.mem.join(arena, " ", rest_names), " ");
+                if (query.len == 0) return usage(arena, verb, "{s} call search needs a QUERY.", .{p});
+                return .{ .command = .{ .call = .{ .search = query } } };
+            }
+            if (n.len > 2) return usage(arena, verb, "{s} call needs a TOOL and at most one JSON argument.", .{p});
+            return .{ .command = .{ .call = .{ .call = .{ .tool = first, .arguments = if (n.len == 2) n[1] else null } } } };
         },
         .approve => {
             if (all and n.len > 0) return usage(arena, verb, "{s} approve takes a NAME or --all, not both.", .{p});
@@ -205,6 +218,7 @@ const overview = [_][2][]const u8{
     .{ "approve NAME | --all", "approve project servers from .mcp.json" },
     .{ "reject NAME", "reject a project server" },
     .{ "call TOOL [JSON | -]", "run an MCP tool from a command fx runs" },
+    .{ "call list | search | help", "find MCP tools and their arguments" },
 };
 
 /// The usage of one verb, or of every verb.
@@ -237,19 +251,26 @@ pub fn writeUsage(w: *Writer, surface: Surface, verb: ?Verb) Writer.Error!void {
         .reject => try w.print("usage: {s} reject NAME\n", .{p}),
         .call => try w.print(
             \\usage: {s} call TOOL [JSON | -]
+            \\       {s} call list SERVER
+            \\       {s} call search QUERY...
+            \\       {s} call help TOOL
             \\  Runs the MCP tool TOOL, such as mcp_linear_list_issues, with the JSON
             \\  object of arguments, or with the object on stdin for -. Prints just
             \\  the tool's data, so a command can save it to a file or filter it.
             \\  When stdout is not a terminal, one line on stderr gives the data's
             \\  size and shape, with the values of short fields that repeat.
+            \\  list prints every tool of SERVER and search the tools that best
+            \\  match QUERY, one per line: the name, a tab, and the description.
+            \\  help prints the arguments TOOL takes and what it does.
             \\  Works only in a command that fx's shell tool runs, while it runs, and
-            \\  asks permission as a direct call of TOOL would.
+            \\  asks permission as a direct call of TOOL would; list, search, and
+            \\  help need none and show only the tools that agent may use.
             \\  Exits 0 on success, 1 when the call fails, 2 for a usage mistake,
             \\  3 outside a running fx shell call, 4 when too many calls are
             \\  running, 5 when permission is not granted, and 6 when the tool
             \\  returns an error.
             \\
-        , .{p}),
+        , .{ p, p, p, p }),
     }
 }
 
@@ -321,7 +342,7 @@ fn runParsed(c: Context, arena: Allocator, args: []const []const u8) !u8 {
         .logout => |name| logout(c, arena, name),
         .approve => |name| trust(c, arena, if (name) |n| .{ .approve = n } else .approve_all),
         .reject => |name| trust(c, arena, .{ .reject = name }),
-        .call => |cl| mcp_call_client.run(arena, io_mod.getIo(), c.out, c.err, cl.tool, cl.arguments),
+        .call => |asked| mcp_call_client.run(arena, io_mod.getIo(), c.out, c.err, asked),
     };
 }
 
@@ -951,6 +972,33 @@ test "parse reads every verb, with flags before --" {
     try testing.expectEqualStrings("x", (try parseCli(a, &.{ "reject", "x" })).command.reject);
     try testing.expectEqual(@as(?Verb, .add), (try parseCli(a, &.{ "add", "-h" })).command.help);
     try testing.expectEqual(@as(?Verb, null), (try parseCli(a, &.{})).command.help);
+
+    const call = (try parseCli(a, &.{ "call", "mcp_linear_list_issues", "-" })).command.call.call;
+    try testing.expectEqualStrings("mcp_linear_list_issues", call.tool);
+    try testing.expectEqualStrings("-", call.arguments.?);
+    try testing.expect((try parseCli(a, &.{ "call", "mcp_linear_list_issues" })).command.call.call.arguments == null);
+    try testing.expectEqualStrings("linear", (try parseCli(a, &.{ "call", "list", "linear" })).command.call.list);
+    try testing.expectEqualStrings("mcp_linear_list_issues", (try parseCli(a, &.{ "call", "help", "mcp_linear_list_issues" })).command.call.help);
+    // A search's words join into one query.
+    try testing.expectEqualStrings("open issues", (try parseCli(a, &.{ "call", "search", "open", "issues" })).command.call.search);
+    try testing.expectEqual(@as(?Verb, .call), (try parseCli(a, &.{ "call", "-h" })).command.help);
+}
+
+test "parse turns fx mcp call mistakes into usage" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const cases = [_]struct { args: []const []const u8, message: []const u8 }{
+        .{ .args = &.{"call"}, .message = "fx mcp call needs a TOOL, or list, search, or help." },
+        .{ .args = &.{ "call", "t", "{}", "{}" }, .message = "fx mcp call needs a TOOL and at most one JSON argument." },
+        .{ .args = &.{ "call", "list" }, .message = "fx mcp call list needs one server NAME." },
+        .{ .args = &.{ "call", "list", "a", "b" }, .message = "fx mcp call list needs one server NAME." },
+        .{ .args = &.{ "call", "help" }, .message = "fx mcp call help needs one TOOL." },
+        .{ .args = &.{ "call", "help", "" }, .message = "fx mcp call help needs one TOOL." },
+        .{ .args = &.{ "call", "search", " " }, .message = "fx mcp call search needs a QUERY." },
+    };
+    for (cases) |case| try testing.expectEqualStrings(case.message, (try parseCli(a, case.args)).usage.message);
+    try testing.expect((try parse(a, .shell, &.{ "call", "list", "linear" })).usage.message.len > 0);
 }
 
 test "parse turns mistakes into usage, and old verbs into pointers" {

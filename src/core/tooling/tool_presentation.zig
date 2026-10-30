@@ -5,6 +5,7 @@ const managed_execution = @import("../execution/managed_execution.zig");
 const file_mutation_contract = @import("file_mutation_contract.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const shared_theme = @import("../shared/theme.zig");
 const tool_args = @import("tool_args.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
 const terminal_contracts = @import("../terminal/contracts.zig");
@@ -622,6 +623,15 @@ fn formatTerminalDisplayTarget(
 }
 
 /// Borrows the name from the prepared action without replacing resource labels.
+/// The action label of an MCP tool's row while it runs, and once it ran.
+pub const mcp_running_label = "Running MCP";
+pub const mcp_ran_label = "Ran MCP";
+
+/// A tool row's status line: a bold label, then the value in tool text.
+pub fn formatToolActionValue(alloc: Allocator, label: []const u8, value: []const u8) Allocator.Error![]u8 {
+    return alloc.print("● {s}\x1b[0m {s}{s}\x1b[0m", .{ label, shared_theme.current().tool_stdout_style, value });
+}
+
 pub fn resolvedSkillName(call: ToolCall, presentation: tool_dispatch.CallPresentation) ?[]const u8 {
     if (presentation.label_arg_kind != .name) return null;
     const selected = call.resolved_skill orelse return null;

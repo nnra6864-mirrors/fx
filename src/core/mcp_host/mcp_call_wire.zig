@@ -2,9 +2,12 @@
 //! and the session's bridge (`mcp_call_bridge.zig`), over one Unix socket
 //! connection per call.
 //!
-//! The client sends one request line:
+//! The client sends one request line, a call or a lookup:
 //!
-//!   {"v":1,"token":"<64 hex digits>","tool":"mcp_linear_list_issues","arguments":{...}}
+//!   {"v":1,"token":"<64 hex digits>","op":"call","tool":"mcp_linear_list_issues","arguments":{...}}
+//!   {"v":1,"token":"<64 hex digits>","op":"list","server":"linear"}
+//!   {"v":1,"token":"<64 hex digits>","op":"search","query":"open issues"}
+//!   {"v":1,"token":"<64 hex digits>","op":"help","tool":"mcp_linear_list_issues"}
 //!
 //! and the bridge answers with one header line and the bytes it announces:
 //!
@@ -14,6 +17,7 @@
 //! tool's error), `failed` or `denied` (what went wrong), or `refused`, with
 //! `reason` naming the refusal. Pure: no I/O, so it is tested on bytes.
 const std = @import("std");
+const capability_mod = @import("../tooling/mcp_call_capability.zig");
 const mcp_call = @import("mcp_call.zig");
 
 const Allocator = std.mem.Allocator;
@@ -42,13 +46,38 @@ pub fn parseToken(hex: []const u8) ?mcp_call.Token {
     return token;
 }
 
+/// What a request asks for.
+pub const Operation = union(enum) {
+    /// Run `tool` with the arguments object, as JSON text.
+    call: struct { tool: []const u8, arguments_json: []const u8 },
+    list: []const u8,
+    search: []const u8,
+    help: []const u8,
+
+    /// The lookup this operation is, or null for a call.
+    pub fn lookup(self: Operation) ?capability_mod.Lookup {
+        return switch (self) {
+            .call => null,
+            .list => |server| .{ .list = server },
+            .search => |query| .{ .search = query },
+            .help => |tool| .{ .help = tool },
+        };
+    }
+
+    /// What the request names, for logs and messages.
+    pub fn subject(self: Operation) []const u8 {
+        return switch (self) {
+            .call => |value| value.tool,
+            .list, .search, .help => |text| text,
+        };
+    }
+};
+
 pub const Request = struct {
     version: u32,
     /// Null when the client sent no well-formed token.
     token: ?mcp_call.Token,
-    tool: []const u8,
-    /// The arguments object, as JSON text.
-    arguments_json: []const u8,
+    operation: Operation,
 };
 
 pub const RequestError = error{ MalformedRequest, OutOfMemory };
@@ -65,28 +94,55 @@ pub fn parseRequest(arena: Allocator, line: []const u8) RequestError!Request {
     if (version != .integer or version.integer < 0 or version.integer > std.math.maxInt(u32)) return error.MalformedRequest;
     const token = object.get("token") orelse return error.MalformedRequest;
     if (token != .string) return error.MalformedRequest;
-    const tool = object.get("tool") orelse return error.MalformedRequest;
-    if (tool != .string or tool.string.len == 0) return error.MalformedRequest;
-    const arguments = object.get("arguments") orelse return error.MalformedRequest;
-    if (arguments != .object) return error.MalformedRequest;
-    var out: std.Io.Writer.Allocating = .init(arena);
-    std.json.Stringify.value(arguments, .{}, &out.writer) catch return error.OutOfMemory;
+    const op = object.get("op") orelse return error.MalformedRequest;
+    if (op != .string) return error.MalformedRequest;
+    const kind = std.meta.stringToEnum(std.meta.Tag(Operation), op.string) orelse return error.MalformedRequest;
+    const operation: Operation = switch (kind) {
+        .call => blk: {
+            const arguments = object.get("arguments") orelse return error.MalformedRequest;
+            if (arguments != .object) return error.MalformedRequest;
+            var out: std.Io.Writer.Allocating = .init(arena);
+            std.json.Stringify.value(arguments, .{}, &out.writer) catch return error.OutOfMemory;
+            break :blk .{ .call = .{ .tool = try nonEmptyString(object, "tool"), .arguments_json = out.written() } };
+        },
+        .list => .{ .list = try nonEmptyString(object, "server") },
+        .search => .{ .search = try nonEmptyString(object, "query") },
+        .help => .{ .help = try nonEmptyString(object, "tool") },
+    };
     return .{
         .version = @intCast(version.integer),
         .token = parseToken(token.string),
-        .tool = tool.string,
-        .arguments_json = out.written(),
+        .operation = operation,
     };
 }
 
-/// Writes one request line. `arguments_json` must be a JSON object.
-pub fn writeRequest(writer: *std.Io.Writer, token: mcp_call.Token, tool: []const u8, arguments_json: []const u8) std.Io.Writer.Error!void {
+fn nonEmptyString(object: std.json.ObjectMap, key: []const u8) RequestError![]const u8 {
+    const value = object.get(key) orelse return error.MalformedRequest;
+    if (value != .string or value.string.len == 0) return error.MalformedRequest;
+    return value.string;
+}
+
+/// Writes one request line. A call's `arguments_json` must be a JSON object.
+pub fn writeRequest(writer: *std.Io.Writer, token: mcp_call.Token, operation: Operation) std.Io.Writer.Error!void {
     const hex = tokenHex(token);
-    try writer.print("{{\"v\":{d},\"token\":\"{s}\",\"tool\":", .{ mcp_call.protocol_version, &hex });
-    try std.json.Stringify.value(tool, .{}, writer);
-    try writer.writeAll(",\"arguments\":");
-    try writer.writeAll(arguments_json);
+    try writer.print("{{\"v\":{d},\"token\":\"{s}\",\"op\":\"{s}\"", .{ mcp_call.protocol_version, &hex, @tagName(operation) });
+    switch (operation) {
+        .call => |value| {
+            try writer.writeAll(",\"tool\":");
+            try std.json.Stringify.value(value.tool, .{}, writer);
+            try writer.writeAll(",\"arguments\":");
+            try writer.writeAll(value.arguments_json);
+        },
+        .list => |server| try writeField(writer, "server", server),
+        .search => |query| try writeField(writer, "query", query),
+        .help => |tool| try writeField(writer, "tool", tool),
+    }
     try writer.writeAll("}\n");
+}
+
+fn writeField(writer: *std.Io.Writer, comptime key: []const u8, text: []const u8) std.Io.Writer.Error!void {
+    try writer.writeAll(",\"" ++ key ++ "\":");
+    try std.json.Stringify.value(text, .{}, writer);
 }
 
 pub const Status = enum { ok, tool_error, failed, denied, refused };
@@ -158,17 +214,37 @@ test "a request line round-trips, and a bad token parses as no token" {
     const arena = arena_state.allocator();
     const token: mcp_call.Token = @splat(0xab);
     var out: std.Io.Writer.Allocating = .init(arena);
-    try writeRequest(&out.writer, token, "mcp_linear_list_issues", "{\"team\":\"ENG\"}");
+    try writeRequest(&out.writer, token, .{ .call = .{ .tool = "mcp_linear_list_issues", .arguments_json = "{\"team\":\"ENG\"}" } });
     const line = out.written();
     try std.testing.expect(std.mem.endsWith(u8, line, "}\n"));
     const parsed = try parseRequest(arena, line[0 .. line.len - 1]);
     try std.testing.expectEqual(@as(u32, 1), parsed.version);
     try std.testing.expectEqualSlices(u8, &token, &parsed.token.?);
-    try std.testing.expectEqualStrings("mcp_linear_list_issues", parsed.tool);
-    try std.testing.expectEqualStrings("{\"team\":\"ENG\"}", parsed.arguments_json);
+    try std.testing.expectEqualStrings("mcp_linear_list_issues", parsed.operation.call.tool);
+    try std.testing.expectEqualStrings("{\"team\":\"ENG\"}", parsed.operation.call.arguments_json);
 
-    const forged = try parseRequest(arena, "{\"v\":1,\"token\":\"nothex\",\"tool\":\"t\",\"arguments\":{}}");
+    const forged = try parseRequest(arena, "{\"v\":1,\"token\":\"nothex\",\"op\":\"call\",\"tool\":\"t\",\"arguments\":{}}");
     try std.testing.expect(forged.token == null);
+}
+
+test "each lookup round-trips with its text, quotes included" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const token: mcp_call.Token = @splat(0x01);
+    for ([_]Operation{
+        .{ .list = "linear" },
+        .{ .search = "open \"issues\" for me" },
+        .{ .help = "mcp_linear_list_issues" },
+    }) |operation| {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        try writeRequest(&out.writer, token, operation);
+        const line = out.written();
+        const parsed = try parseRequest(arena, line[0 .. line.len - 1]);
+        try std.testing.expectEqual(std.meta.activeTag(operation), std.meta.activeTag(parsed.operation));
+        try std.testing.expectEqualStrings(operation.subject(), parsed.operation.subject());
+        try std.testing.expect(parsed.operation.lookup() != null);
+    }
 }
 
 test "garbage request lines are malformed" {
@@ -179,11 +255,16 @@ test "garbage request lines are malformed" {
         "",
         "not json",
         "[]",
-        "{\"v\":1,\"token\":\"\",\"tool\":\"t\"}",
-        "{\"v\":1,\"token\":\"\",\"tool\":\"t\",\"arguments\":[]}",
-        "{\"v\":-1,\"token\":\"\",\"tool\":\"t\",\"arguments\":{}}",
-        "{\"v\":1,\"token\":7,\"tool\":\"t\",\"arguments\":{}}",
-        "{\"v\":1,\"token\":\"\",\"tool\":\"\",\"arguments\":{}}",
+        "{\"v\":1,\"token\":\"\",\"tool\":\"t\",\"arguments\":{}}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"run\",\"tool\":\"t\",\"arguments\":{}}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"call\",\"tool\":\"t\"}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"call\",\"tool\":\"t\",\"arguments\":[]}",
+        "{\"v\":-1,\"token\":\"\",\"op\":\"call\",\"tool\":\"t\",\"arguments\":{}}",
+        "{\"v\":1,\"token\":7,\"op\":\"call\",\"tool\":\"t\",\"arguments\":{}}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"call\",\"tool\":\"\",\"arguments\":{}}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"list\"}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"search\",\"query\":\"\"}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"help\",\"tool\":7}",
     }) |line| try std.testing.expectError(error.MalformedRequest, parseRequest(arena, line));
 }
 

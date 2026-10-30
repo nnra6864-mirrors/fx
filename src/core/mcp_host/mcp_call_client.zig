@@ -9,6 +9,10 @@
 //! The call meets the same permission rules, prompt, and review as a direct
 //! call of the tool by the agent that ran the command. It works only while
 //! that shell call runs.
+//!
+//! `fx mcp call list SERVER`, `search QUERY`, and `help TOOL` print plain
+//! text about the tools that agent may use, so a command can find a tool and
+//! learn its arguments the same way.
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const capability_mod = @import("../tooling/mcp_call_capability.zig");
@@ -43,21 +47,32 @@ pub const Reply = struct {
 
 pub const CallError = error{ MalformedReply, UnsupportedReply, ConnectionLost, OutOfMemory };
 
-/// Sends one call to the bridge at `socket_path` and reads its whole reply.
+/// What `fx mcp call` was asked: a tool to run, or a question about tools.
+pub const Command = union(enum) {
+    /// `arguments` is the JSON argument, `-` for stdin, or null for none.
+    call: struct { tool: []const u8, arguments: ?[]const u8 },
+    /// A server's name.
+    list: []const u8,
+    /// What to look for.
+    search: []const u8,
+    /// A tool's name.
+    help: []const u8,
+};
+
+/// Sends one request to the bridge at `socket_path` and reads its whole reply.
 pub fn call(
     arena: Allocator,
     io: std.Io,
     socket_path: []const u8,
     token: mcp_call.Token,
-    tool: []const u8,
-    arguments_json: []const u8,
+    operation: wire.Operation,
 ) (CallError || std.Io.net.UnixAddress.ConnectError || std.Io.net.UnixAddress.InitError)!Reply {
     const address = try std.Io.net.UnixAddress.init(socket_path);
     const stream = try address.connect(io);
     defer stream.close(io);
     var write_buffer: [4096]u8 = undefined;
     var writer = stream.writer(io, &write_buffer);
-    wire.writeRequest(&writer.interface, token, tool, arguments_json) catch return error.ConnectionLost;
+    wire.writeRequest(&writer.interface, token, operation) catch return error.ConnectionLost;
     writer.interface.flush() catch return error.ConnectionLost;
     var read_buffer: [wire.max_header_bytes]u8 = undefined;
     var reader = stream.reader(io, &read_buffer);
@@ -75,9 +90,9 @@ pub fn call(
     return .{ .header = header, .bytes = bytes };
 }
 
-/// Runs `fx mcp call`. `arguments` is the JSON argument, `-` for stdin, or
-/// null for none. Returns the exit code.
-pub fn run(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, tool: []const u8, arguments: ?[]const u8) !u8 {
+/// The arguments object of a call: the JSON argument, stdin for `-`, or `{}`
+/// for none. Null after telling the user what is wrong with it.
+fn readArguments(arena: Allocator, io: std.Io, err: *Writer, arguments: ?[]const u8) !?[]const u8 {
     const arguments_json = blk: {
         const raw = arguments orelse break :blk "{}";
         if (!std.mem.eql(u8, raw, "-")) break :blk raw;
@@ -86,19 +101,34 @@ pub fn run(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, tool: []con
         break :blk stdin.interface.allocRemaining(arena, .limited(wire.max_request_bytes)) catch |e| switch (e) {
             error.StreamTooLong => {
                 try err.print("fx mcp call: the arguments on stdin are larger than {d} bytes.\n", .{wire.max_request_bytes});
-                return exit.usage;
+                return null;
             },
             else => return e,
         };
     };
     if (!isJsonObject(arena, arguments_json)) {
         try err.writeAll("fx mcp call: the arguments must be one JSON object, such as '{\"team\":\"ENG\"}'.\n");
-        return exit.usage;
+        return null;
     }
+    return arguments_json;
+}
+
+/// Runs `fx mcp call` and returns the exit code.
+pub fn run(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, command: Command) !u8 {
+    const operation: wire.Operation = switch (command) {
+        .call => |value| .{ .call = .{
+            .tool = value.tool,
+            .arguments_json = (try readArguments(arena, io, err, value.arguments)) orelse return exit.usage,
+        } },
+        .list => |server| .{ .list = server },
+        .search => |query| .{ .search = query },
+        .help => |tool| .{ .help = tool },
+    };
+    const tool = operation.subject();
     const socket_path = io_mod.getenv(wire.socket_env) orelse return unavailable(err);
     const token = wire.parseToken(io_mod.getenv(wire.token_env) orelse "") orelse return unavailable(err);
 
-    const reply = call(arena, io, socket_path, token, tool, arguments_json) catch |e| switch (e) {
+    const reply = call(arena, io, socket_path, token, operation) catch |e| switch (e) {
         error.OutOfMemory => return e,
         error.UnsupportedReply => {
             try err.writeAll("fx mcp call: the running fx session is another fx version.\n");
@@ -113,7 +143,8 @@ pub fn run(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, tool: []con
     switch (reply.header.status) {
         .ok => {
             try out.writeAll(reply.bytes);
-            if (!stdoutIsTerminal(io)) {
+            // A lookup's text is already meant to be read.
+            if (operation == .call and !stdoutIsTerminal(io)) {
                 try err.print("fx mcp call: {s}\n", .{try shapeSummary(arena, reply.bytes)});
             }
             return exit.ok;

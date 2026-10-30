@@ -378,7 +378,7 @@ fn serve(stream: std.Io.net.Stream) void {
         .refuse => |refusal| {
             bridge.mutex.unlock(io);
             const reason = wire.Reason.fromRefusal(refusal);
-            debug_trace.logf("mcp-call", "bridge refused tool={s} reason={s}", .{ request.tool, @tagName(reason) });
+            debug_trace.logf("mcp-call", "bridge refused op={s} reason={s}", .{ @tagName(request.operation), @tagName(reason) });
             _ = writeReply(stream, .refused, reason, refusalMessage(reason));
             return;
         },
@@ -417,11 +417,16 @@ fn serve(stream: std.Io.net.Stream) void {
     };
 
     const request_id = arena.print("fx-mcp-call-{d}", .{@backingInt(work.id)}) catch "fx-mcp-call";
-    const authorization: capability_mod.Authorization = blk: {
-        bridge.prompt.lockUncancelable(io);
-        defer bridge.prompt.unlock(io);
-        break :blk registration.capability.authorize(arena, request_id, request.tool, request.arguments_json) catch |err|
-            .{ .deny = arena.print("The permission check for {s} failed: {s}", .{ request.tool, @errorName(err) }) catch "The permission check failed." };
+    // A lookup reads tool metadata only, like the agent's own
+    // `capability_search`, so it has no permission check to wait for.
+    const authorization: capability_mod.Authorization = switch (request.operation) {
+        .call => |value| blk: {
+            bridge.prompt.lockUncancelable(io);
+            defer bridge.prompt.unlock(io);
+            break :blk registration.capability.authorize(arena, request_id, value.tool, value.arguments_json) catch |err|
+                .{ .deny = arena.print("The permission check for {s} failed: {s}", .{ value.tool, @errorName(err) }) catch "The permission check failed." };
+        },
+        .list, .search, .help => .{ .allow = .{} },
     };
     bridge.mutex.lockUncancelable(io);
     const decided = step(.{ .authorized = .{ .id = work.id, .decision = if (authorization == .allow) .allow else .deny } });
@@ -430,7 +435,7 @@ fn serve(stream: std.Io.net.Stream) void {
     var reply: ?struct { status: wire.Status, bytes: []const u8 } = null;
     for (decided.effects()) |effect| switch (effect) {
         .call => {
-            const outcome = registration.capability.call(arena, request_id, request.tool, request.arguments_json, authorization.allow, &live.cancel) catch |err|
+            const outcome = runOperation(arena, registration.capability, request_id, request.operation, authorization.allow, &live.cancel) catch |err|
                 capability_mod.CallOutcome{ .status = .failed, .bytes = arena.print("The MCP call failed: {s}", .{@errorName(err)}) catch "The MCP call failed." };
             bridge.mutex.lockUncancelable(io);
             const finished = step(.{ .call_finished = .{ .id = work.id, .outcome = switch (outcome.status) {
@@ -459,6 +464,19 @@ fn serve(stream: std.Io.net.Stream) void {
     bridge.mutex.unlock(io);
 }
 
+/// Runs an admitted request's work: its MCP call, or its lookup.
+fn runOperation(
+    arena: Allocator,
+    capability: capability_mod.Capability,
+    request_id: []const u8,
+    operation: wire.Operation,
+    allowed: @FieldType(capability_mod.Authorization, "allow"),
+    cancel: *std.atomic.Value(bool),
+) anyerror!capability_mod.CallOutcome {
+    if (operation.lookup()) |question| return capability.lookup(arena, question, cancel);
+    return capability.call(arena, request_id, operation.call.tool, operation.call.arguments_json, allowed, cancel);
+}
+
 /// A capability whose permission check and call the test controls.
 const FakeTool = struct {
     allow: bool = true,
@@ -468,7 +486,14 @@ const FakeTool = struct {
     calls: std.atomic.Value(u32) = .init(0),
 
     fn capability(self: *FakeTool) capability_mod.Capability {
-        return .{ .context = @ptrCast(self), .authorize_fn = authorize, .call_fn = run };
+        return .{ .context = @ptrCast(self), .authorize_fn = authorize, .call_fn = run, .lookup_fn = lookup };
+    }
+
+    fn lookup(raw: *anyopaque, arena: Allocator, question: capability_mod.Lookup, cancel: *std.atomic.Value(bool)) anyerror!capability_mod.CallOutcome {
+        _ = .{ raw, cancel };
+        return switch (question) {
+            .list, .search, .help => |text| .{ .status = .ok, .bytes = try arena.print("{s} {s}\n", .{ @tagName(question), text }) },
+        };
     }
 
     fn authorize(raw: *anyopaque, arena: Allocator, request_id: []const u8, tool: []const u8, arguments_json: []const u8) anyerror!capability_mod.Authorization {
@@ -510,11 +535,11 @@ test "a shell call's command reaches its MCP tool, and a forged token reaches no
     const socket_path = variables[0].value;
     const token = wire.parseToken(variables[1].value).?;
 
-    const reply = try client.call(arena, std.testing.io, socket_path, token, "mcp_linear_list_issues", "{\"team\":\"ENG\"}");
+    const reply = try client.call(arena, std.testing.io, socket_path, token, .{ .call = .{ .tool = "mcp_linear_list_issues", .arguments_json = "{\"team\":\"ENG\"}" } });
     try std.testing.expectEqual(wire.Status.ok, reply.header.status);
     try std.testing.expectEqualStrings("mcp_linear_list_issues {\"team\":\"ENG\"}\n", reply.bytes);
 
-    const forged = try client.call(arena, std.testing.io, socket_path, @splat(7), "mcp_linear_list_issues", "{}");
+    const forged = try client.call(arena, std.testing.io, socket_path, @splat(7), .{ .call = .{ .tool = "mcp_linear_list_issues", .arguments_json = "{}" } });
     try std.testing.expectEqual(wire.Status.refused, forged.header.status);
     try std.testing.expectEqual(wire.Reason.unauthorized, forged.header.reason.?);
     try std.testing.expectEqual(@as(u32, 1), tool.calls.load(.acquire));
@@ -529,9 +554,33 @@ test "a denied call does not run" {
     const registration = try register(tool.capability());
     defer unregister(registration);
     const variables = registration.environment();
-    const reply = try client.call(arena, std.testing.io, variables[0].value, wire.parseToken(variables[1].value).?, "mcp_s_t", "{}");
+    const reply = try client.call(arena, std.testing.io, variables[0].value, wire.parseToken(variables[1].value).?, .{ .call = .{ .tool = "mcp_s_t", .arguments_json = "{}" } });
     try std.testing.expectEqual(wire.Status.denied, reply.header.status);
     try std.testing.expectEqualStrings("Denied by the test.", reply.bytes);
+    try std.testing.expectEqual(@as(u32, 0), tool.calls.load(.acquire));
+}
+
+test "a lookup answers without a permission check, and a forged token gets none" {
+    if (!supported) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // A permission check would wait forever, and would deny.
+    var tool: FakeTool = .{ .allow = false };
+    tool.gate.store(true, .release);
+    defer tool.gate.store(false, .release);
+    const registration = try register(tool.capability());
+    defer unregister(registration);
+    const variables = registration.environment();
+    const token = wire.parseToken(variables[1].value).?;
+    for ([_]wire.Operation{ .{ .list = "linear" }, .{ .search = "open issues" }, .{ .help = "mcp_linear_list_issues" } }) |operation| {
+        const reply = try client.call(arena, std.testing.io, variables[0].value, token, operation);
+        try std.testing.expectEqual(wire.Status.ok, reply.header.status);
+        try std.testing.expectEqualStrings(try arena.print("{s} {s}\n", .{ @tagName(operation), operation.subject() }), reply.bytes);
+        const forged = try client.call(arena, std.testing.io, variables[0].value, @splat(7), operation);
+        try std.testing.expectEqual(wire.Reason.unauthorized, forged.header.reason.?);
+    }
+    try std.testing.expect(!tool.authorizing.load(.acquire));
     try std.testing.expectEqual(@as(u32, 0), tool.calls.load(.acquire));
 }
 
@@ -546,7 +595,7 @@ test "a command that leaves while its call waits for permission runs nothing, an
     const stream = try address.connect(io);
     var buffer: [512]u8 = undefined;
     var writer = stream.writer(io, &buffer);
-    try wire.writeRequest(&writer.interface, wire.parseToken(variables[1].value).?, "mcp_s_t", "{}");
+    try wire.writeRequest(&writer.interface, wire.parseToken(variables[1].value).?, .{ .call = .{ .tool = "mcp_s_t", .arguments_json = "{}" } });
     try writer.interface.flush();
     try waitFor(&tool.authorizing);
     try std.testing.expectEqual(@as(u32, 1), registration.hold.load(.acquire));

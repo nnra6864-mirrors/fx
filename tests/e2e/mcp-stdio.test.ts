@@ -4188,4 +4188,146 @@ describe("fx mcp call", () => {
     expect(seen).toContain("did not run");
     expect(toolCalls(root)).toHaveLength(0);
   }, 90_000);
+
+  // What the command printed, from the shell tool's result.
+  const shellOutput = (result: string): string => JSON.parse(result).output_delta;
+
+  // A shell loop that follows each page's cursor, as a script paging through
+  // a long list would.
+  const pageLoop = [
+    `cursor=0; n=0; : > all.txt`,
+    `while [ -n "$cursor" ]; do`,
+    `  "${FX_BIN}" mcp call ${TOOL_NAME} "{\\"text\\":\\"$cursor\\"}" > page.json 2>/dev/null || { echo "exit=$?"; break; }`,
+    `  n=$((n+1)); grep -o '"item-[0-9]*"' page.json >> all.txt`,
+    `  cursor=$(grep -o '"nextCursor":"[0-9]*"' page.json | grep -o '[0-9][0-9]*')`,
+    `done`,
+    `echo "calls=$n items=$(wc -l < all.txt | tr -d ' ')"`,
+  ].join("\n");
+
+  test("a shell loop pages through a tool's results, one call per page", async () => {
+    const root = bridgeRoot("bridge-pages", {}, { mode: "paged" });
+    const seen = await runBridgeCommand(root, pageLoop);
+    expect(seen).toContain("calls=3 items=9");
+    expect(seen).not.toContain("exit=");
+    expect(readFileSync(join(root.workspace, "all.txt"), "utf8").trim().split("\n")).toEqual(
+      Array.from({ length: 9 }, (_, index) => `"item-${index}"`),
+    );
+    // Each page is its own call, with the cursor the last page gave.
+    expect(toolCalls(root).map((entry) => entry.message.params?.arguments?.text)).toEqual(["0", "1", "2"]);
+  }, 90_000);
+
+  test("list, search, and help describe the agent's tools to a command, and call none", async () => {
+    const root = bridgeRoot("bridge-lookups");
+    const seen = shellOutput(await runBridgeCommand(root, [
+      `"${FX_BIN}" mcp call list fixture; echo "list=$?"`,
+      `"${FX_BIN}" mcp call search echo text; echo "search=$?"`,
+      `"${FX_BIN}" mcp call help ${TOOL_NAME}; echo "help=$?"`,
+      `"${FX_BIN}" mcp call help mcp_fixture_nope; echo "missing=$?"`,
+      `"${FX_BIN}" mcp call list nope; echo "server=$?"`,
+    ].join("\n")));
+    const line = `${TOOL_NAME}\tEcho text through the modern MCP fixture`;
+    expect(seen).toContain(`${line}\nlist=0`);
+    expect(seen).toContain(`${line}\nsearch=0`);
+    // The description is the one the model gets, the server's instructions
+    // included, then each argument.
+    expect(seen).toContain(`${TOOL_NAME}\nEcho text through the modern MCP fixture\n\nServer instructions: Use the modern echo tool.\n`);
+    expect(seen).toContain("\nArguments, as one JSON object:\n  text: string\nhelp=0");
+    expect(seen).toContain("No MCP tool named mcp_fixture_nope is available to this agent.");
+    expect(seen).toContain("missing=1");
+    expect(seen).toContain("No MCP server by that name is available to this agent.");
+    expect(seen).toContain("server=1");
+    expect(toolCalls(root)).toHaveLength(0);
+  }, 90_000);
+
+  test("list, search, and help hide a tool the permission rules deny", async () => {
+    const root = bridgeRoot("bridge-lookups-denied", { permission: { bash: { "*": "allow" }, [TOOL_NAME]: "deny" } });
+    const seen = shellOutput(await runBridgeCommand(root, [
+      `"${FX_BIN}" mcp call list fixture; echo "list=$?"`,
+      `"${FX_BIN}" mcp call help ${TOOL_NAME}; echo "help=$?"`,
+    ].join("\n")));
+    expect(seen).not.toContain(`${TOOL_NAME}\t`);
+    expect(seen).toContain("list=0");
+    expect(seen).toContain(`No MCP tool named ${TOOL_NAME} is available to this agent.`);
+    expect(seen).toContain("help=1");
+  }, 90_000);
+
+  test.skipIf(!tmuxAvailable())(
+    "in the TUI, each call a command makes shows as its own MCP row beside the command",
+    async () => {
+      const root = bridgeRoot("bridge-tui-rows", {}, { mode: "paged", expectedElicitation: "both" });
+      const stderrPath = join(root.root, "stderr.log");
+      let seen = "";
+      const activeGateway = startFakeGateway([
+        fakeGatewayToolCall("run_call", "shell", { action: "run", command: pageLoop }),
+        (body: string) => {
+          seen = toolResultText(body, "run_call");
+          return fakeGatewayFinalText("BRIDGE_ROWS_DONE");
+        },
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 40,
+        stderrPath,
+        env: { ...fixtureEnv(root, activeGateway), FX_PERMISSION_MODE: "full-access" },
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Page through the list.");
+      await tui.waitForText("BRIDGE_ROWS_DONE", 30_000);
+      const scrollback = await tui.captureFullScrollback();
+      // The rows a direct call of the tool gets, in the command's group.
+      expect(scrollback).toContain("● 4 tool calls · 3 MCP calls · 1 command");
+      expect(scrollback.split(`Ran MCP ${TOOL_NAME}`)).toHaveLength(4);
+      expect(scrollback).toContain(`└ Ran MCP ${TOOL_NAME}`);
+      expect(scrollback).not.toContain("Running MCP");
+      expect(seen).toContain("calls=3 items=9");
+      // The model sees the command's output, not the rows.
+      expect(seen).not.toContain("Ran MCP");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    60_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "in the TUI, a call that runs when the user cancels shows as running, then as cancelled",
+    async () => {
+      const root = bridgeRoot("bridge-tui-cancel", {}, { mode: "stall_operation", operationTimeoutMs: 30_000, expectedElicitation: "both" });
+      const stderrPath = join(root.root, "stderr.log");
+      const activeGateway = startFakeGateway([
+        fakeGatewayToolCall("run_call", "shell", { action: "run", command }),
+        fakeGatewayFinalText("BRIDGE_AFTER_CANCEL"),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 40,
+        stderrPath,
+        env: { ...fixtureEnv(root, activeGateway), FX_PERMISSION_MODE: "full-access" },
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Save the list to a file.");
+      await tui.waitForText(`Running MCP ${TOOL_NAME}`, 20_000);
+      expect(toolCalls(root)).toHaveLength(1);
+      await tui.sendInterruptEscapePair(10_000);
+      await tui.waitForText(`Cancelled ${TOOL_NAME}`, 10_000);
+      await tui.waitForStableComposer(10_000);
+      expect(await tui.captureFullScrollback()).not.toContain("Running MCP");
+
+      // The session goes on.
+      await tui.sendText("Go on.");
+      await tui.waitForText("BRIDGE_AFTER_CANCEL", 10_000);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    60_000,
+  );
 });

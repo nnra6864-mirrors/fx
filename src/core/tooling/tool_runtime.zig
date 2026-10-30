@@ -56,6 +56,8 @@ const mcp_call_capability = @import("mcp_call_capability.zig");
 const model_tool_schema = @import("model_tool_schema.zig");
 const auto_classifier_context = @import("../permissions/auto_classifier_context.zig");
 const capability_retrieval = @import("capability_retrieval.zig");
+const lexical_relevance = @import("../shared/lexical_relevance.zig");
+const mcp_tool_lookup = @import("../mcp/tool_lookup.zig");
 const tool_presentation = @import("tool_presentation.zig");
 const shell_impl = @import("../../tools/shell/shell.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
@@ -113,6 +115,16 @@ test {
     _ = file_mutation_execution;
     _ = tool_presentation;
 }
+
+/// Shows tool rows: a host's push of tool lifecycle events.
+pub const ToolLifecyclePublisher = struct {
+    context: *anyopaque,
+    push_fn: *const fn (*anyopaque, types.ToolLifecycleEvent) anyerror!void,
+
+    pub fn push(self: ToolLifecyclePublisher, event: types.ToolLifecycleEvent) anyerror!void {
+        return self.push_fn(self.context, event);
+    }
+};
 
 pub const Context = struct {
     observer: ?*observation.Observer = null,
@@ -184,6 +196,8 @@ pub const Context = struct {
     context_registry: context_contract.Registry,
     context_enabled: bool = true,
     output_chunk_lifecycle_id: ?types.ToolLifecycleId = null,
+    /// The row group of the call `output_chunk_lifecycle_id` names.
+    output_chunk_presentation_group_id: ?types.ToolPresentationGroupId = null,
     output_chunk_ctx: *anyopaque,
     on_output_chunk: command_contract.CommandOutputCallback,
     command_artifact_dir: ?[]const u8 = null,
@@ -213,6 +227,9 @@ pub const Context = struct {
     on_mcp_progress: ?*const fn (*anyopaque, types.ToolLifecycleId, []const u8) void = null,
     tool_progress_ctx: ?*anyopaque = null,
     on_tool_progress: ?*const fn (*anyopaque, types.ToolLifecycleId, []const u8) void = null,
+    /// Where a tool call shows rows for tool calls it makes itself: the MCP
+    /// calls of an `fx mcp call` its command runs. Null shows none.
+    nested_tool_lifecycle: ?ToolLifecyclePublisher = null,
     subagent_status_renderer: ?types.SubagentStatusRenderer = null,
     advertised_dynamic_tool_names: []const []const u8 = &.{},
     permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
@@ -430,6 +447,7 @@ pub fn executeToolCallAuthorized(
     execution_ctx.expected_mcp_binding = request.expected_mcp_binding;
     execution_ctx.current_turn_messages = request.current_turn_messages;
     execution_ctx.output_chunk_lifecycle_id = request.lifecycle_id;
+    execution_ctx.output_chunk_presentation_group_id = request.presentation_group_id;
     execution_ctx.command_timeout_started_ms = request.command_timeout_started_ms;
     execution_ctx.command_replay_capture = request.command_replay_capture;
     execution_ctx.command_replay_unavailable = request.command_replay_unavailable;
@@ -951,7 +969,7 @@ const McpCallBridgeState = struct {
     runtime: Context,
 
     fn capability(self: *McpCallBridgeState) mcp_call_capability.Capability {
-        return .{ .context = @ptrCast(self), .authorize_fn = authorizeBridgeCall, .call_fn = runBridgeCall };
+        return .{ .context = @ptrCast(self), .authorize_fn = authorizeBridgeCall, .call_fn = runBridgeCall, .lookup_fn = lookupBridge };
     }
 };
 
@@ -1022,7 +1040,79 @@ fn runBridgeCall(
     cancel: *std.atomic.Value(bool),
 ) anyerror!mcp_call_capability.CallOutcome {
     const state: *McpCallBridgeState = @ptrCast(@alignCast(raw));
-    const ctx = state.runtime;
+    const row = BridgeCallRow.start(state.runtime, arena, request_id, tool, arguments_json);
+    const outcome = callBridgeTool(state.runtime, arena, request_id, tool, arguments_json, allowed, cancel) catch |err| {
+        if (row) |value| value.finish(arena, if (cancel.load(.acquire)) .cancelled else .failed);
+        return err;
+    };
+    if (row) |value| value.finish(arena, if (cancel.load(.acquire)) .cancelled else switch (outcome.status) {
+        .ok => .completed,
+        .tool_error, .failed => .failed,
+    });
+    return outcome;
+}
+
+/// The row a bridge call shows in its shell call's group: the row a direct
+/// call of the same MCP tool shows, `Running MCP` and then `Ran MCP`. Only a
+/// host that set `nested_tool_lifecycle` shows it, and a row it could not
+/// show is logged, never a reason to fail the call.
+const BridgeCallRow = struct {
+    publisher: ToolLifecyclePublisher,
+    id: types.ToolLifecycleId,
+    tool: []const u8,
+
+    /// Arguments larger than this stay out of the row's details.
+    const max_argument_bytes = 16 * 1024;
+
+    fn start(ctx: Context, arena: Allocator, request_id: []const u8, tool: []const u8, arguments_json: []const u8) ?BridgeCallRow {
+        const publisher = ctx.nested_tool_lifecycle orelse return null;
+        const parent = ctx.output_chunk_lifecycle_id orelse return null;
+        const row: BridgeCallRow = .{ .publisher = publisher, .id = .{ .turn_id = parent.turn_id, .call_id = request_id }, .tool = tool };
+        row.begin(ctx, arena, arguments_json) catch |err| {
+            debug_trace.logf("mcp-call", "request={s} row not shown err={s}", .{ request_id, @errorName(err) });
+            return null;
+        };
+        return row;
+    }
+
+    fn begin(self: BridgeCallRow, ctx: Context, arena: Allocator, arguments_json: []const u8) !void {
+        try self.publisher.push(.{ .authoritative_started = .{
+            .id = self.id,
+            .presentation_group_id = ctx.output_chunk_presentation_group_id,
+            .reconciles_provisional_call_id = null,
+            .tool_name = self.tool,
+            .activity_kind = .mcp,
+            .arguments_json = if (arguments_json.len <= max_argument_bytes) try text_utils.maskSecrets(arena, arguments_json) else null,
+        } });
+        try self.publisher.push(.{ .progress = .{
+            .id = self.id,
+            .text = try tool_presentation.formatToolActionValue(arena, tool_presentation.mcp_running_label, self.tool),
+        } });
+    }
+
+    fn finish(self: BridgeCallRow, arena: Allocator, kind: types.ToolOutcomeKind) void {
+        const label = switch (kind) {
+            .completed => tool_presentation.mcp_ran_label,
+            .cancelled => "Cancelled",
+            .failed, .denied, .deferred => "Failed",
+        };
+        const summary = tool_presentation.formatToolActionValue(arena, label, self.tool) catch label;
+        self.publisher.push(.{ .terminal = .{ .id = self.id, .outcome = .{ .kind = kind, .summary = summary } } }) catch |err| {
+            // The worker's turn end closes a row whose end was lost.
+            debug_trace.logf("mcp-call", "request={s} row end not shown err={s}", .{ self.id.call_id, @errorName(err) });
+        };
+    }
+};
+
+fn callBridgeTool(
+    ctx: Context,
+    arena: Allocator,
+    request_id: []const u8,
+    tool: []const u8,
+    arguments_json: []const u8,
+    allowed: @FieldType(mcp_call_capability.Authorization, "allow"),
+    cancel: *std.atomic.Value(bool),
+) anyerror!mcp_call_capability.CallOutcome {
     const runtime = ctx.mcp_ctx orelse return .{ .status = .failed, .bytes = "MCP is not available in this session." };
     const call_tool = ctx.mcp_call_tool orelse return .{ .status = .failed, .bytes = "MCP is not available in this session." };
     const result = (call_tool(runtime, arena, tool, arguments_json, mcp_call_capability.max_result_bytes, .{
@@ -1073,6 +1163,75 @@ fn bridgeResultData(arena: Allocator, envelope: []const u8) ![]const u8 {
     try std.json.Stringify.value(result, .{}, &out.writer);
     try out.writer.writeByte('\n');
     return out.written();
+}
+
+/// The most search pages one `list` reads: 2,000 tools.
+const max_bridge_list_pages = 100;
+/// A search page for a command goes to its stdout, not to the model, so it
+/// may hold a whole page of tools.
+const bridge_search_page_bytes = 256 * 1024;
+
+/// Answers `fx mcp call list`, `search`, and `help` with the tools this agent
+/// may use: the same search and schemas as its own `capability_search`, with
+/// the same access and permission rules.
+fn lookupBridge(
+    raw: *anyopaque,
+    arena: Allocator,
+    question: mcp_call_capability.Lookup,
+    cancel: *std.atomic.Value(bool),
+) anyerror!mcp_call_capability.CallOutcome {
+    const state: *McpCallBridgeState = @ptrCast(@alignCast(raw));
+    const ctx = state.runtime;
+    var out: std.Io.Writer.Allocating = .init(arena);
+    switch (question) {
+        .help => |tool| {
+            if (ctx.tool_registry.lookup(tool) != null) {
+                return .{ .status = .failed, .bytes = try arena.print("{s} is a built-in tool; fx mcp call runs MCP tools only.", .{tool}) };
+            }
+            const resolved = (try resolveUnselectedMcpTool(ctx, arena, tool)) orelse {
+                return .{ .status = .failed, .bytes = try arena.print("No MCP tool named {s} is available to this agent. Find tool names with fx mcp call search.", .{tool}) };
+            };
+            mcp_tool_lookup.writeHelp(arena, &out.writer, resolved.schema_json) catch |err| switch (err) {
+                error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
+                error.InvalidToolSchema => return .{ .status = .failed, .bytes = try arena.print("The schema of {s} could not be read.", .{tool}) },
+            };
+        },
+        .list, .search => |text| {
+            const runtime = ctx.mcp_ctx orelse return .{ .status = .failed, .bytes = "MCP is not available in this session." };
+            const search = ctx.mcp_search_tools orelse return .{ .status = .failed, .bytes = "MCP is not available in this session." };
+            const query = try arena.create(lexical_relevance.PreparedQuery);
+            query.* = lexical_relevance.prepare(if (question == .list) "" else text) catch |err| {
+                return .{ .status = .failed, .bytes = try arena.print("fx can't search for that: {s}.", .{@errorName(err)}) };
+            };
+            var limits = ctx.context_limits;
+            limits.mcp_search_result_bytes.value = .{ .bytes = bridge_search_page_bytes };
+            var cursor: ?[]const u8 = null;
+            for (0..max_bridge_list_pages) |_| {
+                const request: capability_retrieval.Request = .{
+                    .query = query,
+                    .kind = .mcp,
+                    .server = if (question == .list) text else null,
+                    .limit = capability_retrieval.max_limit,
+                    .cursor = cursor,
+                };
+                request.validate() catch |err| {
+                    return .{ .status = .failed, .bytes = try arena.print("fx can't search for that: {s}.", .{@errorName(err)}) };
+                };
+                const result = try search(runtime, arena, request, ctx.permission_rules, limits, ctx.mcp_access, cancel);
+                const page = mcp_tool_lookup.writeToolLines(arena, &out.writer, result.model_output) catch |err| switch (err) {
+                    error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
+                    error.InvalidSearchPage => return .{ .status = .failed, .bytes = "The MCP search returned a page fx could not read." },
+                };
+                if (page.problem) |problem| if (out.written().len == 0) return .{ .status = .failed, .bytes = problem };
+                if (question == .search) break;
+                const next = page.next_cursor orelse break;
+                // A page that holds no tool would only repeat itself.
+                if (page.tools == 0) break;
+                cursor = next;
+            } else debug_trace.logf("mcp-call", "list server={s} stopped after {d} pages", .{ text, max_bridge_list_pages });
+        },
+    }
+    return .{ .status = .ok, .bytes = out.written() };
 }
 
 test "bridge result data is the structured content, else the text" {
