@@ -74,7 +74,11 @@ const Bridge = struct {
     dir_path: ?[]u8 = null,
     socket_path: ?[]u8 = null,
     listener: ?std.Io.net.Server = null,
-    accept_thread: ?std.Thread = null,
+    /// The accept loop, awaited when the bridge stops.
+    accept_task: ?std.Io.Future(void) = null,
+    /// One task per open connection, cancelled and awaited when the bridge
+    /// stops. Only the accept loop adds to it.
+    connection_tasks: std.Io.Group = .init,
     stop: std.atomic.Value(bool) = .init(false),
     registrations: std.ArrayList(*Registration) = .empty,
     live: std.ArrayList(*Live) = .empty,
@@ -123,18 +127,22 @@ pub fn unregister(registration: *Registration) void {
         }
     }
     const last = bridge.registrations.items.len == 0;
-    var thread: ?std.Thread = null;
+    var accept_task: ?std.Io.Future(void) = null;
     if (last) {
         applyLocked(mcp_call.step(bridge.state, .stopped));
         bridge.phase = .stopping;
         bridge.stop.store(true, .release);
-        thread = bridge.accept_thread;
-        bridge.accept_thread = null;
+        accept_task = bridge.accept_task;
+        bridge.accept_task = null;
     }
     bridge.mutex.unlock(io);
     gpa.destroy(registration);
     if (!last) return;
-    if (thread) |t| t.join();
+    // The accept loop sees `stop` within a poll; after it ends nothing adds
+    // a connection. No owner is left, so the connections still open are
+    // unadmitted ones; cancelling ends their wait for a request line.
+    if (accept_task) |*task| task.await(io);
+    bridge.connection_tasks.cancel(io);
     bridge.mutex.lockUncancelable(io);
     defer bridge.mutex.unlock(io);
     closeListenerLocked(io);
@@ -173,7 +181,7 @@ fn startLocked(io: std.Io) !void {
     errdefer listener.deinit(io);
     bridge.listener = listener;
     bridge.stop.store(false, .release);
-    bridge.accept_thread = std.Thread.spawn(.{}, acceptLoop, .{}) catch |err| {
+    bridge.accept_task = std.Io.concurrent(io, acceptLoop, .{}) catch |err| {
         bridge.listener = null;
         std.Io.Dir.cwd().deleteFile(io, socket_path) catch {};
         return err;
@@ -205,7 +213,7 @@ fn closeListenerLocked(io: std.Io) void {
 }
 
 /// Takes the core's new state and runs the effects that are not the
-/// serving thread's own: cancels, withdrawals, and logs.
+/// serving task's own: cancels, withdrawals, and logs.
 fn applyLocked(out: mcp_call.Output) void {
     bridge.state = out.state;
     for (out.effects()) |effect| switch (effect) {
@@ -249,12 +257,11 @@ fn acceptLoop() void {
             stream.close(io);
             continue;
         }
-        const thread = std.Thread.spawn(.{}, serve, .{stream}) catch |err| {
-            debug_trace.logf("mcp-call", "bridge connection dropped: no thread err={s}", .{@errorName(err)});
+        bridge.connection_tasks.concurrent(io, serve, .{stream}) catch |err| {
+            debug_trace.logf("mcp-call", "bridge connection dropped: no task err={s}", .{@errorName(err)});
             finishConnection(io, stream);
             continue;
         };
-        thread.detach();
     }
 }
 
@@ -265,14 +272,17 @@ fn finishConnection(io: std.Io, stream: std.Io.net.Stream) void {
     bridge.connections -= 1;
 }
 
-const ReadError = error{ TooLarge, Silent, Closed, ReadFailed, OutOfMemory };
+const ReadError = error{ TooLarge, Silent, Closed, ReadFailed, OutOfMemory, Canceled };
 
-/// Reads one request line within the deadline, without its newline.
+/// Reads one request line within the deadline, without its newline. Ends
+/// with `error.Canceled` when the bridge stops first.
 fn readRequestLine(arena: Allocator, fd: posix.socket_t) ReadError![]const u8 {
+    const io = io_mod.getIo();
     var line: std.ArrayList(u8) = .empty;
     const deadline = io_mod.milliTimestamp() + request_deadline_ms;
     var chunk: [16 * 1024]u8 = undefined;
     while (true) {
+        try io.checkCancel();
         const remaining = deadline - io_mod.milliTimestamp();
         if (remaining <= 0) return error.Silent;
         var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
@@ -410,10 +420,13 @@ fn serve(stream: std.Io.net.Stream) void {
     }
 
     var watch: Watch = .{ .fd = stream.socket.handle, .id = work.id };
-    const watcher = std.Thread.spawn(.{}, Watch.run, .{&watch}) catch null;
-    defer if (watcher) |thread| {
+    var watcher: ?std.Io.Future(void) = std.Io.concurrent(io, Watch.run, .{&watch}) catch |err| blk: {
+        debug_trace.logf("mcp-call", "request={d} runs without a disconnect watch err={s}", .{ @backingInt(work.id), @errorName(err) });
+        break :blk null;
+    };
+    defer if (watcher) |*task| {
         watch.done.store(true, .release);
-        thread.join();
+        task.await(io);
     };
 
     const request_id = arena.print("fx-mcp-call-{d}", .{@backingInt(work.id)}) catch "fx-mcp-call";
@@ -621,4 +634,30 @@ test "the bridge removes its socket after the last shell call" {
     try std.Io.Dir.cwd().access(io, socket_path, .{});
     unregister(second);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, socket_path, .{}));
+}
+
+test "the bridge stops at once, and ends a silent client's connection with it" {
+    if (!supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tool: FakeTool = .{};
+    const registration = try register(tool.capability());
+    const address = try std.Io.net.UnixAddress.init(registration.environment()[0].value);
+    const stream = try address.connect(io);
+    defer stream.close(io);
+    const deadline = io_mod.milliTimestamp() + 5_000;
+    while (true) {
+        bridge.mutex.lockUncancelable(io);
+        const open = bridge.connections;
+        bridge.mutex.unlock(io);
+        if (open == 1) break;
+        if (io_mod.milliTimestamp() > deadline) return error.TestTimedOut;
+        io_mod.sleep(10 * std.time.ns_per_ms);
+    }
+    const started = io_mod.milliTimestamp();
+    unregister(registration);
+    // The connection's wait for a request line ended with the bridge, well
+    // before its own deadline.
+    try std.testing.expect(io_mod.milliTimestamp() - started < request_deadline_ms / 2);
+    try std.testing.expectEqual(@as(u32, 0), bridge.connections);
+    try std.testing.expectEqual(@as(u32, 0), tool.calls.load(.acquire));
 }

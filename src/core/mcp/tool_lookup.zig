@@ -2,9 +2,13 @@
 //! shell command, made from the same search pages and tool schemas the agent's
 //! own `capability_search` uses (`tool_search.zig`, `selected_schema.zig`).
 //!
-//! The text comes from MCP servers, so control bytes become spaces and every
-//! part is bounded. Pure: it formats bytes it is given.
+//! The text comes from MCP servers, so it is written the way fx shows any
+//! outside text on a terminal (`text_utils.encodeTerminalSafeInline`: control
+//! bytes and non-printing characters become visible escapes), and every part
+//! is bounded. Pure: it formats bytes it is given.
 const std = @import("std");
+const text_utils = @import("../shared/text_utils.zig");
+const tool_args = @import("../tooling/tool_args.zig");
 
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
@@ -53,11 +57,11 @@ pub fn writeToolLines(arena: Allocator, out: *Writer, page_json: []const u8) Pag
         if (tool != .object) continue;
         const name = tool.object.get("name") orelse continue;
         if (name != .string or name.string.len == 0) continue;
-        try writeClean(out, name.string, 256, .one_line);
+        try writeSafe(arena, out, name.string, 256);
         try out.writeByte('\t');
-        if (tool.object.get("description")) |description| if (description == .string) {
-            try writeClean(out, description.string, max_line_description_bytes, .one_line);
-        };
+        if (tool_args.optionalStringArg(tool.object, "description")) |description| {
+            try writeSafe(arena, out, description, max_line_description_bytes);
+        }
         try out.writeByte('\n');
         written += 1;
     }
@@ -70,12 +74,12 @@ pub fn writeToolLines(arena: Allocator, out: *Writer, page_json: []const u8) Pag
 
 fn pageProblem(arena: Allocator, page: std.json.ObjectMap) Allocator.Error!?[]const u8 {
     if (page.get("authentication_required")) |required| if (required == .object) {
-        const server = stringField(required.object, "server") orelse "this server";
-        const message = stringField(required.object, "message") orelse "it needs a login";
+        const server = tool_args.optionalStringArg(required.object, "server") orelse "this server";
+        const message = tool_args.optionalStringArg(required.object, "message") orelse "it needs a login";
         return try arena.print("MCP server '{s}' needs a login: {s}", .{ server, message });
     };
-    if (stringField(page, "error")) |message| return message;
-    if (stringField(page, "state")) |state| {
+    if (tool_args.optionalStringArg(page, "error")) |message| return message;
+    if (tool_args.optionalStringArg(page, "state")) |state| {
         if (std.mem.eql(u8, state, "server_not_found")) return "No MCP server by that name is available to this agent.";
     }
     if (page.get("unavailable")) |reasons| if (reasons == .array) {
@@ -89,11 +93,6 @@ fn pageProblem(arena: Allocator, page: std.json.ObjectMap) Allocator.Error!?[]co
     return null;
 }
 
-fn stringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const value = object.get(key) orelse return null;
-    return if (value == .string and value.string.len > 0) value.string else null;
-}
-
 pub const HelpError = error{ InvalidToolSchema, OutOfMemory, WriteFailed };
 
 /// Writes what `help` prints for one tool's schema, `{"name", "description",
@@ -105,12 +104,12 @@ pub fn writeHelp(arena: Allocator, out: *Writer, schema_json: []const u8) HelpEr
         else => return error.InvalidToolSchema,
     };
     if (value != .object) return error.InvalidToolSchema;
-    const name = stringField(value.object, "name") orelse return error.InvalidToolSchema;
-    try writeClean(out, name, 256, .one_line);
+    const name = tool_args.optionalStringArg(value.object, "name") orelse return error.InvalidToolSchema;
+    if (name.len == 0) return error.InvalidToolSchema;
+    try writeSafe(arena, out, name, 256);
     try out.writeByte('\n');
-    if (stringField(value.object, "description")) |description| {
-        try writeClean(out, description, max_help_description_bytes, .lines);
-        try out.writeByte('\n');
+    if (tool_args.optionalStringArg(value.object, "description")) |description| {
+        try writeDescription(arena, out, description);
     }
     const input = value.object.get("inputSchema") orelse return error.InvalidToolSchema;
     const properties = if (input == .object) input.object.get("properties") else null;
@@ -126,10 +125,10 @@ pub fn writeHelp(arena: Allocator, out: *Writer, schema_json: []const u8) HelpEr
     while (it.next()) |entry| : (listed += 1) {
         if (listed == max_arguments) break;
         var line: Writer.Allocating = .init(arena);
-        try writeKey(&line.writer, entry.key_ptr.*);
+        try writeKey(arena, &line.writer, entry.key_ptr.*);
         if (!isRequired(required, entry.key_ptr.*)) try line.writer.writeByte('?');
         try line.writer.writeAll(": ");
-        try writeType(&line.writer, entry.value_ptr.*, 0);
+        try writeType(arena, &line.writer, entry.value_ptr.*, 0);
         width = @max(width, line.written().len);
         try lines.append(arena, line.written());
     }
@@ -138,11 +137,11 @@ pub fn writeHelp(arena: Allocator, out: *Writer, schema_json: []const u8) HelpEr
         const entry = it.next().?;
         try out.writeAll("  ");
         try out.writeAll(line);
-        const description = if (entry.value_ptr.* == .object) stringField(entry.value_ptr.object, "description") else null;
-        if (description) |text| {
+        const description = if (entry.value_ptr.* == .object) tool_args.optionalStringArg(entry.value_ptr.object, "description") else null;
+        if (description) |text| if (text.len > 0) {
             try out.splatByteAll(' ', @min(width, 40) -| line.len + 2);
-            try writeClean(out, text, max_argument_description_bytes, .one_line);
-        }
+            try writeSafe(arena, out, text, max_argument_description_bytes);
+        };
         try out.writeByte('\n');
     }
     if (properties.?.object.count() > max_arguments) {
@@ -160,28 +159,26 @@ fn isRequired(required: ?std.json.Value, key: []const u8) bool {
 }
 
 /// A key as written, or JSON-quoted when it is not a plain name.
-fn writeKey(out: *Writer, key: []const u8) Writer.Error!void {
+fn writeKey(arena: Allocator, out: *Writer, key: []const u8) WriteError!void {
     const plain = key.len > 0 and for (key) |byte| {
         if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-' and byte != '$') break false;
     } else true;
     if (plain) return out.writeAll(key);
-    var buffer: [256]u8 = undefined;
-    var clipped: Writer = .fixed(&buffer);
-    writeClean(&clipped, key, 128, .one_line) catch {};
-    try std.json.Stringify.value(clipped.buffered(), .{}, out);
+    const safe = try text_utils.encodeTerminalSafeInline(arena, key, 128);
+    try std.json.Stringify.value(safe.bytes, .{}, out);
 }
 
 /// A JSON Schema as a short type: `string`, `"a" | "b"`, `number[]`,
 /// `{id: string, done?: boolean}`, or `any` for what it does not spell out.
-fn writeType(out: *Writer, schema: std.json.Value, depth: usize) Writer.Error!void {
+fn writeType(arena: Allocator, out: *Writer, schema: std.json.Value, depth: usize) WriteError!void {
     if (schema != .object) return out.writeAll("any");
     const object = schema.object;
-    if (object.get("const")) |literal| return writeLiteral(out, literal);
+    if (object.get("const")) |literal| return writeLiteral(arena, out, literal);
     if (object.get("enum")) |choices| if (choices == .array and choices.array.items.len > 0) {
         for (choices.array.items, 0..) |choice, index| {
             if (index == max_choices) return out.writeAll(" | …");
             if (index > 0) try out.writeAll(" | ");
-            try writeLiteral(out, choice);
+            try writeLiteral(arena, out, choice);
         }
         return;
     };
@@ -190,36 +187,37 @@ fn writeType(out: *Writer, schema: std.json.Value, depth: usize) Writer.Error!vo
             for (members.array.items, 0..) |member, index| {
                 if (index == max_choices) return out.writeAll(" | …");
                 if (index > 0) try out.writeAll(" | ");
-                try writeType(out, member, depth + 1);
+                try writeType(arena, out, member, depth + 1);
             }
             return;
         };
     }
     const declared = object.get("type");
     if (declared) |kind| switch (kind) {
-        .string => |name| return writeNamedType(out, object, name, depth),
+        .string => |name| return writeNamedType(arena, out, object, name, depth),
         .array => |names| if (names.items.len > 0) {
             for (names.items, 0..) |name, index| {
                 if (index > 0) try out.writeAll(" | ");
-                try writeNamedType(out, object, if (name == .string) name.string else "any", depth);
+                try writeNamedType(arena, out, object, if (name == .string) name.string else "any", depth);
             }
             return;
         },
         else => {},
     };
-    if (object.get("properties") != null) return writeNamedType(out, object, "object", depth);
-    if (object.get("items") != null) return writeNamedType(out, object, "array", depth);
+    if (object.get("properties") != null) return writeNamedType(arena, out, object, "object", depth);
+    if (object.get("items") != null) return writeNamedType(arena, out, object, "array", depth);
     return out.writeAll("any");
 }
 
-fn writeNamedType(out: *Writer, object: std.json.ObjectMap, name: []const u8, depth: usize) Writer.Error!void {
+fn writeNamedType(arena: Allocator, out: *Writer, object: std.json.ObjectMap, name: []const u8, depth: usize) WriteError!void {
     if (std.mem.eql(u8, name, "array")) {
         const items = object.get("items") orelse return out.writeAll("any[]");
         if (depth >= max_type_depth) return out.writeAll("any[]");
         var buffer: [512]u8 = undefined;
         var inner: Writer = .fixed(&buffer);
-        writeType(&inner, items, depth + 1) catch {
-            return out.writeAll("any[]");
+        writeType(arena, &inner, items, depth + 1) catch |err| switch (err) {
+            error.WriteFailed => return out.writeAll("any[]"),
+            error.OutOfMemory => return error.OutOfMemory,
         };
         const text = inner.buffered();
         const union_type = std.mem.find(u8, text, " | ") != null;
@@ -241,10 +239,10 @@ fn writeNamedType(out: *Writer, object: std.json.ObjectMap, name: []const u8, de
                 try out.writeAll("…");
                 break;
             }
-            try writeKey(out, entry.key_ptr.*);
+            try writeKey(arena, out, entry.key_ptr.*);
             if (!isRequired(required, entry.key_ptr.*)) try out.writeByte('?');
             try out.writeAll(": ");
-            try writeType(out, entry.value_ptr.*, depth + 1);
+            try writeType(arena, out, entry.value_ptr.*, depth + 1);
         }
         return out.writeByte('}');
     }
@@ -254,40 +252,37 @@ fn writeNamedType(out: *Writer, object: std.json.ObjectMap, name: []const u8, de
     return out.writeAll("any");
 }
 
-fn writeLiteral(out: *Writer, literal: std.json.Value) Writer.Error!void {
+fn writeLiteral(arena: Allocator, out: *Writer, literal: std.json.Value) WriteError!void {
     var buffer: [max_literal_bytes * 2]u8 = undefined;
     var json: Writer = .fixed(&buffer);
     std.json.Stringify.value(literal, .{}, &json) catch {};
     const text = json.buffered();
     if (text.len == 0) return out.writeAll("any");
-    try writeClean(out, text, max_literal_bytes, .one_line);
+    try writeSafe(arena, out, text, max_literal_bytes);
 }
 
-const Layout = enum { one_line, lines };
+const WriteError = Writer.Error || Allocator.Error;
 
-/// Writes `text`, at most `max_bytes` of it cut at a character boundary, with
-/// every control byte a space. `.one_line` turns line breaks into spaces too.
-fn writeClean(out: *Writer, text: []const u8, max_bytes: usize, layout: Layout) Writer.Error!void {
-    const clipped = text.len > max_bytes;
-    var end = @min(text.len, max_bytes);
-    while (end > 0 and end < text.len and (text[end] & 0xc0) == 0x80) end -= 1;
-    const kept = std.mem.trimEnd(u8, text[0..end], " \t\r\n");
-    var index: usize = 0;
-    while (index < kept.len) : (index += 1) {
-        const byte = kept[index];
-        // A C1 control is the two bytes C2 80 to C2 9F in UTF-8.
-        if (byte == 0xc2 and index + 1 < kept.len and kept[index + 1] >= 0x80 and kept[index + 1] <= 0x9f) {
-            try out.writeByte(' ');
-            index += 1;
-        } else if (byte == '\n' and layout == .lines) {
-            try out.writeByte('\n');
-        } else if (byte < 0x20 or byte == 0x7f) {
-            try out.writeByte(' ');
-        } else {
-            try out.writeByte(byte);
-        }
+/// Writes `text` the way fx shows outside text on one terminal line, at most
+/// `max_bytes` of it.
+fn writeSafe(arena: Allocator, out: *Writer, text: []const u8, max_bytes: usize) WriteError!void {
+    const safe = try text_utils.encodeTerminalSafeInline(arena, text, max_bytes);
+    try out.writeAll(safe.bytes);
+}
+
+/// Writes a tool's description line by line, each as `writeSafe` does, at
+/// most `max_help_description_bytes` in all.
+fn writeDescription(arena: Allocator, out: *Writer, text: []const u8) WriteError!void {
+    var budget: usize = max_help_description_bytes;
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, text, " \t\r\n"), '\n');
+    while (lines.next()) |line| {
+        const safe = try text_utils.encodeTerminalSafeInline(arena, line, budget);
+        try out.writeAll(safe.bytes);
+        try out.writeByte('\n');
+        if (safe.truncated) return;
+        budget -|= safe.bytes.len + 1;
+        if (budget == 0 and lines.peek() != null) return out.writeAll("...\n");
     }
-    if (clipped) try out.writeAll("…");
 }
 
 const testing = std.testing;
@@ -307,7 +302,7 @@ test "a search page becomes one line per tool, and says where the next starts" {
     try testing.expect(page.problem == null);
     try testing.expectEqualStrings(
         "mcp_linear_list_issues\tList issues. One per line\n" ++
-            "mcp_linear_get_issue\tGet one  ]52;c;x issue  now\n",
+            "mcp_linear_get_issue\tGet one \\x1b]52;c;x\\x07issue \\u{0085}now\n",
         out.written(),
     );
     try testing.expect(std.mem.findScalar(u8, out.written(), 0x1b) == null);
@@ -323,8 +318,8 @@ test "a long description is cut at a character, and the last page has no cursor"
     try testing.expect(page.next_cursor == null);
     const line = out.written();
     try testing.expect(std.unicode.utf8ValidateSlice(line));
-    try testing.expect(std.mem.endsWith(u8, line, "…\n"));
-    try testing.expect(line.len <= "t\t".len + max_line_description_bytes + "…\n".len);
+    try testing.expect(std.mem.endsWith(u8, line, "...\n"));
+    try testing.expect(line.len <= "t\t".len + max_line_description_bytes + "\n".len);
 }
 
 test "an empty page says why: a login, a failed server, or no such server" {
