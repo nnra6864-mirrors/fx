@@ -4718,6 +4718,84 @@ test "committed file result is appended before degraded secondary publication" {
     try std.testing.expect(persisted.output_handle != null);
 }
 
+// A result without a stamp is stamped again on every rebuild, so each step
+// would parse every earlier result again before streaming the turn
+// (tests/tla/session/TurnStream.tla `NoReparseOfStamped`).
+test "tool results are stamped as they enter the turn, and later requests and the saved turn keep each time" {
+    const Seen = struct {
+        const ModelRequest = @import("../../stream_provider.zig").ModelRequest;
+        var stamps: [2]?i64 = @splat(null);
+        var requests: usize = 0;
+
+        fn observe(request: ModelRequest) !void {
+            requests += 1;
+            var position: usize = 0;
+            for (request.messages) |message| {
+                if (message.role != .tool) continue;
+                const stamp = message.tool_result_created_at_ms orelse return error.TestExpectedStampedToolResult;
+                if (position >= stamps.len) return error.TestUnexpectedToolResult;
+                if (stamps[position]) |first| {
+                    try std.testing.expectEqual(first, stamp);
+                } else stamps[position] = stamp;
+                position += 1;
+            }
+        }
+    };
+    Seen.stamps = @splat(null);
+    Seen.requests = 0;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
+    const preview_lines = [_]diff.PreviewLine{.{ .op = .addition, .new_line = 1, .text = "x" }};
+    const handoff = file_mutation.CommittedFileHandoff.init(
+        .{ .path = "safe.txt", .lines = &preview_lines, .additions = 1, .deletions = 0, .truncated = false },
+        .{ .kind = .write, .raw_path = "/tmp/workspace/safe.txt", .previous_content = null, .committed_at_ms = 42 },
+    );
+    const write_output = "wrote safe.txt (1 bytes)";
+    const read_calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a.txt\"}")};
+    const write_calls = [_]ToolCall{toolCall("call_write", "write_file", "{\"path\":\"safe.txt\",\"content\":\"x\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &read_calls },
+        .{ .tool_calls = &write_calls },
+        .{ .content = "Done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    gateway.observe_request = Seen.observe;
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    // The read result enters through appendToolResultContent, the committed
+    // write through processCommittedFileResult.
+    hooks.exec_plans = &.{
+        .{ .result = .{ .model_output = "a" } },
+        .{ .result = .{
+            .status = .success,
+            .model_output = write_output,
+            .tool_result_memory = .{ .output_bytes = write_output.len, .stored_output_bytes = write_output.len },
+            .tool_result_memory_prepared = true,
+            .committed_file_handoff = handoff,
+        } },
+    };
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.tool_result_dir = result_dir;
+
+    const before = io_mod.milliTimestamp();
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    const after = io_mod.milliTimestamp();
+
+    try std.testing.expectEqual(@as(usize, 3), Seen.requests);
+    const read_stamp = Seen.stamps[0] orelse return error.TestExpectedStampedToolResult;
+    const write_stamp = Seen.stamps[1] orelse return error.TestExpectedStampedToolResult;
+    try std.testing.expect(before <= read_stamp and read_stamp <= write_stamp and write_stamp <= after);
+    const steps = hooks.history_turns.items[0].assistant.execution.tool_steps;
+    try std.testing.expectEqual(@as(usize, 2), steps.len);
+    try std.testing.expectEqual(read_stamp, steps[0].tool_results[0].created_at_ms);
+    try std.testing.expectEqual(write_stamp, steps[1].tool_results[0].created_at_ms);
+}
+
 test "terminal publication failure deletes retained command replay" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -6531,13 +6609,13 @@ test "processQueuedPrompt interruption persists staged feedback from a completed
     );
 }
 
-test "processQueuedPrompt pauses retryable failures and preserves execution on terminal failure" {
+test "processQueuedPrompt preserves execution when Esc ends a retry or a failure ends the turn" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
         toolCall("call_completed", "read_file", "{\"path\":\"README.md\"}"),
     };
     const Expected = enum {
-        paused,
+        interrupted,
         transport_error,
     };
     const Case = struct {
@@ -6550,15 +6628,15 @@ test "processQueuedPrompt pauses retryable failures and preserves execution on t
                 .status = .bad_gateway,
                 .err_body = "gateway unavailable",
             },
-            .expected = .paused,
+            .expected = .interrupted,
         },
         .{
             .completion = .{ .finish_reason = .provider_error },
-            .expected = .paused,
+            .expected = .interrupted,
         },
         .{
             .completion = .{ .omit_finish = true },
-            .expected = .paused,
+            .expected = .interrupted,
         },
         .{
             .completion = .{ .stream_error = error.TestTransportFailure },
@@ -6575,20 +6653,14 @@ test "processQueuedPrompt pauses retryable failures and preserves execution on t
         var gateway = FakeGateway.init(alloc, &completions);
         defer gateway.deinit();
         var deps = FakeAgentRuntimeDeps.init(alloc);
-        if (case.completion.finish_reason == .provider_error) deps.enable_route_recovery = false;
         defer deps.deinit();
         var fixture = PromptFixture{};
 
-        var config = fixture.config();
-        config.max_provider_attempts = 2;
-        // Retryable failures recover autonomously now; park the turn with a
-        // lifecycle pause (the user's try-later) when the retry is scheduled.
-        var pause_flag = std.atomic.Value(bool).init(false);
-        deps.pause_on_auto_retry_status = true;
-        deps.recovery_pause_flag = &pause_flag;
-        config.recovery_pause_flag = &pause_flag;
+        const config = fixture.config();
+        // Esc while the request waits to retry ends the turn.
+        deps.cancel_on_auto_retry_status = config.cancel_flag;
         switch (case.expected) {
-            .paused => try runFakePrompt(
+            .interrupted => try runFakePrompt(
                 &gateway,
                 &deps,
                 config,
@@ -6601,10 +6673,17 @@ test "processQueuedPrompt pauses retryable failures and preserves execution on t
         }
 
         try std.testing.expectEqual(@as(usize, 1), deps.executed_names.items.len);
-        if (case.expected == .paused) {
-            try std.testing.expectEqual(@as(usize, 0), deps.history_turns.items.len);
-            try std.testing.expectEqual(@as(usize, 0), deps.finish_event_count);
-            try std.testing.expectEqual(types.TurnPresentationOutcome.paused, deps.finalized_outcome.?);
+        if (case.expected == .interrupted) {
+            // The interrupted turn keeps the tool step that already ran.
+            try std.testing.expectEqual(@as(usize, 1), deps.history_turns.items.len);
+            const interrupted = deps.history_turns.items[0].interrupted;
+            try std.testing.expectEqual(@as(usize, 1), interrupted.execution.tool_steps.len);
+            try std.testing.expectEqualStrings(
+                "call_completed",
+                interrupted.execution.tool_steps[0].tool_calls[0].id,
+            );
+            try std.testing.expectEqual(@as(usize, 1), deps.finish_event_count);
+            try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, deps.finalized_outcome.?);
             continue;
         }
         try std.testing.expectEqual(@as(usize, 1), deps.history_turns.items.len);

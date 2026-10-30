@@ -3661,6 +3661,10 @@ test "parse recognizes every top-level command and preserves unknown commands" {
         .upgrade => |rest| try std.testing.expectEqual(@as(usize, 0), rest.len),
         else => return error.TestExpectedEqual,
     }
+    switch (parse(command_catalog, &.{ @constCast("update"), @constCast("--channel"), @constCast("dev") })) {
+        .upgrade => |rest| try std.testing.expectEqual(@as(usize, 2), rest.len),
+        else => return error.TestExpectedEqual,
+    }
     switch (parse(command_catalog, &.{ @constCast("replay"), @constCast("tape") })) {
         .replay => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
         else => return error.TestExpectedEqual,

@@ -6,6 +6,7 @@ const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const acp_runner = @import("../cli/acp_runner.zig");
 const cli_surface = @import("../cli/cli_surface.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const types = @import("../shared/types.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const process_provider = @import("../execution/process_provider.zig");
@@ -338,6 +339,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
             return err;
         };
         app.startModelCacheWarmup();
+        if (resume_requested and @hasDecl(App, "startPendingResume")) app.startPendingResume();
     }
 
     app.run() catch |err| {
@@ -439,8 +441,9 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
 
 fn reportShutdownFailure(deps: RunDeps, err: anyerror) void {
     var buffer: [256]u8 = undefined;
-    const text = std.mem.print(&buffer, "fx: session save failed: {s}\n", .{@errorName(err)}) catch
-        "fx: session save failed\n";
+    var plain_buf: [96]u8 = undefined;
+    const text = std.mem.print(&buffer, "fx: couldn't save the session: {s}\n", .{types.plainErrorText(@errorName(err), &plain_buf)}) catch
+        "fx: couldn't save the session\n";
     writeStderr(deps, text);
 }
 
@@ -992,7 +995,7 @@ test "app entry reports persistence failure after teardown instead of a successf
     capture.record_stderr_event = true;
     const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
     try std.testing.expectEqual(RunOutcome{ .exit = 1 }, outcome);
-    try std.testing.expectEqualStrings("fx: session save failed: InputOutput\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("fx: couldn't save the session: a disk read or write failed\n", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
     try std.testing.expectEqualStrings("deinit", test_events[test_event_count - 2]);
     try std.testing.expectEqualStrings("stderr-attempt", test_events[test_event_count - 1]);
@@ -1449,7 +1452,7 @@ test "app entry returns failure when terminal closure cannot save the session" {
     capture.record_stderr_event = true;
     const outcome = try runWithDeps(TestApp, std.testing.allocator, &.{}, testConfig(), capture.deps());
     try std.testing.expectEqual(RunOutcome{ .exit = 1 }, outcome);
-    try std.testing.expectEqualStrings("fx: session save failed: InputOutput\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("fx: couldn't save the session: a disk read or write failed\n", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
     try std.testing.expectEqualStrings("deinit", test_events[test_event_count - 2]);
     try std.testing.expectEqualStrings("stderr-attempt", test_events[test_event_count - 1]);

@@ -9,6 +9,7 @@ const host_capabilities = @import("../hosts/host.zig");
 const session_layout = @import("../session/session_layout.zig");
 const process_identity = @import("../execution/process_identity.zig");
 const managed_execution_contract = @import("../execution/managed_execution_contract.zig");
+const json_decode = @import("../shared/json_decode.zig");
 const process_provider_mod = @import(
     "../execution/process_provider.zig",
 );
@@ -356,7 +357,7 @@ pub fn runLauncher(alloc: Allocator) !void {
     const config_bytes = try alloc.alloc(u8, config_len);
     defer alloc.free(config_bytes);
     try readExactFd(std.posix.STDIN_FILENO, config_bytes);
-    var parsed = try std.json.parseFromSlice(
+    var parsed = try json_decode.parseFromSlice(
         LauncherConfig,
         alloc,
         config_bytes,

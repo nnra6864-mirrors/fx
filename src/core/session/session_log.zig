@@ -15,6 +15,7 @@ const session_layout = @import("session_layout.zig");
 const session_replay = @import("session_replay.zig");
 const result_store = @import("result_store.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
+const json_decode = @import("../shared/json_decode.zig");
 const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 
 const Allocator = std.mem.Allocator;
@@ -214,7 +215,7 @@ pub fn loadConversationRecoveryCheckpoint(
         else => return err,
     };
     defer alloc.free(bytes);
-    var parsed = std.json.parseFromSlice(struct {
+    var parsed = json_decode.parseFromSlice(struct {
         conversation_seq: u64,
         checkpoint: std.json.Value,
     }, alloc, bytes, .{
