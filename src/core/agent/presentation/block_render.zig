@@ -111,6 +111,7 @@ pub fn writeListLine(
     }
     if (bp.parseOrderedList(line)) |parsed| {
         try out.appendSlice(alloc, parsed.indent);
+        try out.appendNTimes(alloc, ' ', orderedMarkerPad(parsed.marker));
         try ansi.writeDim(alloc, out, parsed.marker);
         try out.append(alloc, ' ');
         if (bp.parseTaskListItem(parsed.content)) |task| {
@@ -122,6 +123,16 @@ pub fn writeListLine(
         return true;
     }
     return false;
+}
+
+/// Ordered list numbers are right-aligned in this many columns, so the
+/// markers of items 1 through 999 end in the same column.
+const ordered_number_columns = 3;
+
+/// Returns the spaces that right-align the number of `marker`, such as `1.`
+/// or `12)`. A number wider than `ordered_number_columns` gets none.
+pub fn orderedMarkerPad(marker: []const u8) usize {
+    return ordered_number_columns -| (marker.len - 1);
 }
 
 pub fn writeDefinitionLine(
