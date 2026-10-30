@@ -699,8 +699,9 @@ fn applySessionPickerCatalogPage(
         page_limit = @max(page_limit, picker.summaries.items.len);
         if (picker.selectedId()) |selected_id| {
             var index: usize = 0;
-            for (cache.catalog.summaries.items) |summary| {
-                if (!session_catalog.pickerLists(summary, workspace, query)) continue;
+            const listed = session_catalog.pickerFilter(cache.catalog.summaries.items, workspace, query, .resumable);
+            for (cache.catalog.summaries.items, 0..) |summary, position| {
+                if (!listed.keeps(position)) continue;
                 if (std.mem.eql(u8, summary.id, selected_id)) {
                     selected_index = index;
                     page_limit = @max(page_limit, index + 1);

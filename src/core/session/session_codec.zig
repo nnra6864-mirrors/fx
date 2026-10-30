@@ -11,6 +11,7 @@ const model_provider = @import("../config/model_provider.zig");
 const context_limits = @import("../config/context_limits.zig");
 const credential_authority = @import("../auth/credential_authority.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const json_decode = @import("../shared/json_decode.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -331,7 +332,7 @@ pub fn decodeSessionMetadata(
     if (bytes.len == 0 or bytes.len > max_session_metadata_bytes) {
         return error.SessionMetadataTooLarge;
     }
-    var parsed = std.json.parseFromSlice(SessionMetadata, alloc, bytes, .{
+    var parsed = json_decode.parseFromSlice(SessionMetadata, alloc, bytes, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = false,
         .max_value_len = max_session_metadata_bytes,
@@ -2005,9 +2006,10 @@ pub fn executionHashes(alloc: Allocator, checkpoint: RecoveryCheckpoint) !Execut
     errdefer alloc.free(tool_steps);
     for (execution.tool_steps, tool_steps) |step, *hash| {
         out.clearRetainingCapacity();
-        // The turn's execution is rebuilt before each progress, which stamps
-        // every result's creation time again, so the comparison leaves it
-        // out: a progress that extends another keeps the times it recorded.
+        // The turn's execution is rebuilt before each progress, and a result
+        // whose message carries no time is stamped again then, so the
+        // comparison leaves the time out: a progress that extends another
+        // keeps the times it recorded.
         const results = try alloc.dupe(types.PersistedToolResult, step.tool_results);
         defer alloc.free(results);
         for (results) |*result| result.created_at_ms = 0;

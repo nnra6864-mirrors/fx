@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
 
-pub const version = "0.0.15";
+pub const version = "0.0.16";
 
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");
@@ -3538,6 +3538,7 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
         std.mem.eql(u8, command, "doctor") or
         std.mem.eql(u8, command, "models") or
         std.mem.eql(u8, command, "credits") or
+        std.mem.eql(u8, command, "balance") or
         // Reads AI Gateway usage reports over HTTP with a deadline.
         std.mem.eql(u8, command, "usage");
 }
@@ -3554,6 +3555,20 @@ test "auth and upgrade commands use early threaded io without full entry config"
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "provider")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "usage")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "setup")}));
+}
+
+test "every alias of an early threaded io command uses early threaded io" {
+    const alloc = std.testing.allocator;
+    for (builtin_commands.top_level_specs) |spec| {
+        const token = try alloc.dupeSentinel(u8, spec.token, 0);
+        defer alloc.free(token);
+        if (!needsEarlyThreadedIo(&.{token})) continue;
+        for (spec.aliases) |alias| {
+            const alias_arg = try alloc.dupeSentinel(u8, alias, 0);
+            defer alloc.free(alias_arg);
+            try std.testing.expect(needsEarlyThreadedIo(&.{alias_arg}));
+        }
+    }
 }
 
 test "credential-reading commands use early threaded io without full entry config" {
