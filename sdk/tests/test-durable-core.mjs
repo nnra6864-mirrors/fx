@@ -2578,7 +2578,7 @@ if (durabilityKind === "queue") {
       },
     };
     const agent = createAgent({ durability });
-    assert.equal((await textOf(agent.session(id).prompt("omega"))).result.stopReason, "end_turn");
+    assert.equal((await textOf(agent.session(id).prompt("omicron"))).result.stopReason, "end_turn");
     assert.ok(raced, "the run_started answer was replaced");
     const input = ops.indexOf("input");
     const lease = ops.indexOf("lease", input);
@@ -2783,39 +2783,37 @@ if (durabilityKind === "queue") {
     const dir = await mkdtemp(join(tmpdir(), "libfx-other-sender-"));
     dirs.push(dir);
     let onBStored = null;
-    let armed = false;
-    let ranRelease;
-    const released = new Promise((resolve) => { ranRelease = resolve; });
-    let listed = null;
-    const { durability: base } = await queueWorldAt(dir, { queueLeases: true, runInRequest: true, maxDurationMs: 60_000 });
+    const pending = [];
+    const { durability: base } = await queueWorldAt(dir, {
+      queueLeases: true, runInRequest: true, maxDurationMs: 60_000,
+      waitUntil: (work) => pending.push(work),
+    });
     const durability = hookedWorld(base, {
-      onList: () => { const wake = listed; listed = null; wake?.(); },
       // b's sender goes on from its write, to its backstop and its worker,
-      // once c's worker ran b and read the log again.
+      // once c's worker ran b and relinquished the worker.
       after: async (entry) => {
-        if (entry.k === "release" && armed) { armed = false; ranRelease(); }
         if (entry.k === "input" && entry.messageId === "bc-b" && onBStored) {
           const run = onBStored;
           onBStored = null;
           run();
-          await released;
-          await new Promise((resolve) => { listed = resolve; });
-          await sleep(30);
+          await cTurn;
+          // The turn can finish before receive()'s finally. Only warm and c
+          // have waitUntil work here: b is still held at its input write.
+          await Promise.all(pending);
         }
       },
     });
     const agent = createAgent({ durability });
     const session = agent.session();
     assert.equal((await textOf(session.prompt("warm", { messageId: "bc-w" }))).result.stopReason, "end_turn");
-    await untilIdle(agent);
-    armed = true;
+    await Promise.all(pending);
     let cTurn;
     onBStored = () => { cTurn = textOf(session.prompt("chi", { messageId: "bc-c" })); };
     const b = await textOf(session.prompt("nu", { messageId: "bc-b" }));
     const c = await cTurn;
     assert.equal(b.text, "nu-0 nu-1 nu-2");
     assert.equal(c.text, "chi-0 chi-1 chi-2");
-    await untilIdle(agent);
+    await Promise.all(pending);
     assert.deepEqual(prompted.filter((id) => id.startsWith("bc-")), ["bc-w", "bc-b", "bc-c"], "each turn started once");
     await agent.close();
   });
@@ -2928,6 +2926,69 @@ if (durabilityKind !== "memory") {
     await agent.close();
   });
 
+  test("a prompt aborted while its run is being created stores and queues nothing, and its same-id retry runs once", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-fresh-abort-"));
+    dirs.push(dir);
+    const calls = [];
+    const counted = countingWorld(await durabilityAt(dir), calls);
+    let started;
+    let release;
+    const holding = new Promise((resolve) => { started = resolve; });
+    const released = new Promise((resolve) => { release = resolve; });
+    let id;
+    const durability = {
+      ...counted,
+      world: async () => {
+        const world = await counted.world();
+        const create = world.events.create.bind(world.events);
+        const events = Object.assign(Object.create(world.events), {
+          async create(runId, event, ...rest) {
+            if (runId === id && event?.eventType === "run_created") {
+              started();
+              await released;
+            }
+            return create(runId, event, ...rest);
+          },
+        });
+        return Object.assign(Object.create(world), { events });
+      },
+    };
+    const agent = createAgent({ durability });
+    try {
+      id = await agent.newSessionId();
+      const messageId = "turn-abort-create";
+      const before = ran.length;
+      const promptedBefore = prompted.length;
+      const controller = new AbortController();
+      const turn = agent.session(id).prompt("omicron", { messageId, signal: controller.signal });
+      await holding;
+      controller.abort();
+      release();
+      assert.equal((await turn.accepted).sessionId, id);
+      assert.equal((await turn.result).stopReason, "cancelled");
+      await untilIdle(agent);
+      assert.deepEqual(callsOf(calls, id), ["create:run_created", "create:run_started"], "the aborted prompt wrote only the run's creation, with no input or queue send");
+      assert.deepEqual(prompted.slice(promptedBefore), [], "the aborted prompt started no turn");
+      assert.deepEqual(ran.slice(before), [], "the aborted prompt ran no steps");
+      calls.length = 0;
+      const retry = agent.session(id).prompt("omicron", { messageId });
+      await retry.accepted;
+      assert.ok(reads(admission(calls, id)) > 0, "the retry read the run the aborted prompt created");
+      const result = await retry.result;
+      assert.equal(result.stopReason, "end_turn");
+      assert.notEqual(result.repeated, true, "the aborted prompt did not run the turn");
+      await untilIdle(agent);
+      assert.equal(callsOf(calls, id).filter((name) => name === "create:input").length, 1, "the retry stored the input once");
+      assert.equal(callsOf(calls, id).filter((name) => name === "queue").length, 1, "the retry queued the input once");
+      assert.deepEqual(prompted.slice(promptedBefore), [messageId], "the retry started the turn once");
+      assert.deepEqual(ran.slice(before), [0, 1, 2].map((step) => `${messageId}:${step}`), "the retry ran each step once");
+      assert.deepEqual(JSON.parse(decoder.decode(await agent.session(id).checkpoint())), ["omicron-0", "omicron-1", "omicron-2"]);
+    } finally {
+      release();
+      await agent.close();
+    }
+  });
+
   test("a minted id another server prompted first is read as before, and its turn runs once", async () => {
     const dir = await mkdtemp(join(tmpdir(), "libfx-fresh-other-"));
     dirs.push(dir);
@@ -3005,14 +3066,15 @@ if (durabilityKind !== "memory") {
       const agent = createAgent({ durability: countingWorld(base, calls, faults) });
       const id = await agent.newSessionId();
       const messageId = `turn-${fault.replace(/[^a-z]/g, "")}`;
-      await assert.rejects(agent.session(id).prompt("eps", { messageId }).accepted, /injected failure/, fault);
-      assert.equal(callsOf(calls, id).filter((name) => name === "queue").length, fault === "queue" ? 1 : 0, `${fault}: nothing was queued before the failure`);
+      await assert.rejects(agent.session(id).prompt("eps", { messageId }).accepted, { message: "injected failure", status: 503, call: fault }, fault);
+      const writes = ["create:run_created", "create:run_started", "create:input", "queue"];
+      assert.deepEqual(callsOf(calls, id), writes.slice(0, writes.indexOf(fault) + 1), `${fault}: only the writes through the failed call were attempted`);
       const ranBefore = ran.length;
       calls.length = 0;
       const retry = agent.session(id).prompt("eps", { messageId });
       await retry.accepted;
       assert.ok(reads(admission(calls, id)) > 0, `${fault}: the retry read the session`);
-      assert.equal(callsOf(calls, id).filter((name) => name === "queue").length >= 1, true, `${fault}: the retry queued its message`);
+      assert.equal(callsOf(calls, id).filter((name) => name === "queue").length, 1, `${fault}: the retry queued its message once`);
       const result = await retry.result;
       assert.equal(result.stopReason, "end_turn", fault);
       assert.notEqual(result.repeated, true, `${fault}: no earlier attempt ran it`);
@@ -3033,6 +3095,7 @@ if (durabilityKind === "queue") {
   // `stream` for each stream write.
   const holdingBackstops = (base, calls) => {
     const held = [];
+    const cancelStored = barrier();
     let waiting = null;
     const durability = {
       ...base,
@@ -3040,6 +3103,16 @@ if (durabilityKind === "queue") {
         const world = await base.world();
         const queue = world.queue.bind(world);
         const write = world.streams.write.bind(world.streams);
+        const create = world.events.create.bind(world.events);
+        const events = Object.assign(Object.create(world.events), {
+          async create(...args) {
+            const result = await create(...args);
+            const event = args[1];
+            const entry = event?.eventType === "step_created" ? JSON.parse(decoder.decode(event.eventData.input)) : null;
+            if (entry?.k === "input" && entry.type === "cancel") cancelStored.resolve();
+            return result;
+          },
+        });
         const streams = Object.assign(Object.create(world.streams), {
           write(runId, ...rest) {
             calls.push(["stream", runId]);
@@ -3048,6 +3121,7 @@ if (durabilityKind === "queue") {
           writeMulti: undefined,
         });
         return Object.assign(Object.create(world), {
+          events,
           streams,
           async queue(name, payload, options) {
             const backstop = options?.delaySeconds > 0 && options.idempotencyKey === `${payload.runId}:prompt:${payload.input?.messageId}`;
@@ -3067,7 +3141,7 @@ if (durabilityKind === "queue") {
       while (held.length === 0) await new Promise((resolve) => { waiting = resolve; });
       return held.shift();
     };
-    return { durability, next };
+    return { durability, next, cancelStored: cancelStored.promise };
   };
   const internals = (agent) => agent[Symbol.for("libfx.durableInternals")];
   const until = async (done, what) => {
@@ -3086,6 +3160,383 @@ if (durabilityKind === "queue") {
     return { calls, broker, backstops, durability };
   };
   const backstopOf = (broker, messageId) => broker.sent.filter((message) => message.payload?.input?.messageId === messageId);
+
+  const barrier = () => {
+    let resolve;
+    const promise = new Promise((done) => { resolve = done; });
+    return { promise, resolve };
+  };
+  const bounded = async (promise, what) => {
+    let timer;
+    try {
+      return await Promise.race([promise, new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(what)), 1000);
+      })]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  for (const [outcome, slowOpen] of [["success", true], ["failure", true], ["success", false], ["failure", false]]) {
+    test(`same-session concurrency: a backed second prompt finishes before the first backstop's ${outcome} (${slowOpen ? "opening" : "opened"} engine)`, async () => {
+      const dir = await mkdtemp(join(tmpdir(), "libfx-pending-first-"));
+      dirs.push(dir);
+      const { calls, broker, backstops, durability } = await inRequestAgent(dir);
+      const opening = barrier();
+      const releaseOpen = barrier();
+      const releaseClose = barrier();
+      const lateClosed = barrier();
+      let opens = 0;
+      let lateCloses = 0;
+      const models = [];
+      const create = createDurableAgentFactory({
+        harness: () => ({
+          async open(args) {
+            const first = opens++ === 0;
+            if (first && slowOpen) {
+              opening.resolve();
+              await releaseOpen.promise;
+            }
+            const engine = await scriptedHarness()().open(args);
+            if (first && !slowOpen) opening.resolve();
+            return {
+              ...engine,
+              prompt(input, options) {
+                models.push(options.turnId);
+                return engine.prompt(input, options);
+              },
+              async close() {
+                if (first) await releaseClose.promise;
+                await engine.close();
+                if (first) { lateCloses += 1; lateClosed.resolve(); }
+              },
+            };
+          },
+        }),
+        defaultDurability: async () => memory(),
+      });
+      const agent = create({ durability });
+      const session = agent.session();
+      const first = session.prompt("pending-first", { messageId: "pending-first" });
+      let firstSettled = false;
+      void first.accepted.then(() => { firstSettled = true; }, () => { firstSettled = true; });
+      const firstSend = await backstops.next();
+      let secondSend;
+      try {
+        await bounded(opening.promise, "first engine did not begin opening");
+        const mark = calls.length;
+        const second = session.prompt("ready-second", { messageId: "ready-second" });
+        secondSend = await bounded(backstops.next(), "second backstop did not start");
+        assert.deepEqual(writesSince(calls, mark, session.id), ["create:input"], "only second input stored before its own backstop");
+        assert.deepEqual(models, [], "neither prompt reached a model before its own backstop");
+        secondSend.release();
+        await bounded(second.accepted, "second prompt not accepted");
+        assert.equal((await bounded(second.result, "second prompt waited for first backstop")).stopReason, "end_turn");
+        assert.deepEqual(models, ["pending-first", "ready-second"], "the backed contender drained stored inputs in canonical log order");
+        assert.equal(firstSettled, false, "first acceptance still waits for its own backstop");
+        assert.equal(broker.sent.length, 1, "no artificial queue retry for second prompt");
+        if (outcome === "failure") {
+          firstSend.fail(new Error("first backstop failed"));
+          await assert.rejects(first.accepted, /first backstop failed/);
+          await assert.rejects(first.result, /first backstop failed/);
+        } else {
+          firstSend.release();
+          await bounded(first.accepted, "first prompt not accepted");
+          assert.equal((await bounded(first.result, "first prompt did not resume after its backstop")).stopReason, "end_turn");
+        }
+        releaseOpen.resolve();
+        releaseClose.resolve();
+        await bounded(lateClosed.promise, "displaced early opener did not close");
+        assert.equal(lateCloses, 1, "displaced engine closed exactly once");
+        await bounded(agent.close(), "workers did not stop");
+        assert.deepEqual(models, ["pending-first", "ready-second"], "late opener never ran a duplicate");
+        assert.equal(lateCloses, 1, "agent close did not close the displaced engine twice");
+        const entries = await logEntries(durability, session.id);
+        const [contender] = backstopOf(broker, "ready-second");
+        assert.deepEqual(entries.find((entry) => entry.k === "lease").delivery, { messageId: contender.id, attempt: 0 }, "the contender's own backstop holds the lease that drained the log");
+        for (const id of models) assert.equal(entries.filter((entry) => entry.k === "record" && entry.marks?.some((mark) => mark.start === id)).length, 1, `${id}: one durable start`);
+        assert.equal(internals(agent).liveWorkers(), 0, "no held workers");
+      } finally {
+        firstSend.release();
+        secondSend?.release();
+        releaseOpen.resolve();
+        releaseClose.resolve();
+        await agent.close();
+      }
+    });
+  }
+
+  test("same-session concurrency: a failing concurrent duplicate cannot revoke the original prompt's successful backstop", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-backed-duplicate-"));
+    dirs.push(dir);
+    const { backstops, durability } = await inRequestAgent(dir);
+    const opening = barrier();
+    const releaseOpen = barrier();
+    const create = createDurableAgentFactory({
+      harness: () => ({
+        async open(args) {
+          opening.resolve();
+          await releaseOpen.promise;
+          return scriptedHarness()().open(args);
+        },
+      }),
+      defaultDurability: async () => memory(),
+    });
+    const agent = create({ durability });
+    const session = agent.session();
+    const mark = prompted.length;
+    const first = session.prompt("backed-original", { messageId: "backed-original" });
+    const firstSend = await backstops.next();
+    let duplicateSend;
+    try {
+      await bounded(opening.promise, "first engine did not begin opening");
+      firstSend.release();
+      await bounded(first.accepted, "first backstop did not succeed");
+      const duplicate = session.prompt("backed-original", { messageId: "backed-original" });
+      duplicateSend = await bounded(backstops.next(), "duplicate backstop did not start");
+      duplicateSend.fail(new Error("duplicate backstop failed"));
+      await assert.rejects(duplicate.accepted, /duplicate backstop failed/);
+      await assert.rejects(duplicate.result, /duplicate backstop failed/);
+      releaseOpen.resolve();
+      assert.equal((await bounded(first.result, "duplicate failure revoked the backed original")).stopReason, "end_turn");
+      await bounded(agent.close(), "duplicate left held work");
+      assert.deepEqual(prompted.slice(mark), ["backed-original"], "original started once");
+      assert.equal(internals(agent).liveWorkers(), 0);
+    } finally {
+      firstSend.release();
+      duplicateSend?.release();
+      releaseOpen.resolve();
+      await agent.close();
+    }
+  });
+
+  test("same-session concurrency: a backed later prompt recovers a failed sender's stored input in log order", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-unbacked-retry-"));
+    dirs.push(dir);
+    const { backstops, durability } = await inRequestAgent(dir);
+    const agent = createAgent({ durability });
+    const session = agent.session();
+    const mark = prompted.length;
+    const first = session.prompt("retry-first", { messageId: "retry-first" });
+    const firstSend = await backstops.next();
+    let secondSend;
+    let retrySend;
+    try {
+      firstSend.fail(new Error("first backstop failed"));
+      await assert.rejects(first.accepted, /first backstop failed/);
+      await assert.rejects(first.result, /first backstop failed/);
+      assert.equal(internals(agent).liveWorkers(), 0, "failure holds no worker");
+      const second = session.prompt("retry-second", { messageId: "retry-second" });
+      secondSend = await bounded(backstops.next(), "second backstop did not start");
+      secondSend.release();
+      assert.equal((await bounded(second.result, "second prompt did not finish")).stopReason, "end_turn");
+      assert.deepEqual(prompted.slice(mark), ["retry-first", "retry-second"], "later backed delivery recovered the earlier stored input");
+      const retry = session.prompt("retry-first", { messageId: "retry-first" });
+      retrySend = await bounded(backstops.next(), "retry backstop did not start");
+      retrySend.release();
+      assert.equal((await bounded(retry.result, "retry did not finish")).stopReason, "end_turn");
+      await bounded(agent.close(), "retry left held work");
+      assert.deepEqual(prompted.slice(mark), ["retry-first", "retry-second"], "retry did not repeat a recovered input");
+      assert.equal(internals(agent).liveWorkers(), 0);
+      const entries = await logEntries(durability, session.id);
+      assert.equal(entries.filter((entry) => entry.k === "input" && entry.messageId === "retry-first").length, 1, "retry reused the stored input");
+    } finally {
+      firstSend.release();
+      secondSend?.release();
+      retrySend?.release();
+      await agent.close();
+    }
+  });
+
+  test("same-session concurrency: an accepted steer recovers a stored prompt after its first send failed", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-failed-steer-"));
+    dirs.push(dir);
+    const { backstops, durability } = await inRequestAgent(dir);
+    const steered = barrier();
+    const joins = [];
+    const create = createDurableAgentFactory({
+      harness: () => ({
+        async open(args) {
+          const engine = await scriptedHarness()().open(args);
+          return {
+            ...engine,
+            prompt(input, options) {
+              const turn = engine.prompt(input, options);
+              return {
+                ...turn,
+                async steer(text, id) {
+                  joins.push([options.turnId, id, text]);
+                  await args.store.append({ idempotencyKey: `steer:${id}`, data: encoder.encode("{}"), marks: [{ accepted: id }, { placed: id }] });
+                  steered.resolve();
+                },
+              };
+            },
+          };
+        },
+      }),
+      defaultDurability: async () => memory(),
+    });
+    const agent = create({ durability });
+    const session = agent.session();
+    const mark = prompted.length;
+    const held = holdStep("failed-steer-0");
+    const first = session.prompt("failed-steer", { messageId: "failed-steer" });
+    const firstSend = await backstops.next();
+    try {
+      firstSend.fail(new Error("first backstop failed"));
+      await assert.rejects(first.accepted, /first backstop failed/);
+      await assert.rejects(first.result, /first backstop failed/);
+      assert.equal(internals(agent).liveWorkers(), 0, "failed send holds no worker");
+      await session.steer("guidance", { messageId: "recovery-steer" });
+      await bounded(steered.promise, "accepted steer was stranded behind a failed sender");
+      held.release();
+      await bounded(untilIdle(agent), "steer delivery did not finish");
+      assert.deepEqual(prompted.slice(mark), ["failed-steer"]);
+      assert.deepEqual(joins, [["failed-steer", "recovery-steer", "guidance"]]);
+      const entries = await logEntries(durability, session.id);
+      assert.equal(entries.filter((entry) => entry.k === "record" && entry.marks?.some((mark) => mark.start === "failed-steer")).length, 1, "recovered prompt started once");
+      assert.equal(entries.filter((entry) => entry.k === "record" && entry.marks?.some((mark) => mark.end === true)).length, 1, "recovered prompt finished");
+      assert.equal(entries.filter((entry) => entry.k === "record" && entry.marks?.some((mark) => mark.placed === "recovery-steer")).length, 1, "steer placed once");
+    } finally {
+      firstSend.release();
+      held.release();
+      await agent.close();
+    }
+  });
+
+  test("same-session concurrency: local resume discovers a successful remote retry without its matching delivery", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-remote-retry-"));
+    dirs.push(dir);
+    const { backstops, durability } = await inRequestAgent(dir);
+    const agent = createAgent({ durability });
+    const session = agent.session();
+    const mark = prompted.length;
+    const first = session.prompt("remote-retry", { messageId: "remote-retry" });
+    const firstSend = await backstops.next();
+    const { durability: base, broker } = await queueWorldAt(dir, { queueLeases: true, maxDurationMs: 60_000 });
+    // Enqueue-only retry elsewhere. Its queue accepted it, but its matching
+    // delivery cannot clear process-local state before this process resumes.
+    const remote = createAgent({ durability: {
+      ...base,
+      world: async () => {
+        const instance = await base.world();
+        return Object.assign(Object.create(instance), {
+          queue: (name, payload, options) => instance.queue(name, payload, { ...options, delaySeconds: 60 }),
+        });
+      },
+    } });
+    try {
+      firstSend.fail(new Error("first backstop failed"));
+      await assert.rejects(first.accepted, /first backstop failed/);
+      await assert.rejects(first.result, /first backstop failed/);
+      assert.equal(internals(agent).liveWorkers(), 0);
+      const retry = remote.session(session.id).prompt("remote-retry", { messageId: "remote-retry" });
+      await bounded(retry.accepted, "remote retry was not queued");
+      assert.deepEqual(prompted.slice(mark), [], "remote retry has not been delivered");
+      const resume = session.resume();
+      assert.equal((await bounded(resume.result, "local resume excluded the successful remote retry")).stopReason, "end_turn");
+      assert.equal((await bounded(retry.result, "remote retry did not observe recovery")).stopReason, "end_turn");
+      await bounded(untilIdle(agent), "resume worker did not stop");
+      const [delivery] = broker.sent;
+      await bounded(internals(agent).deliver(delivery.payload.input, { messageId: delivery.id, attempt: 1 }), "matching retry delivery did not settle");
+      assert.deepEqual(prompted.slice(mark), ["remote-retry"], "late matching delivery did not repeat recovery");
+      const entries = await logEntries(durability, session.id);
+      assert.equal(entries.filter((entry) => entry.k === "input" && entry.messageId === "remote-retry").length, 1);
+      assert.equal(entries.filter((entry) => entry.k === "record" && entry.marks?.some((mark) => mark.start === "remote-retry")).length, 1);
+    } finally {
+      firstSend.release();
+      await agent.close();
+      await remote.close();
+    }
+  });
+
+  for (const outcome of ["success", "failure", "abort"]) {
+    test(`same-session concurrency: three prompts make progress in log order, with first ${outcome} and concurrent duplicates`, async () => {
+      const dir = await mkdtemp(join(tmpdir(), "libfx-ready-order-"));
+      dirs.push(dir);
+      const { broker, backstops, durability } = await inRequestAgent(dir);
+      const opening = barrier();
+      const models = [];
+      let activeModels = 0;
+      let concurrentModels = 0;
+      const create = createDurableAgentFactory({
+        harness: () => ({
+          async open(args) {
+            const engine = await scriptedHarness()().open(args);
+            opening.resolve();
+            return {
+              ...engine,
+              prompt(input, options) {
+                assert.ok(backstopOf(broker, "order-third").length > 0, "the contender's successful backstop holds the claim that drains the log");
+                models.push(options.turnId);
+                activeModels += 1;
+                if (activeModels > 1) concurrentModels += 1;
+                const turn = engine.prompt(input, options);
+                const result = turn.result.finally(() => { activeModels -= 1; });
+                void result.catch(() => {});
+                return { ...turn, result };
+              },
+            };
+          },
+        }),
+        defaultDurability: async () => memory(),
+      });
+      const agent = create({ durability });
+      const session = agent.session();
+      const controller = new AbortController();
+      const first = session.prompt("order-first", { messageId: "order-first", signal: controller.signal });
+      const firstSend = await backstops.next();
+      const thirdStep = holdStep("order-third-0");
+      let secondSend;
+      let thirdSend;
+      try {
+        await bounded(opening.promise, "first engine did not open");
+        const second = session.prompt("order-second", { messageId: "order-second" });
+        secondSend = await bounded(backstops.next(), "second send did not start");
+        const third = session.prompt("order-third", { messageId: "order-third" });
+        thirdSend = await bounded(backstops.next(), "third send did not start");
+        if (outcome === "abort") {
+          controller.abort();
+          await bounded(backstops.cancelStored, "targeted cancel was not stored");
+        }
+        thirdSend.release();
+        await bounded(thirdStep.holding, "third prompt waited for an unbacked predecessor");
+        const expected = outcome === "abort" ? ["order-second", "order-third"] : ["order-first", "order-second", "order-third"];
+        assert.deepEqual(models, expected, "stored inputs ran in canonical log order, skipping only the cancelled input");
+        const [delivery] = backstopOf(broker, "order-third");
+        const duplicates = await bounded(Promise.all(Array.from({ length: 3 }, () => internals(agent).deliver({ type: "prompt", sessionId: session.id, messageId: "order-third", agent: agent.name }, { messageId: delivery.id, attempt: 0 }))), "duplicate deliveries waited on the running turn");
+        assert.ok(duplicates.every((result) => result?.timeoutSeconds > 0), "active claims still answer without awaiting their run/turn/steer dependencies");
+        thirdStep.release();
+        assert.equal((await bounded(third.result, "third prompt did not finish")).stopReason, "end_turn");
+        secondSend.release();
+        assert.equal((await bounded(second.result, "second prompt starved behind first")).stopReason, "end_turn");
+        assert.deepEqual(models, expected, "second sender settling did not repeat work");
+        if (outcome === "failure") {
+          firstSend.fail(new Error("first backstop failed"));
+          await assert.rejects(first.accepted, /first backstop failed/);
+          await assert.rejects(first.result, /first backstop failed/);
+        } else {
+          firstSend.release();
+          await bounded(first.accepted, "first prompt not accepted");
+          assert.equal((await bounded(first.result, "first prompt starved after its backstop")).stopReason, outcome === "abort" ? "cancelled" : "end_turn");
+        }
+        await bounded(agent.close(), "workers did not stop");
+        assert.deepEqual(models, expected, "each stored input started once, with no late duplicate");
+        assert.equal(concurrentModels, 0, "genuine concurrent duplicate model paths remain zero");
+        assert.equal(activeModels, 0, "no running model paths left");
+        assert.equal(internals(agent).liveWorkers(), 0, "no held workers");
+        const entries = await logEntries(durability, session.id);
+        if (outcome === "abort") assert.equal(entries.filter((entry) => entry.k === "ended" && entry.messageId === "order-first").length, 1, "aborted prompt ended exactly once");
+        for (const id of models) assert.equal(entries.filter((entry) => entry.k === "record" && entry.marks?.some((mark) => mark.start === id)).length, 1, `${id}: one durable start`);
+      } finally {
+        firstSend.release();
+        secondSend?.release();
+        thirdSend?.release();
+        thirdStep.release();
+        await agent.close();
+      }
+    });
+  }
 
   test("a prompt the request runs opens its engine while its backstop is sent, and writes, shows and asks the model nothing before it is queued", async () => {
     const dir = await mkdtemp(join(tmpdir(), "libfx-early-engine-"));
@@ -3244,34 +3695,41 @@ if (durabilityKind === "queue") {
     await coding.close();
   });
 
-  test("a prompt aborted while its backstop is sent asks the model nothing before it is queued, and ends cancelled once", async () => {
+  test("a backed cancel displaces a pending opener and ends the stored prompt once without a model request", async () => {
     const dir = await mkdtemp(join(tmpdir(), "libfx-early-abort-"));
     dirs.push(dir);
-    const { calls, broker, backstops, durability } = await inRequestAgent(dir);
+    const { broker, backstops, durability } = await inRequestAgent(dir);
     const agent = createAgent({ durability });
     const session = agent.session();
     const messageId = "turn-early-abort";
     const controller = new AbortController();
     const openedBefore = opened.count;
     const turn = session.prompt("sigma", { messageId, signal: controller.signal });
+    let accepted = false;
+    void turn.accepted.then(() => { accepted = true; }, () => {});
     const send = await backstops.next();
-    const mark = calls.length;
-    await until(() => opened.count > openedBefore, "the engine opened while the backstop was sent");
-    controller.abort();
-    await until(async () => (await logEntries(durability, session.id)).some((entry) => entry.type === "cancel"), "the cancel was stored");
-    assert.deepEqual(writesSince(calls, mark, session.id), ["create:input"], "only the cancel was written before the backstop is queued");
-    assert.ok(!prompted.includes(messageId), "no model request before the backstop is queued");
-    send.release();
-    await turn.accepted;
-    assert.equal((await turn.result).stopReason, "cancelled");
-    await untilIdle(agent);
-    const lines = await readLines(session.stream(0), 32);
-    assert.deepEqual(lines.filter((line) => line.type === "turn_end").map((line) => line.stopReason), ["cancelled"], "the turn ended once, cancelled");
-    const entries = await logEntries(durability, session.id);
-    assert.equal(entries.filter((entry) => entry.k === "input" && entry.type === "prompt").length, 1);
-    const [backstop] = backstopOf(broker, messageId);
-    assert.deepEqual(entries.find((entry) => entry.k === "lease").delivery, { messageId: backstop.id, attempt: 0 }, "the lease names the backstop");
-    await agent.close();
+    try {
+      await until(() => opened.count > openedBefore, "the engine opened while the backstop was sent");
+      controller.abort();
+      await until(async () => (await logEntries(durability, session.id)).some((entry) => entry.k === "ended" && entry.messageId === messageId), "the backed cancel did not finish the stored prompt");
+      const lines = await bounded(readLines(session.stream(0), 1), "cancel outcome was not shown before the prompt's backstop");
+      assert.deepEqual(lines.map((line) => line.stopReason), ["cancelled"]);
+      assert.equal(accepted, false, "prompt acceptance still waits for its own send");
+      assert.ok(!prompted.includes(messageId), "cancelled input made no model request");
+      send.release();
+      await turn.accepted;
+      assert.equal((await bounded(turn.result, "cancelled prompt viewer did not settle")).stopReason, "cancelled");
+      await untilIdle(agent);
+      const allLines = await readLines(session.stream(0), 32);
+      assert.deepEqual(allLines.filter((line) => line.type === "turn_end").map((line) => line.stopReason), ["cancelled"], "the turn ended once, cancelled");
+      const entries = await logEntries(durability, session.id);
+      assert.equal(entries.filter((entry) => entry.k === "input" && entry.type === "prompt").length, 1);
+      const cancel = broker.sent.find((message) => message.payload?.input?.type === "cancel");
+      assert.deepEqual(entries.find((entry) => entry.k === "lease").delivery, { messageId: cancel.id, attempt: 1 }, "the cancel's successful delivery holds the recovery lease");
+    } finally {
+      send.release();
+      await agent.close();
+    }
   });
 
   test("an early-opened request's lease names its backstop, whose delivery takes the turn over once the request's process died", async () => {

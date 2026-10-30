@@ -771,6 +771,7 @@ const missingStreamFastMs = 2000;
 // may hold together, least recently read dropped first.
 const maxLogViews = 32;
 const maxLogViewChars = 32 * 1024 * 1024;
+const maxMintedIds = 1024;
 
 // Whether a newest-first listing showed every slot from the lowest it
 // listed to the newest. Pure.
@@ -1720,6 +1721,9 @@ class SessionWorker {
     // about to hand one a read (see consume).
     this.deliveries = 0;
     this.holder = null;
+    // A write-free early claim can give way to a backed delivery. Once its
+    // backstop succeeds, it is a normal claim and cannot be displaced here.
+    this.opening = null;
   }
 
   // Taken just before a read of the log, for consume to tell whether a turn
@@ -1762,7 +1766,7 @@ class SessionWorker {
     }
     // Folded again with the backstop's delivery, which can only end a lease
     // that stood without it (see redelivers).
-    const queued = async () => {
+    const awaitBackstop = async () => {
       if (!backstop) return true;
       try {
         delivery = await backstop;
@@ -1782,7 +1786,7 @@ class SessionWorker {
     // to another agent's session does, goes on to it.
     const owner = state.agent ?? agentOf(message);
     if (owner !== this.agent.name) {
-      if (!(await queued())) return undefined;
+      if (!(await awaitBackstop())) return undefined;
       await this.backend.queue.send(queuedMessage({ ...message, agent: owner }, this.backend.store), {
         idempotencyKey: `${message.sessionId}:${message.type}:${message.messageId}:to:${owner}`,
       });
@@ -1806,16 +1810,24 @@ class SessionWorker {
       // nothing else is written until it lands.
       const startable = () => (this.running || state.lease ? null : earlyStart(entries, state, message, (items) => this.fold(items, delivery)));
       let early = startable();
-      if (!early && backstop) {
-        if (!(await queued())) return undefined;
-        // A turn may have run here while the backstop was sent.
+      if (!early) {
+        if (!(await awaitBackstop())) return undefined;
+        // Only a write-free opener may be displaced. Never await a live
+        // claim here: its run/turn may be waiting for this delivery's steer.
+        const opening = this.opening;
+        if (opening) {
+          opening.stop();
+          await opening.stopped;
+        }
+        // Fold the durable log again after displacement: this delivery's
+        // backstop can recover earlier stored inputs too, in log order.
         await caughtUp();
         early = startable();
       }
       let outcome;
       if (early) {
         outcome = await this.claim(log, state, deadline, early, delivery, backstop);
-        if (!(await queued())) return undefined;
+        if (!(await awaitBackstop())) return undefined;
       } else {
         if (this.running) return { timeoutSeconds: runningBackstopSeconds };
         if (!state.hasWork) {
@@ -1859,7 +1871,7 @@ class SessionWorker {
   // that names that delivery, still in flight: every write waits for it, so
   // the lease names it, and the engine opens meanwhile. Returns what run()
   // returns, "refused" when another worker's write came before the claim,
-  // or "unqueued" when the backstop failed.
+  // or "unqueued" when the backstop failed or the write-free opener gave way.
   async claim(log, state, deadline, early, delivery = null, backstop = null) {
     // Claimed before the first await, so a delivery that arrives meanwhile
     // sees the session running here.
@@ -1877,7 +1889,22 @@ class SessionWorker {
     };
     this.backend.holding(this.holder, true);
     let unqueued = false;
-    const sent = backstop?.then((queued) => { if (queued) lease.delivery = queued; });
+    let opening = null;
+    let stopped;
+    let displaced = false;
+    const revoked = backstop ? new Error("early opener displaced by a backed delivery") : null;
+    const giveWay = backstop ? new Promise((_, reject) => {
+      opening = {
+        stopped: new Promise((resolve) => { stopped = resolve; }),
+        stop: () => { displaced = true; reject(revoked); },
+      };
+      this.opening = opening;
+    }) : null;
+    const sent = backstop ? Promise.race([backstop, giveWay]).then((delivered) => {
+      if (displaced) throw revoked;
+      this.opening = null;
+      if (delivered) lease.delivery = delivered;
+    }) : null;
     void sent?.catch(() => { unqueued = true; });
     try {
       // Both writes go out at once and neither waits for the other; the
@@ -1921,6 +1948,8 @@ class SessionWorker {
     } finally {
       this.backend.holding(this.holder, false);
       this.running = false;
+      if (this.opening === opening) this.opening = null;
+      stopped?.();
     }
   }
 
@@ -1936,9 +1965,9 @@ class SessionWorker {
   // over. With `early`, the state the session was read in, the first turn
   // starts before the claim lands: every write waits for it, and once it
   // failed nothing more is written and the turn stops. The caller answers
-  // for a claim that failed. `queued`, when given, resolves whether the
-  // backstop the lease names was sent.
-  async run(raw, claimed, lease, deadline, early, queued = null) {
+  // for a claim that failed. `backstopSent`, when given, resolves whether
+  // the backstop the lease names was sent without displacing this opener.
+  async run(raw, claimed, lease, deadline, early, backstopSent = null) {
     const agent = this.agent;
     let head = null;
     let failed = null;
@@ -2115,7 +2144,7 @@ class SessionWorker {
         // A failed backstop does not wait out a slow open: its sender fails
         // the prompt once this worker stops. The late engine closes in the
         // background, and the agent's close() waits for it.
-        if (queued && !(await Promise.race([queued, opening.then(() => true, () => true)]))) {
+        if (backstopSent && !(await Promise.race([backstopSent, opening.then(() => true, () => true)]))) {
           agent.track(opening.then((late) => late.close()).catch(() => {}));
           await ready;
           return broken();
@@ -2136,6 +2165,14 @@ class SessionWorker {
         }
         agent.emit("session.error", { sessionId: this.sessionId, error: errorSummary(error) });
         return "done";
+      }
+      // The opener is inert until its own backstop succeeds. A displaced
+      // opener closes without taking a turn or writing anything.
+      if (backstopSent && !(await backstopSent)) {
+        agent.track(harness.close().catch(() => {}));
+        harness = null;
+        await ready;
+        return broken();
       }
       const yieldAt = deadline === null ? undefined : Math.max(1, deadline - this.backend.reserveMs);
       for (;;) {
@@ -2215,12 +2252,6 @@ class SessionWorker {
             await ui.settle();
             state = this.fold(await log.read());
             continue;
-          }
-          // A model request is billed, so none goes out for a prompt whose
-          // backstop failed and whose sender reports it failed.
-          if (queued && !(await queued)) {
-            await ready;
-            return broken();
           }
           try {
             turn = harness.prompt(withImages.input ?? "", { turnId: messageId, yieldAt });
@@ -2768,7 +2799,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
     const minted = new Set();
     const mint = (id) => {
       minted.add(id);
-      if (minted.size > 1024) minted.delete(minted.values().next().value);
+      if (minted.size > maxMintedIds) minted.delete(minted.values().next().value);
       return id;
     };
     const backend = () => {
@@ -2928,8 +2959,8 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
               // continues the turn.
               const delaySeconds = Math.ceil(Math.max(0, deadline - Date.now()) / 1000) + inlineBackstopMarginSeconds;
               const backstop = (async () => {
-                const { messageId } = await created.queue.send(queued, { idempotencyKey, delaySeconds }) ?? {};
-                return messageId ? { messageId, attempt: 0 } : null;
+                const { messageId: backstopId } = await created.queue.send(queued, { idempotencyKey, delaySeconds }) ?? {};
+                return backstopId ? { messageId: backstopId, attempt: 0 } : null;
               })();
               void backstop.catch(() => {});
               // The worker opens its engine while the backstop is sent; its
