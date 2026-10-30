@@ -1312,6 +1312,8 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                     } else if (picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) {
                         try completion_rt.openCurrentModelPicker(app);
+                    } else if (picker_state.isBareEffortCommandAtCursor(&app.input_runtime.edit_state)) {
+                        try completion_rt.openCurrentEffortPicker(app);
                     } else if (completion_rt.hasFileQuery(app)) {
                         if ((try completion_rt.autocompleteFilePickerSelection(app, max_input_len)) == .limit_exceeded) {
                             try input_limit_feedback.report(App, app, .composer, 1);
@@ -1388,6 +1390,7 @@ pub fn Runtime(comptime App: type) type {
                     return;
                 },
                 '\r' => {
+                    if (try submitEffortMenuSelection(app)) return;
                     if (try submitSettingsMenuSelection(app)) return;
                     if (try submitHelpMenuSelection(app, max_input_len, max_prompt_history)) return;
                     if (try submitMcpHostMenu(app)) return;
@@ -1432,6 +1435,18 @@ pub fn Runtime(comptime App: type) type {
                     if (app.input_runtime.lineContinuationState().replaceBackslashBeforeCursorWithNewline(app.alloc)) {
                         app.shell.render_requests.request(.footer);
                         return;
+                    }
+                    // Enter on an empty composer answers a request that waits
+                    // for the user, which resends it.
+                    if (comptime @hasDecl(@TypeOf(app.worker), "requestRecoveryContinue")) {
+                        if (recoveryWaitsForUser(app) and
+                            std.mem.trim(u8, app.input_runtime.edit_state.input.items, " \t\r\n").len == 0)
+                        {
+                            app.worker.requestRecoveryContinue();
+                            debug_trace.logf("input", "event=recovery_continue", .{});
+                            app.shell.render_requests.request(.footer);
+                            return;
+                        }
                     }
                     debug_trace.logf("input", "submit requested stream_active={s} queued={d} input_bytes={d}", .{ if (app.stream.active) "true" else "false", app.worker.queuedPromptCount(), app.input_runtime.edit_state.input.items.len });
                     try submit_rt.submit(app, max_prompt_history);
@@ -1979,9 +1994,11 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn dismissActiveMenusForComposerEdit(app: *App) bool {
-            // The fork menu reads no query from the composer, so an edit closes it.
+            // The fork and effort menus read no query from the composer, so
+            // an edit closes them.
             const fork_menu_closed = cancelForkMenu(app);
-            return dismissAuthPickerForComposerEdit(app) or fork_menu_closed;
+            const effort_menu_closed = cancelEffortMenu(app);
+            return dismissAuthPickerForComposerEdit(app) or fork_menu_closed or effort_menu_closed;
         }
 
         fn dismissActiveMenusThenRedraw(app: *App) void {
@@ -1997,7 +2014,10 @@ pub fn Runtime(comptime App: type) type {
             // the menu, and close() resets origin to .command.
             const origin = app.skills.menu.origin;
             syncSkillsMenu(app);
-            const skill = app.skills.selectedMenuSkill() orelse {
+            // A mention menu that is not shown offers nothing to take, so
+            // Enter sends the prompt as typed.
+            const shown = !origin.isMention() or app.skills.menuVisible();
+            const skill = (if (shown) app.skills.selectedMenuSkill() else null) orelse {
                 if (origin.isMention()) {
                     app.skills.closeMenu();
                     app.shell.render_requests.request(.footer);
@@ -2337,7 +2357,10 @@ pub fn Runtime(comptime App: type) type {
 
         fn submitAuthPickerSelection(app: *App) !bool {
             if (comptime !@hasField(App, "auth")) return false;
-            if (app.stream.active) return false;
+            // A running turn keeps its credential, except one waiting for the
+            // sign-in fx opened for it: nothing is in flight, and finishing
+            // the sign-in continues it.
+            if (app.stream.active and !recoveryWaitsForSignIn(app)) return false;
             if (!app.auth.pickerView().active) return false;
             const choice = app.auth.takePickerChoice(app.alloc) orelse {
                 app.shell.render_requests.request(.footer);
@@ -2710,7 +2733,7 @@ pub fn Runtime(comptime App: type) type {
                     _ = disarmEscapeInterrupt(app, "approval_prompt");
                     return;
                 }
-                if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app) or cancelForkMenu(app)) {
+                if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app) or cancelForkMenu(app) or cancelEffortMenu(app)) {
                     _ = disarmEscapeClear(app);
                     _ = disarmEscapeInterrupt(app, "menu");
                     app.shell.render_requests.request(.footer);
@@ -2727,9 +2750,16 @@ pub fn Runtime(comptime App: type) type {
                     _ = disarmEscapeInterrupt(app, "compaction_feedback");
                     return;
                 }
-                if (interrupt_rt.pauseActiveRecovery(app)) {
+                // A request that waits for the user ends on one Esc, which
+                // also closes a sign-in fx opened for it.
+                if (recoveryWaitsForUser(app)) {
+                    if (comptime @hasField(App, "auth")) {
+                        if (app.auth.pickerView().active) app.auth.closePicker(app.alloc);
+                    }
+                    try interrupt_rt.cancelActiveOperation(app);
                     _ = disarmEscapeClear(app);
-                    _ = disarmEscapeInterrupt(app, "recovery_pause");
+                    _ = disarmEscapeInterrupt(app, "recovery_need_user");
+                    app.shell.render_requests.request(.footer);
                     return;
                 }
                 // Interrupting active work requires a confirming second Esc
@@ -2757,7 +2787,7 @@ pub fn Runtime(comptime App: type) type {
                 _ = disarmEscapeClear(app);
                 return;
             }
-            if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app) or cancelForkMenu(app)) {
+            if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app) or cancelForkMenu(app) or cancelEffortMenu(app)) {
                 _ = disarmEscapeClear(app);
                 app.shell.render_requests.request(.footer);
                 return;
@@ -2792,6 +2822,17 @@ pub fn Runtime(comptime App: type) type {
             } else {
                 app.shell.render_requests.request(.footer);
             }
+        }
+
+        /// Whether the status row shows a request that waits for the user.
+        fn recoveryWaitsForUser(app: *App) bool {
+            if (comptime !@hasDecl(@TypeOf(app.shell), "worker_status_state")) return false;
+            return app.shell.worker_status_state().waitsForUser();
+        }
+
+        fn recoveryWaitsForSignIn(app: *App) bool {
+            if (comptime !@hasDecl(@TypeOf(app.shell), "worker_status_state")) return false;
+            return app.shell.worker_status_state().waitsForSignIn();
         }
 
         fn cancelSkillsMenu(app: *App) bool {
@@ -2858,6 +2899,22 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasField(App, "session_persistence")) return false;
             if (!forkMenuActive(app)) return false;
             app.session_persistence.fork_menu.close(app.alloc);
+            return true;
+        }
+
+        fn cancelEffortMenu(app: *App) bool {
+            if (!app.input_runtime.effort_menu.active) return false;
+            app.input_runtime.effort_menu.close(app.alloc);
+            return true;
+        }
+
+        /// Applies the level highlighted in the `/effort` menu and closes it.
+        fn submitEffortMenuSelection(app: *App) !bool {
+            const menu = &app.input_runtime.effort_menu;
+            const effort = menu.selectedEffort() orelse return false;
+            menu.close(app.alloc);
+            try session_commands.Commands(App).selectEffort(app, effort);
+            app.shell.render_requests.request(.footer);
             return true;
         }
     };
@@ -5490,6 +5547,28 @@ test "app_input_runtime space after matched dollar token inserts and closes menu
     try feedRoutingBytes(&app, "\r");
     try std.testing.expectEqual(@as(usize, 1), app.submitted_prompt_count);
     try std.testing.expectEqualStrings("$man x", app.submitted_prompt[0..app.submitted_prompt_len]);
+}
+
+test "app_input_runtime dollar mention ended by punctuation submits raw on enter" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    const skills = [_]skill_runtime.Skill{.{
+        .name = "status-second",
+        .description = "",
+        .path = "/tmp/status-second/SKILL.md",
+        .source = .global_fx,
+    }};
+    app.skills.items = @constCast(&skills);
+
+    try feedRoutingBytes(&app, "Use $status-second.");
+    try std.testing.expect(!app.skills.menuVisible());
+    try feedRoutingBytes(&app, "\r");
+
+    try std.testing.expect(!app.skills.menu.active);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.entities.skill_tokens.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.submitted_prompt_count);
+    try std.testing.expectEqualStrings("Use $status-second.", app.submitted_prompt[0..app.submitted_prompt_len]);
 }
 
 test "app_input_runtime matched dollar token still binds on enter" {
@@ -9328,7 +9407,9 @@ test "app_input_runtime backslash enter is consumed by an active command skills 
     }};
     app.skills.items = @constCast(&skills);
     app.skills.openMenu();
-    try app.input_runtime.textReplacementState().replace(alloc, "\\");
+    // No skill matches the query, so the menu has nothing to pick and keeps
+    // Enter. A query of only `\` would match every skill.
+    try app.input_runtime.textReplacementState().replace(alloc, "zq\\");
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 

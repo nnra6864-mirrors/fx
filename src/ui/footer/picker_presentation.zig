@@ -6,6 +6,7 @@ const picker_state = @import("../../core/input/picker_state.zig");
 const command_specs = @import("../../core/slash_commands/command_specs.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const list_window = @import("../../core/shared/list_window.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
 const file_index = @import("../../core/workspace/file_index.zig");
 const ui_render = @import("../render.zig");
@@ -423,6 +424,18 @@ fn composeOnboardingPickerRow(
     return row;
 }
 
+/// The device page as a link, the way Codex and Grok open theirs; null when
+/// the address can't be a link target or the row is too narrow for it.
+fn vercelOpenLabel(buf: []u8, url: []const u8, width: u16) ?[]const u8 {
+    if (!text_utils.isLinkTarget(url)) return null;
+    const label = std.mem.print(
+        buf,
+        "   Open   \x1b]8;id=fx-vercel-auth;{s}\x1b\\\x1b[4mAuthorize with Vercel\x1b[24m\x1b]8;;\x1b\\",
+        .{url},
+    ) catch return null;
+    return if (display_width.visibleWidthIgnoringAnsi(label) <= width) label else null;
+}
+
 fn composeSignInPickerRow(
     alloc: Allocator,
     snapshot: login_flow.SignInSnapshot,
@@ -554,7 +567,7 @@ fn composeSignInPickerRow(
         else
             "   Sign in with Vercel",
         1, 4 => "",
-        2 => std.mem.print(
+        2 => vercelOpenLabel(&label_buf, snapshot.verification_uri, width) orelse std.mem.print(
             &label_buf,
             "   Open   {s}",
             .{snapshot.verification_uri},
@@ -816,10 +829,10 @@ pub noinline fn composePickerOptionRowAnnotated(
     if (width_usize == 0 or start_col == 0 or start_col > width) return row;
 
     if (start_col > 1) try row_text.appendAbsoluteColumn(alloc, &row, start_col);
-    // Model, provider, and model-catalog pickers signal selection by
+    // Model, provider, model-catalog, and effort pickers signal selection by
     // brightness alone, like the question panel; other pickers keep the filled row.
     const selected_style = switch (kind) {
-        .model_stage, .provider_stage, .models => ui_render.selected_completion_style,
+        .model_stage, .provider_stage, .models, .effort => ui_render.selected_completion_style,
         .file, .slash, .skills, .help, .settings, .sessions, .fork, .mcp, .auth => ui_render.approval_button_inactive_style,
     };
     const base_style = if (selected) selected_style else ui_render.dim_style;
@@ -917,6 +930,7 @@ pub fn composePickerStatusRowWithProvider(
             .api_key => "",
         },
         .models => "no models available",
+        .effort => "no reasoning effort levels",
         .file => if (loading)
             "indexing files..."
         else if (failed)
@@ -2505,13 +2519,21 @@ test "sign-in stage renders the complete device authorization screen" {
     }
     for ([_][]const u8{
         "Sign in with Vercel",
-        "Open   https://vercel.test/verify",
+        // The device page is a link, not its address printed out.
+        "Open   \x1b]8;id=fx-vercel-auth;https://vercel.test/verify\x1b\\\x1b[4mAuthorize with Vercel\x1b[24m\x1b]8;;\x1b\\",
         "Code   TEST-CODE",
         "Waiting for authorization",
         "enter reopens browser · esc cancels",
     }) |expected| {
         try std.testing.expect(std.mem.find(u8, screen.items, expected) != null);
     }
+    try std.testing.expect(std.mem.find(u8, screen.items, "Open   https://") == null);
+
+    // Too narrow for the link: the address, clipped, and no link left open.
+    var narrow = try composeAuthPickerRow(alloc, view, 2, 7, 24);
+    defer narrow.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, narrow.items, "Open   https://") != null);
+    try std.testing.expect(std.mem.find(u8, narrow.items, "\x1b]8;") == null);
 }
 
 test "Codex sign-in stage renders a bounded clickable authorization action" {

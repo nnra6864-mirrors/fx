@@ -6,8 +6,10 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
+const model_cache_runtime = @import("../app/model_cache_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const output_contracts = @import("../output/output_contracts.zig");
@@ -163,6 +165,7 @@ fn postCommitResolutionError(
             .ignored_project_user_only_setting,
             .legacy_workspace_preferences,
             .manual_backup_available,
+            .private_state_permissions_tightened,
             => {},
         }
     }
@@ -962,14 +965,78 @@ pub fn Commands(comptime App: type) type {
                 );
             }
 
-            if (announce) {
-                try app.writeDomainNotice(.{ .topic = "effort", .tone = .neutral, .body = app.effort.label() }, true);
-            }
+            if (announce) try announceEffortSelection(app);
             app.shell.render_requests.request(.footer);
+        }
+
+        /// Names the effort now in use, as `/model` names the model it
+        /// switched to. A running turn keeps the effort it started with.
+        fn announceEffortSelection(app: *App) !void {
+            const active_response = if (comptime @hasField(App, "stream")) app.stream.active else false;
+            const prefix: []const u8 = if (active_response) "Next turn will use reasoning effort " else "Reasoning effort set to ";
+            const line = try app.alloc.print("{s}{s} for {s}", .{ prefix, app.effort.displayLabel(), provider_runtime.model(app) });
+            defer app.alloc.free(line);
+            try app.writeDomainNotice(.{ .topic = "", .tone = .neutral, .body = line }, true);
+            if (comptime @hasDecl(App, "playInteractionSound")) app.playInteractionSound();
         }
 
         pub fn selectEffortFromSettings(app: *App, effort: types.ReasoningEffort) !void {
             try applyEffort(app, effort, false, true);
+        }
+
+        /// Applies `effort` to the current model, saves it, and names it.
+        pub fn selectEffort(app: *App, effort: types.ReasoningEffort) !void {
+            try applyEffort(app, effort, true, true);
+        }
+
+        /// What `/effort` asks of the shell once its arguments are handled.
+        pub const EffortRequest = union(enum) {
+            /// Nothing more: a level was applied, or a notice said why not.
+            done,
+            /// Open the menu of these levels for the current model.
+            open_menu: model_capabilities.Capabilities,
+        };
+
+        /// `/effort` with no arguments asks for the menu of the current
+        /// model's levels; `/effort <level>` applies that level. A model
+        /// without levels, or a level it does not offer, gets a notice.
+        pub fn handleEffort(app: *App, rest: []const u8) !EffortRequest {
+            const model = provider_runtime.model(app);
+            const capabilities = model_capabilities.resolveForApp(App, app, model);
+            if (capabilities.reasoning_efforts.len == 0) {
+                const loading = if (comptime @hasDecl(App, "isModelCacheLoading")) app.isModelCacheLoading() else false;
+                const message = if (loading)
+                    try app.alloc.print("levels for {s} are still loading; try /effort again in a moment", .{model})
+                else
+                    try app.alloc.print("{s} has no levels to choose from", .{model});
+                defer app.alloc.free(message);
+                try app.writeDomainNotice(.{ .topic = "effort", .tone = .neutral, .body = message }, true);
+                return .done;
+            }
+            const level = std.mem.trim(u8, rest, " \t\r\n");
+            if (level.len == 0) return .{ .open_menu = capabilities };
+            const parsed = types.ReasoningEffort.parse(level);
+            if (parsed) |effort| {
+                if (model_capabilities.reasoningEffortSupported(capabilities, effort)) {
+                    try selectEffort(app, effort);
+                    return .done;
+                }
+            }
+            var offered: std.ArrayList(u8) = .empty;
+            defer offered.deinit(app.alloc);
+            try offered.appendSlice(app.alloc, "default");
+            for (capabilities.reasoning_efforts.slice()) |*option| {
+                try offered.appendSlice(app.alloc, ", ");
+                try offered.appendSlice(app.alloc, option.displayLabel());
+            }
+            // Only a well-formed level name is repeated back.
+            const message = if (parsed) |effort|
+                try app.alloc.print("{s} is not available for {s}; levels: {s}", .{ effort.label(), model, offered.items })
+            else
+                try app.alloc.print("levels for {s}: {s}", .{ model, offered.items });
+            defer app.alloc.free(message);
+            try app.writeDomainNotice(.{ .topic = "effort", .tone = .neutral, .body = message }, true);
+            return .done;
         }
 
         pub fn selectModelFromPicker(
@@ -1358,32 +1425,29 @@ pub fn Commands(comptime App: type) type {
             if (comptime @hasDecl(App, "playInteractionSound")) app.playInteractionSound();
         }
 
+        /// The model `/model <query>` switches to: the one the Models menu
+        /// and the inline suggestions list first for the same query.
         fn resolveModelQueryFromIds(alloc: std.mem.Allocator, ids: []const []u8, query: []const u8) !?[]u8 {
-            for (ids) |id| {
-                if (std.ascii.eqlIgnoreCase(id, query)) {
-                    return try alloc.dupe(u8, id);
-                }
-            }
-
-            var best_score: i32 = 0;
-            var best_id: ?[]const u8 = null;
-
-            for (ids) |id| {
-                const score = fuzzyModelScore(id, query);
-                if (score > best_score) {
-                    best_score = score;
-                    best_id = id;
-                }
-            }
-
-            if (best_id) |id| {
-                return try alloc.dupe(u8, id);
-            }
-
-            return null;
+            if (std.mem.trim(u8, query, " \t\r\n").len == 0) return null;
+            const ranking: fuzzy_match.Ranking(ModelIdMatches) = .{
+                .context = .{ .ids = ids, .query = query },
+                .len = ids.len,
+            };
+            const position = ranking.at(0) orelse return null;
+            return try alloc.dupe(u8, ids[position]);
         }
     };
 }
+
+/// Model ids in catalog order, matched as the Models menu matches them.
+const ModelIdMatches = struct {
+    ids: []const []u8,
+    query: []const u8,
+
+    pub fn matchAt(self: ModelIdMatches, position: usize) ?fuzzy_match.Match {
+        return model_cache_runtime.modelIdMatch(self.query, self.ids[position]);
+    }
+};
 
 fn startsWithWord(text: []const u8, word: []const u8) bool {
     if (!std.ascii.startsWithIgnoreCase(text, word)) return false;
@@ -2430,6 +2494,30 @@ test "session_commands handleModel resolves fuzzy cached model and syncs queued 
         app.terminalTitleLabelText(),
     );
     try expectTranscriptContains(&app, "* Switched to anthropic/claude-sonnet-4-20250514");
+}
+
+test "session_commands handleModel picks the model the Models menu lists first" {
+    const alloc = std.testing.allocator;
+    const ids = [_][]const u8{
+        "openai/gpt-4o-mini",
+        "openai/gpt-4o",
+        "anthropic/claude-sonnet-4.5",
+    };
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-sonnet-4.5");
+    defer app.deinit();
+    app.cached_ids = &ids;
+
+    // The model's own name ranks it above a longer id listed earlier.
+    try Commands(FakeApp).handleModel(&app, "GPT-4o");
+    try std.testing.expectEqualStrings("openai/gpt-4o", app.selected_model.items);
+
+    try Commands(FakeApp).handleModel(&app, "cs45");
+    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4.5", app.selected_model.items);
+
+    // Every word must match, so a query no model matches is used as typed.
+    app.fail_fetch = true;
+    try Commands(FakeApp).handleModel(&app, "openai/gpt-9");
+    try std.testing.expectEqualStrings("openai/gpt-9", app.selected_model.items);
 }
 
 test "session_commands handleModel falls back to raw query when model fetch fails" {

@@ -14948,7 +14948,7 @@ test "transcript lifecycle terminal and finalization transitions stay batch safe
     }{
         .{ .call_id = "completed", .kind = .completed, .summary = "completed", .marker_style = ui_render.system_notice_text_style, .marker = "●" },
         .{ .call_id = "denied", .kind = .denied, .summary = "denied", .marker_style = ui_render.red_style, .marker = "⊘" },
-        .{ .call_id = "cancelled", .kind = .cancelled, .summary = "cancelled", .marker_style = ui_render.warning_style, .marker = "■" },
+        .{ .call_id = "cancelled", .kind = .cancelled, .summary = "cancelled", .marker_style = ui_render.warning_style, .marker = "▪" },
         .{ .call_id = "failed", .kind = .failed, .summary = "failed", .marker_style = ui_render.red_style, .marker = "●" },
     };
     for (cases) |case| {
@@ -15084,7 +15084,7 @@ test "transcript lifecycle terminal markers preserve ANSI summaries and normaliz
     var styled_cancelled_expected: [256]u8 = undefined;
     try expectRawEntryBytes(&runtime, styled_cancelled_entry_id, try std.mem.print(
         &styled_cancelled_expected,
-        "{s}■{s}{s} Cancelled\x1b[0m \x1b[38;5;245msleep 30\x1b[0m{s}" ++
+        "{s}▪{s}{s} Cancelled\x1b[0m \x1b[38;5;245msleep 30\x1b[0m{s}" ++
             " · What can fx do differently?\n",
         .{
             ui_render.warning_style,
@@ -15117,7 +15117,7 @@ test "transcript lifecycle terminal markers preserve ANSI summaries and normaliz
     var cancelled_expected: [128]u8 = undefined;
     try expectRawEntryBytes(&runtime, cancelled_entry_id, try std.mem.print(
         &cancelled_expected,
-        "{s}■{s} {s}Tool cancelled{s} · What can fx do differently?\n",
+        "{s}▪{s} {s}Tool cancelled{s} · What can fx do differently?\n",
         .{
             ui_render.warning_style,
             ui_render.reset_style,

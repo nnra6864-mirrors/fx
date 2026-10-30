@@ -438,6 +438,10 @@ pub fn SubmitRuntime(comptime App: type) type {
                 if (comptime !@hasDecl(@TypeOf(app.worker), "removeQueuedPrompt")) {
                     return false;
                 }
+                const carried_stale_note = if (comptime @hasDecl(@TypeOf(app.worker), "queuedPromptCarriesStaleShellHandles"))
+                    app.worker.queuedPromptCarriesStaleShellHandles(pending.draft.turn_id)
+                else
+                    false;
                 if (!app.worker.removeQueuedPrompt(
                     std.heap.c_allocator,
                     pending.draft.turn_id,
@@ -467,6 +471,13 @@ pub fn SubmitRuntime(comptime App: type) type {
                         .{@tagName(pending.phase)},
                     );
                     return false;
+                }
+                // The removed prompt never ran, so the next one tells the
+                // model its earlier shell handles are gone.
+                if (carried_stale_note) {
+                    if (comptime @hasField(App, "session") and @hasDecl(@TypeOf(app.session), "returnStaleShellHandles")) {
+                        app.session.returnStaleShellHandles(pending.draft.turn_id);
+                    }
                 }
             }
             clearPendingSubmission(app, "ctrl_c_pending_submission");
@@ -2207,6 +2218,7 @@ const PendingLifecycleFake = struct {
         held: bool = true,
         release_count: usize = 0,
         queued_turn_id: ?u64 = null,
+        queued_stale_shell_handles: bool = false,
         active_turn_id: u64 = 0,
         delete_count: usize = 0,
         cancel_count: usize = 0,
@@ -2215,6 +2227,10 @@ const PendingLifecycleFake = struct {
             if (!self.held) return;
             self.held = false;
             self.release_count += 1;
+        }
+
+        pub fn queuedPromptCarriesStaleShellHandles(self: *@This(), turn_id: u64) bool {
+            return self.queued_turn_id == turn_id and self.queued_stale_shell_handles;
         }
 
         pub fn removeQueuedPrompt(
@@ -2235,6 +2251,13 @@ const PendingLifecycleFake = struct {
 
         pub fn requestCancel(self: *@This()) void {
             self.cancel_count += 1;
+        }
+    } = .{},
+    session: struct {
+        returned_stale_note_turn: ?u64 = null,
+
+        pub fn returnStaleShellHandles(self: *@This(), turn_id: u64) void {
+            self.returned_stale_note_turn = turn_id;
         }
     } = .{},
     shell: struct {
@@ -2464,6 +2487,20 @@ test "Ctrl+C cancels pending ownership from every pre-worker phase" {
     try std.testing.expectEqual(@as(?u64, null), queued.worker.queued_turn_id);
     try std.testing.expectEqual(@as(usize, 1), queued.worker.delete_count);
     try std.testing.expectEqual(@as(usize, 1), queued.worker.release_count);
+}
+
+test "Ctrl+C on a queued prompt gives back the stale shell handles note it carried (D93)" {
+    const Runtime = SubmitRuntime(PendingLifecycleFake);
+    for ([_]bool{ true, false }) |carried| {
+        var app = try pendingLifecycleFake(std.testing.allocator, 806);
+        defer app.deinit();
+        Runtime.noteCommittedFrame(&app);
+        Runtime.collectPendingSubmissionFacts(&app);
+        app.worker.queued_stale_shell_handles = carried;
+        try std.testing.expect(Runtime.cancelPendingSubmission(&app));
+        try std.testing.expectEqual(@as(?u64, null), app.worker.queued_turn_id);
+        try std.testing.expectEqual(if (carried) @as(?u64, 806) else null, app.session.returned_stale_note_turn);
+    }
 }
 
 test "Ctrl+C requests cancellation after the pending turn leaves the queue" {
