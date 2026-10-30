@@ -3310,6 +3310,102 @@ if (durabilityKind === "queue") {
     }
   });
 
+  // An opener's backstop can succeed in the same turn of the event loop as a
+  // backed contender stops it: claim()'s race has then settled on the
+  // backstop before stop() rejects giveWay. The opener must give way all the
+  // same, or the contender waits out the opener's whole claim, the live claim
+  // consume() must never await. Giving way, its engine asks the model
+  // nothing, and the next claim, the contender's or the opener's own
+  // delivery's, opens another to run both turns. Here the queue takes each
+  // backstop before the test holds its answer, so the answers come back over
+  // promises alone, the contender's first and the opener's `ticks`
+  // microtasks later.
+  for (const ticks of [0, 1, 2, 3]) {
+    test(`same-session concurrency: an opener whose backstop succeeds as a backed contender stops it still gives way (${ticks} ticks apart)`, async () => {
+      const dir = await mkdtemp(join(tmpdir(), "libfx-displaced-race-"));
+      dirs.push(dir);
+      const { durability: base } = await queueWorldAt(dir, { queueLeases: true, runInRequest: true, maxDurationMs: 60_000 });
+      const answers = [];
+      let waiting = null;
+      const durability = {
+        ...base,
+        world: async () => {
+          const world = await base.world();
+          const queue = world.queue.bind(world);
+          return Object.assign(Object.create(world), {
+            async queue(name, payload, options) {
+              const sent = await queue(name, payload, options);
+              if (options?.delaySeconds > 0 && options.idempotencyKey === `${payload.runId}:prompt:${payload.input?.messageId}`) {
+                await new Promise((resolve) => {
+                  answers.push(resolve);
+                  waiting?.();
+                });
+              }
+              return sent;
+            },
+          });
+        },
+      };
+      const nextAnswer = async () => {
+        while (answers.length === 0) await new Promise((resolve) => { waiting = resolve; });
+        return answers.shift();
+      };
+      const opening = barrier();
+      // Each engine opened, in order: the turns it asked the model for, and
+      // how many times it closed.
+      const engines = [];
+      const create = createDurableAgentFactory({
+        harness: () => ({
+          async open(args) {
+            const record = { asked: [], closed: 0 };
+            engines.push(record);
+            opening.resolve();
+            const engine = await scriptedHarness()().open(args);
+            return {
+              ...engine,
+              prompt(input, options) {
+                record.asked.push(options.turnId);
+                return engine.prompt(input, options);
+              },
+              async close() {
+                await engine.close();
+                record.closed += 1;
+              },
+            };
+          },
+        }),
+        defaultDurability: async () => memory(),
+      });
+      const agent = create({ durability });
+      const session = agent.session();
+      const first = session.prompt("racing-opener", { messageId: "racing-opener" });
+      const answerFirst = await nextAnswer();
+      let answerSecond;
+      try {
+        await bounded(opening.promise, "the opener did not begin opening its engine");
+        const second = session.prompt("racing-contender", { messageId: "racing-contender" });
+        answerSecond = await bounded(nextAnswer(), "the contender's backstop was not sent");
+        // The contender's handoff holds the log its send read, so it reaches
+        // the wait for its own backstop over resolved promises alone.
+        await sleep(0);
+        answerSecond();
+        for (let tick = 0; tick < ticks; tick += 1) await null;
+        answerFirst();
+        assert.equal((await bounded(second.result, "the contender's prompt did not end")).stopReason, "end_turn");
+        assert.equal((await bounded(first.result, "the opener's prompt did not end")).stopReason, "end_turn");
+        await bounded(agent.close(), "workers did not stop");
+        assert.deepEqual(engines.flatMap((engine) => engine.asked), ["racing-opener", "racing-contender"], "each turn started once, in log order");
+        assert.deepEqual(engines[0].asked, [], "the opener gave way: the engine it opened asked the model nothing");
+        assert.equal(engines[0].closed, 1, "the opener's engine closed once");
+        assert.equal(internals(agent).liveWorkers(), 0, "no held workers");
+      } finally {
+        answerFirst();
+        answerSecond?.();
+        await agent.close();
+      }
+    });
+  }
+
   test("same-session concurrency: a backed later prompt recovers a failed sender's stored input in log order", async () => {
     const dir = await mkdtemp(join(tmpdir(), "libfx-unbacked-retry-"));
     dirs.push(dir);
