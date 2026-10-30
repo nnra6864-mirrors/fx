@@ -663,6 +663,10 @@ pub fn Runtime(comptime App: type) type {
                     defer app.alloc.free(summary);
                     try writeCollapsedStartupNotice(app, "config", summary, detail_writer.written());
                 }
+                for (startup.config_diagnostics) |diagnostic| {
+                    const text = diagnostic.note() orelse continue;
+                    try app.writeDomainNotice(.{ .topic = "note", .tone = .information, .body = text }, true);
+                }
             }
             if (comptime @hasField(App, "prompt_history")) {
                 if (prompt_history_unavailable) {

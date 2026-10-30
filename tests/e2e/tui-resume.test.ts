@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -16,7 +17,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { findFooterBlocks } from "./tui-render-assertions";
 import {
@@ -25,10 +26,12 @@ import {
   fakeGatewaySerializedToolCall,
   fakeGatewaySse,
   fakeGatewayToolCall,
+  fakeShellRun,
   hasEmptyComposer,
   isEmptyComposerLine,
   isVolatileTokenStatusRow,
   paneExitMatches,
+  startDynamicFakeGateway,
   startFakeGateway,
   startUpgradeServer,
   TmuxSession,
@@ -8224,3 +8227,490 @@ test.skipIf(!tmuxAvailable())("resumed command rows reclip to live width after t
     rmSync(root, { recursive: true, force: true });
   }
 }, 60_000);
+
+// Auto-resume: a request fx was running when it died or its window closed
+// goes out again on the next `-c`, as `tests/tla/recovery/Resume.tla`
+// models it.
+
+const RESUME_NOTE = "<session_resumed>";
+
+function resumeFixture(prefix: string) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(workspace);
+  writeFileSync(
+    join(home, ".fx", "settings.json"),
+    JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+  );
+  return { root, home, workspace: realpathSync(workspace) };
+}
+
+async function launchFx(
+  fixture: ReturnType<typeof resumeFixture>,
+  gateway: ReturnType<typeof startFakeGateway>,
+  args: string,
+  name: string,
+) {
+  const stderrPath = join(fixture.root, `${name}-stderr.log`);
+  writeFileSync(stderrPath, "");
+  const session = await TmuxSession.create({
+    cmd: `${FX_BIN} ${args}`.trim(),
+    cwd: fixture.workspace,
+    env: gatewayEnv(fixture.home, gateway),
+    stderrPath,
+    width: 100,
+    height: 32,
+  });
+  await session.waitForComposer(TIMEOUT);
+  return { session, stderrPath };
+}
+
+/// fx's own process. On Linux the pane's bash keeps the pane's watcher shell
+/// between it and fx, so the pane's direct child can be that shell, and a
+/// signal sent there never reaches fx.
+function fxPid(session: TmuxSession): number {
+  let pid = session.processPid();
+  for (let depth = 0; depth < 4; depth += 1) {
+    const name = execFileSync("ps", ["-o", "comm=", "-p", String(pid)], { encoding: "utf8" }).trim();
+    if (basename(name) === "fx") return pid;
+    let children: string[] = [];
+    try {
+      children = execFileSync("pgrep", ["-P", String(pid)], { encoding: "utf8" }).trim().split(/\s+/);
+    } catch {}
+    if (children.length !== 1) throw new Error(`process ${pid} (${name}) has ${children.length} children, none of them fx`);
+    pid = Number.parseInt(children[0]!, 10);
+  }
+  throw new Error("no fx process under the tmux pane");
+}
+
+/// Kills fx the way the test names it and waits for the process to go.
+async function endFx(session: TmuxSession, signal: "SIGKILL" | "SIGHUP") {
+  const pid = fxPid(session);
+  process.kill(pid, signal);
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      break;
+    }
+    await Bun.sleep(25);
+  }
+  await session.kill();
+}
+
+test.skipIf(!tmuxAvailable())(
+  "a request fx was killed during goes out again on the next -c",
+  async () => {
+    const fixture = resumeFixture("fx-auto-resume-kill-");
+    let reached: () => void = () => {};
+    const inFlight = new Promise<void>((resolve) => (reached = resolve));
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (body.includes(RESUME_NOTE)) return fakeGatewayFinalText("RESUMED_ANSWER_7310");
+      if (body.includes("Plan the trip.")) {
+        reached();
+        return new Promise<Response>(() => {});
+      }
+      return fakeGatewayFinalText("UNEXPECTED");
+    });
+    let active: TmuxSession | null = null;
+    try {
+      const first = await launchFx(fixture, gateway, "", "first");
+      active = first.session;
+      await active.sendText("Plan the trip.");
+      await inFlight;
+      await endFx(active, "SIGKILL");
+      active = null;
+
+      const before = gateway.requests.length;
+      const second = await launchFx(fixture, gateway, "-c", "second");
+      active = second.session;
+      const pane = await active.waitForText("RESUMED_ANSWER_7310", TIMEOUT);
+      expect(pane).toContain("Resuming the interrupted request");
+      // The killed turn reads as stopped, not as a failure.
+      expect(pane).toContain("system: fx stopped before this turn finished");
+      expect(pane).not.toContain("system: failed");
+      // The note is for the model; the transcript never shows it.
+      expect(pane).not.toContain(RESUME_NOTE);
+      const resumed = gateway.requests.slice(before).find((request) => request.body.includes(RESUME_NOTE));
+      expect(resumed).toBeTruthy();
+      // The model sees the interrupted prompt before the note.
+      expect(resumed!.body).toContain("Plan the trip.");
+      await active.waitForComposer(TIMEOUT);
+      expect(readFileSync(second.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
+/// A gateway that holds every request for `prompt` and its resumes, so each
+/// launch dies with a send in flight, and answers other requests.
+function holdingGateway(prompt: string) {
+  let notify: () => void = () => {};
+  let held = 0;
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (body.includes(prompt)) {
+      held += 1;
+      notify();
+      return new Promise<Response>(() => {});
+    }
+    return fakeGatewayFinalText("UNRELATED");
+  });
+  const heldAtLeast = async (count: number) => {
+    const deadline = Date.now() + TIMEOUT;
+    while (held < count) {
+      if (Date.now() > deadline) throw new Error(`expected ${count} held requests, saw ${held}`);
+      await new Promise<void>((resolve) => {
+        notify = resolve;
+        setTimeout(resolve, 100);
+      });
+    }
+  };
+  return { gateway, heldAtLeast, held: () => held };
+}
+
+test.skipIf(!tmuxAvailable())(
+  "plain fx points at a turn a crash left unfinished, but not at one another fx is working on",
+  async () => {
+    const fixture = resumeFixture("fx-auto-resume-hint-");
+    const { gateway, heldAtLeast, held } = holdingGateway("Map the route.");
+    const hint = "Interrupted turn · fx -c to continue";
+    const sessions: TmuxSession[] = [];
+    try {
+      const first = (await launchFx(fixture, gateway, "", "first")).session;
+      sessions.push(first);
+      await first.sendText("Map the route.");
+      await heldAtLeast(1);
+      await endFx(first, "SIGKILL");
+
+      // Plain fx points at the turn and starts fresh, sending nothing.
+      const plain = await launchFx(fixture, gateway, "", "plain");
+      sessions.push(plain.session);
+      await plain.session.waitForText(hint, TIMEOUT);
+      await Bun.sleep(500);
+      expect(held()).toBe(1);
+      expect(await plain.session.capturePane()).not.toContain("Resuming the interrupted request");
+      expect(readFileSync(plain.stderrPath, "utf8")).toBe("");
+      await plain.session.kill();
+
+      // While -c works on it, the turn is not interrupted.
+      const resumed = (await launchFx(fixture, gateway, "-c", "resumed")).session;
+      sessions.push(resumed);
+      await heldAtLeast(2);
+      const second = await launchFx(fixture, gateway, "", "second");
+      sessions.push(second.session);
+      await Bun.sleep(500);
+      expect(await second.session.captureFullScrollback()).not.toContain(hint);
+      expect(held()).toBe(2);
+    } finally {
+      for (const session of sessions) await session.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 4,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a request that crashed fx twice asks first, and Esc there ends it for good",
+  async () => {
+    const fixture = resumeFixture("fx-auto-resume-loop-");
+    const { gateway, heldAtLeast, held } = holdingGateway("Crash me.");
+    let active: TmuxSession | null = null;
+    try {
+      active = (await launchFx(fixture, gateway, "", "first")).session;
+      await active.sendText("Crash me.");
+      await heldAtLeast(1);
+      await endFx(active, "SIGKILL");
+      // One crash resends on its own.
+      active = (await launchFx(fixture, gateway, "-c", "second")).session;
+      await heldAtLeast(2);
+      await endFx(active, "SIGKILL");
+
+      // The second crash with the send in flight asks before sending.
+      active = (await launchFx(fixture, gateway, "-c", "third")).session;
+      await active.waitForText("This request crashed fx twice", TIMEOUT);
+      await Bun.sleep(300);
+      expect(held()).toBe(2);
+      await active.sendKeys("Escape");
+      await active.waitForComposer(TIMEOUT);
+      await active.kill();
+
+      // Esc ended it: the next launch sends nothing.
+      const last = await launchFx(fixture, gateway, "-c", "fourth");
+      active = last.session;
+      await Bun.sleep(1_000);
+      expect(held()).toBe(2);
+      const replayed = await active.captureFullScrollback();
+      expect(replayed).not.toContain("Resuming the interrupted request · attempt");
+      // The earlier resumes replay as their line, never as fx's note.
+      expect(replayed).toContain("Resuming the interrupted request");
+      expect(replayed).not.toContain(RESUME_NOTE);
+      expect(readFileSync(last.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 4,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "closing the window is not a crash: two closes in flight still resume without asking",
+  async () => {
+    const fixture = resumeFixture("fx-auto-resume-close-");
+    const { gateway, heldAtLeast } = holdingGateway("Keep going.");
+    let active: TmuxSession | null = null;
+    try {
+      active = (await launchFx(fixture, gateway, "", "first")).session;
+      await active.sendText("Keep going.");
+      await heldAtLeast(1);
+      await endFx(active, "SIGHUP");
+      active = (await launchFx(fixture, gateway, "-c", "second")).session;
+      await heldAtLeast(2);
+      await endFx(active, "SIGHUP");
+
+      const third = await launchFx(fixture, gateway, "-c", "third");
+      active = third.session;
+      await heldAtLeast(3);
+      const pane = await active.capturePane();
+      expect(pane).not.toContain("crashed fx twice");
+      // A closed window reads as stopped, not as cancelled.
+      expect(pane).toContain("system: fx stopped before this turn finished");
+      expect(pane).not.toContain("system: cancelled");
+      expect(readFileSync(third.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 4,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a crash while a tool runs resumes with that tool answered as possibly run",
+  async () => {
+    const fixture = resumeFixture("fx-auto-resume-tool-");
+    let toolStarted: () => void = () => {};
+    const running = new Promise<void>((resolve) => (toolStarted = resolve));
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (body.includes(RESUME_NOTE)) return fakeGatewayFinalText("TOOL_RESUMED_4402");
+      if (body.includes("Run the slow step.")) {
+        toolStarted();
+        return fakeShellRun("resume-slow-1", "sleep 30");
+      }
+      return fakeGatewayFinalText("UNRELATED");
+    });
+    let active: TmuxSession | null = null;
+    try {
+      active = (await launchFx(fixture, gateway, "", "first")).session;
+      await active.sendText("Run the slow step.");
+      await running;
+      await active.waitForText("sleep 30", TIMEOUT);
+      await endFx(active, "SIGKILL");
+
+      const before = gateway.requests.length;
+      const second = await launchFx(fixture, gateway, "-c", "second");
+      active = second.session;
+      await active.waitForText("TOOL_RESUMED_4402", TIMEOUT);
+      const resumed = gateway.requests.slice(before).find((request) => request.body.includes(RESUME_NOTE));
+      expect(resumed).toBeTruthy();
+      // The call that was running is answered as possibly run, so the model
+      // decides whether running it again is safe.
+      expect(resumed!.body).toContain("fx stopped while this tool was running");
+      expect(readFileSync(second.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
+// A save cut short. A crash in the middle of writing a log line leaves part
+// of the line and no newline, and the next launch cuts it, so fx reads the
+// save before it. A save's send starts only after its write returns, so a
+// cut save never hides a send that went out, and an answered turn's
+// `turn_end` item keeps it from going out again.
+
+/// A 503 that asks for a wait of `seconds`.
+function retryAfterUnavailable(seconds: number): Response {
+  return new Response(JSON.stringify({ error: { message: "provider temporarily unavailable" } }), {
+    status: 503,
+    headers: { "content-type": "application/json", "retry-after": String(seconds) },
+  });
+}
+
+type SavedRecord = { phase: number; clean: boolean; attempt: number; deaths: number };
+
+/// The records session `id` saved, oldest first, read from the layout
+/// `src/core/recovery/recovery.zig` documents: byte 1 the phase (1 sending,
+/// 2 waiting), byte 2 bit 0 a clean exit, bytes 4 and 5 the attempt, byte 7
+/// the abrupt deaths. A cleared record reads as null.
+function savedRecords(home: string, id: string): (SavedRecord | null)[] {
+  return savedItems(home, id)
+    .filter((item) => "recovery" in item)
+    .map((item) => {
+      const hex = item.recovery?.record;
+      if (typeof hex !== "string") return null;
+      const bytes = Buffer.from(hex, "hex");
+      return { phase: bytes[1]!, clean: (bytes[2]! & 1) !== 0, attempt: bytes.readUInt16LE(4), deaths: bytes[7]! };
+    });
+}
+
+/// Cuts session `id`'s log inside line `index`, as a crash while writing it
+/// would: the lines before it stay, half of it remains without its newline,
+/// and nothing after it was written. Returns that line, parsed.
+function tearLogAt(home: string, id: string, index: number): any {
+  const path = logOf(home, id);
+  const lines = readFileSync(path, "utf8").split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  const line = lines[index]!;
+  writeFileSync(path, `${lines.slice(0, index).map((kept) => `${kept}\n`).join("")}${line.slice(0, Math.floor(line.length / 2))}`);
+  return JSON.parse(line);
+}
+
+function logLineCount(home: string, id: string): number {
+  return readFileSync(logOf(home, id), "utf8").split("\n").filter(Boolean).length;
+}
+
+test.skipIf(!tmuxAvailable())(
+  "a crash that cuts a retry's save short resumes the request without counting a crash",
+  async () => {
+    const fixture = resumeFixture("fx-auto-resume-torn-send-");
+    let sends = 0;
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (body.includes(RESUME_NOTE)) return fakeGatewayFinalText("TORN_SEND_RESUMED_4417");
+      if (!body.includes("Retry me.")) return fakeGatewayFinalText("UNRELATED");
+      sends += 1;
+      // The first send fails; the retry stays on the wire.
+      return sends === 1 ? retryAfterUnavailable(1) : new Promise<Response>(() => {});
+    });
+    let active: TmuxSession | null = null;
+    try {
+      active = (await launchFx(fixture, gateway, "", "first")).session;
+      await active.sendText("Retry me.");
+      await waitForCondition(() => sends >= 2, "the retry");
+      const id = sessionIdFromHome(fixture.home);
+      await waitForCondition(() => savedRecords(fixture.home, id).at(-1)?.attempt === 2, "the retry's save");
+      await endFx(active, "SIGKILL");
+      active = null;
+
+      // The retry's save is the last line: the crash cuts it in half.
+      const records = savedRecords(fixture.home, id);
+      expect(records.at(-2)?.phase).toBe(2);
+      expect(records.at(-1)).toMatchObject({ phase: 1, attempt: 2 });
+      const torn = tearLogAt(fixture.home, id, logLineCount(fixture.home, id) - 1);
+      expect(torn).toMatchObject({ kind: "item", type: "recovery" });
+
+      active = (await launchFx(fixture, gateway, "-c", "second")).session;
+      await active.waitForText("TORN_SEND_RESUMED_4417", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      // fx read the wait's save, which no send followed, so the resumed
+      // send counts no crash.
+      const resumed = savedRecords(fixture.home, id).filter((record) => record !== null).at(-1);
+      expect(resumed).toMatchObject({ phase: 1, deaths: 0 });
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a crash that cuts a wait's save short counts the crash, so the crash-loop guard never counts late",
+  async () => {
+    const fixture = resumeFixture("fx-auto-resume-torn-wait-");
+    let sends = 0;
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (body.includes(RESUME_NOTE)) return fakeGatewayFinalText("TORN_WAIT_RESUMED_6203");
+      if (!body.includes("Wait for me.")) return fakeGatewayFinalText("UNRELATED");
+      sends += 1;
+      // A long wait, so fx is killed while it waits.
+      return retryAfterUnavailable(20);
+    });
+    let active: TmuxSession | null = null;
+    try {
+      active = (await launchFx(fixture, gateway, "", "first")).session;
+      await active.sendText("Wait for me.");
+      const id = await (async () => {
+        await waitForCondition(() => sends >= 1, "the first send");
+        return sessionIdFromHome(fixture.home);
+      })();
+      await waitForCondition(() => savedRecords(fixture.home, id).at(-1)?.phase === 2, "the wait's save");
+      await endFx(active, "SIGKILL");
+      active = null;
+
+      // The wait's save is the last line: the crash cuts it in half, so the
+      // save before it, the first send's, is what the next launch reads.
+      expect(savedRecords(fixture.home, id).at(-2)).toMatchObject({ phase: 1, attempt: 1, deaths: 0 });
+      const torn = tearLogAt(fixture.home, id, logLineCount(fixture.home, id) - 1);
+      expect(torn).toMatchObject({ kind: "item", type: "recovery" });
+
+      active = (await launchFx(fixture, gateway, "-c", "second")).session;
+      await active.waitForText("TORN_WAIT_RESUMED_6203", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      // fx can no longer tell the failed send from one in flight, so it
+      // counts the crash: one too many at worst, never one too few.
+      const resumed = savedRecords(fixture.home, id).filter((record) => record !== null).at(-1);
+      expect(resumed).toMatchObject({ phase: 1, deaths: 1 });
+      expect(sends).toBe(1);
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a crash that cuts an answered turn's commit short never sends the request again",
+  async () => {
+    const fixture = resumeFixture("fx-auto-resume-torn-commit-");
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (body.includes(RESUME_NOTE)) return fakeGatewayFinalText("RESENT_BY_MISTAKE");
+      return fakeGatewayFinalText("ANSWERED_ONCE_5521");
+    });
+    let active: TmuxSession | null = null;
+    try {
+      active = (await launchFx(fixture, gateway, "", "first")).session;
+      await active.sendText("Answer once.");
+      await active.waitForText("ANSWERED_ONCE_5521", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      const id = sessionIdFromHome(fixture.home);
+      await waitForCondition(() => logLines(fixture.home, id).some((line: any) => line.kind === "turn_committed"), "the commit");
+      await endFx(active, "SIGKILL");
+      active = null;
+
+      // The crash cuts the commit line in half; nothing after it was written.
+      const commit = logLines(fixture.home, id).findIndex((line: any) => line.kind === "turn_committed");
+      expect(savedItems(fixture.home, id).some((item) => "turn_end" in item)).toBe(true);
+      expect(tearLogAt(fixture.home, id, commit)).toMatchObject({ kind: "turn_committed" });
+
+      const before = gateway.requests.length;
+      active = (await launchFx(fixture, gateway, "-c", "second")).session;
+      await active.waitForText("ANSWERED_ONCE_5521", TIMEOUT);
+      await Bun.sleep(1_500);
+      const pane = await active.capturePane();
+      expect(pane).not.toContain("Resuming the interrupted request");
+      expect(gateway.requests.slice(before).some((request) => request.body.includes(RESUME_NOTE))).toBe(false);
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);

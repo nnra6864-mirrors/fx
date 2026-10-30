@@ -1632,7 +1632,14 @@ describe("acp: model-independent", () => {
         expect(result.promptResult.result.stopReason).toBe("end_turn");
         expect(gateway.requests).toHaveLength(4);
         const allUpdates = JSON.stringify(result.messages);
-        expect(allUpdates).not.toContain('"state":"paused"');
+        // The module's status shape, then a `recovered` that carries only the
+        // attempt that succeeded.
+        expect(allUpdates).toMatch(
+          /"modelResponseRecovery":\{"state":"waiting","attempt":1,"message":"Connection lost · next try in 1s · attempt 1 · 0s"\}/,
+        );
+        expect(allUpdates).toContain(
+          '"modelResponseRecovery":{"state":"recovered","attempt":4}',
+        );
         // The partial streamed once, then the full replacement (which carries
         // the partial as its prefix) streamed once.
         expect(occurrenceCount(allUpdates, partialText)).toBe(2);
@@ -3095,8 +3102,9 @@ describe("acp: model-independent", () => {
         client = await AcpClient.create({
           cwd: root.workspace,
           env: { ...fakeGatewayEnv(root, gateway) },
-          // A short description limit, so the search truncates the tool's.
-          args: ["--context-limit", "mcp_description_bytes=8", "acp"],
+          // A short description limit and no room for the tool's schema, so
+          // the search can only show the tool's description cut short.
+          args: ["--context-limit", "mcp_description_bytes=8", "--context-limit", "mcp_selected_schema_bytes=8", "acp"],
         });
         await client.request("initialize", { protocolVersion: 1, clientCapabilities: { session: { notices: {} } } }, 1);
         const created = await client.request(
@@ -3144,7 +3152,7 @@ describe("acp: model-independent", () => {
         client = await AcpClient.create({
           cwd: root.workspace,
           env: { ...fakeGatewayEnv(root, gateway) },
-          args: ["--context-limit", "mcp_description_bytes=8", "acp"],
+          args: ["--context-limit", "mcp_description_bytes=8", "--context-limit", "mcp_selected_schema_bytes=8", "acp"],
         });
         const init = await client.request("initialize", { protocolVersion: 1, clientCapabilities: { session: { notices: false } } }, 1) as any;
         expect(init.error).toBeUndefined();

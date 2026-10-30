@@ -2704,10 +2704,10 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const source = [
         "Recommended fix",
         "",
-        "1. Continue polling while ready.",
+        "9. Continue polling while ready.",
         `   ${paragraph}`,
         "",
-        `2. ${paragraph}`,
+        `10. ${paragraph}`,
         "",
         "- Bullet heading.",
         `  ${paragraph}`,
@@ -2719,10 +2719,10 @@ describe.skipIf(SKIP)("tui: resize", () => {
       ].join("\n");
       // Split both paragraph prefixes across deltas, including a spaces-only delta.
       const chunks = [
-        "Recommended fix\n\n1. Continue polling while ready.\n ",
+        "Recommended fix\n\n9. Continue polling while ready.\n ",
         "  ",
         paragraph.slice(0, 83),
-        `${paragraph.slice(83)}\n\n2. ${paragraph}\n\n- Bullet heading.\n `,
+        `${paragraph.slice(83)}\n\n10. ${paragraph}\n\n- Bullet heading.\n `,
         ` ${paragraph.slice(0, 83)}`,
         `${paragraph.slice(83)}\n\n- ${paragraph}\n\nWRAP_REPRO_END\n`,
       ];
@@ -2777,8 +2777,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
         const lines = scrollback.split("\n");
         const markers = [
           "Recommended fix",
-          "1. Continue polling while ready.",
-          "2. I recommend checking",
+          "9. Continue polling while ready.",
+          "10. I recommend checking",
           "• Bullet heading.",
           "• I recommend checking",
           "WRAP_REPRO_END",
@@ -2792,16 +2792,20 @@ describe.skipIf(SKIP)("tui: resize", () => {
           .toBe(normalize(source.replace(/^- /gm, "• ")));
         expect(countOccurrences(scrollback, "I recommend checking")).toBe(4);
 
-        for (const [start, end, indent, marker] of [
-          [rows[1]! + 1, rows[2]!, 5, ""],
-          [rows[2]!, rows[3]!, 5, "2. "],
-          [rows[3]! + 1, rows[4]!, 4, ""],
-          [rows[4]!, rows[5]!, 4, "• "],
+        // Ordered numbers are right-aligned, so the markers of items 9 and
+        // 10 end in the same column and their text starts two columns later.
+        expect(lines[rows[1]!]!.indexOf("9. Continue")).toBe(4);
+        expect(lines[rows[2]!]!.indexOf("10. I recommend")).toBe(3);
+        for (const [start, end, firstIndent, indent, marker] of [
+          [rows[1]! + 1, rows[2]!, 7, 7, ""],
+          [rows[2]!, rows[3]!, 3, 7, "10. "],
+          [rows[3]! + 1, rows[4]!, 4, 4, ""],
+          [rows[4]!, rows[5]!, 2, 4, "• "],
         ] as const) {
           const paragraphRows = lines.slice(start, end).filter((line) => line.trim() !== "");
           expect(paragraphRows.length).toBeGreaterThan(1);
           for (const [index, line] of paragraphRows.entries()) {
-            const expectedIndent = index === 0 && marker ? 2 : indent;
+            const expectedIndent = index === 0 ? firstIndent : indent;
             expect(line.length - line.trimStart().length).toBe(expectedIndent);
             expect(line.length).toBeLessThanOrEqual(cols);
           }

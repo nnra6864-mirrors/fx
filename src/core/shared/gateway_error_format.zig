@@ -74,6 +74,39 @@ pub fn formatHttpRecoveryDiagnostic(alloc: Allocator, status: std.http.Status, d
     return formatHttpDiagnostic(alloc, status, detail, null, max_recovery_diagnostic_bytes);
 }
 
+/// The codes an error body uses when the account is out of credits or quota:
+/// OpenAI's used-up quota and the AI Gateway's credits requirement.
+const out_of_credits_codes = [_][]const u8{ "insufficient_quota", "credit_card_required" };
+
+/// Whether an HTTP error body says the account is out of credits or quota,
+/// read from the `error.code` or `error.type` its message shows.
+pub fn namesOutOfCredits(alloc: Allocator, detail: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, detail, .{}) catch return false;
+    defer parsed.deinit();
+    const root = objectValue(parsed.value) orelse return false;
+    const error_object = objectValue(root.get("error") orelse return false) orelse return false;
+    const code = stringField(error_object, "code") orelse stringField(error_object, "type") orelse return false;
+    for (out_of_credits_codes) |known| {
+        if (std.mem.eql(u8, code, known)) return true;
+    }
+    return false;
+}
+
+test "namesOutOfCredits reads the credits and quota codes only" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(namesOutOfCredits(alloc,
+        \\{"error":{"code":"credit_card_required","message":"Buy credits to use AI Gateway."}}
+    ));
+    try std.testing.expect(namesOutOfCredits(alloc,
+        \\{"error":{"type":"insufficient_quota","message":"You exceeded your current quota."}}
+    ));
+    try std.testing.expect(!namesOutOfCredits(alloc,
+        \\{"error":{"code":"invalid_api_key","message":"Bad key."}}
+    ));
+    try std.testing.expect(!namesOutOfCredits(alloc, "credit_card_required"));
+    try std.testing.expect(!namesOutOfCredits(alloc, ""));
+}
+
 fn formatHttpDiagnostic(
     alloc: Allocator,
     status: std.http.Status,

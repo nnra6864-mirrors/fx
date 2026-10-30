@@ -72,6 +72,8 @@ Key rules:
 
 * `src/core/indexer/` is the native workspace indexer. It reads git's ignore rules, repository layout, and git config as data and never starts a process, so a repository's configuration cannot make it run a program. Outside code imports only its front door, `indexer.zig`, and the indexer imports only the standard library, its own files, `io.zig`, and `debug_trace.zig`. `@`-completion, `glob_files`, and `grep_files` list files only through it and never start a process. `scripts/check-indexer-boundary.sh` enforces this in CI.
 
+* `src/core/recovery/` decides how one model request recovers: when to retry, how long to wait, when to try another way, what the status line says, and what to save so the request survives a closed window or a crash. fx reports events to `step` and carries out the plan it returns. The module performs no I/O, reads no clock, and never allocates. Outside code imports only its front door, `recovery.zig`, and the module imports only the standard library. `tests/tla/recovery/Recovery.tla` models it, and `scripts/check-recovery-boundary.sh` enforces the boundary in CI.
+
 * `src/core/shell_command/safe_git.zig` runs git for the `fx pr` and `fx issue` snapshot and for the agent's direct read-only `git status`, `git diff`, and `git log` when the command does not use the user's own shell environment. It turns off every program a repository's own config can name and refuses to run when git would use a different repository than the one fx read. In `auto` mode a git command it refuses is returned to the agent without running. Commands that run in a shell use git with the repository's full config: git in the shell tool's default `user` environment, and the routine commands `auto` mode runs without review, such as `git status` with other flags, `git fetch`, or `npm test`.
 
 * `src/mcp/` is the MCP engine. Its files import only `std` and each other, and the host passes in `std.Io` and every other service through `src/mcp/host.zig`. fx connects to it through `src/core/mcp_host/`. `src/core/mcp/` holds the MCP types, config parsing, schema checks, search, and tool naming that the host, the tools, ACP, and the UI share.
@@ -187,6 +189,8 @@ Do not bypass the permission system for new tools.
 * Zig 0.17 removed the `**` operator. Fill arrays with `@splat` and build repeated comptime strings with `text_utils.repeat` from `src/core/shared/text_utils.zig`.
 
 * For JSON serialization, use `std.json.Stringify.value` with an allocating writer (`std.Io.Writer.Allocating`).
+
+* To parse JSON into a typed value, use `parseFromSlice` or `parseFromSliceLeaky` from `src/core/shared/json_decode.zig`. They match `std.json`'s, but share one parser across types instead of generating one per type. Parse into `std.json.Value` with `std.json` itself.
 
 * For JSON string escaping (writing raw JSON), use the project's `writeJsonStr` helper in `src/acp/jsonrpc.zig` rather than assuming `std.json.encodeJsonString` exists.
 
@@ -314,7 +318,7 @@ Do not run the complete deterministic test suite locally as the default developm
 
 After the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. Linux is the gate for every change because most fx behavior is identical on every platform:
 
-* `.github/workflows/ci.yml` runs on Linux x86_64. It checks formatting, the PGSO corpus, the public surface, and the compactor and indexer boundaries, runs the ReleaseSafe unit tests, runs the E2E files in four weighted shards plus the MCP conformance baseline, and qualifies the SDK packages. A failed E2E file is retried once. A file that passes only on retry gets a warning annotation; investigate it as a possible race. `Build & Test` fails when any SDK job fails.
+* `.github/workflows/ci.yml` runs on Linux x86_64. It checks formatting, the PGSO corpus, the public surface, and the compactor, indexer, and recovery boundaries, model-checks request recovery, runs the ReleaseSafe unit tests, runs the E2E files in four weighted shards plus the MCP conformance baseline, and qualifies the SDK packages. A failed E2E file is retried once. A file that passes only on retry gets a warning annotation; investigate it as a possible race. `Build & Test` fails when any SDK job fails.
 * `.github/workflows/binary-size.yml` builds each release target on its native runner, reports the size change, and smoke-tests every target's binary. See **Binary Size Observability**.
 * `.github/workflows/bench.yml` enforces the startup latency budget. See **Benchmarks**.
 
@@ -327,6 +331,8 @@ The durable-session model check in the `SDK (Bun + N-API/WASM)` job takes about 
 The `TLA+ MCP models and drivers` job takes about 20 minutes, so a pull request runs its model checks and drivers only when the same detector finds a change to `src/mcp/`, `src/core/mcp_host/`, `src/core/mcp/`, the models in `tests/tla/mcp/` and `tests/tla/mcp_host/`, their drivers in `tests/tla/drivers/mcp/`, `tests/tla/drivers/mcp_host/`, and `tests/tla/drivers/lib/`, the `tests/e2e/fixtures/mcp-*` servers, the helpers those drivers load (`tests/e2e/tmux-helpers.ts`, `tests/evals/eval-helpers.ts`, and `tests/e2e/render-lab/tape.ts`), `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`. Every push to `main` runs them, and the same `gh workflow run ci.yml --ref <branch>` runs them for any other change.
 
 The macOS arm64 PGSO workflow runs on a pull request only when the PGSO pipeline changes: `scripts/pgso/` other than `corpus.json`, the `setup-pgso` action, or `.github/workflows/pgso-macos-arm64.yml`. To qualify any other change, run `gh workflow run pgso-macos-arm64.yml --ref <branch>`. The stable release always runs it.
+
+The Linux arm64 PGSO workflow, `.github/workflows/pgso-linux-arm64.yml`, builds and qualifies a Linux candidate in one job on a GitHub-hosted arm64 runner, which takes several hours. It runs on the same pull request paths, with its own workflow file in place of the macOS one, and `gh workflow run pgso-linux-arm64.yml --ref <branch>` runs it for any other change. Releases don't use it yet.
 
 Live model evals and the live ACP suite need credentials and are not deterministic, so they run only on request. Run the live ACP suite with `gh workflow run ci.yml --ref <branch> -f acp_live=true`.
 

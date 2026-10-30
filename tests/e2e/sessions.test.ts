@@ -3334,7 +3334,7 @@ test.skipIf(!tmuxAvailable())("an app whose disk fills keeps running, and the se
     const whole = readFileSync(log);
     let app2 = await launch(id, Math.floor(whole.length / SH_LIMIT_BLOCK));
     await app2.sendText("The disk is already full.");
-    await app2.waitForText("FileTooBig", TIMEOUT);
+    await app2.waitForText("request failed: a file-size limit was reached", TIMEOUT);
     await app2.waitForComposer(TIMEOUT);
     await quit();
     expect(gateway.requests.length).toBe(asked);
@@ -3347,24 +3347,32 @@ test.skipIf(!tmuxAvailable())("an app whose disk fills keeps running, and the se
     await app2.sendText("The disk fills in this turn.");
     // It names the write that failed first, even when an earlier streamed
     // write took the log down (D40).
-    await app2.waitForText("Turn completed, but fx could not save it (FileTooBig)", TIMEOUT);
+    await app2.waitForText("Couldn't save this turn: a file-size limit was reached", TIMEOUT);
     await app2.waitForComposer(TIMEOUT);
     await quit();
     expect(gateway.requests.length).toBe(asked + 1);
 
+    // The filled turn kept its prompt and its request's record, not its
+    // answer, so the reopen sends the request again on its own, and this
+    // time the answer is saved (`tests/tla/recovery/Resume.tla` AutoResumes).
     const resumed = await startApp(fixture, gateway, ["--resume", id]);
     expect(await scrollbackContains(resumed.session, "BEFORE_APP_FULL_DISK")).toContain("BEFORE_APP_FULL_DISK");
+    await resumed.session.waitForText("LONG_UNSAVED_END", TIMEOUT);
+    await resumed.session.waitForComposer(TIMEOUT);
+    // The long answer scrolls the resume line out of view.
+    expect(await scrollbackContains(resumed.session, "Resuming the interrupted request")).toContain("Resuming the interrupted request");
+    expect(gateway.requests.length).toBe(asked + 2);
     await resumed.session.sendText("After the full disk.");
     await resumed.session.waitForText("AFTER_APP_FULL_DISK", TIMEOUT);
     await quitApp(resumed);
-    // The filled turn kept its prompt, not its answer, and a resume closed it
-    // as interrupted; the refused prompt left nothing.
+    // The reopen closed the filled turn as interrupted, the resumed turn
+    // saved the answer, and the refused prompt left nothing.
     const kinds = logLines(fixture.home, id).map((line) => line.kind);
-    expect(kinds.filter((kind) => kind === "turn_committed")).toHaveLength(2);
+    expect(kinds.filter((kind) => kind === "turn_committed")).toHaveLength(3);
     expect(kinds.filter((kind) => kind === "turn_interrupted")).toHaveLength(1);
     const last = gateway.requests.at(-1)!.body;
     expect(last).toContain("The disk fills in this turn.");
-    expect(last).not.toContain("LONG_UNSAVED_START");
+    expect(last).toContain("LONG_UNSAVED_START");
     expect(last).not.toContain("The disk is already full.");
     expectWholeLog(fixture, id);
   } finally {
@@ -3546,6 +3554,8 @@ function twoToolGateway(prefix: string, prompt: string, after: [string, string])
   const slow = new Promise<void>((resolve) => (served = resolve));
   const gateway = startDynamicFakeGateway(async (body) => {
     if (body.includes(after[0])) return fakeGatewayFinalText(after[1]);
+    // The app resumes the turn the kill interrupted on its own.
+    if (body.includes("<session_resumed>")) return fakeGatewayFinalText(`${prefix}_RESUMED`);
     if (body.includes(prompt) && body.includes(`${prefix}_FIRST_TOOL_OUTPUT`)) {
       served();
       const input = JSON.stringify({ request: { yield_time_ms: 30_000, action: "run", command: "sleep 30" } });
@@ -3593,6 +3603,12 @@ test.skipIf(!tmuxAvailable())("an app killed while a tool runs answers that call
     const resumed = await startApp(fixture, gateway, ["--resume", id], true, appEnv);
     // The resumed transcript shows the text fx showed before the kill.
     expect(await scrollbackContains(resumed.session, "APP_RUNNING_PLAN")).toContain("APP_RUNNING_PLAN");
+    // The app sends the interrupted turn again on its own, with the running
+    // call answered as possibly run (`tests/tla/recovery/Resume.tla`
+    // AutoResumes).
+    await resumed.session.waitForText("APP_RESUMED", TIMEOUT);
+    await resumed.session.waitForComposer(TIMEOUT);
+    expectToolKillRepaired(fixture, id, gateway.requests.find((request: any) => request.body.includes("<session_resumed>"))!.body, "APP");
     await resumed.session.sendText("After the app tool kill.");
     await resumed.session.waitForText("AFTER_APP_TOOL_KILL", TIMEOUT);
     await quitApp(resumed);
@@ -3753,7 +3769,7 @@ const REAL_FULL_DISK = process.platform === "darwin";
 /// What each host says when it refuses, by cause.
 const GRID_SAYS: Record<"damaged" | "denied" | "busy" | "full", Record<GridHost, RegExp>> = {
   damaged: { ask: /InvalidSessionFormat/, app: /saved session is unreadable/, acp: /^Session could not be loaded$/ },
-  denied: { ask: /AccessDenied/, app: /cannot be opened for writing: permission denied|AccessDenied/, acp: /permission denied/ },
+  denied: { ask: /AccessDenied/, app: /permission denied|AccessDenied/, acp: /permission denied/ },
   busy: { ask: /SessionBusy/, app: /another fx process may be using this session/, acp: /^Session is busy$/ },
   full: REAL_FULL_DISK
     ? { ask: /NoSpaceLeft/, app: /NoSpaceLeft|the disk is full/, acp: /the disk is full/ }
@@ -3965,7 +3981,7 @@ async function gridEnter(entry: GridEntry, c: GridCase, gateway: any, token: str
         const deadline = Date.now() + TIMEOUT;
         while (Date.now() < deadline) {
           screen = await session.captureFullScrollback();
-          if (screen.includes(answer) || /✗ .*|could not save/.test(screen.slice(screen.lastIndexOf(prompt)))) break;
+          if (screen.includes(answer) || /✗ .*|[Cc]ouldn't save/.test(screen.slice(screen.lastIndexOf(prompt)))) break;
           await Bun.sleep(100);
         }
         // The reply shows even when saving it fails, so read the turn's end.
@@ -3974,7 +3990,7 @@ async function gridEnter(entry: GridEntry, c: GridCase, gateway: any, token: str
         const turn = screen.slice(screen.lastIndexOf(prompt));
         await session.sendText("/quit");
         await exit("after /quit");
-        return { entered: turn.includes(answer) && !/✗ |could not save/.test(turn), said: `${turn}\n${readFileSync(stderrPath, "utf8")}` };
+        return { entered: turn.includes(answer) && !/✗ |[Cc]ouldn't save/.test(turn), said: `${turn}\n${readFileSync(stderrPath, "utf8")}` };
       } finally {
         await session.kill();
       }
@@ -4098,17 +4114,16 @@ async function gridRow(exit: GridExit, entry: GridEntry) {
           expect(first.entered, `${label}: ${first.said}`).toBe(true);
           expectGridHistory(exit, asked(token)!, label);
         } else if (fault === "full-disk" && first.entered) {
-          // The turn fit in space its files already held; nothing is lost.
+          // The turn fit in space its files already held, so nothing is
+          // lost. The session's close may not have fit; the next open cuts
+          // the line it tore (log.zig `Log.append`), so the session opens
+          // and goes on once the disk has room.
           expectGridHistory(exit, asked(token)!, label);
-          if (readFileSync(c.log).at(-1) !== 0x0a) {
-            // A later line, such as `closed`, did not fit and left a torn
-            // tail. The next open cuts it and keeps the committed turn.
-            await clear();
-            clear = async () => {};
-            const second = await gridEnter(entry, c, gateway, retry, limit);
-            expect(second.entered, `${label} after the fault cleared: ${second.said}`).toBe(true);
-            expect(asked(retry)!, `${label} after the fault cleared`).toContain(`GRID_ANSWER_${token}`);
-          }
+          await clear();
+          clear = async () => {};
+          const second = await gridEnter(entry, c, gateway, retry, limit);
+          expect(second.entered, `${label} after the fault cleared: ${second.said}`).toBe(true);
+          expectGridHistory(exit, asked(retry)!, `${label} after the fault cleared`);
         } else {
           expect(first.entered, `${label} entered`).toBe(false);
           const cause = fault === "flipped-byte" || fault === "lost-blob" ? "damaged" : fault === "read-only" ? "denied" : fault === "full-disk" ? "full" : "busy";
