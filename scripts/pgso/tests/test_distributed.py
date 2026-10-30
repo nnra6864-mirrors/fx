@@ -7,10 +7,13 @@ import tempfile
 import pathlib
 import dataclasses
 import re
+import types
 
 from scripts.pgso.corpus import Corpus, Scenario
+from scripts.pgso import linux, macos
 from scripts.pgso.distributed import (
     _load_documents,
+    _require_distributed_support,
     aggregate_measurement_shards,
     aggregate_scenario_shards,
     matrix_payload,
@@ -564,6 +567,13 @@ class ShardAggregationTests(unittest.TestCase):
                 expected_identity=self.identity,
                 expected_artifact_sha256="e" * 64,
             )
+
+
+class DistributedSupportTests(unittest.TestCase):
+    def test_platforms_with_a_startup_exemption_cannot_build_distributed(self) -> None:
+        _require_distributed_support(types.SimpleNamespace(platform=macos))
+        with self.assertRaisesRegex(PgsoError, "startup profiles that Linux arm64 candidates need"):
+            _require_distributed_support(types.SimpleNamespace(platform=linux))
 
 
 if __name__ == "__main__":

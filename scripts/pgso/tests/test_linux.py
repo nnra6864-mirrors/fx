@@ -189,6 +189,23 @@ class LinuxPlatformTests(unittest.TestCase):
         self.assertEqual({"profile_functions": 4, "unmapped_profile_functions": 1}, mapping)
         self.assertEqual({("4", 0), ("5", 0)}, seen)
 
+    def test_startup_functions_lead_the_link_order(self) -> None:
+        functions = {"help": ("4", 0, 16), "main": ("4", 16, 8), "loop": ("5", 0, 8)}
+        self.paths.startup_order.write_text("help\nmain\n", encoding="utf-8")
+        profile_order = self.root / "profile.order"
+        profile_order.write_text("# Ordered 2 functions\nloop\nmain\n", encoding="utf-8")
+
+        ordered, _, _ = linux.order_symbols(linux.link_order_text(self.paths, profile_order), functions)
+
+        self.assertEqual(["help", "main", "loop"], ordered)
+
+    def test_the_link_order_requires_the_startup_order(self) -> None:
+        profile_order = self.root / "profile.order"
+        profile_order.write_text("loop\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(PgsoError, "startup function order"):
+            linux.link_order_text(self.paths, profile_order)
+
     def test_outlined_helpers_follow_their_earliest_caller(self) -> None:
         ir = self.root / "profile-use.ll"
         ir.write_text(

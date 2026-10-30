@@ -10,6 +10,8 @@ A platform module provides, for its target:
   the LLVM profile runtime, and `os_versions(paths)`, the host OS evidence;
 - `CONTROL_BUILD_FLAGS` and `record_control_build(toolchain, result, paths)`,
   which add to the control build and keep what the later links reuse;
+- `STARTUP_SCENARIOS`, the corpus scenarios whose cold functions profile use
+  must not compile for size, or `()` for none;
 - `ZIG_CC_LINK_FLAGS`, the dead-code removal flags for `zig cc` links, and
   `external_control_strip_argv(toolchain, binary)`, the command that strips
   such a link afterward, or `()` when the link already strips it;

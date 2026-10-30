@@ -19,6 +19,7 @@ from scripts.pgso.pipeline import (
     build_control,
     build_instrumented,
     emit_bitcode,
+    exempt_cold_startup_functions,
     link_candidate,
     merge_profile_batch,
     verify_candidate,
@@ -387,6 +388,7 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
 
         stage = "corpus-training"
         recorder.stage(stage, "running")
+        startup_scenarios = toolchain.platform.STARTUP_SCENARIOS
         training_result = run_corpus(
             corpus,
             paths.instrumented_binary,
@@ -394,21 +396,29 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
             paths.merged_profile,
             toolchain=toolchain,
             bun=bun,
+            startup_scenarios=startup_scenarios,
+            startup_profile_dir=paths.startup_profiles,
         )
         merged_raw_profiles += training_result.merged_raw_profiles
         profile_summary = _profile_summary(toolchain, paths)
+        training_profile = {
+            "path": str(paths.merged_profile),
+            "sha256": sha256_file(paths.merged_profile),
+            "size_bytes": paths.merged_profile.stat().st_size,
+            "merged_raw_profiles": merged_raw_profiles,
+            "summary": profile_summary,
+        }
+        if startup_scenarios:
+            training_profile["startup_profiles"] = {
+                name: sha256_file(paths.startup_profiles / f"{name}.profdata")
+                for name in startup_scenarios
+            }
         recorder.stage(
             stage,
             "passed",
             {
                 "training_corpus": dataclasses.asdict(training_result),
-                "profile": {
-                    "path": str(paths.merged_profile),
-                    "sha256": sha256_file(paths.merged_profile),
-                    "size_bytes": paths.merged_profile.stat().st_size,
-                    "merged_raw_profiles": merged_raw_profiles,
-                    "summary": profile_summary,
-                },
+                "profile": training_profile,
             },
         )
 
@@ -425,7 +435,24 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
             paths,
             expected_sha256=bitcode_sha256,
         )
-        apply_profile(toolchain, paths, bitcode_sha256)
+        startup_exemption = None
+        if startup_scenarios:
+            benchmark_profiles = [linked.pair.merged_profile for linked in linked_benchmarks.values()]
+            if any(profile is None for profile in benchmark_profiles):
+                raise PgsoError("benchmark training profile is incomplete")
+            startup_exemption = exempt_cold_startup_functions(
+                toolchain,
+                paths,
+                bitcode_sha256,
+                startup_scenarios,
+                benchmark_profiles=benchmark_profiles,
+            )
+        apply_profile(
+            toolchain,
+            paths,
+            bitcode_sha256,
+            no_outline_functions=paths.startup_order if startup_scenarios else None,
+        )
         link_candidate(toolchain, paths)
         linked_benchmarks = relink_profile_linked_benchmarks(
             toolchain,
@@ -476,6 +503,8 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
             "summary": _profile_summary(toolchain, paths),
             "supplements": supplement_evidence,
         }
+        if startup_exemption is not None:
+            profile["startup_exemption"] = startup_exemption
         recorder.stage(
             stage,
             "passed",
