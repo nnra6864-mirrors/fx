@@ -422,7 +422,7 @@ fn applyAgentFlag(
 }
 
 fn writeBadAgentValue(alloc: Allocator, deps: RunDeps, command: []const u8, bad: BadAgentValue) !void {
-    const message = try alloc.print("fx {s}: invalid value for {s}: {s}\n", .{ command, bad.flag, bad.value });
+    const message = try alloc.print("fx {s}: invalid value for {s}: {f}\n", .{ command, bad.flag, text_utils.terminalSafe(bad.value) });
     defer alloc.free(message);
     try writeStderr(deps, message);
 }
@@ -647,13 +647,13 @@ fn writeLaunchWordProblem(
             const flag = if (std.mem.findScalar(u8, word, '=')) |at| word[0..at] else word;
             try writer.print("fx: {s} isn't an fx flag; to run one request and exit, use fx ask ", .{flag});
             if (printFlagPrompt(remaining)) |prompt| {
-                try writer.print("\"{s}\"\n", .{prompt});
+                try writer.print("\"{f}\"\n", .{text_utils.terminalSafe(prompt)});
             } else {
                 try writer.writeAll("\"<prompt>\"\n");
             }
         },
         error.UnknownCommandTypo => {
-            try writer.print("fx: unknown command {s}", .{word});
+            try writer.print("fx: unknown command {f}", .{text_utils.terminalSafe(word)});
             if (launchWordSuggestion(command_catalog, word)) |suggestion| {
                 try writer.print(" (did you mean {s}?)", .{suggestion});
             }
@@ -991,23 +991,19 @@ fn launchWordSuggestion(command_catalog: CommandCatalog, word: []const u8) ?[]co
     for (bare_flags) |entry| {
         if (std.mem.eql(u8, word, entry.word)) return entry.flag;
     }
-    const max_distance: usize = if (word.len <= 4) 1 else 2;
-    var best: ?[]const u8 = null;
-    var best_distance = max_distance + 1;
+    // Four letters or fewer get one edit, so a prompt word such as `add` isn't
+    // taken for a mistyped command.
+    var nearest: cli_flags.Nearest = .{ .word = word, .max_edits = if (word.len <= 4) 1 else 2 };
     for (command_catalog.specs) |spec| {
         // `fx resume` is removed; its typos shouldn't point back to it.
         if (spec.kind == .@"resume") continue;
         const names = [_][]const []const u8{ &.{spec.token}, spec.aliases };
         for (names) |group| for (group) |name| {
             if (name.len == 0 or name[0] == '-') continue;
-            const distance = cli_flags.editDistance(word, name) orelse continue;
-            if (distance < best_distance) {
-                best = name;
-                best_distance = distance;
-            }
+            nearest.offer(name);
         };
     }
-    return best;
+    return nearest.best;
 }
 
 /// Detects `fx <subcommand> --help` / `-h` and returns the subcommand kind so the
@@ -2129,7 +2125,7 @@ fn runNonInteractiveWithDeps(
             var rejected_channel: ?[]const u8 = null;
             const opts = parseUpgradeArgs(rest, &rejected_channel) catch |err| {
                 if (rejected_channel) |value| if (!argsContainJson(rest)) {
-                    const line = try alloc.print("fx upgrade: invalid value for --channel: {s}\n", .{value});
+                    const line = try alloc.print("fx upgrade: invalid value for --channel: {f}\n", .{text_utils.terminalSafe(value)});
                     defer alloc.free(line);
                     try writeStderr(deps, line);
                 };
@@ -3963,12 +3959,12 @@ fn runConfigWrite(alloc: Allocator, deps: RunDeps, opts: cli_config.Options) !Ru
     };
 
     var outcome = config_runtime.setUserPreferences(alloc, planned.patch) catch |err| {
+        const message = try alloc.print("failed to save {s}/settings.json: {s}", .{ profile_paths.displayRoot(), cli_config.saveFailureReason(err) });
+        defer alloc.free(message);
         if (opts.format == .json) {
-            try writeJsonCommandFailure(alloc, deps, "config", err, profile_paths.displayText("failed to save ~/.fx/settings.json"));
+            try writeJsonCommandFailure(alloc, deps, "config", err, message);
         } else {
-            const line = try alloc.print("fx config: failed to save {s}/settings.json ({s})\n", .{ profile_paths.displayRoot(), @errorName(err) });
-            defer alloc.free(line);
-            try writeStderr(deps, line);
+            try writeStderrLine(alloc, deps, "fx config: {s}\n", message);
         }
         return .handled_failure;
     };

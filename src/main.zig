@@ -3309,9 +3309,50 @@ fn useFxHomeFromEnv(raw_env: RawEnviron) !void {
         });
         exitFast(1);
     };
+    if (namesNonFolderRaw(value)) {
+        try writeStderrFast("fx: FX_HOME must name a folder, but it or a folder above it is a file\n");
+        exitFast(1);
+    }
     // fx creates its own folder on first use, but opens the folder that holds
     // it directly, so that one has to exist.
     if (profile_paths.fxHomeParent()) |parent| createFolderPathRaw(parent);
+}
+
+/// Whether `path` is a file, or a path through one, rather than a folder or
+/// nothing yet. Asking for `path/` makes the system resolve it as a folder.
+/// This runs before fx's I/O is set up, so it calls libc.
+fn namesNonFolderRaw(path: []const u8) bool {
+    var buffer: [std.Io.Dir.max_path_bytes + 2]u8 = undefined;
+    const trimmed = std.mem.trimEnd(u8, path, "/");
+    if (trimmed.len == 0 or trimmed.len + 2 > buffer.len) return false;
+    @memcpy(buffer[0..trimmed.len], trimmed);
+    buffer[trimmed.len] = '/';
+    buffer[trimmed.len + 1] = 0;
+    const rc = std.c.access(@ptrCast(&buffer), std.c.F_OK);
+    return rc != 0 and std.posix.errno(rc) == .NOTDIR;
+}
+
+test "FX_HOME is refused only when it is a file or a path through one" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = "file", .data = "" });
+    try tmp.dir.createDirPath(io_mod.getIo(), "folder");
+    const root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(root);
+
+    const cases = [_]struct { sub: []const u8, refused: bool }{
+        .{ .sub = "file", .refused = true },
+        .{ .sub = "file/", .refused = true },
+        .{ .sub = "file/fx", .refused = true },
+        .{ .sub = "folder", .refused = false },
+        .{ .sub = "folder/fx", .refused = false },
+        .{ .sub = "missing", .refused = false },
+    };
+    for (cases) |case| {
+        const path = try std.Io.Dir.path.join(std.testing.allocator, &.{ root, case.sub });
+        defer std.testing.allocator.free(path);
+        try std.testing.expectEqual(case.refused, namesNonFolderRaw(path));
+    }
 }
 
 /// Creates `path` and every folder above it that is missing. This runs before

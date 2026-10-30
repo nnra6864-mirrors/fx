@@ -83,8 +83,8 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
         if (std.mem.eql(u8, old, "resource") or std.mem.eql(u8, old, "prompt"))
             return moved(arena, "{s} {s} is gone: fx doesn't support MCP resources and prompts yet.", .{ p, old });
         if (settings_messages.closest(old, &verb_names)) |near|
-            return usage(arena, null, "'{s}' isn't a {s} command; did you mean {s}?", .{ old, p, near });
-        return usage(arena, null, "'{s}' isn't a {s} command.", .{ old, p });
+            return usage(arena, null, "'{f}' isn't a {s} command; did you mean {s}?", .{ text_utils.terminalSafe(old), p, near });
+        return usage(arena, null, "'{f}' isn't a {s} command.", .{ text_utils.terminalSafe(old), p });
     };
 
     // Flags come before `--`; everything after it is a stdio server's command.

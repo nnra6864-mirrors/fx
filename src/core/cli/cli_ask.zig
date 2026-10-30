@@ -3751,7 +3751,7 @@ fn writeAskUsageProblem(alloc: Allocator, deps: RunDeps, problem: AskUsageProble
             try failure.write(&out.writer);
             try flag_placement.writeLaunchFlagHint(&out.writer, "ask", failure);
         },
-        .invalid_value => |bad| try out.writer.print("fx ask: invalid value for {s}: {s}", .{ bad.flag, bad.value }),
+        .invalid_value => |bad| try out.writer.print("fx ask: invalid value for {s}: {f}", .{ bad.flag, text_utils.terminalSafe(bad.value) }),
         .config => |bad| {
             const message = try cli_config.formatOverrideProblem(alloc, bad);
             defer alloc.free(message);

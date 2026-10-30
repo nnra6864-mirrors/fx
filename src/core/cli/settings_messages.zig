@@ -5,21 +5,15 @@ const std = @import("std");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const cli_flags = @import("cli_flags.zig");
 const settings_keys = @import("../config/settings_keys.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
 /// The known key closest to `name` within two edits, if any.
 pub fn closest(name: []const u8, known: []const []const u8) ?[]const u8 {
-    var best: ?[]const u8 = null;
-    var best_distance: usize = 3;
-    for (known) |candidate| {
-        const distance = cli_flags.editDistance(name, candidate) orelse continue;
-        if (distance < best_distance) {
-            best = candidate;
-            best_distance = distance;
-        }
-    }
-    return best;
+    var nearest: cli_flags.Nearest = .{ .word = name };
+    for (known) |candidate| nearest.offer(candidate);
+    return nearest.best;
 }
 
 /// `unknown setting statusLine.contxt in ~/.fx/settings.json (did you mean
@@ -32,7 +26,7 @@ pub fn formatUnknownSetting(alloc: Allocator, key: settings_keys.UnknownKey, dis
     try writer.writeAll("unknown setting ");
     try writeDotted(writer, key.parent, key.name);
     try writer.print(" in {s}", .{display_path});
-    if (key.workspace) |workspace| try writer.print(" for workspace {s}", .{workspace});
+    try writeWorkspace(writer, key.workspace);
     try writeSuggestion(writer, key.parent, closest(key.name, key.known));
     return out.toOwnedSlice();
 }
@@ -46,11 +40,11 @@ pub fn formatOlderName(alloc: Allocator, twice: settings_keys.OlderName, display
     const writer = &out.writer;
     if (twice.both) {
         try writer.print("{s} and {s} are both set in {s}", .{ twice.older, twice.current, display_path });
-        if (twice.workspace) |workspace| try writer.print(" for workspace {s}", .{workspace});
+        try writeWorkspace(writer, twice.workspace);
         try writer.print("; fx uses {s} where they differ, so remove {s}", .{ twice.current, twice.older });
     } else {
         try writer.print("{s} in {s}", .{ twice.older, display_path });
-        if (twice.workspace) |workspace| try writer.print(" for workspace {s}", .{workspace});
+        try writeWorkspace(writer, twice.workspace);
         try writer.print(" " ++ command_specs.deprecated_until ++ "; rename it to {s}", .{twice.current});
     }
     return out.toOwnedSlice();
@@ -62,7 +56,7 @@ pub fn formatOldYolo(alloc: Allocator, workspace: ?[]const u8, display_path: []c
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     try out.writer.print("permission_mode yolo in {s}", .{display_path});
-    if (workspace) |name| try out.writer.print(" for workspace {s}", .{name});
+    try writeWorkspace(&out.writer, workspace);
     try out.writer.writeAll(" " ++ command_specs.deprecated_until ++ "; use full-access");
     return out.toOwnedSlice();
 }
@@ -78,9 +72,15 @@ pub fn formatUnknownPath(alloc: Allocator, part: settings_keys.UnknownPart) ![]u
     return out.toOwnedSlice();
 }
 
+/// Keys and workspace paths come from the command line or a settings file, so
+/// they are written terminal-safe.
 fn writeDotted(writer: *std.Io.Writer, parent: ?[]const u8, name: []const u8) !void {
-    if (parent) |value| try writer.print("{s}.", .{value});
-    try writer.writeAll(name);
+    if (parent) |value| try writer.print("{f}.", .{text_utils.terminalSafe(value)});
+    try writer.print("{f}", .{text_utils.terminalSafe(name)});
+}
+
+fn writeWorkspace(writer: *std.Io.Writer, workspace: ?[]const u8) !void {
+    if (workspace) |path| try writer.print(" for workspace {f}", .{text_utils.terminalSafe(path)});
 }
 
 fn writeSuggestion(writer: *std.Io.Writer, parent: ?[]const u8, suggestion: ?[]const u8) !void {

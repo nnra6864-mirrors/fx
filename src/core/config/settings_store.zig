@@ -1838,12 +1838,6 @@ fn putStringArray(
     return true;
 }
 
-/// The object a renamed settings group is saved under, such as `status_line`
-/// for the older `statusLine`. Values that only the older key sets move into
-/// the current one, and the older key is removed, so the file keeps one
-/// spelling. Sets `changed` when the older key was there. The current name
-/// was an unknown key before the rename, so a value under it that isn't an
-/// object is one fx never used, and saving replaces it.
 /// The object at `name`, created when missing. A value that isn't an object
 /// was ignored by startup, so saving replaces it and logs what it dropped.
 fn ensureGroup(arena: Allocator, root: *std.json.ObjectMap, name: []const u8, changed: *bool) !*std.json.ObjectMap {
@@ -1858,6 +1852,14 @@ fn ensureGroup(arena: Allocator, root: *std.json.ObjectMap, name: []const u8, ch
     return &root.getPtr(name).?.object;
 }
 
+/// The object a renamed settings group is saved under, such as `status_line`
+/// for the older `statusLine`. Values that only the older key sets move into
+/// the current one, and the older key is removed, so the file keeps one
+/// spelling. A value both keys set keeps the current one, which startup
+/// already used, and the older value is dropped with a log line. Sets
+/// `changed` when the older key was there. The current name was an unknown
+/// key before the rename, so a value under it that isn't an object is one fx
+/// never used, and saving replaces it.
 fn renamedGroup(
     arena: Allocator,
     root: *std.json.ObjectMap,
@@ -1871,7 +1873,15 @@ fn renamedGroup(
         const group = &root.getPtr(current).?.object;
         var iterator = value.object.iterator();
         while (iterator.next()) |entry| {
-            if (!group.contains(entry.key_ptr.*)) try group.put(arena, entry.key_ptr.*, entry.value_ptr.*);
+            if (group.contains(entry.key_ptr.*)) {
+                debug_trace.logf(
+                    "config",
+                    "dropping {s}.{s} while renaming {s} to {s}: {s}.{s} is also set and wins",
+                    .{ older, entry.key_ptr.*, older, current, current, entry.key_ptr.* },
+                );
+                continue;
+            }
+            try group.put(arena, entry.key_ptr.*, entry.value_ptr.*);
         }
         _ = root.orderedRemove(older);
         changed.* = true;

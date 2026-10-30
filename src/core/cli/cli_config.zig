@@ -14,6 +14,7 @@ const settings_entries = @import("../config/settings_entries.zig");
 const settings_keys = @import("../config/settings_keys.zig");
 const settings_messages = @import("settings_messages.zig");
 const settings_store = @import("../config/settings_store.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const theme = @import("../shared/theme.zig");
 const types = @import("../shared/types.zig");
 const update_target = @import("../upgrade/update_target.zig");
@@ -294,8 +295,8 @@ fn ownerHint(key: []const u8) []const u8 {
 pub fn formatWriteProblem(alloc: Allocator, key: []const u8, value: ?[]const u8, problem: WriteProblem, via: []const u8) ![]u8 {
     return switch (problem) {
         .none => alloc.dupe(u8, key),
-        .refused => |hint| alloc.print("can't change {s} with {s}; {s}", .{ key, via, hint }),
-        .invalid_value => |expected| alloc.print("invalid value for {s}: {s} (use {s})", .{ key, value orelse "", expected }),
+        .refused => |hint| alloc.print("can't change {f} with {s}; {s}", .{ text_utils.terminalSafe(key), via, hint }),
+        .invalid_value => |expected| alloc.print("invalid value for {f}: {f} (use {s})", .{ text_utils.terminalSafe(key), text_utils.terminalSafe(value orelse ""), expected }),
     };
 }
 
@@ -629,13 +630,45 @@ fn unknownSetting(key: settings_keys.UnknownKey, file: []const u8) output_contra
     return .{ .key = key, .file = file, .suggestion = settings_messages.closest(key.name, key.known) };
 }
 
-/// Why a settings file couldn't be loaded, in words.
+/// Why a settings file couldn't be loaded, in words, as in
+/// `~/.fx/settings.json can't be read: permission denied`.
 pub fn loadFailureReason(err: anyerror) []const u8 {
     return switch (err) {
         error.StreamTooLong => "is larger than 64 KiB",
         error.SyntaxError, error.UnexpectedEndOfInput, error.InvalidNumber => "isn't valid JSON",
+        error.DurablePathUnsafe => "can't be read: " ++ unsafe_settings_path,
+        error.AccessDenied, error.PermissionDenied => "can't be read: permission denied",
+        error.NotDir => "can't be read: a folder in its path is a file",
         else => "can't be read",
     };
+}
+
+/// Why saving the profile's settings file failed, in words, with what to do
+/// where there is something, as in `failed to save ~/.fx/settings.json:
+/// another fx is saving settings; try again`.
+pub fn saveFailureReason(err: anyerror) []const u8 {
+    return switch (err) {
+        error.DurablePathUnsafe => unsafe_settings_path,
+        error.SettingsPrimaryTooLarge, error.FileTooBig => "it is larger than 64 KiB; remove settings you no longer use",
+        error.SettingsLockBusy => "another fx is saving settings; try again",
+        error.AccessDenied, error.PermissionDenied => "permission denied",
+        error.ReadOnlyFileSystem => "the disk is read-only",
+        error.NoSpaceLeft => "the disk is full",
+        error.NotDir => "a folder in its path is a file",
+        error.PrivateStatePermissionsUnsupported => "the file system can't keep the file private",
+        error.InvalidSettingsFormat => "it isn't valid JSON; fix it or move it aside",
+        else => @errorName(err),
+    };
+}
+
+const unsafe_settings_path = "fx keeps settings only in a regular file in a folder it owns, not through a symlink or a hard link";
+
+test "settings failures name the cause in words" {
+    try std.testing.expectEqualStrings("can't be read: permission denied", loadFailureReason(error.AccessDenied));
+    try std.testing.expectEqualStrings("can't be read", loadFailureReason(error.Unexpected));
+    try std.testing.expectEqualStrings("another fx is saving settings; try again", saveFailureReason(error.SettingsLockBusy));
+    try std.testing.expect(std.mem.find(u8, saveFailureReason(error.DurablePathUnsafe), "symlink") != null);
+    try std.testing.expectEqualStrings("Unexpected", saveFailureReason(error.Unexpected));
 }
 
 fn parseForTest(args: []const [:0]const u8) error{ InvalidConfigArgs, UnknownConfigSetting, WorkspaceConfigWrite }!Options {

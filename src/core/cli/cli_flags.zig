@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const command_specs = @import("../slash_commands/command_specs.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const OptionDoc = command_specs.OptionDoc;
 
@@ -85,7 +86,7 @@ pub const Failure = union(enum) {
     pub fn write(self: Failure, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
             .unknown => |unknown| {
-                try writer.print("unknown flag {s}", .{unknown.flag});
+                try writer.print("unknown flag {f}", .{text_utils.terminalSafe(unknown.flag)});
                 if (unknown.suggestion) |suggestion| try writer.print(" (did you mean {s}?)", .{suggestion});
             },
             .missing_value => |flag| try writer.print("{s} needs a value", .{flag}),
@@ -179,20 +180,15 @@ pub const Parser = struct {
 
     /// The documented flag closest to `name` within two edits, if any.
     fn closest(self: *const Parser, name: []const u8) ?[]const u8 {
-        var best: ?[]const u8 = null;
-        var best_distance: usize = 3;
+        var nearest: Nearest = .{ .word = name };
         for (self.docs) |doc| {
             // Never suggest a removed or a deprecated spelling.
             if (doc.replacement != null or doc.hidden) continue;
             const candidate = flagName(doc);
             if (std.mem.eql(u8, candidate, "--") or candidate[0] != '-') continue;
-            const distance = editDistance(name, candidate) orelse continue;
-            if (distance < best_distance) {
-                best = candidate;
-                best_distance = distance;
-            }
+            nearest.offer(candidate);
         }
-        return best;
+        return nearest.best;
     }
 
     fn fail(self: *Parser, failure: Failure) error{InvalidFlag} {
@@ -240,7 +236,7 @@ pub fn writeRangeFailure(w: *std.Io.Writer, start: Parser) std.Io.Writer.Error!b
             const value = match.value orelse continue;
             const number = std.fmt.parseUnsigned(u64, value, 10) catch null;
             if (number) |n| if (n >= range.min and n <= range.max) continue;
-            try w.print("{s} takes a whole number from {d} to {d}, not {s}", .{ flagName(doc), range.min, range.max, value });
+            try w.print("{s} takes a whole number from {d} to {d}, not {f}", .{ flagName(doc), range.min, range.max, text_utils.terminalSafe(value) });
             return true;
         },
     };
@@ -248,7 +244,7 @@ pub fn writeRangeFailure(w: *std.Io.Writer, start: Parser) std.Io.Writer.Error!b
 }
 
 /// Levenshtein distance for names up to 64 bytes; null for longer names.
-pub fn editDistance(a: []const u8, b: []const u8) ?usize {
+fn editDistance(a: []const u8, b: []const u8) ?usize {
     const max = 64;
     if (a.len > max or b.len > max) return null;
     var previous: [max + 1]usize = undefined;
@@ -263,6 +259,40 @@ pub fn editDistance(a: []const u8, b: []const u8) ?usize {
         @memcpy(previous[0 .. b.len + 1], current[0 .. b.len + 1]);
     }
     return previous[b.len];
+}
+
+/// The candidate closest to a mistyped `word` among those offered so far, at
+/// most `max_edits` edits away. Every "did you mean" suggestion fx prints uses
+/// this rule; on a tie the first candidate offered wins.
+pub const Nearest = struct {
+    word: []const u8,
+    max_edits: usize = 2,
+    best: ?[]const u8 = null,
+    best_distance: usize = 0,
+
+    pub fn offer(self: *Nearest, candidate: []const u8) void {
+        const distance = editDistance(self.word, candidate) orelse return;
+        if (distance > self.max_edits) return;
+        if (self.best != null and distance >= self.best_distance) return;
+        self.best = candidate;
+        self.best_distance = distance;
+    }
+};
+
+test "Nearest keeps the first closest candidate within its edit limit" {
+    var nearest: Nearest = .{ .word = "modle" };
+    for ([_][]const u8{ "mode", "model", "modules", "theme" }) |candidate| nearest.offer(candidate);
+    try std.testing.expectEqualStrings("mode", nearest.best.?);
+
+    var far: Nearest = .{ .word = "colour" };
+    far.offer("theme");
+    try std.testing.expect(far.best == null);
+
+    var strict: Nearest = .{ .word = "fixx", .max_edits = 1 };
+    strict.offer("mix");
+    try std.testing.expect(strict.best == null);
+    strict.offer("fix");
+    try std.testing.expectEqualStrings("fix", strict.best.?);
 }
 
 const test_docs = [_]OptionDoc{

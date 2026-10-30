@@ -3316,8 +3316,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
             FX_PERMISSION_MODE: "auto",
             FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
             FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-            FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-            FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+            FX_TEST_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
             FX_MODEL: MODEL,
           },
         });
