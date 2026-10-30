@@ -4001,4 +4001,191 @@ describe("fx mcp call", () => {
     expect(seen).toContain("did not run");
     expect(toolCalls(root)).toHaveLength(0);
   }, 60_000);
+
+  // Runs one shell command through the built binary and returns what the
+  // model saw of it.
+  const runBridgeCommand = async (root: FixtureRoot, shellCommand: string) => {
+    let seen = "";
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command: shellCommand }),
+      (body: string) => {
+        seen = toolResultText(body, "run_call");
+        return fakeGatewayFinalText("BRIDGE_OUTCOME_DONE");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const result = await runFx(["ask", "--json", "--full-access", "--no-save", "Run the command."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway),
+      timeoutMs: 80_000,
+    });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("BRIDGE_OUTCOME_DONE");
+    return seen;
+  };
+  const callTo = (outFile: string, text = "hello") =>
+    `"${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"${text}"}' > ${outFile} 2> err.txt; echo "exit=$?"; cat err.txt; echo "out=$(wc -c < ${outFile} | tr -d ' ')"`;
+
+  test("a tool that returns an error exits 6 with the tool's message and no data", async () => {
+    const root = bridgeRoot("bridge-tool-error", {}, { mode: "tool_failure" });
+    const seen = await runBridgeCommand(root, callTo("out.txt"));
+    expect(seen).toContain("exit=6");
+    expect(seen).toContain("returned an error");
+    expect(seen).toContain("Invalid input: labels require at least one item");
+    expect(seen).toContain("out=0");
+    expect(toolCalls(root)).toHaveLength(1);
+  }, 90_000);
+
+  test("a call whose server crashes exits 1, and the command learns why", async () => {
+    const root = bridgeRoot("bridge-crash", {}, { mode: "crash_always", restartLimit: 0 });
+    const seen = await runBridgeCommand(root, callTo("out.txt"));
+    expect(seen).toContain("exit=1");
+    expect(seen).toContain("fx mcp call: ");
+    expect(seen).toContain("out=0");
+  }, 90_000);
+
+  test("arguments that are not one JSON object exit 2, and nothing is sent", async () => {
+    const root = bridgeRoot("bridge-usage");
+    const seen = await runBridgeCommand(
+      root,
+      `"${FX_BIN}" mcp call ${TOOL_NAME} '[1]'; echo "array=$?"; "${FX_BIN}" mcp call ${TOOL_NAME} 'not json'; echo "text=$?"; "${FX_BIN}" mcp call; echo "none=$?"`,
+    );
+    expect(seen).toContain("array=2");
+    expect(seen).toContain("text=2");
+    expect(seen).toContain("none=2");
+    expect(seen).toContain("must be one JSON object");
+    expect(toolCalls(root)).toHaveLength(0);
+  }, 90_000);
+
+  test("a ninth call while eight are running exits 4, and it never reaches the server", async () => {
+    const root = bridgeRoot("bridge-busy", {}, { mode: "stall_operation", operationTimeoutMs: 15_000 });
+    const holders = Array.from({ length: 8 }, (_, index) =>
+      `"${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"hold${index}"}' > /dev/null 2>&1 &`).join(" ");
+    const seen = await runBridgeCommand(
+      root,
+      `${holders} sleep 3; ${callTo("out.txt", "ninth")}; kill $(jobs -p) 2>/dev/null; wait 2>/dev/null; true`,
+    );
+    expect(seen).toContain("exit=4");
+    expect(seen).toContain("out=0");
+    const texts = toolCalls(root).map((entry) => (entry.message.params?.arguments as { text?: string } | undefined)?.text);
+    expect(texts).not.toContain("ninth");
+    expect(texts.length).toBeLessThanOrEqual(8);
+  }, 120_000);
+
+  // A socket that answers like an fx bridge, so the client's own refusals
+  // can be driven without a session.
+  const withFakeBridge = async (reply: string | null, run: (env: Record<string, string>) => Promise<void>) => {
+    const dir = mkdtempSync(join(tmpdir(), "fxmc-"));
+    const socketPath = join(dir, "s");
+    const server = Bun.listen({
+      unix: socketPath,
+      socket: {
+        data(socket) {
+          if (reply !== null) socket.write(reply);
+          socket.end();
+        },
+      },
+    });
+    try {
+      await run({ FX_MCP_CALL_SOCKET: socketPath, FX_MCP_CALL_TOKEN: "ab".repeat(32) });
+    } finally {
+      server.stop(true);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  const runClient = async (env: Record<string, string | undefined>) => {
+    const child = Bun.spawn([FX_BIN, "mcp", "call", TOOL_NAME, '{"text":"hello"}'], {
+      env: { ...process.env, FX_MCP_CALL_SOCKET: undefined, FX_MCP_CALL_TOKEN: undefined, FX_SOUND: "0", ...env },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    return { stdout, stderr, code };
+  };
+
+  test("outside a shell call, or against another fx version, a call exits 3", async () => {
+    const outside = await runClient({});
+    expect(outside.code).toBe(3);
+    expect(outside.stderr).toContain("no running fx shell call to reach");
+    expect(outside.stdout).toBe("");
+
+    await withFakeBridge('{"v":999,"status":"ok","bytes":0}\n', async (env) => {
+      const other = await runClient(env);
+      expect(other.code).toBe(3);
+      expect(other.stderr).toContain("another fx version");
+      expect(other.stdout).toBe("");
+    });
+  }, 30_000);
+
+  test("a bridge that closes without replying exits 1 and writes no data", async () => {
+    await withFakeBridge(null, async (env) => {
+      const lost = await runClient(env);
+      expect(lost.code).toBe(1);
+      expect(lost.stderr).toContain("the connection to fx was lost");
+      expect(lost.stdout).toBe("");
+    });
+  }, 30_000);
+
+  // A subagent's command reaches the bridge through its own shell call, with
+  // the subagent's access, under the same permission rules as its parent.
+  const runSubagentCommand = async (root: FixtureRoot, mode: "--full-access" | "--auto") => {
+    let seen = "";
+    let childRanCommand = false;
+    const activeGateway = startDynamicFakeGateway(async (body) => {
+      if (body.includes('"toolCallId":"create_bridge_child"')) return fakeGatewayFinalText("BRIDGE_PARENT_DONE");
+      if (body.includes('"toolCallId":"child_call"')) {
+        seen = toolResultText(body, "child_call");
+        // The command ran in the subagent's turn, not the parent's.
+        childRanCommand = body.includes("BRIDGE_CHILD_TASK") && !body.includes("BRIDGE_PARENT_TASK");
+        return fakeGatewayFinalText("BRIDGE_CHILD_DONE");
+      }
+      if (body.includes("BRIDGE_CHILD_TASK")) {
+        return fakeGatewayToolCall("child_call", "shell", { action: "run", command });
+      }
+      if (body.includes("BRIDGE_PARENT_TASK")) {
+        return fakeGatewayToolCall("create_bridge_child", "subagent", {
+          request: { action: "run", task: "BRIDGE_CHILD_TASK" },
+        });
+      }
+      return fakeGatewayFinalText("unexpected bridge subagent request");
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    gateway = activeGateway;
+    const result = await runFx(["ask", "--json", mode, "BRIDGE_PARENT_TASK"], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, activeGateway),
+      timeoutMs: 60_000,
+    });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("BRIDGE_PARENT_DONE");
+    expect(childRanCommand).toBe(true);
+    return seen;
+  };
+
+  test("a subagent's command saves a big result to a file through its own shell call", async () => {
+    const root = bridgeRoot("bridge-subagent");
+    const seen = await runSubagentCommand(root, "--full-access");
+    expect(seen).toContain("exit=0");
+    expect(seen).toContain("BRIDGE_TAIL:hello");
+    expect(seen).toContain("fx mcp call: wrote");
+    expect(seen.length).toBeLessThan(4096);
+    const saved = readFileSync(join(root.workspace, "out.txt"), "utf8");
+    expect(saved.length).toBeGreaterThan(1536 * 1024);
+    expect(toolCalls(root)).toHaveLength(1);
+  }, 90_000);
+
+  test("a subagent's call meets the same deny rule as its parent's", async () => {
+    const root = bridgeRoot("bridge-subagent-denied", { permission: { bash: { "*": "allow" }, [TOOL_NAME]: "deny" } });
+    const seen = await runSubagentCommand(root, "--auto");
+    expect(seen).toContain("exit=5");
+    expect(seen).toContain("did not run");
+    expect(toolCalls(root)).toHaveLength(0);
+  }, 90_000);
 });
