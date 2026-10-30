@@ -53,7 +53,7 @@ const test_epoch_ms: u64 = 1_000_000;
 pub fn failureKind(cause: types.ModelRecoveryCause) ?Failure.Kind {
     return switch (cause) {
         // A path that is down sent nothing.
-        .connectivity_lost, .system_resumed => .offline,
+        .connectivity_lost => .offline,
         // A connection that broke after connecting may have sent the request.
         .network_interrupted, .response_interrupted, .provider_stream_timeout => .dropped,
         .provider_unavailable => .server,

@@ -902,9 +902,8 @@ test "only a reused connection the peer closed before the first response byte is
         .{ .stage = .head, .reused = true, .transport_error = error.ReadFailed, .reported_error = error.ReadFailed, .socket_error = error.NetworkDown },
         .{ .stage = .head, .reused = true, .transport_error = error.ReadFailed, .reported_error = error.ReadFailed },
         .{ .stage = .send, .reused = true, .transport_error = error.WriteFailed, .reported_error = error.WriteFailed },
-        // Cancellation and wake evidence outrank the socket error.
+        // Cancellation evidence outranks the socket error.
         .{ .stage = .send, .reused = true, .transport_error = error.WriteFailed, .reported_error = error.Cancelled, .socket_error = error.ConnectionResetByPeer },
-        .{ .stage = .head, .reused = true, .transport_error = error.ReadFailed, .reported_error = error.SystemResumed, .socket_error = error.ConnectionResetByPeer },
         // Once the server has started answering, resending could run the request twice.
         .{ .stage = .head, .reused = true, .transport_error = error.ReadFailed, .reported_error = error.ReadFailed, .socket_error = error.ConnectionResetByPeer, .received_bytes = 17 },
         .{ .stage = .head, .reused = true, .transport_error = error.HttpRequestTruncated, .reported_error = error.HttpRequestTruncated },
