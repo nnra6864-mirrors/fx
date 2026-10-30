@@ -8,6 +8,7 @@ const session_child_store = @import("../session/session_child_store.zig");
 const session_store = @import("../session/session_store.zig");
 const types = @import("../shared/types.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const json_decode = @import("../shared/json_decode.zig");
 
 const Allocator = std.mem.Allocator;
 const schema_version: u64 = 2;
@@ -639,9 +640,9 @@ fn childFromFolded(alloc: Allocator, entry: session_adapter.Child) !Child {
     defer scratch.deinit();
     const sa = scratch.allocator();
     const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
-    const spawn = std.json.parseFromSliceLeaky(SpawnData, sa, entry.spawn_data orelse return error.InvalidState, options) catch return error.InvalidState;
+    const spawn = json_decode.parseFromSliceLeaky(SpawnData, sa, entry.spawn_data orelse return error.InvalidState, options) catch return error.InvalidState;
     const finish = if (entry.finish_data) |raw|
-        std.json.parseFromSliceLeaky(FinishData, sa, raw, options) catch return error.InvalidState
+        json_decode.parseFromSliceLeaky(FinishData, sa, raw, options) catch return error.InvalidState
     else
         FinishData{};
     const last_outcome = fxOutcome(outcome);

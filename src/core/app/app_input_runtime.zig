@@ -2002,7 +2002,10 @@ pub fn Runtime(comptime App: type) type {
             // the menu, and close() resets origin to .command.
             const origin = app.skills.menu.origin;
             syncSkillsMenu(app);
-            const skill = app.skills.selectedMenuSkill() orelse {
+            // A mention menu that is not shown offers nothing to take, so
+            // Enter sends the prompt as typed.
+            const shown = !origin.isMention() or app.skills.menuVisible();
+            const skill = (if (shown) app.skills.selectedMenuSkill() else null) orelse {
                 if (origin.isMention()) {
                     app.skills.closeMenu();
                     app.shell.render_requests.request(.footer);
@@ -5511,6 +5514,28 @@ test "app_input_runtime space after matched dollar token inserts and closes menu
     try feedRoutingBytes(&app, "\r");
     try std.testing.expectEqual(@as(usize, 1), app.submitted_prompt_count);
     try std.testing.expectEqualStrings("$man x", app.submitted_prompt[0..app.submitted_prompt_len]);
+}
+
+test "app_input_runtime dollar mention ended by punctuation submits raw on enter" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    const skills = [_]skill_runtime.Skill{.{
+        .name = "status-second",
+        .description = "",
+        .path = "/tmp/status-second/SKILL.md",
+        .source = .global_fx,
+    }};
+    app.skills.items = @constCast(&skills);
+
+    try feedRoutingBytes(&app, "Use $status-second.");
+    try std.testing.expect(!app.skills.menuVisible());
+    try feedRoutingBytes(&app, "\r");
+
+    try std.testing.expect(!app.skills.menu.active);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.entities.skill_tokens.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.submitted_prompt_count);
+    try std.testing.expectEqualStrings("Use $status-second.", app.submitted_prompt[0..app.submitted_prompt_len]);
 }
 
 test "app_input_runtime matched dollar token still binds on enter" {
@@ -9349,7 +9374,9 @@ test "app_input_runtime backslash enter is consumed by an active command skills 
     }};
     app.skills.items = @constCast(&skills);
     app.skills.openMenu();
-    try app.input_runtime.textReplacementState().replace(alloc, "\\");
+    // No skill matches the query, so the menu has nothing to pick and keeps
+    // Enter. A query of only `\` would match every skill.
+    try app.input_runtime.textReplacementState().replace(alloc, "zq\\");
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 

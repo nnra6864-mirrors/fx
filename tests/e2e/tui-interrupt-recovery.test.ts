@@ -26,6 +26,8 @@ import {
 } from "./tmux-helpers";
 
 const SKIP = !tmuxAvailable();
+// The persistence fault comes from a library the loader preloads into fx.
+const PRELOADS_LIBRARIES = loadsPreloadedLibraries(FX_BIN);
 const TIMEOUT = 30_000;
 const TRACE_SCOPES = "agent,worker,gateway,history,interrupt,prompt";
 const PARTIAL_CHUNKS = [
@@ -50,6 +52,22 @@ let session: TmuxSession | null = null;
 let gateway: GatewayHandle | null = null;
 let root: string | null = null;
 
+// A static Linux binary has no ELF interpreter, so nothing acts on
+// LD_PRELOAD. macOS binaries always load through dyld.
+function loadsPreloadedLibraries(binary: string): boolean {
+  if (process.platform !== "linux" || !existsSync(binary)) return true;
+  const elf = readFileSync(binary);
+  const PT_INTERP = 3;
+  if (elf.readUInt32BE(0) !== 0x7f454c46 || elf[4] !== 2 || elf[5] !== 1) return true;
+  const offset = Number(elf.readBigUInt64LE(0x20));
+  const size = elf.readUInt16LE(0x36);
+  const count = elf.readUInt16LE(0x38);
+  for (let i = 0; i < count; i++) {
+    if (elf.readUInt32LE(offset + i * size) === PT_INTERP) return true;
+  }
+  return false;
+}
+
 afterEach(async () => {
   if (session) {
     await session.kill();
@@ -64,7 +82,7 @@ afterEach(async () => {
 });
 
 describe.skipIf(SKIP)("tui: interrupt recovery", () => {
-  for (const inject of [false, true]) test(`quit reports final history persistence failure with fault=${inject}`, async () => {
+  for (const inject of [false, true]) test.skipIf(inject && !PRELOADS_LIBRARIES)(`quit reports final history persistence failure with fault=${inject}`, async () => {
     root = realpathSync(mkdtempSync(join(tmpdir(), "fx-shutdown-save-")));
     const home = join(root, "home"), workspace = join(root, "workspace");
     mkdirSync(home); mkdirSync(workspace);

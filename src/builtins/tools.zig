@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const builtin_gateway = @import("gateway.zig");
 const terminal_contracts = @import("../core/terminal/contracts.zig");
 const managed_execution_contract = @import("../core/execution/managed_execution_contract.zig");
@@ -737,7 +738,73 @@ pub const all = [_]tool_dispatch.Tool{
     read_tool_result,
 };
 
-pub const registry = tool_dispatch.Registry{ .tools = all[0..] };
+/// fx's own tools. libfx's Node-API addon never runs them, because its agents
+/// run only the host's tools, so it builds without their code: there, each
+/// tool keeps only its name, which is enough for an MCP tool's alias to still
+/// never take one.
+pub const registry = tool_dispatch.Registry{ .tools = if (build_options.builtin_tools) all[0..] else names_only[0..] };
+
+const names_only = blk: {
+    var tools: [all.len]tool_dispatch.Tool = undefined;
+    for (&tools, all) |*tool, real| tool.* = .{
+        .name = real.name,
+        .description = "",
+        .model_schema = .{ .name = real.name, .description = "" },
+        .model_visible = false,
+        .decode = unavailableDecode,
+        .call = unavailableCall,
+        .reads_only_fn = unavailableReadsOnly,
+        .irreversible_fn = unavailableIrreversible,
+    };
+    break :blk tools;
+};
+
+// A call that reaches a tool kept only by name gets the answer fx gives for
+// any tool it doesn't have, which the model can read and recover from.
+fn unavailableDecode(ctx: tool_dispatch.DispatchContext, _: []const u8) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
+    return .{ .failure = try unsupported(ctx) };
+}
+
+fn unavailableCall(ctx: tool_dispatch.DispatchContext, _: tool_dispatch.ToolInput) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    return .{ .failure = try unsupported(ctx) };
+}
+
+fn unsupported(ctx: tool_dispatch.DispatchContext) error{OutOfMemory}![]u8 {
+    return ctx.allocator.print("Unsupported tool: {s}", .{ctx.tool_call_name});
+}
+
+fn unavailableReadsOnly(_: tool_dispatch.ToolInput) bool {
+    return false;
+}
+
+fn unavailableIrreversible(_: tool_dispatch.ToolInput) bool {
+    return true;
+}
+
+test "without the tools' code, the registry keeps every tool's name and answers Unsupported tool" {
+    try std.testing.expectEqual(all.len, names_only.len);
+    for (names_only, all) |tool, real| {
+        try std.testing.expectEqualStrings(real.name, tool.name);
+        try std.testing.expect(!tool.model_visible);
+    }
+    const names = tool_dispatch.Registry{ .tools = names_only[0..] };
+    for (advertisement_order) |name| try std.testing.expect(names.lookup(name) != null);
+    try std.testing.expect(names.lookup("not_a_builtin_tool") == null);
+
+    const entry = names.lookup("shell").?;
+    const ctx = tool_dispatch.DispatchContext{ .allocator = std.testing.allocator, .tool_call_name = "shell" };
+    const decoded = try entry.decode(ctx, "{\"action\":\"run\",\"command\":\"true\"}");
+    defer std.testing.allocator.free(decoded.failure);
+    try std.testing.expectEqualStrings("Unsupported tool: shell", decoded.failure);
+
+    const NoInput = struct {
+        fn deinit(_: *anyopaque, _: std.mem.Allocator) void {}
+    };
+    var unused: u8 = 0;
+    const called = try entry.call(ctx, .{ .ptr = &unused, .deinit_fn = NoInput.deinit });
+    defer called.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Unsupported tool: shell", called.failure);
+}
 
 pub const advertisement_order = [_][]const u8{
     "read_file",

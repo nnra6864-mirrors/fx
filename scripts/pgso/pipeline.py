@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import pathlib
 import re
+import shutil
 import stat
 import sys
 import uuid
@@ -51,10 +53,12 @@ USE_FLAGS = (
 
 OUTLINE_PARTITIONS = 2
 
-# Each outliner input first goes through `ir_size.py expand-constant-exprs`,
-# and each output through `ir_size.py check-outlined`: the outliner can fold a
-# constant nested in a constant expression into a parameter that carries a
-# different constant (see ir_size.py).
+# Each outliner input first goes through `ir_size.py expand-constant-exprs`
+# and `ir_size.py swap-compares`, and each output through `ir_size.py
+# check-outlined`: the outliner can fold a constant nested in a constant
+# expression into a parameter that carries a different constant, and it can
+# pass a greater-than comparison's operands in the wrong order (see
+# ir_size.py).
 IR_OUTLINER_FLAGS = (
     "-passes=iroutliner",
 )
@@ -68,7 +72,8 @@ OUTLINE_CLEANUP_FLAGS = (
 # wraps Darwin bitcode in the 0x0B17C0DE wrapper header.
 BITCODE_MAGICS = (b"BC\xc0\xde", b"\xde\xc0\x17\x0b")
 
-# Drop the constants that `ir_size.py sparse-constants` left without uses.
+# Drop the constants that `ir_size.py sparse-constants` left without uses and
+# the ones `ir_size.py overlay-constants` replaced with aliases.
 SPARSE_CLEANUP_FLAGS = (
     "-passes=globaldce,verify",
 )
@@ -278,6 +283,16 @@ class PipelinePaths:
             for index in range(OUTLINE_PARTITIONS)
         )
 
+    @property
+    def startup_profiles(self) -> pathlib.Path:
+        """One kept profile per startup scenario, written during training."""
+        return self.profiles / "startup"
+
+    @property
+    def startup_order(self) -> pathlib.Path:
+        """The startup functions in first-use order, for the candidate link."""
+        return self.logs / "startup-order.txt"
+
 
 @dataclasses.dataclass(frozen=True)
 class CandidateEvidence:
@@ -286,6 +301,36 @@ class CandidateEvidence:
     # The platform's candidate metadata (`inspect_candidate`).
     metadata: Any
     version_output: str
+
+
+# LLVM IR names, for ordering the outlined helpers after their callers.
+_LLVM_FUNCTION_NAME = re.compile(
+    r'@("(?:[^"\\]|\\[0-9a-fA-F]{2})*"|[A-Za-z$._][A-Za-z$._0-9]*)\('
+)
+
+
+_OUTLINED_IR_CALL = re.compile(
+    r"@(outlined_ir_func_[0-9]+(?:\.[0-9]+)?)\("
+)
+
+
+def _decode_llvm_identifier(value: str) -> str:
+    if not value.startswith('"'):
+        return value
+    raw = value[1:-1]
+    decoded = bytearray()
+    index = 0
+    while index < len(raw):
+        if raw[index] == "\\":
+            decoded.append(int(raw[index + 1:index + 3], 16))
+            index += 3
+        else:
+            decoded.extend(raw[index].encode())
+            index += 1
+    try:
+        return decoded.decode()
+    except UnicodeDecodeError as error:
+        raise PgsoError("invalid UTF-8 in LLVM function name") from error
 
 
 def _require_nonempty_file(path: pathlib.Path, label: str) -> None:
@@ -350,12 +395,14 @@ def ir_size_argv(
     command: str,
     source: pathlib.Path,
     output: pathlib.Path,
+    options: Sequence[str] = (),
 ) -> tuple[str, ...]:
     return (
         sys.executable,
         str(toolchain.ir_size),
         "--libllvm",
         str(toolchain.libllvm),
+        *options,
         command,
         str(source),
         str(output),
@@ -394,6 +441,7 @@ def profile_use_argv(
     toolchain: Toolchain,
     paths: PipelinePaths,
     profile_path: pathlib.Path | None = None,
+    output: pathlib.Path | None = None,
 ) -> tuple[str, ...]:
     profile = profile_path or paths.merged_profile
     flags = USE_FLAGS if paths.selector == "fx" else BENCHMARK_USE_FLAGS
@@ -403,7 +451,7 @@ def profile_use_argv(
         f"-profile-file={profile}",
         str(paths.bitcode),
         "-o",
-        str(paths.profile_use_base_bitcode),
+        str(output or paths.profile_use_base_bitcode),
     )
 
 
@@ -480,6 +528,7 @@ def candidate_object_argv(
         "-filetype=obj",
         "-O=2",
         *outliner_flags,
+        *toolchain.platform.candidate_object_flags(paths),
         str(paths.profile_use_bitcode),
         "-o",
         str(paths.profile_use_object),
@@ -491,14 +540,18 @@ def build_control(
     spec: ArtifactSpec,
     paths: PipelinePaths,
 ) -> pathlib.Path:
-    run_checked(
-        zig_build_argv(toolchain, spec, paths, emit_ir=False),
+    result = run_checked(
+        (
+            *zig_build_argv(toolchain, spec, paths, emit_ir=False),
+            *toolchain.platform.CONTROL_BUILD_FLAGS,
+        ),
         cwd=spec.repo_root,
         env=zig_build_env(paths),
         timeout_s=900,
         log_path=paths.logs / "build-control.json",
     )
     _require_nonempty_file(paths.control_binary, "ReleaseSafe control")
+    toolchain.platform.record_control_build(toolchain, result, paths)
     return paths.control_binary
 
 
@@ -545,9 +598,17 @@ def _require_bitcode_header(path: pathlib.Path) -> None:
 
 
 def rewrite_sparse_constants(toolchain: Toolchain, paths: PipelinePaths) -> None:
-    """Replace copies of mostly undefined constants with their defined stores."""
+    """Replace copies of mostly undefined constants with their defined stores,
+    pack the constants that are still referenced into one blob, and move
+    mostly empty writable globals to zero-fill."""
     rewritten = paths.profile_use_bitcode.with_name(
         paths.profile_use_bitcode.name + ".sparse"
+    )
+    overlaid = paths.profile_use_bitcode.with_name(
+        paths.profile_use_bitcode.name + ".overlaid"
+    )
+    zero_filled = paths.profile_use_bitcode.with_name(
+        paths.profile_use_bitcode.name + ".zero-filled"
     )
     run_checked(
         ir_size_argv(
@@ -564,10 +625,30 @@ def rewrite_sparse_constants(toolchain: Toolchain, paths: PipelinePaths) -> None
     )
     _require_nonempty_file(rewritten, "sparse-constant bitcode")
     run_checked(
+        ir_size_argv(toolchain, "overlay-constants", rewritten, overlaid),
+        cwd=paths.root,
+        env=os.environ.copy(),
+        timeout_s=300,
+        log_path=paths.logs / "overlay-constants.json",
+        require_empty_stderr=True,
+    )
+    _require_nonempty_file(overlaid, "overlaid-constant bitcode")
+    rewritten.unlink()
+    run_checked(
+        ir_size_argv(toolchain, "zero-fill-globals", overlaid, zero_filled),
+        cwd=paths.root,
+        env=os.environ.copy(),
+        timeout_s=300,
+        log_path=paths.logs / "zero-fill-globals.json",
+        require_empty_stderr=True,
+    )
+    _require_nonempty_file(zero_filled, "zero-filled bitcode")
+    overlaid.unlink()
+    run_checked(
         (
             str(toolchain.opt),
             *SPARSE_CLEANUP_FLAGS,
-            str(rewritten),
+            str(zero_filled),
             "-o",
             str(paths.profile_use_bitcode),
         ),
@@ -578,7 +659,7 @@ def rewrite_sparse_constants(toolchain: Toolchain, paths: PipelinePaths) -> None
         require_empty_stderr=True,
     )
     _require_nonempty_file(paths.profile_use_bitcode, "profile-use bitcode")
-    rewritten.unlink()
+    zero_filled.unlink()
 
 
 def validate_bitcode_hash(path: pathlib.Path, expected_sha256: str) -> None:
@@ -770,18 +851,7 @@ def build_instrumented(
     )
     _require_nonempty_file(paths.instrumented_object, "instrumented object")
 
-    archive = _discover_compiler_runtime(toolchain, paths)
-    compiler_runtime_object = _extract_compiler_runtime(
-        toolchain,
-        archive,
-        paths,
-    )
-    toolchain.platform.link_instrumented(
-        toolchain,
-        paths,
-        compiler_runtime_object,
-        control,
-    )
+    toolchain.platform.link_instrumented(toolchain, paths, control)
 
     return collect_instrumented_profile(
         toolchain,
@@ -803,36 +873,228 @@ def merge_profile_batch(
         raise PgsoError("raw profile batch contains duplicate paths")
     for raw_profile in raw_profiles:
         _require_nonempty_file(raw_profile, "raw profile")
+    inputs: list[pathlib.Path] = []
     if merged_profile.exists():
         _require_nonempty_file(merged_profile, "merged profile accumulator")
+        inputs.append(merged_profile)
+    inputs.extend(raw_profiles)
+    _merge_profiles(toolchain, inputs, merged_profile, log_path)
+    for raw_profile in raw_profiles:
+        raw_profile.unlink()
+    return len(raw_profiles)
 
-    merged_profile.parent.mkdir(parents=True, exist_ok=True)
-    temporary = merged_profile.with_name(
-        f".{merged_profile.name}.{uuid.uuid4().hex}.tmp"
-    )
-    inputs: list[str] = []
-    if merged_profile.exists():
-        inputs.append(str(merged_profile))
-    inputs.extend(str(path) for path in raw_profiles)
+
+def _merge_profiles(
+    toolchain: Toolchain,
+    inputs: Sequence[pathlib.Path],
+    output: pathlib.Path,
+    log_path: pathlib.Path,
+) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.{uuid.uuid4().hex}.tmp")
     run_checked(
         (
             str(toolchain.llvm_profdata),
             "merge",
             "-o",
             str(temporary),
-            *inputs,
+            *(str(path) for path in inputs),
         ),
-        cwd=merged_profile.parent,
+        cwd=output.parent,
         env=os.environ.copy(),
         timeout_s=300,
         log_path=log_path,
         require_empty_stderr=True,
     )
     _require_nonempty_file(temporary, "temporary merged profile")
-    os.replace(temporary, merged_profile)
+    os.replace(temporary, output)
+
+
+def keep_startup_profile(
+    toolchain: Toolchain,
+    raw_profiles: Sequence[pathlib.Path],
+    output: pathlib.Path,
+    log_path: pathlib.Path,
+) -> None:
+    """Merge one startup scenario's raw profiles into `output`.
+
+    The raw profiles stay in place for the shared training merge, which
+    deletes them.
+    """
+    if not raw_profiles:
+        raise PgsoError("startup scenario produced no raw profile")
+    if output.exists():
+        raise PgsoError(f"startup profile already exists: {output}")
     for raw_profile in raw_profiles:
-        raw_profile.unlink()
-    return len(raw_profiles)
+        _require_nonempty_file(raw_profile, "raw profile")
+    _merge_profiles(toolchain, raw_profiles, output, log_path)
+
+
+def _bare_profile_name(name: str) -> str:
+    # Profile records name a function as `<module>;<name>`.
+    return name.split(";", 1)[1] if ";" in name else name
+
+
+def executed_functions(show_text: str) -> set[str]:
+    """The functions with a nonzero block count in `llvm-profdata show
+    --all-functions --counts` output."""
+    executed: set[str] = set()
+    current: str | None = None
+    for line in show_text.splitlines():
+        header = re.match(r"^  (\S.*):$", line)
+        if header:
+            current = header.group(1)
+            continue
+        counts = re.match(r"^    Block counts: \[(.*)\]$", line)
+        if counts and current is not None:
+            if any(int(value) for value in counts.group(1).split(",") if value.strip()):
+                executed.add(_bare_profile_name(current))
+            current = None
+    return executed
+
+
+def remove_profile_records(text: str, names: set[str]) -> tuple[str, set[str]]:
+    """Drop the records of `names` from a text profile.
+
+    Returns the remaining text and the names whose records were removed.
+    Header lines, comments, and the temporal trace block stay.
+    """
+    lines = text.splitlines(keepends=True)
+    kept: list[str] = []
+    removed: set[str] = set()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if line.startswith((":", "#")) or not line.strip():
+            kept.append(line)
+            index += 1
+            continue
+        # A record runs from its name to the next blank line.
+        end = index
+        while end < len(lines) and lines[end].strip():
+            end += 1
+        bare = _bare_profile_name(line.strip())
+        is_record = end - index >= 4 and lines[index + 1].startswith("# Func Hash")
+        if is_record and bare in names:
+            removed.add(bare)
+        else:
+            kept.extend(lines[index:end])
+        index = end
+    return "".join(kept), removed
+
+
+def exempt_cold_startup_functions(
+    toolchain: Toolchain,
+    paths: PipelinePaths,
+    expected_bitcode_sha256: str,
+    scenarios: Sequence[str],
+    benchmark_profiles: Sequence[pathlib.Path] = (),
+) -> dict[str, object]:
+    """Keep profile use from compiling the cold startup functions for size.
+
+    Profile use marks the functions it judges cold `minsize`, and that slows
+    short commands such as `fx help`. This applies the production profile
+    once, then removes from `paths.merged_profile` the records of the startup
+    functions that came out `minsize`, so the real profile use and the
+    benchmark relinks treat them as unprofiled. Hot startup functions, those
+    the build inlined away, and those any of `benchmark_profiles` executes
+    keep their records: the heavy benchmarks build from the production
+    profile, so removing a record they rely on slows them. It also writes the
+    startup functions in first-use order to `paths.startup_order`, which the
+    link places first and `apply_profile` keeps out of outlining.
+    """
+    validate_bitcode_hash(paths.bitcode, expected_bitcode_sha256)
+    startup_profiles = [paths.startup_profiles / f"{name}.profdata" for name in scenarios]
+    for profile in startup_profiles:
+        _require_nonempty_file(profile, "startup profile")
+    startup_profile = paths.profiles / "startup.profdata"
+    _merge_profiles(toolchain, startup_profiles, startup_profile, paths.logs / "merge-startup.json")
+
+    def profdata(*argv: str, log_name: str) -> None:
+        run_checked(
+            (str(toolchain.llvm_profdata), *argv),
+            cwd=paths.root,
+            env=os.environ.copy(),
+            timeout_s=300,
+            log_path=paths.logs / log_name,
+            require_empty_stderr=True,
+        )
+
+    shown = paths.logs / "startup-functions.txt"
+    profdata("show", "--all-functions", "--counts", str(startup_profile), "-o", str(shown),
+             log_name="startup-functions.json")
+    startup = executed_functions(shown.read_text(encoding="utf-8"))
+    if not startup:
+        raise PgsoError("startup profiles executed no functions")
+
+    probe = paths.candidate / f"{paths.binary_name}.startup-probe.bc"
+    run_checked(
+        profile_use_argv(toolchain, paths, paths.merged_profile, output=probe),
+        cwd=paths.root,
+        env=os.environ.copy(),
+        timeout_s=900,
+        log_path=paths.logs / "startup-probe-profile-use.json",
+        require_empty_stderr=True,
+    )
+    _require_bitcode_header(probe)
+    attributes_path = paths.logs / "startup-probe-attributes.json"
+    run_checked(
+        ir_size_argv(toolchain, "minsize-functions", probe, attributes_path),
+        cwd=paths.root,
+        env=os.environ.copy(),
+        timeout_s=900,
+        log_path=paths.logs / "startup-probe-minsize.json",
+        require_empty_stderr=True,
+    )
+    attributes = json.loads(attributes_path.read_text(encoding="utf-8"))
+    defined = set(attributes["defined"])
+    cold = set(attributes["minsize"])
+    benchmark_functions: set[str] = set()
+    for index, benchmark_profile in enumerate(benchmark_profiles):
+        _require_nonempty_file(benchmark_profile, "benchmark training profile")
+        listing = paths.logs / f"startup-benchmark-functions-{index}.txt"
+        profdata("show", "--all-functions", "--counts", str(benchmark_profile), "-o", str(listing),
+                 log_name=f"startup-benchmark-functions-{index}.json")
+        benchmark_functions |= executed_functions(listing.read_text(encoding="utf-8"))
+    exempt = (startup & cold) - benchmark_functions
+
+    text_profile = paths.logs / "production.proftext"
+    profdata("merge", "--text", str(paths.merged_profile), "-o", str(text_profile),
+             log_name="production-to-text.json")
+    filtered, removed = remove_profile_records(text_profile.read_text(encoding="utf-8"), exempt)
+    if removed != exempt:
+        raise PgsoError(
+            f"cold startup functions without a profile record: {sorted(exempt - removed)[:8]}"
+        )
+    filtered_text = paths.logs / "production-startup-exempt.proftext"
+    filtered_text.write_text(filtered, encoding="utf-8")
+    original = paths.profiles / "merged-before-startup-exemption.profdata"
+    shutil.copy2(paths.merged_profile, original)
+    _merge_profiles(toolchain, (filtered_text,), paths.merged_profile, paths.logs / "production-startup-exempt.json")
+
+    startup_order = paths.logs / "startup-profile.order"
+    profdata("order", str(startup_profile), "-o", str(startup_order), log_name="startup-profile-order.json")
+    first_use = [
+        line.strip()
+        for line in startup_order.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    order = first_use + sorted(startup - set(first_use))
+    paths.startup_order.write_text("".join(f"{name}\n" for name in order), encoding="utf-8")
+    return {
+        "scenarios": list(scenarios),
+        "startup_profile_sha256": sha256_file(startup_profile),
+        "startup_functions": len(startup),
+        "exempt_functions": len(exempt),
+        "kept_for_benchmarks": len(startup & cold & benchmark_functions),
+        "kept_hot_functions": len((startup & defined) - cold),
+        "not_defined_functions": len(startup - defined),
+        "records_removed": len(removed),
+        "profile_before_sha256": sha256_file(original),
+        "profile_sha256": sha256_file(paths.merged_profile),
+        "startup_order_functions": len(order),
+        "startup_order_sha256": sha256_file(paths.startup_order),
+    }
 
 
 def _defined_external_symbols(
@@ -879,7 +1141,14 @@ def apply_profile(
     expected_bitcode_sha256: str,
     *,
     profile_path: pathlib.Path | None = None,
+    no_outline_functions: pathlib.Path | None = None,
 ) -> pathlib.Path:
+    """Apply the profile, then outline and clean up the result.
+
+    The functions listed in `no_outline_functions`, one per line, are marked
+    `nooutline` first, so neither outliner moves their code into shared
+    helpers placed elsewhere.
+    """
     validate_bitcode_hash(paths.bitcode, expected_bitcode_sha256)
     profile = profile_path or paths.merged_profile
     _require_nonempty_file(profile, "merged profile")
@@ -895,6 +1164,27 @@ def apply_profile(
         paths.profile_use_base_bitcode,
         "whole-program profile-use bitcode",
     )
+    if no_outline_functions is not None:
+        _require_nonempty_file(no_outline_functions, "no-outline function list")
+        marked = paths.profile_use_base_bitcode.with_name(
+            paths.profile_use_base_bitcode.name + ".no-outline.bc"
+        )
+        run_checked(
+            ir_size_argv(
+                toolchain,
+                "no-outline",
+                paths.profile_use_base_bitcode,
+                marked,
+                ("--functions", str(no_outline_functions)),
+            ),
+            cwd=paths.root,
+            env=os.environ.copy(),
+            timeout_s=900,
+            log_path=paths.logs / "no-outline.json",
+            require_empty_stderr=True,
+        )
+        _require_bitcode_header(marked)
+        os.replace(marked, paths.profile_use_base_bitcode)
     if paths.selector != "fx":
         _outline_without_folded_constants(
             toolchain,
@@ -980,8 +1270,18 @@ def _outline_without_folded_constants(
         require_empty_stderr=True,
     )
     _require_bitcode_header(expanded)
+    swapped = source.with_name(source.name + ".swapped.bc")
     run_checked(
-        outline_ir_argv(toolchain, expanded, output),
+        ir_size_argv(toolchain, "swap-compares", expanded, swapped),
+        cwd=paths.root,
+        env=os.environ.copy(),
+        timeout_s=900,
+        log_path=paths.logs / f"swap-compares-{name}.json",
+        require_empty_stderr=True,
+    )
+    _require_bitcode_header(swapped)
+    run_checked(
+        outline_ir_argv(toolchain, swapped, output),
         cwd=paths.root,
         env=os.environ.copy(),
         timeout_s=900,
