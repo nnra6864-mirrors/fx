@@ -145,9 +145,14 @@ fn localModelCapabilities(_: *anyopaque, _: Allocator, model: []const u8) !model
     return model_capabilities.capabilitiesForModel(model);
 }
 
-pub const RouteRecoveryDecision = enum {
-    disable_fast,
+/// The user's answer when the account is out of credits.
+pub const OutOfCreditsChoice = enum {
+    /// "I added credits, retry": resend the request.
+    retry,
+    /// "Switch to another model": end the turn with the prompt back in the
+    /// composer and the model picker open.
     switch_model,
+    /// "Cancel this turn", or Esc.
     cancel,
 };
 
@@ -167,17 +172,6 @@ pub const ParentTurnDeliveryAck = struct {
 pub const PreparedParentTurnContext = struct {
     content: []const u8,
     acknowledgements: []const ParentTurnDeliveryAck,
-};
-
-pub const RouteRecoveryRequest = struct {
-    selected_model: []const u8,
-    route_model: []const u8,
-    fast_mode: bool,
-    replay_safe: bool,
-    finish_reason: types.ProviderFinishReason,
-    semantic_attempts: usize,
-    unsafe_no_retry_reason: ?types.RouteRecoveryUnsafeReason = null,
-    provider_failure_detail: ?[]const u8 = null,
 };
 
 pub const CredentialRefreshMode = auth_runtime.CredentialRefreshMode;
@@ -295,7 +289,9 @@ pub const AgentRuntimeDeps = struct {
     push_command_output_complete: *const fn (ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) anyerror!void,
     push_http_error: *const fn (ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) anyerror!void,
     refresh_gateway_credential: ?*const fn (ctx: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: CredentialRefreshMode, expected_account_id: ?[]const u8) anyerror!?[]u8 = null,
-    request_route_recovery: ?*const fn (ctx: *anyopaque, arena: Allocator, request: RouteRecoveryRequest) anyerror!RouteRecoveryDecision = null,
+    /// Asks the user what to do when the account is out of credits, and
+    /// blocks until they answer. Only the TUI sets it.
+    ask_out_of_credits: ?*const fn (ctx: *anyopaque) anyerror!OutOfCreditsChoice = null,
     available_model_capabilities: *const fn (ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities = localAvailableModelCapabilities,
     resolve_model_capabilities: *const fn (ctx: *anyopaque, arena: Allocator, model: []const u8) anyerror!model_capabilities.Capabilities = localModelCapabilities,
     /// Reports that the model catalog is known to be failed or unreachable, so

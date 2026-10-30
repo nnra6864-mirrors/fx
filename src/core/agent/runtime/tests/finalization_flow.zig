@@ -233,7 +233,6 @@ test "processQueuedPrompt preserves finish precedence over malformed argument re
         var gateway = FakeGateway.init(alloc, &completions);
         defer gateway.deinit();
         var hooks = FakeAgentRuntimeDeps.init(alloc);
-        if (case.finish_reason == .provider_error) hooks.enable_route_recovery = false;
         defer hooks.deinit();
         var fixture = PromptFixture{};
 
@@ -741,7 +740,6 @@ test "common Stop natural completion allows and preserves disposition" {
     });
     defer gateway.deinit();
     var deps = FakeAgentRuntimeDeps.init(alloc);
-    deps.enable_route_recovery = false;
     defer deps.deinit();
     var fixture = PromptFixture{};
     var lifecycle_runtime = lifecycle_hooks.Runtime.init(alloc);
@@ -792,7 +790,6 @@ test "common Stop cancellation and failure preserve original replay" {
         });
         defer gateway.deinit();
         var deps = FakeAgentRuntimeDeps.init(alloc);
-        deps.enable_route_recovery = false;
         defer deps.deinit();
         var fixture = PromptFixture{};
         var runtime = lifecycle_hooks.Runtime.init(alloc);
@@ -848,7 +845,6 @@ test "common Stop preserves both original replies with optional replay" {
         });
         defer gateway.deinit();
         var deps = FakeAgentRuntimeDeps.init(alloc);
-        deps.enable_route_recovery = false;
         defer deps.deinit();
         var fixture = PromptFixture{};
         var hooks_runtime = lifecycle_hooks.Runtime.init(alloc);
@@ -882,7 +878,6 @@ test "common Stop continues once with original history and joined presentation" 
     });
     defer gateway.deinit();
     var deps = FakeAgentRuntimeDeps.init(alloc);
-    deps.enable_route_recovery = false;
     defer deps.deinit();
     var fixture = PromptFixture{};
     var lifecycle_runtime = lifecycle_hooks.Runtime.init(alloc);
@@ -1080,7 +1075,6 @@ test "common Stop later provider failure ends on Esc with candidate still visibl
     });
     defer gateway.deinit();
     var deps = FakeAgentRuntimeDeps.init(alloc);
-    deps.enable_route_recovery = false;
     deps.enable_recovery_checkpoint = true;
     defer deps.deinit();
     var fixture = PromptFixture{};

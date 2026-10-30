@@ -1038,6 +1038,18 @@ pub fn Runtime(comptime App: type) type {
                                 drain_owns_current = false;
                                 try handlers.append_thematic_rule(handlers.ctx);
                             },
+                            .attempt_start => {
+                                // Earlier text has shown, so the transcript
+                                // ends where this attempt's output begins.
+                                if (comptime @hasDecl(@TypeOf(app.shell), "markAssistantAttemptStart")) {
+                                    app.shell.markAssistantAttemptStart();
+                                }
+                            },
+                            .attempt_restart => |fallback| {
+                                if (!try replaceRestartedAttempt(app)) {
+                                    try handlers.append_text(handlers.ctx, fallback);
+                                }
+                            },
                         }
                     },
                     .notification => |notification| {
@@ -1107,10 +1119,16 @@ pub fn Runtime(comptime App: type) type {
                         // The TUI shows nothing for how a request ended,
                         // recovered or failed; the error itself arrives on
                         // its own. The status line returns to normal activity.
+                        const was_waiting_for_sign_in = app.shell.worker_status_state().waitsForSignIn();
                         if (status.kind == .recovered or status.kind == .failed) {
                             _ = app.shell.worker_status_state().clear_route_recovery();
                         } else {
                             app.shell.worker_status_state().set_route_recovery(status);
+                        }
+                        // A request that starts waiting for a sign-in opens it,
+                        // once; signing in continues the request.
+                        if (!was_waiting_for_sign_in and app.shell.worker_status_state().waitsForSignIn()) {
+                            if (comptime @hasDecl(App, "beginRecoverySignIn")) try app.beginRecoverySignIn();
                         }
                         app.shell.render_requests.request(.footer);
                         try recordRouteRecoveryNotice(app, status);
@@ -1232,6 +1250,18 @@ pub fn Runtime(comptime App: type) type {
 
             lifecycle_cleanup_attempted = true;
             try handlers.tool_lifecycle.finish_batch(app.alloc);
+        }
+
+        /// Replaces what the TUI showed of an answer attempt that restarts:
+        /// the transcript gives back what the attempt added, and its unshown
+        /// text is dropped, so the new answer streams in its place. Returns
+        /// false, changing nothing, when part of the attempt is final.
+        fn replaceRestartedAttempt(app: *App) !bool {
+            if (comptime !@hasDecl(@TypeOf(app.shell), "discardAssistantAttempt")) return false;
+            if (!try app.shell.discardAssistantAttempt(app.alloc)) return false;
+            if (comptime @hasField(App, "pacer")) app.pacer.discardPendingText();
+            debug_trace.logf("worker", "restarted answer replaces the broken-off attempt", .{});
+            return true;
         }
 
         fn flushPendingCommandOutputAtTurnBoundary(
@@ -2798,7 +2828,7 @@ test "core.app_worker_runtime replaces a waiting status with its terminal attemp
 
     switch (app.shell.activityProjection()) {
         .turn_thinking => |thinking| try std.testing.expectEqualStrings(
-            "⚠ Provider unavailable · TestProviderSerializationFailed · stopped after 1 attempt",
+            "⚠ Provider unavailable · test provider serialization failed · stopped after 1 attempt",
             thinking.label,
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,

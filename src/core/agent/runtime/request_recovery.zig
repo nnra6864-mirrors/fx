@@ -60,6 +60,10 @@ pub const RequestRecovery = struct {
     deps: *const runtime_deps.AgentRuntimeDeps,
     cancel_flag: *std.atomic.Value(bool),
     trace_ctx: debug_trace.TraceContext,
+    /// Set by the host when the user answers a request that waits for them,
+    /// for example with Enter. Null on hosts that cannot ask the user, which
+    /// end the turn instead (`canAskUser`).
+    continue_flag: ?*std.atomic.Value(bool) = null,
     /// Off in tests unless a test exercises the thread itself.
     ticker_enabled: bool = !builtin.is_test,
 
@@ -113,19 +117,39 @@ pub const RequestRecovery = struct {
         _ = try self.event(.{ .start = .{ .fast = fast } });
     }
 
-    /// Reports a failed send. A transient kind makes the module wait; the
-    /// caller then calls `waitForSend`.
-    pub fn failed(self: *RequestRecovery, failure: Failure) !void {
-        _ = try self.event(.{ .failed = failure });
+    /// Reports a failed send. Returns the send the module asks for at once,
+    /// which only compaction does. Any other kind makes the module wait or
+    /// ask the user; the caller then calls `waitForSend`.
+    pub fn failed(self: *RequestRecovery, failure: Failure) !?Send {
+        // An answer given before this failure answers nothing.
+        if (self.continue_flag) |flag| flag.store(false, .seq_cst);
+        return self.event(.{ .failed = failure });
     }
 
-    /// Waits for the module's next send, delivering `tick` once a second.
-    /// Returns null when the cancel flag is set; the caller then runs its
-    /// cancel path, which calls `cancel`.
+    /// Whether the host can answer a request that needs the user. Hosts that
+    /// cannot keep fx's own handling and end the turn.
+    pub fn canAskUser(self: *const RequestRecovery) bool {
+        return self.continue_flag != null;
+    }
+
+    /// The user answered a request that waits for them, other than through
+    /// the continue flag, for example with a picker choice. Returns the
+    /// module's send.
+    pub fn userContinue(self: *RequestRecovery) !?Send {
+        return self.event(.user_continue);
+    }
+
+    /// Waits for the module's next send, delivering `tick` once a second and
+    /// `user_continue` when the continue flag is set. Returns null when the
+    /// cancel flag is set; the caller then runs its cancel path, which calls
+    /// `cancel`.
     pub fn waitForSend(self: *RequestRecovery) !?Send {
         var next_tick_ms = self.nowMs() +| tick_ms;
         while (true) {
             if (self.cancel_flag.load(.seq_cst)) return null;
+            if (self.continue_flag) |flag| if (flag.swap(false, .seq_cst)) {
+                if (try self.event(.user_continue)) |send| return send;
+            };
             const now_ms = self.nowMs();
             if (now_ms < next_tick_ms) {
                 self.sleepMs(@min(cancel_poll_ms, next_tick_ms - now_ms));
@@ -407,7 +431,7 @@ test "a transient failure waits with the module's status, then resends" {
     try std.testing.expectEqual(@as(u16, 1), request.attempt());
     try std.testing.expectEqual(@as(usize, 0), fake.route_recovery_statuses.items.len);
 
-    try request.failed(.{ .kind = .dropped });
+    _ = try request.failed(.{ .kind = .dropped });
     const waiting = fake.route_recovery_statuses.items[0];
     try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.waiting, waiting.kind);
     try std.testing.expectEqualStrings("Connection lost · next try in 1s · attempt 1 · 0s", waiting.text.slice());
@@ -430,7 +454,7 @@ test "the first output clears the status and success reports the recovery" {
     defer request.deinit();
 
     try request.start(false);
-    try request.failed(.{ .kind = .server });
+    _ = try request.failed(.{ .kind = .server });
     _ = (try request.waitForSend()).?;
     const shown = fake.route_recovery_statuses.items.len;
 
@@ -460,7 +484,7 @@ test "responding from two threads at once delivers one responding" {
 
     try request.start(false);
     for (0..50) |_| {
-        try request.failed(.{ .kind = .dropped });
+        _ = try request.failed(.{ .kind = .dropped });
         _ = (try request.waitForSend()).?;
         const clears = fake.route_recovery_clear_count;
         const racer = try std.Thread.spawn(.{}, RequestRecovery.responding, .{&request});
@@ -496,7 +520,7 @@ test "Esc during a wait stops waiting and cancel clears the status" {
     defer request.deinit();
 
     try request.start(false);
-    try request.failed(.{ .kind = .rate_limited, .retry_after_ms = 20_000 });
+    _ = try request.failed(.{ .kind = .rate_limited, .retry_after_ms = 20_000 });
     try std.testing.expect(cancel_flag.load(.seq_cst));
     try std.testing.expect(try request.waitForSend() == null);
     try std.testing.expectEqual(@as(u16, 1), request.attempt());
@@ -518,10 +542,10 @@ test "three server errors in a row with Fast on resend without Fast" {
 
     try request.start(true);
     for (0..2) |_| {
-        try request.failed(.{ .kind = .server });
+        _ = try request.failed(.{ .kind = .server });
         try std.testing.expectEqual(Send{}, (try request.waitForSend()).?);
     }
-    try request.failed(.{ .kind = .server });
+    _ = try request.failed(.{ .kind = .server });
     const send = (try request.waitForSend()).?;
     try std.testing.expect(send.no_fast);
     try std.testing.expect(request.send.no_fast);
@@ -529,7 +553,7 @@ test "three server errors in a row with Fast on resend without Fast" {
     try std.testing.expect(std.mem.startsWith(u8, retrying.text.slice(), "Gateway error · retrying without Fast · attempt 4 · "));
 
     // The rest of the request stays off Fast.
-    try request.failed(.{ .kind = .dropped });
+    _ = try request.failed(.{ .kind = .dropped });
     try std.testing.expect((try request.waitForSend()).?.no_fast);
 }
 
@@ -542,13 +566,13 @@ test "a server's Retry-After is honored up to the 30 second ceiling" {
     defer request.deinit();
 
     try request.start(false);
-    try request.failed(.{ .kind = .server, .retry_after_ms = 3_000 });
+    _ = try request.failed(.{ .kind = .server, .retry_after_ms = 3_000 });
     try std.testing.expectEqualStrings("Gateway error · next try in 3s · attempt 1 · 0s", fake.route_recovery_statuses.items[0].text.slice());
     var started_ms = request.nowMs();
     _ = (try request.waitForSend()).?;
     try std.testing.expectEqual(@as(u64, 3_000), request.nowMs() - started_ms);
 
-    try request.failed(.{ .kind = .server, .retry_after_ms = 120_000 });
+    _ = try request.failed(.{ .kind = .server, .retry_after_ms = 120_000 });
     try std.testing.expect(std.mem.startsWith(u8, fake.route_recovery_statuses.items[fake.route_recovery_statuses.items.len - 1].text.slice(), "Gateway error · next try in 30s · attempt 2"));
     started_ms = request.nowMs();
     _ = (try request.waitForSend()).?;
@@ -564,7 +588,7 @@ test "the countdown refreshes once a second while waiting" {
     defer request.deinit();
 
     try request.start(false);
-    try request.failed(.{ .kind = .rate_limited, .retry_after_ms = 3_000 });
+    _ = try request.failed(.{ .kind = .rate_limited, .retry_after_ms = 3_000 });
     _ = (try request.waitForSend()).?;
     var buf: [8][]const u8 = undefined;
     const texts = statusTexts(&fake, &buf);
@@ -585,7 +609,7 @@ test "the in-flight ticker keeps the retrying status counting" {
     defer request.deinit();
 
     try request.start(false);
-    try request.failed(.{ .kind = .dropped });
+    _ = try request.failed(.{ .kind = .dropped });
     _ = (try request.waitForSend()).?;
     const io = io_mod.getIo();
     request.mutex.lockUncancelable(io);
@@ -641,7 +665,7 @@ test "an error after a status reports failed and every exit clears the status" {
         var request = RequestRecovery.init(&deps, &cancel_flag, .{});
         defer request.deinit();
         try request.start(false);
-        try request.failed(.{ .kind = .server });
+        _ = try request.failed(.{ .kind = .server });
         _ = (try request.waitForSend()).?;
         request.endWithError();
         const last = fake.route_recovery_statuses.items[fake.route_recovery_statuses.items.len - 1];
@@ -656,7 +680,7 @@ test "an error after a status reports failed and every exit clears the status" {
         var request = RequestRecovery.init(&deps, &cancel_flag, .{});
         defer request.deinit();
         try request.start(false);
-        try request.failed(.{ .kind = .dropped });
+        _ = try request.failed(.{ .kind = .dropped });
         // fx's terminal status reports the result itself.
         try request.replaceStatus(.{ .kind = .terminal_provider_error, .attempt = 1 });
         request.endWithError();
@@ -670,7 +694,7 @@ test "an error after a status reports failed and every exit clears the status" {
         var request = RequestRecovery.init(&deps, &cancel_flag, .{});
         defer request.deinit();
         try request.start(false);
-        try request.failed(.{ .kind = .dropped });
+        _ = try request.failed(.{ .kind = .dropped });
     }
     try std.testing.expectEqual(@as(usize, 1), fake.route_recovery_clear_count);
 }

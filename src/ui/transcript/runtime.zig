@@ -4501,6 +4501,9 @@ pub const TranscriptRuntime = struct {
     /// A settled terminal resize needs a canonical repaint from row one.
     /// It remains pending until the reset frame commits successfully.
     terminal_reset_pending: bool = false,
+    /// The first entry id the current answer attempt can add, set when the
+    /// attempt starts (`markAssistantAttemptStart`).
+    assistant_attempt_first_entry_id: ?u32 = null,
     /// A committed resize reset established terminal-bottom ownership that
     /// the next cancellation projection must preserve.
     resize_bottom_anchor_pending: bool = false,
@@ -6774,6 +6777,55 @@ pub const TranscriptRuntime = struct {
     /// turn when mid-stream.
     pub fn tailAssistantSegments(self: *TranscriptRuntime) ?*AssistantTurnSegments {
         return transcript_store.tailAssistantSegments(self);
+    }
+
+    /// An answer attempt starts. Earlier text has shown, so entries from
+    /// `next_entry_id` on belong to this attempt.
+    pub fn markAssistantAttemptStart(self: *TranscriptRuntime) void {
+        self.assistant_attempt_first_entry_id = self.next_entry_id;
+    }
+
+    /// Removes what the current answer attempt added, so a restarted answer
+    /// streams in its place. That works only while none of it is final: the
+    /// attempt added at most the writable assistant entry at the tail, and
+    /// no row of it entered terminal history. A finished table or code block
+    /// is final at once, and a resize can push writable rows into history.
+    /// Returns false, changing nothing, when the attempt's output must stay.
+    pub fn discardAssistantAttempt(self: *TranscriptRuntime, alloc: Allocator) !bool {
+        const first = self.assistant_attempt_first_entry_id orelse return false;
+        const entries = self.entries.items;
+        var added: usize = 0;
+        while (added < entries.len and entries[entries.len - 1 - added].id() >= first) added += 1;
+        // Everything the attempt produced is still unshown text.
+        if (added == 0) return true;
+        if (added > 1 or entries[entries.len - 1] != .assistant_turn) return false;
+        const tail_id = entries[entries.len - 1].id();
+        if (try self.entryReachedHistory(alloc, tail_id)) return false;
+
+        try self.assertCanMutateTranscript();
+        var removed = self.entries.orderedRemove(self.entries.items.len - 1);
+        removed.deinit(alloc);
+        try self.rebuildTranscriptCacheAfterStructuredRewrite(alloc, "restarted answer");
+        self.recomputeCursorFromTranscript();
+        self.forgetShimmer();
+        self.markTranscriptStructureDirty();
+        debug_trace.logf("transcript", "restarted answer removed entry_id={d}", .{tail_id});
+        return true;
+    }
+
+    /// Whether any row of entry `id` has entered terminal history, where fx
+    /// can no longer change it.
+    fn entryReachedHistory(self: *const TranscriptRuntime, alloc: Allocator, id: u32) !bool {
+        var source = (try self.prepareCommittedRetentionSourceInterruptible(alloc, null)) orelse return false;
+        defer source.deinit(alloc);
+        const history = self.transcriptCommitDiagnostic().history_visual_offset;
+        var owner: ?u32 = null;
+        for (source.line_provenance, 0..) |line, index| {
+            owner = source_preparation.publication_owner(owner, line);
+            const owned = if (owner) |entry_id| entry_id == id else false;
+            if (owned and source.transcript_visual_row_offsets[index] < history) return true;
+        }
+        return false;
     }
 
     /// Appends paced text to the trailing assistant entry, creating one if needed,

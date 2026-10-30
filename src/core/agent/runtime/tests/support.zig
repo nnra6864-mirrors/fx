@@ -587,6 +587,12 @@ pub const FakeAgentRuntimeDeps = struct {
     cancel_on_text_match: ?[]const u8 = null,
     cancel_on_auto_retry_status: ?*std.atomic.Value(bool) = null,
     cancel_on_auto_retry_attempt: ?usize = null,
+    /// Presses Enter (sets the flag) when a request waits for the user.
+    continue_on_need_user: ?*std.atomic.Value(bool) = null,
+    /// Presses Esc (sets the flag) when a request waits for the user.
+    cancel_on_need_user: ?*std.atomic.Value(bool) = null,
+    /// Records prompts handed back to the composer.
+    record_restored_prompt: bool = false,
     cancel_on_permission: ?*std.atomic.Value(bool) = null,
     cancel_on_permission_name: ?[]const u8 = null,
     cancel_on_execute: ?*std.atomic.Value(bool) = null,
@@ -611,14 +617,10 @@ pub const FakeAgentRuntimeDeps = struct {
     command_replay_output: ?[]const u8 = null,
     command_replay_capability: ?*session_child_store.SessionChildCapability = null,
     last_file_request_allocators_distinct: bool = false,
-    route_recovery_decisions: []const runtime_deps.RouteRecoveryDecision = &.{},
-    enable_route_recovery: bool = true,
-    route_recovery_index: usize = 0,
-    route_recovery_count: usize = 0,
-    last_route_recovery_replay_safe: bool = false,
-    last_route_recovery_fast_mode: bool = false,
-    last_route_recovery_finish_reason: ?types.ProviderFinishReason = null,
-    last_route_recovery_unsafe_reason: ?types.RouteRecoveryUnsafeReason = null,
+    /// Answers to the out-of-credits picker, in order; past the end it cancels.
+    out_of_credits_choices: []const runtime_deps.OutOfCreditsChoice = &.{},
+    out_of_credits_index: usize = 0,
+    out_of_credits_count: usize = 0,
     default_model_capabilities: model_capabilities.Capabilities = .{
         .image_input_support = .non_native,
         .context_window = 1_000_000,
@@ -633,6 +635,8 @@ pub const FakeAgentRuntimeDeps = struct {
     credential_refresh_sources: std.ArrayList(types.CredentialSource) = .empty,
     credential_refresh_modes: std.ArrayList(runtime_deps.CredentialRefreshMode) = .empty,
     credential_refresh_error: ?anyerror = null,
+    /// A forced refresh finds nothing, as when the refresh token is rejected.
+    credential_refresh_fail_force: bool = false,
     last_credential_refresh_expected_account: ?[]u8 = null,
     enable_interactive_notices: bool = false,
     enable_recovery_checkpoint: bool = false,
@@ -768,7 +772,7 @@ pub const FakeAgentRuntimeDeps = struct {
                 .set = setRecoveryCheckpoint,
                 .clear = clearRecoveryCheckpoint,
             } else null,
-            .restore_failed_prompt = if (self.capture_restored_prompts) restoreFailedPrompt else null,
+            .restore_failed_prompt = if (self.capture_restored_prompts or self.record_restored_prompt) restoreFailedPrompt else null,
             .confirm_session_writer = confirmSessionWriter,
             .propagate_grant = @This().propagateGrant,
             .push_event = pushEvent,
@@ -782,7 +786,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .push_command_output_complete = commandOutputComplete,
             .push_http_error = httpError,
             .refresh_gateway_credential = refreshGatewayCredential,
-            .request_route_recovery = if (self.enable_route_recovery) requestRouteRecovery else null,
+            .ask_out_of_credits = askOutOfCredits,
             .available_model_capabilities = availableModelCapabilities,
             .resolve_model_capabilities = resolveModelCapabilities,
             .model_catalog_unavailable = catalogUnavailable,
@@ -813,6 +817,8 @@ pub const FakeAgentRuntimeDeps = struct {
 
     fn restoreFailedPrompt(raw: *anyopaque, prompt: []const u8) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        if (self.record_restored_prompt) try self.record("restore_failed_prompt:{s}", .{prompt});
+        if (!self.capture_restored_prompts) return;
         const owned = try self.alloc.dupe(u8, prompt);
         errdefer self.alloc.free(owned);
         try self.restored_prompts.append(self.alloc, owned);
@@ -889,6 +895,7 @@ pub const FakeAgentRuntimeDeps = struct {
         else
             null;
         if (self.credential_refresh_error) |err| return err;
+        if (self.credential_refresh_fail_force and mode == .force) return null;
         if (self.credential_refresh_index >= self.credential_refresh_tokens.len) return null;
         const token = self.credential_refresh_tokens[self.credential_refresh_index];
         self.credential_refresh_index += 1;
@@ -947,17 +954,13 @@ pub const FakeAgentRuntimeDeps = struct {
         };
     }
 
-    fn requestRouteRecovery(raw: *anyopaque, _: Allocator, request: runtime_deps.RouteRecoveryRequest) !runtime_deps.RouteRecoveryDecision {
+    fn askOutOfCredits(raw: *anyopaque) !runtime_deps.OutOfCreditsChoice {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        self.route_recovery_count += 1;
-        self.last_route_recovery_replay_safe = request.replay_safe;
-        self.last_route_recovery_fast_mode = request.fast_mode;
-        self.last_route_recovery_finish_reason = request.finish_reason;
-        self.last_route_recovery_unsafe_reason = request.unsafe_no_retry_reason;
-        if (self.route_recovery_index < self.route_recovery_decisions.len) {
-            const decision = self.route_recovery_decisions[self.route_recovery_index];
-            self.route_recovery_index += 1;
-            return decision;
+        self.out_of_credits_count += 1;
+        if (self.out_of_credits_index < self.out_of_credits_choices.len) {
+            const choice = self.out_of_credits_choices[self.out_of_credits_index];
+            self.out_of_credits_index += 1;
+            return choice;
         }
         return .cancel;
     }
@@ -1681,6 +1684,7 @@ pub const FakeAgentRuntimeDeps = struct {
                 try self.full_detail_records.append(self.alloc, owned);
                 try self.record("full_detail_record:{s}:{s}", .{ notice.topic, notice.body });
             },
+            .open_model_picker => try self.record("event:open_model_picker", .{}),
             .clear_route_recovery_status => {
                 self.route_recovery_clear_count += 1;
                 try self.record("event:clear_route_recovery_status", .{});
@@ -1813,6 +1817,10 @@ pub const FakeAgentRuntimeDeps = struct {
             return error.TestRouteRecoveryPublicationFailed;
         }
         try self.route_recovery_statuses.append(self.alloc, status);
+        if (status.kind == .need_user) {
+            if (self.continue_on_need_user) |flag| flag.store(true, .seq_cst);
+            if (self.cancel_on_need_user) |flag| flag.store(true, .seq_cst);
+        }
         // Presses Esc while the request waits after the matching attempt.
         if (status.kind == .waiting) {
             if (self.cancel_on_auto_retry_status) |flag| {

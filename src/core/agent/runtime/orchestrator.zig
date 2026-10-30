@@ -15,6 +15,7 @@ const session_runtime = @import("../../session/session.zig");
 const session_codec = @import("../../session/session_codec.zig");
 const result_store = @import("../../session/result_store.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
+const gateway_error_format = @import("../../shared/gateway_error_format.zig");
 const diagnostics = @import("../../workspace/diagnostics.zig");
 const mem_utils = @import("../../shared/mem_utils.zig");
 const text_utils = @import("../../shared/text_utils.zig");
@@ -4423,6 +4424,104 @@ fn failureHttpStatus(kind: agent_stream_provider.FailureKind) std.http.Status {
     };
 }
 
+/// The failure kind an HTTP error that needs the user reports, or null when
+/// fx keeps its own handling, which ends the turn. Only a host that can ask
+/// the user calls this. A context overflow that reaches it already went
+/// through fx's compaction.
+fn needsUserFailureKind(
+    alloc: Allocator,
+    failure: agent_stream_provider.Failure,
+    credential_source: ?types.CredentialSource,
+) ?runtime_request_recovery.Failure.Kind {
+    if (failure.kind == .quota_exhausted or
+        gateway_error_format.namesOutOfCredits(alloc, failure.detail orelse ""))
+    {
+        return .quota;
+    }
+    if (isContextOverflowFailure(failure)) return .too_long;
+    return switch (failure.kind) {
+        .invalid_request, .forbidden, .request_too_large, .provider_error => .rejected,
+        // fx already refreshed the credential once. A source that /login
+        // repairs waits for the user to sign in; any other keeps its notice.
+        .unauthorized => if (signInRepairs(credential_source)) .sign_in else null,
+        // 429 and 5xx retry.
+        .rate_limited, .quota_exhausted, .server_error, .bad_gateway, .unavailable, .gateway_timeout => null,
+    };
+}
+
+/// Whether `/login` repairs the source, so fx can open it on its own.
+fn signInRepairs(credential_source: ?types.CredentialSource) bool {
+    const source = credential_source orelse return false;
+    return switch (source) {
+        .fx_login, .chatgpt_subscription, .grok_subscription => true,
+        .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .host_managed, .configured => false,
+    };
+}
+
+/// The provider's HTTP error detail, clipped, as fx shows it.
+fn httpFailureDetail(
+    arena: Allocator,
+    failure: agent_stream_provider.Failure,
+    job: QueuedPrompt,
+    request_capabilities: model_capabilities.Capabilities,
+) ![]const u8 {
+    const detail = if (failure.detail) |body| std.mem.trim(u8, body, " \r\n\t") else "";
+    const clipped = detail[0..@min(detail.len, http_error_detail_max_bytes)];
+    return runtime_gateway_step.gatewayHttpErrorDetail(
+        arena,
+        failureHttpStatus(failure.kind),
+        clipped,
+        job.model,
+        request_capabilities,
+    );
+}
+
+/// Shows the provider's reason in the transcript while a request waits for
+/// the user, since the status line holds what the user can do.
+fn pushWaitingHttpFailureReason(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    failure: agent_stream_provider.Failure,
+    job: QueuedPrompt,
+    request_capabilities: model_capabilities.Capabilities,
+) !void {
+    const detail = try httpFailureDetail(arena, failure, job, request_capabilities);
+    const message = try gateway_error_format.formatHttpErrorMessage(arena, failureHttpStatus(failure.kind), detail);
+    if (deps.push_interactive_notice) |push| {
+        try push(deps.ctx, .{ .topic = "system", .tone = .warning, .body = message });
+    } else {
+        try deps.push_system_notice(deps.ctx, message);
+    }
+}
+
+const UserAnswer = enum { resend, cancelled, switch_model };
+
+/// Reports a failure that needs the user and waits for their answer.
+fn waitForUser(
+    request_recovery: *runtime_request_recovery.RequestRecovery,
+    deps: *const AgentRuntimeDeps,
+    kind: runtime_request_recovery.Failure.Kind,
+) !UserAnswer {
+    var send = try request_recovery.failed(.{ .kind = kind });
+    // fx compacts a request that is too long before it reports one, so the
+    // module's compacted send would repeat the same request. That send fails
+    // the same way without going out, and the module asks the user.
+    if (send) |pending| if (kind == .too_long and pending.compact_first) {
+        send = try request_recovery.failed(.{ .kind = .too_long });
+    };
+    if (send != null) return .resend;
+    if (kind == .quota) if (deps.ask_out_of_credits) |ask| {
+        const choice = try ask(deps.ctx);
+        debug_trace.logf("recovery", "out of credits choice={s}", .{@tagName(choice)});
+        return switch (choice) {
+            .retry => if (try request_recovery.userContinue() != null) .resend else .cancelled,
+            .switch_model => .switch_model,
+            .cancel => .cancelled,
+        };
+    };
+    return if (try request_recovery.waitForSend() != null) .resend else .cancelled;
+}
+
 fn isContextOverflowFailure(failure: agent_stream_provider.Failure) bool {
     if (failure.kind == .request_too_large) return true;
     if (failure.kind != .invalid_request) return false;
@@ -6952,6 +7051,10 @@ fn processQueuedPromptLoop(
         var successful_vision_route: runtime_vision_contracts.VisionRoute = .native_images;
         var successful_vision_mode: runtime_gateway_step.VisionToolMode = .unavailable;
         var reset_stream_for_next_attempt = false;
+        // The current failure's HTTP error notice is already on screen.
+        var http_failure_notice_shown = false;
+        // The next send reads the stored credential again, after a sign-in.
+        var credential_reload_pending = false;
         var auth_retry_used = false;
         var assistant_prefill_recovery_used = false;
         var skip_next_preflight_refresh = false;
@@ -6971,6 +7074,7 @@ fn processQueuedPromptLoop(
         // line says so. Prefill, language, image-size, and overflow retries
         // stay fx's own and resend inside the same module send.
         var request_recovery = runtime_request_recovery.RequestRecovery.init(deps, config.cancel_flag, step_ctx);
+        request_recovery.continue_flag = config.recovery_continue_flag;
         // `deinit` clears a status still shown on every exit; an error exit
         // reports `failed` first.
         defer request_recovery.deinit();
@@ -6987,18 +7091,20 @@ fn processQueuedPromptLoop(
             // A resend without Fast keeps it off for the rest of this request.
             const attempt_fast_mode = route_fast_mode and !request_recovery.send.no_fast;
             const just_rebuilt_request = skip_next_preflight_refresh and active_compaction_handoff != null and context_overflow_recovery != .pending;
-            if (skip_next_preflight_refresh) {
+            if (skip_next_preflight_refresh and !credential_reload_pending) {
                 skip_next_preflight_refresh = false;
             } else {
+                skip_next_preflight_refresh = false;
                 _ = try refreshGatewayCredentialForJob(
                     deps,
                     std.heap.c_allocator,
                     job,
-                    .if_needed,
+                    if (credential_reload_pending) .reload else .if_needed,
                     &active_api_key,
                     &owned_refreshed_api_key,
                     step_ctx,
                 );
+                credential_reload_pending = false;
             }
             provider_prompt = try build_provider_prompt_with_response_language_control(
                 overlay_arena,
@@ -7647,7 +7753,7 @@ fn processQueuedPromptLoop(
                 );
                 var delay_completed = true;
                 if (will_auto_retry) {
-                    try request_recovery.failed(.{ .kind = failure_kind.? });
+                    _ = try request_recovery.failed(.{ .kind = failure_kind.? });
                     delay_completed = try request_recovery.waitForSend() != null;
                 }
                 if (cancel_requested or !delay_completed) {
@@ -8036,7 +8142,7 @@ fn processQueuedPromptLoop(
                     &stream_ctx,
                 );
                 if (!config.cancel_flag.load(.seq_cst)) {
-                    try request_recovery.failed(.{
+                    _ = try request_recovery.failed(.{
                         // Both causes above are transient.
                         .kind = runtime_request_recovery.failureKind(cause).?,
                         .retry_after_ms = retryAfterMs(failure.retry_after_seconds),
@@ -8049,6 +8155,46 @@ fn processQueuedPromptLoop(
                         recovery_cause = cause;
                         reset_stream_for_next_attempt = true;
                         continue;
+                    }
+                }
+            };
+
+            // On a host that can ask, an error that resending alone cannot fix
+            // waits for the user: Enter or a picker choice resends the
+            // request unchanged, and Esc ends the turn through the cancel
+            // path below. Cancelling the out-of-credits picker, or choosing
+            // another model, ends it on the error.
+            if (response_failure) |failure| if (request_recovery.canAskUser() and
+                !config.cancel_flag.load(.seq_cst))
+            {
+                if (needsUserFailureKind(arena, failure, job.credential_source)) |kind| {
+                    // The provider's reason stays visible while fx waits, and
+                    // after Esc, so the user knows what to change. A sign-in
+                    // needs no reason: fx opens it.
+                    if (kind != .sign_in) {
+                        try pushWaitingHttpFailureReason(deps, arena, failure, job, request_capabilities);
+                        http_failure_notice_shown = true;
+                    }
+                    switch (try waitForUser(&request_recovery, deps, kind)) {
+                        .resend => {
+                            stream_result.deinit(arena);
+                            stream_result_set = false;
+                            http_failure_notice_shown = false;
+                            // The resend uses the credential the sign-in stored.
+                            if (kind == .sign_in) credential_reload_pending = true;
+                            recovery_strategy = resend_strategy.select(.definitely_unsent, .none);
+                            reset_stream_for_next_attempt = true;
+                            continue;
+                        },
+                        .switch_model => {
+                            // The prompt goes back to the composer before the
+                            // picker opens, so the picker keeps it as the
+                            // draft and the user can send it again on the new
+                            // model.
+                            restorePromptAfterTerminalFailure(deps, job, config);
+                            try deps.push_event(deps.ctx, .open_model_picker);
+                        },
+                        .cancelled => {},
                     }
                 }
             };
@@ -8213,7 +8359,11 @@ fn processQueuedPromptLoop(
                     if (content_filtered) "content_filter" else types.ModelFailureDiagnostic.defaultTextForCause(cause),
                 );
                 attempt_failure_diagnostic = diagnostic;
-                const failure_kind: ?runtime_request_recovery.Failure.Kind = if (content_filtered or failure_cause == .non_retryable)
+                // A content filter waits for the user on a host that can ask,
+                // and ends the turn elsewhere, as other non-retryable endings do.
+                const failure_kind: ?runtime_request_recovery.Failure.Kind = if (content_filtered)
+                    (if (request_recovery.canAskUser()) .content_filter else null)
+                else if (failure_cause == .non_retryable)
                     null
                 else
                     runtime_request_recovery.failureKind(cause);
@@ -8239,7 +8389,7 @@ fn processQueuedPromptLoop(
                         attempt_completion,
                         &stream_ctx,
                     );
-                    try request_recovery.failed(.{ .kind = failure_kind.? });
+                    _ = try request_recovery.failed(.{ .kind = failure_kind.? });
                     if (try request_recovery.waitForSend() != null) {
                         preserved_tool_evidence = failure_tool_evidence;
                         recovery_strategy = resend_strategy.select(.possibly_sent, failure_tool_evidence);
@@ -8335,25 +8485,6 @@ fn processQueuedPromptLoop(
                         attempt_completion,
                         diagnostic,
                     );
-                    if (deps.request_route_recovery) |recover| {
-                        const decision = try recover(deps.ctx, arena, .{
-                            .selected_model = job.model,
-                            .route_model = gateway_model,
-                            .fast_mode = attempt_fast_mode,
-                            .replay_safe = false,
-                            .finish_reason = finish_reason,
-                            .semantic_attempts = request_recovery.attempt(),
-                            .provider_failure_detail = attempt_completion.provider_failure_detail,
-                        });
-                        debug_trace.eventf("agent", "route_recovery_decision", step_ctx, "decision={s} replay_safe=false", .{@tagName(decision)});
-                        switch (decision) {
-                            .switch_model, .cancel => {
-                                finish_trace.finish("route_recovery_stopped");
-                                return error.RouteRecoveryStopped;
-                            },
-                            .disable_fast => {},
-                        }
-                    }
                 }
                 finish_trace.finish(if (finish_reason == .provider_error) "provider_error" else "content_filter");
                 return error.ModelError;
@@ -8441,16 +8572,10 @@ fn processQueuedPromptLoop(
             // Every exit below returns normally, so the request reports its
             // end here rather than through the step's errdefer.
             request_recovery.endWithError();
-            const detail = if (failure.detail) |body| std.mem.trim(u8, body, " \r\n\t") else "";
-            const clipped = detail[0..@min(detail.len, http_error_detail_max_bytes)];
-            const http_detail = try runtime_gateway_step.gatewayHttpErrorDetail(
-                arena,
-                failureHttpStatus(failure.kind),
-                clipped,
-                job.model,
-                request_capabilities,
-            );
-            try deps.push_http_error(deps.ctx, failureHttpStatus(failure.kind), http_detail, job.credential_source);
+            if (!http_failure_notice_shown) {
+                const http_detail = try httpFailureDetail(arena, failure, job, request_capabilities);
+                try deps.push_http_error(deps.ctx, failureHttpStatus(failure.kind), http_detail, job.credential_source);
+            }
             if (stop_state.retained_candidate != null) {
                 stop_state.terminal_materializing = true;
                 const assistant_text = try runtime_finalization.stopTerminalText(

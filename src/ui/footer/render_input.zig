@@ -391,6 +391,9 @@ pub const RenderContext = struct {
     file_completions_loading: bool = false,
     file_completions_failed: bool = false,
     inline_completion_suffix: []const u8 = "",
+    /// A request waits for the sign-in fx opened for it, so the auth picker
+    /// shows while the turn is active.
+    auth_picker_during_turn: bool = false,
     auth_picker: auth_runtime.PickerView = .{
         .active = false,
         .available_sources = .empty,

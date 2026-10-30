@@ -6653,7 +6653,6 @@ test "processQueuedPrompt preserves execution when Esc ends a retry or a failure
         var gateway = FakeGateway.init(alloc, &completions);
         defer gateway.deinit();
         var deps = FakeAgentRuntimeDeps.init(alloc);
-        if (case.completion.finish_reason == .provider_error) deps.enable_route_recovery = false;
         defer deps.deinit();
         var fixture = PromptFixture{};
 

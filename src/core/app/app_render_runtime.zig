@@ -776,6 +776,10 @@ pub fn Runtime(comptime App: type) type {
                 else
                     "",
                 .auth_picker = app.auth.pickerView(),
+                .auth_picker_during_turn = if (comptime @hasDecl(@TypeOf(app.shell), "worker_status_state"))
+                    app.shell.worker_status_state().waitsForSignIn()
+                else
+                    false,
                 .skills_menu = if (comptime @hasField(App, "skills"))
                     render_input.skillsMenuProjection(&app.skills)
                 else

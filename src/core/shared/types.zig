@@ -388,34 +388,81 @@ pub const ModelFailureDiagnostic = struct {
         return self.bytes[0..self.len];
     }
 
-    /// User-facing phrasing for machine error names. Provider-supplied text
-    /// passes through unchanged; only known transport error identifiers are
-    /// translated. Raw names stay available in trace logs.
-    fn humanText(self: *const ModelFailureDiagnostic) []const u8 {
-        const raw = self.view();
-        const pairs = .{
-            .{ "ReadFailed", "connection dropped" },
-            .{ "WriteFailed", "connection dropped" },
-            .{ "HttpConnectionClosing", "connection closed" },
-            .{ "ConnectionResetByPeer", "connection reset" },
-            .{ "ConnectionRefused", "connection refused" },
-            .{ "ConnectionTimedOut", "connection timed out" },
-            .{ "Timeout", "timed out" },
-            .{ "StreamStalled", "stream stalled" },
-            .{ "UnknownHostName", "cannot resolve host" },
-            .{ "NameServerFailure", "DNS lookup failed" },
-            .{ "NetworkUnreachable", "network unreachable" },
-            .{ "NetworkDown", "network is down" },
-            .{ "HostUnreachable", "host unreachable" },
-            .{ "NetworkInterrupted", "network interrupted" },
-            .{ "StreamInterrupted", "stream interrupted" },
-        };
-        inline for (pairs) |pair| {
-            if (std.mem.eql(u8, raw, pair[0])) return pair[1];
-        }
-        return raw;
+    /// The diagnostic in plain words (`plainErrorText`). `buf` holds an error
+    /// name split into words.
+    pub fn humanText(self: *const ModelFailureDiagnostic, buf: []u8) []const u8 {
+        return plainErrorText(self.view(), buf);
     }
 };
+
+/// Plain words for an error name fx shows people: the phrase for a name it
+/// knows, else the name split into lowercase words, so `InvalidModelReply`
+/// reads "invalid model reply". Text that is not an error name, such as a
+/// provider's own message, passes through unchanged. Raw names stay in trace
+/// logs. `buf` holds a split name; one too long for it is cut short.
+pub fn plainErrorText(raw: []const u8, buf: []u8) []const u8 {
+    const pairs = .{
+        .{ "ReadFailed", "connection dropped" },
+        .{ "WriteFailed", "connection dropped" },
+        .{ "EndOfStream", "connection closed" },
+        .{ "HttpConnectionClosing", "connection closed" },
+        .{ "ConnectionResetByPeer", "connection reset" },
+        .{ "ConnectionRefused", "connection refused" },
+        .{ "ConnectionTimedOut", "connection timed out" },
+        .{ "ConnectionSetupTimedOut", "connection took too long to open" },
+        .{ "TlsInitializationFailed", "couldn't make a secure connection" },
+        .{ "CertificateBundleLoadFailure", "couldn't load trusted certificates" },
+        .{ "Timeout", "timed out" },
+        .{ "StreamStalled", "stream stalled" },
+        .{ "UnknownHostName", "cannot resolve host" },
+        .{ "NameServerFailure", "DNS lookup failed" },
+        .{ "NetworkUnreachable", "network unreachable" },
+        .{ "NetworkDown", "network is down" },
+        .{ "HostUnreachable", "host unreachable" },
+        .{ "NetworkInterrupted", "network interrupted" },
+        .{ "StreamInterrupted", "stream interrupted" },
+        .{ "InvalidGatewaySseEvent", "unreadable reply" },
+        .{ "InvalidProviderFinishReason", "unreadable reply" },
+        .{ "GatewaySseEventTooLarge", "reply too large to read" },
+        .{ "XaiGrokSseEventTooLarge", "reply too large to read" },
+        // Storage faults read as fx says them on startup and in ACP.
+        .{ "AccessDenied", "permission denied" },
+        .{ "ReadOnlyFileSystem", "the disk is read-only" },
+        .{ "NoSpaceLeft", "the disk is full" },
+        .{ "FileTooBig", "a file-size limit was reached" },
+        .{ "InputOutput", "a disk read or write failed" },
+    };
+    inline for (pairs) |pair| {
+        if (std.mem.eql(u8, raw, pair[0])) return pair[1];
+    }
+    if (!isErrorName(raw)) return raw;
+    var len: usize = 0;
+    for (raw, 0..) |c, i| {
+        const starts_word = i > 0 and std.ascii.isUpper(c) and
+            (std.ascii.isLower(raw[i - 1]) or (i + 1 < raw.len and std.ascii.isLower(raw[i + 1])));
+        if (starts_word) {
+            if (len >= buf.len) break;
+            buf[len] = ' ';
+            len += 1;
+        }
+        if (len >= buf.len) break;
+        buf[len] = std.ascii.toLower(c);
+        len += 1;
+    }
+    return buf[0..len];
+}
+
+/// A Zig error name, as `@errorName` gives it: one ASCII word that starts
+/// with a capital and has a lowercase letter.
+fn isErrorName(raw: []const u8) bool {
+    if (raw.len == 0 or !std.ascii.isUpper(raw[0])) return false;
+    var lower = false;
+    for (raw) |c| {
+        if (!std.ascii.isAlphanumeric(c)) return false;
+        lower = lower or std.ascii.isLower(c);
+    }
+    return lower;
+}
 
 pub const RouteRecoveryStatus = struct {
     pub const label_max_bytes: usize = 512;
@@ -603,10 +650,11 @@ pub const RouteRecoveryStatus = struct {
         action: []const u8,
     ) []const u8 {
         if (self.diagnostic) |diagnostic| {
+            var words: [ModelFailureDiagnostic.max_bytes]u8 = undefined;
             return std.mem.print(
                 buf,
                 "⚠ {s} · {s} · {s}",
-                .{ cause, diagnostic.view(), action },
+                .{ cause, diagnostic.humanText(&words), action },
             ) catch "⚠ Model response failed";
         }
         return std.mem.print(buf, "⚠ {s} · {s}", .{ cause, action }) catch "⚠ Model response failed";
@@ -631,10 +679,11 @@ pub const RouteRecoveryStatus = struct {
         const name = if (self.cause) |cause| causeDisplayName(cause) else "Provider unavailable";
         const plural: []const u8 = if (self.attempt == 1) "" else "s";
         if (self.diagnostic) |diagnostic| {
+            var words: [ModelFailureDiagnostic.max_bytes]u8 = undefined;
             return std.mem.print(
                 buf,
                 "⚠ {s} · {s} · stopped after {d} attempt{s}",
-                .{ name, diagnostic.humanText(), self.attempt, plural },
+                .{ name, diagnostic.humanText(&words), self.attempt, plural },
             ) catch "⚠ Model response recovery ended";
         }
         return std.mem.print(
@@ -741,15 +790,29 @@ test "recovery reports write the shape fx ask and ACP share" {
     try std.testing.expectEqualStrings("{\"state\":\"interrupted\",\"attempt\":4,\"message\":\"Interrupted turn\"}", out.written());
 }
 
-test "model failure diagnostic translates known transport names only" {
-    try std.testing.expectEqualStrings(
-        "connection dropped",
-        ModelFailureDiagnostic.init("ReadFailed").humanText(),
-    );
-    try std.testing.expectEqualStrings(
-        "HTTP 503 · no_available_providers: No providers are currently available",
-        ModelFailureDiagnostic.init("HTTP 503 · no_available_providers: No providers are currently available").humanText(),
-    );
+test "model failure diagnostics read as plain words" {
+    var buf: [ModelFailureDiagnostic.max_bytes]u8 = undefined;
+    const cases = [_]struct { raw: []const u8, plain: []const u8 }{
+        // A name fx knows has its own phrase.
+        .{ .raw = "ReadFailed", .plain = "connection dropped" },
+        .{ .raw = "TlsInitializationFailed", .plain = "couldn't make a secure connection" },
+        .{ .raw = "NoSpaceLeft", .plain = "the disk is full" },
+        // Any other error name is split into words.
+        .{ .raw = "InvalidProviderCompletion", .plain = "invalid provider completion" },
+        .{ .raw = "HTTPRequestFailed", .plain = "http request failed" },
+        // A provider's own text is not an error name and passes through.
+        .{ .raw = "HTTP 503 · no_available_providers: No providers are currently available", .plain = "HTTP 503 · no_available_providers: No providers are currently available" },
+        .{ .raw = "provider_error", .plain = "provider_error" },
+        .{ .raw = "HTTP", .plain = "HTTP" },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqualStrings(case.plain, ModelFailureDiagnostic.init(case.raw).humanText(&buf));
+    }
+}
+
+test "plain error text cuts a split name short instead of overrunning" {
+    var buf: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("invalid ", plainErrorText("InvalidProviderCompletion", &buf));
 }
 
 test "model failure diagnostic truncation is bounded and utf8 safe" {

@@ -2358,7 +2358,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "HTTP restricted provider error renders sticky status row",
+    "HTTP restricted provider error shows its reason while fx waits for the user",
     async () => {
       const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
         "fx-tui-route-http-403-",
@@ -2366,20 +2366,21 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
 
       await session!.sendText("Trigger restricted provider.");
-      await session!.waitForText(
-        "⚠ API access denied · HTTP 403 · Provider: wafer",
+      // The reason goes to the transcript; the status line says what to do.
+      await session!.waitForText("API access denied · HTTP 403 · Provider: wafer", TIMEOUT);
+      await session!.waitForText("The provider rejected this request · press Esc", TIMEOUT);
+      await session!.sendKeys("Escape");
+      await session!.waitForPane(
+        (pane) => !pane.includes("The provider rejected this request"),
         TIMEOUT,
       );
       const scrollback = await session!.captureFullScrollback();
 
       expect(queuedGateway.requests.length).toBe(1);
-      expect(scrollback).toContain(
-        "⚠ API access denied · HTTP 403 · Provider: wafer",
-      );
+      expect(countOccurrences(scrollback, "API access denied · HTTP 403 · Provider: wafer")).toBe(1);
       expect(scrollback).toContain(
         "no_providers_available: Your team has restricted access to this",
       );
-      expect(scrollback).toContain("no_providers_available");
       expect(scrollback).not.toContain('{"error"');
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
@@ -2590,7 +2591,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "content filter opens local recovery modal without transcript card",
+    "content filter waits for the user and one Esc ends the turn",
     async () => {
       const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
         "fx-tui-route-content-filter-",
@@ -2598,27 +2599,89 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
 
       await session!.sendText("Trigger content filter.");
-      const pane = await session!.waitForText("Try again later", TIMEOUT);
-      await session!.sendKeys("Down");
-      await session!.sendKeys("Enter");
+      await session!.waitForText("Blocked by the content filter", TIMEOUT);
+      // A request that waits for the user ends on one Esc, not two.
+      await session!.sendKeys("Escape");
+      await session!.waitForPane(
+        (pane) => !pane.includes("Blocked by the content filter"),
+        TIMEOUT,
+      );
       await session!.waitForComposer(TIMEOUT);
-      await session!.waitForText("⚠ blocked · content_filter · content filter", TIMEOUT);
       const scrollback = await session!.captureFullScrollback();
 
       expect(queuedGateway.requests.length).toBe(1);
-      expect(scrollback).not.toContain("What should fx do?");
-      expect(pane).toContain("Change model");
-      expect(pane).toContain("Try again later");
-      expect(pane).toContain("Response blocked by content filter");
-      expect(scrollback).toContain("⚠ blocked · content_filter · content filter");
-      expect(pane).not.toContain("Disable Fast");
-      expect(pane).not.toContain("Retry same route");
-      expect(scrollback).not.toContain("System");
-      expect(scrollback).not.toContain("Change model");
-      expect(scrollback).not.toContain("request failed: ModelError");
+      expect(scrollback).not.toContain("Try again later");
+      expect(scrollback).not.toContain("request failed");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
+  );
+
+  test(
+    "a rejected request waits for the user and Enter sends it again",
+    async () => {
+      const finalText = "REJECTED_THEN_ANSWERED";
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+        "fx-tui-route-rejected-",
+        [
+          () => new Response(
+            JSON.stringify({ error: { message: "unsupported parameter" } }),
+            { status: 400, headers: { "content-type": "application/json" } },
+          ),
+          () => fakeGatewayFinalText(finalText),
+        ],
+      );
+
+      await session!.sendText("Send a request the provider rejects once.");
+      await session!.waitForText("The provider rejected this request · press Esc", TIMEOUT);
+      expect(queuedGateway.requests).toHaveLength(1);
+      await session!.sendKeys("Enter");
+      const scrollback = await waitForScrollback(
+        session!,
+        (value) => value.includes(finalText),
+        "answer after Enter",
+      );
+
+      expect(queuedGateway.requests).toHaveLength(2);
+      // The provider's reason showed once, while fx waited.
+      expect(countOccurrences(scrollback, "unsupported parameter")).toBe(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "out of credits shows the picker and retries after credits are added",
+    async () => {
+      const finalText = "CREDITS_ADDED_ANSWER";
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+        "fx-tui-route-out-of-credits-",
+        [
+          () => new Response(
+            JSON.stringify({ error: { code: "credit_card_required", message: "Buy credits to use AI Gateway." } }),
+            { status: 403, headers: { "content-type": "application/json" } },
+          ),
+          () => fakeGatewayFinalText(finalText),
+        ],
+      );
+
+      await session!.sendText("Answer once credits are back.");
+      const pane = await session!.waitForText("I added credits, retry", TIMEOUT);
+      expect(pane).toContain("Switch to another model");
+      expect(pane).toContain("Cancel this turn");
+      await session!.sendKeys("Enter");
+      const scrollback = await waitForScrollback(
+        session!,
+        (value) => value.includes(finalText),
+        "answer after credits",
+      );
+
+      expect(queuedGateway.requests).toHaveLength(2);
+      // The provider's reason showed once, while the picker was up.
+      expect(countOccurrences(scrollback, "credit_card_required")).toBe(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
   );
 
   test(
@@ -3003,7 +3066,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "autonomous recovery does not render checkpointed partial output twice",
+    "a restarted answer replaces the half answer it broke off",
     async () => {
       const partialText = "Partial output before EOF.";
       const finalText = "Recovered final output once.";
@@ -3024,9 +3087,100 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const scrollback = await session!.captureFullScrollback();
 
       expect(queuedGateway.requests).toHaveLength(11);
-      expect(scrollback.split(partialText).length - 1).toBe(1);
+      // The new answer took the half answer's place, in scrollback too.
+      expect(scrollback).not.toContain(partialText);
       expect(scrollback.split(finalText).length - 1).toBe(1);
-      expect(scrollback).toContain("Response interrupted. Restarting.");
+      expect(scrollback).not.toContain("Restarted the answer");
+      expect(scrollback).not.toContain("Response interrupted");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "a restarted answer replaces a several-line half answer still on screen",
+    async () => {
+      const partialLines = Array.from({ length: 6 }, (_, index) => `On-screen half line ${index + 1}.`);
+      const finalText = "Recovered final output after a several-line half answer.";
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+        "fx-tui-recovery-medium-partial-",
+        [
+          partialEofResponse(partialLines.join("\n\n")),
+          fakeGatewayFinalText(finalText),
+        ],
+      );
+
+      await session!.sendText("Write a few lines that break off.");
+      await session!.waitForText(finalText, TIMEOUT);
+      await session!.waitForStableComposer(TIMEOUT);
+      const scrollback = await session!.captureFullScrollback();
+
+      expect(queuedGateway.requests).toHaveLength(2);
+      expect(scrollback).not.toContain("On-screen half line");
+      expect(scrollback.split(finalText).length - 1).toBe(1);
+      expect(scrollback).not.toContain("Restarted the answer");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "a half answer that scrolled into history stays and a short line marks the restart",
+    async () => {
+      const partialLines = Array.from({ length: 80 }, (_, index) => `Half answer line ${index + 1}.`);
+      const finalText = "Recovered final output after a tall half answer.";
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+        "fx-tui-recovery-tall-partial-",
+        [
+          partialEofResponse(partialLines.join("\n\n")),
+          fakeGatewayFinalText(finalText),
+        ],
+      );
+
+      await session!.sendText("Write a long answer that breaks off.");
+      await session!.waitForText(finalText, TIMEOUT);
+      await session!.waitForStableComposer(TIMEOUT);
+      const scrollback = await session!.captureFullScrollback();
+
+      expect(queuedGateway.requests).toHaveLength(2);
+      // Rows past the screen top are in the terminal's history, which fx
+      // cannot change, so the half answer stays, once, and a line marks the
+      // restart before the new answer.
+      expect(scrollback.split("Half answer line 1.").length - 1).toBe(1);
+      expect(scrollback.split("Half answer line 80.").length - 1).toBe(1);
+      expect(scrollback.split("↻ Restarted the answer").length - 1).toBe(1);
+      expect(scrollback.indexOf("Half answer line 80.")).toBeLessThan(scrollback.indexOf("↻ Restarted the answer"));
+      expect(scrollback.indexOf("↻ Restarted the answer")).toBeLessThan(scrollback.indexOf(finalText));
+      expect(scrollback.split(finalText).length - 1).toBe(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "a half answer with a finished code block stays and a short line marks the restart",
+    async () => {
+      const partialText = "Intro before the code.\n\n```js\nconst kept = 1;\n```\n\nText after the code";
+      const finalText = "Recovered final output after code.";
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+        "fx-tui-recovery-code-partial-",
+        [
+          partialEofResponse(partialText),
+          fakeGatewayFinalText(finalText),
+        ],
+      );
+
+      await session!.sendText("Write an answer with code that breaks off.");
+      await session!.waitForText(finalText, TIMEOUT);
+      await session!.waitForStableComposer(TIMEOUT);
+      const scrollback = await session!.captureFullScrollback();
+
+      expect(queuedGateway.requests).toHaveLength(2);
+      // The finished code block is final, so the half answer stays.
+      expect(scrollback.split("const kept = 1;").length - 1).toBe(1);
+      expect(scrollback.split("↻ Restarted the answer").length - 1).toBe(1);
+      expect(scrollback.indexOf("↻ Restarted the answer")).toBeLessThan(scrollback.indexOf(finalText));
+      expect(scrollback.split(finalText).length - 1).toBe(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT * 2,
@@ -3052,7 +3206,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         (value) => /stopped after 2\s+attempts/.test(value),
         "terminal failure after a retry",
       );
-      expect(scrollback).toContain("InvalidGatewaySseEvent");
+      expect(scrollback).toContain("unreadable reply");
+      expect(scrollback).not.toContain("InvalidGatewaySseEvent");
       expect(queuedGateway.requests).toHaveLength(2);
       await session!.waitForPane(
         (pane) => composerContains(pane, prompt),
@@ -3252,7 +3407,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "provider error after assistant output restarts a separate visible response",
+    "provider error after assistant output restarts the response in its place",
     async () => {
       const firstCatalogModel = "anthropic/claude-fable-5";
       const finalText = "A complete replacement response.";
@@ -3282,8 +3437,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const scrollback = await session!.captureFullScrollback();
 
       expect(queuedGateway.requests.length).toBe(2);
-      expect(scrollback.split("partial unsafe output").length - 1).toBe(1);
-      expect(scrollback).toContain(finalText);
+      // The restarted response took the broken-off one's place.
+      expect(scrollback).not.toContain("partial unsafe output");
+      expect(scrollback.split(finalText).length - 1).toBe(1);
       expect(scrollback).not.toContain("What should fx do?");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },

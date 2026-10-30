@@ -3334,7 +3334,7 @@ test.skipIf(!tmuxAvailable())("an app whose disk fills keeps running, and the se
     const whole = readFileSync(log);
     let app2 = await launch(id, Math.floor(whole.length / SH_LIMIT_BLOCK));
     await app2.sendText("The disk is already full.");
-    await app2.waitForText("FileTooBig", TIMEOUT);
+    await app2.waitForText("request failed: a file-size limit was reached", TIMEOUT);
     await app2.waitForComposer(TIMEOUT);
     await quit();
     expect(gateway.requests.length).toBe(asked);
@@ -3347,7 +3347,7 @@ test.skipIf(!tmuxAvailable())("an app whose disk fills keeps running, and the se
     await app2.sendText("The disk fills in this turn.");
     // It names the write that failed first, even when an earlier streamed
     // write took the log down (D40).
-    await app2.waitForText("Turn completed, but fx could not save it (FileTooBig)", TIMEOUT);
+    await app2.waitForText("Couldn't save this turn: a file-size limit was reached", TIMEOUT);
     await app2.waitForComposer(TIMEOUT);
     await quit();
     expect(gateway.requests.length).toBe(asked + 1);
@@ -3753,7 +3753,7 @@ const REAL_FULL_DISK = process.platform === "darwin";
 /// What each host says when it refuses, by cause.
 const GRID_SAYS: Record<"damaged" | "denied" | "busy" | "full", Record<GridHost, RegExp>> = {
   damaged: { ask: /InvalidSessionFormat/, app: /saved session is unreadable/, acp: /^Session could not be loaded$/ },
-  denied: { ask: /AccessDenied/, app: /cannot be opened for writing: permission denied|AccessDenied/, acp: /permission denied/ },
+  denied: { ask: /AccessDenied/, app: /permission denied|AccessDenied/, acp: /permission denied/ },
   busy: { ask: /SessionBusy/, app: /another fx process may be using this session/, acp: /^Session is busy$/ },
   full: REAL_FULL_DISK
     ? { ask: /NoSpaceLeft/, app: /NoSpaceLeft|the disk is full/, acp: /the disk is full/ }
@@ -3965,7 +3965,7 @@ async function gridEnter(entry: GridEntry, c: GridCase, gateway: any, token: str
         const deadline = Date.now() + TIMEOUT;
         while (Date.now() < deadline) {
           screen = await session.captureFullScrollback();
-          if (screen.includes(answer) || /✗ .*|could not save/.test(screen.slice(screen.lastIndexOf(prompt)))) break;
+          if (screen.includes(answer) || /✗ .*|[Cc]ouldn't save/.test(screen.slice(screen.lastIndexOf(prompt)))) break;
           await Bun.sleep(100);
         }
         // The reply shows even when saving it fails, so read the turn's end.
@@ -3974,7 +3974,7 @@ async function gridEnter(entry: GridEntry, c: GridCase, gateway: any, token: str
         const turn = screen.slice(screen.lastIndexOf(prompt));
         await session.sendText("/quit");
         await exit("after /quit");
-        return { entered: turn.includes(answer) && !/✗ |could not save/.test(turn), said: `${turn}\n${readFileSync(stderrPath, "utf8")}` };
+        return { entered: turn.includes(answer) && !/✗ |[Cc]ouldn't save/.test(turn), said: `${turn}\n${readFileSync(stderrPath, "utf8")}` };
       } finally {
         await session.kill();
       }

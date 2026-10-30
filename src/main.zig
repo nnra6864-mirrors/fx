@@ -1096,6 +1096,10 @@ const App = struct {
         try InputSubmitRuntime.resumePromptAfterAuth(self, max_prompt_history);
     }
 
+    pub fn beginRecoverySignIn(self: *App) !void {
+        try AuthAppRuntime.beginRecoverySignIn(self);
+    }
+
     pub fn runLoginCommand(self: *App) !void {
         try AuthAppRuntime.runLoginCommand(self);
     }

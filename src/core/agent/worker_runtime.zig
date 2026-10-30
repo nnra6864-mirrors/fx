@@ -546,6 +546,9 @@ pub const WorkerRuntime = struct {
     worker_stop_requested: bool = false,
     finalization_failure: ?FinalizationFailure = null,
     worker_cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Set when the user answers a request that waits for them; the request's
+    /// recovery reads and clears it (`RequestRecovery.continue_flag`).
+    recovery_continue_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// The active turn whose text steering admission owns the cancel flag.
     /// Guarded by `worker_mutex`; explicit cancellation clears this ownership.
     steering_cancel_turn_id: ?u64 = null,
@@ -777,6 +780,12 @@ pub const WorkerRuntime = struct {
 
     pub fn isCancelRequested(self: *const WorkerRuntime) bool {
         return self.worker_cancel_requested.load(.seq_cst);
+    }
+
+    /// The user answered a request that waits for them, for example with
+    /// Enter. A request that is not waiting ignores it.
+    pub fn requestRecoveryContinue(self: *WorkerRuntime) void {
+        self.recovery_continue_requested.store(true, .seq_cst);
     }
 
     pub fn cancellationStopsTurn(self: *WorkerRuntime) bool {

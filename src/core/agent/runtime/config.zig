@@ -43,6 +43,10 @@ pub const Config = struct {
     auto_compact_percent: u8 = compactor.default_percent,
     step_limit_notice: []const u8 = default_step_limit_notice,
     cancel_flag: *std.atomic.Value(bool),
+    /// Set by a host that can ask the user, which only the TUI does: a
+    /// request that needs the user then waits for this flag or the cancel
+    /// flag. Without it, such a request ends the turn.
+    recovery_continue_flag: ?*std.atomic.Value(bool) = null,
     review_enabled: bool = false,
     fast_mode: bool = false,
     ultrafast_mode: bool = false,
