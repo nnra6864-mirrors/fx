@@ -27,14 +27,14 @@ fn process_io_for(comptime os_tag: std.Target.Os.Tag, zio: std.Io) std.Io {
     return if (os_tag == .macos) darwin_process_spawn.wrap(zio) else zio;
 }
 
-pub fn getIo() std.Io {
+// Thousands of call sites reach `getIo`, so it stays out of line: an inlined
+// copy at each one costs more code than the call. The fallback is reached only
+// before main installs the process Io and in tests.
+pub noinline fn getIo() std.Io {
     if (real_io) |zio| return zio;
     return fallbackIo();
 }
 
-// Thousands of callers inline `getIo`, so only the installed-Io fast path is
-// inlined. The fallback is reached only before main installs the process Io
-// and in tests.
 noinline fn fallbackIo() std.Io {
     if (comptime builtin.is_test) return process_io_for(builtin.target.os.tag, std.testing.io);
     return process_io_for(builtin.target.os.tag, fallback_threaded.io());
