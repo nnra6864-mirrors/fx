@@ -132,8 +132,14 @@ zero-fill, which takes no space in the file, and stores those bytes at the
 start of `main`, or of the function Zig's `main` alias names. Even one nonzero
 byte otherwise writes the whole global out; std's `Progress` state is 18 KB for
 a single 255. Nothing reads these globals before `main`, and no later stage
-folds the stores back into an initializer. `globaldce,verify` then drops the
-dead constants. Benchmark artifacts receive every pass so their candidates keep
+folds the stores back into an initializer. `compact-error-names` then reads
+every error name through one function: Zig's `__zig_error_name_table` holds a
+16-byte pointer and length per error, about 26 KB of relocated data, and each
+`@errorName` reads it in place. The function returns the same pointer and
+length from 16-bit offsets into one blob of the same NUL-terminated names.
+Where a PHI merges an entry with another pointer, the pair goes to a stack slot
+laid out like the entry. Any entry or use the pass does not recognize leaves
+the table unchanged. `globaldce,verify` then drops the dead constants. Benchmark artifacts receive every pass so their candidates keep
 the production code shape. The candidate link passes
 `-no_compact_unwind`: fx builds without unwind tables, and newer Apple linkers
 otherwise emit about 160 KB of compact unwind data.
