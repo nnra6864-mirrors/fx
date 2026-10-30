@@ -392,11 +392,15 @@ function handle(message) {
       jsonrpc: "2.0",
       id: message.id,
       result: {
-        protocolVersion: "2024-11-05",
+        protocolVersion: message.params.protocolVersion,
         capabilities: { tools: {} },
         serverInfo: { name: "fixture", version: "1.0.0" },
       },
     });
+    return;
+  }
+  if (message.id !== undefined && message.method !== "tools/list" && message.method !== "tools/call") {
+    send({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "Method not found" } });
     return;
   }
   if (message.method === "tools/list") {
