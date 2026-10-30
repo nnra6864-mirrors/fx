@@ -4,6 +4,7 @@ const token_estimate = @import("../../shared/token_estimate.zig");
 const types = @import("../../shared/types.zig");
 const stream_provider = @import("../stream_provider.zig");
 const text_utils = @import("../../shared/text_utils.zig");
+const json_decode = @import("../../shared/json_decode.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
@@ -104,7 +105,7 @@ pub fn measureProviderRequest(alloc: Allocator, body: []const u8, request: strea
     }
 
     // Typed parsing borrows unescaped payload strings. Value parsing copies them.
-    const parsed = std.json.parseFromSlice(CostRequest, alloc, body, .{
+    const parsed = json_decode.parseFromSlice(CostRequest, alloc, body, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_if_needed,
     }) catch |err| return switch (err) {

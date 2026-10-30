@@ -188,6 +188,8 @@ Do not bypass the permission system for new tools.
 
 * For JSON serialization, use `std.json.Stringify.value` with an allocating writer (`std.Io.Writer.Allocating`).
 
+* To parse JSON into a typed value, use `parseFromSlice` or `parseFromSliceLeaky` from `src/core/shared/json_decode.zig`. They match `std.json`'s, but share one parser across types instead of generating one per type. Parse into `std.json.Value` with `std.json` itself.
+
 * For JSON string escaping (writing raw JSON), use the project's `writeJsonStr` helper in `src/acp/jsonrpc.zig` rather than assuming `std.json.encodeJsonString` exists.
 
 * Zig 0.17 uses `std.Io.File.stdin()` / `.stdout()` / `.stderr()`, not `std.io.getStdIn()`.

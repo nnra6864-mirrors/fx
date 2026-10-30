@@ -11,6 +11,7 @@ const model_provider = @import("../config/model_provider.zig");
 const context_limits = @import("../config/context_limits.zig");
 const credential_authority = @import("../auth/credential_authority.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const json_decode = @import("../shared/json_decode.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -331,7 +332,7 @@ pub fn decodeSessionMetadata(
     if (bytes.len == 0 or bytes.len > max_session_metadata_bytes) {
         return error.SessionMetadataTooLarge;
     }
-    var parsed = std.json.parseFromSlice(SessionMetadata, alloc, bytes, .{
+    var parsed = json_decode.parseFromSlice(SessionMetadata, alloc, bytes, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = false,
         .max_value_len = max_session_metadata_bytes,
