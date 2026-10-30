@@ -7706,6 +7706,12 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(new Set(boundedNames).size).toBe(5);
       expect(boundedNames).toContain(DYNAMIC_MCP_TOOL_NAME);
       expect(boundedNames.every((name: string) => name.startsWith("mcp_fixture_"))).toBe(true);
+      // Each tool on the page says the search loaded its schema.
+      for (const tool of boundedOutput.mcp_tools) {
+        expect(tool.schema_loaded).toBe(true);
+        expect(tool.purpose).toBeUndefined();
+        expect(tool.context_limit).toBeUndefined();
+      }
 
       const selectedRequest = gatewayRequest(gateway.requests[1]!.body);
       const selectedTool = selectedRequest.tools.find((tool) =>

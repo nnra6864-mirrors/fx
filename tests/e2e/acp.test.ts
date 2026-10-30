@@ -3095,8 +3095,9 @@ describe("acp: model-independent", () => {
         client = await AcpClient.create({
           cwd: root.workspace,
           env: { ...fakeGatewayEnv(root, gateway) },
-          // A short description limit, so the search truncates the tool's.
-          args: ["--context-limit", "mcp_description_bytes=8", "acp"],
+          // A short description limit and no room for the tool's schema, so
+          // the search can only show the tool's description cut short.
+          args: ["--context-limit", "mcp_description_bytes=8", "--context-limit", "mcp_selected_schema_bytes=8", "acp"],
         });
         await client.request("initialize", { protocolVersion: 1, clientCapabilities: { session: { notices: {} } } }, 1);
         const created = await client.request(
@@ -3144,7 +3145,7 @@ describe("acp: model-independent", () => {
         client = await AcpClient.create({
           cwd: root.workspace,
           env: { ...fakeGatewayEnv(root, gateway) },
-          args: ["--context-limit", "mcp_description_bytes=8", "acp"],
+          args: ["--context-limit", "mcp_description_bytes=8", "--context-limit", "mcp_selected_schema_bytes=8", "acp"],
         });
         const init = await client.request("initialize", { protocolVersion: 1, clientCapabilities: { session: { notices: false } } }, 1) as any;
         expect(init.error).toBeUndefined();
