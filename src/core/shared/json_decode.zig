@@ -180,7 +180,8 @@ const Sequence = struct {
     shape: SequenceShape,
 
     fn alignment(seq: Sequence) Alignment {
-        return @fromBackingInt(seq.shape.align_log2);
+        // `Alignment` is narrower than the field on 32-bit targets.
+        return @fromBackingInt(@intCast(seq.shape.align_log2));
     }
 };
 
@@ -934,21 +935,17 @@ fn expectSameParse(comptime T: type, input: []const u8, options: json.ParseOptio
 
     const expected = json.parseFromSliceLeaky(T, arena, input, options);
     const actual = parseFromSliceLeaky(T, arena, input, options);
+    // On a mismatch, `std.testing` reports both outcomes.
     if (expected) |expected_value| {
         const actual_value = actual catch |err| {
-            std.debug.print("std.json accepted {s} but json_decode failed with {s}\n", .{ input, @errorName(err) });
-            return error.TestUnexpectedResult;
+            return testing.expectEqual(@as(anyerror!void, {}), @as(anyerror!void, err));
         };
         try testing.expectEqualDeep(expected_value, actual_value);
     } else |expected_err| {
         if (actual) |_| {
-            std.debug.print("std.json rejected {s} with {s} but json_decode accepted it\n", .{ input, @errorName(expected_err) });
-            return error.TestUnexpectedResult;
+            return testing.expectEqual(@as(anyerror!void, expected_err), @as(anyerror!void, {}));
         } else |actual_err| {
-            if (expected_err != actual_err) {
-                std.debug.print("{s}: std.json {s}, json_decode {s}\n", .{ input, @errorName(expected_err), @errorName(actual_err) });
-                return error.TestUnexpectedResult;
-            }
+            try testing.expectEqual(@as(anyerror, expected_err), @as(anyerror, actual_err));
         }
     }
 }
