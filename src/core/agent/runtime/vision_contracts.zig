@@ -227,18 +227,7 @@ pub fn parse_vision_request(
     const object = parsed.value.object;
     var image_ids_value = object.get("image_ids");
     var paths_value = object.get("paths");
-    // Models that fill every schema field send the unused source as null or
-    // []. Next to a real source it names nothing, so it reads as absent.
-    var unused_sources: usize = 0;
-    if (image_ids_value != null and paths_value != null) {
-        if (isUnusedSource(image_ids_value.?)) {
-            image_ids_value = null;
-            unused_sources = 1;
-        } else if (isUnusedSource(paths_value.?)) {
-            paths_value = null;
-            unused_sources = 1;
-        }
-    }
+    const unused_sources = dropUnusedSource(&image_ids_value, &paths_value);
     if (object.count() - unused_sources != 2 or (image_ids_value == null) == (paths_value == null)) {
         return error.InvalidVisionRequest;
     }
@@ -289,6 +278,23 @@ pub fn parse_vision_request(
         .source = source,
         .focus = try alloc.dupe(u8, focus_value.string),
     };
+}
+
+/// Models that fill every schema field send the unused source as null or [].
+/// Next to a real source it names nothing, so this reads it as absent and
+/// returns how many fields it dropped: 1 when it dropped one, otherwise 0.
+fn dropUnusedSource(image_ids: *?std.json.Value, paths: *?std.json.Value) usize {
+    const ids_value = image_ids.* orelse return 0;
+    const paths_value = paths.* orelse return 0;
+    if (isUnusedSource(ids_value)) {
+        image_ids.* = null;
+        return 1;
+    }
+    if (isUnusedSource(paths_value)) {
+        paths.* = null;
+        return 1;
+    }
+    return 0;
 }
 
 fn isUnusedSource(value: std.json.Value) bool {
