@@ -2215,6 +2215,38 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     await expectFixtureProcessesExited(wire);
   }, 30_000);
 
+  test("fx ask tells the model that a stdio call outlived its operation timeout", async () => {
+    const root = createRoot("ask-operation-timeout", MODERN_FIXTURE, {
+      mode: "stall_operation",
+      operationTimeoutMs: 1_500,
+    });
+    const activeGateway = startToolGateway("Operation timeout complete.");
+    gateway = activeGateway;
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Call the stalled MCP fixture."],
+      {
+        cwd: root.workspace,
+        env: fixtureEnv(root, activeGateway),
+        timeoutMs: 20_000,
+      },
+    );
+
+    // fx stops waiting, cancels the call on the server, and tells the model
+    // why and how to wait longer, rather than that the call was cancelled.
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("Operation timeout complete.");
+    expect(activeGateway.requests).toHaveLength(3);
+    const toolResult = toolResultText(activeGateway.requests[2]?.body ?? "", "call_mcp");
+    expect(toolResult).toStartWith("fx stopped waiting for MCP server 'fixture': it did not answer within its operation timeout.");
+    expect(toolResult).toContain("Raise operation_timeout_ms for this server in its MCP config if it needs longer.");
+    expect(toolResult).not.toContain("Cancelled");
+    const wire = readWire(root.wireLogPath);
+    const call = wire.filter((entry) => entry.message.method === "tools/call").at(-1);
+    const cancelled = wire.find((entry) => entry.message.method === "notifications/cancelled");
+    expect(cancelled?.message.params?.requestId).toBe(call?.message.id);
+    await expectFixtureProcessesExited(wire);
+  }, 30_000);
+
   test.skipIf(!tmuxAvailable())(
     "the TUI calls the modern stdio fixture through the shared runtime",
     async () => {

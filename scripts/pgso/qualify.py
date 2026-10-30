@@ -6,6 +6,7 @@ import math
 import os
 import pathlib
 import shlex
+import shutil
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -878,6 +879,8 @@ def measure_startup(
     logs = output_dir / "logs"
     home.mkdir(parents=True, exist_ok=True)
     logs.mkdir(parents=True, exist_ok=True)
+    control_binary = _fresh_copy(control_binary, output_dir / "binaries" / "control")
+    candidate_binary = _fresh_copy(candidate_binary, output_dir / "binaries" / "candidate")
     results: list[MeasurementResult] = []
     startup_samples = max(samples, STARTUP_MINIMUM_SAMPLES)
     startup_rounds = max(
@@ -978,6 +981,24 @@ def measure_startup(
             )
         )
     return tuple(results)
+
+
+def _fresh_copy(binary: pathlib.Path, directory: pathlib.Path) -> pathlib.Path:
+    """A byte-identical copy of `binary` written into `directory` now.
+
+    On Linux a binary whose pages the kernel read back from disk can start 10
+    to 15 percent slower than one written moments ago, with the same page
+    faults. The artifacts were written hours apart and the candidate was run
+    in between, so measuring them in place compares their page-cache state.
+    Copying both just before measuring gives them the same state.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    copy = directory / binary.name
+    shutil.copyfile(binary, copy)
+    shutil.copymode(binary, copy)
+    if sha256_file(copy) != sha256_file(binary):
+        raise PgsoError(f"startup copy of {binary} does not match it")
+    return copy
 
 
 def _measure_microbenchmark(

@@ -171,6 +171,137 @@ class IrSizeTests(LlvmCase):
         self.assertFalse(output.exists())
 
 
+def _blob_layout(ir: str) -> tuple[bytes, dict[str, int]]:
+    """The overlaid blob's bytes and each alias's offset into it."""
+    line = next(l for l in ir.splitlines() if l.startswith("@pgso.overlaid_constants = "))
+    literal = line.split(' c"', 1)[1].rsplit('"', 1)[0]
+    raw, i = bytearray(), 0
+    while i < len(literal):
+        if literal[i] == "\\":
+            raw.append(int(literal[i + 1:i + 3], 16))
+            i += 3
+        else:
+            raw.append(ord(literal[i]))
+            i += 1
+    offsets = {}
+    for l in ir.splitlines():
+        if " alias " in l and "@pgso.overlaid_constants" in l:
+            name = l.split(" =", 1)[0].lstrip("@")
+            offsets[name] = int(l.rsplit("i64 ", 1)[1].rstrip(")")) if "getelementptr" in l else 0
+    return bytes(raw), offsets
+
+
+# Cold (minsize) copies of three error-union results and one null optional.
+OVERLAY = (
+    "%Big = type { [120 x i8] }\n"
+    "%Small = type { [40 x i8] }\n"
+    "@big_a = internal unnamed_addr constant { %Big, i16, [6 x i8] } { %Big undef, i16 653, [6 x i8] undef }, align 8\n"
+    "@big_b = internal unnamed_addr constant { %Big, i16, [6 x i8] } { %Big undef, i16 17, [6 x i8] undef }, align 8\n"
+    "@small = internal unnamed_addr constant { %Small, i16, [6 x i8] } { %Small undef, i16 9, [6 x i8] undef }, align 8\n"
+    "@none = internal unnamed_addr constant { %Big, i8, [7 x i8] } { %Big undef, i8 0, [7 x i8] undef }, align 8\n"
+    + MEMCPY
+    + "define void @cold(ptr %out, i2 %which) minsize {\n"
+    "  switch i2 %which, label %d [ i2 0, label %a i2 1, label %b i2 -2, label %s ]\n"
+    "a:\n  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %out, ptr align 8 @big_a, i64 %n.a, i1 false)\n  ret void\n"
+    "b:\n  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %out, ptr align 8 @big_b, i64 %n.a, i1 false)\n  ret void\n"
+    "s:\n  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %out, ptr align 8 @small, i64 %n.a, i1 false)\n  ret void\n"
+    "d:\n  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %out, ptr align 8 @none, i64 %n.a, i1 false)\n  ret void\n"
+    "}\n"
+).replace("%n.a", "128")
+
+
+@unittest.skipUnless(AVAILABLE, "pinned LLVM with libLLVM is not installed")
+class OverlayConstantTests(LlvmCase):
+    def text(self, bitcode: pathlib.Path) -> str:
+        return subprocess.run(
+            [str(LLVM_BIN / "llvm-dis"), str(bitcode), "-o", "-"], check=True, capture_output=True, text=True
+        ).stdout
+
+    def test_mostly_undefined_constants_share_one_blob_and_keep_their_bytes(self) -> None:
+        source = self.assemble(
+            "overlay",
+            OVERLAY
+            + "define i16 @code_a() minsize {\n  %v = load i16, ptr getelementptr inbounds (i8, ptr @big_a, i64 120), align 8\n  ret i16 %v\n}\n"
+            "define i16 @code_b() minsize {\n  %v = load i16, ptr getelementptr inbounds (i8, ptr @big_b, i64 120), align 8\n  ret i16 %v\n}\n"
+            "define i8 @tag() minsize {\n  %v = load i8, ptr getelementptr inbounds (i8, ptr @none, i64 120), align 8\n  ret i8 %v\n}\n",
+        )
+        result, output = self.run_pass("overlay-constants", source)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("", result.stderr)
+        self.assertIn('"members": 4', result.stdout)
+        ir = self.cleaned_ir(output)
+        blob, offsets = _blob_layout(ir)
+        self.assertEqual({"big_a", "big_b", "small", "none"}, set(offsets))
+        self.assertLess(len(blob), 3 * 128 + 48)
+        for name, offset in offsets.items():
+            self.assertEqual(0, offset % 8, name)
+            self.assertLessEqual(offset + (48 if name == "small" else 128), len(blob), name)
+        self.assertEqual(653, int.from_bytes(blob[offsets["big_a"] + 120:][:2], "little"))
+        self.assertEqual(17, int.from_bytes(blob[offsets["big_b"] + 120:][:2], "little"))
+        self.assertEqual(9, int.from_bytes(blob[offsets["small"] + 40:][:2], "little"))
+        self.assertEqual(0, blob[offsets["none"] + 120])
+        # Loads through the aliases still fold to the original defined bytes.
+        folded = self.root / "folded.bc"
+        subprocess.run([str(LLVM_BIN / "opt"), "-passes=instsimplify", str(output), "-o", str(folded)], check=True)
+        folded_ir = self.text(folded)
+        self.assertIn("ret i16 653", folded_ir)
+        self.assertIn("ret i16 17", folded_ir)
+        self.assertIn("ret i8 0", folded_ir)
+
+    def test_small_and_hot_members_read_zeros_in_their_undefined_bytes(self) -> None:
+        source = self.assemble(
+            "guarded",
+            OVERLAY
+            + "define i16 @hot() {\n  %v = load i16, ptr getelementptr inbounds (i8, ptr @big_b, i64 120), align 8\n  ret i16 %v\n}\n",
+        )
+        result, output = self.run_pass("overlay-constants", source)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn('"guarded_members": 2', result.stdout)
+        blob, offsets = _blob_layout(self.cleaned_ir(output))
+        for name, size, code_at in (("small", 48, 40), ("big_b", 128, 120)):
+            extent = bytearray(blob[offsets[name]:offsets[name] + size])
+            extent[code_at:code_at + 2] = b"\0\0"
+            self.assertEqual(bytes(size), bytes(extent), name)
+
+    def test_pointer_address_and_placed_constants_are_untouched(self) -> None:
+        source = self.assemble(
+            "kept",
+            "@target = global i64 0\n"
+            "@relocated = internal unnamed_addr constant { ptr, [120 x i8] } { ptr @target, [120 x i8] undef }, align 8\n"
+            "@compared = internal unnamed_addr constant { [120 x i8], i16, [6 x i8] } { [120 x i8] undef, i16 3, [6 x i8] undef }, align 8\n"
+            "@named = internal unnamed_addr constant { [120 x i8], i16, [6 x i8] } { [120 x i8] undef, i16 4, [6 x i8] undef }, section \"__TEXT,__fx\", align 8\n"
+            "@significant = internal constant { [120 x i8], i16, [6 x i8] } { [120 x i8] undef, i16 5, [6 x i8] undef }, align 8\n"
+            "declare void @use(ptr)\n"
+            "define i1 @f(ptr %p) minsize {\n"
+            "  call void @use(ptr @relocated)\n  call void @use(ptr @named)\n  call void @use(ptr @significant)\n"
+            "  %c = icmp eq ptr %p, @compared\n  ret i1 %c\n}\n",
+        )
+        result, output = self.run_pass("overlay-constants", source)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn('"members": 0', result.stdout)
+        ir = self.cleaned_ir(output)
+        self.assertNotIn("@pgso.overlaid_constants", ir)
+        for name in ("relocated", "compared", "named", "significant"):
+            self.assertIn(f"@{name} = internal", ir)
+
+    def test_constants_listed_as_used_stay_globals(self) -> None:
+        source = self.assemble(
+            "used",
+            OVERLAY + '@llvm.used = appending global [1 x ptr] [ptr @big_a], section "llvm.metadata"\n',
+        )
+        result, output = self.run_pass("overlay-constants", source)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn('"members": 3', result.stdout)
+        ir = self.cleaned_ir(output)
+        self.assertIn("@big_a = internal unnamed_addr constant", ir)
+        self.assertIn("[ptr @big_a]", ir)
+        self.assertEqual({"big_b", "small", "none"}, set(_blob_layout(ir)[1]))
+
+
 if __name__ == "__main__":
     unittest.main()
 
