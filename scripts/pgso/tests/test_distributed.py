@@ -161,10 +161,11 @@ class WorkflowContractTests(unittest.TestCase):
         )[0]
 
         self.assertIn("  zig:\n", action)
-        self.assertIn(
-            "if: inputs.zig == 'true' || inputs.llvm == 'true'",
-            action,
-        )
+        for runner_os in ("macOS", "Linux"):
+            self.assertIn(
+                f"if: runner.os == '{runner_os}' && (inputs.zig == 'true' || inputs.llvm == 'true')",
+                action,
+            )
         self.assertIn('          zig: "true"', behavior_job)
         self.assertNotIn('          llvm: "true"', behavior_job)
 
