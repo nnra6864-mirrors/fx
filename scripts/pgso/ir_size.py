@@ -3,6 +3,7 @@
 
     ir_size.py --libllvm <libLLVM.dylib> outline-helpers <in.bc> <out.bc>
     ir_size.py --libllvm <libLLVM.dylib> sparse-constants <in.bc> <out.bc>
+    ir_size.py --libllvm <libLLVM.dylib> overlay-constants <in.bc> <out.bc>
     ir_size.py --libllvm <libLLVM.dylib> expand-constant-exprs <in.bc> <out.bc>
     ir_size.py --libllvm <libLLVM.dylib> swap-compares <in.bc> <out.bc>
     ir_size.py --libllvm <libLLVM.dylib> check-outlined <in.bc>
@@ -24,6 +25,20 @@ from a function returning a large `E!T` as a constant `{ T undef, code,
 padding undef }` copied into the result. Copying undefined bytes is refined
 by leaving the destination bytes unchanged, so only the defined bytes are
 stored. Run `opt -passes=globaldce,verify` afterwards to drop dead constants.
+
+overlay-constants packs the mostly undefined internal constants that are
+still referenced, the same `return error.X` results plus `return null` results
+`{ T undef, i8 0 }`, into one shared constant. They are `unnamed_addr`, so
+only their contents matter, and an undefined byte may hold any value: two
+constants can overlap wherever neither defines a byte the other defines
+differently. Each keeps its alignment and its full size inside the blob and
+becomes an alias of its offset, so every reference stays its own symbol. A
+constant that hot code uses, or one small enough for codegen to expand its
+copies into stores, never gets another constant's nonzero byte in its
+undefined bytes, so those copies still read zeros and compile as before.
+Constants that hold relocated pointers, compare or convert their address,
+live in a named section, are thread-local, or are listed in llvm.used stay as
+they are. Run it after sparse-constants, then `opt -passes=globaldce,verify`.
 
 expand-constant-exprs rebuilds each constant expression an instruction uses
 as an operand, such as `getelementptr (i8, ptr @g, i64 16)`, as an
@@ -71,6 +86,7 @@ matches, because that means std naming changed and the pass went stale.
 from __future__ import annotations
 
 import argparse
+import bisect
 import ctypes as C
 import json
 import pathlib
@@ -92,6 +108,14 @@ MAX_DEFINED_BYTES = 128
 MAX_LEAVES = 16
 MEMCPY_SITE_BYTES = 16
 STORE_BYTES = 8
+# overlay-constants: at most this share of a member's bytes may be defined
+# and nonzero, and members below OVERLAY_GUARD_BYTES (the largest copy
+# AArch64 expands into stores in size-optimized code) keep zeros in their
+# undefined bytes.
+OVERLAY_MAX_NONZERO_SHARE = 0.25
+OVERLAY_GUARD_BYTES = 64
+OVERLAY_MAX_ALIGN = 16
+OVERLAY_BLOB = b"pgso.overlaid_constants"
 
 P = C.c_void_p
 STRUCT, ARRAY, INTEGER, POINTER = 10, 11, 8, 12
@@ -99,6 +123,8 @@ FLOATS = (1, 2, 3)
 INTERNAL_LINKAGE, PRIVATE_LINKAGE = 8, 9
 FUNCTION_INDEX = 0xFFFFFFFF
 GET_ELEMENT_PTR = 29
+PTR_TO_INT, INT_TO_PTR = 39, 40
+GLOBAL_UNNAMED_ADDR = 2
 CASTS = {30: "trunc", 39: "ptrtoint", 40: "inttoptr", 41: "bitcast", 60: "addrspacecast", 69: "ptrtoaddr"}
 OUTLINED_PREFIX = "outlined_ir_func"
 
@@ -206,6 +232,30 @@ class Llvm:
         self.SetDebugLoc = f("LLVMInstructionSetDebugLoc", None, P, P)
         self.ReplaceAllUses = f("LLVMReplaceAllUsesWith", None, P, P)
         self.SetValueName2 = f("LLVMSetValueName2", None, P, C.c_char_p, C.c_size_t)
+        self.GetUnnamedAddress = f("LLVMGetUnnamedAddress", C.c_int, P)
+        self.SetUnnamedAddress = f("LLVMSetUnnamedAddress", None, P, C.c_int)
+        self.GetSection = f("LLVMGetSection", C.c_char_p, P)
+        self.IsThreadLocal = f("LLVMIsThreadLocal", C.c_int, P)
+        self.IsExternallyInitialized = f("LLVMIsExternallyInitialized", C.c_int, P)
+        self.GetComdat = f("LLVMGetComdat", P, P)
+        self.GetAlignment = f("LLVMGetAlignment", C.c_uint, P)
+        self.IsAConstantDataSequential = f("LLVMIsAConstantDataSequential", P, P)
+        self.GetAsString = f("LLVMGetAsString", C.c_void_p, P, C.POINTER(C.c_size_t))
+        self.IntWidth = f("LLVMGetIntTypeWidth", C.c_uint, P)
+        self.IsAGlobalValue = f("LLVMIsAGlobalValue", P, P)
+        self.InstOpcode = f("LLVMGetInstructionOpcode", C.c_int, P)
+        self.InstParent = f("LLVMGetInstructionParent", P, P)
+        self.BlockParent = f("LLVMGetBasicBlockParent", P, P)
+        self.GetNamedGlobal = f("LLVMGetNamedGlobal", P, P, C.c_char_p)
+        self.AddGlobal = f("LLVMAddGlobal", P, P, P, C.c_char_p)
+        self.AddAlias2 = f("LLVMAddAlias2", P, P, P, C.c_uint, P, C.c_char_p)
+        self.SetInitializer = f("LLVMSetInitializer", None, P, P)
+        self.SetGlobalConstant = f("LLVMSetGlobalConstant", None, P, C.c_int)
+        self.SetLinkage = f("LLVMSetLinkage", None, P, C.c_int)
+        self.ArrayType2 = f("LLVMArrayType2", P, P, C.c_ulonglong)
+        self.ConstString = f("LLVMConstStringInContext2", P, P, C.c_char_p, C.c_size_t, C.c_int)
+        self.ConstGEP2 = f("LLVMConstInBoundsGEP2", P, P, P, C.POINTER(P), C.c_uint)
+        self.DeleteGlobal = f("LLVMDeleteGlobal", None, P)
 
     def _fn(self, name, res, *args):
         fn = getattr(self.lib, name)
@@ -370,6 +420,211 @@ def sparse_constants(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> 
         except _Skip:
             pass
         glob = following
+    llvm.save(mod, output)
+    return summary
+
+
+def _image(llvm: Llvm, td, value, base: int, image: bytearray, defined: bytearray) -> None:
+    """Record the defined bytes of a constant; undefined bytes stay unset."""
+    if llvm.IsUndef(value):
+        return
+    ty = llvm.TypeOf(value)
+    size = llvm.ABISize(td, ty)
+    if llvm.IsNull(value):
+        defined[base:base + size] = b"\1" * size
+        return
+    kind = llvm.TypeKind(ty)
+    if kind == STRUCT:
+        for i in range(llvm.CountStructElems(ty)):
+            _image(llvm, td, llvm.AggElem(value, i), base + llvm.OffsetOfElement(td, ty, i), image, defined)
+        return
+    if kind == ARRAY:
+        element = llvm.ElementType(ty)
+        if llvm.IsAConstantDataSequential(value):
+            if llvm.TypeKind(element) != INTEGER or llvm.IntWidth(element) != 8:
+                raise _Skip("dense numeric array")
+            length = C.c_size_t()
+            raw = C.string_at(llvm.GetAsString(value, C.byref(length)), length.value)
+            image[base:base + len(raw)] = raw
+            defined[base:base + len(raw)] = b"\1" * len(raw)
+            return
+        stride = llvm.ABISize(td, element)
+        for i in range(llvm.ArrayLen(ty)):
+            item = llvm.AggElem(value, i)
+            if not item:
+                raise _Skip("unreadable array element")
+            _image(llvm, td, item, base + i * stride, image, defined)
+        return
+    if kind == INTEGER and llvm.IsAConstantInt(value) and llvm.IntWidth(ty) <= 64:
+        width = (llvm.IntWidth(ty) + 7) // 8
+        image[base:base + width] = llvm.ConstZExt(value).to_bytes(8, "little")[:width]
+        defined[base:base + size] = b"\1" * size
+        return
+    if kind == POINTER and llvm.IsAConstantExpr(value) and llvm.ConstOpcode(value) == INT_TO_PTR:
+        inner = llvm.GetOperand(value, 0)
+        if llvm.IsAConstantInt(inner):
+            image[base:base + 8] = llvm.ConstZExt(inner).to_bytes(8, "little")
+            defined[base:base + 8] = b"\1" * 8
+            return
+    raise _Skip("relocated or unsupported leaf")
+
+
+def _address_used(llvm: Llvm, value, depth: int = 0) -> bool:
+    """True when a use compares the address or converts it to an integer."""
+    use = llvm.FirstUse(value)
+    while use:
+        user = llvm.GetUser(use)
+        if llvm.IsAInstruction(user):
+            if llvm.IsAICmpInst(user) or llvm.InstOpcode(user) == PTR_TO_INT:
+                return True
+        elif llvm.IsAConstantExpr(user) and llvm.ConstOpcode(user) == PTR_TO_INT:
+            return True
+        elif not llvm.IsAGlobalValue(user) and (depth >= 4 or _address_used(llvm, user, depth + 1)):
+            return True
+        use = llvm.NextUse(use)
+    return False
+
+
+def _used_by_hot_code(llvm: Llvm, value, minsize: int, depth: int = 0) -> bool:
+    use = llvm.FirstUse(value)
+    while use:
+        user = llvm.GetUser(use)
+        if llvm.IsAInstruction(user):
+            if not llvm.GetEnumAttrAt(llvm.BlockParent(llvm.InstParent(user)), FUNCTION_INDEX, minsize):
+                return True
+        elif not llvm.IsAGlobalValue(user) and (depth >= 4 or _used_by_hot_code(llvm, user, minsize, depth + 1)):
+            return True
+        use = llvm.NextUse(use)
+    return False
+
+
+def _listed_as_used(llvm: Llvm, mod) -> set:
+    """Globals that llvm.used or llvm.compiler.used keep; an alias cannot
+    stand in for them there."""
+    listed = set()
+    for name in (b"llvm.used", b"llvm.compiler.used"):
+        used = llvm.GetNamedGlobal(mod, name)
+        init = llvm.GetInitializer(used) if used else None
+        if init:
+            for i in range(llvm.NumOperands(init)):
+                listed.add(llvm.GetOperand(init, i))
+    return listed
+
+
+def _overlay_members(llvm: Llvm, mod, td, minsize: int) -> list:
+    members = []
+    listed = _listed_as_used(llvm, mod)
+    glob = llvm.FirstGlobal(mod)
+    while glob:
+        try:
+            if glob in listed:
+                raise _Skip("listed as used")
+            if llvm.GetLinkage(glob) not in (INTERNAL_LINKAGE, PRIVATE_LINKAGE) or not llvm.IsGlobalConstant(glob):
+                raise _Skip("not an internal constant")
+            if llvm.GetUnnamedAddress(glob) != GLOBAL_UNNAMED_ADDR:
+                raise _Skip("significant address")
+            if llvm.GetSection(glob) or llvm.IsThreadLocal(glob) or llvm.GetComdat(glob) or llvm.IsExternallyInitialized(glob):
+                raise _Skip("placed constant")
+            size = llvm.ABISize(td, llvm.GlobalValueType(glob))
+            align = max(llvm.GetAlignment(glob), 1)
+            init = llvm.GetInitializer(glob)
+            if not init or size < MIN_CONSTANT_BYTES or align > OVERLAY_MAX_ALIGN or not llvm.FirstUse(glob):
+                raise _Skip("not a candidate")
+            image, defined = bytearray(size), bytearray(size)
+            _image(llvm, td, init, 0, image, defined)
+            leaves = [(offset, image[offset]) for offset in range(size) if defined[offset]]
+            nonzero = sum(1 for _, byte in leaves if byte)
+            if nonzero > OVERLAY_MAX_NONZERO_SHARE * size or _address_used(llvm, glob):
+                raise _Skip("dense or address used")
+            guarded = size < OVERLAY_GUARD_BYTES or _used_by_hot_code(llvm, glob, minsize)
+            members.append((nonzero, size, align, guarded, leaves, glob))
+        except _Skip:
+            pass
+        glob = llvm.NextGlobal(glob)
+    # The members with the most nonzero bytes are the hardest to place.
+    members.sort(key=lambda m: (-m[0], -m[1], -m[2]))
+    return members
+
+
+def _pack(members: list) -> tuple[bytearray, list[int]]:
+    """First fit: each member at the lowest aligned offset where its defined
+    bytes agree with the blob and no guarded member's undefined byte would
+    receive a nonzero byte."""
+    blob, defined, guard = bytearray(), bytearray(), bytearray()
+    nonzero_at: list[int] = []
+    offsets = []
+    for _, size, align, guarded, leaves, _ in members:
+        own = {offset: byte for offset, byte in leaves if byte}
+        base = 0
+        while True:
+            end = len(blob)
+            ok = all(
+                base + offset >= end
+                or not (defined[base + offset] and blob[base + offset] != byte)
+                and not (byte and guard[base + offset] and not defined[base + offset])
+                for offset, byte in leaves
+            )
+            if ok and guarded:
+                i = bisect.bisect_left(nonzero_at, base)
+                while ok and i < len(nonzero_at) and nonzero_at[i] < base + size:
+                    ok = own.get(nonzero_at[i] - base) == blob[nonzero_at[i]]
+                    i += 1
+            if ok:
+                break
+            base += align
+        grow = base + size - len(blob)
+        if grow > 0:
+            blob.extend(bytes(grow))
+            defined.extend(bytes(grow))
+            guard.extend(bytes(grow))
+        for offset, byte in leaves:
+            if byte and not (defined[base + offset] and blob[base + offset] == byte):
+                bisect.insort(nonzero_at, base + offset)
+            blob[base + offset] = byte
+            defined[base + offset] = 1
+        if guarded:
+            mine = {offset for offset, _ in leaves}
+            for offset in range(size):
+                if offset not in mine:
+                    guard[base + offset] = 1
+        offsets.append(base)
+    return blob, offsets
+
+
+def overlay_constants(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> dict:
+    ctx, mod = llvm.load(source)
+    td = llvm.CreateTD(llvm.GetDL(mod))
+    i8, i64 = llvm.Int8Ty(ctx), llvm.Int64Ty(ctx)
+    members = _overlay_members(llvm, mod, td, llvm.kind("minsize"))
+    summary = {
+        "pass": "overlay-constants",
+        "members": len(members),
+        "guarded_members": sum(1 for m in members if m[3]),
+        "member_bytes": sum(m[1] for m in members),
+        "blob_bytes": 0,
+    }
+    if members:
+        blob_bytes, offsets = _pack(members)
+        summary["blob_bytes"] = len(blob_bytes)
+        blob = llvm.AddGlobal(mod, llvm.ArrayType2(i8, len(blob_bytes)), OVERLAY_BLOB)
+        llvm.SetInitializer(blob, llvm.ConstString(ctx, bytes(blob_bytes), len(blob_bytes), 1))
+        llvm.SetGlobalConstant(blob, 1)
+        llvm.SetLinkage(blob, INTERNAL_LINKAGE)
+        llvm.SetUnnamedAddress(blob, GLOBAL_UNNAMED_ADDR)
+        llvm.SetAlignment(blob, max(m[2] for m in members))
+        for (_, _, _, _, _, glob), base in zip(members, offsets):
+            index = (P * 1)(llvm.ConstInt(i64, base, 0))
+            target = llvm.ConstGEP2(i8, blob, index, 1) if base else blob
+            # One alias per member keeps each reference its own symbol, so
+            # codegen does not share a blob base across a function's offsets.
+            name = llvm.name(glob).encode()
+            llvm.SetValueName2(glob, b"", 0)
+            alias = llvm.AddAlias2(mod, llvm.GlobalValueType(glob), 0, target, name)
+            llvm.SetLinkage(alias, INTERNAL_LINKAGE)
+            llvm.SetUnnamedAddress(alias, GLOBAL_UNNAMED_ADDR)
+            llvm.ReplaceAllUses(glob, alias)
+            llvm.DeleteGlobal(glob)
+    summary["saved_bytes"] = summary["member_bytes"] - summary["blob_bytes"]
     llvm.save(mod, output)
     return summary
 
@@ -585,6 +840,7 @@ def main(argv: list[str] | None = None) -> int:
         choices=(
             "outline-helpers",
             "sparse-constants",
+            "overlay-constants",
             "expand-constant-exprs",
             "swap-compares",
             "check-outlined",
@@ -610,6 +866,7 @@ def main(argv: list[str] | None = None) -> int:
             run = {
                 "outline-helpers": outline_helpers,
                 "sparse-constants": sparse_constants,
+                "overlay-constants": overlay_constants,
                 "expand-constant-exprs": expand_constant_exprs,
                 "swap-compares": swap_compares,
                 "minsize-functions": minsize_functions,

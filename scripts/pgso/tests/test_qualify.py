@@ -72,11 +72,11 @@ class PgsoQualificationTests(unittest.TestCase):
                 label = command[index + 1]
                 binary = command[index + 2].split(" ", 1)[0]
                 if label == "control":
-                    self.assertEqual(str(control), binary)
+                    self.assertEqual(str(self.measured_copy("control", control)), binary)
                     times = [1.0] * runs
                 else:
                     self.assertEqual("candidate", label)
-                    self.assertEqual(str(candidate), binary)
+                    self.assertEqual(str(self.measured_copy("candidate", candidate)), binary)
                     times = [0.9] * runs
                 results.append({"command": label, "times": times})
             export_path.parent.mkdir(parents=True, exist_ok=True)
@@ -84,6 +84,9 @@ class PgsoQualificationTests(unittest.TestCase):
             return CommandResult(command, 0, "", "", 0.01)
 
         return calls, fake_run
+
+    def measured_copy(self, label: str, binary: pathlib.Path) -> pathlib.Path:
+        return self.root / "measurements" / "binaries" / label / binary.name
 
     def write_hyperfine_export(self, results) -> pathlib.Path:
         path = self.root / "hyperfine.json"
@@ -247,14 +250,45 @@ class PgsoQualificationTests(unittest.TestCase):
 
         self.assertTrue(all(result.passed for result in results))
         self.assertEqual(b"canonical", canonical.read_bytes())
+        control_copy = self.measured_copy("control", control)
+        candidate_copy = self.measured_copy("candidate", candidate)
         self.assertEqual(
             [
-                (str(control), "help"),
-                (str(candidate), "help"),
+                (str(control_copy), "help"),
+                (str(candidate_copy), "help"),
             ],
             calls[:2],
         )
+        self.assertEqual((b"control", b"candidate"), (control_copy.read_bytes(), candidate_copy.read_bytes()))
+        self.assertEqual((b"control", b"candidate"), (control.read_bytes(), candidate.read_bytes()))
         self.assertNotIn(str(canonical), {command[0] for command in calls})
+
+    def test_startup_measurement_refuses_a_copy_that_differs_from_its_artifact(self) -> None:
+        control = self.root / "control" / "fx"
+        candidate = self.root / "candidate" / "fx"
+        hyperfine = self.root / "tools" / "hyperfine"
+        for path in (control, candidate, hyperfine):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"executable")
+
+        def truncated_copy(source, destination):
+            pathlib.Path(destination).write_bytes(b"exec")
+
+        with (
+            mock.patch("scripts.pgso.qualify.shutil.copyfile", side_effect=truncated_copy),
+            mock.patch("scripts.pgso.qualify.run_checked") as run,
+            self.assertRaisesRegex(PgsoError, "does not match"),
+        ):
+            measure_startup(
+                repo_root=self.root,
+                control_binary=control,
+                candidate_binary=candidate,
+                hyperfine_binary=hyperfine,
+                output_dir=self.root / "measurements",
+                samples=50,
+                timeout_s=10,
+            )
+        run.assert_not_called()
 
     def test_startup_measurement_runs_only_the_assigned_command(self) -> None:
         control = self.root / "control" / "fx"
