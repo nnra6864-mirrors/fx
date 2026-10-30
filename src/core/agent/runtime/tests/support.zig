@@ -772,7 +772,7 @@ pub const FakeAgentRuntimeDeps = struct {
                 .set = setRecoveryCheckpoint,
                 .clear = clearRecoveryCheckpoint,
             } else null,
-            .restore_failed_prompt = if (self.capture_restored_prompts) restoreFailedPrompt else null,
+            .restore_failed_prompt = if (self.capture_restored_prompts or self.record_restored_prompt) restoreFailedPrompt else null,
             .confirm_session_writer = confirmSessionWriter,
             .propagate_grant = @This().propagateGrant,
             .push_event = pushEvent,
@@ -787,7 +787,6 @@ pub const FakeAgentRuntimeDeps = struct {
             .push_http_error = httpError,
             .refresh_gateway_credential = refreshGatewayCredential,
             .ask_out_of_credits = askOutOfCredits,
-            .restore_failed_prompt = if (self.record_restored_prompt) restoreFailedPrompt else null,
             .available_model_capabilities = availableModelCapabilities,
             .resolve_model_capabilities = resolveModelCapabilities,
             .model_catalog_unavailable = catalogUnavailable,
@@ -818,6 +817,8 @@ pub const FakeAgentRuntimeDeps = struct {
 
     fn restoreFailedPrompt(raw: *anyopaque, prompt: []const u8) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        if (self.record_restored_prompt) try self.record("restore_failed_prompt:{s}", .{prompt});
+        if (!self.capture_restored_prompts) return;
         const owned = try self.alloc.dupe(u8, prompt);
         errdefer self.alloc.free(owned);
         try self.restored_prompts.append(self.alloc, owned);
@@ -951,11 +952,6 @@ pub const FakeAgentRuntimeDeps = struct {
             .handoff => .handoff,
             .interrupt => .interrupt,
         };
-    }
-
-    fn restoreFailedPrompt(raw: *anyopaque, prompt: []const u8) !void {
-        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        try self.record("restore_failed_prompt:{s}", .{prompt});
     }
 
     fn askOutOfCredits(raw: *anyopaque) !runtime_deps.OutOfCreditsChoice {
