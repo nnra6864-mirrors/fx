@@ -131,11 +131,11 @@ pub fn run(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, command: Co
     const reply = call(arena, io, socket_path, token, operation) catch |e| switch (e) {
         error.OutOfMemory => return e,
         error.UnsupportedReply => {
-            try err.writeAll("fx mcp call: the running fx session is another fx version.\n");
+            try err.writeAll("fx mcp call: the running fx session is another fx version. Run the fx that started the session, or restart the session with this one.\n");
             return exit.unavailable;
         },
         error.ConnectionLost, error.MalformedReply => {
-            try err.print("fx mcp call: the connection to fx was lost ({s}). The call may have run.\n", .{@errorName(e)});
+            try err.print("fx mcp call: the connection to fx was lost ({s}). The call may have run; check its effect before running it again.\n", .{@errorName(e)});
             return exit.failed;
         },
         else => return unavailable(err),

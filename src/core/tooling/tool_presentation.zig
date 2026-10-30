@@ -622,7 +622,6 @@ fn formatTerminalDisplayTarget(
     return encoded.bytes;
 }
 
-/// Borrows the name from the prepared action without replacing resource labels.
 /// The action label of an MCP tool's row while it runs, and once it ran.
 pub const mcp_running_label = "Running MCP";
 pub const mcp_ran_label = "Ran MCP";
@@ -632,6 +631,7 @@ pub fn formatToolActionValue(alloc: Allocator, label: []const u8, value: []const
     return alloc.print("● {s}\x1b[0m {s}{s}\x1b[0m", .{ label, shared_theme.current().tool_stdout_style, value });
 }
 
+/// Borrows the name from the prepared action without replacing resource labels.
 pub fn resolvedSkillName(call: ToolCall, presentation: tool_dispatch.CallPresentation) ?[]const u8 {
     if (presentation.label_arg_kind != .name) return null;
     const selected = call.resolved_skill orelse return null;

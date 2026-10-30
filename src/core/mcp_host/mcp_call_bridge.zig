@@ -318,12 +318,12 @@ fn writeReply(stream: std.Io.net.Stream, status: wire.Status, reason: ?wire.Reas
 
 fn refusalMessage(reason: wire.Reason) []const u8 {
     return switch (reason) {
-        .closed => "The fx session's shell call that started this command has ended.",
-        .unauthorized => "This command was not started by a running fx shell call, or that call has ended.",
-        .unsupported_version => "This fx mcp call is from another fx version than the running session.",
+        .closed => "The fx session's shell call that started this command has ended. Run fx mcp call from a command in a new shell call.",
+        .unauthorized => "This command was not started by a running fx shell call, or that call has ended. Run fx mcp call from a command fx's shell tool runs, not from one left running in the background.",
+        .unsupported_version => "This fx mcp call is from another fx version than the running session. Run the fx that started the session, or restart the session with this one.",
         .busy => "Too many fx mcp call requests are running in this session. Nothing ran; try again when one finishes.",
-        .malformed => "The request was not an fx mcp call request.",
-        .too_large => "The request's arguments are too large.",
+        .malformed => "The request was not an fx mcp call request. Send requests with the fx that started the session.",
+        .too_large => "The request is over 1 MiB. Pass smaller arguments.",
     };
 }
 

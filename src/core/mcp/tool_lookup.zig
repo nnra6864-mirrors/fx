@@ -13,14 +13,17 @@ const tool_args = @import("../tooling/tool_args.zig");
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
 
+/// The longest tool name `list`, `search`, and `help` print.
+const max_name_bytes = 256;
 /// The longest description on a `list` or `search` line.
 pub const max_line_description_bytes = 160;
 /// The longest tool description `help` prints.
 pub const max_help_description_bytes = 2000;
 /// The longest argument description `help` prints.
 const max_argument_description_bytes = 200;
-/// The most top-level arguments `help` lists.
+/// The most top-level arguments `help` lists, and the widest its name column gets.
 const max_arguments = 64;
+const max_name_column = 40;
 /// How deep `help` spells out nested objects, and how many of their keys.
 const max_type_depth = 3;
 const max_inline_keys = 12;
@@ -57,7 +60,7 @@ pub fn writeToolLines(arena: Allocator, out: *Writer, page_json: []const u8) Pag
         if (tool != .object) continue;
         const name = tool.object.get("name") orelse continue;
         if (name != .string or name.string.len == 0) continue;
-        try writeSafe(arena, out, name.string, 256);
+        try writeSafe(arena, out, name.string, max_name_bytes);
         try out.writeByte('\t');
         if (tool_args.optionalStringArg(tool.object, "description")) |description| {
             try writeSafe(arena, out, description, max_line_description_bytes);
@@ -106,7 +109,7 @@ pub fn writeHelp(arena: Allocator, out: *Writer, schema_json: []const u8) HelpEr
     if (value != .object) return error.InvalidToolSchema;
     const name = tool_args.optionalStringArg(value.object, "name") orelse return error.InvalidToolSchema;
     if (name.len == 0) return error.InvalidToolSchema;
-    try writeSafe(arena, out, name, 256);
+    try writeSafe(arena, out, name, max_name_bytes);
     try out.writeByte('\n');
     if (tool_args.optionalStringArg(value.object, "description")) |description| {
         try writeDescription(arena, out, description);
@@ -139,7 +142,7 @@ pub fn writeHelp(arena: Allocator, out: *Writer, schema_json: []const u8) HelpEr
         try out.writeAll(line);
         const description = if (entry.value_ptr.* == .object) tool_args.optionalStringArg(entry.value_ptr.object, "description") else null;
         if (description) |text| if (text.len > 0) {
-            try out.splatByteAll(' ', @min(width, 40) -| line.len + 2);
+            try out.splatByteAll(' ', @min(width, max_name_column) -| line.len + 2);
             try writeSafe(arena, out, text, max_argument_description_bytes);
         };
         try out.writeByte('\n');
