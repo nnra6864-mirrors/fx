@@ -8,6 +8,7 @@ const model_provider = @import("../config/model_provider.zig");
 const context_limits = @import("../config/context_limits.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const json_decode = @import("../shared/json_decode.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -515,7 +516,7 @@ pub fn decodeConversationFrameLeaky(
     if (bytes.len == 0 or bytes.len > event_frame_max_bytes or bytes[bytes.len - 1] != '\n') {
         return error.InvalidConversationFrame;
     }
-    const value = std.json.parseFromSliceLeaky(ConversationEnvelope, arena, bytes, .{
+    const value = json_decode.parseFromSliceLeaky(ConversationEnvelope, arena, bytes, .{
         .allocate = allocate,
         .max_value_len = event_frame_max_bytes,
     }) catch |err| switch (err) {
