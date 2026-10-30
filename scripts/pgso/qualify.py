@@ -528,7 +528,7 @@ def _external_control_link_argv(
         "-target",
         toolchain.target,
         "-O2",
-        "-Wl,-dead_strip",
+        *toolchain.platform.ZIG_CC_LINK_FLAGS,
         "-s",
         str(object_path),
         "-o",
@@ -583,14 +583,16 @@ def build_external_o2_control(
         log_path=paths.logs / "external-control-link.json",
         require_empty_stderr=True,
     )
-    run_checked(
-        (str(toolchain.tools.strip), "-S", "-x", str(binary)),
-        cwd=paths.root,
-        env=os.environ.copy(),
-        timeout_s=120,
-        log_path=paths.logs / "external-control-strip.json",
-        require_empty_stderr=True,
-    )
+    strip_argv = toolchain.platform.external_control_strip_argv(toolchain, binary)
+    if strip_argv:
+        run_checked(
+            strip_argv,
+            cwd=paths.root,
+            env=os.environ.copy(),
+            timeout_s=120,
+            log_path=paths.logs / "external-control-strip.json",
+            require_empty_stderr=True,
+        )
     if not binary.is_file() or binary.stat().st_size == 0:
         raise PgsoError(f"external O2 control is missing or empty: {binary}")
     return binary
@@ -603,7 +605,7 @@ def build_benchmark_pair(
     plan: BenchmarkPlan,
 ) -> BenchmarkPair:
     paths = PipelinePaths.create(output_root, selector=plan.selector)
-    spec = ArtifactSpec(repo_root=repo_root, selector=plan.selector)
+    spec = ArtifactSpec(repo_root=repo_root, target=toolchain.target, selector=plan.selector)
     bitcode_sha256 = emit_bitcode(toolchain, spec, paths)
     external_control = build_external_o2_control(toolchain, paths)
     control = toolchain.platform.read_control_identity(

@@ -291,6 +291,36 @@ class CandidateEvidence:
     version_output: str
 
 
+# LLVM IR names, for ordering the outlined helpers after their callers.
+_LLVM_FUNCTION_NAME = re.compile(
+    r'@("(?:[^"\\]|\\[0-9a-fA-F]{2})*"|[A-Za-z$._][A-Za-z$._0-9]*)\('
+)
+
+
+_OUTLINED_IR_CALL = re.compile(
+    r"@(outlined_ir_func_[0-9]+(?:\.[0-9]+)?)\("
+)
+
+
+def _decode_llvm_identifier(value: str) -> str:
+    if not value.startswith('"'):
+        return value
+    raw = value[1:-1]
+    decoded = bytearray()
+    index = 0
+    while index < len(raw):
+        if raw[index] == "\\":
+            decoded.append(int(raw[index + 1:index + 3], 16))
+            index += 3
+        else:
+            decoded.extend(raw[index].encode())
+            index += 1
+    try:
+        return decoded.decode()
+    except UnicodeDecodeError as error:
+        raise PgsoError("invalid UTF-8 in LLVM function name") from error
+
+
 def _require_nonempty_file(path: pathlib.Path, label: str) -> None:
     if not path.is_file() or path.stat().st_size == 0:
         raise PgsoError(f"{label} is missing or empty: {path}")
@@ -483,6 +513,7 @@ def candidate_object_argv(
         "-filetype=obj",
         "-O=2",
         *outliner_flags,
+        *toolchain.platform.candidate_object_flags(paths),
         str(paths.profile_use_bitcode),
         "-o",
         str(paths.profile_use_object),
@@ -494,14 +525,18 @@ def build_control(
     spec: ArtifactSpec,
     paths: PipelinePaths,
 ) -> pathlib.Path:
-    run_checked(
-        zig_build_argv(toolchain, spec, paths, emit_ir=False),
+    result = run_checked(
+        (
+            *zig_build_argv(toolchain, spec, paths, emit_ir=False),
+            *toolchain.platform.CONTROL_BUILD_FLAGS,
+        ),
         cwd=spec.repo_root,
         env=zig_build_env(paths),
         timeout_s=900,
         log_path=paths.logs / "build-control.json",
     )
     _require_nonempty_file(paths.control_binary, "ReleaseSafe control")
+    toolchain.platform.record_control_build(toolchain, result, paths)
     return paths.control_binary
 
 
@@ -787,18 +822,7 @@ def build_instrumented(
     )
     _require_nonempty_file(paths.instrumented_object, "instrumented object")
 
-    archive = _discover_compiler_runtime(toolchain, paths)
-    compiler_runtime_object = _extract_compiler_runtime(
-        toolchain,
-        archive,
-        paths,
-    )
-    toolchain.platform.link_instrumented(
-        toolchain,
-        paths,
-        compiler_runtime_object,
-        control,
-    )
+    toolchain.platform.link_instrumented(toolchain, paths, control)
 
     return collect_instrumented_profile(
         toolchain,
