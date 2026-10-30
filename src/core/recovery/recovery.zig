@@ -53,10 +53,15 @@ pub const Event = union(enum) {
 };
 
 pub const Start = struct {
-    /// A record saved by a previous fx process; null starts a new request.
+    /// A record saved by a previous fx process; null starts a new request,
+    /// or resumes one that had no request in flight.
     resume_from: ?Record = null,
     /// The request uses the Fast route, so dropping Fast is a real option.
     fast: bool = false,
+    /// The request resumes from an interruption more than a day ago, or
+    /// dated in the future, with or without a record. fx reads the wall
+    /// clock, which the module never does.
+    stale: bool = false,
 };
 
 pub const Failure = struct {
@@ -126,6 +131,8 @@ pub const Status = struct {
         rejected,
         too_long,
         crash_loop,
+        /// The request resumes from a record more than a day old.
+        stale,
     };
 };
 
@@ -211,7 +218,7 @@ const short_columns = 46;
 /// (`tests/tla/recovery/Recovery.tla` NoFalseAlarm).
 fn onStart(state: *State, start: Start, now_ms: u64) Plan {
     if (start.resume_from) |bytes| {
-        if (decode(bytes)) |saved| return resumeFrom(state, saved, start.fast, now_ms);
+        if (decode(bytes)) |saved| return resumeFrom(state, saved, start, now_ms);
     }
     state.* = .{
         .phase = .sending,
@@ -220,20 +227,24 @@ fn onStart(state: *State, start: Start, now_ms: u64) Plan {
         .started_ms = now_ms,
         .fast = start.fast,
     };
+    if (start.stale) return askUser(state, .stale, now_ms);
     return .{ .save = encode(state, now_ms), .send = .{} };
 }
 
 /// A record left by SIGHUP or SIGTERM resumes without a question, and so does
 /// one left while waiting, since the downtime already served as the wait
 /// (`tests/tla/recovery/Recovery.tla` ResumesAfterClose). Only abrupt deaths
-/// with a send in flight count toward asking once (CrashLoopAsks).
-fn resumeFrom(state: *State, saved: State, fast: bool, now_ms: u64) Plan {
+/// with a send in flight count toward asking once (CrashLoopAsks), and a
+/// record more than a day old asks first (`tests/tla/recovery/Resume.tla`
+/// OldAsks).
+fn resumeFrom(state: *State, saved: State, start: Start, now_ms: u64) Plan {
     state.* = saved;
-    state.fast = fast;
+    state.fast = start.fast;
     state.started_ms = now_ms;
     const abrupt = saved.phase == .sending and !saved.flags.clean_exit;
     state.flags.clean_exit = false;
     if (abrupt) state.abrupt_deaths +|= 1;
+    if (start.stale) return askUser(state, .stale, now_ms);
     if (state.abrupt_deaths >= crash_loop_after) return askUser(state, .crash_loop, now_ms);
     if (saved.phase == .need_user) {
         // decode guarantees a need for need_user; resending is the safe fallback.
@@ -294,7 +305,7 @@ fn onTick(state: *State, now_ms: u64) Plan {
 fn onUserContinue(state: *State, now_ms: u64) Plan {
     if (state.phase != .need_user) return .{};
     const label: RetryLabel = if (state.need) |need| switch (need) {
-        .crash_loop => .resuming,
+        .crash_loop, .stale => .resuming,
         .sign_in => .after_sign_in,
         .quota, .content_filter, .rejected, .too_long => .after_user,
     } else .after_user;
@@ -470,8 +481,8 @@ fn waitingStatus(state: *const State, now_ms: u64) Status {
 fn retryingStatus(state: *const State, now_ms: u64) Status {
     const elapsed = Clock.of(elapsedMs(state, now_ms) / 1000);
     const text = switch (state.retry_label) {
-        .compacting => textOf("Conversation too long · compacting, then retrying", .{}),
-        .resuming => textOf("Resuming the interrupted request · attempt {d}", .{state.attempt}),
+        .compacting => textOf("Conversation too long · compacting, then retrying · {s}", .{elapsed.slice()}),
+        .resuming => textOf("Resuming the interrupted request · attempt {d} · {s}", .{ state.attempt, elapsed.slice() }),
         .after_sign_in => textOf("Signed in · retrying · attempt {d} · {s}", .{ state.attempt, elapsed.slice() }),
         .after_user => textOf("Retrying · attempt {d} · {s}", .{ state.attempt, elapsed.slice() }),
         .after_failure => if (state.cause == .server and state.flags.no_fast)
@@ -501,6 +512,11 @@ fn needStatus(need: Status.Need) Status {
             need,
             "This request crashed fx twice · Enter to retry, Esc to cancel",
             "Crashed fx twice · Enter retries, Esc cancels",
+        ),
+        .stale => needOf(
+            need,
+            "Interrupted more than a day ago · Enter to resume, Esc to cancel",
+            "Over a day old · Enter resumes, Esc cancels",
         ),
     };
 }
@@ -851,7 +867,7 @@ test "too long compacts once at once, then waits for the user" {
     const compact = fail(&state, .too_long, 1_000);
     try testing.expect(compact.save != null);
     try testing.expectEqual(Send{ .compact_first = true }, compact.send.?);
-    try testing.expectEqualStrings("Conversation too long · compacting, then retrying", compact.status.?.text.slice());
+    try testing.expectEqualStrings("Conversation too long · compacting, then retrying · 1s", compact.status.?.text.slice());
 
     const ask = fail(&state, .too_long, 2_000);
     try testing.expect(ask.send == null);
@@ -929,6 +945,38 @@ test "a closed window resumes without a question" {
         try testing.expect(startsWith(resumed.status.?.text.slice(), "Resuming the interrupted request · attempt "));
         try testing.expectEqual(@as(u8, 0), state.abrupt_deaths);
     }
+}
+
+test "a record more than a day old asks before resending" {
+    var state: State = .{};
+    const record = startNew(&state, 0, false).save.?;
+    state = .{};
+    const asked = step(&state, .{ .start = .{ .resume_from = record, .stale = true } }, 50);
+    try testing.expect(asked.send == null);
+    try testing.expectEqual(Status.Need.stale, asked.status.?.need.?);
+    try testing.expectEqualStrings(
+        "Interrupted more than a day ago · Enter to resume, Esc to cancel",
+        asked.status.?.text.slice(),
+    );
+
+    // The question is saved, so a relaunch the same day asks again.
+    state = .{};
+    const again = step(&state, .{ .start = .{ .resume_from = asked.save.? } }, 60);
+    try testing.expect(again.send == null);
+    try testing.expectEqual(Status.Need.stale, again.status.?.need.?);
+
+    const resumed = step(&state, .user_continue, 70);
+    try testing.expect(resumed.send != null);
+    try testing.expect(startsWith(resumed.status.?.text.slice(), "Resuming the interrupted request · attempt "));
+}
+
+test "a day-old resume with no record asks too" {
+    var state: State = .{};
+    const plan = step(&state, .{ .start = .{ .stale = true } }, 0);
+    try testing.expect(plan.send == null);
+    try testing.expectEqual(Status.Need.stale, plan.status.?.need.?);
+    const resumed = step(&state, .user_continue, 10);
+    try testing.expect(resumed.send != null);
 }
 
 test "a relaunch during a wait resends at once" {

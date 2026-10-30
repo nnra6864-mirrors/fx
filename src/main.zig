@@ -1363,6 +1363,28 @@ const App = struct {
         SessionAppRuntime.startResumedSessionWarmup(self);
     }
 
+    /// Sends the request a resumed session left unfinished, once the worker
+    /// runs.
+    pub fn startPendingResume(self: *App) void {
+        SessionAppRuntime.startPendingResume(self);
+    }
+
+    /// Queues the turn that resumes a request a previous fx process left
+    /// unfinished. `note` is what the model reads; the transcript shows a
+    /// resume line instead of a user card.
+    pub fn queueResumedRequest(self: *App, note: []const u8, resumed: types.RecoveryResume) !bool {
+        var queued = try self.snapshotPrompt(note, &.{}, null, null, 0, false);
+        errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
+        queued.recovery_resume = resumed;
+        try self.worker.enqueuePrompt(std.heap.c_allocator, queued);
+        HerdrAppRuntime.reportWorking(self);
+        WorkerAppRuntime.syncState(
+            self,
+            app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(self),
+        );
+        return true;
+    }
+
     pub fn resumeSelectedSession(self: *App) !bool {
         return SessionAppRuntime.resumeSelectedSession(self);
     }

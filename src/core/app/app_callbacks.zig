@@ -345,6 +345,10 @@ pub fn Bindings(comptime App: type) type {
                     if (app.session_persistence.v2 != null) agentSavePromptImages else null
                 else
                     null,
+                .save_recovery_record = if (comptime @hasField(App, "session_persistence"))
+                    if (app.session_persistence.v2 != null) agentSaveRecoveryRecord else null
+                else
+                    null,
                 .propagate_grant = agentPropagateGrant,
                 .push_event = agentPushEvent,
                 .push_text = agentPushText,
@@ -1201,6 +1205,11 @@ pub fn Bindings(comptime App: type) type {
         fn agentAppendTurnPiece(ctx: *anyopaque, progress: agent_runtime.TurnProgress) anyerror!void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app_session_runtime.Runtime(App).appendTurnPiece(app, progress);
+        }
+
+        fn agentSaveRecoveryRecord(ctx: *anyopaque, record: types.RecoveryRecordWrite) anyerror!bool {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            return app_session_runtime.Runtime(App).saveRecoveryRecord(app, record);
         }
 
         fn agentRecordUsage(ctx: *anyopaque, usage: types.Usage) anyerror!void {

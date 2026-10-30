@@ -339,6 +339,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
             return err;
         };
         app.startModelCacheWarmup();
+        if (resume_requested and @hasDecl(App, "startPendingResume")) app.startPendingResume();
     }
 
     app.run() catch |err| {

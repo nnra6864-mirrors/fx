@@ -3860,6 +3860,9 @@ fn persistRecoveryCheckpoint(
     strategy: ?resend_strategy.Strategy,
     tool_evidence: resend_strategy.ToolEvidence,
     trace_ctx: TraceContext,
+    /// The recovery module's record for the send this write goes before or
+    /// the response it saves (`RequestRecovery.sendRecord`, `responseRecord`).
+    record: types.RecoveryRecordWrite,
 ) !void {
     try persistRecoveryCheckpointWithAction(
         deps,
@@ -3876,6 +3879,7 @@ fn persistRecoveryCheckpoint(
         checkpointAction(strategy),
         tool_evidence,
         trace_ctx,
+        record,
     );
 }
 
@@ -3896,6 +3900,9 @@ fn persistRecoveryCheckpointWithAction(
     action: types.ModelRecoveryAction,
     tool_evidence: resend_strategy.ToolEvidence,
     trace_ctx: TraceContext,
+    /// The recovery module's record for the send this write goes before or
+    /// the response it saves (`RequestRecovery.sendRecord`, `responseRecord`).
+    record: types.RecoveryRecordWrite,
 ) !void {
     if (deps.recovery_checkpoint == null and deps.append_turn_piece == null) return;
     // Every sink copies or serializes the borrowed checkpoint synchronously.
@@ -3910,7 +3917,7 @@ fn persistRecoveryCheckpointWithAction(
     const projected = try finalization.persistedExecution(arena, execution);
     const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images };
     // Every completed piece reaches the session before the next request.
-    if (deps.append_turn_piece) |append| try append(deps.ctx, .{ .user = user, .execution = projected });
+    if (deps.append_turn_piece) |append| try append(deps.ctx, .{ .user = user, .execution = projected, .recovery_record = record });
     const effect = deps.recovery_checkpoint orelse return;
     try effect.set(deps.ctx, .{
         .turn_id = job.turn_id,
@@ -3987,6 +3994,8 @@ fn persistFinalReplyCheckpoint(
         .delivering_response,
         .none,
         trace_ctx,
+        // The response's own write already cleared its record.
+        .keep,
     );
 }
 
@@ -4096,14 +4105,14 @@ test "recovery checkpoints do not accumulate temporary history copies in the tur
             .{ .role = .tool, .tool_call_id = id, .tool_name = "read_file", .tool_result_status = .success, .content = text_utils.repeat("current evidence", 16) },
         });
         const retained_bytes = turn.queryCapacity();
-        try persistRecoveryCheckpoint(&deps, &finalization, fixture.job(), messages.items, "partial", "model", false, false, 1, false, .network_interrupted, .retry_request, .confirmed, .{});
+        try persistRecoveryCheckpoint(&deps, &finalization, fixture.job(), messages.items, "partial", "model", false, false, 1, false, .network_interrupted, .retry_request, .confirmed, .{}, .keep);
         try std.testing.expectEqual(retained_bytes, turn.queryCapacity());
         try std.testing.expectEqual(step_index + 1, sink.checkpoint.?.execution.tool_steps.len);
         try std.testing.expectEqualStrings(id, sink.checkpoint.?.execution.tool_steps[step_index].tool_calls[0].id);
     }
     sink.fail = true;
     const retained_bytes = turn.queryCapacity();
-    try std.testing.expectError(error.CheckpointWriteFailed, persistRecoveryCheckpoint(&deps, &finalization, fixture.job(), messages.items, "cancelled", "model", false, false, 1, false, .network_interrupted, .continue_after_confirmed_tool, .confirmed, .{}));
+    try std.testing.expectError(error.CheckpointWriteFailed, persistRecoveryCheckpoint(&deps, &finalization, fixture.job(), messages.items, "cancelled", "model", false, false, 1, false, .network_interrupted, .continue_after_confirmed_tool, .confirmed, .{}, .keep));
     try std.testing.expectEqual(retained_bytes, turn.queryCapacity());
     try std.testing.expectEqual(@as(usize, 1000), sink.checkpoint.?.execution.tool_steps.len);
 }
@@ -6864,6 +6873,9 @@ fn processQueuedPromptLoop(
     else
         .none;
     var restore_recovery_source = job.recovery_checkpoint != null;
+    // The turn's first model request resumes the one a previous fx process
+    // left unfinished, when there is one.
+    var recovery_resume = job.recovery_resume;
     // The session sends one runtime context ahead of the history; a change
     // joins the conversation instead (D94).
     var runtime_context = try runtime_context_state.State.init(
@@ -7079,7 +7091,38 @@ fn processQueuedPromptLoop(
         // reports `failed` first.
         defer request_recovery.deinit();
         errdefer request_recovery.endWithError();
-        try request_recovery.start(route_fast_mode);
+        const resumed = recovery_resume;
+        recovery_resume = null;
+        if (try request_recovery.start(route_fast_mode, resumed) == null) {
+            // The module asks before resending a resumed request. The turn
+            // reaches the log now, with the question's record, so Esc ends
+            // it and a relaunch asks again
+            // (`tests/tla/recovery/Resume.tla` CancelNeverResumes).
+            try persistRecoveryCheckpoint(
+                deps,
+                finalization,
+                job,
+                within_turn_suffix.items,
+                "",
+                gateway_model,
+                route_fast_mode,
+                route_fast_mode,
+                0,
+                false,
+                recovery_cause,
+                recovery_strategy,
+                preserved_tool_evidence,
+                step_ctx,
+                request_recovery.sendRecord(),
+            );
+            if (try request_recovery.waitForSend() == null) {
+                runtime_telemetry.traceCancelObserved(step_ctx, false);
+                try request_recovery.cancel();
+                try persistCancelledTurn(deps, finalization, job, "", completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                finish_trace.finish("interrupted");
+                return;
+            }
+        }
 
         while (true) {
             if (reset_stream_for_next_attempt) {
@@ -7608,7 +7651,11 @@ fn processQueuedPromptLoop(
                         &stream_ctx,
                     ),
                     step_ctx,
+                    request_recovery.sendRecord(),
                 );
+            } else {
+                // No write goes before this send, so its record goes now.
+                request_recovery.flushRecord();
             }
 
             const gateway_wait_started_ms = io_mod.milliTimestamp();
@@ -7750,6 +7797,7 @@ fn processQueuedPromptLoop(
                     next_strategy orelse recovery_strategy,
                     failure_tool_evidence,
                     step_ctx,
+                    .keep,
                 );
                 var delay_completed = true;
                 if (will_auto_retry) {
@@ -7972,6 +8020,7 @@ fn processQueuedPromptLoop(
                     .reconcile_tool,
                     .uncertain,
                     step_ctx,
+                    .keep,
                 );
                 try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
                 try finishUncertainToolReview(
@@ -8090,6 +8139,7 @@ fn processQueuedPromptLoop(
                         &stream_ctx,
                     ),
                     step_ctx,
+                    request_recovery.responseRecord(response_failure == null),
                 );
             }
             runtime_assistant_stream.pushTokenProgressUpdate(&stream_ctx, summary_accumulator.reconcileTokenRequest(response_completion.usage, response_completion.delivery_ambiguous)) catch |progress_err| {

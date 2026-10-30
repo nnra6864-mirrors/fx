@@ -640,6 +640,15 @@ pub const FakeAgentRuntimeDeps = struct {
     last_credential_refresh_expected_account: ?[]u8 = null,
     enable_interactive_notices: bool = false,
     enable_recovery_checkpoint: bool = false,
+    /// Keeps the recovery module's record, as a host that resumes requests
+    /// does.
+    enable_recovery_record: bool = false,
+    /// The newest record the hook saved; null once cleared.
+    recovery_record: ?[32]u8 = null,
+    recovery_record_writes: usize = 0,
+    recovery_record_clears: usize = 0,
+    /// The turn has pieces on disk, so a save between sends lands.
+    recovery_turn_written: bool = true,
     /// Returned by every session writer check; null confirms the writer.
     session_writer_error: ?anyerror = null,
     session_writer_checks: usize = 0,
@@ -787,6 +796,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .push_http_error = httpError,
             .refresh_gateway_credential = refreshGatewayCredential,
             .ask_out_of_credits = askOutOfCredits,
+            .save_recovery_record = if (self.enable_recovery_record) saveRecoveryRecord else null,
             .available_model_capabilities = availableModelCapabilities,
             .resolve_model_capabilities = resolveModelCapabilities,
             .model_catalog_unavailable = catalogUnavailable,
@@ -952,6 +962,23 @@ pub const FakeAgentRuntimeDeps = struct {
             .handoff => .handoff,
             .interrupt => .interrupt,
         };
+    }
+
+    fn saveRecoveryRecord(raw: *anyopaque, write: types.RecoveryRecordWrite) !bool {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        if (!self.recovery_turn_written) return false;
+        switch (write) {
+            .keep => return false,
+            .save => |bytes| {
+                self.recovery_record = bytes;
+                self.recovery_record_writes += 1;
+            },
+            .clear => {
+                self.recovery_record = null;
+                self.recovery_record_clears += 1;
+            },
+        }
+        return true;
     }
 
     fn askOutOfCredits(raw: *anyopaque) !runtime_deps.OutOfCreditsChoice {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const session_notices = @import("../session/session.zig");
 const credentials = @import("../auth/credentials.zig");
 const activity_status = @import("../output/activity_status.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
@@ -300,11 +301,11 @@ fn batchSegmentIsInterrupted(events: []const WorkerEvent, cancelled_turn_id: ?u6
     var turn_id: ?u64 = null;
     scan: for (events, 0..) |event, index| {
         if (index > 0) switch (event) {
-            .begin_prompt, .begin_prompt_with_skill_bindings, .begin_presented_prompt => break :scan,
+            .begin_prompt, .begin_prompt_with_skill_bindings, .begin_presented_prompt, .begin_resumed_prompt => break :scan,
             else => {},
         };
         switch (event) {
-            .begin_presented_prompt => |id| turn_id = id,
+            .begin_presented_prompt, .begin_resumed_prompt => |id| turn_id = id,
             .turn_phase_update => |phase| turn_id = phase.turn_id,
             .tool_lifecycle => |lifecycle| {
                 turn_id = switch (lifecycle) {
@@ -368,6 +369,7 @@ pub fn Runtime(comptime App: type) type {
                 .begin_prompt,
                 .begin_prompt_with_skill_bindings,
                 .begin_presented_prompt,
+                .begin_resumed_prompt,
                 .append_user_feedback,
                 .notification,
                 .question_requested,
@@ -912,7 +914,7 @@ pub fn Runtime(comptime App: type) type {
 
             events: while (batch.claim()) |event| {
                 if (!first_event) switch (event) {
-                    .begin_prompt, .begin_prompt_with_skill_bindings, .begin_presented_prompt => {
+                    .begin_prompt, .begin_prompt_with_skill_bindings, .begin_presented_prompt, .begin_resumed_prompt => {
                         interrupted_segment = batchSegmentIsInterrupted(batch.claimedAndRemaining(), taken.cancelled_turn_id);
                     },
                     else => {},
@@ -996,6 +998,19 @@ pub fn Runtime(comptime App: type) type {
                         } else {
                             return error.PresentedPromptUnsupported;
                         }
+                    },
+                    .begin_resumed_prompt => {
+                        if (!try requireAssistantTextDrain(handlers)) {
+                            try retainClaimedEventAndSuffix(app, &batch, "assistant_text_drain_blocked");
+                            drain_owns_current = false;
+                            break :events;
+                        }
+                        resetStream(app, true);
+                        noteTurnStarted(app);
+                        app.stream.active = true;
+                        app.stream.turn_started_ms = io_mod.milliTimestamp();
+                        app.shell.render_requests.request(.footer);
+                        try handlers.semantic_notice(handlers.ctx, session_notices.resumed_request_notice);
                     },
                     .append_user_feedback => |text| {
                         if (!try requireAssistantTextDrain(handlers)) {

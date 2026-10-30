@@ -2819,16 +2819,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           },
         });
         await session.waitForComposer(TIMEOUT);
-        // The kill left the turn open. Reopening marks it interrupted and
-        // waits for the user instead of restarting it on its own.
-        await Bun.sleep(1_000);
-        expect(resumed.started).toBe(false);
-        expect(queuedGateway.requests).toHaveLength(2);
-        await session.sendText("continue");
+        // The closed window left the turn open. Reopening sends the request
+        // again on its own (`tests/tla/recovery/Resume.tla` AutoResumes).
         await waitForCondition(() => resumed.started, "admitted resumed response");
-        await session.waitForText("Thinking", TIMEOUT);
+        await session.waitForText("Resuming the interrupted request", TIMEOUT);
+        // Until the first byte arrives, the status row says which attempt is
+        // resuming the request.
+        await session.waitForText("Resuming the interrupted request · attempt", TIMEOUT);
         expect(queuedGateway.requests).toHaveLength(3);
-        expect(await session.capturePane()).toContain("Thinking");
 
         if (outcome === "finish") {
           resumed.release?.();
@@ -2837,7 +2835,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           await session.sendInterruptEscapePair(TIMEOUT);
           await session.waitForText("What can fx do differently?", TIMEOUT);
         }
-        await session.waitForPane((pane) => !pane.includes("Thinking") && hasEmptyComposer(pane), TIMEOUT);
+        await session.waitForPane((pane) => !pane.includes("Resuming the interrupted request · attempt") && hasEmptyComposer(pane), TIMEOUT);
         const scrollback = await session.captureFullScrollback();
         // The prompt shows once in the history; the resume line above it
         // names the session by the same text.
@@ -2998,10 +2996,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         },
       });
       await session.waitForComposer(TIMEOUT);
-      // Reopening waits for the user instead of retrying the interrupted turn.
-      await Bun.sleep(1_000);
-      expect(queuedGateway.requests).toHaveLength(1);
-      await session.sendText("continue");
+      // A window closed during the wait resends at once on reopening: the
+      // downtime served as the wait (`tests/tla/recovery/Resume.tla`
+      // AutoResumes).
       await session.waitForText(finalText, TIMEOUT);
 
       expect(queuedGateway.requests).toHaveLength(2);

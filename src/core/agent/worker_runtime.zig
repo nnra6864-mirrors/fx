@@ -132,6 +132,9 @@ pub const QueuedPrompt = struct {
     /// Present only when an explicit host action resumes a durable paused
     /// model turn. The same ownership rules as the other queued fields apply.
     recovery_checkpoint: ?session_codec.RecoveryCheckpoint = null,
+    /// The request a previous fx process left unfinished, which this turn's
+    /// first model request resumes.
+    recovery_resume: ?types.RecoveryResume = null,
     /// True when this output surface already contains the checkpoint's
     /// assistant source. Recovery still restores the source for overlap and
     /// persistence, but publishes only novel continuation text.
@@ -485,6 +488,9 @@ pub const WorkerEvent = union(enum) {
     begin_prompt: types.UserTurn,
     begin_prompt_with_skill_bindings: BeginPromptWithSkillBindings,
     begin_presented_prompt: u64,
+    /// A turn that resumes a request a previous fx process left unfinished.
+    /// Its prompt is fx's note to the model, so no user card is written.
+    begin_resumed_prompt: u64,
     append_user_feedback: []u8,
     assistant_presentation: assistant_presentation.Event,
     notification: notification_contract.Notification,
@@ -1439,7 +1445,11 @@ pub const WorkerRuntime = struct {
         errdefer if (!transfer_history) {
             types.freeHistoryTurnSlice(alloc, job_history);
         };
-        if (queued.recovery_checkpoint == null and queued.user_prompt_already_presented) {
+        if (queued.recovery_resume != null) {
+            try self.worker_events.append(alloc, .{
+                .begin_resumed_prompt = queued.turn_id,
+            });
+        } else if (queued.recovery_checkpoint == null and queued.user_prompt_already_presented) {
             try self.worker_events.append(alloc, .{
                 .begin_presented_prompt = queued.turn_id,
             });
@@ -3855,6 +3865,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
             } };
         },
         .begin_presented_prompt => |turn_id| .{ .begin_presented_prompt = turn_id },
+        .begin_resumed_prompt => |turn_id| .{ .begin_resumed_prompt = turn_id },
         .append_user_feedback => |text| .{ .append_user_feedback = try alloc.dupe(u8, text) },
         .assistant_presentation => |presentation| .{
             .assistant_presentation = try presentation.clone(alloc),
@@ -3949,7 +3960,7 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
             freeSkillBindings(alloc, begin.skill_bindings);
             freeSkillDisplaySpans(alloc, begin.skill_display_spans);
         },
-        .begin_presented_prompt => {},
+        .begin_presented_prompt, .begin_resumed_prompt => {},
         .append_user_feedback => |text| alloc.free(text),
         .assistant_presentation => |presentation| {
             var owned = presentation;

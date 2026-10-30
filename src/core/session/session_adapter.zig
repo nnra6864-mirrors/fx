@@ -1835,6 +1835,18 @@ pub const Session = struct {
         execution: types.ExecutionMemory,
         running: Running,
     ) !void {
+        return self.appendProgressWithRecord(user, execution, running, .keep);
+    }
+
+    /// `appendProgress`, with the recovery module's record for the send this
+    /// write goes before (`recovery_type`).
+    pub fn appendProgressWithRecord(
+        self: *Session,
+        user: types.UserTurn,
+        execution: types.ExecutionMemory,
+        running: Running,
+        record: types.RecoveryRecordWrite,
+    ) !void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         var arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -1852,13 +1864,93 @@ pub const Session = struct {
         const encoded = try a.alloc([]u8, events.items.len);
         for (events.items, encoded) |event, *bytes| bytes.* = try self.encodeEvent(a, event);
         const start = try self.streamedPrefix(encoded, .stream, countResults(events.items));
+        // The record goes out in the same write as the pieces before its
+        // send, so a turn's first write already carries it
+        // (`tests/tla/recovery/Resume.tla` CrashLoopAsks).
+        var tail: std.ArrayList(sm.Event) = .empty;
+        if (try self.recoveryItem(a, record)) |piece| try tail.append(a, .{ .item = piece });
         if (!self.turn_open or start < encoded.len) {
-            try self.writePieces(a, events.items[start..], encoded[start..], &.{});
+            try self.writePieces(a, events.items[start..], encoded[start..], tail.items);
             try self.streamed.ensureUnusedCapacity(self.alloc, encoded.len - start);
             for (encoded[start..]) |bytes| self.streamed.appendAssumeCapacity(try self.alloc.dupe(u8, bytes));
+        } else if (tail.items.len > 0) {
+            _ = try self.write(tail.items);
         }
         try self.saveRunning(a, running);
     }
+
+    /// Saves or clears the record in the open turn. A turn not written yet
+    /// takes the record with its first pieces instead, so this writes
+    /// nothing and returns false.
+    pub fn saveRecovery(self: *Session, record: types.RecoveryRecordWrite) !bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (!self.turn_open) return false;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const piece = (try self.recoveryItem(a, record)) orelse return false;
+        _ = try self.write(&.{.{ .item = piece }});
+        return true;
+    }
+
+    fn recoveryItem(self: *Session, a: Allocator, record: types.RecoveryRecordWrite) !?sm.Piece {
+        const bytes: []u8 = switch (record) {
+            .keep => return null,
+            .save => |value| try a.print("{{\"record\":\"{x}\"}}", .{&value}),
+            .clear => try a.dupe(u8, "{\"record\":null}"),
+        };
+        return try self.itemAs(a, recovery_type, bytes);
+    }
+
+    /// The model request a crash or a close left unfinished in the newest
+    /// turn: the record of its newest `recovery` piece, null when its
+    /// response had arrived or none was saved, and when it was saved. Null
+    /// when the newest turn ended otherwise, has no prompt, or completed.
+    pub fn interruptedRequest(self: *Session) !?InterruptedRequest {
+        var state = try self.handle.state(self.alloc);
+        defer state.deinit(self.alloc);
+        const ended = state.last_interrupted orelse return null;
+        if (state.open_turn != null or ended.turn != state.last_turn) return null;
+        switch (ended.reason) {
+            .crash, .closed => {},
+            .cancel, .failed => return null,
+        }
+        var found: InterruptedRequest = .{ .record = null, .saved_ms = 0 };
+        var record_seen = false;
+        var has_prompt = false;
+        var from: sm.From = .end;
+        scan: while (true) {
+            var page = try self.source().readTo(self.alloc, from, .backward, replay_page_lines);
+            defer page.deinit();
+            for (page.entries) |entry| {
+                const body = entry.body orelse continue;
+                switch (body) {
+                    .turn_started => |started| if (started.turn == ended.turn) break :scan,
+                    .item => |piece| {
+                        if (found.saved_ms == 0) found.saved_ms = entry.ts_ms;
+                        if (std.mem.eql(u8, piece.type, itemType(.turn_completed).?)) return null;
+                        if (std.mem.eql(u8, piece.type, itemType(.user).?)) has_prompt = true;
+                        if (record_seen or !std.mem.eql(u8, piece.type, recovery_type)) continue;
+                        record_seen = true;
+                        found.saved_ms = entry.ts_ms;
+                        found.record = parseRecoveryRecord(try self.source().pieceData(page.arena.allocator(), piece));
+                    },
+                    else => {},
+                }
+            }
+            from = .{ .at = page.next orelse break };
+        }
+        return if (has_prompt) found else null;
+    }
+
+    /// See `interruptedRequest`.
+    pub const InterruptedRequest = struct {
+        record: ?[32]u8,
+        /// `ts` of the line that saved the record, or of the turn's newest
+        /// piece when no record was saved.
+        saved_ms: u64,
+    };
 
     /// The step whose calls are running: its calls in their saved form, and
     /// the text of the message that issued them.
@@ -4300,6 +4392,8 @@ noinline fn replay(
                         superseded = true;
                         continue;
                     }
+                    // The recovery module's record, which only a launch reads.
+                    if (std.mem.eql(u8, piece.type, recovery_type)) continue;
                     const ta = turn_arena.allocator();
                     if (std.mem.eql(u8, piece.type, running_type)) {
                         // Kept for the whole turn: copies, not views of the page.
@@ -4366,6 +4460,10 @@ noinline fn replay(
                         .cancel, .closed => .cancelled,
                         .failed, .crash => .failed,
                     } });
+                    turn.interrupted.stopped_by_exit = switch (ended.reason) {
+                        .crash, .closed => true,
+                        .cancel, .failed => false,
+                    };
                     const answered = answerRunning(alloc, &turn.interrupted, running.items, represented.items, running_text) catch |err| {
                         types.freeHistoryTurn(alloc, turn);
                         return err;
@@ -4671,6 +4769,24 @@ const superseded_type = "superseded";
 const running_type = "tool_running";
 /// The text of the message whose calls are running (D51).
 const running_assistant_type = "assistant_running";
+/// The recovery module's record for the turn's model request in flight,
+/// `{"record":"<64 hex digits>"}`, or `{"record":null}` once the request's
+/// response is complete. A launch that finds a turn a crash ended reads
+/// the newest one (`interruptedRequest`). Older builds drop the piece as an
+/// unknown item.
+const recovery_type = "recovery";
+/// The bytes of a `recovery` piece's record; null for a cleared one or one
+/// that does not parse, which the recovery module treats as no record.
+fn parseRecoveryRecord(data: []const u8) ?[32]u8 {
+    const prefix = "{\"record\":\"";
+    if (!std.mem.startsWith(u8, data, prefix)) return null;
+    const rest = data[prefix.len..];
+    if (rest.len != 64 + 2 or !std.mem.eql(u8, rest[64..], "\"}")) return null;
+    var record: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&record, rest[0..64]) catch return null;
+    return record;
+}
+
 /// An edit's full-diff rows, saved right after its `tool_result` item rather
 /// than inside it. Older fx versions reject unknown fields in a piece but
 /// skip unknown item types, so they still read the result and show the
@@ -5577,6 +5693,66 @@ test "a running tool call is saved once, and resume answers it as possibly run" 
     try testing.expectEqualStrings("bash", step.tool_results[0].tool_name);
     try testing.expectEqual(types.PersistedToolStatus.failure, step.tool_results[0].status);
     try testing.expectEqualStrings(unfinished_tool_output, step.tool_results[0].output);
+}
+
+test "a send's record rides with the turn's first write, and a reopen finds the newest" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("go") };
+    // Nothing is written until the turn's first pieces are.
+    try testing.expect(!try s.saveRecovery(.{ .save = @splat(0x11) }));
+    try s.appendProgressWithRecord(user, .{}, .{}, .{ .save = @splat(0x22) });
+    try testing.expect(try s.saveRecovery(.{ .save = @splat(0x33) }));
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    try testing.expectEqual(@as(usize, 2), try countItems(t.store.manager, id, recovery_type));
+    s.close();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    defer r.close();
+    const found = (try r.interruptedRequest()).?;
+    try testing.expectEqual(@as([32]u8, @splat(0x33)), found.record.?);
+    try testing.expect(found.saved_ms > 0);
+    // The history the model sees has no trace of the record.
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), restored.history.len);
+    try testing.expectEqualStrings("go", restored.history[0].interrupted.user.text);
+}
+
+test "a cleared record leaves the turn resumable without one" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("run it") };
+    try s.appendProgressWithRecord(user, .{}, .{}, .{ .save = @splat(0x44) });
+    // The response arrived: its tool call runs with no request in flight.
+    try testing.expect(try s.saveRecovery(.clear));
+    const call: types.ToolCall = .{ .id = "call_1", .name = "bash", .arguments_json = "{}" };
+    try s.appendProgress(user, .{}, .{ .calls = &.{call} });
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    defer r.close();
+    const found = (try r.interruptedRequest()).?;
+    try testing.expectEqual(@as(?[32]u8, null), found.record);
+}
+
+test "a session with no interrupted turn has nothing to resume" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    try testing.expectEqual(@as(?Session.InterruptedRequest, null), try s.interruptedRequest());
 }
 
 test "a crash while a tool runs keeps the text of the message that issued it (D51)" {

@@ -1180,6 +1180,28 @@ const PendingCancelledCommand = struct {
     }
 };
 
+/// A request saved this long ago, or dated this far in the future, asks
+/// before it is sent again (`tests/tla/recovery/Resume.tla` OldAsks).
+const resume_max_age_ms: i64 = 24 * std.time.ms_per_hour;
+const resume_clock_slack_ms: i64 = 5 * std.time.ms_per_min;
+
+fn resumeIsStale(now_ms: i64, saved_ms: u64) bool {
+    const saved = std.math.cast(i64, saved_ms) orelse return true;
+    return now_ms -| saved > resume_max_age_ms or saved -| now_ms > resume_clock_slack_ms;
+}
+
+test "a resumed request older than a day, or dated ahead, asks first" {
+    const now: i64 = 10 * std.time.ms_per_day;
+    const now_u: u64 = @intCast(now);
+    try std.testing.expect(!resumeIsStale(now, now_u));
+    try std.testing.expect(!resumeIsStale(now, now_u - 23 * std.time.ms_per_hour));
+    try std.testing.expect(resumeIsStale(now, now_u - 25 * std.time.ms_per_hour));
+    // A clock a little ahead is noise; a record from the future is not.
+    try std.testing.expect(!resumeIsStale(now, now_u + std.time.ms_per_min));
+    try std.testing.expect(resumeIsStale(now, now_u + 10 * std.time.ms_per_min));
+    try std.testing.expect(resumeIsStale(now, std.math.maxInt(u64)));
+}
+
 pub const Persistence = struct {
     // Serializes event-log mutations with worker usage callbacks. Usage takes
     // its checkpoint mutex first, so callers must not checkpoint while held.
@@ -1209,6 +1231,9 @@ pub const Persistence = struct {
     resume_handoff_intent: ResumeHandoffIntent = .none,
     pending_live_session_policy: ?BackgroundSessionPolicy = null,
     pending_live_session_wait: ?LiveSessionWait = null,
+    /// The request the resumed session's newest turn left unfinished, which
+    /// `startPendingResume` sends again once the worker runs.
+    pending_request_resume: ?types.RecoveryResume = null,
     shutdown_failure: ?anyerror = null,
     /// On the heap, so the pointer every session keeps survives `App.init`
     /// copying the app after it opens the store (`adoptStore`).
@@ -1219,7 +1244,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (@typeInfo(Persistence).@"struct".field_names.len != 27) {
+            if (@typeInfo(Persistence).@"struct".field_names.len != 28) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1248,6 +1273,7 @@ pub const Persistence = struct {
         storage.resume_handoff_intent = .none;
         storage.pending_live_session_policy = null;
         storage.pending_live_session_wait = null;
+        storage.pending_request_resume = null;
         storage.shutdown_failure = null;
         storage.v2_store = null;
         storage.v2 = null;
@@ -1264,6 +1290,9 @@ pub const Persistence = struct {
     }
 
     fn deinitWithCatalog(self: *Persistence, alloc: Allocator, catalog: enum { free, abandon }) void {
+        if (self.pending_request_resume != null) {
+            debug_trace.logf("recovery", "event=resume_dropped reason=deinit", .{});
+        }
         if (self.pending_live_session_policy) |policy| {
             debug_trace.logf(
                 "session",
@@ -2065,6 +2094,7 @@ pub fn Runtime(comptime App: type) type {
             try installResumedV2Session(app, v2, .session);
             startResumedSessionWarmup(app);
             try app.finishLiveSessionResume();
+            startPendingResume(app);
             return true;
         }
 
@@ -2145,6 +2175,42 @@ pub fn Runtime(comptime App: type) type {
             errdefer closeWritableSession(app);
             try hydrateResumedSession(app, resumed.state, &display, notice);
             enableSessionStores(app);
+            // A fork is a new session: it continues nothing on its own.
+            if (notice != .fork) noteInterruptedRequest(app, v2);
+        }
+
+        /// Notes the request the newest turn left unfinished, if a crash or a
+        /// close ended it (`tests/tla/recovery/Resume.tla` AutoResumes).
+        fn noteInterruptedRequest(app: *App, v2: *session_adapter.Session) void {
+            app.session_persistence.pending_request_resume = null;
+            const found = (v2.interruptedRequest() catch |err| {
+                debug_trace.logf("recovery", "event=resume_check_failed err={s}", .{@errorName(err)});
+                return;
+            }) orelse return;
+            const now_ms = io_mod.milliTimestamp();
+            const stale = resumeIsStale(now_ms, found.saved_ms);
+            app.session_persistence.pending_request_resume = .{ .record = found.record, .stale = stale };
+            debug_trace.logf("recovery", "event=resume_pending record={} stale={} saved_ms={d} now_ms={d}", .{ found.record != null, stale, found.saved_ms, now_ms });
+        }
+
+        /// Sends the noted request again, as a turn whose prompt is fx's note
+        /// to the model. The recovery module decides whether it goes at once
+        /// or asks first.
+        pub fn startPendingResume(app: *App) void {
+            if (comptime !@hasDecl(App, "queueResumedRequest")) return;
+            const resumed = app.session_persistence.pending_request_resume orelse return;
+            app.session_persistence.pending_request_resume = null;
+            _ = app.queueResumedRequest(session_runtime.resumed_request_prompt, resumed) catch |err| {
+                debug_trace.logf("recovery", "event=resume_dropped reason=queue_failed err={s}", .{@errorName(err)});
+            };
+        }
+
+        /// `AgentRuntimeDeps.save_recovery_record` on v2.
+        pub fn saveRecoveryRecord(app: *App, record: types.RecoveryRecordWrite) !bool {
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const v2 = app.session_persistence.v2 orelse return false;
+            return v2.saveRecovery(record);
         }
 
         /// Record whether restored history references shell execution handles
@@ -2839,7 +2905,7 @@ pub fn Runtime(comptime App: type) type {
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             const v2 = app.session_persistence.v2 orelse return;
-            try v2.appendProgress(progress.user, progress.execution, .{ .calls = progress.running_calls, .assistant = progress.running_assistant });
+            try v2.appendProgressWithRecord(progress.user, progress.execution, .{ .calls = progress.running_calls, .assistant = progress.running_assistant }, progress.recovery_record);
         }
 
         /// `AgentRuntimeDeps.record_usage` on v2: each reply's usage
@@ -3961,6 +4027,15 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// A turn that resumed an interrupted request replays as the line it
+        /// showed live, not as fx's note to the model.
+        fn appendHistoryUserTurn(sink: anytype, user: types.UserTurn, has_prior_turns: bool) !void {
+            if (std.mem.eql(u8, user.text, session_runtime.resumed_request_prompt)) {
+                return sink.appendNotice(session_runtime.resumed_request_notice);
+            }
+            return sink.appendUserTurn(user, has_prior_turns);
+        }
+
         fn replayHistory(app: *App, history: []const types.HistoryTurn) !void {
             var sink = LiveHistorySink(App){ .app = app };
             var labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
@@ -3992,7 +4067,7 @@ pub fn Runtime(comptime App: type) type {
                         if (entry.execution.turn_summary) |summary| {
                             sink.setCreatedAtMs(summary.started_at_ms);
                         }
-                        try sink.appendUserTurn(entry.user, has_prior_turns.*);
+                        try appendHistoryUserTurn(sink, entry.user, has_prior_turns.*);
                         has_prior_turns.* = true;
                         try writeExecutionHistoryToSink(app, sink, entry.execution, labels);
                         if (entry.execution.turn_summary) |summary| {
@@ -4009,7 +4084,7 @@ pub fn Runtime(comptime App: type) type {
                         if (entry.execution.turn_summary) |summary| {
                             sink.setCreatedAtMs(summary.started_at_ms);
                         }
-                        try sink.appendUserTurn(entry.user, has_prior_turns.*);
+                        try appendHistoryUserTurn(sink, entry.user, has_prior_turns.*);
                         has_prior_turns.* = true;
                         try writeExecutionHistoryToSink(app, sink, entry.execution, labels);
                         if (entry.execution.turn_summary) |summary| {
