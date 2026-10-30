@@ -103,7 +103,7 @@ swap-compares` rewrites each greater-than comparison as the less-than
 comparison with its operands swapped, so the outliner only matches comparisons
 written the same way.
 
-Three size passes in [`ir_size.py`](ir_size.py) run through the pinned LLVM C
+Four size passes in [`ir_size.py`](ir_size.py) run through the pinned LLVM C
 library. Right after Zig emits bitcode, `outline-helpers` marks small shared
 std helpers `noinline`: the allocator's slice `free`, `remap`, and aligned
 allocation, the writer's `write`, `writeAll`, `writeByte`, and
@@ -125,8 +125,14 @@ only their defined bytes matter, and two may share bytes wherever neither
 defines a byte the other defines differently. Each becomes an alias of its
 offset. Members that hot code reads, or that are under 64 bytes, never
 receive another member's nonzero byte in their undefined bytes, so their
-copies still compile as before. `globaldce,verify` then drops the dead
-constants. Benchmark artifacts receive every pass so their candidates keep
+copies still compile as before. `zero-fill-globals` then moves internal
+writable globals of at least 4 KB whose nonzero bytes fit in 64 bytes to
+zero-fill, which takes no space in the file, and stores those bytes at the
+start of `main`, or of the function Zig's `main` alias names. Even one nonzero
+byte otherwise writes the whole global out; std's `Progress` state is 18 KB for
+a single 255. Nothing reads these globals before `main`, and no later stage
+folds the stores back into an initializer. `globaldce,verify` then drops the
+dead constants. Benchmark artifacts receive every pass so their candidates keep
 the production code shape. The candidate link passes
 `-no_compact_unwind`: fx builds without unwind tables, and newer Apple linkers
 otherwise emit about 160 KB of compact unwind data.
