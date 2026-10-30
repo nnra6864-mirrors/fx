@@ -7,11 +7,14 @@
     ir_size.py --libllvm <libLLVM.dylib> expand-constant-exprs <in.bc> <out.bc>
     ir_size.py --libllvm <libLLVM.dylib> swap-compares <in.bc> <out.bc>
     ir_size.py --libllvm <libLLVM.dylib> check-outlined <in.bc>
+    ir_size.py --libllvm <libLLVM.dylib> minsize-functions <in.bc> <out.json>
+    ir_size.py --libllvm <libLLVM.dylib> no-outline <in.bc> <out.bc> --functions <names.txt>
 
 outline-helpers marks small shared std helpers as noinline: the allocator's
 slice free, remap, and aligned allocation, the writer's write, writeAll,
 writeByte, and allocating writer setup and teardown, the byte list's append,
-every list's teardown, slice equality, and the Io mutex's lock and unlock.
+every list's teardown, slice equality and prefix checks, case-insensitive
+ASCII equality, and the Io mutex's lock and unlock.
 Zig inlines them at thousands of call sites (free alone at about
 11,000 in fx); one out-of-line copy per instantiation keeps the same checks,
 poisoning, and calls. Run it on the emitted bitcode, before instrumentation,
@@ -68,6 +71,15 @@ that the outliner rebuilt from a parameter: an instruction LLVM named
 expand-constant-exprs neither should exist, so any hit is a form this guard
 does not cover.
 
+minsize-functions writes the names of the defined functions, and of those
+that carry `minsize`, to a JSON file. Profile use marks the functions it
+judges cold `minsize`.
+
+no-outline adds `nooutline` to the defined functions listed one per line in
+the --functions file. The IR outliner and llc's machine outliner both skip
+such functions, so their code stays in place instead of moving into shared
+helpers elsewhere in the binary. It fails when no listed function is defined.
+
 Every command prints a JSON summary on stdout and exits nonzero when the
 input cannot be read. outline-helpers also fails when no allocator free helper
 matches, because that means std naming changed and the pass went stale.
@@ -89,6 +101,8 @@ OUT_OF_LINE_HELPERS = (
     r"array_list\.Aligned\(u8,null\)\.appendSlice",
     r"array_list\.Aligned\(.*\)\.deinit",
     r"mem\.eql__func_\d+",
+    r"mem\.startsWith(?:__func_\d+)?",
+    r"ascii\.eqlIgnoreCase",
     r"Io\.Mutex\.(?:lock|lockUncancelable|unlock)",
 )
 
@@ -183,6 +197,7 @@ class Llvm:
         self.Erase = f("LLVMInstructionEraseFromParent", None, P)
         self.EnumAttrKind = f("LLVMGetEnumAttributeKindForName", C.c_uint, C.c_char_p, C.c_size_t)
         self.CreateEnumAttr = f("LLVMCreateEnumAttribute", P, P, C.c_uint, C.c_ulonglong)
+        self.CreateStringAttr = f("LLVMCreateStringAttribute", P, P, C.c_char_p, C.c_uint, C.c_char_p, C.c_uint)
         self.AddAttr = f("LLVMAddAttributeAtIndex", None, P, C.c_uint, P)
         self.GetEnumAttrAt = f("LLVMGetEnumAttributeAtIndex", P, P, C.c_uint, C.c_uint)
         self.CallSiteEnumAttr = f("LLVMGetCallSiteEnumAttribute", P, P, C.c_uint, C.c_uint)
@@ -779,22 +794,77 @@ def check_outlined(llvm: Llvm, source: pathlib.Path) -> dict:
     return summary
 
 
+def minsize_functions(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> dict:
+    """Write the defined functions, and those marked `minsize`, to `output`.
+
+    Profile use marks the functions it judges cold `minsize`. The lists go to
+    a file because a whole program's names outgrow captured output.
+    """
+    _, mod = llvm.load(source)
+    minsize = llvm.kind("minsize")
+    defined: list[str] = []
+    small: list[str] = []
+    fn = llvm.FirstFunction(mod)
+    while fn:
+        if not llvm.IsDeclaration(fn):
+            name = llvm.name(fn)
+            defined.append(name)
+            if llvm.GetEnumAttrAt(fn, FUNCTION_INDEX, minsize):
+                small.append(name)
+        fn = llvm.NextFunction(fn)
+    output.write_text(
+        json.dumps({"defined": sorted(defined), "minsize": sorted(small)}, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return {"pass": "minsize-functions", "defined_functions": len(defined), "minsize_functions": len(small)}
+
+
+def no_outline(llvm: Llvm, source: pathlib.Path, output: pathlib.Path, functions: pathlib.Path) -> dict:
+    names = {line.strip() for line in functions.read_text(encoding="utf-8").splitlines() if line.strip()}
+    ctx, mod = llvm.load(source)
+    marked = 0
+    fn = llvm.FirstFunction(mod)
+    while fn:
+        if not llvm.IsDeclaration(fn) and llvm.name(fn) in names:
+            llvm.AddAttr(fn, FUNCTION_INDEX, llvm.CreateStringAttr(ctx, b"nooutline", 9, b"", 0))
+            marked += 1
+        fn = llvm.NextFunction(fn)
+    if marked == 0:
+        raise PassError(f"no function listed in {functions} is defined")
+    llvm.save(mod, output)
+    return {"pass": "no-outline", "listed_functions": len(names), "marked_functions": marked}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--libllvm", required=True, type=pathlib.Path)
     parser.add_argument(
         "command",
-        choices=("outline-helpers", "sparse-constants", "overlay-constants", "expand-constant-exprs", "swap-compares", "check-outlined"),
+        choices=(
+            "outline-helpers",
+            "sparse-constants",
+            "overlay-constants",
+            "expand-constant-exprs",
+            "swap-compares",
+            "check-outlined",
+            "minsize-functions",
+            "no-outline",
+        ),
     )
     parser.add_argument("source", type=pathlib.Path)
     parser.add_argument("output", type=pathlib.Path, nargs="?")
+    parser.add_argument("--functions", type=pathlib.Path)
     args = parser.parse_args(argv)
     if (args.output is None) != (args.command == "check-outlined"):
         parser.error("check-outlined takes only an input; the other commands need an output")
+    if (args.functions is None) == (args.command == "no-outline"):
+        parser.error("--functions goes with no-outline, and only with it")
     try:
         llvm = Llvm(args.libllvm)
         if args.command == "check-outlined":
             summary = check_outlined(llvm, args.source)
+        elif args.command == "no-outline":
+            summary = no_outline(llvm, args.source, args.output, args.functions)
         else:
             run = {
                 "outline-helpers": outline_helpers,
@@ -802,6 +872,7 @@ def main(argv: list[str] | None = None) -> int:
                 "overlay-constants": overlay_constants,
                 "expand-constant-exprs": expand_constant_exprs,
                 "swap-compares": swap_compares,
+                "minsize-functions": minsize_functions,
             }[args.command]
             summary = run(llvm, args.source, args.output)
     except (OSError, PassError) as error:

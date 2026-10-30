@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import subprocess
@@ -11,7 +12,7 @@ from scripts.pgso.pipeline import _require_bitcode_header
 from scripts.pgso.toolchain import IR_SIZE_SCRIPT
 
 LLVM_BIN = pathlib.Path(os.environ.get("FX_PGSO_LLVM_BIN", "/opt/homebrew/opt/llvm@22/bin"))
-LIBLLVM = (LLVM_BIN.parent / "lib" / "libLLVM.dylib").resolve()
+LIBLLVM = (LLVM_BIN.parent / "lib" / ("libLLVM.dylib" if sys.platform == "darwin" else "libLLVM.so")).resolve()
 AVAILABLE = (LLVM_BIN / "llvm-as").is_file() and LIBLLVM.is_file()
 
 # The production module layout; alignment decisions depend on it.
@@ -131,6 +132,10 @@ class IrSizeTests(LlvmCase):
             ('"array_list.Aligned(u8,null).append"', False),
             ("mem.eql__func_4", True),
             ("mem.eqlBytes", False),
+            ("mem.startsWith__func_9", True),
+            ("mem.startsWith", True),
+            ("ascii.eqlIgnoreCase", True),
+            ("ascii.startsWithIgnoreCase", False),
             ("Io.Mutex.lockUncancelable", True),
             ("Io.Mutex.unlock", True),
             ("Io.Mutex.tryLock", False),
@@ -461,3 +466,73 @@ class OutlinedConstantTests(LlvmCase):
         self.assertIn("[ getelementptr inbounds (i8, ptr @g, i64 24), %a ]", ir)
         self.assertIn("%pgso.expr = getelementptr inbounds i8, ptr @g, i64 16", ir)
         self.assertIn("call void @use(ptr %pgso.expr)", ir)
+
+
+@unittest.skipUnless(AVAILABLE, "pinned LLVM with libLLVM is not installed")
+class MinsizeFunctionTests(LlvmCase):
+    def test_lists_the_defined_functions_and_those_marked_minsize(self) -> None:
+        source = self.assemble(
+            "attributes",
+            "define void @cold() minsize optsize { ret void }\n"
+            "define void @hot() { ret void }\n"
+            "declare void @external()\n",
+        )
+        output = self.root / "attributes.json"
+
+        result = subprocess.run(
+            [sys.executable, str(IR_SIZE_SCRIPT), "--libllvm", str(LIBLLVM), "minsize-functions", str(source), str(output)],
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual({"defined": ["cold", "hot"], "minsize": ["cold"]}, json.loads(output.read_text()))
+        self.assertEqual(
+            {"pass": "minsize-functions", "defined_functions": 2, "minsize_functions": 1},
+            json.loads(result.stdout),
+        )
+
+
+@unittest.skipUnless(AVAILABLE, "pinned LLVM with libLLVM is not installed")
+class NoOutlineTests(LlvmCase):
+    IR = (
+        "define void @startup() { ret void }\n"
+        "define void @other() { ret void }\n"
+        "declare void @external()\n"
+    )
+
+    def no_outline(self, source: pathlib.Path, names: str) -> tuple[subprocess.CompletedProcess, pathlib.Path]:
+        functions = self.root / "functions.txt"
+        functions.write_text(names)
+        output = self.root / "marked.bc"
+        result = subprocess.run(
+            [sys.executable, str(IR_SIZE_SCRIPT), "--libllvm", str(LIBLLVM), "--functions", str(functions),
+             "no-outline", str(source), str(output)],
+            capture_output=True,
+            text=True,
+        )
+        return result, output
+
+    def test_marks_only_the_listed_defined_functions(self) -> None:
+        result, output = self.no_outline(self.assemble("functions", self.IR), "startup\nexternal\nmissing\n")
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(
+            {"pass": "no-outline", "listed_functions": 3, "marked_functions": 1},
+            json.loads(result.stdout),
+        )
+        text = subprocess.run(
+            [str(LLVM_BIN / "llvm-dis"), str(output), "-o", "-"], check=True, capture_output=True, text=True
+        ).stdout
+        startup = next(line for line in text.splitlines() if line.startswith("define void @startup"))
+        other = next(line for line in text.splitlines() if line.startswith("define void @other"))
+        group = startup.split("#")[1].split()[0]
+        self.assertIn('"nooutline"', next(line for line in text.splitlines() if line.startswith(f"attributes #{group} ")))
+        self.assertNotIn("#", other)
+
+    def test_fails_when_no_listed_function_is_defined(self) -> None:
+        result, output = self.no_outline(self.assemble("functions", self.IR), "external\nmissing\n")
+
+        self.assertEqual(1, result.returncode)
+        self.assertIn("is defined", result.stderr)
+        self.assertFalse(output.exists())
