@@ -15,6 +15,12 @@
 #   hot-retry           resending at once after a failure                  NoHotRetry
 #   send-without-save   a retry sent without saving the record first       SaveBeforeSend
 #
+# RecoveryTimed.tla adds a discrete clock. recovery-timed.cfg must pass, and
+# each of its mutations plants one defect:
+#
+#   unbounded-wait      a Retry-After past the 30-second cap               WaitBounded
+#   frozen-countdown    the countdown stops changing every second          StatusFresh
+#
 # Resume.tla models the app around the module across process exits.
 # resume.cfg and resume-deep.cfg are the design and must pass;
 # resume-today.cfg is fx before it, which leaves an interrupted request for
@@ -52,6 +58,9 @@ Recovery recovery-mutation-no-closing ResumesAfterClose
 Recovery recovery-mutation-never-ask CrashLoopAsks
 Recovery recovery-mutation-hot-retry NoHotRetry
 Recovery recovery-mutation-send-without-save SaveBeforeSend
+RecoveryTimed recovery-timed -
+RecoveryTimed recovery-mutation-unbounded-wait WaitBounded
+RecoveryTimed recovery-mutation-frozen-countdown StatusFresh
 Resume resume -
 Resume resume-deep -
 Resume resume-today AutoResumes
