@@ -101,7 +101,7 @@ swap-compares` rewrites each greater-than comparison as the less-than
 comparison with its operands swapped, so the outliner only matches comparisons
 written the same way.
 
-Two size passes in [`ir_size.py`](ir_size.py) run through the pinned LLVM C
+Three size passes in [`ir_size.py`](ir_size.py) run through the pinned LLVM C
 library. Right after Zig emits bitcode, `outline-helpers` marks small shared
 std helpers `noinline`: the allocator's slice `free`, `remap`, and aligned
 allocation, the writer's `write`, `writeAll`, `writeByte`, and
@@ -112,12 +112,20 @@ runs before instrumentation, so training, profile use, and the recorded
 bitcode identity all include it. It reports matches per pattern and fails if
 the allocator `free` helper does not match. After profile use and outlining,
 `sparse-constants` rewrites copies from mostly undefined internal constants
-into stores of their defined bytes, then `globaldce,verify` drops the dead
-constants. Zig emits such a constant for each `return error.X` from a
-function returning a large error union. Undefined bytes become "destination
-unchanged", a refinement of copying undefined bytes; explicit values,
-including zeros, are still stored. Benchmark artifacts receive both passes so
-their candidates keep the production code shape. The candidate link passes
+into stores of their defined bytes. Zig emits such a constant for each
+`return error.X` from a function returning a large error union. Undefined
+bytes become "destination unchanged", a refinement of copying undefined
+bytes; explicit values, including zeros, are still stored. The constants it
+cannot rewrite, because a load, a PHI, or a call still reads them, go to
+`overlay-constants`, along with `return null` results of large optionals. It
+packs them into one constant where they overlap: they are `unnamed_addr`, so
+only their defined bytes matter, and two may share bytes wherever neither
+defines a byte the other defines differently. Each becomes an alias of its
+offset. Members that hot code reads, or that are under 64 bytes, never
+receive another member's nonzero byte in their undefined bytes, so their
+copies still compile as before. `globaldce,verify` then drops the dead
+constants. Benchmark artifacts receive every pass so their candidates keep
+the production code shape. The candidate link passes
 `-no_compact_unwind`: fx builds without unwind tables, and newer Apple linkers
 otherwise emit about 160 KB of compact unwind data.
 
@@ -156,7 +164,7 @@ Candidate behavior qualification records each scenario's debug trace under `cand
 
 ## Qualification policy
 
-Startup compares `help`, `--version`, `status --json`, `doctor --json`, and `sessions --json`. It first executes each verified immutable artifact once to require successful output and empty stderr. Timing then uses pinned Hyperfine with no intermediate shell, ten warmups per artifact in each of at least 100 alternating rounds, and at least 1,000 measured samples per artifact. No contiguous block exceeds ten measured runs, so short machine-noise bursts are distributed between control and candidate while p95 retains 50 tail observations. Startup measurement sets `FX_DISABLE_KEYCHAIN=1` so the compiler comparison cannot be dominated by host-global macOS Keychain subprocess latency; the deterministic behavior corpus remains responsible for exercising Keychain integration. No per-sample Python process management or evidence-file write is included in the timed boundary, and measurement never replaces `zig-out/bin/fx`. Heavy qualification compares file indexing at 100,000 paths, UI activity, and approval transcript, diff, combined, and large-payload workloads.
+Startup compares `help`, `--version`, `status --json`, `doctor --json`, and `sessions --json`. It first copies each verified immutable artifact into the measurement directory and checks that the copy's SHA-256 matches, so both binaries start from the same page-cache state: on Linux a binary whose pages were read back from disk can start 10 to 15 percent slower than one written moments ago. It then executes each copy once to require successful output and empty stderr. Timing then uses pinned Hyperfine with no intermediate shell, ten warmups per artifact in each of at least 100 alternating rounds, and at least 1,000 measured samples per artifact. No contiguous block exceeds ten measured runs, so short machine-noise bursts are distributed between control and candidate while p95 retains 50 tail observations. Startup measurement sets `FX_DISABLE_KEYCHAIN=1` so the compiler comparison cannot be dominated by host-global macOS Keychain subprocess latency; the deterministic behavior corpus remains responsible for exercising Keychain integration. No per-sample Python process management or evidence-file write is included in the timed boundary, and measurement never replaces `zig-out/bin/fx`. Heavy qualification compares file indexing at 100,000 paths, UI activity, and approval transcript, diff, combined, and large-payload workloads.
 
 Heavy comparisons use at least 50 measured samples for each artifact and alternate pair order AB then BA. Command failures and timeouts fail qualification and are never replaced. A candidate fails when either p50 or p95 is more than 10% slower than its matching control. The existing Linux startup workflow remains the authority for the repository's absolute 2 ms command budget.
 

@@ -1,18 +1,9 @@
 const std = @import("std");
 const debug_trace = @import("debug_trace.zig");
 const display_width = @import("display_width.zig");
+const ascii_case = @import("ascii_case.zig");
 
-pub fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-
-    const last_start = haystack.len - needle.len;
-    var i: usize = 0;
-    while (i <= last_start) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
-    }
-    return false;
-}
+pub const containsIgnoreCase = ascii_case.containsIgnoreCase;
 
 /// Returns `text` repeated `count` times as a comptime string literal.
 pub inline fn repeat(comptime text: []const u8, comptime count: usize) *const [text.len * count:0]u8 {

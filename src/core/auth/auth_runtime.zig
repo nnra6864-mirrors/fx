@@ -16,6 +16,7 @@ const provider_picker_catalog = @import("provider_picker_catalog.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
@@ -1327,13 +1328,7 @@ pub const PickerView = struct {
             .connections => connectionChoiceCount(),
             .provider => if (comptime host_target.is_wasm) 2 else 3,
             .sign_in, .api_key => 0,
-            .change_team => blk: {
-                var count: usize = 0;
-                for (self.teams) |team| {
-                    if (teamMatchesQuery(team, self.team_query)) count += 1;
-                }
-                break :blk count;
-            },
+            .change_team => teamFilter(self.teams, self.team_query).count(),
             .switch_credential => gatewaySourceCount(self.available_sources) + 1,
         };
     }
@@ -1362,15 +1357,7 @@ pub const PickerView = struct {
                 else => null,
             },
             .sign_in, .api_key => null,
-            .change_team => blk: {
-                var visible_index: usize = 0;
-                for (self.teams, 0..) |team, team_index| {
-                    if (!teamMatchesQuery(team, self.team_query)) continue;
-                    if (visible_index == index) break :blk .{ .team = team_index };
-                    visible_index += 1;
-                }
-                break :blk null;
-            },
+            .change_team => if (teamFilter(self.teams, self.team_query).at(index)) |team_index| .{ .team = team_index } else null,
             .switch_credential => if (index < gatewaySourceCount(self.available_sources))
                 .{ .source = gatewaySourceAtIndex(self.available_sources, index).? }
             else if (index == gatewaySourceCount(self.available_sources))
@@ -1468,9 +1455,20 @@ fn connectionChoiceAt(index: usize) ?Choice {
     };
 }
 
-fn teamMatchesQuery(team: login_flow.Team, query: []const u8) bool {
-    return text_utils.containsIgnoreCase(team.name, query) or
-        text_utils.containsIgnoreCase(team.slug, query);
+/// Teams match by name or slug, and keep their order, as every fx menu
+/// filters (`fuzzy_match.Filter`).
+const TeamMatches = struct {
+    teams: []const login_flow.Team,
+    query: []const u8,
+
+    pub fn matchAt(self: TeamMatches, position: usize) ?fuzzy_match.Match {
+        const team = self.teams[position];
+        return fuzzy_match.match(self.query, &.{ .{ .text = team.name }, .{ .text = team.slug } });
+    }
+};
+
+fn teamFilter(teams: []const login_flow.Team, query: []const u8) fuzzy_match.Filter(TeamMatches) {
+    return .init(.{ .teams = teams, .query = query }, teams.len);
 }
 
 pub const GatewayTeamStatus = enum {
