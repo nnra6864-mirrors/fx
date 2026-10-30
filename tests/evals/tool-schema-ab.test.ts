@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   applyVariant,
   extractToolCalls,
+  isRemoteCommand,
   numberIn,
   parseStreamUsage,
   rootRequest,
@@ -111,5 +112,14 @@ describe("tool schema A/B helpers", () => {
     expect(numberIn("142 lines", 42)).toBe(false);
     expect(numberIn("42.5", 42)).toBe(false);
     expect(numberIn("1.42", 42)).toBe(false);
+  });
+
+  test("only commands that reach the network count as remote", () => {
+    for (const command of ["gh pr list -R vercel/next.js", "curl -s https://api.github.com", "git fetch origin", "ls -la && git ls-remote origin", "cd x; wget https://example.com"]) {
+      expect(isRemoteCommand(command)).toBe(true);
+    }
+    for (const command of ["ls -la && git log --oneline -5", "pwd; git status --short", "git log origin/main", "find . -name '*.md'", "grep -rn curl src"]) {
+      expect(isRemoteCommand(command)).toBe(false);
+    }
   });
 });

@@ -431,6 +431,57 @@ function git(cwd: string, ...args: string[]): void {
   if (result.status !== 0) throw new Error(`git ${args.join(" ")} failed in ${cwd}`);
 }
 
+/**
+ * Replaces the shared fixture in `repo` with `files` and makes it look like a
+ * real clone of `remote`: a commit history and an up-to-date origin/main.
+ */
+function seedClone(repo: string, remote: string, files: Record<string, string>, subjects: string[]): void {
+  const id = ["-c", "user.email=dev@example.com", "-c", "user.name=dev"];
+  rmSync(repo, { recursive: true, force: true });
+  for (const [path, text] of Object.entries(files)) {
+    mkdirSync(join(repo, path, ".."), { recursive: true });
+    writeFileSync(join(repo, path), text);
+  }
+  git(repo, "init", "-q", "-b", "main");
+  git(repo, "remote", "add", "origin", remote);
+  subjects.forEach((subject, index) => {
+    writeFileSync(join(repo, "HISTORY.log"), subjects.slice(0, index + 1).join("\n") + "\n");
+    git(repo, ...id, "add", "-A");
+    git(repo, ...id, "commit", "-q", "-m", subject);
+  });
+  git(repo, "update-ref", "refs/remotes/origin/main", "HEAD");
+  git(repo, "branch", "-q", "--set-upstream-to=origin/main", "main");
+}
+
+let fxClone: string | null = null;
+/** Replaces `repo` with a shallow clone of the real fx repository, cloned once per process. */
+function seedFxClone(repo: string): void {
+  const remote = "https://github.com/vercel-labs/fx.git";
+  if (!fxClone) {
+    fxClone = join(mkdtempSync(join(tmpdir(), "fx-schema-ab-fx-")), "fx");
+    git(tmpdir(), "clone", "-q", "--depth", "20", "--single-branch", remote, fxClone);
+  }
+  rmSync(repo, { recursive: true, force: true });
+  git(tmpdir(), "clone", "-q", fxClone, repo);
+  git(repo, "remote", "set-url", "origin", remote);
+}
+
+const V0_FILES: Record<string, string> = {
+  "README.md": "# v0\n\nThe v0 web app.\n",
+  "package.json": JSON.stringify({ name: "v0", private: true, scripts: { release: "node scripts/release.mjs" } }, null, 2) + "\n",
+  "CHANGELOG.md": "# Changelog\n\n## 1.0.0\n\n- Add the release notes page.\n\n## 0.9.0\n\n- Set up the v0 web app.\n",
+  "apps/www/release-notes.ts": "// Renders CHANGELOG.md on the release notes page.\nexport const changelogPath = '../../CHANGELOG.md';\n",
+  "scripts/release.mjs": "// Moves the Unreleased section of CHANGELOG.md under the new version, then tags the release.\n",
+  "docs/changelog.md": "# Writing changelog entries\n\nAdd one line per user-facing change under Unreleased in CHANGELOG.md. The release script stamps the version.\n",
+};
+const V0_SUBJECTS = [
+  "Set up the v0 web app",
+  "Add the release notes page",
+  "Generate the changelog during release",
+  "Document how changelog entries are written",
+  "Release 1.0.0",
+];
+
 export function writeFixture(root: string): { repo: string; home: string; trackerLog: string } {
   const repo = join(root, "repo");
   const home = join(root, "home");
@@ -589,6 +640,11 @@ function killPort(port: number): void {
 const shellCommands = (ctx: TaskContext) => used(ctx, "shell").map((s) => String(s.input?.command ?? "").trim());
 // grep_files also prints "Searching", so read the provider's own stream.
 const searchedWeb = (ctx: TaskContext) => ctx.webSearched || ctx.calls.some((call) => call.providerExecuted);
+/** A shell command that reaches the network: gh, curl, wget, or a git command that talks to a remote. */
+export const isRemoteCommand = (command: string) =>
+  /(^|[;&|(]\s*)(gh|curl|wget)\s/.test(command.trim()) || /\bgit\s+(clone|fetch|pull|ls-remote)\b/.test(command);
+const isRemoteCall = (call: ToolCallRecord) =>
+  call.providerExecuted || call.name === "web_fetch" || (call.name === "shell" && isRemoteCommand(String(call.input?.command ?? "")));
 
 export const TASKS: Task[] = [
   // The two local-first cases from github-routing.test.ts, with full call capture.
@@ -596,7 +652,7 @@ export const TASKS: Task[] = [
     id: "gh-history-local",
     tool: "shell",
     prompt: () => "look for changes/last commits in the fx",
-    setup: (repo) => git(repo, "remote", "add", "origin", "https://github.com/vercel-labs/fx.git"),
+    setup: (repo) => seedFxClone(repo),
     check: (c) => {
       const commands = shellCommands(c);
       const usedGh = commands.some((command) => /^gh\s+/.test(command));
@@ -607,29 +663,65 @@ export const TASKS: Task[] = [
   {
     id: "gh-url-metadata",
     tool: "shell",
-    prompt: () => "For https://github.com/vercel/v0, use GitHub metadata to tell me how many open pull requests it currently has. Do not answer from the URL alone.",
+    prompt: () => "For https://github.com/vercel/next.js, use GitHub metadata to tell me how many open pull requests it currently has. Do not answer from the URL alone.",
     setup: (repo) => git(repo, "remote", "add", "origin", "https://github.com/vercel-labs/fx.git"),
     check: (c) => {
-      // gh may be signed out in the fresh profile; the routing decision is what counts.
-      const remote = c.calls.find((call) => call.providerExecuted || call.name === "web_fetch" || (call.name === "shell" && /^gh\s+/.test(String(call.input?.command ?? "").trim())));
-      const viaGh = remote?.name === "shell";
-      return ok(viaGh && !searchedWeb(c), `first remote action is gh (${remote?.name ?? "none"}), no web search`);
+      // gh is signed out in the fresh profile, so a fallback after gh is fine; reaching past gh first is not.
+      const remote = c.calls.find(isRemoteCall);
+      const viaGh = remote?.name === "shell" && /(^|[;&|(]\s*)gh\s/.test(String(remote.input?.command ?? "").trim());
+      return ok(viaGh, `first remote action is gh (${remote?.name ?? "none"}: ${String(remote?.input?.command ?? remote?.input?.url ?? "").slice(0, 40)})`);
     },
   },
   {
     id: "gh-local-first",
     tool: "read_file",
     prompt: () => "investigate how the v0 changelog works in the v0 GitHub repo",
+    setup: (repo) => seedClone(repo, "https://github.com/vercel/v0.git", V0_FILES, V0_SUBJECTS),
+    check: (c) => {
+      // Any local first step counts: a file tool, or a shell command that stays on this machine.
+      const first = c.calls.find((call) => !call.providerExecuted);
+      const local = first !== undefined && !isRemoteCall(first) && ["glob_files", "grep_files", "read_file", "shell"].includes(first.name);
+      return ok(local && !searchedWeb(c) && has(c.output, "changelog"), `first action local (${first?.name}), no web search`);
+    },
+  },
+  // Held out: no tool text was tuned on these two.
+  {
+    id: "gh-upstream-local",
+    tool: "shell",
+    prompt: () => "What changed upstream since my last pull? Summarize the new commits.",
     setup: (repo) => {
-      git(repo, "remote", "add", "origin", "https://github.com/vercel/v0.git");
-      writeFileSync(join(repo, "CHANGELOG.md"), "# Changelog\n\n## 1.0.0\n\n- The v0 changelog is maintained in this root file.\n");
-      mkdirSync(join(repo, "apps", "www"), { recursive: true });
-      writeFileSync(join(repo, "apps", "www", "release-notes.ts"), "export const changelogPath = '../../CHANGELOG.md';\n");
+      const upstream = join(repo, "..", "upstream.git");
+      const peer = join(repo, "..", "peer");
+      const id = ["-c", "user.email=eval@example.com", "-c", "user.name=eval"];
+      git(join(repo, ".."), "init", "-q", "--bare", "-b", "main", upstream);
+      git(repo, "remote", "add", "origin", upstream);
+      git(repo, "push", "-q", "origin", "main");
+      git(join(repo, ".."), "clone", "-q", upstream, peer);
+      writeFileSync(join(peer, "rate_limit.py"), "MAX_REQUESTS_PER_MINUTE = 120\n");
+      git(peer, ...id, "add", "rate_limit.py");
+      git(peer, ...id, "commit", "-q", "-m", "Add a rate limiter to the API client");
+      git(peer, "push", "-q", "origin", "main");
+    },
+    check: (c) => {
+      const commands = shellCommands(c);
+      const usedGh = commands.some((command) => /(^|[;&|]\s*)gh\s/.test(command));
+      return ok(has(c.output, "rate limit") && !usedGh && !searchedWeb(c) && used(c, "web_fetch").length === 0, `names the upstream commit, local git only (gh=${usedGh})`);
+    },
+  },
+  {
+    id: "repo-release-workflow",
+    tool: "read_file",
+    prompt: () => "Where is the release workflow defined in this repo, and what triggers it?",
+    setup: (repo) => {
+      git(repo, "remote", "add", "origin", "https://github.com/vercel-labs/fx.git");
+      mkdirSync(join(repo, ".github", "workflows"), { recursive: true });
+      writeFileSync(join(repo, ".github", "workflows", "release.yml"), "name: Release\non:\n  push:\n    tags: ['v*']\njobs:\n  publish:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo publish\n");
     },
     check: (c) => {
       const first = c.calls.find((call) => !call.providerExecuted);
-      const local = first !== undefined && (["glob_files", "grep_files", "read_file"].includes(first.name) || (first.name === "shell" && /^git\s+/.test(String(first.input?.command ?? "").trim())));
-      return ok(local && !searchedWeb(c) && has(c.output, "changelog"), `first action local (${first?.name}), no web search`);
+      const local = first !== undefined && !isRemoteCall(first);
+      const remote = c.calls.some(isRemoteCall);
+      return ok(local && !remote && has(c.output, "release.yml") && has(c.output, "tag"), `answers from the checkout without going remote (first=${first?.name}, remote=${remote})`);
     },
   },
   {
@@ -823,8 +915,9 @@ export const TASKS: Task[] = [
     tool: "ask_user_question",
     prompt: () => "I want to add a cache layer. Before doing anything, ask me which backend I prefer, Redis, Memcached, or SQLite, as a multiple-choice question.",
     // fx ask cannot show a question, so the right result is the question in
-    // the reply. A tool call there costs a step but is not wrong.
-    check: (c) => ok(has(c.output, "Redis", "Memcached", "SQLite") && !c.calls.some((s) => s.name !== "ask_user_question"), "asked in the reply without acting"),
+    // the reply. A tool call there costs a step but is not wrong, and reading
+    // the workspace first is not acting; changing it is.
+    check: (c) => ok(has(c.output, "Redis", "Memcached", "SQLite") && c.calls.every((s) => ["ask_user_question", "read_file", "glob_files", "grep_files"].includes(s.name)), "asked in the reply without changing anything"),
   },
   {
     id: "vision-text",
