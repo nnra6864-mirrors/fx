@@ -286,6 +286,7 @@ class Llvm:
         self.Int16Ty = f("LLVMInt16TypeInContext", P, P)
         self.Int32Ty = f("LLVMInt32TypeInContext", P, P)
         self.GetParam = f("LLVMGetParam", P, P, C.c_uint)
+        self.CountParams = f("LLVMCountParams", C.c_uint, P)
         self.GetPoison = f("LLVMGetPoison", P, P)
         self.ConstArray2 = f("LLVMConstArray2", P, P, C.POINTER(P), C.c_ulonglong)
         self.BuildAlloca = f("LLVMBuildAlloca", P, P, P, C.c_char_p)
@@ -830,10 +831,33 @@ def _error_names(llvm: Llvm, td, table) -> list[bytes]:
     return names
 
 
-def _entry_reads(llvm: Llvm, entry, allow_phi: bool) -> tuple[list, list, list, list]:
+def _passes_to_reader(llvm: Llvm, call, entry) -> bool:
+    """Whether `call` passes `entry` only as arguments of a function defined in
+    the module that only reads them, like the pair copies the IR outliner
+    makes. The callee is left unchanged."""
+    callee = llvm.IsAFunction(llvm.CalledValue(call))
+    if not callee or llvm.IsDeclaration(callee):
+        return False
+    # The called function is a call's last operand.
+    arguments = llvm.NumOperands(call) - 1
+    if arguments != llvm.CountParams(callee):
+        return False
+    passed = False
+    for i in range(arguments):
+        if llvm.GetOperand(call, i) == entry:
+            passed = True
+            try:
+                _entry_reads(llvm, llvm.GetParam(callee, i), allow_phi=False, allow_calls=False)
+            except _Skip:
+                return False
+    return passed
+
+
+def _entry_reads(llvm: Llvm, entry, allow_phi: bool, allow_calls: bool = True) -> tuple[list, list, list, list, list]:
     """The loads of an entry's name pointer and length, the length-field
-    addresses, and the PHIs that merge entries. Anything else stops the pass."""
-    name_loads, length_loads, length_fields, phis = [], [], [], []
+    addresses, the PHIs that merge entries, and the calls that pass the entry
+    to a function that only reads it. Anything else stops the pass."""
+    name_loads, length_loads, length_fields, phis, calls = [], [], [], [], []
     for user in _users(llvm, entry):
         if llvm.IsALoadInst(user) and llvm.TypeKind(llvm.TypeOf(user)) == POINTER:
             name_loads.append(user)
@@ -854,9 +878,12 @@ def _entry_reads(llvm: Llvm, entry, allow_phi: bool) -> tuple[list, list, list, 
             length_fields.append(user)
         elif allow_phi and llvm.IsAPHINode(user):
             phis.append(user)
+        elif allow_calls and llvm.IsACallInst(user) and _passes_to_reader(llvm, user, entry):
+            if user not in calls:
+                calls.append(user)
         else:
             raise _Skip("error name entry used other than by reading it")
-    return name_loads, length_loads, length_fields, phis
+    return name_loads, length_loads, length_fields, phis, calls
 
 
 def _error_name_function(llvm: Llvm, ctx, mod, names: list[bytes]):
@@ -909,9 +936,10 @@ def compact_error_names(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) 
     keep it in relocated data. Each read becomes a call to
     `pgso.error_name`, which returns the same pair from 16-bit offsets into
     one blob of the same NUL-terminated names. Where a PHI merges an entry's
-    address with another pointer, the pair goes to a stack slot laid out like
-    the entry, and the PHI carries the slot. Any table entry or use the pass
-    does not recognize leaves the module unchanged."""
+    address with another pointer, or a call passes it to a function that only
+    reads it, the pair goes to a stack slot laid out like the entry, and the
+    PHI or call carries the slot. Any table entry or use the pass does not
+    recognize leaves the module unchanged."""
     ctx, mod = llvm.load(source)
     td = llvm.CreateTD(llvm.GetDL(mod))
     summary = {"pass": "compact-error-names", "rewritten_reads": 0, "spilled_reads": 0, "names": 0}
@@ -944,15 +972,22 @@ def compact_error_names(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) 
     builder = llvm.CreateBuilder(ctx)
     i8, i64 = llvm.Int8Ty(ctx), llvm.Int64Ty(ctx)
     pair = llvm.StructType(ctx, (P * 2)(llvm.PointerType(ctx, 0), i64), 2, 0)
-    slots = {}
-    for phi in phis:
-        entry_block = llvm.EntryBlock(llvm.BlockParent(llvm.InstParent(phi)))
+
+    def new_slot(inst):
+        entry_block = llvm.EntryBlock(llvm.BlockParent(llvm.InstParent(inst)))
         llvm.PositionBefore(builder, llvm.FirstInstruction(entry_block))
         slot = llvm.BuildAlloca(builder, pair, b"")
         llvm.SetAlignment(slot, 8)
-        slots[phi] = slot
+        return slot
 
-    for gep, index, (name_loads, length_loads, length_fields, gep_phis) in plans:
+    def store_pair(slot, name, length):
+        llvm.SetAlignment(llvm.BuildStore(builder, name, slot), 8)
+        length_at = llvm.BuildGEP2(builder, i8, slot, (P * 1)(llvm.ConstInt(i64, 8, 0)), 1, b"")
+        llvm.SetAlignment(llvm.BuildStore(builder, length, length_at), 8)
+
+    slots = {phi: new_slot(phi) for phi in phis}
+    for gep, index, (name_loads, length_loads, length_fields, gep_phis, gep_calls) in plans:
+        call_slot = new_slot(gep) if gep_calls else None
         llvm.PositionBefore(builder, gep)
         call = llvm.BuildCall2(builder, fn_type, fn, (P * 1)(index), 1, b"")
         name = llvm.BuildExtractValue(builder, call, 0, b"")
@@ -967,12 +1002,17 @@ def compact_error_names(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) 
             llvm.Erase(field)
         for phi in gep_phis:
             slot = slots[phi]
-            llvm.SetAlignment(llvm.BuildStore(builder, name, slot), 8)
-            length_at = llvm.BuildGEP2(builder, i8, slot, (P * 1)(llvm.ConstInt(i64, 8, 0)), 1, b"")
-            llvm.SetAlignment(llvm.BuildStore(builder, length, length_at), 8)
+            store_pair(slot, name, length)
             for k in range(llvm.CountIncoming(phi)):
                 if llvm.IncomingValue(phi, k) == gep:
                     llvm.SetOperand(phi, k, slot)
+            summary["spilled_reads"] += 1
+        if call_slot is not None:
+            store_pair(call_slot, name, length)
+            for passing in gep_calls:
+                for k in range(llvm.NumOperands(passing) - 1):
+                    if llvm.GetOperand(passing, k) == gep:
+                        llvm.SetOperand(passing, k, call_slot)
             summary["spilled_reads"] += 1
         if name_loads or length_loads:
             summary["rewritten_reads"] += 1

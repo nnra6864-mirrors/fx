@@ -707,6 +707,64 @@ ERROR_NAME_MAIN = (
 )
 
 
+# The IR outliner can move a name copy into a function that other callers
+# share, as `outlined_ir_func_140` does for `core.indexer.bounded_read.readWith`.
+# `@copied` scores a name as `@score` does; `@copied_local` passes a local pair.
+ERROR_NAME_COPIED = (
+    "define internal void @copy_pair(ptr %from, ptr %to) {\n"
+    "start:\n"
+    "  %name = load ptr, ptr %from, align 8\n"
+    "  %length_at = getelementptr inbounds nuw i8, ptr %from, i64 8\n"
+    "  %length = load i64, ptr %length_at, align 8\n"
+    "  store ptr %name, ptr %to, align 8\n"
+    "  %to_length = getelementptr inbounds nuw i8, ptr %to, i64 8\n"
+    "  store i64 %length, ptr %to_length, align 8\n"
+    "  ret void\n"
+    "}\n"
+    "define internal i64 @copied(i64 %e) {\n"
+    "start:\n"
+    "  %out = alloca { ptr, i64 }, align 8\n"
+    "  %entry = getelementptr inbounds nuw [16 x i8], ptr @__zig_error_name_table, i64 %e\n"
+    "  call void @copy_pair(ptr %entry, ptr %out)\n"
+    "  %name = load ptr, ptr %out, align 8\n"
+    "  %length_at = getelementptr inbounds nuw i8, ptr %out, i64 8\n"
+    "  %length = load i64, ptr %length_at, align 8\n"
+    "  %first = load i8, ptr %name, align 1\n"
+    "  %end = getelementptr inbounds i8, ptr %name, i64 %length\n"
+    "  %sentinel = load i8, ptr %end, align 1\n"
+    "  %first64 = zext i8 %first to i64\n"
+    "  %sentinel64 = zext i8 %sentinel to i64\n"
+    "  %scaled = mul i64 %length, 16\n"
+    "  %partial = add i64 %scaled, %first64\n"
+    "  %penalty = mul i64 %sentinel64, 1000\n"
+    "  %score = add i64 %partial, %penalty\n"
+    "  ret i64 %score\n"
+    "}\n"
+    "define internal i64 @copied_local() {\n"
+    "start:\n"
+    "  %local = alloca { ptr, i64 }, align 8\n"
+    "  %out = alloca { ptr, i64 }, align 8\n"
+    "  store ptr @n2, ptr %local, align 8\n"
+    "  %local_length = getelementptr inbounds i8, ptr %local, i64 8\n"
+    "  store i64 4, ptr %local_length, align 8\n"
+    "  call void @copy_pair(ptr %local, ptr %out)\n"
+    "  %length_at = getelementptr inbounds nuw i8, ptr %out, i64 8\n"
+    "  %length = load i64, ptr %length_at, align 8\n"
+    "  ret i64 %length\n"
+    "}\n"
+    # (3*16 + 'F') + (1*16 + 'Q') + 4 = 219.
+    "define i32 @main() {\n"
+    "start:\n"
+    "  %a = call i64 @copied(i64 1)\n"
+    "  %b = call i64 @copied(i64 3)\n"
+    "  %c = call i64 @copied_local()\n"
+    "  %ab = add i64 %a, %b\n"
+    "  %all = add i64 %ab, %c\n"
+    "  %result = trunc i64 %all to i32\n"
+    "  ret i32 %result\n"
+    "}\n"
+)
+
 @unittest.skipUnless(AVAILABLE and (LLVM_BIN / "lli").is_file(), "pinned LLVM 21 with libLLVM and lli is not installed")
 class CompactErrorNameTests(LlvmCase):
     def text(self, bitcode: pathlib.Path) -> str:
@@ -738,6 +796,22 @@ class CompactErrorNameTests(LlvmCase):
         self.assertEqual(521 % 256, self.exit_code(source))
         self.assertEqual(self.exit_code(source), self.exit_code(output))
 
+    def test_an_entry_passed_to_a_function_that_only_reads_it_goes_through_a_slot(self) -> None:
+        source = self.assemble("copied", ERROR_NAMES + ERROR_NAME_COPIED)
+        result, output = self.run_pass("compact-error-names", source)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn('"rewritten_reads": 0', result.stdout)
+        self.assertIn('"spilled_reads": 1', result.stdout)
+
+        ir = self.cleaned_ir(output)
+        self.assertNotIn("@__zig_error_name_table", ir)
+        self.assertEqual(1, ir.count("call { ptr, i64 } @pgso.error_name("))
+        # The shared copy is unchanged, so its other callers are too.
+        self.assertIn("%name = load ptr, ptr %from, align 8", ir)
+        self.assertEqual(2, ir.count("call void @copy_pair("))
+        self.assertEqual(219, self.exit_code(source))
+        self.assertEqual(self.exit_code(source), self.exit_code(output))
+
     def test_unrecognized_uses_leave_the_table_in_place(self) -> None:
         cases = {
             "escaping": (
@@ -745,6 +819,17 @@ class CompactErrorNameTests(LlvmCase):
                 "define void @use(i64 %e) {\n"
                 "  %entry = getelementptr inbounds nuw [16 x i8], ptr @__zig_error_name_table, i64 %e\n"
                 "  call void @keep(ptr %entry)\n"
+                "  ret void\n}\n",
+                "error name entry used other than by reading it",
+            ),
+            "kept": (
+                "@kept = internal global ptr null\n"
+                "define internal void @remember(ptr %p) {\n"
+                "  store ptr %p, ptr @kept, align 8\n"
+                "  ret void\n}\n"
+                "define void @use(i64 %e) {\n"
+                "  %entry = getelementptr inbounds nuw [16 x i8], ptr @__zig_error_name_table, i64 %e\n"
+                "  call void @remember(ptr %entry)\n"
                 "  ret void\n}\n",
                 "error name entry used other than by reading it",
             ),

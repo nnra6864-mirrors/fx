@@ -137,8 +137,10 @@ every error name through one function: Zig's `__zig_error_name_table` holds a
 16-byte pointer and length per error, about 26 KB of relocated data, and each
 `@errorName` reads it in place. The function returns the same pointer and
 length from 16-bit offsets into one blob of the same NUL-terminated names.
-Where a PHI merges an entry with another pointer, the pair goes to a stack slot
-laid out like the entry. Any entry or use the pass does not recognize leaves
+Where a PHI merges an entry with another pointer, or a call passes it to a
+function that only reads it, such as a pair copy the IR outliner made, the
+pair goes to a stack slot laid out like the entry. Any entry or use the pass
+does not recognize leaves
 the table unchanged. `globaldce,verify` then drops the dead constants. Benchmark artifacts receive every pass so their candidates keep
 the production code shape. The candidate link passes
 `-no_compact_unwind`: fx builds without unwind tables, and newer Apple linkers
