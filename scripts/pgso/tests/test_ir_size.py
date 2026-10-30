@@ -536,3 +536,101 @@ class NoOutlineTests(LlvmCase):
         self.assertEqual(1, result.returncode)
         self.assertIn("is defined", result.stderr)
         self.assertFalse(output.exists())
+
+ZERO_FILL_STATE = (
+    "@target = internal global i32 7, align 4\n"
+    "@state = internal unnamed_addr global { [8192 x i8], i32, ptr, i64 } "
+    "{ [8192 x i8] undef, i32 255, ptr @target, i64 0 }, align 8\n"
+)
+# Returns 255 + 7 when both restored fields read back.
+ZERO_FILL_MAIN = (
+    "define i32 @main() {\n"
+    "entry:\n"
+    "  %slot = alloca i32, align 4\n"
+    "  %count_at = getelementptr inbounds i8, ptr @state, i64 8192\n"
+    "  %count = load i32, ptr %count_at, align 8\n"
+    "  %pointer_at = getelementptr inbounds i8, ptr @state, i64 8200\n"
+    "  %pointer = load ptr, ptr %pointer_at, align 8\n"
+    "  %value = load i32, ptr %pointer, align 4\n"
+    "  %sum = add i32 %count, %value\n"
+    "  store i32 %sum, ptr %slot, align 4\n"
+    "  %result = load i32, ptr %slot, align 4\n"
+    "  ret i32 %result\n"
+    "}\n"
+)
+
+
+@unittest.skipUnless(AVAILABLE and (LLVM_BIN / "lli").is_file(), "pinned LLVM 21 with libLLVM and lli is not installed")
+class ZeroFillGlobalTests(LlvmCase):
+    def text(self, bitcode: pathlib.Path) -> str:
+        return subprocess.run(
+            [str(LLVM_BIN / "llvm-dis"), str(bitcode), "-o", "-"], check=True, capture_output=True, text=True
+        ).stdout
+
+    def exit_code(self, bitcode: pathlib.Path) -> int:
+        # LLVM's interpreter runs the module the same way on any host; JIT
+        # compiling its macOS target fails on Linux.
+        result = subprocess.run(
+            [str(LLVM_BIN / "lli"), "--force-interpreter", str(bitcode)], capture_output=True, text=True
+        )
+        self.assertEqual("", result.stderr)
+        return result.returncode
+
+    def test_mostly_undefined_global_moves_to_zero_fill_and_main_restores_its_bytes(self) -> None:
+        source = self.assemble("state", ZERO_FILL_STATE + ZERO_FILL_MAIN)
+        result, output = self.run_pass("zero-fill-globals", source)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn('"zero_filled_globals": 1', result.stdout)
+        self.assertIn('"stored_bytes": 12', result.stdout)
+
+        ir = self.text(output)
+        self.assertIn("@state = internal unnamed_addr global { [8192 x i8], i32, ptr, i64 } zeroinitializer", ir)
+        self.assertIn("@target = internal global i32 7", ir)
+        body = ir[ir.index("define i32 @main()") :]
+        # The stores come after the entry allocas and before the first read.
+        self.assertLess(body.index("alloca i32"), body.index("store i32 255"))
+        self.assertLess(body.index("store i32 255"), body.index("%count = load"))
+        self.assertLess(body.index("store ptr @target"), body.index("%count = load"))
+        self.assertEqual(262 % 256, self.exit_code(source))
+        self.assertEqual(self.exit_code(source), self.exit_code(output))
+
+    def test_main_defined_as_an_alias_like_zig_is_followed(self) -> None:
+        aliased = ZERO_FILL_MAIN.replace("define i32 @main()", "define internal i32 @main.main()")
+        source = self.assemble("aliased", ZERO_FILL_STATE + "@main = alias i32 (), ptr @main.main\n" + aliased)
+        result, output = self.run_pass("zero-fill-globals", source)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn('"zero_filled_globals": 1', result.stdout)
+        body = self.text(output)
+        body = body[body.index("define internal i32 @main.main()") :]
+        # LLVM's interpreter cannot start at an alias, so the plain-`main`
+        # test above is the one that runs both modules.
+        self.assertLess(body.index("store i32 255"), body.index("%count = load"))
+        self.assertLess(body.index("store ptr @target"), body.index("%count = load"))
+
+    def test_globals_that_must_keep_their_initializer_are_untouched(self) -> None:
+        kept = (
+            # Too many nonzero bytes to restore.
+            "@dense = internal global [1024 x i64] [" + ", ".join(["i64 1"] * 1024) + "], align 8\n"
+            # Too small to save a page.
+            "@small = internal global { [1024 x i8], i32 } { [1024 x i8] undef, i32 1 }, align 4\n"
+            "@constant = internal unnamed_addr constant { [8192 x i8], i32 } { [8192 x i8] undef, i32 1 }, align 4\n"
+            "@external = global { [8192 x i8], i32 } { [8192 x i8] undef, i32 1 }, align 4\n"
+            "@local = internal thread_local global { [8192 x i8], i32 } { [8192 x i8] undef, i32 1 }, align 4\n"
+            '@placed = internal global { [8192 x i8], i32 } { [8192 x i8] undef, i32 1 }, section "__DATA,__fx", align 4\n'
+        )
+        uses = "".join(
+            f"  %{name} = load i32, ptr @{name}, align 4\n"
+            for name in ("dense", "small", "constant", "external", "local", "placed")
+        )
+        main = "define i32 @main() {\nentry:\n" + uses + "  ret i32 0\n}\n"
+        result, output = self.run_pass("zero-fill-globals", self.assemble("kept", kept + main))
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn('"zero_filled_globals": 0', result.stdout)
+        self.assertNotIn("zeroinitializer", self.text(output))
+
+    def test_a_module_without_main_is_unchanged(self) -> None:
+        library = ZERO_FILL_STATE + "define i32 @read() {\n  %v = load i32, ptr @state, align 8\n  ret i32 %v\n}\n"
+        result, output = self.run_pass("zero-fill-globals", self.assemble("library", library))
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn('"skipped": "no main"', result.stdout)
+        self.assertIn("i32 255", self.text(output))

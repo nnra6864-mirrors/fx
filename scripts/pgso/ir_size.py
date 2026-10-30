@@ -119,6 +119,11 @@ OVERLAY_MAX_NONZERO_SHARE = 0.25
 OVERLAY_GUARD_BYTES = 64
 OVERLAY_MAX_ALIGN = 16
 OVERLAY_BLOB = b"pgso.overlaid_constants"
+# zero-fill-globals: writable globals at least this large whose nonzero
+# defined bytes fit in ZERO_FILL_MAX_STORED_BYTES move to zero-fill.
+ZERO_FILL_MIN_BYTES = 4096
+ZERO_FILL_MAX_STORED_BYTES = 64
+ZERO_FILL_MAX_STORES = 8
 
 P = C.c_void_p
 STRUCT, ARRAY, INTEGER, POINTER = 10, 11, 8, 12
@@ -259,6 +264,13 @@ class Llvm:
         self.ConstString = f("LLVMConstStringInContext2", P, P, C.c_char_p, C.c_size_t, C.c_int)
         self.ConstGEP2 = f("LLVMConstInBoundsGEP2", P, P, P, C.POINTER(P), C.c_uint)
         self.DeleteGlobal = f("LLVMDeleteGlobal", None, P)
+        self.GetNamedFunction = f("LLVMGetNamedFunction", P, P, C.c_char_p)
+        self.EntryBlock = f("LLVMGetEntryBasicBlock", P, P)
+        self.ConstNull = f("LLVMConstNull", P, P)
+        self.IsAAllocaInst = f("LLVMIsAAllocaInst", P, P)
+        self.GetNamedAlias = f("LLVMGetNamedGlobalAlias", P, P, C.c_char_p, C.c_size_t)
+        self.AliasTarget = f("LLVMAliasGetAliasee", P, P)
+        self.IsAFunction = f("LLVMIsAFunction", P, P)
 
     def _fn(self, name, res, *args):
         fn = getattr(self.lib, name)
@@ -632,6 +644,116 @@ def overlay_constants(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) ->
     return summary
 
 
+def _nonzero_leaves(llvm: Llvm, td, value, base: int, out: list) -> None:
+    """Collects (offset, constant, size, alignment) for each defined nonzero
+    scalar in `value`; undefined and zero parts hold nothing to restore."""
+    if llvm.IsUndef(value) or llvm.IsNull(value):
+        return
+    ty = llvm.TypeOf(value)
+    kind = llvm.TypeKind(ty)
+    if kind == STRUCT:
+        for i in range(llvm.CountStructElems(ty)):
+            _nonzero_leaves(llvm, td, llvm.AggElem(value, i), base + llvm.OffsetOfElement(td, ty, i), out)
+        return
+    if kind == ARRAY:
+        element = llvm.ElementType(ty)
+        stride = llvm.ABISize(td, element)
+        for i in range(llvm.ArrayLen(ty)):
+            item = llvm.AggElem(value, i)
+            if not item:
+                raise _Skip("unreadable array element")
+            _nonzero_leaves(llvm, td, item, base + i * stride, out)
+        return
+    scalar = (
+        (kind == INTEGER and llvm.IsAConstantInt(value))
+        or (kind == POINTER and llvm.IsConstant(value))
+        or (kind in FLOATS and llvm.IsAConstantFP(value))
+    )
+    if not scalar:
+        raise _Skip(f"unsupported leaf kind {kind}")
+    out.append((base, value, llvm.ABISize(td, ty), llvm.ABIAlign(td, ty)))
+    if len(out) > ZERO_FILL_MAX_STORES or sum(leaf[2] for leaf in out) > ZERO_FILL_MAX_STORED_BYTES:
+        raise _Skip("too many nonzero bytes")
+
+
+def _zero_fill_plan(llvm: Llvm, td, glob):
+    if llvm.IsDeclaration(glob) or llvm.IsGlobalConstant(glob):
+        return None
+    if llvm.GetLinkage(glob) not in (INTERNAL_LINKAGE, PRIVATE_LINKAGE):
+        return None
+    if llvm.IsThreadLocal(glob) or llvm.IsExternallyInitialized(glob) or llvm.GetSection(glob) or llvm.GetComdat(glob):
+        return None
+    ty = llvm.GlobalValueType(glob)
+    size = llvm.ABISize(td, ty)
+    initializer = llvm.GetInitializer(glob)
+    if size < ZERO_FILL_MIN_BYTES or not initializer or llvm.IsNull(initializer) or llvm.IsUndef(initializer):
+        return None
+    stores: list = []
+    try:
+        _nonzero_leaves(llvm, td, initializer, 0, stores)
+    except _Skip:
+        return None
+    # Without a nonzero byte, LLVM already puts the global in zero-fill.
+    return (glob, ty, size, stores) if stores else None
+
+
+def _entry_function(llvm: Llvm, mod):
+    """`main`, or the function it aliases: Zig defines the program's `main`
+    as an alias of an internal function."""
+    entry = llvm.GetNamedFunction(mod, b"main")
+    if entry:
+        return entry
+    alias = llvm.GetNamedAlias(mod, b"main", 4)
+    return llvm.IsAFunction(llvm.AliasTarget(alias)) if alias else None
+
+
+def zero_fill_globals(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> dict:
+    """Moves large writable globals that are almost all zero or undefined to
+    zero-fill, which takes no space in the file, and stores their few nonzero
+    bytes at the start of `main` instead.
+
+    A writable global with even one nonzero byte in its initializer is
+    written out whole. `main` runs before anything else in the program reads
+    these globals, and no later pipeline stage evaluates stores back into an
+    initializer, so every read sees the same value as before."""
+    ctx, mod = llvm.load(source)
+    td = llvm.CreateTD(llvm.GetDL(mod))
+    summary = {"pass": "zero-fill-globals", "zero_filled_globals": 0, "zero_filled_bytes": 0, "stored_bytes": 0}
+    entry_fn = _entry_function(llvm, mod)
+    if not entry_fn or llvm.IsDeclaration(entry_fn):
+        llvm.save(mod, output)
+        summary["skipped"] = "no main"
+        return summary
+    plans = []
+    glob = llvm.FirstGlobal(mod)
+    while glob:
+        plan = _zero_fill_plan(llvm, td, glob)
+        if plan:
+            plans.append(plan)
+        glob = llvm.NextGlobal(glob)
+    if plans:
+        i8, i64 = llvm.Int8Ty(ctx), llvm.Int64Ty(ctx)
+        builder = llvm.CreateBuilder(ctx)
+        first = llvm.FirstInstruction(llvm.EntryBlock(entry_fn))
+        while first and llvm.IsAAllocaInst(first):
+            first = llvm.NextInstruction(first)
+        if not first:
+            raise PassError("main has an empty entry block")
+        llvm.PositionBefore(builder, first)
+        for glob, ty, size, stores in plans:
+            llvm.SetInitializer(glob, llvm.ConstNull(ty))
+            for offset, value, width, align in stores:
+                index = (P * 1)(llvm.ConstInt(i64, offset, 0))
+                address = llvm.BuildGEP2(builder, i8, glob, index, 1, b"")
+                store = llvm.BuildStore(builder, value, address)
+                llvm.SetAlignment(store, align)
+                summary["stored_bytes"] += width
+            summary["zero_filled_globals"] += 1
+            summary["zero_filled_bytes"] += size
+    llvm.save(mod, output)
+    return summary
+
+
 def _instructions(llvm: Llvm, fn):
     block = llvm.FirstBlock(fn)
     while block:
@@ -844,6 +966,7 @@ def main(argv: list[str] | None = None) -> int:
             "outline-helpers",
             "sparse-constants",
             "overlay-constants",
+            "zero-fill-globals",
             "expand-constant-exprs",
             "swap-compares",
             "check-outlined",
@@ -870,6 +993,7 @@ def main(argv: list[str] | None = None) -> int:
                 "outline-helpers": outline_helpers,
                 "sparse-constants": sparse_constants,
                 "overlay-constants": overlay_constants,
+                "zero-fill-globals": zero_fill_globals,
                 "expand-constant-exprs": expand_constant_exprs,
                 "swap-compares": swap_compares,
                 "minsize-functions": minsize_functions,
