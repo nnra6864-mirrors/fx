@@ -1494,11 +1494,15 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     for (startup.config_diagnostics) |diagnostic| {
         var notice_writer: std.Io.Writer.Allocating = .init(alloc);
         defer notice_writer.deinit();
-        try notice_writer.writer.print(
-            "fx ask: config {s}: {s}",
-            .{ @tagName(diagnostic.layer), @tagName(diagnostic.cause) },
-        );
-        try config_runtime.writeDiagnosticMetadata(&notice_writer.writer, diagnostic);
+        if (diagnostic.note()) |text| {
+            try notice_writer.writer.print("fx ask: note: {s}", .{text});
+        } else {
+            try notice_writer.writer.print(
+                "fx ask: config {s}: {s}",
+                .{ @tagName(diagnostic.layer), @tagName(diagnostic.cause) },
+            );
+            try config_runtime.writeDiagnosticMetadata(&notice_writer.writer, diagnostic);
+        }
         try notice_writer.writer.writeByte('\n');
         const notice = try notice_writer.toOwnedSlice();
         defer alloc.free(notice);
