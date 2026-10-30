@@ -491,7 +491,7 @@ pub const MarkdownProcessor = struct {
         }
 
         try out.appendNTimes(alloc, ' ', shift);
-        if (try block_render.writeListLine(alloc, line, line_has_lf, out, &fs, &link_id_counter)) {
+        if (try block_render.writeListLine(alloc, line, line_has_lf, .right_aligned, out, &fs, &link_id_counter)) {
             if (bp.parseOrderedList(line)) |item| {
                 try self.open_ordered_items.append(alloc, .{
                     .content_column = item.indent.len + item.marker.len + 1,
@@ -2650,9 +2650,25 @@ test "blockquote renders headings and list items inside the quote" {
     try std.testing.expectEqualStrings(
         "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[1mNote\x1b[22m\n" ++
             "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[2m\xe2\x80\xa2 \x1b[22mone\n" ++
-            "\x1b[2m\xe2\x94\x82 \x1b[22m  \x1b[2m2.\x1b[22m two\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[2m2.\x1b[22m two\n" ++
             "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[38;5;252m\xe2\x9c\x93\x1b[39m done\n" ++
             "\x1b[2m\xe2\x94\x82 \x1b[22mplain\n",
+        out.items,
+    );
+}
+
+test "ordered lists inside a quote keep their markers as written" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "> 9. nine\n>    - child\n> 10. ten\n", &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[2m9.\x1b[22m nine\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22m   \x1b[2m\xe2\x80\xa2 \x1b[22mchild\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[2m10.\x1b[22m ten\n",
         out.items,
     );
 }
@@ -2745,6 +2761,63 @@ test "flushing assistant text closes open ordered items" {
     try processor.flush(alloc, &out);
     try processor.push(alloc, "   prose\n", &out);
     try std.testing.expectEqualStrings("  \x1b[2m1.\x1b[22m item\n   prose\n", out.items);
+}
+
+const fuzz_markdown_list_pieces = [_][]const u8{
+    "1. ",   "9. ",      "10. ",  "100) ", "1000. ", "123456789. ", "1234567890. ", "1.",
+    "- ",    "* ",       "+ ",    "[x] ",  "[ ] ",   " ",           "   ",          "    ",
+    "\t",    "\n",       "\n\n",  "\r\n",  "> ",     ">> ",         "```",          "~~~",
+    "|a|\n", "---\n",    "===\n", "# ",    "[^1]: ", ": ",          "word",         "**b**",
+    "`c`",   "\u{754c}",
+};
+
+/// Open items nest strictly inward, and each level pads by at most two.
+fn expectOpenOrderedItemsNested(processor: *const MarkdownProcessor) !void {
+    const items = processor.open_ordered_items.items;
+    for (items, 0..) |item, i| {
+        try std.testing.expect(item.shift <= 2 * (i + 1));
+        if (i == 0) continue;
+        try std.testing.expect(items[i - 1].content_column < item.content_column);
+        try std.testing.expect(items[i - 1].shift <= item.shift);
+    }
+}
+
+fn fuzzMarkdownLists(_: void, smith: *std.testing.Smith) !void {
+    const alloc = std.testing.allocator;
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(alloc);
+    for (0..smith.valueRangeAtMost(u8, 0, 64)) |_| {
+        try source.appendSlice(alloc, fuzz_markdown_list_pieces[smith.index(fuzz_markdown_list_pieces.len)]);
+    }
+
+    var whole = MarkdownProcessor{};
+    defer whole.deinit(alloc);
+    var whole_out: std.ArrayList(u8) = .empty;
+    defer whole_out.deinit(alloc);
+    try whole.push(alloc, source.items, &whole_out);
+    try expectOpenOrderedItemsNested(&whole);
+    try whole.flush(alloc, &whole_out);
+    try std.testing.expectEqual(@as(usize, 0), whole.open_ordered_items.items.len);
+
+    var split = MarkdownProcessor{};
+    defer split.deinit(alloc);
+    var split_out: std.ArrayList(u8) = .empty;
+    defer split_out.deinit(alloc);
+    var start: usize = 0;
+    while (start < source.items.len) {
+        const len: usize = smith.valueRangeAtMost(u16, 1, @intCast(source.items.len - start));
+        try split.push(alloc, source.items[start..][0..len], &split_out);
+        try expectOpenOrderedItemsNested(&split);
+        start += len;
+    }
+    try split.flush(alloc, &split_out);
+    try std.testing.expectEqualStrings(whole_out.items, split_out.items);
+}
+
+test "Markdown lists render the same however assistant text is split" {
+    try std.testing.fuzz({}, fuzzMarkdownLists, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").markdown_lists.*),
+    });
 }
 
 test "task list items render static pending and completed markers" {

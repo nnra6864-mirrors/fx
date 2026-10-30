@@ -84,9 +84,17 @@ fn writeQuotedBlockContent(
         try writeHeading(alloc, header.level, header.content, out, footnotes, link_id);
         return;
     }
-    if (try writeListLine(alloc, content, line_has_lf, out, footnotes, link_id)) return;
+    if (try writeListLine(alloc, content, line_has_lf, .as_written, out, footnotes, link_id)) return;
     try inline_render.writeInline(alloc, tu.withoutTerminalHardBreakMarker(content, line_has_lf), out, false, footnotes, link_id);
 }
+
+/// How `writeListLine` draws ordered list numbers.
+pub const OrderedMarkers = enum {
+    as_written,
+    /// Padded by `orderedMarkerPad`. The caller moves the lines nested in
+    /// the item by the same amount.
+    right_aligned,
+};
 
 /// Renders an unordered, ordered, or task list line without a trailing
 /// newline. Returns false when `line` is not a list item.
@@ -94,6 +102,7 @@ pub fn writeListLine(
     alloc: Allocator,
     line: []const u8,
     line_has_lf: bool,
+    ordered_markers: OrderedMarkers,
     out: *std.ArrayList(u8),
     footnotes: ?*const payload.FootnoteSink,
     link_id: *u32,
@@ -111,7 +120,7 @@ pub fn writeListLine(
     }
     if (bp.parseOrderedList(line)) |parsed| {
         try out.appendSlice(alloc, parsed.indent);
-        try out.appendNTimes(alloc, ' ', orderedMarkerPad(parsed.marker));
+        if (ordered_markers == .right_aligned) try out.appendNTimes(alloc, ' ', orderedMarkerPad(parsed.marker));
         try ansi.writeDim(alloc, out, parsed.marker);
         try out.append(alloc, ' ');
         if (bp.parseTaskListItem(parsed.content)) |task| {
