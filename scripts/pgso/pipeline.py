@@ -41,8 +41,8 @@ GENERATION_FLAGS = (
     f"-passes={PROFILE_PREPARATION_PASSES},default<O2>",
 )
 
-# Apply the profile before partitioning so every part inherits the accepted
-# whole-program optimization and profile metadata.
+# Apply the profile to the whole program before outlining, so the outliner
+# sees the accepted whole-program optimization and profile metadata.
 USE_FLAGS = (
     "--disable-vp",
     "-pgo-kind=pgo-instr-use-pipeline",
@@ -50,8 +50,6 @@ USE_FLAGS = (
     "-profile-summary-cutoff-cold=600000",
     f"-passes={PROFILE_PREPARATION_PASSES},default<O2>,mergefunc",
 )
-
-OUTLINE_PARTITIONS = 2
 
 # Each outliner input first goes through `ir_size.py expand-constant-exprs`
 # and `ir_size.py swap-compares`, and each output through `ir_size.py
@@ -153,8 +151,7 @@ class PipelinePaths:
     merged_profile: pathlib.Path
     candidate: pathlib.Path
     profile_use_base_bitcode: pathlib.Path
-    outline_split_prefix: pathlib.Path
-    linked_outlined_bitcode: pathlib.Path
+    outlined_bitcode: pathlib.Path
     profile_use_bitcode: pathlib.Path
     profile_use_ir: pathlib.Path
     profile_use_object: pathlib.Path
@@ -254,8 +251,7 @@ class PipelinePaths:
             merged_profile=profiles / "merged.profdata",
             candidate=candidate,
             profile_use_base_bitcode=candidate / f"{binary_name}.profile-use.bc",
-            outline_split_prefix=candidate / f"{binary_name}.split.",
-            linked_outlined_bitcode=candidate / f"{binary_name}.outlined.bc",
+            outlined_bitcode=candidate / f"{binary_name}.outlined.bc",
             profile_use_bitcode=candidate / bitcode_name,
             profile_use_ir=candidate / f"{binary_name}.ll",
             profile_use_object=candidate / f"{binary_name}.o",
@@ -267,20 +263,6 @@ class PipelinePaths:
             ir_cache=ir_cache,
             global_cache=global_cache,
             logs=logs,
-        )
-
-    @property
-    def outline_split_bitcodes(self) -> tuple[pathlib.Path, ...]:
-        return tuple(
-            pathlib.Path(f"{self.outline_split_prefix}{index}")
-            for index in range(OUTLINE_PARTITIONS)
-        )
-
-    @property
-    def outlined_bitcodes(self) -> tuple[pathlib.Path, ...]:
-        return tuple(
-            self.candidate / f"{self.binary_name}.outlined.{index}.bc"
-            for index in range(OUTLINE_PARTITIONS)
         )
 
     @property
@@ -455,20 +437,6 @@ def profile_use_argv(
     )
 
 
-def split_ir_argv(
-    toolchain: Toolchain,
-    paths: PipelinePaths,
-) -> tuple[str, ...]:
-    return (
-        str(toolchain.llvm_split),
-        "-j",
-        str(OUTLINE_PARTITIONS),
-        "-o",
-        str(paths.outline_split_prefix),
-        str(paths.profile_use_base_bitcode),
-    )
-
-
 def outline_ir_argv(
     toolchain: Toolchain,
     source: pathlib.Path,
@@ -483,18 +451,6 @@ def outline_ir_argv(
     )
 
 
-def link_outlined_ir_argv(
-    toolchain: Toolchain,
-    paths: PipelinePaths,
-) -> tuple[str, ...]:
-    return (
-        str(toolchain.llvm_link),
-        *map(str, paths.outlined_bitcodes),
-        "-o",
-        str(paths.linked_outlined_bitcode),
-    )
-
-
 def cleanup_outlined_ir_argv(
     toolchain: Toolchain,
     paths: PipelinePaths,
@@ -503,7 +459,7 @@ def cleanup_outlined_ir_argv(
         str(toolchain.opt),
         *OUTLINE_CLEANUP_FLAGS,
         *toolchain.platform.public_api_flags(toolchain, paths),
-        str(paths.linked_outlined_bitcode),
+        str(paths.outlined_bitcode),
         "-o",
         str(paths.profile_use_bitcode),
     )
@@ -1215,35 +1171,13 @@ def apply_profile(
         paths.profile_use_base_bitcode,
         paths.logs / "public-symbols-before.json",
     )
-    run_checked(
-        split_ir_argv(toolchain, paths),
-        cwd=paths.root,
-        env=os.environ.copy(),
-        timeout_s=300,
-        log_path=paths.logs / "split-profile-use.json",
-        require_empty_stderr=True,
+    _outline_without_folded_constants(
+        toolchain,
+        paths,
+        paths.profile_use_base_bitcode,
+        paths.outlined_bitcode,
+        "profile-use",
     )
-    for split in paths.outline_split_bitcodes:
-        _require_nonempty_file(split, "profile-use IR partition")
-    for index, (split, outlined) in enumerate(
-        zip(paths.outline_split_bitcodes, paths.outlined_bitcodes)
-    ):
-        _outline_without_folded_constants(
-            toolchain,
-            paths,
-            split,
-            outlined,
-            f"profile-use-{index}",
-        )
-    run_checked(
-        link_outlined_ir_argv(toolchain, paths),
-        cwd=paths.root,
-        env=os.environ.copy(),
-        timeout_s=300,
-        log_path=paths.logs / "link-outlined-ir.json",
-        require_empty_stderr=True,
-    )
-    _require_nonempty_file(paths.linked_outlined_bitcode, "linked outlined bitcode")
     run_checked(
         cleanup_outlined_ir_argv(toolchain, paths),
         cwd=paths.root,
@@ -1261,7 +1195,7 @@ def apply_profile(
     )
     if outlined_symbols != original_symbols:
         raise PgsoError(
-            "partitioned outlining changed the public symbol surface: "
+            "outlining changed the public symbol surface: "
             f"before={original_symbols}, after={outlined_symbols}"
         )
     return paths.profile_use_bitcode
