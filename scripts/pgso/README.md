@@ -108,7 +108,8 @@ library. Right after Zig emits bitcode, `outline-helpers` marks small shared
 std helpers `noinline`: the allocator's slice `free`, `remap`, and aligned
 allocation, the writer's `write`, `writeAll`, `writeByte`, and
 allocating-writer setup and teardown, the byte list's `appendSlice`, every
-list's `deinit`, `mem.eql`, and the `Io.Mutex` lock and unlock. Zig otherwise copies
+list's `deinit`, `mem.eql`, `mem.startsWith`, `ascii.eqlIgnoreCase`, and the
+`Io.Mutex` lock and unlock. Zig otherwise copies
 them into thousands of call sites (`free` alone into about 11,000). The pass
 runs before instrumentation, so training, profile use, and the recorded
 bitcode identity all include it. It reports matches per pattern and fails if

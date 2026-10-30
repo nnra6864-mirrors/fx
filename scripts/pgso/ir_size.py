@@ -13,7 +13,8 @@
 outline-helpers marks small shared std helpers as noinline: the allocator's
 slice free, remap, and aligned allocation, the writer's write, writeAll,
 writeByte, and allocating writer setup and teardown, the byte list's append,
-every list's teardown, slice equality, and the Io mutex's lock and unlock.
+every list's teardown, slice equality and prefix checks, case-insensitive
+ASCII equality, and the Io mutex's lock and unlock.
 Zig inlines them at thousands of call sites (free alone at about
 11,000 in fx); one out-of-line copy per instantiation keeps the same checks,
 poisoning, and calls. Run it on the emitted bitcode, before instrumentation,
@@ -100,6 +101,8 @@ OUT_OF_LINE_HELPERS = (
     r"array_list\.Aligned\(u8,null\)\.appendSlice",
     r"array_list\.Aligned\(.*\)\.deinit",
     r"mem\.eql__func_\d+",
+    r"mem\.startsWith(?:__func_\d+)?",
+    r"ascii\.eqlIgnoreCase",
     r"Io\.Mutex\.(?:lock|lockUncancelable|unlock)",
 )
 
