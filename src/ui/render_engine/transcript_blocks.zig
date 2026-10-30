@@ -4598,7 +4598,7 @@ test "renderEntriesToBytes reflows parser-rendered lists at paint-time cols" {
     const third = std.mem.find(u8, narrow, "third-").?;
     try std.testing.expect(first < second and second < third);
     try std.testing.expect(std.mem.find(u8, narrow, "\n    ") != null);
-    try std.testing.expect(std.mem.find(u8, narrow, "\n     ") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "\n       ") != null);
     try std.testing.expect(std.mem.find(u8, narrow, "\n      ") != null);
 
     var lines = std.mem.splitScalar(u8, narrow, '\n');
@@ -4620,7 +4620,7 @@ test "renderEntriesToBytes preserves parser-rendered list paragraph indentation"
     try appendAssistantTestEntry(&entries, alloc, 1, source.items);
     const narrow = try renderEntriesToBytes(alloc, entries.items, 18, .{});
     defer alloc.free(narrow);
-    try std.testing.expect(std.mem.find(u8, narrow, "     alpha beta\n     gamma delta") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "       alpha beta\n       gamma delta") != null);
     try std.testing.expect(std.mem.find(u8, narrow, "    alpha beta\n    gamma delta") != null);
 }
 
@@ -4661,7 +4661,7 @@ test "renderEntriesToBytes reflows parser-rendered task lists at paint-time cols
     const nested = std.mem.find(u8, narrow, "nested-").?;
     try std.testing.expect(first < completed and completed < nested);
     try std.testing.expect(std.mem.find(u8, narrow, "\n    ") != null);
-    try std.testing.expect(std.mem.find(u8, narrow, "\n       ") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "\n         ") != null);
     try std.testing.expect(std.mem.find(u8, narrow, "\n      ") != null);
 
     var lines = std.mem.splitScalar(u8, narrow, '\n');

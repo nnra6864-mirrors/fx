@@ -6,6 +6,7 @@ const browser = @import("../auth/browser_callback.zig");
 const transport_mod = @import("../auth/oauth_transport.zig");
 const host = @import("../hosts/host.zig");
 const output = @import("../output/output_contracts.zig");
+const json_decode = @import("../shared/json_decode.zig");
 const Allocator = std.mem.Allocator;
 const callback_url = "https://fx.sh/api/slack/oauth/callback";
 const bot_scope = "app_mentions:read";
@@ -58,7 +59,7 @@ pub fn run(alloc: Allocator, action: Action, transport: transport_mod.Provider, 
     }
     if (action == .refresh and previous == null) return error.SlackInstallationMissing;
     const config_url = try alloc.print("{s}/api/slack/install/config", .{origin});
-    const config = (try std.json.parseFromSlice(Config, alloc, try request(alloc, transport, .get, config_url, null, null), .{ .allocate = .alloc_always })).value;
+    const config = (try json_decode.parseFromSlice(Config, alloc, try request(alloc, transport, .get, config_url, null, null), .{ .allocate = .alloc_always })).value;
     try validate_config(config);
     const token_url = if (test_origin(origin)) try alloc.print("{s}/api/oauth.v2.access", .{origin}) else "https://slack.com/api/oauth.v2.access";
     const identity_url = if (test_origin(origin)) try alloc.print("{s}/api/auth.test", .{origin}) else "https://slack.com/api/auth.test";
@@ -251,7 +252,7 @@ fn load(alloc: Allocator, dir: *io.VerifiedDir) !?Installation {
     const stat = try file.stat(io.getIo());
     if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o777 != 0o600) return error.UnsafeSlackCredentialFile;
     const bytes = try io.readFileToEnd(alloc, &file, 65536);
-    const record = (try std.json.parseFromSlice(Installation, alloc, bytes, .{ .allocate = .alloc_always })).value;
+    const record = (try json_decode.parseFromSlice(Installation, alloc, bytes, .{ .allocate = .alloc_always })).value;
     if (record.version != 1 or !valid_id(record.app_id, "A") or !valid_id(record.team_id, "T") or !valid_id(record.bot_user_id, "UW") or !valid_id(record.bot_id, "B") or !valid_id(record.installed_by, "UW") or !std.mem.eql(u8, record.scope, bot_scope) or record.access_token.len == 0 or
         (record.refresh_token != null) != (record.expires_at_ms != null) or (record.refresh_token != null) != (record.refresh_expires_at_ms != null)) return error.InvalidSlackCredentialFile;
     return record;

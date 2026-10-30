@@ -60,6 +60,7 @@ const session_permission_state = @import("../permissions/session_permission_stat
 const model_provider = @import("../config/model_provider.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const history_range = @import("../shared/history_range.zig");
+const json_decode = @import("../shared/json_decode.zig");
 
 const Allocator = std.mem.Allocator;
 const Event = session_event.ConversationEvent;
@@ -1706,7 +1707,7 @@ pub const Session = struct {
         const all = events.items;
         const encoded = try a.alloc([]u8, all.len);
         for (all, encoded) |piece, *bytes| bytes.* = try self.encodeEvent(a, piece);
-        const start = try self.streamedPrefix(encoded[0..pieces.len]);
+        const start = try self.streamedPrefix(encoded[0..pieces.len], .commit, countResults(pieces));
 
         var tail: std.ArrayList(sm.Event) = .empty;
         switch (end) {
@@ -1878,7 +1879,7 @@ pub const Session = struct {
         };
         const encoded = try a.alloc([]u8, events.items.len);
         for (events.items, encoded) |event, *bytes| bytes.* = try self.encodeEvent(a, event);
-        const start = try self.streamedPrefix(encoded);
+        const start = try self.streamedPrefix(encoded, .stream, countResults(events.items));
         // The record goes out in the same write as the pieces before its
         // send, so a turn's first write already carries it
         // (`tests/tla/recovery/Resume.tla` CrashLoopAsks).
@@ -2142,13 +2143,18 @@ pub const Session = struct {
     /// How many of `encoded` the open turn already holds. A streamed piece
     /// that differs from the final turn is a bug; the stale turn is closed
     /// as superseded and the whole turn is written afresh, never mixed.
-    fn streamedPrefix(self: *Session, encoded: []const []u8) !usize {
-        if (!self.turn_open) return 0;
+    /// `phase` and `results`, the rebuild's tool result count, only name
+    /// the decision in the session trace, which the driver of
+    /// `tests/tla/session/TurnStreamTrace.tla` replays.
+    fn streamedPrefix(self: *Session, encoded: []const []u8, phase: StreamPhase, results: usize) !usize {
         const streamed = self.streamed.items;
-        const same = streamed.len <= encoded.len and (for (streamed, encoded[0..streamed.len]) |x, y| {
-            if (!samePiece(self.alloc, x, y)) break false;
-        } else true);
-        if (same) return streamed.len;
+        const held = if (self.turn_open) streamed.len else 0;
+        const reparsed: ?usize = if (self.turn_open) reparsedPrefix(self.alloc, streamed, encoded) else 0;
+        debug_trace.logf("session", "event=sessions_v2_stream session={s} phase={s} held={d} kept={d} results={d} reparsed={d}", .{
+            self.id(), @tagName(phase), held, if (reparsed != null) held else 0, results, reparsed orelse 0,
+        });
+        if (!self.turn_open) return 0;
+        if (reparsed != null) return streamed.len;
         debug_trace.logf("session", "event=sessions_v2_stream_mismatch session={s} streamed={d} final={d} dropped=stale_turn", .{ self.id(), streamed.len, encoded.len });
         _ = try self.write(&.{
             .{ .item = .{ .type = superseded_type, .data = "{}" } },
@@ -2320,7 +2326,7 @@ pub const Session = struct {
         defer scratch.deinit();
         const sa = scratch.allocator();
         const raw = (try self.handle.state(sa)).client_prompt orelse return null;
-        return try alloc.dupe(u8, try std.json.parseFromSliceLeaky([]const u8, sa, raw, .{}));
+        return try alloc.dupe(u8, try json_decode.parseFromSliceLeaky([]const u8, sa, raw, .{}));
     }
 
     /// Keeps the ACP client's system prompt with the session; the same
@@ -2384,7 +2390,7 @@ pub const Session = struct {
     /// before D92, or one fx cannot read, counts from zero.
     fn savedUsage(self: *Session, sa: Allocator) !types.Usage {
         const raw = (try self.handle.state(sa)).usage orelse return .{};
-        return std.json.parseFromSliceLeaky(types.Usage, sa, raw, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        return json_decode.parseFromSliceLeaky(types.Usage, sa, raw, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => {
                 debug_trace.logf("session", "event=sessions_v2_usage_reset session={s} reason={s} dropped=saved_usage", .{ self.id(), @errorName(err) });
@@ -2415,7 +2421,7 @@ pub const Session = struct {
         var state = try self.handle.state(a);
         defer state.deinit(a);
         if (state.title) |raw| {
-            const current = try std.json.parseFromSliceLeaky([]const u8, a, raw, .{});
+            const current = try json_decode.parseFromSliceLeaky([]const u8, a, raw, .{});
             var display = try session_display_metadata.deriveFromHistory(a, history);
             defer display.deinit(a);
             if (!display.present or !std.mem.eql(u8, current, display.title)) {
@@ -2579,7 +2585,7 @@ pub const Session = struct {
         defer scratch.deinit();
         const sa = scratch.allocator();
         const st = try self.handle.state(sa);
-        const title = if (st.title) |raw| try alloc.dupe(u8, try std.json.parseFromSliceLeaky([]const u8, sa, raw, .{})) else null;
+        const title = if (st.title) |raw| try alloc.dupe(u8, try json_decode.parseFromSliceLeaky([]const u8, sa, raw, .{})) else null;
         return .{ .title = title, .updated_ms = std.math.cast(i64, st.updated_ms) orelse 0 };
     }
 
@@ -2667,7 +2673,7 @@ pub const Session = struct {
         const sa = scratch.allocator();
         const raw = (try self.handle.state(sa)).moved_files orelse return;
         const Value = struct { map: []const u8 };
-        const value = std.json.parseFromSliceLeaky(Value, sa, raw, .{ .ignore_unknown_fields = true }) catch return error.InvalidSessionFormat;
+        const value = json_decode.parseFromSliceLeaky(Value, sa, raw, .{ .ignore_unknown_fields = true }) catch return error.InvalidSessionFormat;
         const bytes = self.store.manager.getBlob(sa, self.id(), value.map) catch |err| switch (err) {
             // A lost or damaged map damages the session, as a lost blob
             // does (D39); its old handles read as gone.
@@ -2677,7 +2683,7 @@ pub const Session = struct {
             },
             else => |e| return e,
         };
-        const map = std.json.parseFromSliceLeaky(std.json.ArrayHashMap([]const u8), sa, bytes, .{}) catch return error.InvalidSessionFormat;
+        const map = json_decode.parseFromSliceLeaky(std.json.ArrayHashMap([]const u8), sa, bytes, .{}) catch return error.InvalidSessionFormat;
         const host = self.host;
         try host.moved.ensureUnusedCapacity(host.alloc, @intCast(map.map.count()));
         for (map.map.keys(), map.map.values()) |key, hash| {
@@ -2695,7 +2701,7 @@ pub const Session = struct {
         const sa = scratch.allocator();
         const raw = (try self.handle.state(sa)).compaction_records orelse return;
         const Value = struct { map: []const u8 };
-        const value = std.json.parseFromSliceLeaky(Value, sa, raw, .{ .ignore_unknown_fields = true }) catch return error.InvalidSessionFormat;
+        const value = json_decode.parseFromSliceLeaky(Value, sa, raw, .{ .ignore_unknown_fields = true }) catch return error.InvalidSessionFormat;
         const bytes = self.store.manager.getBlob(sa, self.id(), value.map) catch |err| switch (err) {
             // A lost or damaged map damages the session, as a lost blob
             // does (D39); its records read as gone.
@@ -2705,7 +2711,7 @@ pub const Session = struct {
             },
             else => |e| return e,
         };
-        const map = std.json.parseFromSliceLeaky(std.json.ArrayHashMap([]const u8), sa, bytes, .{}) catch return error.InvalidSessionFormat;
+        const map = json_decode.parseFromSliceLeaky(std.json.ArrayHashMap([]const u8), sa, bytes, .{}) catch return error.InvalidSessionFormat;
         const host = self.host;
         host.mutex.lockUncancelable(io_mod.getIo());
         defer host.mutex.unlock(io_mod.getIo());
@@ -2972,7 +2978,7 @@ const Source = struct {
     /// blob's path, from which readers load its bytes when they need them
     /// (D89). A fork reads the blobs it hard-linked here too.
     fn decodeUser(src: Source, pa: Allocator, data: []const u8) !session_event.ConversationUser {
-        const wire = try std.json.parseFromSliceLeaky(WireUser, pa, data, .{ .allocate = .alloc_if_needed });
+        const wire = try json_decode.parseFromSliceLeaky(WireUser, pa, data, .{ .allocate = .alloc_if_needed });
         const images = try wire.toImages(pa);
         for (wire.images, images) |image, *out| {
             const hash = image.blob orelse continue;
@@ -3728,7 +3734,7 @@ fn holdsV2(store: *Store, alloc: Allocator, id: []const u8) bool {
 
 fn parseV1Source(a: Allocator, raw: ?[]const u8) ?V1Source {
     const bytes = raw orelse return null;
-    const source = std.json.parseFromSliceLeaky(V1Source, a, bytes, .{ .ignore_unknown_fields = true }) catch return null;
+    const source = json_decode.parseFromSliceLeaky(V1Source, a, bytes, .{ .ignore_unknown_fields = true }) catch return null;
     if (!source.keeps() and source.fingerprint.len != 64) return null;
     return source;
 }
@@ -4155,7 +4161,7 @@ fn restoreFrom(src: Source, alloc: Allocator, sa: Allocator, state: sm.State, nu
             debug_trace.logf("session", "event=sessions_v2_compaction_unreadable session={s} offset={d}", .{ src.id, offset });
             return error.InvalidSessionFormat;
         };
-        const compacted = try std.json.parseFromSliceLeaky(CompactedData, sa, data, .{});
+        const compacted = try json_decode.parseFromSliceLeaky(CompactedData, sa, data, .{});
         try history.ensureUnusedCapacity(alloc, 1);
         if (numbers) |n| try n.list.append(n.alloc, null);
         history.appendAssumeCapacity(.{ .compacted_summary = .{
@@ -4211,7 +4217,7 @@ fn settingsFrom(alloc: Allocator, sa: Allocator, state: sm.State) !Restored {
         .updated_at_ms = std.math.cast(i64, state.updated_ms) orelse 0,
     };
     errdefer restored.deinit(alloc);
-    if (state.title) |raw| restored.title = try alloc.dupe(u8, try std.json.parseFromSliceLeaky([]const u8, sa, raw, .{}));
+    if (state.title) |raw| restored.title = try alloc.dupe(u8, try json_decode.parseFromSliceLeaky([]const u8, sa, raw, .{}));
     if (state.prefs) |raw| restored.preferences = try decodePreferences(alloc, raw);
     if (state.permissions) |raw| restored.permission_state = try session_codec.decodePermissionState(alloc, raw);
     return restored;
@@ -4264,7 +4270,7 @@ const DetailSink = struct {
     }
 
     fn summary(sink: *DetailSink, data: []const u8) !void {
-        const parsed = try std.json.parseFromSlice(CompactedData, sink.alloc, data, .{});
+        const parsed = try json_decode.parseFromSlice(CompactedData, sink.alloc, data, .{});
         defer parsed.deinit();
         const text = try sink.alloc.dupe(u8, parsed.value.summary);
         errdefer sink.alloc.free(text);
@@ -4542,9 +4548,34 @@ fn storedBody(src: Source, alloc: Allocator, handle: []const u8, len: usize) !?[
     return bytes;
 }
 
-/// Whether a streamed piece is the final one. fx stamps a tool result's
-/// `created_at_ms` each time it rebuilds a turn, so that field alone may
-/// differ; the streamed, earlier stamp stands.
+/// Which of the two calls of `Session.streamedPrefix` a decision came from.
+const StreamPhase = enum { stream, commit };
+
+fn countResults(events: []const Event) usize {
+    var count: usize = 0;
+    for (events) |event| count += @intFromBool(event == .tool_result);
+    return count;
+}
+
+/// How many of the open turn's pieces `samePiece` had to parse because the
+/// rebuild changed their bytes, or null when one of them no longer stands.
+/// A rebuild keeps each tool result's stamp, so this is 0 unless some path
+/// lost it (`tests/tla/session/TurnStream.tla` NoReparseOfStamped).
+fn reparsedPrefix(alloc: Allocator, streamed: []const []const u8, encoded: []const []const u8) ?usize {
+    if (streamed.len > encoded.len) return null;
+    var reparsed: usize = 0;
+    for (streamed, encoded[0..streamed.len]) |held, bytes| {
+        if (std.mem.eql(u8, held, bytes)) continue;
+        if (!samePiece(alloc, held, bytes)) return null;
+        reparsed += 1;
+    }
+    return reparsed;
+}
+
+/// Whether a streamed piece is the final one. A rebuild keeps each tool
+/// result's `created_at_ms`, so the bytes match; a result whose message
+/// carries no stamp is stamped again when rebuilt, so that field alone may
+/// differ, and the streamed, earlier stamp stands.
 fn samePiece(alloc: Allocator, streamed: []const u8, final: []const u8) bool {
     if (std.mem.eql(u8, streamed, final)) return true;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -4700,7 +4731,7 @@ fn summaryOf(alloc: Allocator, scratch: Allocator, item: sm.Summary) !session_st
     const origin = try alloc.dupe(u8, item.workspace);
     errdefer alloc.free(origin);
     const title: ?[]u8 = if (item.title) |raw|
-        try alloc.dupe(u8, try std.json.parseFromSliceLeaky([]const u8, scratch, raw, .{}))
+        try alloc.dupe(u8, try json_decode.parseFromSliceLeaky([]const u8, scratch, raw, .{}))
     else
         null;
     errdefer if (title) |value| alloc.free(value);
@@ -4826,7 +4857,7 @@ fn attachFileReview(src: Source, a: Allocator, builder: *session_log.Conversatio
             return;
         },
     };
-    const review = std.json.parseFromSliceLeaky(FileReview, a, data, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+    const review = json_decode.parseFromSliceLeaky(FileReview, a, data, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             debug_trace.logf("session", "event=sessions_v2_file_review_invalid session={s} err={s} dropped=file_review", .{ src.id, @errorName(err) });
@@ -4977,8 +5008,8 @@ fn encodePiece(alloc: Allocator, event: Event) ![]u8 {
 /// With `.alloc_if_needed`, strings may point into `data`.
 fn decodePiece(arena: Allocator, kind: PieceKind, data: []const u8, allocate: std.json.AllocWhen) !Event {
     const event: Event = switch (kind) {
-        .user => .{ .user = try (try std.json.parseFromSliceLeaky(WireUser, arena, data, .{ .allocate = allocate })).toUser(arena) },
-        inline else => |tag| @unionInit(Event, @tagName(tag), try std.json.parseFromSliceLeaky(
+        .user => .{ .user = try (try json_decode.parseFromSliceLeaky(WireUser, arena, data, .{ .allocate = allocate })).toUser(arena) },
+        inline else => |tag| @unionInit(Event, @tagName(tag), try json_decode.parseFromSliceLeaky(
             @FieldType(Event, @tagName(tag)),
             arena,
             data,
@@ -5190,7 +5221,7 @@ fn decodeInstructions(alloc: Allocator, raw: []const u8) !?[]u8 {
 }
 
 fn decodeLanguage(arena: Allocator, raw: []const u8) !types.ConversationLanguage {
-    const tag = try std.json.parseFromSliceLeaky([]const u8, arena, raw, .{});
+    const tag = try json_decode.parseFromSliceLeaky([]const u8, arena, raw, .{});
     return session_codec.parseConversationLanguage(tag);
 }
 
@@ -6247,6 +6278,125 @@ test "a tool result's rebuild time alone does not supersede its stream" {
     try testing.expect(samePiece(testing.allocator, a, b));
     try testing.expect(!samePiece(testing.allocator, a, c));
     try testing.expect(!samePiece(testing.allocator, "{\"text\":\"a\"}", "{\"text\":\"b\"}"));
+}
+
+fn resultEvent(call_id: []const u8, preview: []const u8, stamp: i64) Event {
+    return .{ .tool_result = .{
+        .call_id = call_id,
+        .tool_name = "read_file",
+        .status = .success,
+        .artifact_ref = "result-read_file.txt",
+        .stored_bytes = preview.len,
+        .completeness = .complete,
+        .preview = preview,
+        .created_at_ms = stamp,
+    } };
+}
+
+fn encodeAll(a: Allocator, events: []const Event) ![]const []const u8 {
+    const encoded = try a.alloc([]const u8, events.len);
+    for (events, encoded) |event, *bytes| bytes.* = try encodePiece(a, event);
+    return encoded;
+}
+
+test "streamed pieces stand by their bytes, and only a restamped result needs parsing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const user: Event = .{ .user = .{ .text = "read them" } };
+    const streamed = try encodeAll(a, &.{ user, resultEvent("call-1", "one", 100), resultEvent("call-2", "two", 101) });
+    // A rebuild that kept every stamp, with one more result.
+    try testing.expectEqual(@as(?usize, 0), reparsedPrefix(testing.allocator, streamed, try encodeAll(a, &.{
+        user, resultEvent("call-1", "one", 100), resultEvent("call-2", "two", 101), resultEvent("call-3", "three", 102),
+    })));
+    // A rebuild that stamped each result again still stands, by parsing.
+    try testing.expectEqual(@as(?usize, 2), reparsedPrefix(testing.allocator, streamed, try encodeAll(a, &.{
+        user, resultEvent("call-1", "one", 200), resultEvent("call-2", "two", 201),
+    })));
+    // Other content, or a missing piece, no longer stands.
+    try testing.expectEqual(@as(?usize, null), reparsedPrefix(testing.allocator, streamed, try encodeAll(a, &.{
+        user, resultEvent("call-1", "uno", 100), resultEvent("call-2", "two", 101),
+    })));
+    try testing.expectEqual(@as(?usize, null), reparsedPrefix(testing.allocator, streamed, try encodeAll(a, &.{
+        user, resultEvent("call-2", "two", 101),
+    })));
+}
+
+fn readResult(call_id: []const u8, output: []const u8, stamp: i64) types.PersistedToolResult {
+    return .{
+        .tool_call_id = @constCast(call_id),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast(output),
+        .output_bytes = output.len,
+        .stored_output_bytes = output.len,
+        .created_at_ms = stamp,
+    };
+}
+
+/// The stamp of the one tool result a session's only turn restores with.
+fn restoredStamp(t: *TestHome, id: []const u8) !i64 {
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), restored.history.len);
+    const steps = restored.history[0].assistant.execution.tool_steps;
+    try testing.expectEqual(@as(usize, 1), steps.len);
+    try testing.expectEqual(@as(usize, 1), steps[0].tool_results.len);
+    return steps[0].tool_results[0].created_at_ms;
+}
+
+test "a turn whose result keeps its stamp commits as streamed, with that stamp" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("read it") };
+    var calls = [_]types.ToolCall{.{ .id = "call-1", .name = "read_file", .arguments_json = "{}" }};
+    var results = [_]types.PersistedToolResult{readResult("call-1", "contents", 100)};
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    const execution: types.ExecutionMemory = .{ .tool_steps = &steps };
+    try s.appendProgress(user, execution, .{});
+    try s.appendProgress(user, execution, .{});
+    var turn: types.HistoryTurn = .{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = execution } };
+    try s.prepareTurn(&turn);
+    defer if (results[0].output_handle) |handle| testing.allocator.free(handle);
+    defer if (results[0].preview) |preview| testing.allocator.free(preview);
+    try s.commitTurn(turn, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    try testing.expectEqual(@as(usize, 0), try countItems(t.store.manager, id, superseded_type));
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, "tool_result"));
+    try testing.expectEqual(@as(i64, 100), try restoredStamp(&t, id));
+}
+
+test "a result rebuilt with other content supersedes its stream and is written as rebuilt" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("read it") };
+    var calls = [_]types.ToolCall{.{ .id = "call-1", .name = "read_file", .arguments_json = "{}" }};
+    var results = [_]types.PersistedToolResult{readResult("call-1", "contents", 100)};
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    const execution: types.ExecutionMemory = .{ .tool_steps = &steps };
+    try s.appendProgress(user, execution, .{});
+    results[0].status = .failure;
+    results[0].created_at_ms = 200;
+    try s.appendProgress(user, execution, .{});
+    // The turn written afresh holds the rebuild, its stamp included.
+    const written = for (s.streamed.items) |bytes| {
+        if (std.mem.find(u8, bytes, "\"artifact_ref\"") != null) break bytes;
+    } else return error.TestExpectedStreamedResult;
+    try testing.expect(std.mem.find(u8, written, "\"created_at_ms\":200") != null);
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, superseded_type));
 }
 
 test "a streamed turn that differs from its commit is superseded, never mixed" {
@@ -7711,7 +7861,7 @@ const V1Home = struct {
         defer fixtures.close(io);
         const manifest = try fixtures.readFileAlloc(io, "manifest.json", a, .limited(1 << 16));
         const Manifest = struct { workspace: []const u8, kinds: std.json.ArrayHashMap([]const []const u8) };
-        const parsed = try std.json.parseFromSliceLeaky(Manifest, a, manifest, .{ .ignore_unknown_fields = true });
+        const parsed = try json_decode.parseFromSliceLeaky(Manifest, a, manifest, .{ .ignore_unknown_fields = true });
         v1.workspace = parsed.workspace;
         const all = parsed.kinds.map.get(kind) orelse return error.FileNotFound;
         if (count > all.len) return error.TestUnexpectedResult;
@@ -7752,7 +7902,7 @@ const V1Home = struct {
             const folder = try std.Io.Dir.path.join(a, &.{ profile_paths.sessions_dir_name, id });
             const saved_json = try fx.dir.readFileAlloc(io, try std.Io.Dir.path.join(a, &.{ folder, "session.json" }), a, .limited(1 << 20));
             const Saved = struct { updated_at_ms: ?i64 = null };
-            const saved = (try std.json.parseFromSliceLeaky(Saved, a, saved_json, .{ .ignore_unknown_fields = true })).updated_at_ms orelse continue;
+            const saved = (try json_decode.parseFromSliceLeaky(Saved, a, saved_json, .{ .ignore_unknown_fields = true })).updated_at_ms orelse continue;
             const at: std.Io.Timestamp = .{ .nanoseconds = @as(i96, saved) * std.time.ns_per_ms };
             const log = try std.Io.Dir.path.join(a, &.{ folder, "events.jsonl" });
             _ = fx.dir.statFile(io, log, .{}) catch |err| switch (err) {

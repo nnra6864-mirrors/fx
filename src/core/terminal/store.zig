@@ -7,6 +7,7 @@ const session_child_store = @import("../session/session_child_store.zig");
 const session_layout = @import("../session/session_layout.zig");
 const process_identity = @import("../execution/process_identity.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const json_decode = @import("../shared/json_decode.zig");
 const process_provider_mod = @import(
     "../execution/process_provider.zig",
 );
@@ -1858,7 +1859,7 @@ fn clone_record(alloc: Allocator, wire: RecordWire) Allocator.Error!Record {
 }
 
 fn parse_record(alloc: Allocator, bytes: []const u8) !Record {
-    var parsed = std.json.parseFromSlice(
+    var parsed = json_decode.parseFromSlice(
         RecordWire,
         alloc,
         bytes,
@@ -1985,7 +1986,7 @@ fn load_event(
         else => return err,
     };
     defer alloc.free(bytes);
-    var parsed = std.json.parseFromSlice(
+    var parsed = json_decode.parseFromSlice(
         EventWire,
         alloc,
         bytes,
@@ -5508,7 +5509,7 @@ fn load_owner_catalog_authority(
     defer file.deinit();
     const bytes = try file.readToEnd(alloc, max_record_bytes);
     defer alloc.free(bytes);
-    var parsed = std.json.parseFromSlice(
+    var parsed = json_decode.parseFromSlice(
         OwnerCatalogAuthorityWire,
         alloc,
         bytes,
@@ -5619,7 +5620,7 @@ fn load_authority(
     defer file.deinit();
     const bytes = try file.readToEnd(alloc, max_record_bytes);
     defer alloc.free(bytes);
-    var parsed = std.json.parseFromSlice(
+    var parsed = json_decode.parseFromSlice(
         AuthorityWire,
         alloc,
         bytes,
@@ -5710,7 +5711,7 @@ fn load_close_transaction(
     defer file.deinit();
     const bytes = try file.readToEnd(alloc, max_event_bytes);
     defer alloc.free(bytes);
-    var parsed = std.json.parseFromSlice(
+    var parsed = json_decode.parseFromSlice(
         CloseTransaction,
         alloc,
         bytes,
