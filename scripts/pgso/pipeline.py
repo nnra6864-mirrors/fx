@@ -599,8 +599,9 @@ def _require_bitcode_header(path: pathlib.Path) -> None:
 
 def rewrite_sparse_constants(toolchain: Toolchain, paths: PipelinePaths) -> None:
     """Replace copies of mostly undefined constants with their defined stores,
-    pack the constants that are still referenced into one blob, and move
-    mostly empty writable globals to zero-fill."""
+    pack the constants that are still referenced into one blob, move
+    mostly empty writable globals to zero-fill, and read error names
+    through one function over a compact table."""
     rewritten = paths.profile_use_bitcode.with_name(
         paths.profile_use_bitcode.name + ".sparse"
     )
@@ -609,6 +610,9 @@ def rewrite_sparse_constants(toolchain: Toolchain, paths: PipelinePaths) -> None
     )
     zero_filled = paths.profile_use_bitcode.with_name(
         paths.profile_use_bitcode.name + ".zero-filled"
+    )
+    compacted = paths.profile_use_bitcode.with_name(
+        paths.profile_use_bitcode.name + ".compacted"
     )
     run_checked(
         ir_size_argv(
@@ -645,10 +649,20 @@ def rewrite_sparse_constants(toolchain: Toolchain, paths: PipelinePaths) -> None
     _require_nonempty_file(zero_filled, "zero-filled bitcode")
     overlaid.unlink()
     run_checked(
+        ir_size_argv(toolchain, "compact-error-names", zero_filled, compacted),
+        cwd=paths.root,
+        env=os.environ.copy(),
+        timeout_s=300,
+        log_path=paths.logs / "compact-error-names.json",
+        require_empty_stderr=True,
+    )
+    _require_nonempty_file(compacted, "compacted-error-name bitcode")
+    zero_filled.unlink()
+    run_checked(
         (
             str(toolchain.opt),
             *SPARSE_CLEANUP_FLAGS,
-            str(zero_filled),
+            str(compacted),
             "-o",
             str(paths.profile_use_bitcode),
         ),
@@ -659,7 +673,7 @@ def rewrite_sparse_constants(toolchain: Toolchain, paths: PipelinePaths) -> None
         require_empty_stderr=True,
     )
     _require_nonempty_file(paths.profile_use_bitcode, "profile-use bitcode")
-    zero_filled.unlink()
+    compacted.unlink()
 
 
 def validate_bitcode_hash(path: pathlib.Path, expected_sha256: str) -> None:
