@@ -307,10 +307,12 @@ test "fx mcp call outside a shell call reports it is unavailable" {
     var out: std.Io.Writer.Allocating = .init(arena_state.allocator());
     var err: std.Io.Writer.Allocating = .init(arena_state.allocator());
     if (io_mod.getenv(wire.socket_env) != null) return error.SkipZigTest;
-    try std.testing.expectEqual(exit.unavailable, try run(arena_state.allocator(), std.testing.io, &out.writer, &err.writer, "mcp_s_t", null));
+    try std.testing.expectEqual(exit.unavailable, try run(arena_state.allocator(), std.testing.io, &out.writer, &err.writer, .{ .call = .{ .tool = "mcp_s_t", .arguments = null } }));
     try std.testing.expectEqual(@as(usize, 0), out.written().len);
     try std.testing.expect(std.mem.find(u8, err.written(), "no running fx shell call") != null);
-    try std.testing.expectEqual(exit.usage, try run(arena_state.allocator(), std.testing.io, &out.writer, &err.writer, "mcp_s_t", "[1]"));
+    try std.testing.expectEqual(exit.usage, try run(arena_state.allocator(), std.testing.io, &out.writer, &err.writer, .{ .call = .{ .tool = "mcp_s_t", .arguments = "[1]" } }));
+    // A lookup outside a shell call is unavailable too.
+    try std.testing.expectEqual(exit.unavailable, try run(arena_state.allocator(), std.testing.io, &out.writer, &err.writer, .{ .list = "linear" }));
 }
 
 test "a shape summary of one item names sizes, keys, and types, not values" {
