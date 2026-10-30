@@ -1234,6 +1234,9 @@ pub const Persistence = struct {
     /// The request the resumed session's newest turn left unfinished, which
     /// `startPendingResume` sends again once the worker runs.
     pending_request_resume: ?types.RecoveryResume = null,
+    /// Plain `fx` checks, once its first frame is on screen, whether the
+    /// session `fx -c` opens left a turn unfinished.
+    interrupted_turn_hint_pending: bool = false,
     shutdown_failure: ?anyerror = null,
     /// On the heap, so the pointer every session keeps survives `App.init`
     /// copying the app after it opens the store (`adoptStore`).
@@ -1244,7 +1247,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (@typeInfo(Persistence).@"struct".field_names.len != 28) {
+            if (@typeInfo(Persistence).@"struct".field_names.len != 29) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1274,6 +1277,7 @@ pub const Persistence = struct {
         storage.pending_live_session_policy = null;
         storage.pending_live_session_wait = null;
         storage.pending_request_resume = null;
+        storage.interrupted_turn_hint_pending = false;
         storage.shutdown_failure = null;
         storage.v2_store = null;
         storage.v2 = null;
@@ -1892,6 +1896,30 @@ pub fn Runtime(comptime App: type) type {
                 .revision = revision,
             });
             try app.writeDomainNotice(.{ .topic = "", .tone = .success, .body = body.written() }, true);
+        }
+
+        /// Plain `fx` points at a turn the session `fx -c` opens left
+        /// unfinished, whether or not `fx -c` would send it again on its own.
+        /// The check reads the session index, so it waits for the first frame
+        /// (`collectInterruptedTurnHint`).
+        pub fn queueInterruptedTurnHint(app: *App) void {
+            app.session_persistence.interrupted_turn_hint_pending = true;
+        }
+
+        pub fn collectInterruptedTurnHint(app: *App) void {
+            if (!app.session_persistence.interrupted_turn_hint_pending) return;
+            if (app.shell.render_requests.hasReason(.first_frame)) return;
+            app.session_persistence.interrupted_turn_hint_pending = false;
+            const v2_store = app.session_persistence.v2_store orelse return;
+            if (!session_adapter.hasInterruptedTurn(v2_store, app.alloc, app.workspace_root)) return;
+            debug_trace.logf("session", "event=interrupted_turn_hint", .{});
+            app.writeDomainNotice(.{
+                .topic = "session",
+                .tone = .neutral,
+                .body = "Interrupted turn · fx -c to continue",
+            }, true) catch |err| {
+                debug_trace.logf("session", "event=interrupted_turn_hint_failed err={s}", .{@errorName(err)});
+            };
         }
 
         pub fn resumeRequestedSessionAfterUpgrade(
