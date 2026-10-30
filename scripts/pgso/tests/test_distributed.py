@@ -150,6 +150,21 @@ class WorkflowContractTests(unittest.TestCase):
                 )
                 self.assertIn("          overwrite: true\n", upload)
 
+    def test_linux_workflows_differ_only_in_architecture(self) -> None:
+        workflows = pathlib.Path(__file__).resolve().parents[3] / ".github/workflows"
+        expected = (workflows / "pgso-linux-arm64.yml").read_text()
+        for arm64, x86_64 in (
+            ("Linux arm64 PGSO candidate", "Linux x86_64 PGSO candidate"),
+            ("pgso-linux-arm64", "pgso-linux-x86_64"),
+            ("runs-on: ubuntu-24.04-arm", "runs-on: ubuntu-24.04"),
+            ("Require native arm64 host", "Require native x86_64 host"),
+            ('test "$(uname -m)" = aarch64', 'test "$(uname -m)" = x86_64'),
+            ("--target aarch64-linux", "--target x86_64-linux"),
+        ):
+            self.assertIn(arm64, expected)
+            expected = expected.replace(arm64, x86_64)
+        self.assertEqual(expected, (workflows / "pgso-linux-x86_64.yml").read_text())
+
     def test_behavior_workers_install_pinned_zig_without_llvm(self) -> None:
         repo_root = pathlib.Path(__file__).resolve().parents[3]
         action = (repo_root / ".github/actions/setup-pgso/action.yml").read_text()
@@ -573,8 +588,11 @@ class ShardAggregationTests(unittest.TestCase):
 class DistributedSupportTests(unittest.TestCase):
     def test_platforms_with_a_startup_exemption_cannot_build_distributed(self) -> None:
         _require_distributed_support(types.SimpleNamespace(platform=macos))
-        with self.assertRaisesRegex(PgsoError, "startup profiles that Linux arm64 candidates need"):
-            _require_distributed_support(types.SimpleNamespace(platform=linux))
+        for platform in (linux.ARM64, linux.X86_64):
+            with self.subTest(target=platform.TARGET), self.assertRaisesRegex(
+                PgsoError, f"startup profiles that {platform.DISPLAY_NAME} candidates need"
+            ):
+                _require_distributed_support(types.SimpleNamespace(platform=platform))
 
 
 if __name__ == "__main__":
