@@ -950,7 +950,7 @@ async function queueAnswer(result) {
 // libfx starts and closes a World it `owned`, having created it; a World the
 // app passed in stays the app's.
 function createWorldBackend(world, durability) {
-  const { name, reserveMs, pollMs, leaseMs, alive, holderInfo, livenessKnown = false, queueLeases = false, runInRequest = queueLeases, waitUntil, queueDurable = false, maxDurationMs, owned = true } = durability;
+  const { name, reserveMs, pollMs, leaseMs, alive, holderInfo, livenessKnown = false, queueLeases = false, runInRequest = queueLeases, waitUntil, queueDurable = false, maxDurationMs, owned = true, holdConsumerGroup = null } = durability;
   const spec = world.specVersion === undefined ? {} : { specVersion: world.specVersion };
   const created = new Set();
   // Runs being created now: writes that go out together create a run once.
@@ -1398,8 +1398,10 @@ function createWorldBackend(world, durability) {
     queue: {
       // Whether the World's queue can hold a message for the process that
       // sends it (`experimental_hold`), so that process runs it as the
-      // message's first delivery.
-      holds: () => world.capabilities?.experimental_queueHold === true,
+      // message's first delivery. The hold is taken for the consumer group
+      // of the route the queue delivers to, which the durability names: one
+      // taken for another group would leave that route a second copy.
+      holds: () => holdConsumerGroup !== null && world.capabilities?.experimental_queueHold === true,
       // Returns the queue's id for the message, when the World gives one.
       // With `hold`, sent undelayed on a World that holds messages, it also
       // returns `held`, the message the queue holds for this process, when
@@ -1409,7 +1411,7 @@ function createWorldBackend(world, durability) {
         const sent = await world.queue(queueName, { runId: message.sessionId, requestId: message.messageId, input: message }, {
           ...(idempotencyKey ? { idempotencyKey } : {}),
           ...(delaySeconds > 0 ? { delaySeconds } : {}),
-          ...(holding ? { experimental_hold: {} } : {}),
+          ...(holding ? { experimental_hold: { consumerGroup: holdConsumerGroup } } : {}),
         });
         const messageId = typeof sent?.messageId === "string" && sent.messageId.length > 0 ? sent.messageId : null;
         const held = holding && typeof sent?.experimental_held?.consume === "function" ? sent.experimental_held : null;

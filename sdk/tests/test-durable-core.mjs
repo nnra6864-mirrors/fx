@@ -1021,7 +1021,7 @@ if (durabilityKind === "queue") {
       const dir = await mkdtemp(join(tmpdir(), "libfx-in-request-held-"));
       dirs.push(dir);
       const waited = [];
-      const { durability, broker } = await queueWorldAt(dir, { hold: "held", queueLeases: true, runInRequest: true, maxDurationMs, reserveMs: 100, waitUntil: (work) => waited.push(work) });
+      const { durability, broker } = await queueWorldAt(dir, { hold: "held", holdFunction: "app/api/libfx/route.ts", queueLeases: true, runInRequest: true, maxDurationMs, reserveMs: 100, waitUntil: (work) => waited.push(work) });
       const agent = createAgent({ durability });
       const session = agent.session();
       // With the short deadline, a step outlasts the request.
@@ -1033,7 +1033,7 @@ if (durabilityKind === "queue") {
       assert.equal(result.stopReason, "end_turn");
       assert.equal(text, [0, 1, 2].map((step) => `${input}-${step}`).join(" "));
       const [first, ...after] = broker.sent.filter((message) => message.payload?.input?.messageId === `turn-${input}`);
-      assert.deepEqual(first.options.experimental_hold, {}, "the prompt was sent asking for a hold");
+      assert.deepEqual(first.options.experimental_hold, { consumerGroup: "app_Sapi_Slibfx_Sroute_Dts" }, "the prompt was sent asking for a hold for the wake route's consumer group");
       assert.equal(first.options.delaySeconds, undefined, "undelayed");
       assert.equal(first.options.idempotencyKey, `${session.id}:prompt:turn-${input}`, "with its idempotency key");
       assert.equal(first.consumed, true, "the request consumed the held message");
@@ -1064,7 +1064,7 @@ if (durabilityKind === "queue") {
   test("if the request running a held prompt dies, the queue's next delivery of the message takes the session over", async () => {
     const dir = await mkdtemp(join(tmpdir(), "libfx-in-request-held-lapse-"));
     dirs.push(dir);
-    const { durability, broker } = await queueWorldAt(dir, { hold: "held", queueLeases: true, runInRequest: true, maxDurationMs: 600_000, waitUntil: () => {} });
+    const { durability, broker } = await queueWorldAt(dir, { hold: "held", holdConsumerGroup: "default", queueLeases: true, runInRequest: true, maxDurationMs: 600_000, waitUntil: () => {} });
     const fenced = [];
     // The route takes the redelivery to the first agent, as to another
     // process; the second takes the prompt in its request.
@@ -1096,11 +1096,30 @@ if (durabilityKind === "queue") {
     await first.close();
   });
 
+  test("a World that can hold messages, given no consumer group to hold them for, keeps the backstop", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-in-request-no-group-"));
+    dirs.push(dir);
+    const waited = [];
+    const { durability, broker } = await queueWorldAt(dir, { hold: "held", queueLeases: true, runInRequest: true, maxDurationMs: 60_000, waitUntil: (work) => waited.push(work) });
+    const agent = createAgent({ durability });
+    const session = agent.session();
+    const { text, result } = await textOf(session.prompt("ungrouped", { messageId: "turn-ungrouped" }));
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(text, "ungrouped-0 ungrouped-1 ungrouped-2");
+    const [backstop] = broker.sent.filter((message) => message.payload?.input?.messageId === "turn-ungrouped");
+    assert.equal(backstop.options.experimental_hold, undefined, "no hold was asked for");
+    assert.ok(backstop.options.delaySeconds > 0, "the backstop waits past the request's deadline");
+    assert.equal(backstop.attempt, 0, "the request ran the turn before any delivery");
+    assert.equal(waited.length, 1, "the request's run went to waitUntil");
+    await waited[0];
+    await agent.close();
+  });
+
   test("where the queue does not hold a prompt, the request runs nothing and the queue delivers it", async () => {
     const dir = await mkdtemp(join(tmpdir(), "libfx-in-request-not-held-"));
     dirs.push(dir);
     const waited = [];
-    const { durability, broker } = await queueWorldAt(dir, { hold: "notHeld", queueLeases: true, runInRequest: true, maxDurationMs: 60_000, waitUntil: (work) => waited.push(work) });
+    const { durability, broker } = await queueWorldAt(dir, { hold: "notHeld", holdConsumerGroup: "default", queueLeases: true, runInRequest: true, maxDurationMs: 60_000, waitUntil: (work) => waited.push(work) });
     const agent = createAgent({ durability });
     const session = agent.session();
     const { text, result } = await textOf(session.prompt("unheld", { messageId: "turn-unheld" }));
@@ -1108,7 +1127,7 @@ if (durabilityKind === "queue") {
     assert.equal(text, "unheld-0 unheld-1 unheld-2");
     const sent = broker.sent.filter((message) => message.payload?.input?.messageId === "turn-unheld");
     assert.equal(sent.length, 1, "one message, and no backstop");
-    assert.deepEqual(sent[0].options.experimental_hold, {}, "the prompt was sent asking for a hold");
+    assert.deepEqual(sent[0].options.experimental_hold, { consumerGroup: "default" }, "the prompt was sent asking for a hold");
     assert.equal(sent[0].options.delaySeconds, undefined, "undelayed");
     assert.equal(sent[0].consumed, undefined, "the request did not run it");
     assert.equal(sent[0].attempt, 1, "the queue delivered it");
@@ -1702,6 +1721,26 @@ test("world() checks its options, and an agent names it among the durabilities",
   const { vercel } = await import("../durable/vercel.mjs");
   assert.deepEqual([vercel().runInRequest, vercel({ leaseMs: 15_000 }).runInRequest], [true, false]);
   assert.equal(typeof vercel().waitUntil, "function");
+  // A hold is taken for the wake route's consumer group, as Vercel names a
+  // vercel.json trigger's (`vercelTriggerConsumerGroup` in
+  // `@workflow/world-vercel`), or as the app names it.
+  const groupOf = (holdFunction, holdService) => world({}, { queueLeases: true, holdFunction, ...(holdService ? { holdService } : {}) }).holdConsumerGroup;
+  assert.deepEqual([
+    groupOf("api/libfx.ts"),
+    groupOf("app/api/libfx/route.ts"),
+    groupOf("api/my_fn.ts"),
+    groupOf("api/flow.ts", "web"),
+    groupOf("app/api/[id]/route.js"),
+  ], ["api_Slibfx_Dts", "app_Sapi_Slibfx_Sroute_Dts", "api_Smy__fn_Dts", "web_7Eapi_Sflow_Dts", "app_Sapi_S_5Bid_5D_Sroute_Djs"]);
+  assert.equal(world({}, { queueLeases: true, holdConsumerGroup: "default" }).holdConsumerGroup, "default");
+  assert.equal(world({}, { queueLeases: true }).holdConsumerGroup, undefined, "no group, no hold");
+  assert.equal(vercel({ holdFunction: "api/libfx.ts" }).holdConsumerGroup, "api_Slibfx_Dts");
+  assert.equal(vercel().holdConsumerGroup, undefined);
+  assert.throws(() => world({}, { name: "pg", queueLeases: true, holdFunction: "api/libfx.ts", holdConsumerGroup: "default" }), /pg\(\) takes holdConsumerGroup or holdFunction, not both/);
+  assert.throws(() => world({}, { name: "pg", queueLeases: true, holdConsumerGroup: "" }), /pg\(\) holdConsumerGroup must be a non-empty string/);
+  assert.throws(() => world({}, { name: "pg", queueLeases: true, holdService: "web" }), /pg\(\) holdService needs holdFunction/);
+  assert.throws(() => world({}, { name: "pg", queueLeases: true, runInRequest: false, holdConsumerGroup: "default" }), /pg\(\) holdConsumerGroup needs runInRequest/);
+  assert.throws(() => vercel({ leaseMs: 15_000, holdFunction: "api/libfx.ts" }), /vercel\(\) holdFunction needs runInRequest/);
   assert.throws(() => createAgent({ durability: {} }), /durability must come from memory\(\), local\(\), vercel\(\) or world\(\)/);
 });
 

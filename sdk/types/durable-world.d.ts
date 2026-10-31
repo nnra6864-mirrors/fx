@@ -25,8 +25,8 @@ export interface World {
   };
   /**
    * What the World supports. With `experimental_queueHold`, a prompt that runs in the request that took it (see
-   * `WorldOptions.runInRequest`) is sent with `experimental_hold` and run through the result's
-   * `experimental_held.consume()`.
+   * `WorldOptions.runInRequest`) is sent with `experimental_hold`, for `WorldOptions.holdConsumerGroup` or
+   * `holdFunction`, and run through the result's `experimental_held.consume()`.
    */
   readonly capabilities?: {
     readonly experimental_queueHold?: boolean;
@@ -73,13 +73,28 @@ export type WorldOptions = {
   queueLeases?: boolean;
   /**
    * With `queueLeases`: a prompt runs in the request that took it when no worker holds the session. On a World with
-   * `capabilities.experimental_queueHold`, the request sends the prompt asking the queue to hold it and runs it as the
+   * `capabilities.experimental_queueHold`, given `holdConsumerGroup` or `holdFunction`, the request sends the prompt asking the queue to hold it and runs it as the
    * message's first delivery, whose lease the queue renews while it runs; a prompt the queue does not hold, the queue
    * delivers. On any other World, the queue keeps the prompt as a backstop it delivers only after that request's
    * deadline. Either way the request's lease names the message, so if the request died, the queue's next delivery of it
    * takes the session over. Default true with `queueLeases`.
    */
   runInRequest?: boolean;
+  /**
+   * With `runInRequest`: the consumer group of the route the queue delivers libfx's messages to. On a World with
+   * `capabilities.experimental_queueHold`, a prompt the request runs is held for this group, so a hold the request lets
+   * lapse is delivered to that route. Without it, or `holdFunction`, no prompt is held, and the queue keeps a backstop.
+   * Not with `holdFunction`.
+   */
+  holdConsumerGroup?: string;
+  /**
+   * With `runInRequest`: the wake route's key under `functions` in vercel.json, such as `"app/api/libfx/route.js"`.
+   * Vercel names its `queue/v2beta` trigger's consumer group after it, and the hold is taken for that group. Not with
+   * `holdConsumerGroup`.
+   */
+  holdFunction?: string;
+  /** With `holdFunction`: the name of the Vercel service the wake route belongs to, when it belongs to one. */
+  holdService?: string;
   /** Keeps the request alive until `work`, a turn it runs after its response, settles, such as Vercel's `waitUntil` or Next's `after()`. */
   waitUntil?(work: Promise<void>): void;
   /** Without liveness, how long a lease lasts after its worker took or last renewed it; renewed every third of that. At least 1000. Default 15000. */
