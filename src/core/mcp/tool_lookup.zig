@@ -2,11 +2,14 @@
 //! shell command, made from the same search pages and tool schemas the agent's
 //! own `capability_search` uses (`tool_search.zig`, `selected_schema.zig`).
 //!
-//! The text comes from MCP servers, so it is written the way fx shows any
-//! outside text on a terminal (`text_utils.encodeTerminalSafeInline`: control
-//! bytes and non-printing characters become visible escapes), and every part
-//! is bounded. Pure: it formats bytes it is given.
+//! The pages and schemas carry server text encoded for the model
+//! (`model_context_encoding.writeScalar`), so it is decoded first. It comes
+//! from MCP servers, so it is then written the way fx shows any outside text
+//! on a terminal (`text_utils.encodeTerminalSafeInline`: control bytes and
+//! non-printing characters become visible escapes), and every part is
+//! bounded. Pure: it formats bytes it is given.
 const std = @import("std");
+const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_args = @import("../tooling/tool_args.zig");
 
@@ -15,6 +18,8 @@ const Writer = std.Io.Writer;
 
 /// The longest tool name `list`, `search`, and `help` print.
 const max_name_bytes = 256;
+/// The longest reason `list` or `search` gives for finding no tools.
+const max_problem_bytes = 1024;
 /// The longest description on a `list` or `search` line.
 pub const max_line_description_bytes = 160;
 /// The longest tool description `help` prints.
@@ -60,10 +65,10 @@ pub fn writeToolLines(arena: Allocator, out: *Writer, page_json: []const u8) Pag
         if (tool != .object) continue;
         const name = tool.object.get("name") orelse continue;
         if (name != .string or name.string.len == 0) continue;
-        try writeSafe(arena, out, name.string, max_name_bytes);
+        try writeSafe(arena, out, try model_context_encoding.decodeScalarAlloc(arena, name.string), max_name_bytes);
         try out.writeByte('\t');
         if (tool_args.optionalStringArg(tool.object, "description")) |description| {
-            try writeSafe(arena, out, description, max_line_description_bytes);
+            try writeSafe(arena, out, try model_context_encoding.decodeScalarAlloc(arena, description), max_line_description_bytes);
         }
         try out.writeByte('\n');
         written += 1;
@@ -75,7 +80,14 @@ pub fn writeToolLines(arena: Allocator, out: *Writer, page_json: []const u8) Pag
     return .{ .tools = written, .next_cursor = next_cursor, .problem = if (written == 0) try pageProblem(arena, page) else null };
 }
 
+/// Why a page holds no tools, as one terminal-safe line: the client prints it.
 fn pageProblem(arena: Allocator, page: std.json.ObjectMap) Allocator.Error!?[]const u8 {
+    const raw = try pageProblemText(arena, page) orelse return null;
+    const decoded = try model_context_encoding.decodeScalarAlloc(arena, raw);
+    return (try text_utils.encodeTerminalSafeInline(arena, decoded, max_problem_bytes)).bytes;
+}
+
+fn pageProblemText(arena: Allocator, page: std.json.ObjectMap) Allocator.Error!?[]const u8 {
     if (page.get("authentication_required")) |required| if (required == .object) {
         const server = tool_args.optionalStringArg(required.object, "server") orelse "this server";
         const message = tool_args.optionalStringArg(required.object, "message") orelse "it needs a login";
@@ -111,8 +123,10 @@ pub fn writeHelp(arena: Allocator, out: *Writer, schema_json: []const u8) HelpEr
     if (name.len == 0) return error.InvalidToolSchema;
     try writeSafe(arena, out, name, max_name_bytes);
     try out.writeByte('\n');
+    // The description and the server's instructions are encoded for the
+    // model (`selected_schema.zig`); the arguments' own descriptions are not.
     if (tool_args.optionalStringArg(value.object, "description")) |description| {
-        try writeDescription(arena, out, description);
+        try writeDescription(arena, out, try model_context_encoding.decodeScalarAlloc(arena, description));
     }
     const input = value.object.get("inputSchema") orelse return error.InvalidToolSchema;
     const properties = if (input == .object) input.object.get("properties") else null;
@@ -415,4 +429,56 @@ test "help bounds deep, wide, and hostile schemas" {
     var bad: Writer.Allocating = .init(arena);
     try testing.expectError(error.InvalidToolSchema, writeHelp(arena, &bad.writer, "{\"description\":\"x\"}"));
     try testing.expectError(error.InvalidToolSchema, writeHelp(arena, &bad.writer, "[]"));
+}
+
+test "text the search encoded for the model reads plainly, and stays terminal-safe" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // As `tool_search.zig` writes a page: each string encoded for the model.
+    const description = try model_context_encoding.scalarAlloc(arena, "Ask about a repo\nand get an answer & \"more\" <here>\x1b[2J.");
+    var page: Writer.Allocating = .init(arena);
+    try page.writer.writeAll("{\"tools\":[{\"name\":\"mcp_deepwiki_ask_wiki_question\",\"description\":");
+    try std.json.Stringify.value(description, .{}, &page.writer);
+    try page.writer.writeAll("}],\"count\":1}");
+    var out: Writer.Allocating = .init(arena);
+    _ = try writeToolLines(arena, &out.writer, page.written());
+    try testing.expectEqualStrings("mcp_deepwiki_ask_wiki_question\tAsk about a repo and get an answer & \"more\" <here>\\x1b[2J.\n", out.written());
+
+    const reason = try model_context_encoding.scalarAlloc(arena, "MCP server 'say \"hi\"' is unavailable:\n\x1b]52;c;x\x07 it exited");
+    var empty: Writer.Allocating = .init(arena);
+    try empty.writer.writeAll("{\"tools\":[],\"count\":0,\"unavailable\":[");
+    try std.json.Stringify.value(reason, .{}, &empty.writer);
+    try empty.writer.writeAll("]}");
+    var none: Writer.Allocating = .init(arena);
+    const result = try writeToolLines(arena, &none.writer, empty.written());
+    try testing.expectEqualStrings("MCP server 'say \"hi\"' is unavailable: \\x1b]52;c;x\\x07 it exited", result.problem.?);
+}
+
+test "help decodes the description and server instructions, not the arguments" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // As `selected_schema.zig` merges them: each part encoded, joined raw.
+    const encoded_description = try model_context_encoding.scalarAlloc(arena, "Resolves a name.\n\nCall this first & pass \"query\".");
+    const encoded_instructions = try model_context_encoding.scalarAlloc(arena, "Docs for <libraries>.");
+    const merged = try arena.print("{s}\n\nServer instructions: {s}", .{ encoded_description, encoded_instructions });
+    var schema: Writer.Allocating = .init(arena);
+    try schema.writer.writeAll("{\"name\":\"mcp_context7_resolve-library-id\",\"description\":");
+    try std.json.Stringify.value(merged, .{}, &schema.writer);
+    try schema.writer.writeAll(",\"inputSchema\":{\"type\":\"object\",\"required\":[\"query\"],\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Use 'Next.js' &amp; not \\\"nextjs\\\"\"}}}}");
+    var out: Writer.Allocating = .init(arena);
+    try writeHelp(arena, &out.writer, schema.written());
+    try testing.expectEqualStrings(
+        \\mcp_context7_resolve-library-id
+        \\Resolves a name.
+        \\
+        \\Call this first & pass "query".
+        \\
+        \\Server instructions: Docs for <libraries>.
+        \\
+        \\Arguments, as one JSON object:
+        \\  query: string  Use 'Next.js' &amp; not "nextjs"
+        \\
+    , out.written());
 }
