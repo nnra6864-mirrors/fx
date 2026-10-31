@@ -233,8 +233,8 @@ pub const ConfigDiagnostic = struct {
     /// A one-line note for the user instead of a configuration issue.
     pub fn note(self: ConfigDiagnostic) ?[]const u8 {
         return switch (self.cause) {
-            .private_state_permissions_tightened => "Other users could write to ~/.fx, so fx took that access away. " ++
-                "If you didn't write ~/.fx/settings.json yourself, check it.",
+            .private_state_permissions_tightened => profile_paths.displayText("Other users could write to ~/.fx, so fx took that access away. " ++
+                "If you didn't write ~/.fx/settings.json yourself, check it."),
             else => null,
         };
     }
