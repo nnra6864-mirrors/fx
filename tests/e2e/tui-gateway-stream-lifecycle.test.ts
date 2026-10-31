@@ -1587,6 +1587,63 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   }, TIMEOUT * 2);
 
+  test("a reply whose limit ran out before a cut-off tool call is resent and the turn finishes", async () => {
+    const sentinel = "cut-call-ran.txt";
+    const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+      "fx-tui-length-resend-",
+      [
+        () => fakeGatewaySse([
+          { type: "reasoning-start", id: "spent" },
+          { type: "reasoning-delta", id: "spent", delta: "thinking until the limit runs out" },
+          { type: "reasoning-end", id: "spent" },
+          { type: "tool-input-start", id: "cut_call", toolName: "shell" },
+          {
+            type: "tool-call",
+            toolCallId: "cut_call",
+            toolName: "shell",
+            input: { request: { action: "run", command: `printf ran > ${sentinel}` } },
+          },
+          { type: "finish", finishReason: { unified: "length", raw: "length" } },
+        ]),
+        () => fakeGatewayFinalText("AFTER_LENGTH_RESEND"),
+        () => fakeGatewayFinalText("LATER_PROMPT_OK"),
+      ],
+      {
+        models: [{
+          id: MODEL,
+          type: "language",
+          tags: ["tool-use", "reasoning"],
+          context_window: 1_050_000,
+          max_tokens: 128_000,
+          reasoning_options: [{ type: "effort", values: ["low", "medium", "high"] }],
+        }],
+      },
+    );
+    await session!.sendText("Write the versioned test file.");
+    await session!.waitForText("AFTER_LENGTH_RESEND", TIMEOUT);
+    await session!.waitForStableComposer(TIMEOUT);
+    expect(queuedGateway.requests).toHaveLength(2);
+    expect(JSON.parse(queuedGateway.requests[0]!.body).reasoning).toBeUndefined();
+    expect(JSON.parse(queuedGateway.requests[1]!.body).reasoning).toBe("low");
+    expect(existsSync(join(root!, "workspace", sentinel))).toBe(false);
+    const scrollback = await session!.captureFullScrollback();
+    // The notice wraps at the pane's width.
+    expect(scrollback.replace(/\s+/g, " ")).toContain("Retrying with low effort.");
+    expect(scrollback).not.toContain("did not run them");
+    expect(scrollback).not.toContain("response hit provider length limit");
+    expect(scrollback).not.toContain("UnknownToolLifecycleIdentity");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    await session!.sendText("Confirm a later prompt is still usable.");
+    await session!.waitForText("LATER_PROMPT_OK", TIMEOUT);
+    await session!.waitForStableComposer(TIMEOUT);
+    // The later prompt goes back to the selected effort.
+    expect(queuedGateway.requests).toHaveLength(3);
+    expect(JSON.parse(queuedGateway.requests[2]!.body).reasoning).toBeUndefined();
+    await session!.sendText("/quit");
+    expect(await session!.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  }, TIMEOUT * 2);
+
   test("trace report explains a rejected image when the model catalog is unavailable", async () => {
     root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-trace-catalog-")));
     const home = join(root, "home");
