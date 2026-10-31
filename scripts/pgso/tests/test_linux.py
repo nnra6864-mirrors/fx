@@ -77,9 +77,14 @@ class LinuxPlatformTests(unittest.TestCase):
         self.assertIs(linux.X86_64, platforms.for_target("x86_64-linux"))
         self.assertEqual("Linux x86_64", linux.X86_64.DISPLAY_NAME)
 
+    def test_only_x86_64_has_a_larger_size_ceiling(self) -> None:
+        self.assertEqual(7.000, macos.SIZE_CEILING_MIB)
+        self.assertEqual(7.000, linux.ARM64.SIZE_CEILING_MIB)
+        self.assertEqual(8.000, linux.X86_64.SIZE_CEILING_MIB)
+
     def test_every_platform_provides_what_the_pipeline_reads(self) -> None:
         names = (
-            "TARGET", "DISPLAY_NAME", "HOST_ARCH", "LIBLLVM_NAME", "CONTROL_BUILD_FLAGS",
+            "TARGET", "DISPLAY_NAME", "HOST_ARCH", "LIBLLVM_NAME", "SIZE_CEILING_MIB", "CONTROL_BUILD_FLAGS",
             "STARTUP_SCENARIOS", "ZIG_CC_LINK_FLAGS", "check_host", "discover_tools",
             "os_versions", "record_control_build", "external_control_strip_argv",
             "read_control_identity", "control_identity_from_evidence", "link_instrumented",

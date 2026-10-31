@@ -5,6 +5,7 @@ for its target:
 
 - `TARGET`, `DISPLAY_NAME`, `HOST_ARCH`, the only host architecture it
   builds on, and `LIBLLVM_NAME`, the LLVM C library `ir_size.py` loads;
+- `SIZE_CEILING_MIB`, the largest candidate it accepts;
 - `check_host()`, which returns the host architecture after checking the host
   can build and run the target natively;
 - `discover_tools(zig, clang)`, which returns the platform's native tools and
