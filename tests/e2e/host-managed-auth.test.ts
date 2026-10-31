@@ -252,11 +252,11 @@ describe("host-managed authentication", () => {
     expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
   }, TIMEOUT);
 
-  test("an empty reply cut short is asked again only through a provider that takes fx's output limit", async () => {
+  test("an empty reply cut short is asked again with fx's limit through Grok and at low effort through Codex", async () => {
     const childEnv = env();
     const turnBodies = (path: string) => responseBodies
       .filter((entry) => entry.path === path && !entry.body.includes("Generate a short title"))
-      .map((entry) => JSON.parse(entry.body) as { max_output_tokens?: number });
+      .map((entry) => JSON.parse(entry.body) as { max_output_tokens?: number; reasoning?: { effort?: string } });
     for (const provider of ["codex", "grok"] as const) {
       const selected = await runFx(["provider", provider], {
         cwd: workspace,
@@ -277,10 +277,15 @@ describe("host-managed authentication", () => {
       expect(asked.code).toBe(0);
       expect(sent[0]!.max_output_tokens).toBeUndefined();
       if (provider === "codex") {
-        // The Codex endpoint ignores fx's limit, so a retry would repeat the request.
-        expect(sent).toHaveLength(1);
-        expect(asked.stderr).not.toContain("Retrying with a higher limit.");
-        expect(JSON.parse(asked.stdout).final_output).toBe("The reply ran out of output tokens before any text.");
+        // The Codex endpoint ignores fx's limit, so the resend asks for less
+        // reasoning instead, which the selected model offers.
+        expect(sent).toHaveLength(2);
+        expect(sent[1]!.max_output_tokens).toBeUndefined();
+        expect(sent[0]!.reasoning?.effort).toBeUndefined();
+        expect(sent[1]!.reasoning?.effort).toBe("low");
+        expect(asked.stderr).toContain("Retrying with low effort.");
+        expect(asked.stderr).not.toContain("Retrying with a higher limit");
+        expect(asked.stdout).toContain("CODEX_HOST_MANAGED_OK");
       } else {
         expect(sent).toHaveLength(2);
         expect(sent[1]!.max_output_tokens).toBe(32_768);

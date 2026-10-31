@@ -8827,7 +8827,7 @@ describe("acp: model-independent", () => {
 
         expect(result.promptResult.result.stopReason).toBe("max_output_tokens");
         expect(JSON.stringify(result.messages)).toContain("ACP partial output");
-        expect(JSON.stringify(result.messages)).toContain("did not execute");
+        expect(JSON.stringify(result.messages)).toContain("did not run them");
         expect(existsSync(sentinelPath)).toBe(false);
         expect(gateway.requests).toHaveLength(1);
         expect(client.stderr).toBe("");

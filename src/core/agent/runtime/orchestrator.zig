@@ -85,8 +85,15 @@ const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const CredentialRefreshMode = runtime_deps.CredentialRefreshMode;
 
 const http_error_detail_max_bytes: usize = 4096;
-const empty_length_retry_notice = "The reply ran out of output tokens before any text. Retrying with a higher limit.";
 const empty_length_limited_reply = "The reply ran out of output tokens before any text.";
+
+fn lengthResendNotice(raised_limit: bool, lowered_effort: bool) []const u8 {
+    const prefix = empty_length_limited_reply ++ " Retrying with";
+    if (raised_limit and lowered_effort) return prefix ++ " a higher limit and low effort.";
+    if (raised_limit) return prefix ++ " a higher limit.";
+    std.debug.assert(lowered_effort);
+    return prefix ++ " low effort.";
+}
 const assistant_prefill_recovery_prompt =
     "Continue from the preceding tool result.";
 pub const assistant_tail_continuation_prompt =
@@ -4838,6 +4845,13 @@ fn isTerminalProviderExecutedCompletion(completion: types.ModelCompletion) bool 
     return content.len > 0 and types.allToolCallsProviderExecuted(completion.tool_calls);
 }
 
+fn hasProviderExecutedCall(tool_calls: []const types.ToolCall) bool {
+    for (tool_calls) |call| {
+        if (call.provenance == .provider_executed) return true;
+    }
+    return false;
+}
+
 noinline fn settle_deferred_tool_starts(
     deps: *const AgentRuntimeDeps,
     stream_ctx: *runtime_assistant_stream.StreamChunkContext,
@@ -6800,6 +6814,11 @@ fn processQueuedPromptLoop(
     // The limit the turn's one retry of an empty, cut-short reply set. Later
     // steps keep it until the catalog names a limit of its own.
     var length_retry_output_tokens: ?u32 = null;
+    // The effort of the next step when it resends a reply that hit its output
+    // limit with nothing usable; null when the next step is not a resend. A
+    // resend's own reply is never resent, so one such reply costs at most one
+    // more request.
+    var length_resend_effort: ?types.ReasoningEffort = null;
     var last_step_ctx = finish_trace.ctx;
     var current_step_index: usize = 0;
     var last_tool_call_name: []const u8 = "none";
@@ -6894,6 +6913,9 @@ fn processQueuedPromptLoop(
             pending_context_notes.clearRetainingCapacity();
         }
         current_step_index = step + 1;
+        const resend_effort = length_resend_effort;
+        length_resend_effort = null;
+        const step_effort = resend_effort orelse config.effort;
         if (deps.observer) |observer| observer.beginStep(current_step_index);
         defer if (deps.observer) |observer| observer.endStep();
         const step_ctx: TraceContext = .{ .turn_id = turn_id, .step_id = debug_trace.nextStepId(), .subagent_id = config.subagent_id };
@@ -7347,11 +7369,11 @@ fn processQueuedPromptLoop(
                 try deps.push_text(deps.ctx, .{ .operational = "\n" });
             }
             last_gateway_message_count = gateway_instructions.items.len + request_messages.len;
-            var provider_opts = try model_capabilities.resolveUltrafastProviderOptions(request_capabilities, job.provider, gateway_model, config.effort, attempt_fast_mode, config.ultrafast_mode);
+            var provider_opts = try model_capabilities.resolveUltrafastProviderOptions(request_capabilities, job.provider, gateway_model, step_effort, attempt_fast_mode, config.ultrafast_mode);
             provider_opts.prompt_caching = config.provider_capabilities.gateway_prompt_caching;
             provider_opts.provider_order = config.provider_order;
             provider_opts.provider_strict = config.provider_strict;
-            runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, attempt_fast_mode, config.effort, provider_opts);
+            runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, attempt_fast_mode, step_effort, provider_opts);
             // Fast drops silently when the catalog cannot confirm support.
             // Tell the user once per turn, but only when the catalog itself is
             // known to be down; a reachable catalog that simply lacks fast
@@ -8874,24 +8896,41 @@ fn processQueuedPromptLoop(
             },
         );
         try runtime_telemetry.traceReturnedToolCalls(arena, step_ctx, completion.tool_calls);
-        // A reply the provider cut short before any text or tool call, from a
-        // request that named no output limit, ran out of the provider's own
-        // default. A provider that takes fx's limit gets the request once more
-        // with one.
-        const empty_length_retry: ?u32 = if (disposition == .length_limited and
-            completion.tool_calls.len == 0 and
+        // A reply the provider cut short before any text, such as reasoning
+        // that never reached an answer followed at most by tool calls cut off
+        // mid-arguments, is dropped and asked once more when the resend can
+        // differ: with fx's limit when the request named none and the
+        // provider takes one, since the provider's own default ran out, and at
+        // `low` effort when that reasons less. A resend's own reply, visible
+        // text, tool calls the provider already ran, and a resend that would
+        // repeat the request end the turn as before.
+        const may_resend = disposition == .length_limited and
+            resend_effort == null and
             std.mem.trim(u8, partial_assistant, " \t\r\n").len == 0 and
+            !hasProviderExecutedCall(completion.tool_calls) and
+            agent_steps.allowsStep(config.agent_step_limit, step + 1);
+        const raised_limit: ?u32 = if (may_resend and
             length_retry_output_tokens == null and
             config.provider_capabilities.sends_output_limit and
-            model_capabilities.requestOutputTokens(request_capabilities) == null and
-            agent_steps.allowsStep(config.agent_step_limit, step + 1))
+            model_capabilities.requestOutputTokens(request_capabilities) == null)
             model_capabilities.emptyLengthRetryOutputTokens(request_capabilities)
         else
             null;
-        if (empty_length_retry) |limit| {
-            length_retry_output_tokens = limit;
-            debug_trace.eventf("agent", "empty_length_limited_retry", step_ctx, "max_output_tokens={d}", .{limit});
-            try deps.push_text(deps.ctx, .{ .operational = empty_length_retry_notice });
+        const lowered_effort = if (may_resend)
+            model_capabilities.lengthResendEffort(request_capabilities, step_effort)
+        else
+            null;
+        if (raised_limit != null or lowered_effort != null) {
+            if (raised_limit) |limit| length_retry_output_tokens = limit;
+            const effort = lowered_effort orelse step_effort;
+            length_resend_effort = effort;
+            try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, turn_id, completion.tool_calls, advertised_dynamic_tool_names);
+            debug_trace.eventf("agent", "length_limited_resend", step_ctx, "dropped_tool_calls={d} max_output_tokens={any} effort={s}", .{
+                completion.tool_calls.len,
+                raised_limit,
+                effort.label(),
+            });
+            try deps.push_text(deps.ctx, .{ .operational = lengthResendNotice(raised_limit != null, lowered_effort != null) });
             try deps.push_text(deps.ctx, .{ .operational = "\n" });
             continue;
         }
