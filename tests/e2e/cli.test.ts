@@ -6129,7 +6129,10 @@ describe("cli: completion", () => {
       const script = await writeScript("fish", home);
       for (const [words, want] of cases) {
         const line = words.join(" ");
-        const run = spawnSync("fish", ["--no-config", "-c", `source '${script}'; complete -C '${line}'`], {
+        // As in the bash and zsh harnesses, file completion offers nothing,
+        // so only the words fx itself offers are compared.
+        const stubFiles = "function __fish_complete_path; end";
+        const run = spawnSync("fish", ["--no-config", "-c", `source '${script}'; ${stubFiles}; complete -C '${line}'`], {
           cwd: home,
           encoding: "utf8",
         });

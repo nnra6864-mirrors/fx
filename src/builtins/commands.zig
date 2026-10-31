@@ -94,17 +94,17 @@ pub const session_options = [_]command_specs.OptionDoc{
     json_option,
 };
 
-pub const acp_options = agentRunOptions("sessions this server starts", false) ++ [_]command_specs.OptionDoc{
+pub const acp_options = agentRunOptions("sessions this server starts", .without_provider_order) ++ [_]command_specs.OptionDoc{
     .{ .flag = "--log-file <path>", .description = "Write ACP logs to a file" },
 };
 
 pub const acp_usage = "acp " ++ agent_run_usage_base ++ " [--log-file <path>]";
 
-pub const pr_options = agentRunOptions("this request", true) ++ [_]command_specs.OptionDoc{
+pub const pr_options = agentRunOptions("this request", .with_provider_order) ++ [_]command_specs.OptionDoc{
     .{ .flag = "--create", .description = "Publish the drafted pull request via the GitHub CLI" },
 };
 
-const issue_options = agentRunOptions("this request", true) ++ [_]command_specs.OptionDoc{
+const issue_options = agentRunOptions("this request", .with_provider_order) ++ [_]command_specs.OptionDoc{
     .{ .flag = "--create", .description = "Publish the drafted issue via the GitHub CLI" },
 };
 
@@ -163,12 +163,15 @@ const permission_modes = [_][]const u8{ "ask", "auto", "full-access" };
 /// The built-in providers. A configured connection's name is also accepted.
 const builtin_providers = [_][]const u8{ "gateway", "codex", "grok" };
 
+/// Whether a command takes the gateway provider-order flags.
+const ProviderOrder = enum { with_provider_order, without_provider_order };
+
 /// The flags that shape an agent run, the same on every command that runs the
 /// agent: `fx ask`, `fx pr`, `fx issue`, and `fx acp`. `scope` names what they
 /// shape, such as "this request". `src/core/cli/agent_run_flags.zig` parses
 /// them. `fx acp` leaves out the provider-order flags, because ACP sessions
 /// don't apply gateway provider routing.
-fn agentRunOptions(comptime scope: []const u8, comptime routing: bool) [if (routing) 15 else 12]command_specs.OptionDoc {
+fn agentRunOptions(comptime scope: []const u8, comptime provider_order: ProviderOrder) [if (provider_order == .with_provider_order) 15 else 12]command_specs.OptionDoc {
     const all = [_]command_specs.OptionDoc{
         .{ .flag = "--permission-mode <mode>", .description = "Set the permission mode for " ++ scope ++ ": ask, auto, or full-access", .values = &permission_modes },
         .{ .flag = "--ask", .description = "Ask before each action that needs permission" },
@@ -186,14 +189,14 @@ fn agentRunOptions(comptime scope: []const u8, comptime routing: bool) [if (rout
         .{ .flag = "--provider-strict", .description = "Restrict " ++ scope ++ " to only the providers in --provider-order" },
         .{ .flag = "--no-provider-strict", .description = "Clear the provider restriction for " ++ scope },
     };
-    return if (routing) all else all[0..12].*;
+    return if (provider_order == .with_provider_order) all else all[0..12].*;
 }
 
 /// The usage-line form of `agentRunOptions`.
 const agent_run_usage_base = "[--permission-mode <mode>|--ask|--auto|--full-access] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast]";
 const agent_run_usage = agent_run_usage_base ++ " [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict]";
 
-pub const ask_options = agentRunOptions("this request", true) ++ [_]command_specs.OptionDoc{
+pub const ask_options = agentRunOptions("this request", .with_provider_order) ++ [_]command_specs.OptionDoc{
     .{ .flag = "--image PATH", .description = "Attach an image file; repeat for multiple images" },
     .{ .flag = "--system TEXT", .description = "Replace the built-in system prompt for this request" },
     json_option,

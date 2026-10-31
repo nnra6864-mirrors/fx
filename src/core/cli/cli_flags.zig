@@ -7,6 +7,7 @@
 //! another, the last one wins, and each command validates its own values.
 
 const std = @import("std");
+const builtin_commands = @import("../../builtins/commands.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
@@ -293,6 +294,90 @@ test "Nearest keeps the first closest candidate within its edit limit" {
     try std.testing.expect(strict.best == null);
     strict.offer("fix");
     try std.testing.expectEqualStrings("fix", strict.best.?);
+}
+
+test "the flag parser keeps its laws on fuzzed command lines" {
+    try std.testing.fuzz({}, fuzzParserLaws, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "--model\x00x\x00hello",
+            "--model=x\x00--model\x00y\x00--\x00--fast",
+            "--modle\x00--json",
+            "--resume-id\x00abc",
+            "-\x00--\x00-x\x00--=\x00---",
+            "--provider-order\x00\x00--timeout=\x1b[2J",
+            "--mod\x1b]0;owned\x07",
+            "--limit\x005\x1b[2J",
+            "caf\xc3\xa9\x00--\xff\xfe",
+        }) ++ @import("fuzz_corpus").cli_flags.*),
+    });
+}
+
+/// The input splits at zero bytes into up to 16 arguments, which parse
+/// against `fx ask`'s options. The parser must stop on its own, return only
+/// documented options with values borrowed from the arguments, agree with
+/// `firstFailure`, give the same answer twice, and describe every failure,
+/// and every value outside a flag's range, in terminal-safe text.
+fn fuzzParserLaws(_: void, smith: *std.testing.Smith) !void {
+    var input: [512]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&input));
+
+    var storage: [input.len + 16]u8 = undefined;
+    var args: [16][:0]const u8 = undefined;
+    var count: usize = 0;
+    var used: usize = 0;
+    var parts = std.mem.splitScalar(u8, input[0..len], 0);
+    while (parts.next()) |part| {
+        if (count == args.len) break;
+        @memcpy(storage[used..][0..part.len], part);
+        storage[used + part.len] = 0;
+        args[count] = storage[used .. used + part.len :0];
+        used += part.len + 1;
+        count += 1;
+    }
+    const argv = args[0..count];
+    const docs: []const OptionDoc = &builtin_commands.ask_options;
+
+    var parser = Parser.init(docs, argv);
+    var again = Parser.init(docs, argv);
+    var steps: usize = 0;
+    while (true) : (steps += 1) {
+        try std.testing.expect(steps <= argv.len);
+        const item = parser.next() catch {
+            try std.testing.expectError(error.InvalidFlag, again.next());
+            const failure = parser.failure orelse return error.TestExpectedFailure;
+            var message: [4096]u8 = undefined;
+            var writer: std.Io.Writer = .fixed(&message);
+            try failure.write(&writer);
+            try std.testing.expect(text_utils.isTerminalSafe(writer.buffered()));
+            try std.testing.expect(firstFailure(docs, argv) != null);
+            break;
+        };
+        try std.testing.expectEqualDeep(item, try again.next());
+        const found = item orelse {
+            try std.testing.expect(firstFailure(docs, argv) == null);
+            break;
+        };
+        switch (found) {
+            .positional => |text| try std.testing.expect(borrowed(&storage, text)),
+            .option => |match| {
+                try std.testing.expect(match.index < docs.len);
+                if (match.value) |value| try std.testing.expect(borrowed(&storage, value));
+            },
+        }
+    }
+
+    var range_message: [4096]u8 = undefined;
+    var range_writer: std.Io.Writer = .fixed(&range_message);
+    _ = try writeRangeFailure(&range_writer, .init(&builtin_commands.sessions_options, argv));
+    try std.testing.expect(text_utils.isTerminalSafe(range_writer.buffered()));
+}
+
+fn borrowed(storage: []const u8, text: []const u8) bool {
+    if (text.len == 0) return true;
+    const start = @intFromPtr(storage.ptr);
+    const at = @intFromPtr(text.ptr);
+    return at >= start and at + text.len <= start + storage.len;
 }
 
 const test_docs = [_]OptionDoc{

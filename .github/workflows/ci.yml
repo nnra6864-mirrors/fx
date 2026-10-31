@@ -752,6 +752,8 @@ jobs:
           missing=()
           command -v tmux >/dev/null 2>&1 || missing+=(tmux)
           command -v zsh >/dev/null 2>&1 || missing+=(zsh)
+          # cli.test.ts runs the fish completion script only where fish is installed.
+          command -v fish >/dev/null 2>&1 || missing+=(fish)
           if [ "${#missing[@]}" -gt 0 ]; then
             retry() {
               local attempt
@@ -786,6 +788,7 @@ jobs:
           printf 'set-option -g history-limit 100000\n' > "$HOME/.tmux.conf"
           tmux -V
           zsh --version
+          fish --version
 
       - name: Install E2E dependencies
         run: bun install --frozen-lockfile

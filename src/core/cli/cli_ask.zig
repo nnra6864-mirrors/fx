@@ -1421,29 +1421,28 @@ fn preflightAskImages(
 }
 
 pub fn runPrompt(alloc: Allocator, prompt: []const u8, agent: agent_run_flags.Overrides, cfg: Config, context_registry: context_contract.Registry, tool_set: tool_set_contract.ToolSet) !u8 {
-    const result = try runPromptInternal(alloc, prompt, agent.permission, cfg, .{
-        .output_mode = .raw,
-        .images = &.{},
-        .provider_override = agent.provider,
-        .model_override = agent.model,
-        .effort_override = agent.effort,
-        .fast_override = agent.fast,
-        .ultrafast_override = agent.ultrafast,
-        .provider_order_override = agent.provider_order,
-        .provider_strict_override = agent.provider_strict,
-        .deps = .{
-            .context_registry = context_registry,
-            .tool_set = tool_set,
-            .load_mcp_host = cfg.load_mcp_host,
-        },
-    });
+    const result = try runPromptWithRunFlags(alloc, prompt, agent, cfg, context_registry, tool_set, .raw);
     defer result.deinit(alloc);
     return result.exit_code;
 }
 
 pub fn runPromptCapture(alloc: Allocator, prompt: []const u8, agent: agent_run_flags.Overrides, cfg: Config, context_registry: context_contract.Registry, tool_set: tool_set_contract.ToolSet) !PromptRunResult {
+    return runPromptWithRunFlags(alloc, prompt, agent, cfg, context_registry, tool_set, .json);
+}
+
+/// Runs `prompt` with the run flags a caller parsed, such as `fx pr` or
+/// `fx issue`, so every such caller applies the same set.
+fn runPromptWithRunFlags(
+    alloc: Allocator,
+    prompt: []const u8,
+    agent: agent_run_flags.Overrides,
+    cfg: Config,
+    context_registry: context_contract.Registry,
+    tool_set: tool_set_contract.ToolSet,
+    output_mode: OutputMode,
+) !PromptRunResult {
     return runPromptInternal(alloc, prompt, agent.permission, cfg, .{
-        .output_mode = .json,
+        .output_mode = output_mode,
         .images = &.{},
         .provider_override = agent.provider,
         .model_override = agent.model,
@@ -3620,8 +3619,6 @@ fn resolveAskSubagentAuthority(
     );
 }
 
-/// Parses one `--provider-order` value for `fx ask`, replacing any earlier
-/// occurrence. The returned slice is owned by `alloc`.
 /// What was wrong with an `fx ask` command line, for its error message.
 const AskUsageProblem = union(enum) {
     none,
@@ -4209,7 +4206,7 @@ fn testModelPromptOverlay(model: []const u8) ?[]const u8 {
 
 fn testConfig() Config {
     return .{
-        .command_usage = "ask [--auto|--full-access] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|<id>>|--resume-id <id>] [--] <prompt>",
+        .command_usage = "ask [--auto|--full-access] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|<id>>] [--] <prompt>",
         .default_model = "model",
         .default_agent_step_limit = 4,
         .gateway_retry_count = 1,
