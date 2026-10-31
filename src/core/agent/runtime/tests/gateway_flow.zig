@@ -7572,7 +7572,7 @@ test "processQueuedPrompt fails closed without stable credential authority" {
         .turn_id = 45,
         .user = .{ .text = @constCast("user prompt") },
         .assistant_source = @constCast("partial response"),
-        .cause = .system_resumed,
+        .cause = .connectivity_lost,
         .action = .waiting_for_connectivity,
         .authority = .{
             .provider = .gateway,

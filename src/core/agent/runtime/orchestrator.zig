@@ -7721,7 +7721,6 @@ fn processQueuedPromptLoop(
                 const failure_cause: types.ModelRecoveryCause = if (network_failure) |evidence|
                     switch (evidence.cause) {
                         .transport_interrupted => .network_interrupted,
-                        .system_resumed => .system_resumed,
                         .connectivity_lost => .connectivity_lost,
                         .stream_stalled => .provider_stream_timeout,
                     }
