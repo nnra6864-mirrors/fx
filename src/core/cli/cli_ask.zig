@@ -1494,11 +1494,15 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     for (startup.config_diagnostics) |diagnostic| {
         var notice_writer: std.Io.Writer.Allocating = .init(alloc);
         defer notice_writer.deinit();
-        try notice_writer.writer.print(
-            "fx ask: config {s}: {s}",
-            .{ @tagName(diagnostic.layer), @tagName(diagnostic.cause) },
-        );
-        try config_runtime.writeDiagnosticMetadata(&notice_writer.writer, diagnostic);
+        if (diagnostic.note()) |text| {
+            try notice_writer.writer.print("fx ask: note: {s}", .{text});
+        } else {
+            try notice_writer.writer.print(
+                "fx ask: config {s}: {s}",
+                .{ @tagName(diagnostic.layer), @tagName(diagnostic.cause) },
+            );
+            try config_runtime.writeDiagnosticMetadata(&notice_writer.writer, diagnostic);
+        }
         try notice_writer.writer.writeByte('\n');
         const notice = try notice_writer.toOwnedSlice();
         defer alloc.free(notice);
@@ -4314,12 +4318,13 @@ fn testProcessQueuedPromptChecksExecOnlyTerminal(_: *agent_runtime.Agent, deps: 
     for (advertised_shell.input_schema.properties) |property| {
         try std.testing.expect(!std.mem.eql(u8, property.name, "tty"));
     }
-    try std.testing.expect(std.mem.find(u8, advertised_shell.description, "shell.interact") != null);
+    try std.testing.expect(std.mem.find(u8, advertised_shell.description, "action=interact") != null);
+    try std.testing.expect(std.mem.find(u8, advertised_shell.description, "tty") == null);
     try std.testing.expectEqualStrings(builtin_tools.web_search.description, cfg.custom_tool_guidance);
     try std.testing.expectEqualStrings("test model overlay", cfg.model_prompt_overlay.?);
     const runtime_shell = deps.tool_registry.lookup("shell") orelse
         return error.TestExpectedEqual;
-    try std.testing.expect(std.mem.find(u8, runtime_shell.description, "shell.interact") != null);
+    try std.testing.expect(std.mem.find(u8, runtime_shell.description, "action=interact") != null);
     try testPushAssistantText(deps, "assistant text");
 }
 
@@ -4330,7 +4335,8 @@ fn testProcessQueuedPromptChecksFullTerminal(_: *agent_runtime.Agent, deps: *con
     const advertised_shell = for (cfg.advertised_functions) |function| {
         if (std.mem.eql(u8, function.name, "shell")) break function;
     } else return error.TestExpectedEqual;
-    try std.testing.expect(std.mem.find(u8, advertised_shell.description, "shell.interact") != null);
+    try std.testing.expect(std.mem.find(u8, advertised_shell.description, "action=interact") != null);
+    try std.testing.expect(std.mem.find(u8, advertised_shell.description, "tty=true") != null);
     try testPushAssistantText(deps, "assistant text");
 }
 

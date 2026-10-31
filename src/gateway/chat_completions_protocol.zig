@@ -7,6 +7,7 @@ const tool_result_errors = @import("../core/tooling/tool_result_errors.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const tool_call_ids = @import("tool_call_ids.zig");
 const sse = @import("sse.zig");
+const json_depth = @import("json_depth.zig");
 const configured_provider = @import("../core/config/configured_provider.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -67,7 +68,7 @@ pub const Error = error{
 const max_selected_tools = 256;
 const max_name_bytes = 128;
 const max_history_arguments_bytes = 1024 * 1024;
-const max_json_depth = 64;
+const max_json_depth = json_depth.max_depth;
 
 const Function = struct {
     name: []const u8,
@@ -188,28 +189,7 @@ fn validate_request(request: stream_provider.RequestData) Error!void {
 }
 
 fn check_json_depth(text: []const u8) Error!void {
-    var depth: usize = 0;
-    var quoted = false;
-    var escaped = false;
-    for (text) |byte| {
-        if (quoted) {
-            if (escaped) {
-                escaped = false;
-            } else if (byte == '\\') {
-                escaped = true;
-            } else if (byte == '"') quoted = false;
-        } else switch (byte) {
-            '"' => quoted = true,
-            '{', '[' => {
-                if (depth == max_json_depth) return error.JsonTooDeep;
-                depth += 1;
-            },
-            '}', ']' => if (depth > 0) {
-                depth -= 1;
-            },
-            else => {},
-        }
-    }
+    if (json_depth.exceeds(text)) return error.JsonTooDeep;
 }
 
 /// Caller owns the bounded diagnostic. Normalize JSON before masking so later

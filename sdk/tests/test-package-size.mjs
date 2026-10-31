@@ -76,9 +76,9 @@ const miscompiled = [];
 // the check can't pass only because a description was reworded.
 const toolSource = await readFile(new URL("../../src/builtins/tools.zig", import.meta.url), "utf8");
 const toolDescriptions = [
-  "Fetch bounded text from a known public HTTP(S) URL",
-  "Run every command with shell.run",
-  "Read a stored tool result or captured command output",
+  "Fetch a public http(s) URL the user named and return its text",
+  "Run a shell command. Each call starts a new shell",
+  "Read more of a truncated tool result by its handle",
 ];
 for (const text of toolDescriptions) {
   assert.ok(toolSource.includes(text), `src/builtins/tools.zig no longer contains "${text}"; use another built-in tool's description`);

@@ -714,6 +714,8 @@ const App = struct {
             } else if (launch.upgrade_relaunch) |relaunch| {
                 SessionAppRuntime.writeUpgradeNotice(&app, app_version, build_update_channel, relaunch.previous_revision orelse "", build_revision) catch |err|
                     debug_trace.logf("session", "event=upgrade_notice_unavailable err={s}", .{@errorName(err)});
+            } else {
+                SessionAppRuntime.queueInterruptedTurnHint(&app);
             }
         }
         const env_disabled = if (io_mod.getenv("FX_AUTO_UPGRADE")) |val|
@@ -896,6 +898,10 @@ const App = struct {
         // These delete image snapshots and log discarded drafts.
         self.worker.deinit(std.heap.c_allocator);
         self.clearPendingImages();
+        // Full-detail loads read saved results through the session store,
+        // so their threads end before it closes.
+        self.shell.stopBackgroundLoads();
+        shutdown_trace.mark("transcript_loads_stopped");
         SessionAppRuntime.deinitPersistenceForProcessExit(self);
         self.question_prompt.deinit(self.alloc);
         shutdown_trace.mark("persistence_finalized");
@@ -2888,6 +2894,7 @@ const App = struct {
             try AuthAppRuntime.collectStartupCredentialFacts(self);
             AuthAppRuntime.collectDeferredStartupInventory(self);
         }
+        if (comptime host_profile.durable_sessions) SessionAppRuntime.collectInterruptedTurnHint(self);
         InputSubmitRuntime.collectPendingSubmissionFacts(self);
         InputAppRuntime.collectFilePickerFacts(self);
 
@@ -4697,6 +4704,7 @@ test {
     _ = @import("core/config/model_provider.zig");
     _ = @import("core/config/configured_provider.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
+    _ = @import("gateway/json_depth.zig");
     _ = provider_runtime;
     _ = @import("acp/prompt.zig");
     _ = @import("acp/libfx_hooks.zig");
@@ -4763,6 +4771,7 @@ test {
     _ = @import("core/shared/debug_trace.zig");
     _ = @import("core/output/diff.zig");
     _ = @import("core/shared/display_width.zig");
+    _ = @import("core/shared/gateway_error_format.zig");
     _ = @import("core/cli/doctor_runtime.zig");
     _ = @import("core/auth/login_flow.zig");
     _ = @import("core/auth/chatgpt_oauth.zig");

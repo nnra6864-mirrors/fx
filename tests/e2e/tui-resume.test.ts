@@ -8358,6 +8358,48 @@ function holdingGateway(prompt: string) {
 }
 
 test.skipIf(!tmuxAvailable())(
+  "plain fx points at a turn a crash left unfinished, but not at one another fx is working on",
+  async () => {
+    const fixture = resumeFixture("fx-auto-resume-hint-");
+    const { gateway, heldAtLeast, held } = holdingGateway("Map the route.");
+    const hint = "Interrupted turn · fx -c to continue";
+    const sessions: TmuxSession[] = [];
+    try {
+      const first = (await launchFx(fixture, gateway, "", "first")).session;
+      sessions.push(first);
+      await first.sendText("Map the route.");
+      await heldAtLeast(1);
+      await endFx(first, "SIGKILL");
+
+      // Plain fx points at the turn and starts fresh, sending nothing.
+      const plain = await launchFx(fixture, gateway, "", "plain");
+      sessions.push(plain.session);
+      await plain.session.waitForText(hint, TIMEOUT);
+      await Bun.sleep(500);
+      expect(held()).toBe(1);
+      expect(await plain.session.capturePane()).not.toContain("Resuming the interrupted request");
+      expect(readFileSync(plain.stderrPath, "utf8")).toBe("");
+      await plain.session.kill();
+
+      // While -c works on it, the turn is not interrupted.
+      const resumed = (await launchFx(fixture, gateway, "-c", "resumed")).session;
+      sessions.push(resumed);
+      await heldAtLeast(2);
+      const second = await launchFx(fixture, gateway, "", "second");
+      sessions.push(second.session);
+      await Bun.sleep(500);
+      expect(await second.session.captureFullScrollback()).not.toContain(hint);
+      expect(held()).toBe(2);
+    } finally {
+      for (const session of sessions) await session.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 4,
+);
+
+test.skipIf(!tmuxAvailable())(
   "a request that crashed fx twice asks first, and Esc there ends it for good",
   async () => {
     const fixture = resumeFixture("fx-auto-resume-loop-");
